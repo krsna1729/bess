@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -28,8 +29,11 @@
 namespace {
 
 using bess::testing::Bytes;
+using bess::testing::FoldChecksum;
+using bess::testing::Ip4;
 using bess::testing::Mac;
 using bess::testing::ModuleHarness;
+using bess::testing::OnesSum;
 using bess::testing::PacketBuilder;
 using bess::utils::Ethernet;
 
@@ -136,6 +140,9 @@ class RouterTest : public ::testing::Test {
   // The metadata writer a graph uses for this attribute: a SetMetadata
   // setting next_hop_id = `id` (big-endian, as the Router reads it), which in
   // a graph is what an ActionTable writes.
+  // A fresh name per call: the harness keeps every module it creates until the
+  // test ends (ModuleHarness::~ModuleHarness destroys them), so a second
+  // writer in one test would fail creation with a name already taken.
   Module *MakeWriter(uint32_t id) {
     bess::pb::SetMetadataArg arg;
     bess::pb::SetMetadataArg::Attribute *attr = arg.add_attrs();
@@ -144,7 +151,7 @@ class RouterTest : public ::testing::Test {
     const uint8_t bytes[4] = {static_cast<uint8_t>(id >> 24), static_cast<uint8_t>(id >> 16),
                               static_cast<uint8_t>(id >> 8), static_cast<uint8_t>(id)};
     attr->set_value_bin(reinterpret_cast<const char *>(bytes), sizeof(bytes));
-    return h_.Create("SetMetadata", arg, "writer");
+    return h_.Create("SetMetadata", arg, "writer" + std::to_string(next_writer_++));
   }
 
   // One frame through a writer that sets next_hop_id = 1, into `rt`: the
@@ -156,6 +163,69 @@ class RouterTest : public ::testing::Test {
     return h_.RunPipeline(writer, 0, {frame}, rt, std::move(ogates));
   }
 
+  // A router that routes by destination (D-155): the mode is configuration,
+  // not a guess about the graph's wiring.
+  Router *MakeDestinationRouter(uint64_t domains = 1) {
+    bess::pb::RouterArg arg;
+    arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
+    arg.set_max_domains(domains);
+    return dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  }
+
+  // A next hop: egress gate `gate`, addresses named or not (D-129).
+  void MakeHop(Router *rt, uint32_t id, uint64_t gate, const char *dst_mac, const char *src_mac,
+               bess::pb::RouterNeighborState neighbor = bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED) {
+    bess::pb::RouterNextHopIdKey key;
+    key.set_id(id);
+    bess::pb::RouterNextHopValue value;
+    value.set_egress_gate(gate);
+    value.set_neighbor(neighbor);
+    if (dst_mac != nullptr) {
+      const std::array<uint8_t, 6> mac = Mac(dst_mac);
+      value.set_dst_mac(reinterpret_cast<const char *>(mac.data()), mac.size());
+    }
+    if (src_mac != nullptr) {
+      const std::array<uint8_t, 6> mac = Mac(src_mac);
+      value.set_src_mac(reinterpret_cast<const char *>(mac.data()), mac.size());
+    }
+    EXPECT_EQ("", h_.UpsertResource("rt/next_hops", key, value));
+  }
+
+  // One route in one domain, naming `hop`.
+  void MakeRoute(Router *rt, const char *prefix, uint32_t length, uint32_t domain, uint32_t hop) {
+    bess::pb::RouterRouteKey key;
+    key.set_ipv4(prefix);
+    key.set_prefix_length(length);
+    key.set_domain(domain);
+    bess::pb::RouterRouteValue value;
+    value.set_next_hop_id(hop);
+    EXPECT_EQ("", h_.UpsertResource("rt/routes", key, value));
+  }
+
+  // What a VIF writes: the route domain a packet arrived in. A fresh name per
+  // call, as MakeWriter's.
+  Module *MakeDomainWriter(uint32_t domain) {
+    bess::pb::SetMetadataArg arg;
+    bess::pb::SetMetadataArg::Attribute *attr = arg.add_attrs();
+    attr->set_name("route_domain");
+    attr->set_size(4);
+    const uint8_t bytes[4] = {static_cast<uint8_t>(domain >> 24), static_cast<uint8_t>(domain >> 16),
+                              static_cast<uint8_t>(domain >> 8), static_cast<uint8_t>(domain)};
+    attr->set_value_bin(reinterpret_cast<const char *>(bytes), sizeof(bytes));
+    return h_.Create("SetMetadata", arg, "vif" + std::to_string(next_writer_++));
+  }
+
+  // A frame in the domain it carries, through the VIF that writes it.
+  std::map<gate_idx_t, std::vector<Bytes>> RunToDestination(Router *rt, const Bytes &frame,
+                                                           uint32_t domain = 0,
+                                                           std::vector<gate_idx_t> ogates = {0, 1}) {
+    Module *vif = MakeDomainWriter(domain);
+    EXPECT_EQ(0, ModuleGraph::ConnectModules(vif, 0, rt, 0, true));
+    return h_.RunPipeline(vif, 0, {frame}, rt, std::move(ogates));
+  }
+
+  // Names for the metadata writers, one per call (see MakeWriter).
+  int next_writer_ = 0;
   ModuleHarness h_;
 };
 
@@ -176,7 +246,7 @@ TEST_F(RouterTest, ANamedHopIsWrittenIntoTheFrame) {
   EXPECT_EQ(Mac("02:00:00:00:00:aa"), SrcOf(got));
   EXPECT_TRUE(std::equal(frame.begin() + 12, frame.end(), got.begin() + 12))
       << "the ethertype and everything after it are the frame's own";
-  EXPECT_EQ(0u, rt->l2_rewrite_failures());
+  EXPECT_EQ(0u, rt->header_write_failures());
 }
 
 // A hop that names no addresses: the frame keeps the header it arrived with.
@@ -190,7 +260,7 @@ TEST_F(RouterTest, AHopThatNamesNoAddressesIsForwardedUntouched) {
 
   ASSERT_EQ(1u, out[1].size());
   EXPECT_EQ(frame, out[1][0]) << "byte for byte what arrived";
-  EXPECT_EQ(0u, rt->l2_rewrite_failures());
+  EXPECT_EQ(0u, rt->header_write_failures());
 }
 
 // Half a pair is not a rewrite: writing the destination alone would put a zero
@@ -204,7 +274,7 @@ TEST_F(RouterTest, AHopThatNamesOnlyOneAddressIsForwardedUntouched) {
 
   ASSERT_EQ(1u, out[1].size());
   EXPECT_EQ(frame, out[1][0]);
-  EXPECT_EQ(0u, rt->l2_rewrite_failures()) << "not a failure: the hop named nothing to write";
+  EXPECT_EQ(0u, rt->header_write_failures()) << "not a failure: the hop named nothing to write";
 }
 
 // A frame whose payload is shared (a clone, as a decap or a span leaves one):
@@ -232,7 +302,7 @@ TEST_F(RouterTest, ASharedFrameIsCopiedBeforeTheHeaderIsWritten) {
   ASSERT_EQ(1u, sharer->kept_.size());
   const Bytes &original = BytesOf(sharer->kept_[0]);
   EXPECT_EQ(frame, original) << "the payload's other holder is untouched";
-  EXPECT_EQ(0u, rt->l2_rewrite_failures());
+  EXPECT_EQ(0u, rt->header_write_failures());
   for (bess::PacketHandle kept : sharer->kept_) {
     bess::PacketFree(kept);
   }
@@ -252,8 +322,8 @@ TEST_F(RouterTest, AFrameWhoseHeaderCannotBeWrittenIsDroppedAndCounted) {
 
   EXPECT_TRUE(out[0].empty());
   EXPECT_TRUE(out[1].empty()) << "dropped, not forwarded";
-  EXPECT_EQ(1u, rt->l2_rewrite_failures());
-  EXPECT_NE(std::string::npos, rt->GetDesc().find("1 l2 rewrite failures"))
+  EXPECT_EQ(1u, rt->header_write_failures());
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("1 header write failures"))
       << rt->GetDesc();
 }
 
@@ -267,7 +337,237 @@ TEST_F(RouterTest, AnUnresolvedHopIsDropped) {
 
   EXPECT_TRUE(out[0].empty());
   EXPECT_TRUE(out[1].empty());
-  EXPECT_EQ(0u, rt->l2_rewrite_failures()) << "a drop for another reason, not a failed write";
+  EXPECT_EQ(0u, rt->header_write_failures()) << "a drop for another reason, not a failed write";
+}
+
+// -- mode 2: routing by destination (D-155) ----------------------------------
+
+// A frame addressed to `dst`, arriving with `ttl` and the addresses a port
+// would use.
+Bytes FrameTo(const char *dst, uint8_t ttl = 64) {
+  PacketBuilder b;
+  b.Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b")
+      .IPv4("192.0.2.1", dst)
+      .Udp(1000, 2000)
+      .Payload("payload");
+  b.Last<PacketBuilder::IPv4Hdr>().ttl = ttl;
+  return b.Build();
+}
+
+// The frame's IPv4 TTL: Ethernet is 14 bytes, and TTL is byte 8 of the header.
+uint8_t TtlOf(const Bytes &frame) { return frame[14 + 8]; }
+
+// The header's own checksum, which covers the TTL.
+uint16_t ChecksumOf(const Bytes &frame) {
+  return static_cast<uint16_t>(frame[14 + 10] << 8 | frame[14 + 11]);
+}
+
+// A route in the FIB is enough: the module looks the packet's destination up
+// itself, writes the hop's addresses, and decrements the TTL as a router must.
+TEST_F(RouterTest, DestinationRoutingForwardsOnTheFibsGateAndDecrementsTtl) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  EXPECT_TRUE(rt->routes_by_destination());
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  const Bytes frame = FrameTo("10.1.2.3");
+  auto out = RunToDestination(rt, frame);
+
+  ASSERT_EQ(1u, out[1].size()) << "the hop's egress gate";
+  EXPECT_TRUE(out[0].empty());
+  const Bytes &got = out[1][0];
+  ASSERT_EQ(frame.size(), got.size());
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), DstOf(got));
+  EXPECT_EQ(Mac("02:00:00:00:00:aa"), SrcOf(got));
+  EXPECT_EQ(63, TtlOf(got)) << "a router decrements what it forwards";
+  EXPECT_NE(ChecksumOf(frame), ChecksumOf(got)) << "the checksum covers the TTL";
+  // FoldChecksum returns the complement of the folded sum, so a valid header
+  // folds to 0: the checksum covers the TTL it left with.
+  EXPECT_EQ(0, FoldChecksum(OnesSum(std::span<const uint8_t>(got.data() + 14, 20))))
+      << "the header it left with is a valid one";
+  EXPECT_TRUE(std::equal(frame.begin() + 12, frame.begin() + 22, got.begin() + 12))
+      << "the ethertype and the header up to the TTL are the frame's own";
+  EXPECT_TRUE(std::equal(frame.begin() + 26, frame.end(), got.begin() + 26))
+      << "and so is everything after the checksum";
+}
+
+// The mode decides, not the wiring: a module configured to route by
+// destination ignores a `next_hop_id` another module writes.
+TEST_F(RouterTest, TheMetadataIdIsIgnoredInDestinationMode) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeHop(rt, 2, 0, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  Module *writer = MakeWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  auto out = h_.RunPipeline(writer, 0, {FrameTo("10.1.2.3")}, rt, {0, 1});
+
+  ASSERT_EQ(1u, out[1].size()) << "the FIB's hop, not the id metadata named";
+  EXPECT_TRUE(out[0].empty());
+}
+
+// The default mode keeps failing closed: with no writer the module drops every
+// packet and does not consult the FIB it holds (D-155).
+TEST_F(RouterTest, TheIdModeStillFailsClosedWithoutAWriter) {
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", bess::pb::RouterArg(), "rt"));
+  ASSERT_NE(nullptr, rt);
+  EXPECT_FALSE(rt->routes_by_destination());
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  auto out = h_.RunPipeline(rt, 0, {FrameTo("10.1.2.3")}, rt, {0, 1});
+
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_TRUE(out[1].empty()) << "dropped, not routed by destination";
+  EXPECT_EQ(0u, rt->no_route_frames()) << "the FIB was never consulted";
+}
+
+TEST_F(RouterTest, AnUnknownModeIsRefused) {
+  bess::pb::RouterArg arg;
+  arg.set_mode(static_cast<bess::pb::RouteMode>(7));
+  EXPECT_NE("", h_.CreateError("Router", arg));
+}
+
+// A destination the FIB does not cover, and a hop whose neighbor is not
+// resolved: both drop, and both say why.
+TEST_F(RouterTest, AMissAndAnUnresolvedNeighborAreDroppedAndCounted) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa",
+          bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  auto unresolved = RunToDestination(rt, FrameTo("10.1.2.3"));
+  EXPECT_TRUE(unresolved[0].empty());
+  EXPECT_TRUE(unresolved[1].empty());
+  EXPECT_EQ(1u, rt->unresolved_frames());
+  EXPECT_EQ(0u, rt->no_route_frames());
+
+  auto miss = RunToDestination(rt, FrameTo("192.168.1.1"));
+  EXPECT_TRUE(miss[0].empty());
+  EXPECT_TRUE(miss[1].empty());
+  EXPECT_EQ(1u, rt->no_route_frames());
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("no route: 1")) << rt->GetDesc();
+}
+
+// TTL 0 and 1 expire (nothing is forwarded); 2 leaves as 1 -- the boundary
+// DecrementTtl documents, and the frame is dropped without being written.
+TEST_F(RouterTest, AnExpiringTtlIsDroppedAndCounted) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  for (uint8_t ttl : {uint8_t{0}, uint8_t{1}}) {
+    auto out = RunToDestination(rt, FrameTo("10.1.2.3", ttl));
+    EXPECT_TRUE(out[0].empty());
+    EXPECT_TRUE(out[1].empty()) << "ttl " << static_cast<int>(ttl);
+  }
+  EXPECT_EQ(2u, rt->ttl_expired_frames());
+
+  auto out = RunToDestination(rt, FrameTo("10.1.2.3", 2));
+  ASSERT_EQ(1u, out[1].size());
+  EXPECT_EQ(1, TtlOf(out[1][0]));
+}
+
+// The domain a packet carries picks its FIB, and a domain this router does not
+// hold misses rather than aliasing another domain's routes.
+TEST_F(RouterTest, TheDomainAttributeSelectsTheFib) {
+  Router *rt = MakeDestinationRouter(/*domains=*/3);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 0, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeHop(rt, 2, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 1, 1);
+  MakeRoute(rt, "10.0.0.0", 8, 2, 2);
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  auto one = RunToDestination(rt, FrameTo("10.1.2.3"), /*domain=*/1);
+  ASSERT_EQ(1u, one[0].size()) << "domain 1's route names gate 0";
+  EXPECT_TRUE(one[1].empty());
+
+  auto two = RunToDestination(rt, FrameTo("10.1.2.3"), /*domain=*/2);
+  ASSERT_EQ(1u, two[1].size()) << "domain 2's route names gate 1";
+  EXPECT_TRUE(two[0].empty());
+
+  // 65536 is not a domain of this router: it must not alias domain 0 (the
+  // domain id is 24 bits wide, so narrowing it would).
+  auto unknown = RunToDestination(rt, FrameTo("10.1.2.3"), /*domain=*/65536);
+  EXPECT_TRUE(unknown[0].empty());
+  EXPECT_TRUE(unknown[1].empty());
+}
+
+// What destination routing cannot route: a frame that is not IP, one whose
+// headers do not parse, and a non-initial fragment (its L4 header, and so the
+// flow hash a group route needs, is in an earlier fragment).
+TEST_F(RouterTest, FramesWithoutARoutableIpv4HeaderAreDroppedAndCounted) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  const Bytes arp = PacketBuilder()
+                        .Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b")
+                        .Arp(1, "02:00:00:00:00:0a", "192.0.2.1", "00:00:00:00:00:00", "10.1.2.3")
+                        .Build();
+  const Bytes ipv6 = PacketBuilder()
+                         .Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b")
+                         .IPv6("2001:db8::1", "2001:db8::2")
+                         .Udp(1000, 2000)
+                         .Payload("payload")
+                         .Build();
+  // A frame that says IPv4 and carries no header: malformed, not "not IP".
+  const Bytes no_header = PacketBuilder()
+                              .Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b", 0x0800)
+                              .Build();
+  const Bytes fragment = PacketBuilder()
+                             .Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b")
+                             .Add(PacketBuilder::IPv4Hdr{.src = Ip4("192.0.2.1"),
+                                                         .dst = Ip4("10.1.2.3"),
+                                                         .frag = 0x0008})
+                             .Payload("payload")
+                             .Build();
+
+  for (const Bytes *frame : {&arp, &ipv6, &no_header, &fragment}) {
+    auto out = RunToDestination(rt, *frame);
+    EXPECT_TRUE(out[0].empty());
+    EXPECT_TRUE(out[1].empty());
+  }
+  EXPECT_EQ(2u, rt->not_ipv4_frames()) << "the ARP frame and the IPv6 one";
+  EXPECT_EQ(1u, rt->malformed_frames()) << "the frame that says IPv4 and has none";
+  EXPECT_EQ(1u, rt->non_initial_fragments());
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("non-initial fragments: 1")) << rt->GetDesc();
+}
+
+// A shared payload is copied before the TTL is written: the other holder of
+// the payload keeps the TTL it arrived with.
+TEST_F(RouterTest, ASharedFrameIsCopiedBeforeTheTtlIsWritten) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  Sharer *sharer = dynamic_cast<Sharer *>(h_.Create("Sharer", bess::pb::EmptyArg(), "sharer"));
+  ASSERT_NE(nullptr, sharer);
+  Module *vif = MakeDomainWriter(0);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(sharer, 0, vif, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(vif, 0, rt, 0, true));
+
+  const Bytes frame = FrameTo("10.1.2.3");
+  auto out = h_.RunPipeline(sharer, 0, {frame}, rt, {1});
+
+  ASSERT_EQ(1u, out[1].size());
+  EXPECT_EQ(63, TtlOf(out[1][0])) << "the clone was decremented";
+  ASSERT_EQ(1u, sharer->kept_.size());
+  const Bytes &original = BytesOf(sharer->kept_[0]);
+  EXPECT_EQ(64, TtlOf(original)) << "the payload's other holder is untouched";
+  EXPECT_EQ(frame, original) << "byte for byte, including its checksum";
+  EXPECT_EQ(0u, rt->header_write_failures());
+  for (bess::PacketHandle kept : sharer->kept_) {
+    bess::PacketFree(kept);
+  }
 }
 
 }  // namespace

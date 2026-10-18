@@ -10890,3 +10890,67 @@ swapped key and cell fails; each plane starts on a cache line of its own and end
 allocation scales with the worker count and is at least the cells themselves; and four writer threads adding
 200,000 times each leave the exact totals while a concurrent reader never sees a sum above the final one. Fast
 build: suite 216/216.
+
+## D-155 The Router routes: a destination and a domain in, the FIB's hop out
+
+**Status:** accepted (2026-10-18; the module was named Router and never looked at a packet).
+**Code:** `core/modules/router.{h,cc}` (the mode, `RouteByDestination`, the reason counters, `GetDesc`),
+`protobuf/module_msg.proto` (`RouteMode`, `RouterArg.mode`), `core/route/l3_packet.h` (`FlowHash`),
+`examples/appliances/router/router_app.h` (calls it), `core/modules/router_test.cc` (10 new),
+`docs/dataplane-tables.md`.
+**Analysis:** [dataplane-tables.md](dataplane-tables.md), [plugin-api.md](plugin-api.md).
+
+**Context.** The module owns the FIBs - `RouterArg` sizes them with `max_routes` and `max_domains` - and its
+packet path never opened one: it resolved the `next_hop_id` metadata a classifier wrote (D-129, D-153). The
+decision half of routing existed everywhere except in a module: `route::Router::Resolve(domain, dst, hash)` is
+what the appliance calls (`examples/appliances/router`, the roadmap's R1 direct path), `LookupRoute` is what the
+benches measure, and the only module that reads a packet's destination is `IPLookup`, which looks a prefix up in
+its *own* resource and jumps to a gate - no hop, no addresses, no TTL, and a second copy of the routes. The VIF
+module writes a `route_domain` attribute that nothing read. A graph therefore could not route by destination
+with hop semantics at all: the honest name for the module was "next-hop executor", and M15's chain
+(`destination + RouteDomain -> FIB -> forwarding id -> adjacency -> interface + rewrite`) had no module to live
+in.
+
+**Decision.** `RouterArg.mode` chooses what the packet path decides from, and the mode is configuration, not an
+inference about the graph's wiring:
+
+- **`ROUTE_MODE_NEXT_HOP_ID` is the default, and is unchanged.** An unreadable `next_hop_id` still drops every
+  packet and says so once per resume. A module that changed its decision source because a writer disappeared
+  would turn a wiring mistake into a policy change; the tree's other classifiers (ExactMatch) fix their mode in
+  `Init` for the same reason, and `docs/dataplane-tables.md`'s fail-closed rule is what the default keeps.
+- **`ROUTE_MODE_DESTINATION` routes the packet itself**, in the appliance's order and with its calls: parse the
+  frame (`conntrack::ParseFrame`, the same checked parse), look the destination up in the domain the packet
+  carries (the `route_domain` attribute a VIF writes, domain 0 when nothing writes it - the domain id is 24 bits
+  wide, so it is not narrowed), drop what the FIB does not resolve and what the neighbor is not resolved for,
+  decrement the TTL (`route::DecrementTtl`), write the hop's addresses, and leave on `GateOf(hop->egress)`. The
+  `next_hop_id` attribute is ignored in this mode even if something writes it.
+- **One flow hash for both paths.** `route::FlowHash` moves out of the appliance into `route/l3_packet.h`, so a
+  group route picks the same member whichever path resolves it. A non-initial fragment is dropped, as the
+  appliance drops it: its L4 header - and so its ports - is in an earlier fragment, and a member chosen
+  differently from its own first fragment's would split one datagram across paths.
+- **The TTL is decremented in destination mode only.** The ID executor's contract is byte-preservation apart
+  from the addresses, which D-153's cases pin; adding a TTL write there would silently change graphs that
+  already own TTL themselves. The asymmetry is the difference between a full forwarding mode and an executor,
+  not a claim that classifier-selected traffic is exempt from TTL.
+- **Every drop has a reason and a counter**: not IPv4, malformed, non-initial fragment, no route, unresolved
+  neighbor, TTL expired, and a header that could not be written - `header_write_failures`, renamed from
+  `l2_rewrite_failures` now that the TTL is written through the same path. `GetDesc` reports the mode and the
+  counts. A hop whose egress is no gate is dropped before the copy and the TTL write, since the frame is leaving
+  anyway.
+
+**Not in this change.** Group routes cannot be programmed through the module's resources yet
+(`RouterRouteValue` names one next hop and `RouterArg` has no `max_groups`), so a graph cannot yet express the
+ECMP pair the appliance demonstrates; that is the next commit, and it comes before any claim that the module is
+equivalent to the appliance. `IPLookup` is retired in its own commit as a recorded break
+(`docs/compatibility.md`). Nothing here resolves neighbors, enforces an MTU or generates an ICMP error: M15
+supplies those as mechanisms and leaves exception policy to applications.
+
+**Evidence.** `RouterTest` (15, `core/modules/router_test.cc`, through the module harness's real task and
+graph). The 6 D-153 cases still pin the ID executor byte for byte. The 9 new ones cover destination routing: a
+route forwards on the hop's gate with the addresses written, the TTL decremented, a valid header checksum and
+every other byte untouched; an id another module writes is ignored; the default mode still fails closed with no
+writer and never consults the FIB it holds; an unknown mode is refused at Init; a miss and an unresolved
+neighbor drop and count; TTL 0 and 1 drop while 2 leaves as 1; the `route_domain` metadata picks the FIB, and a
+domain this router does not hold misses instead of aliasing domain 0; an ARP frame, an IPv6 frame, a frame that
+says IPv4 and has no header, and a non-initial fragment are dropped with their own counters; and a shared
+payload is copied before the TTL is written, so the payload's other holder keeps the header it arrived with.

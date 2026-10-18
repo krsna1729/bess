@@ -16,13 +16,35 @@
 // K7's route table and next hops as a module, enrolled in the transaction
 // engine (D-023).
 //
-// Packet path: the next-hop id arrives in packet metadata (a `next_hop_id`
-// be32 attribute an ActionTable writes), the next hop is resolved -- one
-// acquire load per id -- and the packet leaves on the gate that hop's egress
-// names (in a module graph, the path to the egress port). A packet whose id
-// names no next hop is dropped, and so is one whose neighbor is not resolved:
-// what to do toward an unresolved neighbor (queue, punt, drop) is the
-// application's, and dropping is the choice that never forwards on a guess.
+// Packet path, two modes (D-155). The mode is configuration, set in Init: a
+// module decides, it does not change what it decides from because a graph's
+// wiring changed underneath it.
+//
+//  1. ROUTE_MODE_NEXT_HOP_ID (the default). The next-hop id arrives in packet
+//     metadata (a `next_hop_id` be32 attribute an ActionTable writes): the
+//     module resolves it -- one acquire load per id -- and the packet leaves
+//     on the gate that hop's egress names (in a module graph, the path to the
+//     egress port). This is the classifier's decision and the module executes
+//     it. A graph that writes no id fails closed: every packet is dropped,
+//     and the resume hook says so once, because a guessed gate is worse than
+//     a drop.
+//
+//  2. ROUTE_MODE_DESTINATION. The module decides, the way the router
+//     appliance does (examples/appliances/router) and with the same library
+//     calls: parse the frame, look the destination address up in the route
+//     domain the packet carries (a `route_domain` be32 attribute a VIF
+//     writes; domain 0 when nothing writes it), drop what the FIB does not
+//     resolve or whose neighbor is not resolved, decrement the TTL, write the
+//     hop's addresses, and leave on the hop's egress gate. A frame that is
+//     not an IPv4 packet, one whose headers do not parse, and a non-initial
+//     fragment (its L4 header is in an earlier fragment, so it cannot be
+//     hashed to a group member) are dropped and counted. The `next_hop_id`
+//     attribute is ignored in this mode, even if some module writes it.
+//
+// Both modes drop a packet whose hop is unknown, or whose neighbor is not
+// resolved: what to do toward an unresolved neighbor (queue, punt, drop) is
+// the application's, and dropping is the choice that never forwards on a
+// guess.
 //
 // A resolved hop that names both of its addresses has them written into the
 // frame's Ethernet header (route::RewriteL2) before it leaves, so a frame
@@ -68,21 +90,69 @@ class Router final : public Module {
   // The enrolled router, for tests and for the module's own introspection.
   const bess::route::Router *router() const { return router_.get(); }
 
-  // Frames dropped because a resolved next hop's addresses could not be
-  // written into the header (the payload was shared and could not be copied,
-  // or the header crosses a segment). Relaxed: the packet path only
-  // increments, control reads it (GetDesc).
-  uint64_t l2_rewrite_failures() const noexcept {
-    return l2_rewrite_failures_.load(std::memory_order_relaxed);
+  // True when the module decides each packet's next hop itself, from the
+  // packet's destination address in its route domain (D-155).
+  bool routes_by_destination() const {
+    return mode_ == bess::pb::ROUTE_MODE_DESTINATION;
+  }
+
+  // Frames dropped because a header could not be written: a resolved next
+  // hop's addresses into the Ethernet header, or the TTL into the IPv4 header
+  // (the payload was shared and could not be copied, or the header crosses a
+  // segment). Relaxed: the packet path only increments, control reads it
+  // (GetDesc).
+  uint64_t header_write_failures() const noexcept {
+    return header_write_failures_.load(std::memory_order_relaxed);
+  }
+
+  // What destination routing dropped, by reason (relaxed, as above): a frame
+  // that is not IP, one whose headers do not parse, one that is not the first
+  // fragment of its datagram, one the FIB has no route for, one whose hop's
+  // neighbor is not resolved, and one whose TTL ran out.
+  uint64_t not_ipv4_frames() const noexcept {
+    return not_ipv4_frames_.load(std::memory_order_relaxed);
+  }
+  uint64_t malformed_frames() const noexcept {
+    return malformed_frames_.load(std::memory_order_relaxed);
+  }
+  uint64_t non_initial_fragments() const noexcept {
+    return non_initial_fragments_.load(std::memory_order_relaxed);
+  }
+  uint64_t no_route_frames() const noexcept {
+    return no_route_frames_.load(std::memory_order_relaxed);
+  }
+  uint64_t unresolved_frames() const noexcept {
+    return unresolved_frames_.load(std::memory_order_relaxed);
+  }
+  uint64_t ttl_expired_frames() const noexcept {
+    return ttl_expired_frames_.load(std::memory_order_relaxed);
   }
 
  private:
+  // Mode 1 (D-155): resolve the `next_hop_id` each packet carries.
+  void RouteById(Context *ctx, bess::PacketBatch *batch, bess::metadata::mt_offset_t offset);
+  // Mode 2 (D-155): look each packet's destination address up in its domain's
+  // FIB, then run the forwarding chain the appliance runs.
+  void RouteByDestination(Context *ctx, bess::PacketBatch *batch);
+
   std::unique_ptr<bess::route::Router> router_;
   // After router_, which owns the resources they bind (D-044).
   bess::framework::ResourceBinding next_hops_binding_;
   bess::framework::ResourceBinding routes_binding_;
   int next_hop_id_attr_ = -1;
-  std::atomic<uint64_t> l2_rewrite_failures_{0};
+  // The route domain a packet arrived in, written by the graph's VIF; domain 0
+  // when nothing writes it (D-155).
+  int route_domain_attr_ = -1;
+  // What the packet path decides from (D-155): configuration, not a guess
+  // about the graph's wiring.
+  bess::pb::RouteMode mode_ = bess::pb::ROUTE_MODE_NEXT_HOP_ID;
+  std::atomic<uint64_t> header_write_failures_{0};
+  std::atomic<uint64_t> not_ipv4_frames_{0};
+  std::atomic<uint64_t> malformed_frames_{0};
+  std::atomic<uint64_t> non_initial_fragments_{0};
+  std::atomic<uint64_t> no_route_frames_{0};
+  std::atomic<uint64_t> unresolved_frames_{0};
+  std::atomic<uint64_t> ttl_expired_frames_{0};
 };
 
 #endif  // BESS_MODULES_ROUTER_H_

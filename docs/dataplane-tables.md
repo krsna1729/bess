@@ -40,6 +40,10 @@ stopping traffic.
    layout computation. Check `bess::metadata::IsValidOffset()` and drop or
    take a default path rather than reading byte 0; ActionTable, Meter and
    Router fail closed and report invalid offsets from `OnEvent(PreResume)`.
+   A module whose decision source is configuration rather than metadata has no
+   offset to check: the Router's `ROUTE_MODE_DESTINATION` reads the packet's
+   own destination instead, which is exactly why the mode is configuration and
+   not an inference about the graph (D-155).
 4. **Published state is never mutated in place, except where a structure is
    built for it.** `RcuPtr` generations are immutable once published. The
    exceptions are `ConcurrentExactTable` and `RouteTable`: DPDK designed them
@@ -452,8 +456,11 @@ reference to something missing.
   bits 40-63 (the default domain's keys are unchanged), and domains are
   created before `Enroll()` and frozen after it. D-046. The
   `Router` module enrolls on `Init()` and releases on `DeInit()`; its packet
-  path resolves a next-hop id from metadata and writes a resolved hop's
-  addresses into the frame's Ethernet header when it names both (D-032, D-153).
+  path resolves a next-hop id from metadata, or -- in `ROUTE_MODE_DESTINATION`
+  -- looks the packet's own IPv4 destination up in its route domain's FIB and
+  runs the forwarding chain (TTL, then the addresses), and either way writes a
+  resolved hop's addresses into the frame's Ethernet header when it names both
+  (D-032, D-153, D-155).
 - **ActionTable** registers `<module>/actions` (key: `EncodeKey(ActionId)`,
   value: `{meter id, next hop id}`) and declares both the meter and the
   next-hop resources: an action's value references them, so the engine orders

@@ -1329,9 +1329,19 @@ message ActionTableArg {
 }
 
 /**
+ * What a Router decides each packet's next hop from (D-155).
+ */
+enum RouteMode {
+  ROUTE_MODE_NEXT_HOP_ID = 0; /// The `next_hop_id` metadata a classifier writes: the module executes a decision made upstream. With no writer it drops every packet and reports it once per resume (D-129), never guessing.
+  ROUTE_MODE_DESTINATION = 1; /// The packet's own IPv4 destination address, looked up in the route domain it carries: the module makes the decision, the way the router appliance does.
+}
+
+/**
  * The Router module forwards a packet to the egress its next-hop id (from
- * packet metadata) names. Routes and next hops are the resource pair D-023
- * describes, changed together or not at all.
+ * packet metadata) names, or -- in ROUTE_MODE_DESTINATION -- routes it by its
+ * own IPv4 destination address in the route domain it carries (D-155). Routes
+ * and next hops are the resource pair D-023 describes, changed together or
+ * not at all.
  *
  * __Input Gates__: 1
  * __Output Gates__: many (the next hop's egress)
@@ -1342,6 +1352,7 @@ message RouterArg {
   uint64 max_next_hops = 3; /// Most next hops (default 4096).
   uint64 max_domains = 4; /// Route domains (VRFs) 0..n-1, each with its own FIB sized as above (default 1: the default domain only).
   RouteBackend backend = 5; /// Every domain's route table structure (default: LPM).
+  RouteMode mode = 6; /// What the packet path decides from (default: the next_hop_id metadata).
 }
 
 /**
