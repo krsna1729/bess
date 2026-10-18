@@ -377,6 +377,20 @@ the controller reads the total before it acts. A worker event can be lost when i
 (counted, shown as `bess.events_lost`), so a consumer that cannot afford a missed report keeps
 polling as the backstop. The worker path's event also carries `worker`, the plane that crossed.
 
+**Where a module's counters live.** A module's counters are per key and per worker, and the shared
+structure for them is `stats::KeyedCounters` (`stats/keyed_counters.h`, experimental, D-154):
+`keys` x `cells_per_key` 64-bit cells in one plane per worker, sized to the worker count the
+module passes, so a module on 8 workers pays 8 planes and not the 64 worker slots the daemon
+reserves. `CounterSet` is the other shape: a small fixed schema of cells, not a key space. A
+worker adds with `ForWorker(wid).Add(key, cell, n)` -- a relaxed load, an add and a relaxed store
+to a line it owns, no lock and no allocation -- and the control side reads `Read(wid, key, cell)`
+or `Total(key, cell)`, the sum over the planes, which is what a `ThresholdTable` read returns.
+The keys are the module's own dense indices, so nothing hashes or grows on the packet path. A
+reused key keeps its value: a module that reuses a slot either subtracts the value it recorded
+when it re-armed the key, or keeps its keys monotonic. `keys`, `cells_per_key` and `workers` are
+all at least 1, and that is a promise rather than a check: a module that owns a capacity refuses
+a zero one in its own `Init`.
+
 The context is bound when the `Module` base is constructed, so it is usable in
 a derived constructor's member initializers (for example
 `published_(init_context().rcu())`). There is no other way to obtain a

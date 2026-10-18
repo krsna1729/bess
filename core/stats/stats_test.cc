@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "stats/counter_set.h"
+#include "stats/keyed_counters.h"
 #include "stats/worker_histogram.h"
 #include "stats/worker_local.h"
 
@@ -194,6 +195,129 @@ TEST(CounterSetTest, ConcurrentAddsAreExact) {
   done = true;
   reader.join();
   EXPECT_EQ(kWriters * kPerWriter, set.Snapshot().totals[kPackets]);
+}
+
+// -- KeyedCounters -------------------------------------------------------------
+
+// A module's counters are per key and per worker: the keys are the owner's
+// dense indices (a rule's slot, a session's slot) and the cells are what the
+// owner counts (the UPF's counter module counts octets and packets per rule).
+TEST(KeyedCountersTest, PlanesAreSummedAndKeptApart) {
+  KeyedCounters counters(/*keys=*/4, /*cells_per_key=*/2, /*workers=*/8);
+  EXPECT_EQ(4u, counters.keys());
+  EXPECT_EQ(2u, counters.cells_per_key());
+  EXPECT_EQ(8u, counters.workers());
+
+  counters.ForWorker(W(0)).Add(1, kBytes, 300);
+  counters.ForWorker(W(0)).Add(1, kPackets, 3);
+  counters.ForWorker(W(5)).Add(1, kBytes, 40);
+
+  EXPECT_EQ(300u, counters.Read(W(0), 1, kBytes));
+  EXPECT_EQ(3u, counters.Read(W(0), 1, kPackets));
+  EXPECT_EQ(40u, counters.Read(W(5), 1, kBytes));
+  EXPECT_EQ(0u, counters.Read(W(5), 1, kPackets)) << "a cell never written";
+  EXPECT_EQ(340u, counters.Total(1, kBytes)) << "summed over the planes";
+  EXPECT_EQ(3u, counters.Total(1, kPackets));
+  EXPECT_EQ(0u, counters.Total(0, kBytes)) << "a key never written";
+  EXPECT_EQ(0u, counters.Total(3, kPackets));
+}
+
+// The index arithmetic: every (key, cell) is its own cell, in every plane. A
+// stride that dropped the plane padding, or a swapped key and cell, aliases
+// two of these and fails here.
+TEST(KeyedCountersTest, KeysAndCellsDoNotAlias) {
+  KeyedCounters counters(/*keys=*/5, /*cells_per_key=*/3, /*workers=*/2);
+  counters.ForWorker(W(1)).Add(4, 2, 7);
+
+  for (size_t key = 0; key < counters.keys(); key++) {
+    for (size_t cell = 0; cell < counters.cells_per_key(); cell++) {
+      EXPECT_EQ(0u, counters.Read(W(0), key, cell))
+          << "key " << key << " cell " << cell << " in the other plane";
+      const uint64_t want = (key == 4 && cell == 2) ? 7u : 0u;
+      EXPECT_EQ(want, counters.Read(W(1), key, cell))
+          << "key " << key << " cell " << cell;
+    }
+  }
+  EXPECT_EQ(7u, counters.Total(4, 2));
+}
+
+// One plane per worker, each starting on a cache line of its own: no two
+// workers share a line, whatever the key space rounds to.
+TEST(KeyedCountersTest, PlanesStartOnTheirOwnCacheLine) {
+  constexpr size_t kKeys = 3;
+  constexpr size_t kCells = 2;
+  constexpr uint16_t kWorkers = 4;
+  KeyedCounters counters(kKeys, kCells, kWorkers);
+
+  for (uint16_t w = 0; w < kWorkers; w++) {
+    EXPECT_EQ(0u, counters.CellOffset(W(w), 0, 0) % kCacheLine)
+        << "worker " << w << "'s plane starts on a line";
+  }
+  for (uint16_t w = 1; w < kWorkers; w++) {
+    EXPECT_LE(counters.CellOffset(W(w - 1), kKeys - 1, kCells - 1) +
+                  sizeof(uint64_t),
+              counters.CellOffset(W(w), 0, 0))
+        << "worker " << w - 1 << "'s plane ends before worker " << w << "'s";
+  }
+  EXPECT_LE(counters.CellOffset(W(kWorkers - 1), kKeys - 1, kCells - 1) +
+                sizeof(uint64_t),
+            counters.bytes());
+  EXPECT_EQ(0u, counters.bytes() % kCacheLine);
+}
+
+// The point of the class: the planes are sized to the worker count the owner
+// passes, not to the 64 worker slots the daemon reserves. A keyed plane is
+// large, so this is what a module's memory is.
+TEST(KeyedCountersTest, MemoryFollowsTheWorkerCountNotTheSlotSpace) {
+  constexpr size_t kKeys = 1024;
+  constexpr size_t kCells = 2;
+  KeyedCounters few(kKeys, kCells, /*workers=*/2);
+  KeyedCounters all(kKeys, kCells, dataplane::kMaxWorkers);
+
+  EXPECT_EQ(dataplane::kMaxWorkers / 2 * few.bytes(), all.bytes())
+      << "the planes scale with the worker count";
+  EXPECT_GE(few.bytes(), 2 * kKeys * kCells * sizeof(uint64_t))
+      << "at least the cells themselves";
+}
+
+// Single-writer adds lose nothing, whatever the reader does meanwhile, and a
+// summed read never exceeds the final total: a cell is read whole.
+TEST(KeyedCountersTest, ConcurrentAddsAreExact) {
+  constexpr int kWriters = 4;
+  constexpr uint64_t kPerWriter = 200'000;
+  KeyedCounters counters(/*keys=*/2, /*cells_per_key=*/2, kWriters);
+
+  std::atomic<bool> done{false};
+  std::atomic<uint64_t> over{0};
+  std::thread reader([&] {
+    while (!done.load()) {
+      if (counters.Total(1, kPackets) > kWriters * kPerWriter) {
+        over++;
+      }
+    }
+  });
+
+  std::vector<std::thread> writers;
+  writers.reserve(kWriters);
+  for (int t = 0; t < kWriters; t++) {
+    writers.emplace_back([&, t] {
+      const auto plane = counters.ForWorker(W(static_cast<uint16_t>(t)));
+      for (uint64_t i = 0; i < kPerWriter; i++) {
+        plane.Add(1, kPackets, 1);
+        plane.Add(1, kBytes, 1500);
+      }
+    });
+  }
+  for (auto &w : writers) {
+    w.join();
+  }
+  done = true;
+  reader.join();
+
+  EXPECT_EQ(0u, over) << "a summed total never exceeded the final one";
+  EXPECT_EQ(kWriters * kPerWriter, counters.Total(1, kPackets));
+  EXPECT_EQ(kWriters * kPerWriter * 1500, counters.Total(1, kBytes));
+  EXPECT_EQ(0u, counters.Total(0, kPackets)) << "the other key stayed untouched";
 }
 
 // -- WorkerHistogram -----------------------------------------------------------
