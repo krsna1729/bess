@@ -10477,7 +10477,11 @@ deltas, typed `WorkerId`; `Track` migrated. See the K6 section.
 
 `core/route/`: in-place `rte_lpm` route tables under the runtime QSBR,
 `Router` with ordered route/next-hop publication, `RewriteL2`; `IPLookup`
-migrated. See the K7 section.
+migrated. See the K7 section. `RewriteL2` had no caller but its own unit test
+until 2026-10-18, when the `Router` module began writing a resolved hop's
+addresses into the frame (D-153): the addresses had a writer in the resource
+layer and no reader on the packet path, so a frame crossed a routing boundary
+with the addresses it arrived with.
 
 ### G1 current status and next work (updated 2026-10-01)
 
@@ -10728,7 +10732,9 @@ value-add features: a firewall, CGNAT, rate limiting, mirroring.
 - **L2:** L2Forward (a static MAC table: no learning, no aging, no flooding
   domains), VLAN push/pop/split, ArpResponder (static entries).
 - **L3:** IPLookup (LPM only), UpdateTTL, IPChecksum. `core/route/Router`
-  (next hops, L2 rewrite) exists, but no module uses it.
+  (next hops, L2 rewrite) exists; the L2 rewrite had no module caller until
+  2026-10-18, when the `Router` module began writing a resolved hop's addresses
+  into the frame (D-153).
 - **L4 and state:** NAT (basic, one worker), StaticNAT, ACL (a linear scan),
   HashLB (a hash over fields), URLFilter, BPF.
 - **Tunnels:** VXLAN encap/decap, generic encap/decap, MPLS pop.

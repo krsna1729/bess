@@ -1140,7 +1140,14 @@ TEST_F(SessionPacketPathTest, WireSessionSteersPolicesAndReadsBack) {
 
   const auto pkt1 = SessionPacket("10.1.2.3", 1234, rng_);
   const auto pkt2 = SessionPacket("10.1.2.3", 1234, rng_);
-  EXPECT_EQ((std::vector<bess::testing::Bytes>{pkt1}), Egress({pkt1, pkt2}));
+  // The meter's burst passes the first packet and drops the second; the frame
+  // that leaves carries the next hop's addresses rather than the ones it
+  // arrived with, and nothing after the Ethernet header is touched (D-153).
+  bess::testing::Bytes want = pkt1;
+  ASSERT_GE(want.size(), 12u);
+  std::memcpy(want.data(), "\x02\x00\x00\x00\x00\x01", 6);
+  std::memcpy(want.data() + 6, "\x02\x00\x00\x00\x00\x02", 6);
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{want}), Egress({pkt1, pkt2}));
 
   EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&s.meter_key, &s.meter}}));
   EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&s.hop_key, &s.hop}}));

@@ -3,6 +3,8 @@
 #ifndef BESS_MODULES_ROUTER_H_
 #define BESS_MODULES_ROUTER_H_
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -21,8 +23,17 @@
 // names no next hop is dropped, and so is one whose neighbor is not resolved:
 // what to do toward an unresolved neighbor (queue, punt, drop) is the
 // application's, and dropping is the choice that never forwards on a guess.
-// Rewriting the next hop's L2 addresses is a separate module's job (Rewrite
-// reads them from metadata); this module decides the egress.
+//
+// A resolved hop that names both of its addresses has them written into the
+// frame's Ethernet header (route::RewriteL2) before it leaves, so a frame
+// crossing a routing boundary carries this node's addresses rather than the
+// ones it arrived with. A hop that names none (or only one) is forwarded
+// untouched: a zero address means "not named" in the resource's read-back
+// (D-129), and writing one would put an invalid frame on the wire. A frame
+// whose header cannot be written -- a shared payload that could not be copied,
+// or a header that crosses a segment -- is dropped and counted, because
+// forwarding it with the addresses it arrived with would put it on the wire as
+// someone else's.
 //
 // Control path: `<module>/next_hops` and `<module>/routes` are resources, so
 // one transaction can create a session's next hop, the route to it, the
@@ -57,12 +68,21 @@ class Router final : public Module {
   // The enrolled router, for tests and for the module's own introspection.
   const bess::route::Router *router() const { return router_.get(); }
 
+  // Frames dropped because a resolved next hop's addresses could not be
+  // written into the header (the payload was shared and could not be copied,
+  // or the header crosses a segment). Relaxed: the packet path only
+  // increments, control reads it (GetDesc).
+  uint64_t l2_rewrite_failures() const noexcept {
+    return l2_rewrite_failures_.load(std::memory_order_relaxed);
+  }
+
  private:
   std::unique_ptr<bess::route::Router> router_;
   // After router_, which owns the resources they bind (D-044).
   bess::framework::ResourceBinding next_hops_binding_;
   bess::framework::ResourceBinding routes_binding_;
   int next_hop_id_attr_ = -1;
+  std::atomic<uint64_t> l2_rewrite_failures_{0};
 };
 
 #endif  // BESS_MODULES_ROUTER_H_

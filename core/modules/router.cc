@@ -14,6 +14,7 @@
 #include "framework/resource_bindings.h"
 #include "dataplane/transaction_engine.h"
 #include "modules/router_gate_map.h"
+#include "packet_reshape.h"
 #include "utils/endian.h"
 #include "utils/ether.h"
 #include "utils/format.h"
@@ -320,18 +321,47 @@ void Router::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   for (int i = 0; i < cnt; i++) {
     const route::NextHop *hop =
         (resolved & (uint64_t{1} << i)) != 0 ? hops[i] : nullptr;
-    gates[i] = hop != nullptr && hop->neighbor == route::NeighborState::kResolved
-                   ? GateOf(hop->egress)
-                   : DROP_GATE;
+    const bool usable =
+        hop != nullptr && hop->neighbor == route::NeighborState::kResolved;
+    // A zero address means "not named" (D-129), and half a pair would write an
+    // invalid frame: a hop that names both is rewritten, any other is
+    // forwarded with the header it arrived with.
+    if (!usable || hop->dst_mac.IsZero() || hop->src_mac.IsZero()) {
+      gates[i] = usable ? GateOf(hop->egress) : DROP_GATE;
+      continue;
+    }
+    gates[i] = GateOf(hop->egress);
+    bess::PacketRef pkt = batch->packet(i);
+    auto rewritten = route::RewriteL2(pkt, *hop);
+    if (!rewritten &&
+        rewritten.error() == bess::packet::MutationError::kSharedStorage) {
+      // A shared payload: copy it first, then write (K4). The copy may
+      // replace the mbuf, so the batch keeps the new handle.
+      bess::PacketHandle handle = pkt.handle();
+      if (!bess::packet::EnsureWritable(handle)) {
+        gates[i] = DROP_GATE;
+        l2_rewrite_failures_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      batch->handles()[i] = handle;
+      rewritten = route::RewriteL2(bess::PacketRef(handle), *hop);
+    }
+    if (!rewritten) {
+      gates[i] = DROP_GATE;
+      l2_rewrite_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
   EmitBatch(ctx, batch, gates);
 }
 
 std::string Router::GetDesc() const {
-  return bess::utils::Format("%zu routes, %zu next hops",
-                             router_->route_count(), router_->next_hop_count());
+  return bess::utils::Format(
+      "%zu routes, %zu next hops, %zu l2 rewrite failures",
+      router_->route_count(), router_->next_hop_count(),
+      static_cast<size_t>(l2_rewrite_failures()));
 }
 
 ADD_MODULE(Router, "router",
-           "forwards to the egress its next-hop id names (routes and next "
-           "hops as transactional resources)")
+           "forwards to the egress its next-hop id names and writes a resolved "
+           "next hop's addresses into the frame (routes and next hops as "
+           "transactional resources)")

@@ -2755,12 +2755,21 @@ Two engine gaps surfaced while building it:
   `run file` script. The generic `ResumeAll()` behavior remains a correctness
   hazard for callers that invoke it while workers are already running.
 
-**Deferred:** L2 rewriting in the Router module (a `Rewrite` reading the hop's
-addresses composes today); a per-color drop/queue policy for unresolved
+**Deferred:** a per-color drop/queue policy for unresolved
 neighbors; worker-exclusive meters (K5 supports them; the module cannot verify
 the placement they need); `ExactMatch`'s `Clear()` and a bulk erase for an
 enrolled router; trimming `MeterSetBuilder::Clone()`'s O(capacity) copy per
 transaction.
+
+**Amendment (2026-10-18): the Router writes the hop's addresses; L2 rewriting is no longer deferred.** The
+Decision above says "L2 rewriting stays a separate module's job" - it does not. The stock `Rewrite` writes a
+template, and nothing in the tree called `route::RewriteL2` but its own unit test, so a frame forwarded across a
+routing boundary left with the addresses it arrived with; the UPF's interop found it (an N6 frame named the N3
+port's addresses and the data network dropped it) and filled the hole at graph level with a
+`GenericDecap`/`GenericEncap` pair, recorded as a gap in their `docs/interop.md`. The Router now writes a
+resolved hop's addresses into the frame's Ethernet header before the frame leaves (D-153). This closes the item
+the Deferred list above opened with - "L2 rewriting in the Router module (a `Rewrite` reading the hop's addresses
+composes today)" - and removes it from that list, so the list now has four items, all of which stand.
 
 ## D-033 Framework contracts, runtime ownership, and extension boundaries
 
@@ -10761,3 +10770,62 @@ two hundred totals; a crossing becomes the shared event with its worker; a type 
 full ring refuses and counts; a default notifier is inert. `ThresholdTableTest.ATickAndAWorkerReportTheSameEventShape`
 drives both producers into one log and compares what a consumer sees: same type and source, same fields and
 values, the worker path adding only `worker`.
+
+## D-153 The Router writes a resolved next hop's addresses into the frame
+
+**Status:** accepted (2026-10-18; the UPF's interop found the gap).
+**Code:** `core/modules/router.{h,cc}` (the packet path, `l2_rewrite_failures()`, `GetDesc`),
+`core/modules/router_test.cc` (new), `core/modules/session_pipeline_test.cc` (the wire session's expectation),
+`core/meson.build`, `docs/decisions.md` (D-032's amendment), `docs/dataplane-tables.md`, `MODERNIZATION.md`
+(the K7 note and the status list's L3 line).
+**Analysis:** [dataplane-tables.md](dataplane-tables.md), [plugin-api.md](plugin-api.md).
+
+**Context.** A next hop has carried `dst_mac`/`src_mac` since K7, and `NeighborState::kResolved`'s comment says
+"L2 addresses known; forward with `RewriteL2()`" - but nothing in the tree called `RewriteL2` except its own unit
+test (`route_test.cc`). The Router chose the egress gate and forwarded the frame with the addresses it arrived
+with, which is invisible while every uplink ends in a `Sink` and no graph names MACs. The UPF's interop was the
+first deployment to forward a real frame across a routing boundary: the N6 frame still named the gNB and the N3
+port, and the data network dropped it. Their graph filled the hole with a `GenericDecap`/`GenericEncap` pair
+(`ci/interop/graph.py`), recorded as a gap in their own `docs/interop.md`. Nothing here caught it: the tree's
+own graphs (the live tests, the bessctl scripts, the examples) write next hops with an egress gate and no
+addresses, and the one in-process slice that does write both - the session vertical slice's wire session -
+asserted that the frame left unchanged, which was the old contract. That expectation is updated in this commit:
+it is the test that caught the change.
+
+**Decision.** The Router writes a resolved hop's addresses into the frame's Ethernet header
+(`route::RewriteL2`) before the frame leaves, on the same gate the hop's egress names. Rules, each with a
+reason:
+
+- **Only when the hop names both addresses.** A zero address means "not named" in the resource's read-back
+  (D-129), so a hop that names neither is forwarded untouched - which keeps every graph whose hops name no
+  addresses bit-identical (the session slice's wire session names both, and its expectation changes with this
+  commit) - and a hop that names only one is forwarded untouched too: writing half a pair would put a
+  frame on the wire with a zero source address, which is worse than leaving the addresses it had. The check is
+  two 6-byte comparisons on the hop, not a pass over the frame, so a hop that names no addresses costs that much
+  and no write at all; the write itself is 12 bytes into the frame's first segment.
+- **A shared payload is copied first.** `RewriteL2` refuses a frame whose storage is shared
+  (`MutationError::kSharedStorage`), which is what a clone (a decap, a span) leaves behind; the packet path
+  then runs the K4 `EnsureWritable` and writes the batch's handle back, since the copy may replace the mbuf.
+- **A frame whose header cannot be written is dropped, and counted.** Forwarding it with the addresses it
+  arrived with would put it on the wire as someone else's; `l2_rewrite_failures()` counts the drops and
+  `GetDesc` reports them, so a silent failure cannot happen twice. The same drop already applied to an id that
+  names no next hop and to an unresolved neighbor, unchanged.
+
+**Not in this change.** A hop that names one address of the pair is not refused at write time (the dataplane
+rule above is enough, and a refusal would change a resource's contract); nothing queues a frame toward an
+unresolved neighbor, and no ICMP error is generated for a drop - `route/l3_packet.h` has the ICMPv4 error
+builder and no caller, which is the natural companion of a bounded pending queue (the K9 store's own shape) and
+belongs to the neighbour-resolution work the record already lists.
+
+**Evidence.** `RouterTest` (6, `core/modules/router_test.cc`, through the module harness's real task and graph,
+with a `SetMetadata` standing in for the `ActionTable` that writes `next_hop_id`): a named hop's addresses are
+written into the frame, on the hop's gate, with the ethertype and everything after it untouched; a hop that
+names no addresses is forwarded byte-for-byte; a hop that names only one is too, and is not counted as a
+failure; a frame whose payload is shared is copied before the write, and the other holder of the payload never
+sees it; a frame whose header cannot be written (shorter than the Ethernet header - the same
+`head_len < sizeof(Ethernet)` check a header in a later segment fails) is dropped and counted, and `GetDesc`
+shows the count; an unresolved neighbor is dropped without being counted as a failed write.
+`SessionPacketPathTest.WireSessionSteersPolicesAndReadsBack` (the session vertical slice) now asserts that the
+frame leaving the router's egress gate carries the hop's addresses and nothing else changes - it pinned the
+frame as untouched before this change, and the full suite is what found it. `docs/dataplane-tables.md`'s Router
+paragraph states the write beside the metadata read.

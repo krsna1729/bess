@@ -820,6 +820,7 @@ unit_test_sources = [
   'modules/url_filter_test.cc',
   'modules/random_update_test.cc',
   'modules/rewrite_test.cc',
+  'modules/router_test.cc',
   'modules/update_test.cc',
   'modules/queue_test.cc',
   'modules/round_robin_test.cc',

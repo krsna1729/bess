@@ -452,7 +452,8 @@ reference to something missing.
   bits 40-63 (the default domain's keys are unchanged), and domains are
   created before `Enroll()` and frozen after it. D-046. The
   `Router` module enrolls on `Init()` and releases on `DeInit()`; its packet
-  path resolves a next-hop id from metadata (D-032).
+  path resolves a next-hop id from metadata and writes a resolved hop's
+  addresses into the frame's Ethernet header when it names both (D-032, D-153).
 - **ActionTable** registers `<module>/actions` (key: `EncodeKey(ActionId)`,
   value: `{meter id, next hop id}`) and declares both the meter and the
   next-hop resources: an action's value references them, so the engine orders
