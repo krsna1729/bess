@@ -334,6 +334,29 @@ TEST_F(PacketStoreTest, InitRefusesAKeyAttributeItCannotRegister) {
   EXPECT_EQ(EINVAL, CreateStoreRefused(empty));
 }
 
+// A bound the pool cannot carry is refused at Init: the store holds mbuf
+// handles, so its bound plus what the ingress ring can hold (4096) must fit
+// the pool the hot path allocates from. Without the check the store would
+// starve every other module's batches, and the drops would look like a network
+// fault rather than a configuration. The harness creates the default pool, so
+// its number is read rather than assumed.
+TEST(PacketStorePoolTest, InitRefusesABoundThePoolCannotCarry) {
+  bess::testing::ModuleHarness h;
+  const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
+  ASSERT_NE(nullptr, pool);
+  const uint32_t capacity = static_cast<uint32_t>(pool->Capacity());
+  ASSERT_GT(capacity, 4096u);
+
+  PacketStoreArg huge;
+  huge.set_max_packets(capacity);
+  EXPECT_NE("", h.CreateError("PacketStore", huge));
+
+  // Just inside it: accepted (the bound and the ring together fit exactly).
+  PacketStoreArg fits;
+  fits.set_max_packets(capacity - 4096);
+  EXPECT_EQ("", h.CreateError("PacketStore", fits));
+}
+
 // The per-flow limits resource (D-129): "<module>/flows", key the flow id.
 // An entry carries exactly the fields it set, so a client can tell an absent
 // field from a present zero, and the table is live: workers read one published
@@ -792,6 +815,117 @@ TEST_F(PacketStoreFlowsTest, ARefusedTransactionPublishesNothing) {
   const auto k3 = Key(3);
   EXPECT_EQ("", h_.UpsertResource(flows_, k3, value));
   EXPECT_EQ("", h_.ReadBackDiffers(flows_, {{&k3, &value}}));
+}
+
+// A held packet's lifetime is the flow's timeout, not the store's pressure:
+// what expired is freed on the owner's run whether or not the store is full
+// (the bound is not the only thing that frees), and the sweep is bounded, so
+// the run stays a run.
+TEST_F(PacketStoreTest, AnExpiredPacketIsFreedWithoutPressure) {
+  PacketStoreArg arg;
+  arg.set_max_packets(1000);  // nowhere near full: nothing else frees
+  arg.set_max_packets_per_flow(10);
+  arg.set_timeout_ms(1);
+  PacketStore *ps = CreateStore(arg);
+  ASSERT_NE(nullptr, ps);
+
+  PlainPacketPool pool(16);
+  Task task(ps, nullptr);
+  Context ctx{};
+  ctx.wid = bess::dataplane::WorkerId(0);
+  ctx.task = &task;
+
+  PacketBatch batch;
+  batch.clear();
+  for (int i = 0; i < 3; i++) {
+    bess::PacketHandle pkt = pool.Alloc();
+    ASSERT_NE(nullptr, pkt);
+    PacketRef ref(pkt);
+    ref.append(64);
+    batch.add(ref);
+  }
+  ps->ProcessBatch(&ctx, &batch);
+  PacketBatch drained;
+  drained.clear();
+  ps->RunTask(&ctx, &drained, nullptr);
+  EXPECT_EQ("3 packets stored across 1 flows (max 1000)", ps->GetDesc());
+  EXPECT_EQ(13u, pool.Size());
+
+  // The clock moves past the flow's 1 ms: the packets are dead even though the
+  // store holds almost nothing. (`current_worker` is the global the module
+  // reads its clock from, so a test can move time instead of sleeping.)
+  const uint64_t now = ::current_worker.current_tsc();
+  ::current_worker.set_current_tsc(now + 100'000'000ULL);  // ~30 ms
+  ps->RunTask(&ctx, &drained, nullptr);
+  EXPECT_EQ("0 packets stored across 0 flows (max 1000)", ps->GetDesc());
+  EXPECT_EQ(16u, pool.Size());
+}
+
+// The module's bound is what holds packets, and what does not fit goes out by
+// gate 1 rather than staying: the pool the hot path allocates from can never be
+// held beyond `max_packets`, whatever arrives.
+TEST(PacketStoreBoundTest, TheGlobalBoundHoldsAndTheExcessGoesToGate1) {
+  bess::testing::ModuleHarness h;
+  PacketStoreArg arg;
+  arg.set_max_packets(8);            // the module's whole budget
+  arg.set_max_packets_per_flow(64);  // the per-flow cap is not the limit here
+  Module *ps = h.Create("PacketStore", arg);
+  ASSERT_NE(nullptr, ps);
+
+  const std::vector<bess::testing::Bytes> in(32, bess::testing::Bytes(64, 0xab));
+  h.Run(ps, 0, in, {0, 1});
+  const auto out = h.RunTask(ps, {0, 1});
+  EXPECT_EQ("8 packets stored across 1 flows (max 8)", ps->GetDesc());
+  EXPECT_EQ(24u, out.at(1).size()) << "the excess leaves by gate 1";
+  // Nothing was released, so gate 0 is not even in the map.
+  EXPECT_TRUE(out.find(0) == out.end() || out.at(0).empty());
+}
+
+// One run takes at most its budget off the ring, whatever the ring holds: a run
+// that drained 4095 packets would take about 128 batches from the task's pool,
+// which every downstream module in the same round also draws on.
+TEST_F(PacketStoreTest, OneRunTakesAtMostItsBudgetOffTheRing) {
+  constexpr int kFed = 4095;  // what the ingress ring holds (slots - 1)
+
+  PacketStoreArg arg;
+  arg.set_max_packets(kFed);
+  arg.set_max_packets_per_flow(kFed);
+  PacketStore *ps = CreateStore(arg);
+  ASSERT_NE(nullptr, ps);
+
+  PlainPacketPool pool(kFed);
+  Task task(ps, nullptr);
+  Context ctx{};
+  ctx.wid = bess::dataplane::WorkerId(0);
+  ctx.task = &task;
+
+  PacketBatch batch;
+  batch.clear();
+  for (int i = 0; i < kFed; i++) {
+    bess::PacketHandle pkt = pool.Alloc();
+    ASSERT_NE(nullptr, pkt);
+    PacketRef ref(pkt);
+    ref.append(64);
+    batch.add(ref);
+    if (batch.cnt() == static_cast<int>(bess::PacketBatch::kMaxBurst)) {
+      ps->ProcessBatch(&ctx, &batch);
+      batch.clear();
+    }
+  }
+  if (batch.cnt() > 0) {
+    ps->ProcessBatch(&ctx, &batch);
+  }
+
+  PacketBatch drained;
+  drained.clear();
+  ps->RunTask(&ctx, &drained, nullptr);
+  EXPECT_EQ("1024 packets stored across 1 flows (max 4095)", ps->GetDesc());
+  ps->RunTask(&ctx, &drained, nullptr);
+  EXPECT_EQ("2048 packets stored across 1 flows (max 4095)", ps->GetDesc());
+  // What is left is still the store's to free (the fixture's teardown would
+  // free it after this pool is gone).
+  ps->DeInit();
+  EXPECT_EQ(static_cast<size_t>(kFed), pool.Size());
 }
 
 }  // namespace

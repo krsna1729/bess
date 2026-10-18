@@ -136,6 +136,14 @@ class PacketStore final : public Module {
   uint32_t max_packets_per_flow_ = 64;
   uint64_t timeout_ns_ = 5'000'000'000ULL;  // 5 seconds
 
+  // Flows one run's expiry sweep looks at (see EvictExpiredBounded): a run's
+  // cost is this, whatever the store holds. Expiry is honoured within one
+  // rotation, which is this many runs.
+  static constexpr size_t kExpireFlowsPerRun = 256;
+  // Where the last sweep stopped, so the next one resumes there. Only the
+  // owner touches it.
+  uint32_t expire_cursor_ = 0;
+
   // Packets the `drop` command freed (the owner's count) and packets the
   // ingress ring refused because it was full (any worker's count: a batch had
   // nowhere to go). Each has its own metric, because each is a different loss:
@@ -227,6 +235,13 @@ class PacketStore final : public Module {
 
   // Frees the store's expired packets, by the limits in force for each flow.
   void EvictExpired(const LimitsMap &limits, uint64_t now_ns);
+
+  // Frees expired packets without pressure, at a bounded cost per run: the
+  // sweep walks kExpireFlowsPerRun flows from `expire_cursor_` and resumes
+  // where it stopped, so a run's cost does not grow with the store's size (a
+  // full sweep per run is what this replaces: with 100K flows it would be the
+  // run's whole budget) and a flow is visited once per rotation.
+  void EvictExpiredBounded(const LimitsMap &limits, uint64_t now_ns);
 
   // Frees everything the store holds, stored and queued.
   void ClearStore();

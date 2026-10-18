@@ -122,6 +122,45 @@ void PacketStore::EvictExpired(const LimitsMap &limits, uint64_t now_ns) {
   }
 }
 
+void PacketStore::EvictExpiredBounded(const LimitsMap &limits,
+                                      uint64_t now_ns) {
+  if (store_.empty()) {
+    expire_cursor_ = 0;
+    return;
+  }
+  size_t visited = 0;
+  auto it = store_.lower_bound(expire_cursor_);
+  while (visited < kExpireFlowsPerRun) {
+    if (it == store_.end()) {
+      it = store_.begin();
+    }
+    auto &queue = it->second;
+    const uint64_t timeout = LimitsFor(limits, it->first).first;
+    while (timeout != 0 && !queue.empty() &&
+           (now_ns - queue.front().timestamp_ns > timeout)) {
+      bess::PacketFree(queue.front().pkt.handle());
+      queue.pop_front();
+      total_packets_.store(total_packets_.load(std::memory_order_relaxed) - 1,
+                           std::memory_order_relaxed);
+    }
+    visited++;
+    if (queue.empty()) {
+      it = store_.erase(it);
+      flows_held_.store(flows_held_.load(std::memory_order_relaxed) - 1,
+                        std::memory_order_relaxed);
+      if (store_.empty()) {
+        expire_cursor_ = 0;
+        return;
+      }
+    } else {
+      ++it;
+    }
+    // Resume at the next flow this sweep did not reach, or from the start once
+    // it ran off the end.
+    expire_cursor_ = it == store_.end() ? 0 : it->first;
+  }
+}
+
 void PacketStore::StoreBatch(Context *ctx, bess::PacketBatch *batch,
                              const uint32_t *flow_ids, const LimitsMap &limits,
                              uint64_t now_ns) {
@@ -424,6 +463,20 @@ CommandResponse PacketStore::Init(const bess::pb::PacketStoreArg &arg) {
   using AccessMode = bess::metadata::Attribute::AccessMode;
 
   max_packets_ = arg.max_packets() ? arg.max_packets() : 4096;
+  // The store holds mbuf handles, so its bound plus what the ingress ring can
+  // hold must fit the pool the hot path allocates from. A bound near the
+  // pool's size would starve every other module's batches, and the resulting
+  // drops would look like a network fault rather than a configuration.
+  if (const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
+      pool != nullptr &&
+      pool->Capacity() <
+          static_cast<size_t>(max_packets_) + size_t{kIngressSlots}) {
+    return CommandFailure(
+        EINVAL,
+        "max_packets %u plus the %u the ingress ring can hold exceeds the "
+        "packet pool's %zu buffers",
+        max_packets_, kIngressSlots, pool->Capacity());
+  }
   max_packets_per_flow_ =
       arg.max_packets_per_flow() ? arg.max_packets_per_flow() : 64;
   timeout_ns_ = arg.timeout_ms()
@@ -672,6 +725,13 @@ struct task_result PacketStore::RunTask(Context *ctx, bess::PacketBatch *batch,
   }
   const uint32_t handed = DrainIngress(ctx, kIngressPerRun);
   ingress_owed_ = handed >= ingress_owed_ ? 0 : ingress_owed_ - handed;
+  // What expired is freed whether or not the store is under pressure: a held
+  // packet's lifetime is the flow's timeout, and the store's bound is not the
+  // only thing that frees. The sweep is bounded, so this run stays a run.
+  const LimitsMap *limits = limits_.Read();
+  if (limits != nullptr) {
+    EvictExpiredBounded(*limits, tsc_to_ns(current_worker.current_tsc()));
+  }
   uint32_t applied = 0;
   if (ingress_owed_ == 0 && requests_due_ > 0) {
     applied = DrainRequests(requests_due_);

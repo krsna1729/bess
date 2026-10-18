@@ -9727,6 +9727,31 @@ two-operation transaction publishing both entries; live, a daemon with a two-wor
 workers ran, `release` moved the store's gate 0 from 0 to 64, an erase applied with `0 operation(s)` and read back as
 `[]`, and `ps/flows` was listed without the paused flag while `rewrite0/templates` still carries it.
 
+**Amendment (2026-10-18): expiry is enforced on the owner's run, at a bounded cost.** The timeout was checked
+only when the store was at its `max_packets` bound, so a held packet could outlive its flow's timeout
+indefinitely while the store stayed under the bound - which is what a client that buffers against a policy
+timer (a DL buffering duration) cannot live with: the packets were freed eventually, but only under pressure.
+The owner's run now sweeps `kExpireFlowsPerRun` (256) flows from where the last sweep stopped, freeing what
+expired. Two properties come out of that shape: a run's cost does not grow with the store's size (a full sweep
+per run would be a run's whole budget at 100K flows, and every downstream module in the same round draws on
+the same budget), and a flow is visited once per rotation, so expiry is honoured within one rotation
+(`flows_held / 256` runs) rather than exactly at the deadline. The pressure path is unchanged: a store at its
+bound still evicts expired packets before it evicts anything else. Three tests pin the contract: a packet past
+its timeout is freed while the store holds almost nothing (the clock is moved with `set_current_tsc`, no
+sleeping); the module's bound holds and what does not fit leaves by gate 1, so the pool the hot path allocates
+from cannot be held beyond `max_packets`; and one run takes at most its budget off the ingress ring (1024
+packets) whatever the ring holds.
+
+Sizing, in the UPF's numbers: `max_packets` 65,536 plus the 4,096 the ingress ring can hold is 69,632 mbufs,
+26.6% of the 262,144 default pool, while the hot path's batches of 32 keep their share. Their per-flow
+`timeout_ns` now rides on this expiry: their differential test is the instrument (hold under a short-duration
+BAR, wait past it, send the forward instruction, and require the encap's output not to move), and if the free
+leaves no observable trace at all they will say so in their compliance matrix, because "the packets were freed"
+is otherwise an absence a reviewer cannot see. That fraction is safe; a `max_packets` near the pool's size is
+not, and nothing refused one, so `Init` now refuses a bound the pool cannot carry, naming the pool's own number
+(the store holds mbuf *handles*: a copy-based store would protect the pool but cost a copy in plus a copy and an
+allocation out, which 26.6% does not justify).
+
 ## D-124 WildcardMatch: fixed-width masking for every key width; shared-layout grouping and mode W not adopted
 
 **Status:** accepted (2026-10-14).
@@ -10424,12 +10449,52 @@ header; a fragment whose ports cannot be read is looked up with both ports 0, so
 starts at 0 matches it.
 
 **Consequences.** Measured (`classifier_firewall_table_bench`, release, `-march=x86-64-v3`, pinned to one
-benchmark core, `balanced` profile, medians of three): 112 M keys/s for a 10-rule policy whose keys hit the
-first rule, 35 M/s for 1,000 rules with the hits spread, 27 M/s for the same policy over IPv6, against 0.96
-M/s for the scalar scan of that list. A handful of rules is *cheaper to scan than to index* - the crossover
-is a few tens of rules - which is why this table is for policies of that size and up, and why
-`RuntimeMaskedBackend` stays the answer for the smallest ones. One change rebuilds the whole table (mode G):
-44 µs at 1K rules, 819 µs at 10K, so a per-session table of 100K+ rules wants sharding (one table per
-direction, or per UE group) or an incremental path that does not exist yet. Masking is the
-`MaskedAddrPair16x2` kernel, whose emitted shape the assembly review checks (docs/assembly-shape.md), and an
-IPv4 key is one 64-bit register: two 32-bit loads, a shift, an OR and an AND.
+benchmark core, `balanced` profile, medians of three; the absolute values move about 20% between runs under
+desktop load, so the ratios are the durable part): 114 M keys/s for a 10-rule policy whose keys hit the first
+rule, 34 M/s for 1,000 rules with the hits spread, 26 M/s for the same policy over IPv6, against 0.47 M/s for
+the scalar scan of that list. A handful of rules is *cheaper to scan than to index* - at 10 rules the scan
+wins by 1.26x - which is why this table is for policies of that size and up, and why `RuntimeMaskedBackend`
+stays the answer for the smallest ones; the index's advantage grows to 72x at 1,000 rules. One change rebuilds
+the whole table (mode G): about 50 µs at 1K rules and about 1 ms at 10K, so a per-session table of 100K+
+rules wants sharding (one table per direction, or per UE group) or an incremental path that does not exist
+yet. Masking is the `MaskedAddrPair16x2` kernel, whose emitted shape the assembly review checks
+(docs/assembly-shape.md), and an IPv4 key is one 64-bit register: two 32-bit loads, a shift, an OR and an
+AND.
+
+**Amendment (2026-10-18): a rule names an action, and a rule that drops cannot.** The UPF's compiler asked the
+right question: a matched SDF filter must select the PDR's action (its ActionTable entry, its meter, its next
+hop), and the first cut had only `drop`, so the module was a filter rather than a matcher - a promise made in
+the handoff prose and not in the proto. A rule now carries `optional uint32 action_id` (an ActionId, D-141),
+and the packet path writes it into the packet's `action_id` metadata - the same handoff `WildcardMatch` and
+`ExactMatch` use, so an ActionTable selects the action with no new mechanism. 0 means "no action" and is
+written on every pass, so a stale id cannot reach a later lookup; a rule that both drops and names an action is
+refused (EINVAL), because the packet never reaches the ActionTable that would resolve it.
+
+Two shapes the UPF asked to have stated, since they are what their compiler emits: a rule naming both families
+is refused (one rule is one family - `10.0.0.0/8` beside `2001:db8::/32` is a mistake, not a disjunction), and
+a *buffering* PDR is expressed through the action rather than by the rule: the module forwards on the gate it
+arrived on, and the ActionTable entry the action selects names the next hop - including the packet store's
+input gate - so `firewall -> ActionTable -> packet_store` is the chain, with the store's own `flows` entry
+carrying the duration. The firewall does not need to know what buffering is.
+
+The transactional half of D-141 (a rule with a nonzero ActionId ordered after its action, and refused while
+that action is missing) is **not** in this change: the module's policy is one `Singleton` over the whole rule
+list, while the framework's reference list is per-value on a custom resource, so it needs either a `references`
+hook on the singleton template or a hand-written resource for the rule list. The UPF's own writes do not depend
+on it - their compiler writes an action and its rule in one transaction, and the engine's reference check
+(D-021) validates the merged end state - so it is on the tree's list for a writer that updates rules and
+actions separately, not for theirs.
+
+The write itself is covered end to end by the UPF's live chain (`firewall -> ActionTable -> ...`), not by
+`firewall_test`: a Meter and a Router read a worker's clock and state, so the module harness cannot run them,
+and a chain that avoided running them would prove the metadata offsets rather than the handoff. What the
+module's write depends on - `LookupBatch` reporting the matched rule's 1-based id, which is what names the
+ActionId - is pinned by `FirewallTableTest.LookupBatchReportsMaskActionAndRule`. That dependency cost a real
+bug: the first cut passed `with_rule_id = false`, so the id was 0 and the ActionId was read from `action_ids[-1]`
+(the assertion caught it; in a release build it would have published a garbage action id).
+
+**The header is installed, as `experimental`** (with the other classifier headers): a plugin may hold the table
+rather than vendor a copy, which is the outcome the UPF asked for and the one the library's own contract implies
+- "the table is the library: any module can hold one and look up keys itself". That is three edits in one change
+(`core_public_subdir_headers` in `core/meson.build`, the class in `tools/api_classes.json`, and this record), as
+`api_classes.json`'s own comment requires: promoting a header is an edit in all three places.
