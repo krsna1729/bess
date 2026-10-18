@@ -6,6 +6,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -212,12 +213,51 @@ TEST(ThresholdTableTest, ReportCrossingsQueuesTheSharedEvent) {
   EXPECT_EQ(1u, hub.Run(std::chrono::milliseconds(5), 0));
   const std::vector<PendingEvent> events = hub.TakeEvents();
   ASSERT_EQ(1u, events.size());
-  EXPECT_EQ(kCounterThresholdEvent, events[0].type);
+  EXPECT_EQ(stats::kCounterThresholdEvent, events[0].type);
   EXPECT_EQ("urr0", events[0].source);
   EXPECT_EQ("42", events[0].fields.at("key"));
   EXPECT_EQ("77", events[0].fields.at("value"));
   EXPECT_EQ("70", events[0].fields.at("limit"));
   EXPECT_EQ(0u, t.size());
+}
+
+// One event shape from both producers, as the log shows them: the module's
+// tick (queued, then appended by the maintenance loop) and a worker's
+// CrossingNotifier give the same type and source and the same fields; the
+// worker's adds only which plane crossed. A consumer's handler serves both.
+TEST(ThresholdTableTest, ATickAndAWorkerReportTheSameEventShape) {
+  stats::EventHub log(1024, 4);
+  Counters c;
+  c.totals[42] = 77;
+  ThresholdTable t;
+  t.Arm(42, 70);
+  TickHub hub;
+  TickEndpoint tick(hub, {}, [&](TickContext &ctx) {
+    ReportCrossings(ctx, "urr0", t.Sweep([&c](uint64_t k) { return c.Read(k); },
+                                         [&ctx] { return ctx.Expired(); }));
+  });
+  hub.Run(std::chrono::milliseconds(5), 0);
+  for (PendingEvent &e : hub.TakeEvents()) {  // what the maintenance loop does
+    log.Emit(std::move(e.type), std::move(e.source), std::move(e.fields));
+  }
+  stats::CrossingNotifier notifier(log, "urr0");
+  ASSERT_TRUE(notifier.Note(dataplane::WorkerId(3), 42, 77, 70));
+  ASSERT_EQ(1u, log.DrainWorkers());
+
+  const auto got = log.Read(1, 10, std::chrono::milliseconds(0));
+  ASSERT_EQ(2u, got.events.size());
+  const stats::Event &from_tick = got.events[0];
+  const stats::Event &from_worker = got.events[1];
+  EXPECT_EQ(from_tick.type, from_worker.type);
+  EXPECT_EQ(from_tick.source, from_worker.source);
+  std::set<std::string> tick_fields;
+  for (const auto &[name, value] : from_tick.fields) {
+    tick_fields.insert(name);
+    EXPECT_EQ(value, from_worker.fields.at(name)) << name;
+  }
+  EXPECT_EQ((std::set<std::string>{"key", "value", "limit"}), tick_fields);
+  EXPECT_EQ(4u, from_worker.fields.size()) << "the worker path adds only `worker`";
+  EXPECT_EQ("3", from_worker.fields.at("worker"));
 }
 
 }  // namespace

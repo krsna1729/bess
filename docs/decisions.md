@@ -10679,7 +10679,9 @@ type, source and fields, from the daemon's log. Fast build: suite 214/214.
 ## D-151 Armed counter limits are a library a module's tick uses
 
 **Status:** accepted (2026-10-18).
-**Code:** `core/framework/threshold_table.h` (`ThresholdTable`, `ReportCrossings`, `kCounterThresholdEvent`),
+**Code:** `core/framework/threshold_table.h` (`ThresholdTable`, `ReportCrossings`; the event type,
+`stats::kCounterThresholdEvent`, is defined in `core/stats/crossing_notifier.h`, D-152, the lower layer both
+producers share),
 `core/framework/threshold_table_test.cc`, `core/meson.build` and `tools/api_classes.json` (installed,
 experimental), `docs/plugin-api.md`.
 
@@ -10714,7 +10716,7 @@ latency is the maintenance interval plus, for a very large table, the ticks a pa
 a crossing reported faster than that has the worker-side notifier, exact only when a key's traffic is pinned to
 one worker.
 
-**Evidence.** `ThresholdTableTest` (9): fires once at the limit and is removed and does not fire again; a
+**Evidence.** `ThresholdTableTest` (10, the tenth being D-152's one-shape test): fires once at the limit and is removed and does not fire again; a
 counter already past its limit fires at the next sweep with the total it has; arming replaces a limit; disarm
 says whether there was an entry; a key the read no longer knows is dropped and reported once; a stopped sweep
 resumes, every key past its limit fires exactly once, and every armed entry is looked at within a few more
@@ -10722,3 +10724,40 @@ passes; the order of reads pins that a removal leaves the cursor on the slot the
 variant that skipped it passes every outcome check and fails only this one); a sweep always evaluates its first
 batch; `ReportCrossings` queues the shared event with the module's name as source and key, value and limit as
 fields, through a real `TickEndpoint`.
+
+## D-152 Worker-side crossing events: an opt-in, exact only for a key pinned to one worker
+
+**Status:** accepted (2026-10-18; the user: "a simple opt-in if they know their workload").
+**Code:** `core/stats/crossing_notifier.h` (`CrossingNotifier`, `kCounterThresholdEvent`), tests in
+`core/stats/event_hub_test.cc` and `core/framework/threshold_table_test.cc`, `core/meson.build` and
+`tools/api_classes.json` (installed, experimental), `docs/plugin-api.md`.
+
+**Context.** D-151's table reads every plane from the control side, so it is exact for any key but reports with
+the maintenance interval's latency. A module whose workload pins a key's traffic to one worker (sessions steered
+by RSS on the key) can do better at no extra read: that worker's own count is the key's total.
+
+**Decision.** `stats::CrossingNotifier` is the worker-side counterpart, a small helper over the event hub
+(`EventHub::Post`, as `EventThrottle` is). The packet path pays one compare after the increment it already makes,
+`Crossed(before, after, limit)`, true exactly once as a growing count passes a limit whatever the step, and a
+`Note(wid, key, value, limit)` only on a crossing, which never blocks or allocates. It reports the same event as
+the tick path, `bess.counter_threshold` with `key`, `value` and `limit`, plus `worker` (the plane that crossed),
+so a consumer's handler serves both. A plugin using it requires `BESS_CAP_EVENT_SOURCES`.
+
+**The condition, stated where the author looks.** A worker sees its own plane. If a key's packets can arrive on
+several workers, no worker sees the total and the event says only that one plane reached the limit: a hint.
+`WorkerLimit(total, workers)` is the per-worker limit that cannot miss a crossing of `total` (if the planes sum to
+it, one is at least `ceil(total / workers)`), and on such an event the controller reads the total before it acts.
+A key spread across workers belongs on the D-151 sweep. A worker event can also be lost (a full ring, counted and
+shown as `bess.events_lost`), so a consumer that cannot afford a missed report keeps polling as the backstop.
+
+**Arming.** The limit is stored where the worker reads it, by the module's own action. A limit at or below the
+count never fires, so arming a running counter is its current count plus the room wanted, and one read after
+arming covers a crossing between the controller's read and the arm.
+
+**Evidence.** `CrossingNotifierTest` (6): a count passes a limit exactly once at step sizes 1, 7, 64 and 1500
+and not when already at or past it; `WorkerLimit` is exhaustively shown to be a limit one plane must reach when
+three planes sum to the total, and `(limit - 1) * workers < total <= workers * limit` over nine worker counts and
+two hundred totals; a crossing becomes the shared event with its worker; a type of its own keeps the fields; a
+full ring refuses and counts; a default notifier is inert. `ThresholdTableTest.ATickAndAWorkerReportTheSameEventShape`
+drives both producers into one log and compares what a consumer sees: same type and source, same fields and
+values, the worker path adding only `worker`.

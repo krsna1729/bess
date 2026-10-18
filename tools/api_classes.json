@@ -106,6 +106,7 @@
     "route/route_table.h": "experimental",
     "route/router.h": "experimental",
     "stats/counter_set.h": "experimental",
+    "stats/crossing_notifier.h": "experimental",
     "stats/event_hub.h": "experimental",
     "stats/event_throttle.h": "experimental",
     "stats/metric_registry.h": "experimental",

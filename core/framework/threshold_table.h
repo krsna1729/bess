@@ -61,14 +61,9 @@
 #include <vector>
 
 #include "framework/module_tick.h"
+#include "stats/crossing_notifier.h"
 
 namespace bess::framework {
-
-// The event a crossing is reported as, by every producer (a module's tick
-// through ReportCrossings, the opt-in worker-side notifier): one type, so a
-// consumer's handler serves both. Its source is the reporting module's name;
-// its fields are key, value (the total read) and limit.
-inline constexpr const char *kCounterThresholdEvent = "bess.counter_threshold";
 
 class ThresholdTable {
  public:
@@ -183,7 +178,7 @@ class ThresholdTable {
 inline void ReportCrossings(TickContext &ctx, const std::string &source,
                             const ThresholdTable::Result &result) {
   for (const ThresholdTable::Crossing &c : result.crossed) {
-    ctx.Emit(kCounterThresholdEvent, source,
+    ctx.Emit(stats::kCounterThresholdEvent, source,
              {{"key", std::to_string(c.key)},
               {"value", std::to_string(c.value)},
               {"limit", std::to_string(c.limit)}});

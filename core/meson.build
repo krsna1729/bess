@@ -671,6 +671,7 @@ core_public_subdir_headers = {
   ),
   'stats': files(
     'stats/counter_set.h',
+    'stats/crossing_notifier.h',
     'stats/event_hub.h',
     'stats/event_throttle.h',
     'stats/metric_registry.h',

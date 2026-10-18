@@ -3,6 +3,7 @@
 // accounted exactly, per-worker order, gapless sequences, gaps for readers
 // that fall behind, and readers woken at close.
 
+#include "stats/crossing_notifier.h"
 #include "stats/event_hub.h"
 #include "stats/event_throttle.h"
 
@@ -87,6 +88,103 @@ TEST(EventThrottleTest, OneEventPerIntervalPerWorkerCarryingTheCount) {
   const auto later = hub.Read(4, 100, milliseconds(0));
   ASSERT_FALSE(later.events.empty());
   EXPECT_EQ("11", later.events.back().fields.at("count")) << "the refused 10 + 1";
+}
+
+// A growing count passes a limit exactly once, whatever the step: the packet
+// path posts one event per arming, not one per packet past the limit.
+TEST(CrossingNotifierTest, ACountPassesALimitExactlyOnceAtAnyStepSize) {
+  for (const uint64_t step : {1u, 7u, 64u, 1500u}) {
+    uint64_t count = 0;
+    int crossings = 0;
+    while (count < 20000) {
+      const uint64_t before = count;
+      count += step;
+      crossings += CrossingNotifier::Crossed(before, count, 1000) ? 1 : 0;
+    }
+    EXPECT_EQ(1, crossings) << "step " << step;
+  }
+  EXPECT_FALSE(CrossingNotifier::Crossed(1000, 1001, 1000)) << "already at the limit: no new crossing";
+  EXPECT_FALSE(CrossingNotifier::Crossed(2000, 2001, 1000)) << "already past it";
+  EXPECT_TRUE(CrossingNotifier::Crossed(999, 1000, 1000)) << "reaching it is crossing it";
+  EXPECT_FALSE(CrossingNotifier::Crossed(0, 5, 0)) << "a zero limit is never crossed by counting";
+}
+
+// For a key spread across W planes, WorkerLimit is the per-worker limit that
+// cannot miss: whatever the planes hold, if they sum to the total one of them
+// is at or past it. Exhaustive over three workers and every split.
+TEST(CrossingNotifierTest, WorkerLimitCannotMissACrossingOfTheTotal) {
+  constexpr uint64_t kTotal = 7;
+  const uint64_t limit = CrossingNotifier::WorkerLimit(kTotal, 3);
+  EXPECT_EQ(3u, limit);
+  for (uint64_t a = 0; a <= kTotal; a++) {
+    for (uint64_t b = 0; b <= kTotal; b++) {
+      for (uint64_t c = 0; c <= kTotal; c++) {
+        if (a + b + c >= kTotal) {
+          EXPECT_TRUE(a >= limit || b >= limit || c >= limit) << a << "," << b << "," << c;
+        }
+      }
+    }
+  }
+  // And it is the least such limit: one lower would fire with the sum still
+  // short, which is the hint the doc names; one higher could miss.
+  for (uint32_t workers = 1; workers <= 9; workers++) {
+    for (uint64_t total = 1; total <= 200; total++) {
+      const uint64_t w = CrossingNotifier::WorkerLimit(total, workers);
+      EXPECT_LT((w - 1) * workers, total) << total << " over " << workers;
+      EXPECT_LE(total, w * workers) << total << " over " << workers;
+    }
+  }
+  EXPECT_EQ(CrossingNotifier::WorkerLimit(10, 1), CrossingNotifier::WorkerLimit(10, 0))
+      << "no workers is read as one";
+}
+
+// What a crossing becomes in the log: the shared type, the module's name as
+// source, the key, the count when it crossed, the limit, and the worker.
+TEST(CrossingNotifierTest, ACrossingBecomesTheSharedEventWithItsWorker) {
+  EventHub hub(1024, 4);
+  CrossingNotifier crossed(hub, "urr0");
+  ASSERT_TRUE(crossed.Note(WorkerId(2), 42, 1001, 1000));
+  ASSERT_EQ(1u, hub.DrainWorkers());
+  const auto got = hub.Read(1, 10, milliseconds(0));
+  ASSERT_EQ(1u, got.events.size());
+  EXPECT_EQ(kCounterThresholdEvent, got.events[0].type);
+  EXPECT_EQ("urr0", got.events[0].source);
+  EXPECT_EQ("42", got.events[0].fields.at("key"));
+  EXPECT_EQ("1001", got.events[0].fields.at("value"));
+  EXPECT_EQ("1000", got.events[0].fields.at("limit"));
+  EXPECT_EQ("2", got.events[0].fields.at("worker"));
+}
+
+// A module reporting under a name of its own keeps the same fields.
+TEST(CrossingNotifierTest, ATypeOfItsOwnKeepsTheSameFields) {
+  EventHub hub(1024, 4);
+  CrossingNotifier crossed(hub, "my.threshold", "mod");
+  ASSERT_TRUE(crossed.Note(WorkerId(0), 1, 2, 3));
+  ASSERT_EQ(1u, hub.DrainWorkers());
+  const auto got = hub.Read(1, 10, milliseconds(0));
+  ASSERT_EQ(1u, got.events.size());
+  EXPECT_EQ("my.threshold", got.events[0].type);
+  EXPECT_EQ("1", got.events[0].fields.at("key"));
+  EXPECT_EQ("2", got.events[0].fields.at("value"));
+  EXPECT_EQ("3", got.events[0].fields.at("limit"));
+}
+
+// Never blocks: a worker whose ring is full is refused, and the hub counts it.
+TEST(CrossingNotifierTest, AFullRingRefusesAndCounts) {
+  EventHub hub(1024, 4);
+  CrossingNotifier crossed(hub, "urr0");
+  for (uint64_t i = 0; i < 4; i++) {
+    EXPECT_TRUE(crossed.Note(WorkerId(1), i, 10, 10)) << i;
+  }
+  EXPECT_FALSE(crossed.Note(WorkerId(1), 4, 10, 10)) << "the ring of 4 is full";
+  EXPECT_EQ(1u, hub.lost());
+}
+
+// A module that never opened one runs no event code: a default notifier posts
+// nothing and says so.
+TEST(CrossingNotifierTest, ADefaultNotifierIsInert) {
+  CrossingNotifier none;
+  EXPECT_FALSE(none.Note(WorkerId(0), 1, 2, 3));
 }
 
 TEST(EventHubTest, AReaderBehindTheLogGetsAGapThenWhatIsHeld) {

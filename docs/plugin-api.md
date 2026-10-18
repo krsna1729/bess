@@ -316,7 +316,7 @@ struct BessPluginDescriptor {
   | `BESS_CAP_METRICS` | operational metrics (`init_context().metrics()`) |
   | `BESS_CAP_REQUESTS` | worker-to-control requests (`init_context().requests()`) |
   | `BESS_CAP_EVENTS` | operational events (`init_context().events()`) |
-  | `BESS_CAP_EVENT_SOURCES` | named event sources and the throttled packet-path events (`EventHub::NamedSource`, `EventHub::Full`, `stats::EventThrottle`) |
+  | `BESS_CAP_EVENT_SOURCES` | named event sources and the throttled or threshold packet-path events (`EventHub::NamedSource`, `EventHub::Full`, `stats::EventThrottle`, `stats::CrossingNotifier`) |
   | `BESS_CAP_TICKS` | periodic control-side work (`init_context().ticks()`) |
 
   The `standalone_*` conformance plugins in `examples/standalone_plugin` use
@@ -362,6 +362,20 @@ construction or `Init()`:
 | `codecs()` | bind a wire codec to each resource registered through `resources()`, so `ApplyTransaction` and `ListTransactionResources` reach it (`framework::ResourceBindings`, experimental; below) |
 
 Every type this surface names is installed.
+
+**Counter crossings.** A controller that wants to know when a counter passes a limit is told by
+one event shape, `bess.counter_threshold` (source: the module; fields `key`, `value`, `limit`),
+from whichever of two producers fits the workload. The module's own tick sweeps a
+`framework::ThresholdTable` (D-151), which reads every worker's plane, so it is exact for any key
+and costs the packet path nothing; the latency is the maintenance interval. A worker can instead
+post the crossing itself with `stats::CrossingNotifier` (`stats/crossing_notifier.h`,
+experimental, D-152): one compare, `Crossed(before, after, limit)`, after the increment it
+already makes, and a `Note(...)` only on a crossing. That is exact only when a key's traffic is
+pinned to one worker, because a worker sees its own plane alone; for a key spread across workers
+its event is a hint (`WorkerLimit(total, workers)` is the per-worker limit that cannot miss), and
+the controller reads the total before it acts. A worker event can be lost when its ring is full
+(counted, shown as `bess.events_lost`), so a consumer that cannot afford a missed report keeps
+polling as the backstop. The worker path's event also carries `worker`, the plane that crossed.
 
 The context is bound when the `Module` base is constructed, so it is usable in
 a derived constructor's member initializers (for example
