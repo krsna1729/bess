@@ -190,11 +190,10 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
   constexpr size_t kBatchSize = 32;
   constexpr size_t kRules = 24;
 
-  uint64_t total_fast_hits = 0;
-  uint64_t total_scalar_hits = 0;
-
   for (const size_t key_size : {size_t{4}, size_t{8}, size_t{12}, size_t{13}}) {
     for (const size_t mask_len : {key_size - 1, key_size, key_size + 3}) {
+      uint64_t total_fast_hits = 0;
+      uint64_t total_scalar_hits = 0;
       const size_t src_off = 4;
       const size_t dst_off = 6;
       const bool ports_fit = dst_off + sizeof(uint16_t) <= key_size;
@@ -203,26 +202,26 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
       std::vector<std::vector<std::byte>> rule_keys;  // hit keys, per rule
 
       for (uint32_t i = 0; i < kRules; i++) {
-        // Half the rules leave the port bytes unmasked, so a key can satisfy
-        // the mask and land inside both ranges. The whole window has to be
-        // inside the mask, or a chosen port would violate the mask instead.
+        // Half the rules are built to match: their value carries no bits
+        // outside their mask. The others carry such bits on purpose and can
+        // never match - they exercise the rejection path. At least one rule
+        // must be matchable, or the configuration never produces a hit.
+        const bool matchable = i % 2 == 0;
+
+        // A rule with a free port window can satisfy any port, so its range is
+        // drawn freely; the whole window has to be inside the mask, or a
+        // chosen port would violate the mask instead.
         const bool ports_free =
-            ports_fit && (i % 2 == 0) &&
-            src_off + sizeof(uint16_t) <= mask_len &&
+            matchable && ports_fit && src_off + sizeof(uint16_t) <= mask_len &&
             dst_off + sizeof(uint16_t) <= mask_len;
 
         std::vector<std::byte> value(mask_len);
         std::vector<std::byte> mask(mask_len);
         for (size_t j = 0; j < mask_len; j++) {
           mask[j] = static_cast<std::byte>(byte_dist(rng));
-          // A rule can only ever match if its value carries no bits outside its
-          // mask, so the constructible rules are built that way. The others
-          // carry such bits on purpose and can never match: they still
-          // exercise the rejection path.
           value[j] = static_cast<std::byte>(
-              (ports_free || j % 2 == 0)
-                  ? (byte_dist(rng) & static_cast<int>(mask[j]))
-                  : byte_dist(rng));
+              matchable ? (byte_dist(rng) & static_cast<int>(mask[j]))
+                        : byte_dist(rng));
         }
         if (ports_free) {
           for (size_t j = 0; j < sizeof(uint16_t); j++) {
@@ -237,15 +236,15 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
           }
         }
 
-        const uint16_t s_lo = port_dist(rng);
-        const uint16_t s_hi = s_lo + (port_dist(rng) % 1000);
-        const uint16_t d_lo = port_dist(rng);
-        const uint16_t d_hi = d_lo + (port_dist(rng) % 1000);
+        // Ports. The rule's range check runs on the key's port bytes, so the
+        // range must contain them: when the mask leaves the port bytes free,
+        // draw a range and write a port inside it; otherwise value/mask fixes
+        // the bytes, and the range is built around them. Every bound stays
+        // inside uint16, so a drawn width never wraps.
+        uint16_t s_lo = 0, s_hi = 0xffff, d_lo = 0, d_hi = 0xffff;
 
         // Every rule gets a key, so every configuration is exercised. The key
-        // matches the value/mask by construction; when the mask leaves the
-        // ports free they must be inside the rule's range, or the rule's own
-        // range check rejects the key.
+        // matches the value/mask by construction.
         std::vector<std::byte> key(key_size);
         for (size_t j = 0; j < key_size; j++) {
           const std::byte m = j < mask.size() ? mask[j] : std::byte{0};
@@ -254,12 +253,29 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
                               static_cast<std::byte>(~static_cast<int>(m)));
         }
         if (ports_free) {
+          s_lo = static_cast<uint16_t>(port_dist(rng) % (0xffff - 1000));
+          s_hi = static_cast<uint16_t>(s_lo + (port_dist(rng) % 1000));
+          d_lo = static_cast<uint16_t>(port_dist(rng) % (0xffff - 1000));
+          d_hi = static_cast<uint16_t>(d_lo + (port_dist(rng) % 1000));
           const be16_t src_port{static_cast<uint16_t>(
               s_lo + (port_dist(rng) % (s_hi - s_lo + 1)))};
           const be16_t dst_port{static_cast<uint16_t>(
               d_lo + (port_dist(rng) % (d_hi - d_lo + 1)))};
           std::memcpy(key.data() + src_off, &src_port, sizeof(src_port));
           std::memcpy(key.data() + dst_off, &dst_port, sizeof(dst_port));
+        } else if (ports_fit) {
+          // The key's port bytes are already fixed by value/mask, so the range
+          // must contain them or the rule rejects a key that matches it.
+          be16_t src_port;
+          be16_t dst_port;
+          std::memcpy(&src_port, key.data() + src_off, sizeof(src_port));
+          std::memcpy(&dst_port, key.data() + dst_off, sizeof(dst_port));
+          const uint16_t src = src_port.value();
+          const uint16_t dst = dst_port.value();
+          s_lo = static_cast<uint16_t>(src > 1000 ? src - 1000 : 0);
+          s_hi = static_cast<uint16_t>(std::min<uint32_t>(0xffffu, src + 1000));
+          d_lo = static_cast<uint16_t>(dst > 1000 ? dst - 1000 : 0);
+          d_hi = static_cast<uint16_t>(std::min<uint32_t>(0xffffu, dst + 1000));
         }
         rule_keys.push_back(std::move(key));
 
@@ -355,14 +371,14 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
           }
         }
       }
+      // A configuration whose keys never hit would not exercise the
+      // comparison at all.
+      EXPECT_GT(total_scalar_hits, 0u)
+          << "no hits for key size " << key_size << ", mask length "
+          << mask_len;
+      EXPECT_EQ(total_fast_hits, total_scalar_hits);
     }
   }
-
-  // Without this the whole comparison could be vacuous: a stream that never
-  // hits exercises only the rejection path, and an always-false implementation
-  // would pass it.
-  EXPECT_GT(total_scalar_hits, 0u);
-  EXPECT_EQ(total_fast_hits, total_scalar_hits);
 }
 
 TEST(RangeBackendTest, CartesianExplosionElimination) {
