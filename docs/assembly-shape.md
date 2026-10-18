@@ -44,6 +44,7 @@ page did exactly that, and swapped two bodies).
 | `k_match32x4` | `MatchHashes32x4` | `jmp` - the dispatch itself; the AVX2 callee is `vpbroadcastd` + `vpcmpeqd` + `vmovmskps`, and the scalar callee (local, no symbol) is `vpcmpeqd` + `vpand` + a `vpsrldq`/`vpor` fold | the dispatched AVX2 compare |
 | `k_vlan_remove` | `RemoveVlanTag` | `vmovdqu` + `vpslldq $4` + `vmovdqu` | "one 16-byte load, one byte shift, one store" |
 | `k_vlan_insert` | `InsertVlanTag` | `vmovdqu 4(%rdi)` + `vpinsrd $3` + `vmovdqu` | "one 16-byte load, one lane insert, one store" |
+| `k_maskpair16x2` | `MaskedAddrPair16x2` | two `vmovdqu` mask loads, two `vpand` with the address as the memory operand, two `vmovdqu` stores | "one 16-byte load, one AND and one 16-byte store per address" |
 
 Every body is three to forty instructions, with no call, and the only branches
 are the two length loops (`SkipBytesOutsideRanges`, `SumWords32`). The three

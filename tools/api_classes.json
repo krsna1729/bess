@@ -44,6 +44,7 @@
     "arch/word_probe.h": "experimental",
     "classifier/byte_key.h": "experimental",
     "classifier/classifier.h": "experimental",
+    "classifier/firewall_table.h": "experimental",
     "classifier/range_backend.h": "experimental",
     "dataplane/action_id.h": "experimental",
     "dataplane/batch_stages.h": "experimental",

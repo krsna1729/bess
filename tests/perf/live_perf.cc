@@ -498,6 +498,30 @@ std::vector<std::string> MAcl(Build &b) {
   return MBase(b, {{"acl", 1}});
 }
 
+// The same 16 rules as the ACL arm, with the two things a firewall has and
+// ACL does not: a protocol and a port *range* per rule (ACL's ports are single
+// values, and WildcardMatch must write a range as 2n-2 prefixes and pay for
+// each in its tuple budget). The traffic matches the first rule.
+std::vector<std::string> MFirewall(Build &b) {
+  std::string rules;
+  for (int i = 0; i < 16; i++) {
+    rules += std::string(i ? ", " : "") + R"({"src_ip": "10.0.)" + std::to_string(i) +
+             R"(.0/24", "dst_ip": "11.0.0.0/8", "proto": 17,)" +
+             R"( "dst_port_low": 1000, "dst_port_high": 3000})";
+  }
+  b.Mod("Firewall", "fw", R"({"rules": [)" + rules + "]}");
+  return MBase(b, {{"fw", 1}});
+}
+
+// The same policy with a rule that cannot match the traffic: every packet
+// scans every group and is dropped, which is the cost of a miss.
+std::vector<std::string> MFirewallMiss(Build &b) {
+  b.Mod("Firewall", "fw",
+        R"({"rules": [{"src_ip": "12.0.0.0/8", "dst_ip": "11.0.0.0/8", "proto": 17,)"
+        R"( "dst_port_low": 1000, "dst_port_high": 3000}]})");
+  return MBase(b, {{"fw", 1}});
+}
+
 // -- the UPF plugin's arms (--plugin DIR loads it) ----------------------------------
 //
 // Each arm brings its own control: the same frame through the same chain with a
@@ -648,6 +672,8 @@ std::vector<Test> Catalogue() {
       {"M.iplookup/fib", 'M', MIpLookup(R"({"backend": "ROUTE_BACKEND_FIB"})")},
       {"M.l2forward", 'M', ML2Forward},
       {"M.acl", 'M', MAcl},
+      {"M.firewall", 'M', MFirewall},
+      {"M.firewall/miss", 'M', MFirewallMiss},
       {"M.hashlb", 'M', m("HashLB", "lb", R"({"gates": [0, 1, 2, 3], "mode": "l3"})", 4)},
       {"M.update", 'M',
        m("Update", "up",

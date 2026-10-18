@@ -105,6 +105,42 @@ GetPipeline — the client derives no topology); `--allow-dirty-placement`
 silences the warning. Numbers taken while siblings compete measure contention,
 so treat a warned run as the caveat says.
 
+## The firewall table
+
+`classifier_firewall_table_bench` (`core/classifier/firewall_table_bench.cc`)
+measures the table's packet path (`LookupBatch` over 32 keys) against the scalar
+scan of the same rule list, and the masking kernel against the portable loop it
+replaced. Build and run it from the release tree, pinned to one benchmark core
+(`build/relsem` is a release lane with `-Dcpu=x86-64-v3` and benchmarks on):
+
+```
+ninja -C build/relsem core/classifier_firewall_table_bench
+taskset -c 2 build/relsem/core/classifier_firewall_table_bench \
+    --benchmark_repetitions=3 --benchmark_report_aggregates_only=true
+```
+
+Args are `{rules, batch, dist, family}`: `dist` 0/1/2 is "every key hits the
+first rule", "hits spread over the rules", "every key misses". Measured on this
+host (release, `-march=x86-64-v3`, `balanced` profile, pinned to core 2, medians
+of 3, cv <= 0.5%, and a desktop load of ~3 on 20 CPUs: the absolute values moved
+about 20% between two such runs, so read the ratios and re-measure before
+quoting a number):
+
+| policy, 32 keys per batch | ns per batch | M keys/s |
+|---|---|---|
+| v4, 10 rules, first rule hit | 281 | 114 |
+| v4, 1,000 rules, hits spread | 945 | 34 |
+| v4, 1,000 rules, all miss | 709 | 45 |
+| v4, 10,000 rules, hits spread | 1,349 | 24 |
+| v6, 1,000 rules, hits spread | 1,243 | 26 |
+| scalar scan, 10 rules, first rule hit | 274 | 117 |
+| scalar scan, 1,000 rules, hits spread | 67,659 | 0.47 |
+
+A handful of rules is cheaper to scan than to index - at 10 rules the scan wins
+by 1.26x - and the index's advantage grows to 72x at 1,000. Building the table
+(what an apply costs) is about 50 µs at 1K rules and about 1 ms at 10K
+(`BM_FirewallBuild`; 44-58 µs and 0.82-1.07 ms across runs).
+
 ## Flow-state tables
 
 `flow_bench` (`core/flow/flow_bench.cc`, D-052) covers `WorkerFlowTable` and

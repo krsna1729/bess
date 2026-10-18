@@ -385,6 +385,33 @@ message ACLArg {
 }
 
 /**
+ * A firewall: an ordered policy over the 5-tuple, with port ranges.
+ *
+ * The first matching rule wins (the list order is the policy order), a
+ * matching rule that does not drop forwards, and a packet no rule matches is
+ * dropped. Port ranges are first-class: a range is two bounds, not a set of
+ * masks, so a wide range costs the table nothing (see
+ * core/classifier/firewall_table.h).
+ *
+ * __Input Gates__: 1
+ * __Output Gates__: 1 (the incoming gate)
+ */
+message FirewallArg {
+  message Rule {
+    string src_ip = 1;         /// Source prefix in CIDR. Wildcard if "".
+    string dst_ip = 2;         /// Destination prefix in CIDR. Wildcard if "".
+    uint32 proto = 3;          /// IP protocol number. Wildcard if 0.
+    uint32 src_port_low = 4;   /// Inclusive lower bound (default 0).
+    optional uint32 src_port_high = 5; /// Inclusive upper bound (default 65535).
+    uint32 dst_port_low = 6;   /// Inclusive lower bound (default 0).
+    optional uint32 dst_port_high = 7; /// Inclusive upper bound (default 65535).
+    bool drop = 8;             /// Drop matching packets instead of forwarding.
+    optional uint32 action_id = 9; /// The ActionId a matching packet carries, 0 for none. The packet path writes it into the packet's "action_id" metadata attribute, so an ActionTable downstream selects the action this rule names (D-141). A rule that drops cannot name one.
+  }
+  repeated Rule rules = 1; /// The policy, in order.
+}
+
+/**
  * The BPF module is an access control module that sends packets out on a particular gate based on whether they match a BPF filter.
  *
  * __Input Gates__: 1

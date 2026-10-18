@@ -60,6 +60,7 @@ stopping traffic.
 |---|---|---|---|
 | exact match on runtime-defined fields (packet/metadata bytes → small value) | `ConcurrentExactTable` | `classifier/concurrent_exact.h` | in place, O(1) (mode C) |
 | masked/ternary match with priorities (5-tuple ACL style) | `RuntimeMaskedBackend` in a generation | `classifier/masked_exact.h` | rebuild + swap (mode G) |
+| masked 5-tuple **with port ranges**, both families, order = policy order | `FirewallTable` | `classifier/firewall_table.h` | rebuild + swap (mode G) |
 | exact match with a compile-time key type (a struct you own) | `ExactTable<Key, Result, Backend>` | `classifier/typed_exact.h` | rebuild + swap (G) |
 | IPv4 longest-prefix match | `RouteTable<Value>`; `Router` for routes + next hops | `route/route_table.h`, `route/router.h` | in place (C) |
 | id → object (the result of a lookup is a rich object) | `ObjectTable<Id, T>` | `dataplane/object_table.h` | rebuild + swap (G) |
@@ -97,6 +98,7 @@ and fatal at millions:
 | ExactMatch, one rule | 426 µs at 1K rules, 47 ms at 100K, 645 ms at 1M | 0.3 µs at any size |
 | IPLookup (`rte_lpm`) | 9.4 ms at 1K routes, 341 ms at 64K; a 512K build takes ~21 s | 0.5-33 µs |
 | WildcardMatch (masked, 8 tuples) | 7 µs at 8 rules, 500 µs at 256 rules | (G today; see section 5) |
+| FirewallTable (masked + port ranges, both families) | ~50 µs at 1K rules, ~1 ms at 10K | (G) |
 
 A whole-table swap is reserved for cases with no incremental alternative:
 `Clear()` on a route table, and structures such as `rte_acl` that can only be
@@ -165,6 +167,78 @@ state through G, C or W.
 - **Updates:** immutable once built; published in a generation through
   `RcuPtr`.
 - **Used by:** WildcardMatch.
+
+### `FirewallTable` (masked 5-tuple with port ranges, both families, mode G)
+
+`classifier/firewall_table.h`. A policy of ordered rules - source and
+destination prefix, protocol, source and destination port range, an action
+word - where **the first rule that matches wins**, as a firewall's list does.
+IPv4 and IPv6 rules live in one table: the family is part of a group's
+identity, so a v4 rule never sees a v6 packet, and a rule with no prefix at all
+sees both.
+
+The index is tuple space over the **masked fields only**: one group per
+(family, protocol, source prefix length, destination prefix length), each
+holding one array of (masked key -> rule) entries sorted by key. **The port
+ranges are not in the key**: they are checked after the group's key hits, so a
+range costs no group and no mask. That is what `WildcardMatch` cannot do - it
+must write a range as 2n-2 prefixes per field and pay for each one in its tuple
+budget (D-102) - and it is why the UPF's compiler refuses a PDR with a port
+range today.
+
+Measured (`classifier_firewall_table_bench`, release, `-march=x86-64-v3`, 32
+keys per batch, pinned to one core; see [benchmarking.md](benchmarking.md) for
+the profile and the caveat on absolutes): 114 M keys/s for a 10-rule policy
+whose keys hit the first rule, 34 M/s for a 1,000-rule policy with the hits
+spread over its rules, 26 M/s for the same policy over IPv6, against 0.47 M/s
+for the scalar scan of that list. A 10-rule policy that matches its first rule
+is *cheaper to scan* (117 M/s) than to index, because the index pays a group
+scan and a binary search per key: a handful of rules wants the scan itself (or
+`RuntimeMaskedBackend`), and the index's advantage grows to 72x at 1,000 rules.
+
+One change rebuilds the whole table (mode G): about 50 µs at 1K rules and about
+1 ms at 10,000. A per-session table with 100K+ rules therefore wants sharding
+(one table per direction, or per UE group) or an incremental path that does not
+exist yet.
+
+Packet path: the module (`modules/firewall.h`) extracts the key - IPv4 by
+offset, IPv6 through its extension chain (bounded at four headers) to the
+transport header - and a packet the table cannot judge (a non-IP frame, a
+truncated header) is dropped rather than passed by a catch-all rule. A
+fragment whose ports cannot be read is looked up with both ports 0, so only a
+rule whose range starts at 0 can match it. Masking is the `MaskedAddrPair16x2`
+kernel (`arch/masked_addr.h`); an IPv4 key is one 64-bit register, so its whole
+masking step is two 32-bit loads, a shift, an OR and an AND.
+
+**Actions.** A rule carries an `action_id` (an ActionId, D-141) beside its
+`drop` flag: the module writes it into the packet's `action_id` metadata, which
+an ActionTable downstream reads to select the action - its meter, its next hop
+- so a matched rule names an outcome rather than only "pass" or "drop". 0 means
+no action, and it is written on every pass so a stale id cannot reach a later
+lookup; a rule that both drops and names an action is refused (the packet never
+reaches the ActionTable that would resolve it). Two more shapes are refused
+rather than guessed at: a rule naming both families (one rule is one family,
+not a disjunction), and a port range the wrong way round. A *buffering* PDR is
+not a rule shape: the module forwards on the gate it arrived on, and the
+ActionTable entry the action selects names the next hop - including a packet
+store's input gate - so `firewall -> ActionTable -> packet_store` carries it,
+with the store's own `flows` entry holding the duration.
+
+**Sharding is the convention, not a workaround.** The key is a concrete struct,
+so a holder cannot add a dimension to it. A field that *partitions* the policy -
+a UPF's route domain, one table per domain per direction - belongs in the table
+set; a field that *varies within* a policy (a QFI, a tunnel) belongs in the key.
+A rebuild is ~50 µs at 1K rules and ~1 ms at 10,000, so a per-session policy of
+65k sessions wants one table per direction, per domain or per interface rather
+than one table for everything. `Stats.groups` is the invariant to test from
+outside: **a range-only change must not move it** - that is the property that
+justifies the whole design.
+
+**Three field traps, one line each.** `""` means any address *of the rule's
+family*, while `0.0.0.0/0` pins IPv4 - two ways to say "any" with different
+family effects. The family comes from the prefixes, and a rule naming both is
+refused. An unset port bound is 65535, not 0, because the proto field is
+`optional`.
 
 ### Typed `ExactTable<Key, Result, Backend>` (compile-time keys, mode G)
 

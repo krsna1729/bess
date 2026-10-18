@@ -166,6 +166,7 @@ file is the reasoning.
 | D-144 | The gate byte counter is gone: `TrackArg.bits` was its only switch and every hook was installed with the default arg, so `bess_gate_bytes_total` could never appear; the feature went with it, while the field number and name stay reserved so no client can silently write the old one | accepted |
 | D-145 | The Go SDK ships as a nested module under module-prefixed tags (`sdk/go/vX.Y.Z`), consumed by pinning a tag or a commit; unpinned queries resolve through the repository's default branch, which is `develop`, while `master` stays the archival upstream mirror and no branch is renamed; `go.work` is a machine-local development shortcut, never how a consumer builds | accepted |
 | D-146 | C++, Python and Go are all first-class control_v2 SDKs, and the Python one is rebuilt clean-room: a fresh client taking `pybess.sdk`'s place - the same transaction discipline (one request id per logical transaction, recovery through `GetTransaction`, the daemon epoch, typed resources and typed outcomes) over the same wire, with no legacy service and no place in the runtime package (D-135). It amends D-104's count of two supported SDKs | accepted |
+| D-147 | The firewall table: a masked 5-tuple policy where a port range costs no tuple (the ports are checked after the group's masked key, so a range adds no group, no mask and no entry - what WildcardMatch cannot do without spending 2n-2 prefixes per field of its budget, D-102), IPv4 and IPv6 in one table (the family is part of a group's identity, so a v4 rule never sees a v6 packet and a rule with no prefix sees both), the first match in rule order wins, and a packet the table cannot judge is dropped rather than passed by a catch-all; the module publishes the whole policy as one `<name>/rules` singleton (D-129) | accepted |
 
 
 ---
@@ -10391,3 +10392,44 @@ layout change: cut `sdk/go/v0.1.0` on a green commit, then repin the consumers f
 - **Consequence for the docs.** `docs/control-sdk.md` no longer says "the two clients": it names all three,
   with the Python one marked as the clean-room rebuild (D-146). A sentence elsewhere that reads as a
   prohibition on a Python client is corrected the same way.
+
+## D-147 The firewall table: a port range costs no tuple
+
+**Status:** accepted (2026-10-18).
+**Code:** `core/classifier/firewall_table.{h,cc}`, `core/modules/firewall.{h,cc}`,
+`core/arch/masked_addr.h`, `protobuf/module_msg.proto` (`FirewallArg`),
+`core/classifier/firewall_table_test.cc`, `core/modules/firewall_test.cc`,
+`core/arch/kernels_test.cc`, `core/classifier/firewall_table_bench.cc`.
+**Analysis and measurements:** [benchmarking.md](benchmarking.md),
+[dataplane-tables.md](dataplane-tables.md), [assembly-shape.md](assembly-shape.md).
+
+**Context.** The UPF's compiler refuses a PDR whose SDF filter carries a port range rather than widening it,
+and its graphs declare `max_tuples: 8`: a `WildcardMatch` rule must write a range as 2n-2 prefixes per field
+and pay for each in its tuple budget (D-102), so a range-heavy policy spends both its budget and its lookup
+time on ranges. Two other SDF shapes have no home in the existing tables: a rule whose prefix is written
+sloppily (the UPF's "an SDF prefix is an address" bug class), and one policy that holds both families.
+
+**Decision.** A table whose index is tuple space over the **masked fields only**: one group per (family,
+protocol, source prefix length, destination prefix length), each holding one array of (masked key -> rule)
+entries sorted by key. **The ports are not in the key** - they are checked after the group's key hits, so a
+range costs two comparisons and no group, no mask and no entry. IPv4 and IPv6 rules live in one table: the
+family is part of a group's identity, so a v4 rule can never see a v6 packet and a rule with no prefix at all
+sees both. The first rule that matches wins, in list order, and a key the table cannot judge is the caller's
+business: the module drops such a packet rather than letting a catch-all rule claim it.
+
+**The module** is `Firewall` (`modules/firewall.h`): its state is its init argument and the `<name>/rules`
+singleton (D-129), it has no actions, and a write is an RCU swap, so the workers are never paused. IPv4 keys
+come from the header by offset; IPv6 through the extension chain, bounded at four headers, to the transport
+header; a fragment whose ports cannot be read is looked up with both ports 0, so only a rule whose range
+starts at 0 matches it.
+
+**Consequences.** Measured (`classifier_firewall_table_bench`, release, `-march=x86-64-v3`, pinned to one
+benchmark core, `balanced` profile, medians of three): 112 M keys/s for a 10-rule policy whose keys hit the
+first rule, 35 M/s for 1,000 rules with the hits spread, 27 M/s for the same policy over IPv6, against 0.96
+M/s for the scalar scan of that list. A handful of rules is *cheaper to scan than to index* - the crossover
+is a few tens of rules - which is why this table is for policies of that size and up, and why
+`RuntimeMaskedBackend` stays the answer for the smallest ones. One change rebuilds the whole table (mode G):
+44 µs at 1K rules, 819 µs at 10K, so a per-session table of 100K+ rules wants sharding (one table per
+direction, or per UE group) or an incremental path that does not exist yet. Masking is the
+`MaskedAddrPair16x2` kernel, whose emitted shape the assembly review checks (docs/assembly-shape.md), and an
+IPv4 key is one 64-bit register: two 32-bit loads, a shift, an OR and an AND.

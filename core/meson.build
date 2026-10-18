@@ -13,6 +13,7 @@ dataplane_core_sources = files(
 classifier_sources = files(
   'classifier/concurrent_exact.cc',
   'classifier/concurrent_masked.cc',
+  'classifier/firewall_table.cc',
   'classifier/extract_plan.cc',
   'classifier/result_plan.cc',
   'classifier/runtime_schema.cc',
@@ -130,6 +131,7 @@ driver_sources = files(
 
 module_sources = files(
   'modules/acl.cc',
+  'modules/firewall.cc',
   'modules/action_table.cc',
   'modules/arp_responder.cc',
   'modules/bpf.cc',
@@ -613,6 +615,7 @@ core_public_subdir_headers = {
   'classifier': files(
     'classifier/byte_key.h',
     'classifier/classifier.h',
+    'classifier/firewall_table.h',
     'classifier/range_backend.h',
   ),
   'l2': files(
@@ -711,6 +714,7 @@ unit_test_sources = [
   'classifier/typed_exact_test.cc',
   'classifier/masked_exact_test.cc',
   'classifier/range_backend_test.cc',
+  'classifier/firewall_table_test.cc',
   'classifier/generation_test.cc',
   'classifier/packed_value_store_test.cc',
   'classifier/cuckoo_exact_test.cc',
@@ -771,6 +775,7 @@ unit_test_sources = [
   'metadata_test.cc',
   'module_test.cc',
   'modules/acl_test.cc',
+  'modules/firewall_test.cc',
   'modules/arp_responder_test.cc',
   'modules/bridge_test.cc',
   'modules/bpf_test.cc',
@@ -1040,6 +1045,7 @@ test(
 
 if get_option('build_benchmarks')
   benchmark_sources = {
+    'classifier_firewall_table_bench': ['classifier/firewall_table_bench.cc', benchmark_main_dep],
     'fib_bench': ['fib_bench.cc', benchmark_dep],
     'mempool_bench': ['mempool_bench.cc', benchmark_dep],
     'packet_edit_plan_bench': ['packet_edit_plan_bench.cc', benchmark_main_dep],

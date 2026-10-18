@@ -124,6 +124,7 @@ Not reachable as a configuration error, but each one changes behavior.
 | `MAX_TRACE_DEPTH`, `MAX_TRACE_BUFSIZE` | 32, 4,096 B | `module.cc` | module call tracing, compiled only with `SN_TRACE_MODULES` |
 | `kPackedPriorityLimit` | ±32,767 | `classifier/concurrent_masked.h` | WildcardMatch priorities in this range are packed into the table value and compared there; outside it the rule's record supplies the rank (same result) |
 | `kMaskedMaxKeyBytes` | 64 B | `classifier/masked_exact.h` | widest masked key; sizes the packet path's stack scratch |
+| `kMaxIpv6ExtHeaders` | 4 | `modules/firewall.cc` | IPv6 extension headers a rule is judged through; a transport behind more of them is judged with both ports 0, so only a rule whose port range starts at 0 matches (D-147) |
 
 ## Internal batch bounds (not reachable from configuration)
 

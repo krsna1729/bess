@@ -4,9 +4,11 @@
 // definitions, whichever path this build takes (the vector kernels in an x86
 // build, the portable loops with -DBESS_ARCH_GENERIC or on arm64).
 
+#include "arch/masked_addr.h"
 #include "arch/tag_match.h"
 #include "arch/vlan.h"
 #include "arch/word_probe.h"
+#include "testing/rng.h"
 
 #include <gtest/gtest.h>
 
@@ -28,7 +30,7 @@ uint32_t MatchDefinition(const auto *lanes, int n, auto value) {
 }
 
 TEST(MatchTest, Tags16x8EqualDefinition) {
-  std::mt19937 rng(7);
+  std::mt19937 rng = bess::testing::SeededRng(7);
   alignas(16) uint16_t tags[8];
   for (int trial = 0; trial < 20000; trial++) {
     // A small alphabet makes matches (including several per bucket) likely;
@@ -46,7 +48,7 @@ TEST(MatchTest, Tags16x8EqualDefinition) {
 }
 
 TEST(MatchTest, Hashes32x4EqualDefinition) {
-  std::mt19937 rng(34);
+  std::mt19937 rng = bess::testing::SeededRng(34);
   alignas(16) uint32_t hashes[4];
   for (int trial = 0; trial < 20000; trial++) {
     const uint32_t base = trial & 1 ? 0x7ffffffe : 0;
@@ -121,6 +123,41 @@ TEST(VlanTest, InsertMovesTheAddressesBackAndFillsTheGap) {
   RemoveVlanTag(b.data());
   auto original = Numbered();
   EXPECT_TRUE(std::equal(b.begin() + 4, b.end(), original.begin() + 4));
+}
+
+TEST(MaskedAddrTest, PairAgreesWithThePortableDefinition) {
+  std::mt19937 rng = bess::testing::SeededRng(41);
+  alignas(32) uint8_t src[16];
+  alignas(32) uint8_t dst[16];
+  alignas(32) uint8_t mask_src[16];
+  alignas(32) uint8_t mask_dst[16];
+  alignas(32) uint8_t out[32];
+  for (int trial = 0; trial < 20000; trial++) {
+    for (size_t i = 0; i < 16; i++) {
+      src[i] = static_cast<uint8_t>(rng());
+      dst[i] = static_cast<uint8_t>(rng());
+      mask_src[i] = static_cast<uint8_t>(rng());
+      mask_dst[i] = static_cast<uint8_t>(rng());
+    }
+    // Whole-byte masks as well as arbitrary ones: a prefix mask has whole
+    // bytes set and one partial byte.
+    if (trial % 3 == 0) {
+      const size_t bits = static_cast<size_t>(rng() % 129);
+      for (size_t i = 0; i < 16; i++) {
+        mask_src[i] = i * 8 + 8 <= bits ? 0xff
+                                       : (i * 8 < bits ? static_cast<uint8_t>(
+                                                             0xffu << (8 - (bits - i * 8)))
+                                                       : 0);
+        mask_dst[i] = mask_src[15 - i];
+      }
+    }
+    MaskedAddrPair16x2(out, src, dst, mask_src, mask_dst);
+    for (size_t i = 0; i < 16; i++) {
+      ASSERT_EQ(static_cast<uint8_t>(src[i] & mask_src[i]), out[i]) << trial;
+      ASSERT_EQ(static_cast<uint8_t>(dst[i] & mask_dst[i]), out[16 + i])
+          << trial;
+    }
+  }
 }
 
 }  // namespace

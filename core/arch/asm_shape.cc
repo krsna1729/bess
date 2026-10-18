@@ -29,6 +29,7 @@
 #include "arch/byte_match.h"
 #include "arch/checksum_kernels.h"
 #include "arch/crc32c.h"
+#include "arch/masked_addr.h"
 #include "arch/tag_match.h"
 #include "arch/vlan.h"
 #include "arch/word_probe.h"
@@ -74,6 +75,12 @@ extern "C" {
 
 [[gnu::noinline]] void k_vlan_insert(void *p, uint32_t tag) {
   InsertVlanTag(p, tag);
+}
+
+[[gnu::noinline]] void k_maskpair16x2(void *out, const void *src,
+                                      const void *dst, const void *mask_src,
+                                      const void *mask_dst) {
+  MaskedAddrPair16x2(out, src, dst, mask_src, mask_dst);
 }
 
 }  // extern "C"
