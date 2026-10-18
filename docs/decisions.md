@@ -166,7 +166,8 @@ file is the reasoning.
 | D-144 | The gate byte counter is gone: `TrackArg.bits` was its only switch and every hook was installed with the default arg, so `bess_gate_bytes_total` could never appear; the feature went with it, while the field number and name stay reserved so no client can silently write the old one | accepted |
 | D-145 | The Go SDK ships as a nested module under module-prefixed tags (`sdk/go/vX.Y.Z`), consumed by pinning a tag or a commit; unpinned queries resolve through the repository's default branch, which is `develop`, while `master` stays the archival upstream mirror and no branch is renamed; `go.work` is a machine-local development shortcut, never how a consumer builds | accepted |
 | D-146 | C++, Python and Go are all first-class control_v2 SDKs, and the Python one is rebuilt clean-room: a fresh client taking `pybess.sdk`'s place - the same transaction discipline (one request id per logical transaction, recovery through `GetTransaction`, the daemon epoch, typed resources and typed outcomes) over the same wire, with no legacy service and no place in the runtime package (D-135). It amends D-104's count of two supported SDKs | accepted |
-| D-147 | The firewall table: a masked 5-tuple policy where a port range costs no tuple (the ports are checked after the group's masked key, so a range adds no group, no mask and no entry - what WildcardMatch cannot do without spending 2n-2 prefixes per field of its budget, D-102), IPv4 and IPv6 in one table (the family is part of a group's identity, so a v4 rule never sees a v6 packet and a rule with no prefix sees both), the first match in rule order wins, and a packet the table cannot judge is dropped rather than passed by a catch-all; the module publishes the whole policy as one `<name>/rules` singleton (D-129) | accepted |
+| D-147 | The firewall table: a masked 5-tuple policy where a port range costs no tuple (the ports are checked after the group's masked key, so a range adds no group, no mask and no entry - what WildcardMatch cannot do without spending 2n-2 prefixes per field of its budget, D-102), IPv4 and IPv6 in one table (the family is part of a group's identity, so a v4 rule never sees a v6 packet and a rule with no prefix sees both), the first match in rule order wins, and a packet the table cannot judge is dropped rather than passed by a catch-all; the module publishes the whole policy as one `<name>/rules` singleton (D-129). Amended 2026-10-18: the same policy can be **scanned** (`FirewallScan`) rather than indexed, sharing the index's predicate, validation and normalization so the two cannot drift | accepted |
+| D-148 | The desired-state clear is bounded in the daemon, not in the client: a listed resource owns its contents, so an empty list clears a map, and today that is one transaction with one op per entry - refused whole by the engine's retire budget (`retire_high_water()/2`, "split it"). `TransactionEngine::ApplyBatched` applies what fits and halves on the budget refusal, and `ApplyResourcesLocked` calls it; convergence rather than atomicity, and the busy retry moves inside it because a caller looping over the whole request would re-apply batches that already applied, an erase of an already-erased key being refused ("not found"), not ignored | accepted |
 
 
 ---
@@ -10498,3 +10499,49 @@ rather than vendor a copy, which is the outcome the UPF asked for and the one th
 - "the table is the library: any module can hold one and look up keys itself". That is three edits in one change
 (`core_public_subdir_headers` in `core/meson.build`, the class in `tools/api_classes.json`, and this record), as
 `api_classes.json`'s own comment requires: promoting a header is an edit in all three places.
+
+**Amended 2026-10-18: the same policy can be scanned instead of indexed.** `FirewallScan`, in the same header,
+holds the rules in policy order and answers `Lookup`/`LookupBatch` with the same `Match` shape, and it shares the
+three things that decide an answer rather than repeating them: the predicate (`Matches`, called with the key packed
+to each rule's own prefix lengths, which is what the index does per group), the validation (`CheckRule`, extracted
+from `Build`, so the two refuse the same policies with the same message) and the normalization (`NormalizeRule`,
+also extracted from `Build`: mask the addresses to their prefix lengths, derive the port-check flag). A scan pays
+one packing per rule rather than one per group - the measured crossover is 117 M vs 114 M keys/s at 10 rules and
+72x in the index's favour at 1,000 - so it is for a handful of rules, which is the shape a per-session policy has.
+The equivalence test walks 200 random policies times 200 random keys plus a 64-key batch through the index, the
+scan and the scalar reference, and it caught two real bugs in the scan before this landed: storing the caller's
+rule as given missed rules (unmasked addresses) and found rules it should not (an underived `checks_ports` flag,
+a full 0..65535 range being no check). Both fixes are the sharing above, which is the point: one predicate, one
+validation, one normalization, so the two structures cannot drift.
+
+## D-148 The desired-state clear is bounded in the daemon, not in the client
+
+**Context.** A pipeline that lists a resource owns its contents, so an empty list clears a map - the operation a
+controller wants to say when it means "empty these tables" rather than "tell me what is in them". What the
+desired-state path does today is build **one** transaction with **one op per entry**, under the control-plane
+lock: the enumeration moved to the daemon rather than removed. The engine refuses that transaction whole once it
+would retire more than `retire_high_water()/2` objects, with "more than one batch allows (N); split it" and the
+reservations aborted, so nothing becomes visible.
+
+**Decision.** The daemon splits; the caller's contract stays trivial. `TransactionEngine::ApplyBatched` applies
+the operations in batches, halving a batch the engine refuses as over budget, and `ApplyResourcesLocked` calls it
+instead of `Apply`. A caller cannot size the transaction itself - what one retires depends on the operations'
+cascades, not on their count - so it is found by asking rather than computed.
+
+**Convergence, not atomicity.** The batches that applied stay applied, and the next Apply finishes the rest
+because the desired state did not change. That is enough for a clear that runs before a controller serves
+traffic, and it is stated rather than assumed.
+
+**Consequence: the busy retry moves inside `ApplyBatched`.** A caller looping over the whole request after a
+`kBusy` would re-apply the batches that already applied - and an erase of an already-erased key is **refused**
+("not found"), not ignored. That was found by the test rather than by reasoning: the first version asserted a
+second clear would succeed and fit one transaction, and it failed with `kRejected` and "not found". The retry is
+therefore per batch, and the refusal is what proves convergence.
+
+**Evidence.** `TransactionEngineBatchingTest.ASetPastTheRetireBudgetIsSplitAndApplied` gives itself a domain with
+`retire_high_water = 8`, so the budget is 4 and a set of 16 entries must split (the runtime's own budget is 2048,
+larger than any table the shared fixture can hold - the first version of this test silently *skipped*, which is
+why it now owns its domain). It asserts the whole set is refused with `over_budget` set and nothing applied, that
+`ApplyBatched` applies it in more than one transaction counted from `outcome_counts()` rather than timed, and that
+a second clear reports the keys absent. The control-plane path is `ApplyResourcesLocked` (D-129's desired-state
+rules); the engine's budget itself is `retire_high_water()/2`, unchanged.
