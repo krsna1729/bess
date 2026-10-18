@@ -66,8 +66,9 @@ TSAN_DPDK_ARGS = '-DRTE_USE_C11_MEM_MODEL -DRTE_FORCE_INTRINSICS'
 # reads it from `ci_profile.py lanes`. The ubuntu-24.04 x86 pair gates. The
 # others are experimental and must not block a merge: the ubuntu-26.04 lanes
 # show toolchain and library drift (GCC 15, Clang 22) before it reaches the
-# gating lanes; the arm64 and generic lanes are new (M21) and gate once they
-# have been green. `push_only` lanes run on pushes to develop/master and tags,
+# gating lanes; the arm64 lanes gate and run on pull requests (develop requires
+# them), while the generic and release-semantics lanes are experimental.
+# `push_only` lanes run on pushes to develop/master and tags,
 # not on pull requests: they catch drift and portability breaks a release
 # later, and leaving them out halves a pull request's runner time. The
 # sanitizer lanes run on pull requests.
@@ -86,12 +87,15 @@ LANES = [
     # N2), the same compilers, DPDK bootstrap and steps as the gating pair,
     # built for the armv8.2-a floor. AF_XDP stays required: Ubuntu 24.04 ships
     # libxdp-dev/libbpf-dev for arm64.
-    # Gating since their first green run (d040ec6d; user decision, D-093).
-    # Still push_only: a pull request does not run them, the push does.
-    {'name': 'gcc-arm64', 'os': 'ubuntu-24.04-arm', 'cc': 'gcc-14', 'cxx': 'g++-14',
-     'push_only': True},
-    {'name': 'clang-arm64', 'os': 'ubuntu-24.04-arm', 'cc': 'clang-19', 'cxx': 'clang++-19',
-     'push_only': True},
+    # Gating since their first green run (d040ec6d; user decision, D-093), and
+    # they run on pull requests too, because `develop` requires them: a
+    # required check that a pull request never runs can never be satisfied, so
+    # every pull request sits blocked until an admin overrides the policy
+    # (2026-10-18). The runners are free on a public repository and the lanes
+    # run in parallel with the rest, so a pull request's wall clock is
+    # unchanged.
+    {'name': 'gcc-arm64', 'os': 'ubuntu-24.04-arm', 'cc': 'gcc-14', 'cxx': 'g++-14'},
+    {'name': 'clang-arm64', 'os': 'ubuntu-24.04-arm', 'cc': 'clang-19', 'cxx': 'clang++-19'},
     # Sanitizers (M22, D-072): ASan+UBSan over the unit, architecture, plugin
     # and fuzz-corpus suites; TSan over the concurrency tests in
     # tools/sanitizers/tsan_tests.txt. Experimental until green, then gating:

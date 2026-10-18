@@ -79,15 +79,17 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   clang-tidy; required since its first fully green run, 5c409d37),
   `gcc-arm64` and `clang-arm64` (green since d040ec6d), with `Protobuf
   compatibility`, are the required checks on `develop` (user decision,
-  2026-10-05, D-093). The arm64 lanes run on pushes only, so a pull request
-  cannot wait on them: a pushed break is fixed forward. The ubuntu-26.04
+  2026-10-05, D-093). The arm64 lanes run on pull requests too (2026-10-18):
+  `develop` requires them, and a required check that a pull request never runs
+  can never be satisfied, so every pull request sat blocked until an admin
+  overrode the policy. The ubuntu-26.04
   lanes stay experimental (a future distribution).
 - **Which lanes run when.** The lane table is `LANES` in `tools/ci_profile.py`;
   the workflow's `Lanes` job turns it into the matrix
   (`ci_profile.py lanes --event <event>`). Pull requests run the gating pair
-  (`gcc`, `clang`) and the sanitizer lanes; pushes to `develop`/`master` and
-  tags run every lane, adding arm64, generic, release-semantics and
-  ubuntu-26.04 (`push_only`).
+  (`gcc`, `clang`), the arm64 pair and the sanitizer lanes; pushes to
+  `develop`/`master` and tags run every lane, adding generic, release-semantics
+  and ubuntu-26.04 (`push_only`).
   A break those lanes catch shows up on the push and is fixed forward. A new
   push cancels the older run it supersedes: per pull request, per branch
   for pushes to `develop` and `master` (the tip's run covers every merged
