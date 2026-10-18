@@ -242,27 +242,26 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
         const uint16_t d_lo = port_dist(rng);
         const uint16_t d_hi = d_lo + (port_dist(rng) % 1000);
 
+        // Every rule gets a key, so every configuration is exercised. The key
+        // matches the value/mask by construction; when the mask leaves the
+        // ports free they must be inside the rule's range, or the rule's own
+        // range check rejects the key.
+        std::vector<std::byte> key(key_size);
+        for (size_t j = 0; j < key_size; j++) {
+          const std::byte m = j < mask.size() ? mask[j] : std::byte{0};
+          const std::byte v = j < value.size() ? value[j] : std::byte{0};
+          key[j] = (v & m) | (static_cast<std::byte>(byte_dist(rng)) &
+                              static_cast<std::byte>(~static_cast<int>(m)));
+        }
         if (ports_free) {
-          std::vector<std::byte> key(key_size);
-          for (size_t j = 0; j < key_size; j++) {
-            const std::byte m =
-                j < mask.size() ? mask[j] : std::byte{0};
-            const std::byte v =
-                j < value.size() ? value[j] : std::byte{0};
-            key[j] = (v & m) |
-                     (static_cast<std::byte>(byte_dist(rng)) &
-                      static_cast<std::byte>(~static_cast<int>(m)));
-          }
           const be16_t src_port{static_cast<uint16_t>(
               s_lo + (port_dist(rng) % (s_hi - s_lo + 1)))};
           const be16_t dst_port{static_cast<uint16_t>(
               d_lo + (port_dist(rng) % (d_hi - d_lo + 1)))};
           std::memcpy(key.data() + src_off, &src_port, sizeof(src_port));
           std::memcpy(key.data() + dst_off, &dst_port, sizeof(dst_port));
-          rule_keys.push_back(std::move(key));
-        } else {
-          rule_keys.emplace_back();
         }
+        rule_keys.push_back(std::move(key));
 
         rules.push_back({
             .value = std::move(value),
@@ -318,6 +317,10 @@ TEST(RangeBackendTest, DifferentialFuzzAgainstScalarReference) {
         }
         keys.push_back(std::move(random_key));
       }
+      // A configuration whose rules yield no keys would pass vacuously.
+      ASSERT_GT(keys.size(), 0u)
+          << "no keys for key size " << key_size << ", mask length "
+          << mask_len;
 
       for (size_t b = 0; b < keys.size(); b += kBatchSize) {
         const size_t count = std::min(kBatchSize, keys.size() - b);

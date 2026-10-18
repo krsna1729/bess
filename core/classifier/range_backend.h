@@ -122,7 +122,12 @@ class ScalarRangeBackend {
   [[nodiscard]] uint64_t LookupBatch(ConstBytes keys, size_t key_stride,
                                      size_t key_size,
                                      std::span<Result> results) const noexcept {
-    const size_t count = std::min(results.size(), size_t{64});
+    // Never read past the key buffer: a caller may pass more result slots
+    // than it has keys. A zero stride means there is no first key.
+    const size_t count =
+        key_stride == 0
+            ? 0
+            : std::min({results.size(), keys.size() / key_stride, size_t{64}});
     uint64_t hit_mask = 0;
 
     for (size_t i = 0; i < count; i++) {
@@ -222,7 +227,12 @@ class RangeClassifier {
   [[nodiscard]] uint64_t LookupBatch(ConstBytes keys, size_t key_stride,
                                      size_t key_size,
                                      std::span<Result> results) const noexcept {
-    const size_t count = std::min(results.size(), size_t{64});
+    // Never read past the key buffer: a caller may pass more result slots
+    // than it has keys. A zero stride means there is no first key.
+    const size_t count =
+        key_stride == 0
+            ? 0
+            : std::min({results.size(), keys.size() / key_stride, size_t{64}});
     uint64_t hit_mask = 0;
 
     for (size_t i = 0; i < count; i++) {
