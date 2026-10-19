@@ -11132,9 +11132,10 @@ allocation:
   which also serializes the ledger's `VisitReferences` walk -- while removal stays frozen after enrollment.
   D-046's `max_domains` sentence ("creates domains `0..n-1` at `Init()`") no longer describes the module.
 - **The two locks nest in both orders, and one lock above them is what makes that safe.** A transaction holds
-  the engine's lock and then takes the router's (`ApplyImpl` -> `RouteResource::Reserve`); enrollment, release
-  and the group-reference walk take the router's and then the engine's. They cannot interleave: every path that
-  takes either pair runs under the control plane's mutex (`ApplyTransaction`/`ApplyPipeline` for transactions,
+  the engine's lock and then takes the router's (`ApplyImpl` -> `RouteResource::Reserve`); enrollment and
+  release take the router's and then the engine's. The group-reference read is not a third edge: it copies the
+  registry and its name under the router's lock and takes the engine's after releasing it. They cannot
+  interleave: every path that takes either pair runs under the control plane's mutex (`ApplyTransaction`/`ApplyPipeline` for transactions,
   `CreateModule`/`DestroyModule` for Init/DeInit), and only one thread holds it. TSan's lock-order detector
   works on the observed lock-order graph and cannot see that outer lock, so the cycle it reports at `Reserve`
   is suppressed in `tools/sanitizers/tsan.supp`, where the two edges are written down.

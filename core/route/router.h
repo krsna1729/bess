@@ -251,11 +251,10 @@ class Router {
   std::expected<void, RouteError> SetRoute(RouteDomainId domain, Ipv4Prefix prefix,
                                            NextHopGroupId group);
   size_t next_hop_group_count() const;
-  // Routes naming group `id`, across all domains. Enrolled, this takes the
-  // engine's lock while holding the router's -- the opposite order to a
-  // transaction's apply -- so a caller outside the engine's own paths must
-  // hold the control plane's mutex, the lock that serialises the two orders
-  // (tools/sanitizers/tsan.supp, D-158).
+  // Routes naming group `id`, across all domains. Takes the engine's lock
+  // after releasing this one, never nested -- the two are taken in both orders
+  // elsewhere (tools/sanitizers/tsan.supp, D-158). `engine_` is replaced only
+  // by Enroll/Release, which the module lifecycle serialises with this call.
   size_t GroupReferences(NextHopGroupId id) const;
   // Groups naming next hop `id` (counted once per member position).
   size_t GroupMemberships(NextHopId id) const;
