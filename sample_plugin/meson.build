@@ -7,6 +7,16 @@ sample_plugin = shared_module(
   ],
   include_directories: [core_include, core_pb_inc, sample_pb_inc],
   dependencies: [dpdk_dep, glog_dep, protobuf_dep, grpcpp_dep],
+  # A plugin must stay unloadable. GCC's default -fgnu-unique gives a static
+  # local inside an inline function STB_GNU_UNIQUE binding, and protobuf's
+  # generated enum helpers instantiate one (NameOfDenseEnum's static string)
+  # as soon as a module calls, say, UsageReportMode_Name(). glibc then marks
+  # the dlopen'ed object NODELETE at load, so dlclose() never unmaps it and
+  # UnloadPlugin refuses (plugin_loader.cc's "stays mapped after dlclose") --
+  # a module that merely names its own enum in GetDesc() makes the whole
+  # plugin permanent. The flag costs a plugin nothing: it has no other object
+  # to share the symbol with.
+  cpp_args: cpp.get_supported_arguments('-fno-gnu-unique'),
   build_rpath: dpdk_libdir,
   install: true,
   install_dir: join_paths(get_option('libdir'), 'bess', 'modules'),
