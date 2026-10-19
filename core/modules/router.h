@@ -117,7 +117,8 @@ class Router final : public Module {
   // What destination routing dropped, by reason (relaxed, as above): a frame
   // that is not IP, one whose headers do not parse, one that is not the first
   // fragment of its datagram, one the FIB has no route for, one whose hop's
-  // neighbor is not resolved, and one whose TTL ran out.
+  // neighbor is not resolved, one whose TTL ran out, and one whose hop forwards
+  // nowhere (a blackhole route, D-160).
   uint64_t not_ipv4_frames() const noexcept {
     return not_ipv4_frames_.load(std::memory_order_relaxed);
   }
@@ -136,6 +137,9 @@ class Router final : public Module {
   uint64_t ttl_expired_frames() const noexcept {
     return ttl_expired_frames_.load(std::memory_order_relaxed);
   }
+  uint64_t blackholed_frames() const noexcept {
+    return blackholed_frames_.load(std::memory_order_relaxed);
+  }
 
  private:
   // Mode 1 (D-155): resolve the `next_hop_id` each packet carries.
@@ -144,7 +148,8 @@ class Router final : public Module {
   // FIB, then run the forwarding chain the appliance runs.
   void RouteByDestination(Context *ctx, bess::PacketBatch *batch);
   // One counter per verdict the chain reports (route/forward.h). kForward is
-  // not a drop and kNoEgress is a hop nobody configured: neither is counted.
+  // not a drop; kNoEgress is the blackhole shape (D-160), counted apart from a
+  // miss because the route exists and chose that hop.
   void CountVerdict(bess::route::ForwardVerdict verdict);
 
   std::unique_ptr<bess::route::Router> router_;
@@ -166,6 +171,9 @@ class Router final : public Module {
   std::atomic<uint64_t> no_route_frames_{0};
   std::atomic<uint64_t> unresolved_frames_{0};
   std::atomic<uint64_t> ttl_expired_frames_{0};
+  // A route sent the frame to a hop that names no egress interface: the
+  // blackhole shape (D-160), counted apart from a miss.
+  std::atomic<uint64_t> blackholed_frames_{0};
 };
 
 #endif  // BESS_MODULES_ROUTER_H_

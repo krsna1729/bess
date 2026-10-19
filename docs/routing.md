@@ -50,6 +50,12 @@ one object store, not a route update, so there is no churn and no transient hole
 is the same shape one level up: the FIB names the group, and the group's member is chosen by the frame's own
 flow hash (`route::FlowHash`), so a flow keeps one member (D-156).
 
+A next hop whose egress interface is absent (`kInvalidInterfaceId`; on the module's wire, `egress_gate =
+DROP_GATE`) forwards nowhere: the chain reports `kNoEgress` and the packet ends there. That is the blackhole
+shape -- `0.0.0.0/0` to such a hop is the domain's default that drops, and a local `/32` uses it for the
+node's own address -- and the module counts what it drops as `blackholed`, apart from `no route`, because the
+route exists and chose that hop (D-160).
+
 ## The pieces
 
 | file | what it is |
@@ -99,8 +105,8 @@ change what it decides from because a graph's wiring changed underneath it. In d
 
 The module owns: the mode, the gate map (`modules/router_gate_map.h` — a hop's egress interface to an output
 gate), the counters (one per outcome of the chain: not IPv4, malformed, non-initial fragment, no route,
-unresolved neighbor, TTL expired, header-write failure), and the copy a shared payload needs before its header
-is written.
+unresolved neighbor, TTL expired, a hop that forwards nowhere (D-160), header-write failure), and the copy a
+shared payload needs before its header is written.
 
 The application owns everything that is policy: which domain a packet is in (an interface, a VIF, a port), what
 an unresolved neighbor means (R1 drops it; a graph may punt it), where the TTL is decremented (`UpdateTTL` in
@@ -128,6 +134,7 @@ id), and it is cheaper to reuse than to grow a second prefix table.
 
 - `docs/dataplane-tables.md` — the tables themselves, their capacities and their update costs.
 - `docs/decisions.md` — D-046 (domains), D-111 (the LPM resource), D-132 (the FIB backends), D-153 (address
-  writes), D-155 (routing by destination), D-156 (groups), D-157 (the shared chain), D-158 (lazy domains).
+  writes), D-155 (routing by destination), D-156 (groups), D-157 (the shared chain), D-158 (lazy domains),
+  D-160 (a hop that forwards nowhere).
 - `examples/appliances/router/router_app.h` — R1, the reference application, and `examples/static_router` for
   the same code as a program without `bessd`.

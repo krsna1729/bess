@@ -11184,3 +11184,33 @@ D-154) landed on the same principle.
 measures the three paths (`core/stats/counter_paths_bench.cc`); no in-tree module uses them yet, and the first
 consumer will be a module that owns counters, which is the plan's own next step. A controller that wants a
 watch arms it through the owning module's action, and a module's tick is where a fill watch lives.
+
+## D-160 A hop that forwards nowhere is a blackhole route, and the module counts it
+
+**Status:** accepted (2026-10-19; the plan's item 6: "reserve a null/blackhole route value, so `0.0.0.0/0` →
+drop (OMEC's default) can be expressed per domain").
+
+**Decision.** A next hop whose `egress` is `kInvalidInterfaceId` forwards nowhere: the chain reports
+`kNoEgress` for a frame that reaches it, and the route that chose it is the blackhole shape -- a default route
+that drops, or a local `/32` for the node's own address. The library names the shape
+(`route::BlackholeNextHop()`), the module's wire can already express it (`egress_gate = DROP_GATE`, the one
+accepted value outside `[0, MAX_GATES)`; `router_gate_map.h`), and the module counts what the chain drops for
+it as `blackholed_frames`, beside `no_route_frames`.
+
+**Why.** The shape was expressible but invisible: a frame a route dropped at a hop with no interface moved no
+counter, so an operator could not see a blackhole route's traffic at all. It is also not a miss -- the route
+exists and chose that hop -- and the two want different answers (a blackhole is intentional; a miss is a gap
+in the FIB), so they are counted apart and `GetDesc` reports both. A hop with a valid egress and an unresolved
+neighbor stays `unresolved`: what drops a frame here is the absence of an interface, not the absence of an
+address.
+
+**Consequences.** A domain can now hold a default route that drops: `0.0.0.0/0` to a hop written with
+`egress_gate = DROP_GATE`. Nothing else moved -- the packet path is the same `Resolve` it was, the wire format
+is unchanged, `NextHop` is the same 16 bytes (`BlackholeNextHop()` is a factory for the existing shape), and
+`kNoEgress` is now counted where it was previously silent.
+
+**Evidence.** `RouterTest` 22/22 on `build/fast`, including the new
+`ARouteToAHopThatForwardsNowhereIsABlackhole`: a `0.0.0.0/0` route to a `DROP_GATE` hop drops the frame,
+`blackholed_frames()` is 1, `no_route_frames()` and `unresolved_frames()` stay 0, and `GetDesc` says
+"blackholed: 1". The chain itself has no separate unit test; the module's destination tests exercise it, and
+this case is the first to reach a hop that names no egress interface.

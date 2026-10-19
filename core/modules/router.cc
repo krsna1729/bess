@@ -461,8 +461,9 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
   EmitBatch(ctx, batch, gates);
 }
 
-// One counter per verdict the chain reports (route/forward.h). kForward is
-// not a drop and kNoEgress is a hop nobody configured: neither is counted.
+// One counter per verdict the chain reports (route/forward.h). kForward is not
+// a drop; kNoEgress is the blackhole shape (D-160), counted apart from a miss
+// because the route exists and chose that hop.
 void Router::CountVerdict(route::ForwardVerdict verdict) {
   switch (verdict) {
     case route::ForwardVerdict::kNotIpv4:
@@ -483,8 +484,13 @@ void Router::CountVerdict(route::ForwardVerdict verdict) {
     case route::ForwardVerdict::kTtlExpired:
       ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
       return;
-    case route::ForwardVerdict::kForward:
     case route::ForwardVerdict::kNoEgress:
+      // A route to a hop that names no egress interface: the blackhole shape
+      // (D-160). Counted, unlike a hop whose interface has no gate in this
+      // graph (the adapter's own check, which is configuration).
+      blackholed_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kForward:
       return;
   }
 }
@@ -581,14 +587,15 @@ std::string Router::GetDesc() const {
   return bess::utils::Format(
       "%zu routes, %zu next hops, %zu groups, %zu header write failures, routing by "
       "destination (not ipv4: %zu, malformed: %zu, non-initial fragments: %zu, "
-      "no route: %zu, unresolved: %zu, ttl expired: %zu)",
+      "no route: %zu, unresolved: %zu, ttl expired: %zu, blackholed: %zu)",
       router_->route_count(), router_->next_hop_count(),
       router_->next_hop_group_count(),
       static_cast<size_t>(header_write_failures()),
       static_cast<size_t>(not_ipv4_frames()), static_cast<size_t>(malformed_frames()),
       static_cast<size_t>(non_initial_fragments()), static_cast<size_t>(no_route_frames()),
       static_cast<size_t>(unresolved_frames()),
-      static_cast<size_t>(ttl_expired_frames()));
+      static_cast<size_t>(ttl_expired_frames()),
+      static_cast<size_t>(blackholed_frames()));
 }
 
 ADD_MODULE(Router, "router",

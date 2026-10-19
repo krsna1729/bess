@@ -50,6 +50,15 @@ enum class NeighborState : uint8_t {
 // L2 addresses to write when the neighbor is resolved. What to do with packets
 // toward an unresolved neighbor (queue, punt, drop) is the application's.
 //
+// A hop with no egress interface (`kInvalidInterfaceId`) forwards nowhere: the
+// chain reports `kNoEgress` for a frame that reaches it, and the caller counts
+// that as its own outcome. It is the shape of a blackhole route -- a default
+// route that drops, a prefix this node refuses to forward (D-160,
+// `BlackholeNextHop()`) -- and of a local /32, the node's own address, which is
+// not forwarded either. Such a hop names no addresses and its neighbor state is
+// irrelevant: a route to it is meant to end the packet, not to resolve
+// anything.
+//
 // `egress` is a logical interface (`dataplane::InterfaceId`, zero = none), not
 // a graph gate: the owner maps it to a gate, a port and queue, or a hardware
 // action (M7, D-049). This library knows nothing of any of them.
@@ -64,6 +73,18 @@ struct NextHop {
 // straddles two. A 32-bit egress made it 20 bytes and cost a hot 1K-route
 // lookup 14% (D-060).
 static_assert(sizeof(NextHop) == 16, "a next hop is 16 bytes");
+
+// A next hop that forwards nowhere: no egress interface (D-160). A route to it
+// blackholes a prefix -- `0.0.0.0/0` to this is the domain's default that
+// drops, and it is the shape a local /32 uses for the node's own address. What
+// the chain reports for it (`kNoEgress`) is a caller's outcome to count, and it
+// is not a miss: the route exists.
+inline NextHop BlackholeNextHop() noexcept {
+  NextHop hop;
+  hop.egress = dataplane::kInvalidInterfaceId;
+  hop.neighbor = NeighborState::kResolved;
+  return hop;
+}
 
 // Writes `hop`'s destination and source MAC into the packet's Ethernet
 // header. Requires the header in the first segment and exclusive payload
