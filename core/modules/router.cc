@@ -630,15 +630,17 @@ std::string Router::GetDesc() const {
         static_cast<size_t>(unresolved_frames()),
         static_cast<size_t>(ttl_expired_frames()),
         static_cast<size_t>(blackholed_frames()));
-  }
-  // A punt is configuration a reader has to know about (D-162): without it,
-  // the two counters above mean "dropped".
-  if (punt_miss_gate_ != DROP_GATE) {
-    desc += bess::utils::Format(", a miss punts to gate %d", punt_miss_gate_);
-  }
-  if (punt_unresolved_gate_ != DROP_GATE) {
-    desc += bess::utils::Format(", an unresolved neighbor punts to gate %d",
-                                punt_unresolved_gate_);
+    // A punt is configuration a reader has to know about (D-162): without it,
+    // the counters above mean "dropped". Only the destination path has punt
+    // gates -- the next-hop-id path forwards what the attribute names and
+    // drops everything else -- so only its desc mentions them.
+    if (punt_miss_gate_ != DROP_GATE) {
+      desc += bess::utils::Format(", a miss punts to gate %d", punt_miss_gate_);
+    }
+    if (punt_unresolved_gate_ != DROP_GATE) {
+      desc += bess::utils::Format(", an unresolved neighbor punts to gate %d",
+                                  punt_unresolved_gate_);
+    }
   }
   return desc;
 }

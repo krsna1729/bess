@@ -539,6 +539,20 @@ TEST_F(RouterTest, ABlackholeHopIsNotAnUnresolvedNeighbor) {
   EXPECT_EQ(0u, rt->no_route_frames());
 }
 
+// D-162: only the destination path has punt gates. A next-hop-id router armed
+// with them forwards what the attribute names and drops everything else, so
+// its desc must not advertise a punt a reader would look for.
+TEST_F(RouterTest, ANextHopIdRouterDoesNotAdvertisePuntGates) {
+  bess::pb::RouterArg arg;
+  arg.set_punt_miss_gate(2);
+  arg.set_punt_unresolved_gate(3);
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  EXPECT_EQ(std::string::npos, rt->GetDesc().find("punts to gate")) << rt->GetDesc();
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("next-hop id from metadata"))
+      << rt->GetDesc();
+}
+
 // D-162: a punt gate sends what the destination path cannot forward to a slow
 // path instead of dropping it -- a miss and an unresolved neighbor to their own
 // gates -- and the counter still records what happened.
