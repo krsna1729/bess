@@ -11286,3 +11286,32 @@ round-trip sample set without the IPLookup row, including the `rt/routes` cleari
 this change was prepared); buf is not installed on this workstation, so CI's "Protobuf compatibility" job is
 the standing re-check. A repository-wide search for `IPLookup`/`ip_lookup`/`iplookup` leaves only the
 historical documents and comments named above.
+
+## D-162 A miss and an unresolved neighbor can punt to a gate, beside drop and count
+
+**Status:** accepted (2026-10-19; the plan's item 3: "miss/unresolved punt policy as args beside drop+count").
+
+**Decision.** `RouterArg` gains `punt_miss_gate` and `punt_unresolved_gate`. A frame the destination path
+cannot forward -- the FIB has no route for its destination, or the route's hop names an unresolved neighbor --
+leaves on that gate instead of being dropped. 0 (the proto default) and `DROP_GATE` both mean drop, which is
+what the module did before; any other value must be a gate the graph can have (`IsValidGateValue`), and a bad
+value is refused at `Init`, like an unknown mode. The frame is counted either way, so `no_route_frames` and
+`unresolved_frames` stay the record of what happened, and `GetDesc` says when a punt is configured.
+
+**Why.** The module's drop is the right default and the wrong only answer: a controller wants the frame (a
+routing daemon's slow path, an ICMP generator, a capture), and the application that owns the policy -- the same
+split D-155 drew for the mode -- can only implement it if the module hands the frame over instead of freeing
+it. The punt is a gate, not a callback, so the graph decides what happens there with the modules it already
+has, and the packet path pays nothing: the check is a comparison against `DROP_GATE` on a path that is already
+dropping.
+
+**Consequences.** A graph that wants a miss punted wires a module to that gate and sets the arg; nothing else
+changes -- the counters, the mode, the chain and the wire format are as they were, and with neither arg set the
+behaviour is byte-identical to the previous one. Gate 0 is a real gate and is not a punt target: 0 in the field
+means "no punt" (the proto says so), and that is this shape's one asymmetry. R1 still drops; a punt is a
+graph's choice.
+
+**Evidence.** `RouterTest` 24/24 on `build/fast`, including
+`AMissAndAnUnresolvedNeighborPuntToTheirGates` (a miss leaves on the miss gate, an unresolved neighbor on the
+unresolved gate, a forwarded frame is untouched by the policy, and both counters still move) and
+`AnInvalidPuntGateIsRefused`.

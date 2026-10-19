@@ -176,6 +176,16 @@ class RouterTest : public ::testing::Test {
     return dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
   }
 
+  // A destination-mode router that punts what it cannot forward (D-162): a miss
+  // to `miss_gate`, an unresolved neighbor to `unresolved_gate`.
+  Router *MakePuntingRouter(uint64_t miss_gate, uint64_t unresolved_gate) {
+    bess::pb::RouterArg arg;
+    arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
+    arg.set_punt_miss_gate(miss_gate);
+    arg.set_punt_unresolved_gate(unresolved_gate);
+    return dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  }
+
   // A next hop: egress gate `gate`, addresses named or not (D-129).
   void MakeHop(Router *rt, uint32_t id, uint64_t gate, const char *dst_mac, const char *src_mac,
                bess::pb::RouterNeighborState neighbor = bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED) {
@@ -498,6 +508,48 @@ TEST_F(RouterTest, ARouteToAHopThatForwardsNowhereIsABlackhole) {
   EXPECT_EQ(0u, rt->no_route_frames()) << "the route exists: this is not a miss";
   EXPECT_EQ(0u, rt->unresolved_frames()) << "a hop that forwards nowhere resolves nothing";
   EXPECT_NE(std::string::npos, rt->GetDesc().find("blackholed: 1")) << rt->GetDesc();
+}
+
+// D-162: a punt gate sends what the destination path cannot forward to a slow
+// path instead of dropping it -- a miss and an unresolved neighbor to their own
+// gates -- and the counter still records what happened.
+TEST_F(RouterTest, AMissAndAnUnresolvedNeighborPuntToTheirGates) {
+  Router *rt = MakePuntingRouter(/*miss_gate=*/2, /*unresolved_gate=*/3);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa",
+          bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);
+  MakeHop(rt, 2, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);      // hop 1: unresolved
+  MakeRoute(rt, "192.168.0.0", 16, 0, 2);  // hop 2: resolved
+
+  const std::vector<gate_idx_t> ogates = {0, 1, 2, 3};
+  auto unresolved = RunToDestination(rt, FrameTo("10.1.2.3"), 0, ogates);
+  EXPECT_TRUE(unresolved[0].empty());
+  EXPECT_TRUE(unresolved[1].empty());
+  ASSERT_EQ(1u, unresolved[3].size()) << "the unresolved punt gate";
+  EXPECT_EQ(1u, rt->unresolved_frames());
+
+  auto miss = RunToDestination(rt, FrameTo("172.16.1.1"), 0, ogates);
+  ASSERT_EQ(1u, miss[2].size()) << "the miss punt gate";
+  EXPECT_TRUE(miss[3].empty()) << "not the unresolved one";
+  EXPECT_EQ(1u, rt->no_route_frames());
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("a miss punts to gate 2"))
+      << rt->GetDesc();
+
+  // What forwards is untouched by the policy.
+  auto routed = RunToDestination(rt, FrameTo("192.168.1.1"), 0, ogates);
+  ASSERT_EQ(1u, routed[1].size()) << "the hop's own egress gate";
+  EXPECT_TRUE(routed[2].empty());
+  EXPECT_TRUE(routed[3].empty());
+}
+
+// A punt gate that is not a gate this graph can have is refused at Init, like
+// an unknown mode (D-162).
+TEST_F(RouterTest, AnInvalidPuntGateIsRefused) {
+  bess::pb::RouterArg arg;
+  arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
+  arg.set_punt_miss_gate(70000);  // beyond MAX_GATES and not DROP_GATE
+  EXPECT_NE("", h_.CreateError("Router", arg));
 }
 
 // TTL 0 and 1 expire (nothing is forwarded); 2 leaves as 1 -- the boundary

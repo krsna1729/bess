@@ -119,6 +119,21 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     return CommandFailure(EINVAL, "unknown route mode %d", static_cast<int>(arg.mode()));
   }
   mode_ = arg.mode();
+  // The punt gates (D-162): 0 is the proto default and DROP_GATE the explicit
+  // spelling, and both mean drop and count. Any other value must be a gate
+  // this graph can have; gate 0 itself is a real gate and is not a target.
+  if (!bess::IsValidGateValue(arg.punt_miss_gate()) ||
+      !bess::IsValidGateValue(arg.punt_unresolved_gate())) {
+    return CommandFailure(EINVAL, "invalid punt gate %llu/%llu",
+                          static_cast<unsigned long long>(arg.punt_miss_gate()),
+                          static_cast<unsigned long long>(arg.punt_unresolved_gate()));
+  }
+  punt_miss_gate_ = arg.punt_miss_gate() == 0
+                        ? DROP_GATE
+                        : static_cast<gate_idx_t>(arg.punt_miss_gate());
+  punt_unresolved_gate_ = arg.punt_unresolved_gate() == 0
+                              ? DROP_GATE
+                              : static_cast<gate_idx_t>(arg.punt_unresolved_gate());
   route::LpmRouteTable::Config config;
   config.max_routes = arg.max_routes() ? arg.max_routes() : 4096;
   config.tbl8_groups = arg.max_tbl8s() ? arg.max_tbl8s() : 256;
@@ -535,6 +550,19 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
         std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), pkt.total_len());
     if (resolved.verdict != route::ForwardVerdict::kForward) {
       CountVerdict(resolved.verdict);
+      // A punt gate is the application's slow path (D-162): a frame the
+      // destination path cannot forward leaves on it instead of being
+      // dropped, and it is counted either way, so the counters stay the
+      // record of what happened.
+      const gate_idx_t punt =
+          resolved.verdict == route::ForwardVerdict::kNoRoute
+              ? punt_miss_gate_
+              : resolved.verdict == route::ForwardVerdict::kUnresolved
+                    ? punt_unresolved_gate_
+                    : DROP_GATE;
+      if (punt != DROP_GATE) {
+        gates[i] = punt;
+      }
       continue;
     }
     const gate_idx_t gate = GateOf(resolved.egress);
@@ -577,25 +605,37 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
 }
 
 std::string Router::GetDesc() const {
+  std::string desc;
   if (!routes_by_destination()) {
-    return bess::utils::Format(
+    desc = bess::utils::Format(
         "%zu routes, %zu next hops, %zu groups, %zu header write failures, next-hop id from metadata",
         router_->route_count(), router_->next_hop_count(),
         router_->next_hop_group_count(),
         static_cast<size_t>(header_write_failures()));
+  } else {
+    desc = bess::utils::Format(
+        "%zu routes, %zu next hops, %zu groups, %zu header write failures, routing by "
+        "destination (not ipv4: %zu, malformed: %zu, non-initial fragments: %zu, "
+        "no route: %zu, unresolved: %zu, ttl expired: %zu, blackholed: %zu)",
+        router_->route_count(), router_->next_hop_count(),
+        router_->next_hop_group_count(),
+        static_cast<size_t>(header_write_failures()),
+        static_cast<size_t>(not_ipv4_frames()), static_cast<size_t>(malformed_frames()),
+        static_cast<size_t>(non_initial_fragments()), static_cast<size_t>(no_route_frames()),
+        static_cast<size_t>(unresolved_frames()),
+        static_cast<size_t>(ttl_expired_frames()),
+        static_cast<size_t>(blackholed_frames()));
   }
-  return bess::utils::Format(
-      "%zu routes, %zu next hops, %zu groups, %zu header write failures, routing by "
-      "destination (not ipv4: %zu, malformed: %zu, non-initial fragments: %zu, "
-      "no route: %zu, unresolved: %zu, ttl expired: %zu, blackholed: %zu)",
-      router_->route_count(), router_->next_hop_count(),
-      router_->next_hop_group_count(),
-      static_cast<size_t>(header_write_failures()),
-      static_cast<size_t>(not_ipv4_frames()), static_cast<size_t>(malformed_frames()),
-      static_cast<size_t>(non_initial_fragments()), static_cast<size_t>(no_route_frames()),
-      static_cast<size_t>(unresolved_frames()),
-      static_cast<size_t>(ttl_expired_frames()),
-      static_cast<size_t>(blackholed_frames()));
+  // A punt is configuration a reader has to know about (D-162): without it,
+  // the two counters above mean "dropped".
+  if (punt_miss_gate_ != DROP_GATE) {
+    desc += bess::utils::Format(", a miss punts to gate %d", punt_miss_gate_);
+  }
+  if (punt_unresolved_gate_ != DROP_GATE) {
+    desc += bess::utils::Format(", an unresolved neighbor punts to gate %d",
+                                punt_unresolved_gate_);
+  }
+  return desc;
 }
 
 ADD_MODULE(Router, "router",

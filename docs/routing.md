@@ -108,10 +108,12 @@ gate), the counters (one per outcome of the chain: not IPv4, malformed, non-init
 unresolved neighbor, TTL expired, a hop that forwards nowhere (D-160), header-write failure), and the copy a
 shared payload needs before its header is written.
 
-The application owns everything that is policy: which domain a packet is in (an interface, a VIF, a port), what
-an unresolved neighbor means (R1 drops it; a graph may punt it), where the TTL is decremented (`UpdateTTL` in
-the graph, or the chain when the module routes by destination), and ICMP/uRPF (not the Router's business). A
-packet whose destination has no route and a packet whose neighbor is unresolved are distinct, counted outcomes.
+The application owns everything that is policy: which domain a packet is in (an interface, a VIF, a port), where
+the TTL is decremented (`UpdateTTL` in the graph, or the chain when the module routes by destination), and
+ICMP/uRPF (not the Router's business). A packet whose destination has no route and a packet whose neighbor is
+unresolved are distinct, counted outcomes; the module drops both by default, and it can send either to a gate
+instead (`punt_miss_gate`, `punt_unresolved_gate`, D-162) -- the frame is counted either way, so the counters
+stay the record of what happened.
 
 ## Domains are cheap: `max_domains` is a bound
 
