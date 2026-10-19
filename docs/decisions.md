@@ -11045,7 +11045,7 @@ replaces the need for it.
 
 - **`ResolveFrame(router, domain, frame, total_len)` reads.** The checked parse (`conntrack::ParseFrame`), the
   destination resolved in `domain` by the frame's own flow hash (`route::FlowHash`, so a group route picks the
-  same member in both paths), the neighbor check, the egress check, and the TTL read. It returns
+  same member in both paths), the egress check, the neighbor check, and the TTL read. It returns
   `FrameRoute{verdict, hop, egress, l3_offset}` and writes nothing, so a caller that drops a frame never makes
   it writable -- the property the module's packet path had by hand (a shared payload is not copied for a packet
   that must expire).
@@ -11080,7 +11080,8 @@ before a caller can consult its own gate map, so a hop whose egress maps to no g
 before the gate is consulted. That ordering is unobservable in the tree: the module cannot hold such a hop
 (every next hop it accepts passes `IsValidGateValue` and `InterfaceOf`, `modules/router_gate_map.h`, so
 `GateOf` returns `DROP_GATE` only for egress 0, which the chain reports as `kNoEgress` before it reads the
-TTL, uncounted as before), and a direct `route::Router` caller has no gate map and no counters of its own --
+TTL -- counted as blackholed, D-160), and a direct `route::Router` caller has no gate map and no counters of
+its own --
 its path read the TTL at the same point, after the neighbor check. A caller that both set an unmapped
 `NextHop::egress` and consulted a gate map would see the difference; the tree has none.
 
@@ -11131,9 +11132,10 @@ allocation:
   which also serializes the ledger's `VisitReferences` walk -- while removal stays frozen after enrollment.
   D-046's `max_domains` sentence ("creates domains `0..n-1` at `Init()`") no longer describes the module.
 - **The two locks nest in both orders, and one lock above them is what makes that safe.** A transaction holds
-  the engine's lock and then takes the router's (`ApplyImpl` -> `RouteResource::Reserve`); enrollment, release
-  and the group-reference walk take the router's and then the engine's. They cannot interleave: every path that
-  takes either pair runs under the control plane's mutex (`ApplyTransaction`/`ApplyPipeline` for transactions,
+  the engine's lock and then takes the router's (`ApplyImpl` -> `RouteResource::Reserve`); enrollment and
+  release take the router's and then the engine's. The group-reference read is not a third edge: it copies the
+  registry and its name under the router's lock and takes the engine's after releasing it. They cannot
+  interleave: every path that takes either pair runs under the control plane's mutex (`ApplyTransaction`/`ApplyPipeline` for transactions,
   `CreateModule`/`DestroyModule` for Init/DeInit), and only one thread holds it. TSan's lock-order detector
   works on the observed lock-order graph and cannot see that outer lock, so the cycle it reports at `Reserve`
   is suppressed in `tools/sanitizers/tsan.supp`, where the two edges are written down.
@@ -11328,8 +11330,10 @@ appliance keeps the default. An unknown value keeps the default rather than fail
 
 **Why.** The chain's own comment said the choice was the deployment's ("Which fields a deployment hashes is
 its own choice (D-066)") but nothing could make it: the hash was one function with one field set. A graph
-whose traffic must not be spread -- one subscriber's flows pinned to one member, or a policy that must not
-read an L4 header -- needs the address-pair-only hash, and it is the graph, not the library, that knows which.
+whose traffic must not be spread -- one subscriber's flows pinned to one member -- needs the address-pair-only
+hash, and it is the graph, not the library, that knows which. (The parse reads the L4 header either way: a
+later fragment has none, and is refused before any hash is taken; `kL3` keeps its ports out of the hash, it
+does not avoid reading them.)
 The choice stays in the library as a parameter rather than a second hash function, so both callers still hash
 the same way for the same frame.
 
@@ -11356,12 +11360,16 @@ interfaces an address and installs one connected route per interface at `Init`.
 **Why.** Every IPv4 router has these routes, and each application was writing the same three lines: mask the
 address, make the prefix, make a hop that points at the interface. The masking is the part worth owning --
 the route table's `Ipv4Prefix::Make` rejects an address with host bits, so the arithmetic belongs in one place
-where two applications cannot disagree about it. The hop's neighbor starts unresolved on purpose: a host on
-the subnet is reached by resolving it, which is the application's ARP and the neighbor table's to publish, so
-the route exists from the moment the interface does and `Bind`/`SetNextHop` is what makes it forward.
+where two applications cannot disagree about it. The hop's neighbor starts unresolved on purpose: the hop
+names the interface, not a neighbor, so nothing resolves it and a frame to the subnet itself is unresolved.
+Reaching a host on the subnet is a /32 route and hop the application writes when resolution learns the host --
+`NeighborTable::Bind` is what makes a learned neighbor update a hop, and binding this one to a host would point
+the whole subnet at that host's MAC. The route exists from the moment the interface does.
 
-**Consequences.** A connected route forwards nothing until a host on its subnet resolves, which is the honest
-state -- a router with no ARP entry drops. The appliance's table gains one route per interface (four here) and
+**Consequences.** A connected route forwards nothing on its own: its hop names the interface, not a neighbor,
+so nothing resolves it automatically and a frame to the subnet itself is dropped -- a host on the subnet is a
+/32 route the application writes, or a `SetNextHop` on the connected hop itself, which is the honest state (a
+router with no ARP entry drops). The appliance's table gains one route per interface (four here) and
 its `route_writes()` counts them, because they are part of the static policy; its interfaces now carry
 addresses, and the second gateway moved to 198.18.0.1 so it sits on its own interface's subnet (a gateway
 off-link is a policy error the helper cannot see).

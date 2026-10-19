@@ -53,9 +53,11 @@
 // and what a graph decides.
 //
 // A resolved hop that names both of its addresses has them written into the
-// frame's Ethernet header (route::RewriteL2) before it leaves, so a frame
-// crossing a routing boundary carries this node's addresses rather than the
-// ones it arrived with. A hop that names none (or only one) is forwarded
+// frame's Ethernet header before it leaves -- through the forwarding chain in
+// destination mode (route/forward.h's WriteForwarded, D-157), through
+// route::RewriteL2 in the next-hop-id mode -- so a frame crossing a routing
+// boundary carries this node's addresses rather than the ones it arrived
+// with. A hop that names none (or only one) is forwarded
 // untouched: a zero address means "not named" in the resource's read-back
 // (D-129), and writing one would put an invalid frame on the wire. A frame
 // whose header cannot be written -- a shared payload that could not be copied,

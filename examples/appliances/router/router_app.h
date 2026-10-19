@@ -184,8 +184,11 @@ class RouterApp {
     route_writes_ = 3;
     // The connected routes (D-164): each interface's own subnet is reachable on
     // it, with the hop the library makes -- the interface, no neighbor resolved
-    // yet. A host on the subnet is reached by resolving it, which LearnNeighbor
-    // does; hops 1..3 above are the gateways, so these start at 4.
+    // yet, so a frame to the subnet itself is unresolved and dropped. A host on
+    // a subnet needs its own /32 route and hop: LearnNeighbor updates the hops
+    // bound to a neighbor (NeighborTable::Bind), and these are bound to
+    // nothing -- binding one to a host would point the whole subnet at that
+    // host's MAC. Hops 1..3 above are the gateways, so these start at 4.
     uint32_t connected_hop = 4;
     for (const Interface &iface : interfaces_) {
       const auto connected =

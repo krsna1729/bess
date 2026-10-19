@@ -141,9 +141,13 @@ struct NextHopGroup {
 // and without a search, an unknown, removed or out-of-range domain is a miss
 // (never undefined behaviour), and CreateDomain()/RemoveDomain() are safe
 // while workers resolve. Domain 0 exists from Create() and cannot be removed.
-// Domains are structural, not transactional: they are created before
-// Enroll(), and once enrolled they are frozen (kEnrolled). D-046 records why
-// a dense SlotTable and not a map or a rebuilt vector.
+// Domains are structural, not transactional, in the sense that a domain's FIB
+// is its own table, not a route in another one: the first route a transaction
+// writes into a domain creates it (D-158, CreateDomainLocked), and
+// `max_domains` bounds the ids instead of allocating them, so a router
+// configured for many network instances pays only for the ones that hold
+// routes. D-046 records why a dense SlotTable and not a map or a rebuilt
+// vector.
 //
 // Update modes, stated plainly:
 //
@@ -247,7 +251,10 @@ class Router {
   std::expected<void, RouteError> SetRoute(RouteDomainId domain, Ipv4Prefix prefix,
                                            NextHopGroupId group);
   size_t next_hop_group_count() const;
-  // Routes naming group `id`, across all domains.
+  // Routes naming group `id`, across all domains. Takes the engine's lock
+  // after releasing this one, never nested -- the two are taken in both orders
+  // elsewhere (tools/sanitizers/tsan.supp, D-158). `engine_` is replaced only
+  // by Enroll/Release, which the module lifecycle serialises with this call.
   size_t GroupReferences(NextHopGroupId id) const;
   // Groups naming next hop `id` (counted once per member position).
   size_t GroupMemberships(NextHopId id) const;
@@ -309,6 +316,10 @@ class Router {
   // Routes naming `id` (control-side reference count), across all domains.
   // Enrolled, routes only: a group holding the hop is GroupMemberships, and a
   // non-route resource naming it lives in the engine's ledger (D-065, D-023).
+  // Holds the router's mutex while walking the route resource, and takes no
+  // engine lock -- but a walk must not see a transaction mid-apply, so a
+  // caller outside the engine's own paths holds the control plane's mutex, as
+  // for the ForEach* walks.
   size_t RouteReferences(NextHopId id) const;
 
   // Control-side walks over the committed state, for reading it back (D-129):

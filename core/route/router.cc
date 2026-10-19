@@ -727,11 +727,23 @@ size_t Router::next_hop_group_count() const {
 }
 
 size_t Router::GroupReferences(NextHopGroupId id) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (engine_ != nullptr) {
-    return engine_->ReferenceCount(groups_name_, dataplane::EncodeKey(id));
+  // The engine's lock is taken after this one is released, never under it: the
+  // two are taken in both orders elsewhere (Enroll registers the resources, a
+  // transaction's apply reaches RouteResource::Reserve), and a public method
+  // is the wrong place for the second nesting. Enroll/Release are the only
+  // writers of `engine_`, and the module lifecycle serialises them with every
+  // caller of this method, so the copy is safe to call through.
+  dataplane::ResourceRegistry *engine;
+  std::string name;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (engine_ == nullptr) {
+      return ValidGroupId(id) ? group_references_[id.value()] : 0;
+    }
+    engine = engine_;
+    name = groups_name_;
   }
-  return ValidGroupId(id) ? group_references_[id.value()] : 0;
+  return engine->ReferenceCount(name, dataplane::EncodeKey(id));
 }
 
 // Enrolled, the engine counts references per (group, member) once, not per

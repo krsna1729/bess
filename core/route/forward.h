@@ -59,8 +59,8 @@ struct FrameRoute {
 
 // The read half: the checked parse, the destination resolved in `domain` (a
 // group route picks its member with the frame's own flow hash, the one hash
-// both callers use, reading the fields the caller names -- D-163), the neighbor
-// check, the egress check, and the TTL read before anything is written.
+// both callers use, reading the fields the caller names -- D-163), the egress
+// check, the neighbor check, and the TTL read before anything is written.
 // `frame` is the packet's first segment and `total_len` the whole frame (0: the
 // span's length).
 inline FrameRoute ResolveFrame(const Router &router, RouteDomainId domain,
@@ -95,11 +95,16 @@ inline FrameRoute ResolveFrame(const Router &router, RouteDomainId domain,
   if (hop == nullptr) {
     return {.verdict = ForwardVerdict::kNoRoute};
   }
-  if (hop->neighbor != NeighborState::kResolved) {
-    return {.verdict = ForwardVerdict::kUnresolved, .egress = hop->egress};
-  }
+  // The egress first: a hop that forwards nowhere is the blackhole shape
+  // (D-160) whatever its neighbor state says, and router.h promises that state
+  // is irrelevant for such a hop -- a route to it ends the packet rather than
+  // resolving anything. The other order reported a blackhole hop's frames as
+  // kUnresolved, which the caller counts as its own outcome.
   if (hop->egress == dataplane::kInvalidInterfaceId) {
     return {.verdict = ForwardVerdict::kNoEgress};
+  }
+  if (hop->neighbor != NeighborState::kResolved) {
+    return {.verdict = ForwardVerdict::kUnresolved, .egress = hop->egress};
   }
   const auto *ip = reinterpret_cast<const utils::Ipv4 *>(frame.data() + p.l3_offset);
   if (ip->ttl <= 1) {

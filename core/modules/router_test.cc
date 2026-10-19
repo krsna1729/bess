@@ -510,6 +510,49 @@ TEST_F(RouterTest, ARouteToAHopThatForwardsNowhereIsABlackhole) {
   EXPECT_NE(std::string::npos, rt->GetDesc().find("blackholed: 1")) << rt->GetDesc();
 }
 
+// The same blackhole hop, with a neighbor state nothing ever resolved: a local
+// /32, or a hop a controller wrote before any resolution. The route still ends
+// the frame -- the neighbor state of a hop that forwards nowhere decides
+// nothing (router.h) -- so it must not be counted as an unresolved neighbor,
+// and with a punt gate armed (D-162) it must not take it either: a route meant
+// to end the packet must not hand it to a slow path.
+TEST_F(RouterTest, ABlackholeHopIsNotAnUnresolvedNeighbor) {
+  Router *rt = MakePuntingRouter(/*miss_gate=*/2, /*unresolved_gate=*/3);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, DROP_GATE, nullptr, nullptr,
+          bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);
+  MakeRoute(rt, "0.0.0.0", 0, 0, 1);
+
+  const std::vector<gate_idx_t> ogates = {0, 1, 2, 3};
+  auto out = RunToDestination(rt, FrameTo("10.1.2.3"), 0, ogates);
+  // The capture map holds an entry only for a gate that received a frame, so
+  // the loop names the gates: iterating the map would assert nothing in the
+  // case that matters -- a frame punted to gate 2 or 3 would add an entry and
+  // the counters would still read blackholed, which is the defect this test
+  // exists for.
+  for (const gate_idx_t gate : ogates) {
+    EXPECT_EQ(0u, out.count(gate)) << "gate " << gate << " took a frame";
+  }
+  EXPECT_TRUE(out.empty()) << "the router emitted a frame";
+  EXPECT_EQ(1u, rt->blackholed_frames());
+  EXPECT_EQ(0u, rt->unresolved_frames()) << "a hop that forwards nowhere resolves nothing";
+  EXPECT_EQ(0u, rt->no_route_frames());
+}
+
+// D-162: only the destination path has punt gates. A next-hop-id router armed
+// with them forwards what the attribute names and drops everything else, so
+// its desc must not advertise a punt a reader would look for.
+TEST_F(RouterTest, ANextHopIdRouterDoesNotAdvertisePuntGates) {
+  bess::pb::RouterArg arg;
+  arg.set_punt_miss_gate(2);
+  arg.set_punt_unresolved_gate(3);
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  EXPECT_EQ(std::string::npos, rt->GetDesc().find("punts to gate")) << rt->GetDesc();
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("next-hop id from metadata"))
+      << rt->GetDesc();
+}
+
 // D-162: a punt gate sends what the destination path cannot forward to a slow
 // path instead of dropping it -- a miss and an unresolved neighbor to their own
 // gates -- and the counter still records what happened.

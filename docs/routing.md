@@ -98,7 +98,9 @@ Routes, next hops and groups are written through the module's resources (`<route
 `/groups`) in transactions, or directly by an application. The first routes a router usually writes are its
 connected ones: an interface's own address implies the subnet reachable on it, and
 `route::ConnectedRouteFor(address, length, egress)` (D-164) returns that prefix with a hop on the interface,
-whose neighbor stays unresolved until resolution learns it.
+whose neighbor stays unresolved -- the hop names the interface, not a neighbor, so nothing resolves it and a
+frame to the subnet itself is unresolved. Reaching a host on that subnet is a /32 route and hop the application
+writes when resolution learns the host (`NeighborTable::Bind` is what makes a learned neighbor update a hop).
 
 The two recipes meet in one module. Which one runs is **configuration**, not a per-packet test: the `mode` arg
 (`ROUTE_MODE_NEXT_HOP_ID`, the default, or `ROUTE_MODE_DESTINATION`, D-155). A module decides; it does not
@@ -124,6 +126,10 @@ stay the record of what happened.
 `max_domains` bounds the domain ids; it does not allocate them. A domain's FIB is created when it is first
 needed — explicitly (`CreateDomain`), or by the first route a transaction writes into it (D-158). A router
 configured for four network instances pays for the instances that hold routes, not for the configuration.
+That first write pays the table's build: `rte_lpm_create`/`rte_fib_create` runs synchronously, under the
+engine's lock and the router's, sized by the module's `max_routes`, so one transaction can block control
+operations for the length of that create — the cost table's rebuild column prices create plus every add at a
+given size, an upper bound for it (`docs/dataplane-tables.md`); later writes are ordinary live updates.
 `RemoveDomain` takes an empty domain away; removal is frozen once the router is enrolled, because the engine's
 resource holds raw FIB pointers (D-046).
 

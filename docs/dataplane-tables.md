@@ -100,7 +100,7 @@ and fatal at millions:
 | structure | one change by rebuild (G) | one change in place (C) |
 |---|---|---|
 | ExactMatch, one rule | 426 µs at 1K rules, 47 ms at 100K, 645 ms at 1M | 0.3 µs at any size |
-| IPLookup (`rte_lpm`) | 9.4 ms at 1K routes, 341 ms at 64K; a 512K build takes ~21 s | 0.5-33 µs |
+| `RouteTable` (`rte_lpm`) | 9.4 ms at 1K routes, 341 ms at 64K; a 512K build takes ~21 s | 0.5-33 µs |
 | WildcardMatch (masked, 8 tuples) | 7 µs at 8 rules, 500 µs at 256 rules | (G today; see section 5) |
 | FirewallTable (masked + port ranges, both families) | ~50 µs at 1K rules, ~1 ms at 10K | (G) |
 
@@ -467,7 +467,8 @@ reference to something missing.
   ~0.2-0.6 µs as a transaction against 0.06-0.2 µs direct. D-023. The
   routes resource covers every route domain: the key carries the domain in
   bits 40-63 (the default domain's keys are unchanged), and domains are
-  created before `Enroll()` and frozen after it. D-046. The
+  created by the first route write into them, so `max_domains` bounds the ids
+  while a router pays only for the domains that hold routes. D-158. The
   `Router` module enrolls on `Init()` and releases on `DeInit()`; its packet
   path resolves a next-hop id from metadata, or -- in `ROUTE_MODE_DESTINATION`
   -- runs the library's forwarding chain (`route/forward.h`: the checked parse,
@@ -625,7 +626,7 @@ reference to something missing.
 | module | table | how changes apply | notes |
 |---|---|---|---|
 | ExactMatch | `ConcurrentExactTable` | C: add/delete/clear in place; default gate and restore by G; transactions through resource `<module>/rules` | 0.3 µs per add at any size; D-022 |
-| IPLookup | `RouteTable` (`rte_lpm`) | C | |
+| Router | `RouteTable` (`rte_lpm`) | C: add/delete in place; transactions through the route, next-hop and group resources | routes, next hops and groups as resources (D-023, D-155, D-156); the route key carries its domain |
 | WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list; transactions through resource `<module>/rules` | D-014, D-024 |
 | L2Forward | `PackedMacTable<SingleWriter>` (one-word slots, 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, moves destination-first under a sequence number readers re-check on a miss, no grace period. Multi-entry `add`/`populate` are all-or-nothing per command (validation plus rollback), but not dataplane-atomic: packets see entries one by one | D-017, D-073 |
 | ACL | `std::vector` of rules, linear scan | G: `add` copies, appends and publishes (all or nothing) | D-017; `rte_acl` (G-only) is the candidate for large rule sets |
@@ -757,6 +758,6 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | update-mode thresholds, writer rate | `update_scale_bench` |
 | control-ingress transport | `ingress_bench` |
 | plain vs staged body rule | `modules_table_scale_bench`, `classifier_cuckoo_scale_bench` |
-| `rte_fib` backend (correctness, D-130/D-132) | `route_route_test` (`RteFibTest.*`, every build) and the `/Fib` instances of the route tests; `route_bench`, `fib_bench` and `live_perf M.iplookup/fib` for cost |
+| `rte_fib` backend (correctness, D-130/D-132) | `route_route_test` (`RteFibTest.*`, every build) and the `/Fib` instances of the route tests; `route_bench`, `fib_bench` and `live_perf M.router/fib` for cost |
 | LPM lookup and update cost | `route_bench` |
 | meters, counters, RCU | `meter_bench`, `stats_bench`, `rcu_bench` |
