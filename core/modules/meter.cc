@@ -299,6 +299,10 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   meter_id_attr_ = AddMetadataAttr(
       id_attr_name_, levels_ * sizeof(bess::utils::be32_t),
       bess::metadata::Attribute::AccessMode::kRead);
+  // The profile's rates and bursts are in the chosen unit: bytes/s for a
+  // bit-rate, packets/s for a packet-rate (8.2.63), the same buckets either
+  // way. The library is unit-agnostic -- it is handed one integer per packet.
+  packets_ = arg.cost() == bess::pb::MeterArg::METER_COST_PACKETS;
   if (meter_id_attr_ < 0) {
     const std::string name = resource_->name();
     CHECK(init_context().resources().ReleaseForTeardown(
@@ -458,8 +462,10 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
     gates[i] = kGreenGate;
     alive[i] = true;
     // The packet's charge is level-independent; a packet the basis cannot
-    // measure is dropped at its first non-zero meter id.
-    costs[i] = AccountedBytes(batch->packet(i));
+    // measure is dropped at its first non-zero meter id. A packet-rate meter
+    // charges one unit whatever the frame, so it does not consult the basis.
+    costs[i] = packets_ ? std::optional<uint32_t>(1)
+                        : AccountedBytes(batch->packet(i));
   }
   // One pass per level, over the packets the levels before it let live: a
   // packet a level marks red is not charged to the levels after it, so the
