@@ -323,6 +323,49 @@ the one in the build directory: after any change to the SDK's headers, re-instal
 Builds must be release builds with `NDEBUG` (`b_ndebug=if-release`): a tree configured with `b_ndebug=false`
 pays `_GLIBCXX_ASSERTIONS` everywhere (MODERNIZATION.md entry 148).
 
+## Noticing a counter threshold: the three paths
+
+`stats_counter_paths_bench` (`core/stats/counter_paths_bench.cc`) measures what
+each way of noticing that a per-key counter passed a limit costs: the packet
+path's own counter write (`KeyedCounters::Plane::Add`, D-154), the one compare
+the event path adds after it (`CrossingNotifier::Crossed`, D-152), the
+crossing's `WorkerEvent` (`CrossingNotifier::Note` -> `EventHub::Post`, D-152),
+arming K keys and sweeping them (`ThresholdTable::Sweep`, D-151), and a
+controller reading every key (`Total`, the polling path). Build and run it from
+a release tree, pinned to one benchmark core:
+
+```
+ninja -C build/fast core/stats_counter_paths_bench   # -Dbuild_benchmarks=true
+taskset -c 2 build/fast/core/stats_counter_paths_bench \
+    --benchmark_repetitions=3 --benchmark_report_aggregates_only=true
+```
+
+Measured on this host (debugoptimized `-O2`, `-march=x86-64-v3`, pinned to core
+2, medians of 3, cv <= 1.2%; this host has no isolated CPUs, so read the ratios
+and re-measure before quoting a number):
+
+| row | K = 1024 | K = 16384 | per unit |
+|---|---|---|---|
+| packet path: counter bump (`Plane::Add`) | 0.425 ns | 0.425 ns | per packet |
+| packet path: bump + the crossing compare (`Crossed`) | 0.586 ns | 0.597 ns | per packet |
+| packet path: the crossing (`Note` -> `EventHub::Post`) | 322 ns | -- | per crossing |
+| control side: arm K keys | 23.4 us | 336.6 us | 22.8 / 20.5 ns per key |
+| control side: poll every key (`Total`) | 684 ns | 10.88 us | 0.67 / 0.66 ns per key |
+| control side: sweep every armed key, nothing crossing | 1.39 us | 22.44 us | 1.35 / 1.37 ns per key |
+| control side: sweep every armed key, one entry firing | 1.73 us | 23.17 us | one K-entry walk, +0.35 us at K = 1024 for the fire and the erase |
+
+The shape of the answer: the event path's per-packet tax in the steady state is
+the compare, not nothing -- 0.59 ns against 0.425 ns for the bare bump, about
+0.16 ns a packet, and `CrossingNotifier::Crossed` is `constexpr`. Its cost when
+a key crosses is 322 ns, about 760 counter bumps, so the per-packet tax is that
+322 ns divided by the packets a key takes to cross. The two control-side paths
+read every key for about the price of a load: 0.67 ns per key to poll, 1.37 ns
+per key to sweep (the sweep also compares against the limit and removes what
+fired -- a firing entry adds 0.35 us to the 1024-key walk, not less: the library
+walks every armed entry, and only `stop()` ends the walk early). 16,384 keys
+cost 10.9 us to poll and 22.4 us to sweep, once per interval, against a
+per-packet tax only the event path pays. Arming is a one-time 20-23 ns per key.
+
 ## Compiler tuning matrix (D-127)
 
 `-march=x86-64-v3` release trees of one source (`-Dbuildtype=release`, `b_staticpic=false`, DPDK 25.11.3 shared,
