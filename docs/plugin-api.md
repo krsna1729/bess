@@ -376,6 +376,9 @@ its event is a hint (`WorkerLimit(total, workers)` is the per-worker limit that 
 the controller reads the total before it acts. A worker event can be lost when its ring is full
 (counted, shown as `bess.events_lost`), so a consumer that cannot afford a missed report keeps
 polling as the backstop. The worker path's event also carries `worker`, the plane that crossed.
+The SDKs' `WatchCounters` (Go) and `watch_counters` (Python) narrow the stream to one module's
+crossings and parse their fields (`docs/control-sdk.md`), so a controller need not know this
+shape; a gap in the log or a restart ends that watch with an error rather than passing it over.
 
 **Fill levels.** A resource that states a capacity is watched by the daemon itself, with no module
 involvement: on its maintenance tick it reads every reachable resource's `LiveCount()` against the first

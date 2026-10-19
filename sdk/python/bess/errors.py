@@ -102,3 +102,17 @@ class DaemonRestartedError(Error):
     def __init__(self, message, refused=False):
         super().__init__(message)
         self.refused = refused
+
+
+class GapError(Error):
+    """The daemon's event log dropped events, so a watch cannot promise it saw all.
+
+    A counter watch that ends with this has to re-read the counters it armed
+    and watch again: a crossing may be among the events the log no longer held.
+    """
+
+    def __init__(self, message, module="", gap_from=0, gap_to=0):
+        super().__init__(message)
+        self.module = module
+        self.gap_from = gap_from
+        self.gap_to = gap_to

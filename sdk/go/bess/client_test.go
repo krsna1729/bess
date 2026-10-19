@@ -47,23 +47,24 @@ func known(o pb.TransactionRecord_Outcome, epoch uint64) step {
 }
 
 type fake struct {
-	epoch     uint64
-	applies   []step
-	gets      []step
-	sent      []*pb.ApplyTransactionRequest
-	asked     []string
-	listed    int
-	rejectOps bool
-	oldDaemon bool // answers GetCapabilities with UNIMPLEMENTED
-	refuse    bool // answers GetCapabilities with PERMISSION_DENIED
-	streams   []*scriptedStream
-	watched   [][2]uint64 // (from_sequence, daemon_epoch) per WatchEvents call
-	pipelines []step      // ApplyPipeline's script (err/md; nil err: applied)
-	applied   []*pb.ApplyPipelineRequest
-	captures  []*pb.SetCaptureRequest
-	reads     []*pb.GetPipelineRequest  // GetPipeline requests
-	actions   []step                    // InvokeAction's script (err/md; nil err: answered)
-	invoked   []*pb.InvokeActionRequest // InvokeAction requests
+	epoch        uint64
+	applies      []step
+	gets         []step
+	sent         []*pb.ApplyTransactionRequest
+	asked        []string
+	listed       int
+	rejectOps    bool
+	oldDaemon    bool // answers GetCapabilities with UNIMPLEMENTED
+	refuse       bool // answers GetCapabilities with PERMISSION_DENIED
+	streams      []*scriptedStream
+	watched      [][2]uint64 // (from_sequence, daemon_epoch) per WatchEvents call
+	watchedTypes [][]string  // the type filter of each WatchEvents call
+	pipelines    []step      // ApplyPipeline's script (err/md; nil err: applied)
+	applied      []*pb.ApplyPipelineRequest
+	captures     []*pb.SetCaptureRequest
+	reads        []*pb.GetPipelineRequest  // GetPipeline requests
+	actions      []step                    // InvokeAction's script (err/md; nil err: answered)
+	invoked      []*pb.InvokeActionRequest // InvokeAction requests
 }
 
 // actionResult is what the fake's actions answer.
@@ -230,6 +231,7 @@ func (s *scriptedStream) Recv() (*pb.Event, error) {
 
 func (f *fake) watch(_ context.Context, in *pb.WatchEventsRequest) (eventStream, error) {
 	f.watched = append(f.watched, [2]uint64{in.GetFromSequence(), in.GetDaemonEpoch()})
+	f.watchedTypes = append(f.watchedTypes, in.GetTypes())
 	if len(f.streams) == 0 {
 		return nil, status.Error(codes.Unavailable, "no more streams")
 	}

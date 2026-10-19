@@ -22,8 +22,11 @@ protocol only - the same choice the Go and C++ SDKs made.
 """
 
 from .client import (
+    COUNTER_THRESHOLD,
+    NO_WORKER,
     Applied,
     Client,
+    CounterCrossing,
     PipelineSnapshot,
     PipelineVersion,
     RetryPolicy,
@@ -34,6 +37,7 @@ from .errors import (
     ConflictError,
     DaemonRestartedError,
     Error,
+    GapError,
     InvalidRequestError,
     OpFailure,
     RejectedError,
@@ -43,12 +47,16 @@ from .errors import (
 from .pipeline import PipelineBuilder
 
 __all__ = [
+    "COUNTER_THRESHOLD",
+    "NO_WORKER",
     "Applied",
     "BusyError",
     "Client",
     "ConflictError",
+    "CounterCrossing",
     "DaemonRestartedError",
     "Error",
+    "GapError",
     "InvalidRequestError",
     "OpFailure",
     "PipelineBuilder",
