@@ -1089,6 +1089,7 @@ if get_option('build_benchmarks')
     'grace_period_bench': ['rcu/grace_period_bench.cc', benchmark_dep],
     'meter_bench': ['meter/meter_bench.cc', benchmark_main_dep],
     'stats_bench': ['stats/stats_bench.cc', benchmark_main_dep],
+    'stats_counter_paths_bench': ['stats/counter_paths_bench.cc', benchmark_main_dep],
     'route_bench': ['route/route_bench.cc', benchmark_main_dep],
     'route_route_domain_bench': ['route/route_domain_bench.cc', benchmark_main_dep],
     'traffic_class_bench': ['traffic_class_bench.cc', benchmark_main_dep],
