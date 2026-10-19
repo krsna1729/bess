@@ -11024,3 +11024,72 @@ group, then the member can; without
 fuzz models the two ids and its corpus gains a group route and a both-targets seed; the SDK live test
 round-trips a group sample. buf breaking (`WIRE_JSON`, D-026) against develop is clean -- `next_hop_id` is
 untouched and `group_id` is new; a oneof shape fails `FIELD_SAME_ONEOF` (verified).
+
+## D-157 The forwarding chain is one library function: the appliance and the Router module call the same two
+
+**Status:** accepted (2026-10-19; the user: "make the router appliance and the module as good as what I pasted ... ideally the module should be thin").
+
+**Context.** R1's direct path (`RouterApp::Process`) and the Router module's destination mode were two
+implementations of one chain: both parsed the frame, hashed it, looked the destination up in a domain,
+checked the neighbor, read the TTL, decremented it and wrote the hop's addresses. They were not the same
+chain, and what differed was the appliance's side: it had no egress check (a hop whose egress was
+`kInvalidInterfaceId` was forwarded), no D-153 rule (it wrote both addresses unconditionally, zeros included),
+and one verdict for every parse failure (`kNotIpv4` for a malformed frame and for a non-initial fragment too).
+No test compared the two paths -- no test includes `router_app.h` (its two includers are the appliance's own
+module adapter and `examples/static_router`, a program that meson runs as a test target but which drives the
+direct path only), its self-test drives the direct path, and the install check drives the graph path -- so
+nothing kept them from drifting. R1's acceptance criterion in the plan was a test comparing the two; one shared implementation
+replaces the need for it.
+
+**Decision.** `route/forward.h` holds the chain as two calls, and both callers use nothing else of it:
+
+- **`ResolveFrame(router, domain, frame, total_len)` reads.** The checked parse (`conntrack::ParseFrame`), the
+  destination resolved in `domain` by the frame's own flow hash (`route::FlowHash`, so a group route picks the
+  same member in both paths), the neighbor check, the egress check, and the TTL read. It returns
+  `FrameRoute{verdict, hop, egress, l3_offset}` and writes nothing, so a caller that drops a frame never makes
+  it writable -- the property the module's packet path had by hand (a shared payload is not copied for a packet
+  that must expire).
+- **`WriteForwarded(frame, l3_offset, hop)` writes.** The TTL (`DecrementTtl`, checksum updated) and then the
+  hop's addresses when it names both (D-153); a hop that names none, or only one, is forwarded with the header
+  it arrived with.
+- **`ForwardVerdict` is the one vocabulary**: `kForward`, `kNotIpv4`, `kMalformed`, `kNonInitialFragment`,
+  `kNoRoute`, `kUnresolved`, `kTtlExpired`, `kNoEgress`. The appliance's private `Verdict` enum is gone (its
+  `Decision` carries the library's) and the module maps the verdict to its counters, so the two paths name the
+  same outcomes.
+- **Policy and packet ownership stay with the caller**: the route domain (metadata, an interface, a port), what
+  an unresolved neighbor means, the copy a shared payload needs before its header is written
+  (`EnsureWritable`) and the contiguity re-check after it, the gate a hop's egress maps to, every counter, and
+  any metadata a caller wants to write. The chain's own interface takes spans, a `Router`, a domain and a hop,
+  and nothing else; the library sources in `core/route/` include none of Module, gate, runtime, control or
+  protobuf (`tools/check_includes.py`, which exempts the directory's tests and benchmarks -- they use the
+  runtime), so a new metadata output is a change in the module's adapter, never in the chain. The packet
+  helpers the library already had (`route/router.h`'s `RewriteL2`, the mutation errors) are not part of the
+  chain.
+
+**Consequences.** Equivalence between the direct path and the graph adapter is by construction instead of by a
+test comparing two implementations, so what remains to test is the adapter's own plumbing (metadata to domain,
+verdict to counter, egress to gate). The module's destination path is now: domain from metadata, `ResolveFrame`,
+verdict to counter, egress to gate, `EnsureWritable` and the contiguity check, `WriteForwarded` -- 46 lines of
+code where it was 85, with no parse, hash, resolve, TTL or address code of its own; the appliance's `Process`
+is 16 where it was 26. Two of the appliance's own behaviors change, both toward the module's rules and both in
+the plan's direction: a hop whose egress is `kInvalidInterfaceId` is dropped (`kNoEgress`) rather than
+forwarded, and a resolved neighbor whose `dst_mac` is zero is forwarded with the frame's own addresses rather
+than written with zeros (D-153). Its verdicts are finer too: a malformed frame is `kMalformed` and a
+non-initial fragment `kNonInitialFragment`, where every parse failure was `kNotIpv4`. The chain reads the TTL
+before a caller can consult its own gate map, so a hop whose egress maps to no gate is judged `kTtlExpired`
+before the gate is consulted. That ordering is unobservable in the tree: the module cannot hold such a hop
+(every next hop it accepts passes `IsValidGateValue` and `InterfaceOf`, `modules/router_gate_map.h`, so
+`GateOf` returns `DROP_GATE` only for egress 0, which the chain reports as `kNoEgress` before it reads the
+TTL, uncounted as before), and a direct `route::Router` caller has no gate map and no counters of its own --
+its path read the TTL at the same point, after the neighbor check. A caller that both set an unmapped
+`NextHop::egress` and consulted a gate map would see the difference; the tree has none.
+
+**Evidence.** `RouterTest` 21/21 (`core/modules/router_test.cc`; the same 21 cases D-156 names -- the destination
+mode's behavior is pinned through the adapter and did not change) and `route_router_transaction_test` 32/32
+pass on `build/fast`. The install check (`tools/ci_profile.py verify-install --compiler gcc --name fast`)
+builds the staged tree, compiles every installed header (`tools/check_installed_headers.py`, which is what
+proves `route/forward.h` self-contained), builds `examples/standalone_plugin`, `examples/static_router`,
+`examples/sdk_samples` and `examples/appliances` (all four plugins, `librouter_appliance.so` included) against
+that install, and runs `static_router`'s own checks -- 172.16.1.1 forwarded with gateway A's MACs and TTL
+64 -> 63, VRF 2 routed apart, a miss and a TTL expiry dropped with the frame unchanged -- which now execute the
+same two calls the module executes.

@@ -68,7 +68,7 @@ class RouterAppliance final : public Module {
       const RouterApp::Decision d =
           app_->Process(ingress, std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len()),
                         pkt.total_len());
-      if (d.verdict == RouterApp::Verdict::kForward) {
+      if (d.verdict == bess::route::ForwardVerdict::kForward) {
         EmitPacket(ctx, pkt, static_cast<gate_idx_t>(d.egress.value() - 1));
       } else {
         DropPacket(ctx, pkt);
@@ -92,7 +92,7 @@ class RouterAppliance final : public Module {
  private:
   // The direct path, no graph. Returns "" or what failed.
   static std::string SelfTest(RouterApp &app) {
-    using V = RouterApp::Verdict;
+    using V = bess::route::ForwardVerdict;
     const uint32_t host = 0x0a010203;  // 10.1.2.3: routed in both VRFs
     // Overlapping VRFs: the same destination leaves VRF 1 by the ECMP pair
     // (if1/if2) and VRF 2 by if3.

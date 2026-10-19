@@ -465,10 +465,11 @@ reference to something missing.
   created before `Enroll()` and frozen after it. D-046. The
   `Router` module enrolls on `Init()` and releases on `DeInit()`; its packet
   path resolves a next-hop id from metadata, or -- in `ROUTE_MODE_DESTINATION`
-  -- looks the packet's own IPv4 destination up in its route domain's FIB and
-  runs the forwarding chain (TTL, then the addresses), and either way writes a
-  resolved hop's addresses into the frame's Ethernet header when it names both
-  (D-032, D-153, D-155).
+  -- runs the library's forwarding chain (`route/forward.h`: the checked parse,
+  the destination looked up in the packet's route domain, the neighbor check,
+  the TTL and the addresses; D-157), and either way writes a resolved hop's
+  addresses into the frame's Ethernet header when it names both (D-032, D-153,
+  D-155).
 - **ActionTable** registers `<module>/actions` (key: `EncodeKey(ActionId)`,
   value: `{meter id, next hop id}`) and declares both the meter and the
   next-hop resources: an action's value references them, so the engine orders

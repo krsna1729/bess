@@ -12,10 +12,10 @@
 #include <utility>
 
 #include "framework/resource_bindings.h"
-#include "conntrack/packet_parse.h"
 #include "dataplane/transaction_engine.h"
 #include "modules/router_gate_map.h"
 #include "packet_reshape.h"
+#include "route/forward.h"
 #include "route/l3_packet.h"
 #include "utils/endian.h"
 #include "utils/ether.h"
@@ -467,11 +467,45 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
   EmitBatch(ctx, batch, gates);
 }
 
-// Mode 2 (D-155): the appliance's chain (examples/appliances/router, Process),
-// with the same library calls in the same order -- parse the frame, look the
-// destination up in the packet's route domain, drop what the FIB does not
-// resolve and what the neighbor is not resolved for, decrement the TTL, write
-// the hop's addresses, and leave on the hop's egress gate.
+// One counter per verdict the chain reports (route/forward.h). kForward is
+// not a drop and kNoEgress is a hop nobody configured: neither is counted.
+void Router::CountVerdict(route::ForwardVerdict verdict) {
+  switch (verdict) {
+    case route::ForwardVerdict::kNotIpv4:
+      not_ipv4_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kMalformed:
+      malformed_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kNonInitialFragment:
+      non_initial_fragments_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kNoRoute:
+      no_route_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kUnresolved:
+      unresolved_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kTtlExpired:
+      ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kForward:
+    case route::ForwardVerdict::kNoEgress:
+      return;
+  }
+}
+
+// Mode 2 (D-155): the destination path, through the library's forwarding chain
+// (route/forward.h, D-157) -- the same two calls the appliance makes
+// (examples/appliances/router, Process), so the two paths cannot disagree
+// about a fragment, a TTL boundary or which hop address is written.
+//
+// What is this module's: the domain from metadata (policy a controller writes),
+// the copy a shared payload needs before its header is written (packet
+// ownership, which is a graph's business and not a library's), the counters,
+// and the gate a hop's egress maps to. The parse, the prefix lookup with the
+// frame's flow hash, the neighbor state, the TTL and the addresses are the
+// chain's.
 //
 // A non-initial fragment is dropped, as the appliance drops it: its L4 header
 // is in an earlier fragment, so it has no ports to hash with, and a group
@@ -487,39 +521,6 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
     gates[i] = DROP_GATE;
     bess::PacketRef pkt = batch->packet(i);
 
-    bess::conntrack::ParsedFlowPacket p;
-    const bess::conntrack::ParseStatus parsed = bess::conntrack::ParseFrame(
-        std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), p, pkt.total_len());
-    if (parsed != bess::conntrack::ParseStatus::kOk) {
-      // Not an IP packet, headers that do not fit or lie about their lengths,
-      // or a non-initial fragment: nothing to route by, or nothing to hash
-      // with.
-      if (parsed == bess::conntrack::ParseStatus::kNotIp) {
-        not_ipv4_frames_.fetch_add(1, std::memory_order_relaxed);
-      } else if (parsed == bess::conntrack::ParseStatus::kFragment) {
-        non_initial_fragments_.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        malformed_frames_.fetch_add(1, std::memory_order_relaxed);
-      }
-      continue;
-    }
-    if (p.l3 != bess::conntrack::L3Kind::kIpv4) {
-      not_ipv4_frames_.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
-
-    // The destination in the LPM's own order (host order, whatever the host
-    // is: the endian wrapper converts) and the flow hash a group route picks a
-    // member with -- route::FlowHash, the one function the appliance hashes
-    // with too, so a flow keeps one member in both paths. Its address words
-    // are opaque, so both paths pass the header's bytes as they are.
-    bess::utils::be32_t dst;
-    std::memcpy(&dst, p.dst.data(), sizeof(dst));
-    uint32_t src_word, dst_word;
-    std::memcpy(&src_word, p.src.data(), sizeof(src_word));
-    std::memcpy(&dst_word, p.dst.data(), sizeof(dst_word));
-    const uint32_t flow_hash =
-        route::FlowHash(src_word, dst_word, p.src_port, p.dst_port, p.protocol);
     // The domain id is 24 bits wide (Router::RouteKey packs it above the
     // prefix; route/route_domain.h): no narrowing here, so a domain this
     // router does not hold is looked up as itself and misses instead of
@@ -529,30 +530,20 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
             ? route::RouteDomainId(
                   get_attr_with_offset<bess::utils::be32_t>(domain_offset, pkt).value())
             : route::kDefaultRouteDomainId;
-    const route::NextHop *hop = router_->Resolve(domain, dst.value(), flow_hash);
-    if (hop == nullptr) {
-      no_route_frames_.fetch_add(1, std::memory_order_relaxed);
+    const route::FrameRoute resolved = route::ResolveFrame(
+        *router_, domain,
+        std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), pkt.total_len());
+    if (resolved.verdict != route::ForwardVerdict::kForward) {
+      CountVerdict(resolved.verdict);
       continue;
     }
-    if (hop->neighbor != route::NeighborState::kResolved) {
-      unresolved_frames_.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
-    const gate_idx_t gate = GateOf(hop->egress);
+    const gate_idx_t gate = GateOf(resolved.egress);
     if (gate == DROP_GATE) {
-      // The hop names no usable egress: the frame is leaving anyway, so it is
-      // neither copied nor written.
+      // A hop whose egress is no gate of this graph: configuration, not
+      // traffic, so nothing is counted and nothing is written.
       continue;
     }
 
-    auto *ip = reinterpret_cast<const bess::utils::Ipv4 *>(
-        pkt.head_data<const uint8_t *>() + p.l3_offset);
-    if (ip->ttl <= 1) {
-      // The same boundary DecrementTtl refuses at, read before the header is
-      // made writable so a packet that must expire is not copied first.
-      ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
     // The TTL is written whatever the hop names, so the header must be
     // writable: a shared payload is copied once (K4) and the copy replaces
     // the batch's handle.
@@ -567,26 +558,20 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
     // re-established rather than assumed: writing it through a stale pointer
     // would touch bytes that are not in this segment.
     if (writable.head_len() <
-        static_cast<size_t>(p.l3_offset) + sizeof(bess::utils::Ipv4)) {
+        static_cast<size_t>(resolved.l3_offset) + sizeof(bess::utils::Ipv4)) {
       header_write_failures_.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
-    auto *wip = reinterpret_cast<bess::utils::Ipv4 *>(
-        writable.head_data<uint8_t *>() + p.l3_offset);
-    if (route::DecrementTtl(*wip) != route::TtlResult::kForward) {
+    if (route::WriteForwarded(
+            std::span(writable.head_data<uint8_t *>(), writable.head_len()),
+            resolved.l3_offset, *resolved.hop) != route::TtlResult::kForward) {
+      // ResolveFrame refuses a TTL of 0 or 1, so this is unreachable with the
+      // same bytes; counting it keeps the boundary honest if a mutation ever
+      // rewrote the header between the two calls.
       ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     gates[i] = gate;
-    // A hop that names both addresses is written; one that names none, or only
-    // one, is forwarded with the header it arrived with (D-129).
-    if (hop->dst_mac.IsZero() || hop->src_mac.IsZero()) {
-      continue;
-    }
-    if (!route::RewriteL2(writable, *hop)) {
-      gates[i] = DROP_GATE;
-      header_write_failures_.fetch_add(1, std::memory_order_relaxed);
-    }
   }
   EmitBatch(ctx, batch, gates);
 }

@@ -11,6 +11,7 @@
 #include "framework/resource_bindings.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
+#include "route/forward.h"
 #include "route/router.h"
 
 // K7's route table and next hops as a module, enrolled in the transaction
@@ -31,18 +32,19 @@
 //
 //  2. ROUTE_MODE_DESTINATION. The module decides, the way the router
 //     appliance does (examples/appliances/router) and with the same library
-//     calls: parse the frame, look the destination address up in the route
-//     domain the packet carries (a `route_domain` be32 attribute a VIF
-//     writes; domain 0 when nothing writes it), drop what the FIB does not
-//     resolve or whose neighbor is not resolved, decrement the TTL, write the
-//     hop's addresses, and leave on the hop's egress gate. A route names a
-//     next hop or a next-hop group; a group route picks its member by the
-//     frame's flow hash (route::FlowHash, the appliance's function), so a
-//     flow keeps one member. A frame that is not an IPv4 packet, one whose
-//     headers do not parse, and a non-initial fragment (its L4 header is in
-//     an earlier fragment, so it cannot be hashed to a group member) are
-//     dropped and counted. The `next_hop_id` attribute is ignored in this
-//     mode, even if some module writes it.
+//     calls: the route domain the packet carries (a `route_domain` be32
+//     attribute a VIF writes; domain 0 when nothing writes it) and the
+//     library's forwarding chain (route/forward.h, D-157), which parses the
+//     frame, looks the destination address up in that domain, checks the
+//     neighbor, decrements the TTL and writes the hop's addresses; the packet
+//     leaves on the hop's egress gate. A route names a next hop or a next-hop
+//     group; a group route picks its member by the frame's flow hash
+//     (route::FlowHash), so a flow keeps one member in both paths. A frame
+//     that is not an IPv4 packet, one whose headers do not parse, and a
+//     non-initial fragment (its L4 header is in an earlier fragment, so it
+//     cannot be hashed to a group member) are dropped and counted. The
+//     `next_hop_id` attribute is ignored in this mode, even if some module
+//     writes it.
 //
 // Both modes drop a packet whose hop is unknown, or whose neighbor is not
 // resolved: what to do toward an unresolved neighbor (queue, punt, drop) is
@@ -140,6 +142,9 @@ class Router final : public Module {
   // Mode 2 (D-155): look each packet's destination address up in its domain's
   // FIB, then run the forwarding chain the appliance runs.
   void RouteByDestination(Context *ctx, bess::PacketBatch *batch);
+  // One counter per verdict the chain reports (route/forward.h). kForward is
+  // not a drop and kNoEgress is a hop nobody configured: neither is counted.
+  void CountVerdict(bess::route::ForwardVerdict verdict);
 
   std::unique_ptr<bess::route::Router> router_;
   // After router_, which owns the resources they bind (D-044).
