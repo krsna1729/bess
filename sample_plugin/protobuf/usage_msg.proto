@@ -1,0 +1,64 @@
+// Copyright (c) 2026, The Regents of the University of California.
+// SPDX-License-Identifier: BSD-3-Clause
+
+syntax = "proto3";
+
+package sample.usage.pb;
+
+/**
+ * UsageReport is the worked example of the counter-watch pattern (D-150,
+ * D-151, D-152, D-154), and its use case is the one that drove it: a UPF-like
+ * deployment meters each subscriber's volume and wants a report when a
+ * subscriber reaches a quota, without reading every counter every second.
+ *
+ * It meters two cells per key on the worker that saw the packet -- octets and
+ * packets, the pair a usage report is made of -- where the key is the dense
+ * slot index of a subscriber or rule that a classifier writes as metadata. A
+ * controller arms quotas through the module's own "<name>/quotas" resource,
+ * and how a crossing is noticed is the module's `mode` argument, fixed at Init:
+ * the packet path compares each packet against its key's armed quota, the tick
+ * sweeps the armed keys on the control side, or both (the default), so a
+ * deployment states what it wants instead of the module guessing.
+ *
+ * __Input Gates__: 1
+ * __Output Gates__: 1
+ */
+message UsageReportArg {
+  uint64 keys = 1; /// The key space: keys are 0..keys-1, one per subscriber or rule slot. Each worker's plane is sized to this and to `workers` (D-154).
+  string key_attr = 3; /// The metadata attribute a packet's key arrives in (required: the module has no other way to know whose volume a packet is).
+  UsageReportMode mode = 4; /// How a crossing is noticed (default: both).
+  uint64 tick_period_ms = 5; /// The sweep's period, in milliseconds (default 1000). Read only when the mode sweeps.
+  uint64 workers = 6; /// The workers this pipeline will run on, so each one gets its own plane (D-154). The daemon launches workers after the pipeline is built, so the module cannot read the count itself; 0 means every slot (64), which is always safe and costs 64 planes. A count that is too small is refused before traffic runs, not written past.
+}
+
+/// Which of the three ways to notice a crossing the module runs. Each has a
+/// measured cost (docs/benchmarking.md): the packet path's compare is about
+/// 0.16 ns a packet, the sweep about 1.34 ns per armed key per pass, and the
+/// event itself 340 ns when one fires.
+enum UsageReportMode {
+  USAGE_REPORT_BOTH = 0; /// Both (the default): the packet path posts the report when an armed key crosses, and the tick sweeps the armed keys as the backstop. The exact answer, at the price of the compare.
+  USAGE_REPORT_EVENTS = 1; /// Events only: the packet path compares, no tick runs. Right when a subscriber's traffic is pinned to one worker, where the report is exact rather than a hint.
+  USAGE_REPORT_SWEEP = 2; /// Sweep only: the packet path only meters, and the tick reads every armed key. Right when a subscriber's traffic is spread across workers, where a per-worker report could only be a hint.
+}
+
+/**
+ * A quota a controller armed for one key: the value of "<name>/quotas".
+ * A controller sets the whole set (one value, D-129's singleton shape), so
+ * setting it replaces every quota and a key left out is disarmed; a crossing
+ * fires once and the entry is removed, so a controller that wants the next
+ * report re-arms at its next quota. A zero quota is refused: disarming is a
+ * set that leaves the key out.
+ */
+message UsageQuota {
+  uint64 key = 1; /// The key this quota is for (a subscriber's or rule's slot).
+  uint64 octets = 2; /// The key's octet total at which the report is made.
+}
+
+/**
+ * The whole quota set: what "<name>/quotas" holds. A controller sets it (one
+ * value, D-129's singleton shape), so the set is replaced atomically and a
+ * quota left out is disarmed.
+ */
+message UsageQuotas {
+  repeated UsageQuota quotas = 1; /// The quotas, one per armed key.
+}

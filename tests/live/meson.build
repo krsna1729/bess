@@ -13,6 +13,7 @@ live_test_sources = [
   'module_traffic_test.cc',
   'simd_width_test.cc',
   'stateful_modules_test.cc',
+  'usage_report_test.cc',
 ]
 live_lib = static_library(
   'live_daemon',
@@ -38,11 +39,24 @@ live_env = {
 }
 foreach source : live_test_sources
   name = 'live_' + source.replace('_test.cc', '')
+  extra_sources = []
+  includes = live_inc
+  env = live_env
+  if source == 'simd_width_test.cc'
+    includes = [live_inc, live_arch_inc]
+  elif source == 'usage_report_test.cc'
+    # The sample plugin's own message (the test builds UsageReportArg and the
+    # quotas resource with the generated types) and the plugin itself: the
+    # daemon it starts loads it with --modules.
+    extra_sources = [sample_usage_cpp_target]
+    includes = [live_inc, sample_pb_inc]
+    env = live_env + {'BESS_PLUGIN_DIR': join_paths(meson.project_build_root(), 'sample_plugin')}
+  endif
   exe = executable(
     name,
-    source,
+    [source] + extra_sources,
     implicit_include_directories: false,
-    include_directories: source == 'simd_width_test.cc' ? [live_inc, live_arch_inc] : live_inc,
+    include_directories: includes,
     link_with: live_lib,
     dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
   )
@@ -50,7 +64,7 @@ foreach source : live_test_sources
     name,
     exe,
     depends: [bessd, bessctl_link] + sdk_cpp_test_targets,
-    env: live_env,
+    env: env,
     suite: 'live',
     is_parallel: false,
     timeout: 600,

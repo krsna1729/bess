@@ -2,7 +2,9 @@ sample_plugin = shared_module(
   'sequential_update',
   [
     'modules/sequential_update.cc',
+    'modules/usage_report.cc',
     sample_cpp_target,
+    sample_usage_cpp_target,
     proto_ready_marker,  # core pb/*.pb.h, reached through module.h
   ],
   include_directories: [core_include, core_pb_inc, sample_pb_inc],

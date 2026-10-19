@@ -24,3 +24,29 @@ sample_cpp_target = custom_target(
   ],
   build_by_default: true,
 )
+
+# The worked example's message, generated the same way into the same directory
+# ("pb/usage_msg.pb.h" from sample_pb_inc).
+sample_usage_cpp_target = custom_target(
+  'sample_usage_proto_cpp',
+  input: usage_proto_file,
+  output: [
+    'usage_msg.pb.cc',
+    'usage_msg.pb.h',
+    'usage_msg.grpc.pb.cc',
+    'usage_msg.grpc.pb.h',
+  ],
+  depend_files: usage_proto_file,
+  command: [
+    python,
+    protobuf_generator,
+    protoc.full_path(),
+    grpc_cpp_plugin.full_path(),
+    'cpp',
+    join_paths(meson.project_source_root(), 'sample_plugin', 'protobuf'),
+    sample_pb_dir,
+    '@INPUT@',
+    '@OUTPUT@',
+  ],
+  build_by_default: true,
+)
