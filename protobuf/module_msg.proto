@@ -79,17 +79,6 @@ message HashLBSettings {
   repeated int64 gates = 3; /// The gates to load balance over.
 }
 
-/// A route of the IPLookup resource "<module>/routes" (D-111): key.
-message IPLookupRouteKey {
-  string prefix = 1; /// The CIDR IP part of the prefix, e.g. "10.0.0.0"
-  uint64 prefix_len = 2; /// The prefix length (0: the default route)
-}
-
-/// A route of the IPLookup resource "<module>/routes": value.
-message IPLookupRouteValue {
-  uint64 gate = 1; /// The output gate
-}
-
 /**
  * The L2Forward module has a function `lookup(...)` to query what output gate
  * a given MAC address will be forwared to; it returns the gate ID number.
@@ -629,20 +618,6 @@ message IPEncapArg {
 enum RouteBackend {
   ROUTE_BACKEND_LPM = 0;
   ROUTE_BACKEND_FIB = 1;
-}
-
-/**
- * An IPLookup module perfroms LPM lookups over a packet destination.
- * IPLookup takes no parameters to instantiate.
- * To add rules to the IPLookup table, use `IPLookup.add()`
- *
- * __Input Gates__: 1
- * __Output Gates__: many (configurable, depending on rule values)
- */
-message IPLookupArg {
-  uint32 max_rules = 1; /// Maximum number of rules (default: 1024)
-  uint32 max_tbl8s = 2; /// Maximum number of IP prefixes with smaller than /24 (default: 128)
-  RouteBackend backend = 3; /// Route table structure (default: LPM)
 }
 
 /**

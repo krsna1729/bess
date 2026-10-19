@@ -121,14 +121,15 @@ configured for four network instances pays for the instances that hold routes, n
 `RemoveDomain` takes an empty domain away; removal is frozen once the router is enrolled, because the engine's
 resource holds raw FIB pointers (D-046).
 
-## IPLookup is on its way out
+## IPLookup is retired
 
-`IPLookup` is the legacy shape: one table per module, gate-valued routes, no domains, no next hops, no
-addresses. Everything it can express, the Router expresses with more (D-155, D-156), so the module is being
-retired -- with its resource table and its three protobuf messages -- and Recipe B is what takes its place.
-The library class its routes use (`route/lpm_resource.h`, D-111) stays: a prefix table a transaction can
-change is the shape a subscriber lookup needs when framed routes and IPv6 prefixes arrive (prefix → session
-id), and it is cheaper to reuse than to grow a second prefix table.
+`IPLookup` was the legacy shape: one table per module, gate-valued routes, no domains, no next hops, no
+addresses. Everything it could express, the Router expresses with more (D-155, D-156), so the module, its
+resource table and its three protobuf messages are gone; a manifest that names `mclass: IPLookup` no longer
+applies, and `docs/compatibility.md` carries the entry a user reads (D-161). The library class its routes used
+(`route/lpm_resource.h`, D-111) stays: a prefix table a transaction can change is the shape a subscriber
+lookup needs when framed routes and IPv6 prefixes arrive (prefix → session id), and it is cheaper to reuse
+than to grow a second prefix table.
 
 ## Where to look next
 

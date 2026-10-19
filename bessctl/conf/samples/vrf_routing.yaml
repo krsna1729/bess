@@ -1,26 +1,42 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-# VRF-style routing with one IPLookup per tenant: 10.0.0.0/8 goes to tenant
-# Red's gateway (gate 1) or tenant Blue's (gate 2); the default route of each
-# drops to gate 0.
+# VRF-style routing: one FIB per route domain (D-155). The Vif's two
+# interfaces tell the tenants apart -- Red's frames are addressed to
+# 02:00:00:00:00:11, Blue's to 02:00:00:00:00:12, both untagged -- and write
+# route_domain 1 and 2; 10.0.0.0/8 goes to each tenant's own gateway (gate 1
+# for Red, gate 2 for Blue), each default route to gate 0.
 #
-# Converted from vrf_routing.bess (D-104). Rewrite templates are the packets it
-# built with scapy.
+# Converted from vrf_routing.bess (D-104) -- two IPLookups, one per tenant,
+# now one Router with two domains; the Rewrite templates are the packets it
+# built with scapy, readdressed to the two Vif interfaces (`AgAAAAAB`/
+# `AgAAAAAC` are the next hops' 02:00:00:00:00:01/02 as bytes base64).
 modules:
-  - name: blue_vrf
-    mclass: IPLookup
-  - name: red_vrf
-    mclass: IPLookup
+  - name: vif
+    mclass: Vif
+    arg:
+      interfaces:
+        - id: 1
+          vlan: 0
+          mac_addr: "02:00:00:00:00:11"
+          ip_addr: "10.0.0.1"
+          route_domain: 1
+          gate: 0
+        - id: 2
+          vlan: 0
+          mac_addr: "02:00:00:00:00:12"
+          ip_addr: "10.0.0.2"
+          route_domain: 2
+          gate: 0
+      default_gate: 3
+  - name: router0
+    mclass: Router
+    arg: {mode: ROUTE_MODE_DESTINATION, max_routes: 16, max_next_hops: 4, max_domains: 3}
   - name: rewrite0
     mclass: Rewrite
     arg:
       templates:
-        - BhY+G3IyAh5nn02uCABFAAAuAAEAAEARrRHAqAEBCgECAycRJxIAGjYGVlJGX1JPVVRJTkdfUEFDS0VU
-  - name: rewrite1
-    mclass: Rewrite
-    arg:
-      templates:
-        - BhY+G3IyAh5nn02uCABFAAAuAAEAAEARwqmsEAABCgECAycRJxIAGkueVlJGX1JPVVRJTkdfUEFDS0VU
+        - AgAAAAARAh5nn02uCABFAAAuAAEAAEARrRHAqAEBCgECAycRJxIAGjYGVlJGX1JPVVRJTkdfUEFDS0VU
+        - AgAAAAASAh5nn02uCABFAAAuAAEAAEARwqmsEAABCgECAycRJxIAGkueVlJGX1JPVVRJTkdfUEFDS0VU
   - name: sink0
     mclass: Sink
   - name: sink1
@@ -31,42 +47,43 @@ modules:
     mclass: Sink
   - name: source0
     mclass: Source
-  - name: source1
-    mclass: Source
 connections:
-  - upstream: blue_vrf
+  - upstream: vif
+    downstream: router0
+  - upstream: vif
+    ogate: 3
     downstream: sink3
-  - upstream: blue_vrf
+  - upstream: router0
+    downstream: sink0
+  - upstream: router0
+    ogate: 1
+    downstream: sink1
+  - upstream: router0
     ogate: 2
     downstream: sink2
-  - upstream: red_vrf
-    downstream: sink1
-  - upstream: red_vrf
-    ogate: 1
-    downstream: sink0
   - upstream: rewrite0
-    downstream: red_vrf
-  - upstream: rewrite1
-    downstream: blue_vrf
+    downstream: vif
   - upstream: source0
     downstream: rewrite0
-  - upstream: source1
-    downstream: rewrite1
 workers:
   - {wid: 0, core: 0}
 tasks:
   - module: source0
     wid: 0
-  - module: source1
-    wid: 0
 resources:
-  red_vrf/routes:
-    - key: {prefix: 0.0.0.0, prefix_len: 0}
-      value: {gate: 0}
-    - key: {prefix: 10.0.0.0, prefix_len: 8}
-      value: {gate: 1}
-  blue_vrf/routes:
-    - key: {prefix: 0.0.0.0, prefix_len: 0}
-      value: {gate: 0}
-    - key: {prefix: 10.0.0.0, prefix_len: 8}
-      value: {gate: 2}
+  router0/next_hops:
+    - key: {id: 1}
+      value: {egress_gate: 1, dst_mac: "AgAAAAAC", src_mac: "AgAAAAAB"}
+    - key: {id: 2}
+      value: {egress_gate: 2, dst_mac: "AgAAAAAC", src_mac: "AgAAAAAB"}
+    - key: {id: 3}
+      value: {egress_gate: 0, dst_mac: "AgAAAAAC", src_mac: "AgAAAAAB"}
+  router0/routes:
+    - key: {ipv4: 10.0.0.0, prefix_length: 8, domain: 1}
+      value: {next_hop_id: 1}
+    - key: {ipv4: 0.0.0.0, prefix_length: 0, domain: 1}
+      value: {next_hop_id: 3}
+    - key: {ipv4: 10.0.0.0, prefix_length: 8, domain: 2}
+      value: {next_hop_id: 2}
+    - key: {ipv4: 0.0.0.0, prefix_length: 0, domain: 2}
+      value: {next_hop_id: 3}

@@ -57,6 +57,24 @@ running daemon in the test suite.
   that announces its replacement, and its removal is a decision record.
   Protobuf fields and enum values are never reused (above).
 
+## Recorded breaks
+
+- **`IPLookup` is retired** (D-161). The module is gone from the build and
+  from the API: a manifest that names `mclass: IPLookup` no longer applies,
+  the C++ class is removed, and `IPLookupArg`, `IPLookupRouteKey` and
+  `IPLookupRouteValue` are deleted from `protobuf/module_msg.proto`.
+  `buf breaking` (`WIRE_JSON`, D-026) reports the deletions clean - deleting
+  a message is not one of its rules - so the CI job did not fail and no
+  `buf skip breaking` label was needed; this entry is the record. The
+  replacement is the `Router` (D-155): the same route table (LPM or FIB),
+  routes that name a next hop or, with `max_groups`, a group (D-156), and
+  next hops that carry link addresses. `ROUTE_MODE_DESTINATION` routes a
+  packet by its own IPv4 destination, what `IPLookup` did:
+  `bessctl/conf/samples/router.yaml` is that shape, and
+  `bessctl/conf/samples/vrf_routing.yaml` (one Router, one FIB per route
+  domain, a Vif writing the domain) is the VRF shape the two IPLookups in
+  that sample used to have.
+
 ## What a build is made of
 
 Every install carries `share/bess/build-info.json` (version, commit, plugin

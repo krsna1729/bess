@@ -466,17 +466,26 @@ std::vector<std::string> MSession(Build &b) {
   return MBase(b, {{"em", 1}, {"at", 1}, {"mt", 1}, {"rt", 1}});
 }
 
-Builder MIpLookup(const std::string &arg) {
-  return [arg](Build &b) {
-    b.Mod("IPLookup", "ipl", arg);
+// The FIB at module level: the Router in destination mode (D-155), 256 /16s
+// plus the default -- the table IPLookup measured, on the module that holds
+// it now, with a next hop per side of the split it made with gates.
+Builder MRouter(const std::string &backend) {
+  return [backend](Build &b) {
+    b.Mod("Router", "rt",
+          R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": 512, "max_next_hops": 2, "backend": ")" +
+              backend + R"("})");
+    b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 1})", "RouterNextHopValue",
+            R"({"egress_gate": 1, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})");
+    b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 2})", "RouterNextHopValue",
+            R"({"egress_gate": 0, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})");
     for (int i = 0; i < 256; i++) {
-      b.Entry("ipl/routes", "IPLookupRouteKey",
-              R"({"prefix": "11.)" + std::to_string(i) + R"(.0.0", "prefix_len": 16})",
-              "IPLookupRouteValue", R"({"gate": 1})");
+      b.Entry("rt/routes", "RouterRouteKey",
+              R"({"ipv4": "11.)" + std::to_string(i) + R"(.0.0", "prefix_length": 16})",
+              "RouterRouteValue", R"({"next_hop_id": 1})");
     }
-    b.Entry("ipl/routes", "IPLookupRouteKey", R"({"prefix": "0.0.0.0", "prefix_len": 0})",
-            "IPLookupRouteValue", R"({"gate": 0})");
-    return MBase(b, {{"ipl", 2}});
+    b.Entry("rt/routes", "RouterRouteKey", R"({"ipv4": "0.0.0.0", "prefix_length": 0})",
+            "RouterRouteValue", R"({"next_hop_id": 2})");
+    return MBase(b, {{"rt", 2}});
   };
 }
 
@@ -668,8 +677,8 @@ std::vector<Test> Catalogue() {
       {"M.wildcardmatch/8", 'M', MWildcardMasks(8)},
       {"M.wildcardmatch/16", 'M', MWildcardMasks(16)},
       {"M.session", 'M', MSession},
-      {"M.iplookup", 'M', MIpLookup("{}")},
-      {"M.iplookup/fib", 'M', MIpLookup(R"({"backend": "ROUTE_BACKEND_FIB"})")},
+      {"M.router", 'M', MRouter("ROUTE_BACKEND_LPM")},
+      {"M.router/fib", 'M', MRouter("ROUTE_BACKEND_FIB")},
       {"M.l2forward", 'M', ML2Forward},
       {"M.acl", 'M', MAcl},
       {"M.firewall", 'M', MFirewall},

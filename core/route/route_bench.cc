@@ -7,8 +7,8 @@
 //              1 = 4M uniformly random keys (DRAM-bound tbl24):
 //                RawLpmX4       the pre-K7 IPLookup shape: SSE byte swap of
 //                               packet-order addresses + rte_lpm_lookupx4
-//                RouteTable     host-order gather + LookupBatch (what
-//                               IPLookup now runs)
+//                RouteTable     host-order gather + LookupBatch (what the
+//                               `Router` module runs)
 //                Router         LookupBatch + next-hop resolution
 //              RouteTable, Router and UpdateInPlace also run on the rte_fib
 //              backend (the *Fib rows, D-132).

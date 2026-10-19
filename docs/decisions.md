@@ -11214,3 +11214,75 @@ is unchanged, `NextHop` is the same 16 bytes (`BlackholeNextHop()` is a factory 
 `blackholed_frames()` is 1, `no_route_frames()` and `unresolved_frames()` stay 0, and `GetDesc` says
 "blackholed: 1". The chain itself has no separate unit test; the module's destination tests exercise it, and
 this case is the first to reach a hop that names no egress interface.
+
+## D-161 IPLookup is retired
+
+**Status:** accepted (2026-10-19; the recorded break D-155 scheduled for its own commit).
+**Code:** deleted: `core/modules/ip_lookup.{h,cc}`, `core/modules/ip_lookup_test.cc`,
+`bessctl/conf/samples/iplookup.yaml`, three messages in `protobuf/module_msg.proto` (`IPLookupArg`,
+`IPLookupRouteKey`, `IPLookupRouteValue`) and `core/meson.build`'s entries; migrated:
+`bessctl/conf/samples/router.yaml` (new, from `iplookup.yaml`), `bessctl/conf/samples/vrf_routing.yaml`,
+`tests/live/classifier_traffic_test.cc`, `tests/live/simd_width_test.cc`, `tests/live/control_sdk_test.cc`,
+`tests/perf/live_perf.cc` (`M.router`, `M.router/fib`); comments in `core/route/route_table.h`,
+`core/route/route_test.cc`, `core/route/route_bench.cc`, `core/fib_bench.cc`; `docs/compatibility.md`,
+`docs/dataplane-tables.md`, `docs/limits.md`, `docs/routing.md`.
+**Analysis:** [compatibility.md](compatibility.md), [dataplane-tables.md](dataplane-tables.md).
+
+**Context.** Two modules held routes. `IPLookup` looked a prefix up in its own `rte_lpm` and jumped to a gate:
+no next hop, no link addresses, no route domain. The `Router` holds the same table and, since D-155/D-156,
+resolves a route to a hop (neighbor, addresses, gate), selects by route domain and flow hash, and can route by
+the packet's own IPv4 destination. Nothing a stored route could express was left that only `IPLookup`
+understood; what remained were its name, its `gate`-valued route and the `lpm_resource.h` mixin (D-111) that
+existed for its one resource. The samples, the live tests, the SDK round-trip sample and the perf cases still
+ran it as if it were the route table's module.
+
+**Decision.**
+
+- **The module, its test and its resource table are removed**, and the API goes with them: the C++ class,
+  the three messages (no command or module names them anymore), and the resource table that made an
+  `LpmRouteTable` the module's one resource. `route/lpm_resource.h` (`LpmTableResource`, D-111) and its test
+  **stay**: a prefix table a transaction can change is library surface with a named future consumer (the
+  plan's prefix selector, and the UPF's framed routes and IPv6 prefixes, which reuse it instead of growing a
+  second prefix table), and it costs one header and one test. A manifest that names `mclass: IPLookup` no
+  longer applies and a C++ plugin that subclassed the module no longer builds; both are what "retired" means
+  here, and `docs/compatibility.md` carries the entry a user reads ("Recorded breaks").
+- **The samples move to the Router.** `iplookup.yaml` becomes `router.yaml`: the same three templates and
+  gates (172.16/16 -> gate 1, 192.168.1/24 -> gate 2, the default -> gate 5), now `ROUTE_MODE_DESTINATION`
+  routes to three next hops that carry addresses. `vrf_routing.yaml` - two IPLookups, one per tenant - becomes
+  one Router with three domains and a Vif whose two untagged interfaces (distinct destination MACs, so the
+  two templates are readdressed) write `route_domain` 1 and 2; each tenant's 10/8 route goes to its own
+  gateway and each default route to gate 0. Both keep the "converted from .bess (D-104)" record.
+- **The live tests and the harness move the same way.** `classifier_traffic`'s routing case becomes
+  `RouterRoutesChangeWhileForwarding`: the Router in destination mode, two hops (the default route to hop 1,
+  the upserted /16s to hop 2), routes changing under traffic, both gates asserted. `simd_width` runs its
+  `rte_lpm` slot as the Router's route table. The SDK round-trip sample drops its IPLookup row - nothing takes
+  its place, the Router's row and its three resources arrived in D-155/D-156 - and its resource-clearing case
+  reads `rt/routes` and erases the one route the sample holds (was three, on `ipl/routes`).
+  `M.iplookup`/`M.iplookup/fib` become `M.router`/`M.router/fib`: the same 256-route table plus the default,
+  with a next hop per side, since destination mode writes addresses and decrements the TTL.
+- **The break is recorded, not waived.** `buf breaking` (`WIRE_JSON`, D-026) reports deleting a message
+  clean - no rule covers it (verified with buf 1.74.0 while this change was prepared) - so CI's "Protobuf
+  compatibility" job does not fail and no `buf skip breaking` label is needed; the record is
+  `docs/compatibility.md`'s "Recorded breaks", and no field or enum number is reused (D-026).
+- **Descriptions of the data path move; recorded numbers do not.** `dataplane-tables.md`'s cost row, the
+  route table's "used by", the built-in modules table and the FIB-backend row name the Router, and
+  `limits.md`'s DPDK-instance-name row drops the module. `benchmarking.md`'s tune matrix,
+  `performance-clawback.md` and `docs/baselines/*.json` are records of past commits and keep their
+  `M.iplookup` rows under that name.
+
+**Not in this change.** The Router gains no capability here - the retirement is a deletion and a set of
+migrations. The historical documents stay historical: `MODERNIZATION.md`, `docs/performance-clawback.md`,
+the recorded perf baselines, and `route_bench`'s and `fib_bench`'s "pre-K7 IPLookup shape" comments (they name
+the question the benches answer, not a module).
+
+**Evidence.** `ninja -C build/fast` builds the tree with the module, its test and the mixin gone (542
+targets, GCC). `RouterTest` 22/22, `route_test` 44/44, `router_transaction_test` 34/34, `route_domain_test`
+22/22 and `lpm_resource_test` 8/8 on `build/fast`. The live lanes are CI's: `live_control_sdk` (the
+round-trip sample set without the IPLookup row, including the `rt/routes` clearing case),
+`live_classifier_traffic` (`RouterRoutesChangeWhileForwarding`: transactions ran, both gates saw traffic),
+`live_simd_width` (the Router's route table at every SIMD width) and `live_bessctl` (every sample applies -
+`router.yaml` and the rewritten `vrf_routing.yaml` included, `iplookup.yaml` gone). `buf breaking`
+(`WIRE_JSON`, D-026) reports deleting a message clean -- no rule covers it (checked with buf 1.74.0 while
+this change was prepared); buf is not installed on this workstation, so CI's "Protobuf compatibility" job is
+the standing re-check. A repository-wide search for `IPLookup`/`ip_lookup`/`iplookup` leaves only the
+historical documents and comments named above.
