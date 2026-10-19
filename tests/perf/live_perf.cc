@@ -336,12 +336,23 @@ std::vector<std::string> FQueue(Build &b) {
 
 // Source -> Rewrite -> RandomUpdate (kFlows source addresses) -> [rest] -> Sink;
 // `rest`: (module, output gates) in order, created by the caller except Bypass.
+// `dest_span` > 0 adds a second field to the same RandomUpdate: the traffic
+// then draws its destination from dest_span addresses starting at 11.0.0.0,
+// which is what a module that routes by destination pays for -- the FIB's
+// working set, not the number of rules. One module, not two, so a sweep's
+// pipeline has exactly the shape M.router's has.
 std::vector<std::string> MBase(Build &b, std::vector<std::pair<std::string, int>> rest = {},
-                               const std::optional<std::string> &frame = std::nullopt) {
+                               const std::optional<std::string> &frame = std::nullopt,
+                               uint64_t dest_span = 0) {
   std::string last = Source(b, "src", 60, frame ? *frame : Ipv4Udp());
-  b.Mod("RandomUpdate", "ru",
-        R"({"fields": [{"offset": 26, "size": 4, "min": )" + std::to_string(0x0a000001) +
-            R"(, "max": )" + std::to_string(0x0a000000 + kFlows) + "}]}");
+  std::string fields =
+      R"({"offset": 26, "size": 4, "min": )" + std::to_string(0x0a000001) +
+      R"(, "max": )" + std::to_string(0x0a000000 + kFlows) + "}";
+  if (dest_span > 0) {
+    fields += R"(, {"offset": 30, "size": 4, "min": )" + std::to_string(0x0b000000) +
+              R"(, "max": )" + std::to_string(0x0b000000 + dest_span - 1) + "}";
+  }
+  b.Mod("RandomUpdate", "ru", R"({"fields": [)" + fields + "]}");
   b.Conn(last, "ru");
   last = "ru";
   if (rest.empty()) {
@@ -486,6 +497,36 @@ Builder MRouter(const std::string &backend) {
     b.Entry("rt/routes", "RouterRouteKey", R"({"ipv4": "0.0.0.0", "prefix_length": 0})",
             "RouterRouteValue", R"({"next_hop_id": 2})");
     return MBase(b, {{"rt", 2}});
+  };
+}
+
+// M.router with the two magnitudes that decide what a destination lookup
+// costs: `routes` /24 prefixes and `dest_span` destination addresses the
+// traffic draws from, both starting at 11.0.0.0. The prefixes are consecutive,
+// so the traffic's range covers exactly the first dest_span/256 of them: what
+// varies is the FIB's working set against the table's size, with every packet
+// matching a route rather than the default. 65536 is the layout's maximum
+// (11.255.255.0/24); above it the address plan needs another octet.
+Builder MRouterScale(int routes, uint64_t dest_span,
+                     const std::string &backend = "ROUTE_BACKEND_LPM") {
+  return [routes, dest_span, backend](Build &b) {
+    b.Mod("Router", "rt",
+          R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": )" +
+              std::to_string(routes + routes / 4) + R"(, "max_next_hops": 2, "backend": ")" +
+              backend + R"("})");
+    b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 1})", "RouterNextHopValue",
+            R"({"egress_gate": 1, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})");
+    b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 2})", "RouterNextHopValue",
+            R"({"egress_gate": 0, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})");
+    for (int i = 0; i < routes; i++) {
+      b.Entry("rt/routes", "RouterRouteKey",
+              R"({"ipv4": "11.)" + std::to_string(i / 256) + "." + std::to_string(i % 256) +
+                  R"(.0", "prefix_length": 24})",
+              "RouterRouteValue", R"({"next_hop_id": 1})");
+    }
+    b.Entry("rt/routes", "RouterRouteKey", R"({"ipv4": "0.0.0.0", "prefix_length": 0})",
+            "RouterRouteValue", R"({"next_hop_id": 2})");
+    return MBase(b, {{"rt", 2}}, std::nullopt, dest_span);
   };
 }
 
@@ -679,6 +720,14 @@ std::vector<Test> Catalogue() {
       {"M.session", 'M', MSession},
       {"M.router", 'M', MRouter("ROUTE_BACKEND_LPM")},
       {"M.router/fib", 'M', MRouter("ROUTE_BACKEND_FIB")},
+      {"M.router/s256", 'M', MRouterScale(256, 256u)},
+      {"M.router/s64k", 'M', MRouterScale(256, 1u << 16u)},
+      {"M.router/r2560s64k", 'M', MRouterScale(2560, 1u << 16u)},
+      {"M.router/r2560", 'M', MRouterScale(2560, uint64_t{2560} * 256)},
+      {"M.router/r10240", 'M', MRouterScale(10240, uint64_t{10240} * 256)},
+      {"M.router/r65536", 'M', MRouterScale(65536, uint64_t{65536} * 256)},
+      {"M.router/r2560s64k-fib", 'M',
+       MRouterScale(2560, 1u << 16u, "ROUTE_BACKEND_FIB")},
       {"M.l2forward", 'M', ML2Forward},
       {"M.acl", 'M', MAcl},
       {"M.firewall", 'M', MFirewall},
