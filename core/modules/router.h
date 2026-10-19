@@ -49,7 +49,8 @@
 // Both modes drop a packet whose hop is unknown, or whose neighbor is not
 // resolved: what to do toward an unresolved neighbor (queue, punt, drop) is
 // the application's, and dropping is the choice that never forwards on a
-// guess.
+// guess. docs/routing.md is the guide: the library's pieces, the two recipes
+// and what a graph decides.
 //
 // A resolved hop that names both of its addresses has them written into the
 // frame's Ethernet header (route::RewriteL2) before it leaves, so a frame

@@ -307,6 +307,8 @@ refused. An unset port bound is 65535, not 0, because the proto field is
   `ReplaceRouteSetAtomic(domain, routes)` builds a replacement FIB beside the
   live one, validates next hops and rte_lpm capacity before publishing, and
   publishes it with one pointer store (a table build, not an in-place update).
+  The guide to the library and to the two ways a graph routes is
+  `docs/routing.md`.
 - **Used by:** IPLookup, the `Router` module.
 
 - **Next-hop groups** (M15, D-065): `SetNextHopGroup(id, members)` and
