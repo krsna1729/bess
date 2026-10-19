@@ -163,6 +163,7 @@ func TestWatchCountersDrawsItsBoundsWhereGoDoes(t *testing.T) {
 		{"a worker above an int", "worker", "2147483648"},
 		{"a key above 64 bits", "key", "18446744073709551616"},
 		{"a value above 64 bits", "value", "18446744073709551616"},
+		{"a limit above 64 bits", "limit", "18446744073709551616"},
 	} {
 		fields := map[string]string{"key": "7", "value": "100", "limit": "100"}
 		fields[tc.field] = tc.value

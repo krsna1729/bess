@@ -553,6 +553,27 @@ class ScriptedTest(unittest.TestCase):
         with self.assertRaises(errors.DaemonRestartedError):
             list(client.watch_counters("usage"))
 
+    def test_watch_counters_passes_over_a_workers_lost_events(self):
+        """A worker's ring loss names a worker, not a module: the watch goes on."""
+        client, _ = self.make_client([[
+            counter_event("usage", 2, key="7", value="100", limit="100"),
+            v2.Event(type="bess.events_lost", sequence=3, source="worker1", daemon_epoch=1),
+            counter_event("usage", 4, key="9", value="50", limit="50"),
+            v2.Event(type="bess.restart", daemon_epoch=2),
+        ]])
+        seen = []
+        with self.assertRaises(errors.DaemonRestartedError):
+            for crossing in client.watch_counters("usage"):
+                seen.append(crossing)
+        self.assertEqual([7, 9], [c.key for c in seen])
+
+    def test_watch_counters_forwards_the_resume_arguments(self):
+        """from_sequence and daemon_epoch reach the request, as in watch_events."""
+        client, transport = self.make_client([[]])
+        list(client.watch_counters("usage", from_sequence=11, daemon_epoch=2))
+        self.assertEqual(11, transport.requests[-1].from_sequence)
+        self.assertEqual(2, transport.requests[-1].daemon_epoch)
+
 
 def counter_event(source, sequence, **fields):
     """The event both producers emit: key, value and limit always, worker when
