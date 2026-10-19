@@ -98,7 +98,9 @@ Routes, next hops and groups are written through the module's resources (`<route
 `/groups`) in transactions, or directly by an application. The first routes a router usually writes are its
 connected ones: an interface's own address implies the subnet reachable on it, and
 `route::ConnectedRouteFor(address, length, egress)` (D-164) returns that prefix with a hop on the interface,
-whose neighbor stays unresolved until resolution learns it.
+whose neighbor stays unresolved -- the hop names the interface, not a neighbor, so nothing resolves it and a
+frame to the subnet itself is unresolved. Reaching a host on that subnet is a /32 route and hop the application
+writes when resolution learns the host (`NeighborTable::Bind` is what makes a learned neighbor update a hop).
 
 The two recipes meet in one module. Which one runs is **configuration**, not a per-packet test: the `mode` arg
 (`ROUTE_MODE_NEXT_HOP_ID`, the default, or `ROUTE_MODE_DESTINATION`, D-155). A module decides; it does not
