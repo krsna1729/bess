@@ -115,6 +115,9 @@ class Meter final : public Module {
   // How many meter ids one packet carries (the `meter_id` attribute is
   // 4 * levels_ bytes wide). 1 is the module's historical behaviour.
   size_t levels_ = 1;
+  // What one packet is charged: its bytes (the historical unit) or one unit,
+  // for a packet-rate meter.
+  bool packets_ = false;
 
   int meter_id_attr_ = -1;
   // The attribute's registered name, for the one log line that names it.

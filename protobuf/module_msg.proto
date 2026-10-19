@@ -1326,6 +1326,15 @@ message MeterArg {
   // each non-zero slot in turn (green and yellow continue, red stops). Default
   // 1, the historical one-meter packet.
   uint32 levels = 3;
+  // What one packet is charged. Bytes is the historical unit (and what a
+  // bit-rate QER's MBR/GBR mean); Packets makes the same buckets count
+  // packets, so a profile of `peak_rate: 1000` is 1000 packets a second -- the
+  // unit of the QER's Packet Rate (8.2.63) and the serving-PLMN rate control.
+  enum MeterCost {
+    METER_COST_BYTES = 0;
+    METER_COST_PACKETS = 1;
+  }
+  MeterCost cost = 4;
 }
 
 /**

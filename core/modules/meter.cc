@@ -275,6 +275,10 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   meter_id_attr_ = AddMetadataAttr(
       id_attr_name_, levels_ * sizeof(bess::utils::be32_t),
       bess::metadata::Attribute::AccessMode::kRead);
+  // The profile's rates and bursts are in the chosen unit: bytes/s for a
+  // bit-rate, packets/s for a packet-rate (8.2.63), the same buckets either
+  // way. The library is unit-agnostic -- it is handed one integer per packet.
+  packets_ = arg.cost() == bess::pb::MeterArg::METER_COST_PACKETS;
   if (meter_id_attr_ < 0) {
     const std::string name = resource_->name();
     CHECK(init_context().resources().ReleaseForTeardown(
@@ -401,7 +405,8 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
         continue;
       }
       const meter::MeterColor color = state->CheckColorAware(
-          now, pkt.total_len(), static_cast<meter::MeterColor>(gates[i]));
+          now, packets_ ? 1u : pkt.total_len(),
+          static_cast<meter::MeterColor>(gates[i]));
       // MeterColor's values are the output gates: green 0, yellow 1, red 2.
       gates[i] = static_cast<gate_idx_t>(color);
       if (color == meter::MeterColor::kRed) {
