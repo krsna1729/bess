@@ -78,7 +78,9 @@ inline TtlResult DecrementHopLimit(std::span<uint8_t> ipv6_header) noexcept {
 // `kL3L4` is the whole flow: a group spreads one flow's packets over one
 // member. `kL3` is the address pair alone, which pins every flow to one
 // destination to the same member -- what a graph wants when a subscriber's
-// traffic must not be spread, or when the L4 header must not be read.
+// traffic must not be spread. The parse reads the L4 header either way (a
+// later fragment has none, and is refused before any hash is taken); `kL3`
+// only keeps its ports out of the hash.
 enum class FlowHashFields : uint8_t {
   kL3L4,
   kL3,
