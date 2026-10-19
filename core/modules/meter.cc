@@ -209,6 +209,16 @@ class Meter::MetersResource final : public dataplane::Resource {
 };
 
 CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
+  // The level count sizes the attribute both this module and the ActionTable
+  // declare, and the framework refuses a size mismatch between them. Validate
+  // it before the resource is registered, so a refused module leaves nothing.
+  levels_ = arg.levels() == 0 ? 1 : arg.levels();
+  if (levels_ * sizeof(bess::utils::be32_t) >
+      bess::metadata::kMetadataAttrMaxSize) {
+    return CommandFailure(EINVAL, "levels must be 1-%zu",
+                          bess::metadata::kMetadataAttrMaxSize /
+                              sizeof(bess::utils::be32_t));
+  }
   if (arg.capacity() > std::numeric_limits<meter::MeterId::rep_type>::max()) {
     return CommandFailure(EINVAL, "meter capacity exceeds valid meter ids");
   }
@@ -260,8 +270,11 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   // A graph with two meters -- a flow maximum and a session aggregate from one
   // classifier result -- sets the name so each reads its own identity.
   id_attr_name_ = arg.id_attr().empty() ? "meter_id" : arg.id_attr();
-  meter_id_attr_ = AddMetadataAttr(id_attr_name_, sizeof(bess::utils::be32_t),
-                                   bess::metadata::Attribute::AccessMode::kRead);
+  // One attribute, 4 bytes per level: every level's id is read from the same
+  // place the ActionTable wrote the list.
+  meter_id_attr_ = AddMetadataAttr(
+      id_attr_name_, levels_ * sizeof(bess::utils::be32_t),
+      bess::metadata::Attribute::AccessMode::kRead);
   if (meter_id_attr_ < 0) {
     const std::string name = resource_->name();
     CHECK(init_context().resources().ReleaseForTeardown(
@@ -355,29 +368,46 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
 
   const meter::MeterSet *set = published_.Read();
   const uint64_t now = meter::MeterNow();
-  std::array<meter::MeterId, bess::PacketBatch::kMaxBurst> ids;
-  std::array<uint32_t, bess::PacketBatch::kMaxBurst> bytes;
-  std::array<meter::MeterColor, bess::PacketBatch::kMaxBurst> colors;
+  const size_t levels = levels_;
+  std::array<bool, bess::PacketBatch::kMaxBurst> alive;
   for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-    ids[i] = meter::MeterId(
-        get_attr_with_offset<bess::utils::be32_t>(offset, pkt).value());
-    bytes[i] = pkt.total_len();
+    gates[i] = kGreenGate;
+    alive[i] = true;
   }
-
-  const uint64_t resolved = set->CheckBatch(
-      std::span(ids).first(static_cast<size_t>(cnt)),
-      std::span(bytes).first(static_cast<size_t>(cnt)),
-      std::span(colors).first(static_cast<size_t>(cnt)), now);
-  for (int i = 0; i < cnt; i++) {
-    if ((resolved & (uint64_t{1} << i)) == 0) {
-      // Id 0 is "no meter": unmetered, so green. Anything else names a meter
-      // that is not there (a dangling action), which is dropped.
-      gates[i] = ids[i].value() == 0 ? kGreenGate : DROP_GATE;
-      continue;
+  // One pass per level, over the packets the levels before it let live: a
+  // packet a level marks red is not charged to the levels after it, so the
+  // session's bucket is not billed for what the flow's dropped. Green and
+  // yellow continue and keep charging; the packet's colour is the worst seen.
+  for (size_t l = 0; l < levels; l++) {
+    const bess::metadata::mt_offset_t slot =
+        offset + static_cast<bess::metadata::mt_offset_t>(
+                     l * sizeof(bess::utils::be32_t));
+    for (int i = 0; i < cnt; i++) {
+      if (!alive[i]) {
+        continue;
+      }
+      bess::PacketRef pkt = batch->packet(i);
+      const meter::MeterId id(
+          get_attr_with_offset<bess::utils::be32_t>(slot, pkt).value());
+      if (id.value() == 0) {
+        continue;  // no meter at this level
+      }
+      meter::MeterState *state = set->Lookup(id);
+      if (state == nullptr) {
+        // A dangling id is dropped rather than forwarded unmetered, as with
+        // a single level.
+        gates[i] = DROP_GATE;
+        alive[i] = false;
+        continue;
+      }
+      const meter::MeterColor color = state->CheckColorAware(
+          now, pkt.total_len(), static_cast<meter::MeterColor>(gates[i]));
+      // MeterColor's values are the output gates: green 0, yellow 1, red 2.
+      gates[i] = static_cast<gate_idx_t>(color);
+      if (color == meter::MeterColor::kRed) {
+        alive[i] = false;
+      }
     }
-    // MeterColor's values are the output gates: green 0, yellow 1, red 2.
-    gates[i] = static_cast<gate_idx_t>(colors[i]);
   }
 }
 

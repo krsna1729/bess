@@ -105,11 +105,15 @@ Router *CreateRouterModule(const std::string &name,
 }
 
 Meter *CreateMeterModule(const std::string &name, uint64_t capacity,
-                         const std::string &id_attr = "") {
+                         const std::string &id_attr = "",
+                         uint32_t levels = 0) {
   bess::pb::MeterArg arg;
   arg.set_capacity(capacity);
   if (!id_attr.empty()) {
     arg.set_id_attr(id_attr);
+  }
+  if (levels != 0) {
+    arg.set_levels(levels);
   }
   return static_cast<Meter *>(Create("Meter", name, Pack(arg)));
 }
@@ -118,7 +122,8 @@ ActionTable *CreateActionTable(const std::string &name, const std::string &meter
                                const std::string &next_hops, uint64_t capacity = 64,
                                const std::string &meter_attr = "",
                                const std::string &next_hop_attr = "",
-                               const std::string &action_attr = "") {
+                               const std::string &action_attr = "",
+                               uint32_t levels = 0) {
   bess::pb::ActionTableArg arg;
   arg.set_capacity(capacity);
   arg.set_meters(meters);
@@ -131,6 +136,9 @@ ActionTable *CreateActionTable(const std::string &name, const std::string &meter
   }
   if (!action_attr.empty()) {
     arg.set_action_attr(action_attr);
+  }
+  if (levels != 0) {
+    arg.set_levels(levels);
   }
   return static_cast<ActionTable *>(Create("ActionTable", name, Pack(arg)));
 }
@@ -294,7 +302,7 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
   }
   const ActionTable::Action *action = at->LookupAction(ActionId(1));
   ASSERT_NE(nullptr, action);
-  EXPECT_EQ(action->meter.value(), 1u);
+  EXPECT_EQ(action->meters[0].value(), 1u);
   EXPECT_EQ(action->next_hop.value(), 1u);
   EXPECT_EQ(at->LookupAction(ActionId(2)), nullptr);
 
@@ -416,7 +424,7 @@ TEST_F(SessionPipelineTest, RejectionsLeaveNothingChanged) {
                                     bess::dataplane::EncodeKey(MeterId(1))),
             1u);
   EXPECT_NE(nullptr, mt);
-  EXPECT_EQ(at->LookupAction(ActionId(1))->meter.value(), 1u);
+  EXPECT_EQ(at->LookupAction(ActionId(1))->meters[0].value(), 1u);
 
   // A meter profile that rte_meter would refuse is refused here, and the
   // rejected transaction leaves the meter alone.
@@ -1522,6 +1530,103 @@ TEST_F(SessionPipelineTest, ConfiguredActionAndNextHopNamesPairWithTheirReaders)
             at->attr_offset(AttrIndex(at, "flow_meter_id")));
   EXPECT_EQ(rt->attr_offset(AttrIndex(rt, "hop_id")),
             at->attr_offset(AttrIndex(at, "hop_id")));
+}
+
+// A multi-level action writes every slot of the one `meter_id` attribute the
+// Meter reads, 4 bytes per level. The single-id form still names level 0 and
+// fills the rest with 0 ("no meter"), so a Meter expecting more levels never
+// reads a neighbour slot the action did not write.
+TEST_F(SessionPipelineTest, AOneIdActionFillsEverySlotOfATwoLevelTable) {
+  bess::testing::ModuleHarness h;
+  ActionTable *at = CreateActionTable("at_legacy", "mt_legacy/meters",
+                                      "rt_legacy/next_hops", 64, "", "", "", 2);
+  Meter *mt = CreateMeterModule("mt_legacy", 64, "", 2);
+  Router *rt = CreateRouterModule("rt_legacy");
+  ASSERT_NE(nullptr, at);
+  ASSERT_NE(nullptr, mt);
+  ASSERT_NE(nullptr, rt);
+  ASSERT_EQ(8u, at->all_attrs()[AttrIndex(at, "meter_id")].size);
+  ASSERT_EQ(8u, mt->all_attrs()[AttrIndex(mt, "meter_id")].size);
+
+  bess::pb::MeterIdKey meter_key;
+  meter_key.set_id(1);
+  bess::pb::MeterPolicyValue meter;
+  meter.mutable_tr_tcm()->set_committed_rate(1);
+  meter.mutable_tr_tcm()->set_committed_burst(100);
+  meter.mutable_tr_tcm()->set_peak_rate(1);
+  meter.mutable_tr_tcm()->set_peak_burst(100);
+  EXPECT_EQ("", h.UpsertResource("mt_legacy/meters", meter_key, meter));
+
+  bess::pb::ActionIdKey action_key;
+  action_key.set_id(1);
+  bess::pb::ActionValue one_id;
+  one_id.set_meter_id(1);
+  EXPECT_EQ("", h.UpsertResource("at_legacy/actions", action_key, one_id));
+
+  const ActionTable::Action *action = at->LookupAction(ActionId(1));
+  ASSERT_NE(nullptr, action);
+  EXPECT_EQ(2u, action->levels) << "the table's level count, not the form's";
+  EXPECT_EQ(1u, action->meters[0].value());
+  EXPECT_EQ(0u, action->meters[1].value()) << "the second slot is no meter";
+}
+
+// A two-level record is policed in order: green and yellow keep charging the
+// later levels, red stops, and the shared session bucket is not billed for
+// what the flow's first level dropped.
+TEST_F(SessionPipelineTest, TwoLevelsPoliceInOrderAndARedChargesNoLaterLevel) {
+  // The Meter reads two ids from the one 8-byte attribute; a writer names the
+  // record per stream (1,2 then 3,2), so no ActionTable is needed to exercise
+  // the ordered passes. 2 is the shared session bucket at both streams' level 2.
+  bess::pb::SetMetadataArg flow_a_arg;
+  auto *a = flow_a_arg.add_attrs();
+  a->set_name("meter_id");
+  a->set_size(8);
+  a->set_value_bin(std::string("\x00\x00\x00\x01\x00\x00\x00\x02", 8));
+  bess::pb::SetMetadataArg flow_b_arg;
+  auto *b = flow_b_arg.add_attrs();
+  b->set_name("meter_id");
+  b->set_size(8);
+  b->set_value_bin(std::string("\x00\x00\x00\x03\x00\x00\x00\x02", 8));
+  Module *flow_a = Create("SetMetadata", "md_flow_a", Pack(flow_a_arg));
+  Module *flow_b = Create("SetMetadata", "md_flow_b", Pack(flow_b_arg));
+  Meter *mt = CreateMeterModule("mt_lv", 64, "", 2);
+  ASSERT_NE(nullptr, flow_a);
+  ASSERT_NE(nullptr, flow_b);
+  ASSERT_NE(nullptr, mt);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(flow_a, 0, mt, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(flow_b, 0, mt, 0, true));
+  ASSERT_EQ(8u, mt->all_attrs()[AttrIndex(mt, "meter_id")].size);
+
+  auto r = Apply({
+      Op::Upsert("mt_lv/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(60)})),
+      // The shared bucket holds exactly two packets: the first stream's green
+      // packet and the second stream's, but not a charge from the red one.
+      Op::Upsert("mt_lv/meters", bess::dataplane::EncodeKey(MeterId(2)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(120)})),
+      Op::Upsert("mt_lv/meters", bess::dataplane::EncodeKey(MeterId(3)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(60)})),
+  });
+  ASSERT_EQ(Outcome::kApplied, r.outcome)
+      << (r.ops.empty() ? "" : r.ops[0].error);
+
+  std::random_device rd;
+  std::mt19937 rng{rd()};
+  const auto first = SessionPacket("10.1.2.3", 1234, rng);
+  const auto second = SessionPacket("10.1.2.3", 1234, rng);
+  bess::testing::ModuleHarness h;
+
+  auto out = h.RunPipeline(flow_a, 0, {first, second}, mt, {0, 2});
+  EXPECT_EQ(1u, out[0].size()) << "the first packet is green at both levels";
+  ASSERT_EQ(1u, out[2].size()) << "the second is red at the first level";
+
+  // The second stream passes its own first level. The shared level-2 bucket
+  // still holds its burst, so this packet is green; it would be red had the
+  // red packet above been charged to level 2 before being dropped.
+  const auto other = SessionPacket("10.1.2.4", 4321, rng);
+  out = h.RunPipeline(flow_b, 0, {other}, mt, {0, 2});
+  EXPECT_EQ(1u, out[0].size()) << "the red packet charged no later level";
+  EXPECT_TRUE(out[2].empty());
 }
 
 }  // namespace
