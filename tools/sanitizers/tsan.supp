@@ -20,3 +20,18 @@ race:__rte_ring_enqueue_elems
 # not the inline reader: a race of any other writer against a FIB lookup --
 # a BESS table freed or reset under readers -- is still reported.
 race:add_depth_big
+# The transaction engine's lock and the Router's are taken in both orders, and
+# both nestings are safe because a single lock above them serialises every path
+# that takes either pair: the control plane's mutex, held by
+# ApplyTransaction/ApplyPipeline on the transaction side and by
+# CreateModule/DestroyModule on the Init/DeInit side, and only one thread holds
+# it. The cycle TSan reports (D-158 introduced the second edge):
+#   Router::Enroll (router.cc:350) -> ResourceRegistry::Register ->
+#     TransactionEngine::Register (transaction_engine.cc:65)  [router -> engine]
+#   TransactionEngine::ApplyImpl (transaction_engine.cc:483) ->
+#     Router::RouteResource::Reserve (router.cc:190)          [engine -> router]
+# Its deadlock detector works on the observed lock-order graph and cannot see
+# that outer lock. Suppressed at both ends of the newer edge: a cycle that does
+# not pass through the router's mutex and the engine's is still reported.
+deadlock:bess::route::Router::RouteResource::Reserve
+deadlock:bess::route::Router::Enroll

@@ -72,7 +72,10 @@ class RouterTransactionTest : public bess::testing::RouteBackendTest {
     auto router = Router::Create("rt", config, next_hops,
                                  bess::runtime::runtime().rcu(), domains, groups);
     EXPECT_TRUE(router.has_value());
-    // Domains are structural: they exist before the router is enrolled.
+    // The direct API still wants CreateDomain first (kUnknownDomain), so a test
+    // that writes routes directly gets the domains it asked for; the resource
+    // path creates a domain on demand (D-158), which
+    // ATransactionCreatesTheDomainItFirstWritesInto covers.
     for (uint32_t d = 1; d < domains; d++) {
       EXPECT_TRUE((*router)->CreateDomain(RouteDomainId(d), config));
     }
@@ -121,6 +124,53 @@ TEST_P(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
             Outcome::kApplied);
   EXPECT_EQ(EgressOf(*router, Ip(10, 9, 9, 9)), 1);
   EXPECT_EQ(router->RouteReferences(NextHopId(1)), 1u);
+}
+
+// D-158: a domain a transaction first writes a route into is created by that
+// write, so `max_domains` bounds the ids without allocating every domain's FIB.
+// The direct API keeps CreateDomain explicit, an out-of-range domain is refused
+// with nothing created, and an erase in a missing domain is still "not found".
+TEST_P(RouterTransactionTest, ATransactionCreatesTheDomainItFirstWritesInto) {
+  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
+  config.max_routes = 4096;
+  auto made = Router::Create("rtlazy", config, /*max_next_hops=*/8,
+                             bess::runtime::runtime().rcu(), /*max_domains=*/4,
+                             /*max_groups=*/0);
+  ASSERT_TRUE(made.has_value());
+  auto router = std::move(*made);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  // Only the default domain exists: the other three cost nothing yet.
+  EXPECT_EQ(1u, router->domain_count());
+  EXPECT_FALSE(router->HasDomain(RouteDomainId(2)));
+
+  const Ipv4Prefix net = P(Ip(10, 0, 0, 0), 8);
+  ASSERT_EQ(Apply({router->SetRouteOp(RouteDomainId(2), net, NextHopId(1)),
+                   router->SetNextHopOp(NextHopId(1), Hop(2))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_TRUE(router->HasDomain(RouteDomainId(2)));
+  EXPECT_EQ(2u, router->domain_count());
+  const NextHop *hop = router->Resolve(RouteDomainId(2), Ip(10, 1, 2, 3));
+  ASSERT_NE(nullptr, hop);
+  EXPECT_EQ(2u, hop->egress.value());
+  EXPECT_EQ(router->route_count(RouteDomainId(2)), 1u);
+  EXPECT_EQ(router->LookupRoute(kDefaultRouteDomainId, Ip(10, 1, 2, 3)),
+            kInvalidNextHopId)
+      << "the default domain did not gain the route";
+
+  // Beyond `max_domains`: refused, and no domain appears.
+  auto out_of_range =
+      Apply({router->SetRouteOp(RouteDomainId(9), net, NextHopId(1))});
+  ASSERT_EQ(out_of_range.outcome, Outcome::kRejected);
+  EXPECT_FALSE(router->HasDomain(RouteDomainId(9)));
+  EXPECT_EQ(2u, router->domain_count());
+
+  // An erase in a domain that does not exist creates nothing.
+  auto erase = Apply({router->RemoveRouteOp(RouteDomainId(3), net)});
+  ASSERT_EQ(erase.outcome, Outcome::kRejected);
+  EXPECT_NE(erase.ops[0].error.find("not found"), std::string::npos);
+  EXPECT_FALSE(router->HasDomain(RouteDomainId(3)));
+  EXPECT_EQ(2u, router->domain_count());
 }
 
 // Groups made through the direct API stay out of the engine's ledger: a router

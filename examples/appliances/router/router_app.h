@@ -6,15 +6,17 @@
 // Reference appliance R1 (roadmap M24): an IPv4 router with VRFs, ECMP and
 // neighbor resolution, written as an application against BESS's installed
 // headers. What is the application's: the static control policy below, the
-// interface-to-device mapping (an interface is a graph gate here), the flow
-// hash, and what to do with an unresolved neighbor (drop). What is BESS's:
-// route domains and their FIBs, next hops and groups (route/router.h), the
-// neighbor table (route/neighbor_table.h), the checked parse
-// (conntrack/packet_parse.h), TTL and the L2 rewrite (route/l3_packet.h).
+// interface-to-device mapping (an interface is a graph gate here), and what a
+// verdict becomes -- an unresolved neighbor is dropped, a TTL of 0 or 1 is
+// dropped. What is BESS's: route domains and their FIBs, next hops and groups
+// (route/router.h), the neighbor table (route/neighbor_table.h), and the
+// forwarding chain (route/forward.h): the checked parse, the lookup with the
+// frame's own flow hash, the neighbor state, the TTL and the L2 rewrite.
 //
 // The same class runs two ways: called directly on frames (no module graph:
 // RouterApp::Process), and inside a module that maps gates to interfaces
-// (router_appliance.cc). Both make the same decision for the same frame.
+// (router_appliance.cc). Both call the same chain, so they cannot disagree
+// about a frame.
 
 #include <array>
 #include <cstdint>
@@ -25,14 +27,12 @@
 #include <string>
 #include <vector>
 
-#include "conntrack/packet_parse.h"
 #include "dataplane/interface_id.h"
 #include "rcu/rcu_domain.h"
-#include "route/l3_packet.h"
+#include "route/forward.h"
 #include "route/neighbor_table.h"
 #include "route/router.h"
 #include "utils/ether.h"
-#include "utils/ip.h"
 
 namespace appliance {
 
@@ -53,9 +53,11 @@ class RouterApp {
     RouteDomainId vrf;
   };
 
-  enum class Verdict : uint8_t { kForward, kNotIpv4, kNoRoute, kUnresolved, kTtlExpired };
+  // The verdict vocabulary is the library's (route/forward.h): this path and
+  // the Router module name the same outcomes, and a decision adds only where
+  // the frame was headed.
   struct Decision {
-    Verdict verdict = Verdict::kNotIpv4;
+    bess::route::ForwardVerdict verdict = bess::route::ForwardVerdict::kNotIpv4;
     InterfaceId egress{};
   };
 
@@ -79,36 +81,31 @@ class RouterApp {
     return i < interfaces_.size() ? &interfaces_[i] : nullptr;
   }
 
-  // Routes one frame in place (the direct path): the checked parse, the VRF's
-  // FIB with the flow hash for a group route, the neighbor state, TTL, then the
-  // L2 rewrite. Nothing of the frame changes unless the verdict is kForward.
-  // `frame` is the packet's first segment, `total_len` its length (0: the span's).
+  // Routes one frame in place (the direct path): the library's forwarding chain
+  // (route/forward.h, D-157), which parses the frame, looks the destination up
+  // in the VRF's FIB with the frame's own flow hash, checks the neighbor,
+  // decrements the TTL and writes the hop's addresses. The VRF comes from the
+  // interface the frame arrived on; an unresolved neighbor is dropped, which is
+  // the application's choice. Nothing of the frame changes unless the verdict
+  // is kForward. `frame` is the packet's first segment, `total_len` its length
+  // (0: the span's).
   Decision Process(InterfaceId ingress, std::span<uint8_t> frame, size_t total_len = 0) const noexcept {
     const Interface *in = InterfaceOf(ingress);
-    bess::conntrack::ParsedFlowPacket p;
-    if (in == nullptr ||
-        bess::conntrack::ParseFrame(frame, p, total_len) != bess::conntrack::ParseStatus::kOk ||
-        p.l3 != bess::conntrack::L3Kind::kIpv4) {
-      return {Verdict::kNotIpv4};
+    if (in == nullptr) {
+      return {};  // not an interface of this appliance: nothing to route by
     }
-    // The LPM takes host order, on any host: the endian wrapper converts.
-    bess::utils::be32_t dst;
-    std::memcpy(&dst, p.dst.data(), sizeof(dst));
-    const NextHop *hop = router_->Resolve(in->vrf, dst.value(), FlowHash(p));
-    if (hop == nullptr) {
-      return {Verdict::kNoRoute};
+    const bess::route::FrameRoute resolved =
+        bess::route::ResolveFrame(*router_, in->vrf, frame, total_len);
+    if (resolved.verdict != bess::route::ForwardVerdict::kForward) {
+      return {resolved.verdict, resolved.egress};
     }
-    if (hop->neighbor != bess::route::NeighborState::kResolved) {
-      return {Verdict::kUnresolved, hop->egress};  // the application's choice: drop
+    if (bess::route::WriteForwarded(frame, resolved.l3_offset, *resolved.hop) !=
+        bess::route::TtlResult::kForward) {
+      // ResolveFrame refuses a TTL of 0 or 1, so this needs the header to have
+      // changed between the two calls; naming it keeps the boundary honest.
+      return {bess::route::ForwardVerdict::kTtlExpired, resolved.egress};
     }
-    auto *ip = reinterpret_cast<bess::utils::Ipv4 *>(frame.data() + p.l3_offset);
-    if (bess::route::DecrementTtl(*ip) != bess::route::TtlResult::kForward) {
-      return {Verdict::kTtlExpired, hop->egress};
-    }
-    auto *eth = reinterpret_cast<Ethernet *>(frame.data());
-    eth->dst_addr = hop->dst_mac;
-    eth->src_addr = hop->src_mac;
-    return {Verdict::kForward, hop->egress};
+    return {bess::route::ForwardVerdict::kForward, resolved.egress};
   }
 
   // What address resolution learned: every next hop bound to the neighbor is
@@ -142,17 +139,6 @@ class RouterApp {
     const uint8_t bytes[6] = {0x02, 0, 0, 0, 0, last};
     std::memcpy(&a, bytes, 6);
     return a;
-  }
-
-  // The application's flow hash: the parsed frame's addresses, ports and
-  // protocol, mixed by the library's one implementation (route::FlowHash), so
-  // the Router module -- this appliance's graph adapter -- picks the same
-  // member of a group route that this path picks.
-  static uint32_t FlowHash(const bess::conntrack::ParsedFlowPacket &p) noexcept {
-    uint32_t s, d;
-    std::memcpy(&s, p.src.data(), 4);
-    std::memcpy(&d, p.dst.data(), 4);
-    return bess::route::FlowHash(s, d, p.src_port, p.dst_port, p.protocol);
   }
 
   // The static control policy (the application's): four interfaces, two VRFs

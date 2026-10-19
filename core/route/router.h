@@ -233,6 +233,12 @@ class Router {
 
   // -- domains ----------------------------------------------------------------
 
+  // A domain's FIB is created when it is first needed: explicitly here, or by
+  // the first route a transaction writes into it (D-158), so `max_domains` is a
+  // bound on the ids rather than an allocation -- a router configured for many
+  // network instances pays for the ones that hold routes. A domain created on
+  // demand is sized like the default one.
+  //
   // Adds domain `domain` (0 < domain < max_domains) with its own FIB sized by
   // `config`. kInvalidId beyond max_domains, kDomainExists, kEnrolled.
   std::expected<void, RouteError> CreateDomain(RouteDomainId domain,
@@ -528,9 +534,9 @@ class Router {
     return DomainSlot(domain.value() + 1);
   }
 
-  Router(std::string name, std::unique_ptr<LpmRouteTable> default_routes,
-         size_t max_next_hops, size_t max_domains, size_t max_groups,
-         rcu::RcuDomain &rcu);
+  Router(const std::string &name, const Config &config,
+         std::unique_ptr<LpmRouteTable> default_routes, size_t max_next_hops,
+         size_t max_domains, size_t max_groups, rcu::RcuDomain &rcu);
 
   class RouteResource;
   class GroupResource;
@@ -542,7 +548,9 @@ class Router {
   }
 
   // Control-side walk over the existing domains, in id order. The caller holds
-  // mutex_, or the router is enrolled (domains frozen).
+  // mutex_, or the transaction engine's lock for an enrolled router (the one
+  // writer that can still create a domain holds it, D-158), or has exclusive
+  // access (Enroll's check).
   template <typename Fn>
   void ForEachDomain(Fn &&fn) const {
     for (const RouteDomainId id : domain_ids_) {
@@ -625,8 +633,12 @@ class Router {
   rcu::RcuDomain &rcu_;
   const size_t max_domains_;
   const uint32_t max_next_hops_;  // route values above it name groups
+  // What a domain created on demand is sized with: the default domain's
+  // config (D-158).
+  const Config domain_config_;
   // Slot = domain id + 1. Read lock-free by workers and the engine; written
-  // under mutex_ (and never once enrolled).
+  // under mutex_ -- by CreateDomain, and by the route resource for a domain a
+  // transaction first writes into (D-158).
   dataplane::SlotTable<DomainSlot, Domain> domains_;
   // Domain 0's FIB: it is never removed, so the default-domain readers skip
   // the slot lookup.
@@ -654,6 +666,10 @@ class Router {
   };
   std::vector<RetiringGroup> retiring_groups_;
 
+  // CreateDomain()'s body without the engine guard: the route resource creates
+  // a domain a transaction writes into (D-158). Under mutex_.
+  std::expected<void, RouteError> CreateDomainLocked(RouteDomainId domain,
+                                                     const Config &config);
   // A route value's reference (a next hop's or a group's), control side.
   void Reference(uint32_t value) noexcept;
   void Unreference(uint32_t value) noexcept;

@@ -54,7 +54,7 @@ int main() {
       return 1;
     }
     RouterApp &app = **made;
-    using V = RouterApp::Verdict;
+    using V = bess::route::ForwardVerdict;
 
     // 172.16.1.1 arriving on interface 1 (VRF 1) leaves by interface 1, to
     // gateway A's MAC, from interface 1's, with the TTL decremented.

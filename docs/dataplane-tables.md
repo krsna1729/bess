@@ -299,11 +299,16 @@ refused. An unset port bound is 65535, not 0, because the proto field is
   index (default 1); domains live in a `SlotTable` indexed by `RouteDomainId`,
   so `Resolve(domain, ip)` / `ResolveBatch(domain, ips, hops)` are lock-free,
   need no `Module`, metadata or gates, and miss on an unknown domain.
-  `CreateDomain`/`RemoveDomain` are safe while readers run.
+  `CreateDomain`/`RemoveDomain` are safe while readers run; a domain is created
+  when it is first needed -- explicitly, or by the first route a transaction
+  writes into it (D-158) -- so `max_domains` bounds the ids without allocating
+  every FIB.
   `SetRoute`/`RemoveRoute` are the live in-place update;
   `ReplaceRouteSetAtomic(domain, routes)` builds a replacement FIB beside the
   live one, validates next hops and rte_lpm capacity before publishing, and
   publishes it with one pointer store (a table build, not an in-place update).
+  The guide to the library and to the two ways a graph routes is
+  `docs/routing.md`.
 - **Used by:** IPLookup, the `Router` module.
 
 - **Next-hop groups** (M15, D-065): `SetNextHopGroup(id, members)` and
@@ -465,10 +470,11 @@ reference to something missing.
   created before `Enroll()` and frozen after it. D-046. The
   `Router` module enrolls on `Init()` and releases on `DeInit()`; its packet
   path resolves a next-hop id from metadata, or -- in `ROUTE_MODE_DESTINATION`
-  -- looks the packet's own IPv4 destination up in its route domain's FIB and
-  runs the forwarding chain (TTL, then the addresses), and either way writes a
-  resolved hop's addresses into the frame's Ethernet header when it names both
-  (D-032, D-153, D-155).
+  -- runs the library's forwarding chain (`route/forward.h`: the checked parse,
+  the destination looked up in the packet's route domain, the neighbor check,
+  the TTL and the addresses; D-157), and either way writes a resolved hop's
+  addresses into the frame's Ethernet header when it names both (D-032, D-153,
+  D-155).
 - **ActionTable** registers `<module>/actions` (key: `EncodeKey(ActionId)`,
   value: `{meter id, next hop id}`) and declares both the meter and the
   next-hop resources: an action's value references them, so the engine orders
