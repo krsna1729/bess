@@ -7,9 +7,13 @@
 //              1 = 4M uniformly random keys (DRAM-bound tbl24):
 //                RawLpmX4       the pre-K7 IPLookup shape: SSE byte swap of
 //                               packet-order addresses + rte_lpm_lookupx4
-//                RouteTable     host-order gather + LookupBatch (what the
-//                               `Router` module runs)
-//                Router         LookupBatch + next-hop resolution
+//                RouteTable     host-order gather + LookupBatch (the batch
+//                               call shape; the module's destination path
+//                               still resolves one frame at a time, so its FIB
+//                               rows are the scalar path -- see M.router/fib
+//                               in live_perf)
+//                Router         LookupBatch + next-hop resolution (the bench
+//                               case; the module resolves one frame at a time)
 //              RouteTable, Router and UpdateInPlace also run on the rte_fib
 //              backend (the *Fib rows, D-132).
 //   update  -- one route change applied in place (K7) versus rebuilding the

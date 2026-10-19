@@ -760,4 +760,5 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | plain vs staged body rule | `modules_table_scale_bench`, `classifier_cuckoo_scale_bench` |
 | `rte_fib` backend (correctness, D-130/D-132) | `route_route_test` (`RteFibTest.*`, every build) and the `/Fib` instances of the route tests; `route_bench`, `fib_bench` and `live_perf M.router/fib` for cost |
 | LPM lookup and update cost | `route_bench` |
+| the Router's destination path at scale (route count × destination spread), LPM and FIB | `live_perf --tests M.router,M.router/s256,M.router/s64k,M.router/r2560s64k,M.router/r2560,M.router/r10240,M.router/r65536,M.router/r2560s64k-fib` |
 | meters, counters, RCU | `meter_bench`, `stats_bench`, `rcu_bench` |
