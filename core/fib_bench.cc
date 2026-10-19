@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// rte_lpm vs rte_fib for `IPLookup` -- the table-level half of the "rte_fib
-// vs rte_lpm" experiment (MODERNIZATION.md, Phase D). The module-level
-// question is whether FIB can replace LPM *and* delete BESS's x86 SIMD
-// block, so this binary measures the exact code shapes the module would use,
-// not just "a lookup":
+// rte_lpm vs rte_fib for BESS's route table (`route::LpmRouteTable`, what the
+// `Router` module holds) -- the table-level half of the "rte_fib vs rte_lpm"
+// experiment (MODERNIZATION.md, Phase D). The module-level question is
+// whether FIB can replace LPM *and* delete BESS's x86 SIMD block, so this
+// binary measures the exact code shapes the table's users take, not just
+// "a lookup":
 //
 //   BM_LookupLpmVec     the former module path: four keys byte-swapped to
 //                       value form at a time (once an SSSE3 byte shuffle in
@@ -26,7 +27,7 @@
 //   raw    the bytes as they sit in a packet header (be32_t::raw_value()),
 //          which a dataplane module reads with one load
 //   value  the host-order numeric address (be32_t::value()), which is what
-//          IPLookup hands rte_lpm_add() and what DPDK's LPM indexes with
+//          BESS's LPM path hands rte_lpm_add() and what DPDK's LPM indexes with
 //          (`ip >> 8`: the address's top byte first)
 // The vector path exists to get from raw to value four at a time; the scalar
 // tail path pays a per-packet swap; FIB's network-order flag is exactly
@@ -100,8 +101,8 @@ namespace {
 
 const size_t kBatch = 32;            // PacketBatch::kMaxBurst
 const size_t kLookupKeys = 1 << 16;  // 256KB of keys: L2-resident by design
-// BESS's DROP_GATE (core/gate.h: MAX_GATES), i.e. what IPLookup emits when
-// there is no match. Deliberately outside the generated route range
+// BESS's DROP_GATE (core/gate.h: MAX_GATES), i.e. what a route table's miss
+// emits when there is no match. Deliberately outside the generated route range
 // ([1, kMaxNextHop]): a sentinel that collides with a real next hop would
 // make a lookup miss indistinguishable from a correct hit, in both the gate
 // and any counter that counts hops.
@@ -160,7 +161,7 @@ uint32_t PrefixValue(uint32_t host_addr, uint8_t len) {
 // --------------------------------------------------------------------------
 
 struct Route {
-  uint32_t prefix;  // value form: what IPLookup passes to rte_lpm_add()
+  uint32_t prefix;  // value form: what the LPM path passes to rte_lpm_add()
   uint8_t len;
   uint32_t next_hop;
 };

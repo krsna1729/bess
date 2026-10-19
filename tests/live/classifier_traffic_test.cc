@@ -199,25 +199,35 @@ class ClassifierTrafficTest : public LiveTest {
 
 // -- transactions while a worker forwards (run_with_live_commands) -----------
 
-// Routes change while a worker forwards traffic (K7, mode C).
-TEST_F(ClassifierTrafficTest, IpLookupRoutesChangeWhileForwarding) {
-  Apply(Traffic("ipl", "IPLookup", nullptr, {0, 1})
-            .Entry("ipl/routes", *Arg("IPLookupRouteKey", R"({"prefix": "0.0.0.0"})"),
-                   *Arg("IPLookupRouteValue", R"({"gate": 0})")));
-  auto routes = client().Resource("ipl/routes");
+// Routes change while a worker forwards traffic (K7, mode C): the FIB is the
+// Router's now (D-155, destination mode), and the route's next hop is where
+// the packet leaves.
+TEST_F(ClassifierTrafficTest, RouterRoutesChangeWhileForwarding) {
+  auto arg = Arg("RouterArg",
+                 R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": 512, "max_next_hops": 2})");
+  Apply(Traffic("rt", "Router", arg.get(), {0, 1})
+            .Entry("rt/next_hops", *Arg("RouterNextHopIdKey", R"({"id": 1})"),
+                   *Arg("RouterNextHopValue",
+                        R"({"egress_gate": 0, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})"))
+            .Entry("rt/next_hops", *Arg("RouterNextHopIdKey", R"({"id": 2})"),
+                   *Arg("RouterNextHopValue",
+                        R"({"egress_gate": 1, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})"))
+            .Entry("rt/routes", *Arg("RouterRouteKey", R"({"ipv4": "0.0.0.0", "prefix_length": 0})"),
+                   *Arg("RouterRouteValue", R"({"next_hop_id": 1})")));
+  auto routes = client().Resource("rt/routes");
   ASSERT_TRUE(routes) << routes.error().message;
   const int commands = RunWhileForwarding(milliseconds(2000), [&](int i) {
-    const std::string prefix =
+    const std::string ipv4 =
         std::to_string(1 + (i / 2) % 200) + "." + std::to_string((i / 400) % 256) + ".0.0";
-    const std::string key = R"({"prefix": ")" + prefix + R"(", "prefix_len": 16})";
+    const std::string key = R"({"ipv4": ")" + ipv4 + R"(", "prefix_length": 16})";
     if (i % 2 == 0) {
-      Upsert(*routes, key, R"({"gate": 1})");
+      Upsert(*routes, key, R"({"next_hop_id": 2})");
     } else {
       Erase(*routes, key);
     }
   });
   EXPECT_GT(commands, 10) << "too few transactions ran";
-  EXPECT_GT(Packets("ipl", 0) + Packets("ipl", 1), 0);
+  EXPECT_GT(Packets("rt", 0) + Packets("rt", 1), 0);
 }
 
 // Rules are added and cleared while a worker forwards traffic (mode G): each

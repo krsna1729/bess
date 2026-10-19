@@ -170,7 +170,7 @@ class LpmRouteTable {
   std::expected<void, RouteError> Erase(Ipv4Prefix prefix);
 
   // Removes every non-default route by publishing a fresh empty table; the
-  // default route is kept (what rte_lpm_delete_all meant for IPLookup).
+  // default route is kept (what rte_lpm_delete_all meant).
   std::expected<void, RouteError> Clear();
 
   struct Rule {

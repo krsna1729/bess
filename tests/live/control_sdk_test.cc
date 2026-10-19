@@ -342,11 +342,6 @@ std::vector<ModuleSample> EveryResourceSample() {
        R"({"rules": [{"src_ip": "10.0.0.0/8", "proto": 17, "dst_port_low": 53, "dst_port_high": 53}]})", false,
        {{"rules",
          setting(R"({"rules": [{"src_ip": "10.0.0.0/8", "proto": 17, "dst_port_low": 53, "dst_port_high": 53, "action_id": 7}, {"src_ip": "10.0.0.0/8", "drop": true}]})")}}},
-      {"ipl", "IPLookup", "", false,
-       {{"routes",
-         {{R"({"prefix": "10.0.0.0", "prefix_len": 8})", R"({"gate": 1})"},
-          {R"({"prefix": "0.0.0.0"})", R"({"gate": 3})"},
-          {R"({"prefix": "192.168.1.0", "prefix_len": 24})", "{}"}}}}},
       {"l2", "L2Forward", "", false,
        {{"macs",
          {{R"({"addr": "02:00:00:00:00:02"})", R"({"gate": 3})"},
@@ -540,23 +535,23 @@ TEST_F(ControlSdkTest, EveryResourceRoundTrips) {
   EXPECT_EQ(0u, again->resource_ops()) << desired_drift;
   EXPECT_EQ(same->resource_generation(), again->resource_generation()) << desired_drift;
 
-  // (c) ipl/routes listed with no entries is cleared; l2/macs left out of
+  // (c) rt/routes listed with no entries is cleared; l2/macs left out of
   // the pipeline keeps what it held.
   v2::Pipeline partial = *desired;
   auto *listed = partial.mutable_resources();
   for (int i = listed->size() - 1; i >= 0; i--) {
     if (listed->Get(i).name() == "l2/macs") {
       listed->DeleteSubrange(i, 1);
-    } else if (listed->Get(i).name() == "ipl/routes") {
+    } else if (listed->Get(i).name() == "rt/routes") {
       listed->Mutable(i)->clear_entries();
     }
   }
   auto cleared = client().ApplyPipeline(partial);
   ASSERT_TRUE(cleared) << cleared.error().message;
-  EXPECT_EQ(3u, cleared->resource_ops()) << "the three routes erased, nothing else";
-  auto after = client().Pipeline({.include_resources = true, .resources = {"ipl/routes", "l2/macs"}});
+  EXPECT_EQ(1u, cleared->resource_ops()) << "the one route erased, nothing else";
+  auto after = client().Pipeline({.include_resources = true, .resources = {"rt/routes", "l2/macs"}});
   ASSERT_TRUE(after) << after.error().message;
-  const v2::ResourceContents *routes = FindResource(after->pipeline, "ipl/routes");
+  const v2::ResourceContents *routes = FindResource(after->pipeline, "rt/routes");
   EXPECT_TRUE(routes == nullptr || routes->entries_size() == 0) << routes->ShortDebugString();
   const v2::ResourceContents *macs = FindResource(after->pipeline, "l2/macs");
   const v2::ResourceContents *macs_before = FindResource(read->pipeline, "l2/macs");

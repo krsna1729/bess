@@ -3,7 +3,7 @@
 // --simd_width under traffic (D-126): bessd started with auto, 256 and 512
 // forwards through the modules whose paths depend on the width -- CuckooMap's
 // runtime-dispatched tag compare (DRR's flow table, past 1,024 buckets),
-// rte_hash (ExactMatch), rte_lpm (IPLookup), the AVX2 checksum kernels
+// rte_hash (ExactMatch), rte_lpm (the Router's route table), the AVX2 checksum kernels
 // (IPChecksum, L4Checksum), HashLB -- and must neither die nor stop on a
 // signal: --simd_width=512 on a CPU without AVX-512 (this development host)
 // is clamped to the CPU's width, never executed. The expected width comes
@@ -108,7 +108,7 @@ TEST_P(SimdWidthLiveTest, ForwardsAndShutsDownWithoutSigill) {
   }
 
   // Source -> Rewrite -> RandomUpdate -> ExactMatch -> WildcardMatch ->
-  // IPLookup -> IPChecksum -> L4Checksum -> HashLB -> DRR -> Sink. 4,096
+  // Router -> IPChecksum -> L4Checksum -> HashLB -> DRR -> Sink. 4,096
   // source addresses and a rate-limited DRR task: thousands of flows queue up
   // at once, and DRR's CuckooMap (four entries per bucket, a power-of-two
   // bucket count) grows to the 1,024 buckets from which its lookups take the
@@ -142,10 +142,18 @@ TEST_P(SimdWidthLiveTest, ForwardsAndShutsDownWithoutSigill) {
   v2::TaskPlacement drr_task;
   drr_task.set_module("drr");
   drr_task.set_parent("drr_rl");
-  // The default route, as the "ipl/routes" resource (D-129).
-  auto route_key = types.Make("bess.pb.IPLookupRouteKey", R"({"prefix": "0.0.0.0"})");
-  auto route_value = types.Make("bess.pb.IPLookupRouteValue", R"({"gate": 0})");
-  ASSERT_TRUE(route_key && route_value);
+  // The Router in destination mode (D-155) with the default route: its route
+  // table is rte_lpm, one of the width-sensitive libraries this pipeline runs.
+  auto router = types.Make(
+      "bess.pb.RouterArg",
+      R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": 16, "max_next_hops": 2})");
+  auto hop_key = types.Make("bess.pb.RouterNextHopIdKey", R"({"id": 1})");
+  auto hop_value =
+      types.Make("bess.pb.RouterNextHopValue",
+                 R"({"egress_gate": 0, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})");
+  auto route_key = types.Make("bess.pb.RouterRouteKey", R"({"ipv4": "0.0.0.0", "prefix_length": 0})");
+  auto route_value = types.Make("bess.pb.RouterRouteValue", R"({"next_hop_id": 1})");
+  ASSERT_TRUE(router && hop_key && hop_value && route_key && route_value);
   auto pipeline = bess::sdk::PipelineBuilder()
                       .Worker(0, std::nullopt, "")
                       .TrafficClass(rl)
@@ -154,17 +162,18 @@ TEST_P(SimdWidthLiveTest, ForwardsAndShutsDownWithoutSigill) {
                       .Module("rnd", "RandomUpdate", random.get())
                       .Module("em", "ExactMatch", em.get())
                       .Module("wm", "WildcardMatch", wm.get())
-                      .Module("ipl", "IPLookup", nullptr)
+                      .Module("rt", "Router", router.get())
                       .Module("ipc", "IPChecksum", ipc.get())
                       .Module("l4c", "L4Checksum", l4c.get())
                       .Module("lb", "HashLB", lb.get())
                       .Module("drr", "DRR", drr.get())
                       .Module("sink", "Sink", nullptr)
-                      .Chain({"src", "rewrite", "rnd", "em", "wm", "ipl", "ipc", "l4c", "lb",
+                      .Chain({"src", "rewrite", "rnd", "em", "wm", "rt", "ipc", "l4c", "lb",
                               "drr", "sink"})
                       .Task(src_task)
                       .Task(drr_task)
-                      .Entry("ipl/routes", *route_key, *route_value)
+                      .Entry("rt/next_hops", *hop_key, *hop_value)
+                      .Entry("rt/routes", *route_key, *route_value)
                       .Build();
   ASSERT_TRUE(pipeline) << pipeline.error().message;
   auto applied = client.ApplyPipeline(*pipeline);
@@ -178,7 +187,7 @@ TEST_P(SimdWidthLiveTest, ForwardsAndShutsDownWithoutSigill) {
   auto samples = client.Metrics();
   ASSERT_TRUE(samples) << samples.error().message;
   std::string counts;
-  for (const char *module : {"rnd", "em", "wm", "ipl", "ipc", "l4c", "lb", "drr"}) {
+  for (const char *module : {"rnd", "em", "wm", "rt", "ipc", "l4c", "lb", "drr"}) {
     const auto n = GatePackets(*samples, module, 0);
     ASSERT_TRUE(n) << module << " has no gate 0 counter";
     EXPECT_GT(*n, 0) << module << " forwarded nothing";

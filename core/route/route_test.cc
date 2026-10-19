@@ -234,7 +234,7 @@ TEST_P(RouteTableTest, LimitsAreErrors) {
 TEST_P(RouteTableTest, LongNamesSurviveReplacement) {
   LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   auto created = RouteTable<Value>::Create(
-      "ip_lookup_upstream_network_instance_a", config,
+      "router_upstream_network_instance_a", config,
       bess::runtime::runtime().rcu());
   ASSERT_TRUE(created.has_value()) << RouteErrorName(created.error());
   auto &table = *created;
@@ -398,7 +398,7 @@ TEST_P(RouteTableTest, DeletesNeverFailWithAStalledReader) {
 }
 
 // The other half of what the transactional route resources depend on
-// (router.cc, lpm_resource.h CHECK it): changing or deleting an existing rule
+// (router.cc CHECKs it): changing or deleting an existing rule
 // never fails, even with the budget spent and the free groups gone to adds
 // while a stalled reader holds freed ones in the defer queue. The /25 repeats
 // its covering /16's value: rte_fib folded such a /24's group away and needed
