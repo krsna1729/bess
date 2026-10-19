@@ -776,6 +776,7 @@ unit_test_sources = [
   'control/maintenance_loop_test.cc',
   'control/metrics_exposition_test.cc',
   'control/pressure_monitor_test.cc',
+  'control/resource_fill_test.cc',
   'control/scheduling_constraints_test.cc',
   'cli_mode_test.cc',
   'bessd_test.cc',

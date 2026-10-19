@@ -15,7 +15,9 @@
 #include "control/control_plane.h"
 #include "control/http_server.h"
 #include "control/maintenance_loop.h"
+#include "control/resource_fill.h"
 #include "dpdk.h"
+#include "framework/resource_bindings.h"
 #include "runtime/opts.h"
 #include "runtime/runtime_state.h"
 #include "runtime/startup.h"
@@ -85,10 +87,16 @@ void ApiServer::Run() {
     // Worker-to-control module requests (TP4, D-077), delivered under the
     // control-plane lock, and workers' events moved into the event log (M25);
     // stopped before the dataplane is torn down below.
+    // The built-in fill watch (D-165): every registered resource's fill is
+    // read against the level on this loop's tick, and each crossing is one
+    // event on the log below.
+    bess::control::ResourceFillWatch fills(bess::runtime::runtime().transactions(),
+                                           bess::framework::ResourceBindings::ProcessDefault());
     bess::control::MaintenanceLoop maintenance(
         control_plane, bess::runtime::runtime().requests(), bess::runtime::runtime().ticks(),
         std::chrono::microseconds(FLAGS_maintenance_interval_us),
-        &bess::runtime::runtime().events());
+        &bess::runtime::runtime().events(), std::chrono::seconds(1),
+        std::chrono::microseconds(250), &fills);
     // SIGTERM/SIGINT: the same shutdown as Admin.Shutdown (D-030).
     bess::startup::TerminationWatcher watcher(shutdown);
     server->Wait();
