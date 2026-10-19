@@ -380,15 +380,17 @@ The SDKs' `WatchCounters` (Go) and `watch_counters` (Python) narrow the stream t
 crossings and parse their fields (`docs/control-sdk.md`), so a controller need not know this
 shape; a gap in the log or a restart ends that watch with an error rather than passing it over.
 
-**Fill levels.** A resource that states a capacity is watched by the daemon itself, with no module
-involvement: on its maintenance tick it reads every reachable resource's `LiveCount()` against the first
-count that reaches 80% of its `Capacity()` (D-165, `control/resource_fill.h`) and reports one
-`bess.resource_fill` event per crossing -- fields `resource`, `count`, `limit`, `capacity`, source the
-resource's module -- once, and again only after the fill has fallen below the level (or after the resource
-has stopped being reachable and come back, which is a new table). A resource that states no capacity (a
-tuple space that grows with the workload) is not watched, and a table that fills and drains inside one
-tick is not seen: this samples. The sweep runs with the control-plane lock held, like a module's tick, so
-a table filling up is reported without a controller polling `GetResourceStatus`.
+**Fill levels.** A resource is watched by the daemon itself, with no module involvement: on its maintenance
+tick it reads every reachable resource's `LiveCount()` against its level -- the count the resource states in
+`FillLevel()`, or the first count that reaches 80% of its `Capacity()` when `FillLevel()` is unstated (D-165,
+D-166, `control/resource_fill.h`) -- and reports one `bess.resource_fill` event per crossing: fields
+`resource`,
+`count` and `limit`, and `capacity` when the resource states one, source the resource's module. It reports
+once, and again only after the fill has fallen below the level (or after the resource has stopped being
+reachable and come back, which is a new table). A resource that states neither a level nor a capacity (a
+tuple space that grows with the workload) is not watched, and a table that fills and drains inside one tick is
+not seen: this samples. The sweep runs with the control-plane lock held, like a module's tick, so a table
+filling up is reported without a controller polling `GetResourceStatus`.
 
 **Where a module's counters live.** A module's counters are per key and per worker, and the shared
 structure for them is `stats::KeyedCounters` (`stats/keyed_counters.h`, experimental, D-154):

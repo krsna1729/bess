@@ -47,11 +47,15 @@ bool WaitFor(const std::atomic<int> &value, int want) {
 // (resource_fill_test.cc has the same pair; they are small and test-local).
 class FillResource final : public dataplane::Resource {
  public:
-  FillResource(std::string name, uint64_t *count, std::optional<uint64_t> *capacity)
-      : Resource(std::move(name), {}), count_(count), capacity_(capacity) {}
+  FillResource(std::string name, uint64_t *count, std::optional<uint64_t> *capacity,
+               std::optional<uint64_t> *level = nullptr)
+      : Resource(std::move(name), {}), count_(count), capacity_(capacity), level_(level) {}
 
   size_t LiveCount() const override { return *count_; }
   std::optional<uint64_t> Capacity() const override { return *capacity_; }
+  std::optional<uint64_t> FillLevel() const override {
+    return level_ == nullptr ? std::nullopt : *level_;
+  }
   bool Contains(const dataplane::ResourceKey &) const override { return false; }
   void VisitReferences(
       const std::function<void(const dataplane::Reference &)> &) const override {}
@@ -62,6 +66,7 @@ class FillResource final : public dataplane::Resource {
  private:
   uint64_t *count_;
   std::optional<uint64_t> *capacity_;
+  std::optional<uint64_t> *level_;
 };
 
 class StubCodec final : public framework::ResourceCodec {
@@ -209,6 +214,37 @@ TEST(MaintenanceLoopTest, AFillCrossingReachesTheLog) {
   EXPECT_EQ("80", got.events[0].fields.at("count"));
   EXPECT_EQ("80", got.events[0].fields.at("limit"));
   EXPECT_EQ("100", got.events[0].fields.at("capacity"));
+}
+
+// A crossing of a resource that states no capacity carries no "capacity"
+// field, rather than a zero a controller could read as a full table: the level
+// it states is a count of its own, and needs no ceiling.
+TEST(MaintenanceLoopTest, AFillCrossingOfAnUnboundedResourceOmitsCapacity) {
+  ControlPlane control;
+  framework::RequestHub hub;
+  framework::TickHub ticks;
+  stats::EventHub log;
+  uint64_t count = 5;                // the level this resource states
+  std::optional<uint64_t> capacity;  // a tuple space: no ceiling to state
+  std::optional<uint64_t> level = 5;
+  FillResource resource("mod/space", &count, &capacity, &level);
+  rcu::RcuDomain domain(1, 8);
+  dataplane::TransactionEngine engine(domain);
+  ASSERT_TRUE(engine.Register(&resource).has_value());
+  framework::ResourceBindings bindings;
+  const framework::ResourceBinding binding = bindings.Bind(resource, std::make_shared<StubCodec>());
+  ResourceFillWatch fills(engine, bindings);
+
+  MaintenanceLoop loop(control, hub, ticks, std::chrono::microseconds(500), &log,
+                       std::chrono::seconds(1), std::chrono::microseconds(250), &fills);
+  const stats::EventHub::ReadResult got = log.Read(1, 10, std::chrono::seconds(10));
+  ASSERT_FALSE(got.events.empty());
+  EXPECT_EQ(kResourceFillEvent, got.events[0].type);
+  EXPECT_EQ("mod", got.events[0].source);
+  EXPECT_EQ("mod/space", got.events[0].fields.at("resource"));
+  EXPECT_EQ("5", got.events[0].fields.at("count"));
+  EXPECT_EQ("5", got.events[0].fields.at("limit"));
+  EXPECT_FALSE(got.events[0].fields.contains("capacity"));
 }
 
 }  // namespace

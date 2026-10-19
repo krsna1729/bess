@@ -23,11 +23,15 @@ namespace {
 // and Reserve is never called by the watch.
 class FillResource final : public dataplane::Resource {
  public:
-  FillResource(std::string name, uint64_t *count, std::optional<uint64_t> *capacity)
-      : Resource(std::move(name), {}), count_(count), capacity_(capacity) {}
+  FillResource(std::string name, uint64_t *count, std::optional<uint64_t> *capacity,
+               std::optional<uint64_t> *level = nullptr)
+      : Resource(std::move(name), {}), count_(count), capacity_(capacity), level_(level) {}
 
   size_t LiveCount() const override { return *count_; }
   std::optional<uint64_t> Capacity() const override { return *capacity_; }
+  std::optional<uint64_t> FillLevel() const override {
+    return level_ == nullptr ? std::nullopt : *level_;
+  }
   bool Contains(const dataplane::ResourceKey &) const override { return false; }
   void VisitReferences(
       const std::function<void(const dataplane::Reference &)> &) const override {}
@@ -38,6 +42,7 @@ class FillResource final : public dataplane::Resource {
  private:
   uint64_t *count_;
   std::optional<uint64_t> *capacity_;
+  std::optional<uint64_t> *level_;
 };
 
 // A codec that carries no entries: the watch only needs the resource to be
@@ -67,9 +72,10 @@ class ResourceFillWatchTest : public ::testing::Test {
 
   uint64_t count_ = 0;
   std::optional<uint64_t> capacity_ = 100;
+  std::optional<uint64_t> level_;  // unstated: the daemon's fraction applies
   rcu::RcuDomain domain_{1, 8};
   dataplane::TransactionEngine engine_{domain_};
-  FillResource resource_{"mod/table", &count_, &capacity_};
+  FillResource resource_{"mod/table", &count_, &capacity_, &level_};
   framework::ResourceBindings bindings_;
   framework::ResourceBinding binding_;
 };
@@ -221,6 +227,75 @@ TEST_F(ResourceFillWatchTest, ACapacityThatGrowsOrIsWithdrawnRearmsTheResource) 
   capacity_ = std::nullopt;
   EXPECT_TRUE(fills.Sweep([] { return false; }).crossed.empty());
   EXPECT_EQ(0u, fills.fired());
+}
+
+TEST_F(ResourceFillWatchTest, AStatedLevelIsTheCountItFiresAt) {
+  ResourceFillWatch fills(engine_, bindings_);
+
+  level_ = 12;  // the resource states a count of its own, not a fraction
+  count_ = 11;
+  EXPECT_TRUE(fills.Sweep([] { return false; }).crossed.empty());
+
+  count_ = 12;
+  const ResourceFillWatch::Result fired = fills.Sweep([] { return false; });
+  ASSERT_EQ(1u, fired.crossed.size());
+  EXPECT_EQ(12u, fired.crossed[0].limit);
+  EXPECT_EQ(std::optional<uint64_t>(100), fired.crossed[0].capacity);
+  EXPECT_EQ(1u, fills.fired());
+
+  // A count, not a fraction: the daemon's default over this capacity is 80, so
+  // 12 would not fire under it. A rise to 79 is the same crossing and is not
+  // reported twice.
+  count_ = 79;
+  EXPECT_TRUE(fills.Sweep([] { return false; }).crossed.empty());
+  EXPECT_EQ(1u, fills.fired());
+}
+
+TEST_F(ResourceFillWatchTest, AStatedLevelWatchesAResourceThatStatesNoCapacity) {
+  ResourceFillWatch fills(engine_, bindings_);
+
+  capacity_ = std::nullopt;  // a tuple space: no ceiling to state
+  level_ = 5;
+  count_ = 4;
+  EXPECT_TRUE(fills.Sweep([] { return false; }).crossed.empty());
+
+  count_ = 5;
+  const ResourceFillWatch::Result fired = fills.Sweep([] { return false; });
+  ASSERT_EQ(1u, fired.crossed.size());
+  EXPECT_EQ(5u, fired.crossed[0].limit);
+  EXPECT_FALSE(fired.crossed[0].capacity.has_value());
+}
+
+TEST_F(ResourceFillWatchTest, AStatedLevelAboveTheDefaultSuppressesIt) {
+  ResourceFillWatch fills(engine_, bindings_);
+
+  level_ = 200;  // above the 80% the default would give for a capacity of 100
+  count_ = 100;
+  EXPECT_TRUE(fills.Sweep([] { return false; }).crossed.empty());
+  EXPECT_EQ(0u, fills.fired());
+
+  count_ = 200;
+  const ResourceFillWatch::Result fired = fills.Sweep([] { return false; });
+  ASSERT_EQ(1u, fired.crossed.size());
+  EXPECT_EQ(200u, fired.crossed[0].limit);
+}
+
+TEST_F(ResourceFillWatchTest, AStatedLevelOfZeroIsReadAsNone) {
+  ResourceFillWatch fills(engine_, bindings_);
+
+  // With no capacity either, there is nothing to watch at all.
+  capacity_ = std::nullopt;
+  level_ = 0;  // would fire for an empty resource and never fall below
+  count_ = 0;
+  EXPECT_TRUE(fills.Sweep([] { return false; }).crossed.empty());
+  EXPECT_EQ(0u, fills.fired());
+
+  // Read as unstated, not as a level of zero: the daemon's fraction applies.
+  capacity_ = 100;
+  count_ = 80;
+  const ResourceFillWatch::Result fired = fills.Sweep([] { return false; });
+  ASSERT_EQ(1u, fired.crossed.size());
+  EXPECT_EQ(80u, fired.crossed[0].limit);
 }
 
 TEST(ResourceFillWatchSlice, APassOverMoreThanABatchStopsAndTheNextOneCompletes) {
