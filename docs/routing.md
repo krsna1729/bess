@@ -48,7 +48,8 @@ BESS has exactly this split: `RouteKey{domain, prefix}` → a next-hop id, and
 next hops to republish and the application calls `Router::SetNextHop`; **routes never move**. An ARP reply is
 one object store, not a route update, so there is no churn and no transient hole. A route to a next-hop group
 is the same shape one level up: the FIB names the group, and the group's member is chosen by the frame's own
-flow hash (`route::FlowHash`), so a flow keeps one member (D-156).
+flow hash (`route::FlowHash`), so a flow keeps one member (D-156); which fields that hash reads is the graph's
+choice -- the whole flow by default, the address pair alone with `FLOW_HASH_L3` (D-163).
 
 A next hop whose egress interface is absent (`kInvalidInterfaceId`; on the module's wire, `egress_gate =
 DROP_GATE`) forwards nowhere: the chain reports `kNoEgress` and the packet ends there. That is the blackhole
@@ -94,7 +95,10 @@ decrement twice. The Router carries neighbor *state*, not resolution: nothing in
 request (D-153) -- a graph's own resolution component resolves an address and republishes the affected next
 hops (`NeighborTable::Update` -> `Router::SetNextHop`), and what an unresolved neighbor means stays policy.
 Routes, next hops and groups are written through the module's resources (`<router>/routes`, `/next_hops`,
-`/groups`) in transactions, or directly by an application.
+`/groups`) in transactions, or directly by an application. The first routes a router usually writes are its
+connected ones: an interface's own address implies the subnet reachable on it, and
+`route::ConnectedRouteFor(address, length, egress)` (D-164) returns that prefix with a hop on the interface,
+whose neighbor stays unresolved until resolution learns it.
 
 The two recipes meet in one module. Which one runs is **configuration**, not a per-packet test: the `mode` arg
 (`ROUTE_MODE_NEXT_HOP_ID`, the default, or `ROUTE_MODE_DESTINATION`, D-155). A module decides; it does not
@@ -108,10 +112,12 @@ gate), the counters (one per outcome of the chain: not IPv4, malformed, non-init
 unresolved neighbor, TTL expired, a hop that forwards nowhere (D-160), header-write failure), and the copy a
 shared payload needs before its header is written.
 
-The application owns everything that is policy: which domain a packet is in (an interface, a VIF, a port), what
-an unresolved neighbor means (R1 drops it; a graph may punt it), where the TTL is decremented (`UpdateTTL` in
-the graph, or the chain when the module routes by destination), and ICMP/uRPF (not the Router's business). A
-packet whose destination has no route and a packet whose neighbor is unresolved are distinct, counted outcomes.
+The application owns everything that is policy: which domain a packet is in (an interface, a VIF, a port), where
+the TTL is decremented (`UpdateTTL` in the graph, or the chain when the module routes by destination), and
+ICMP/uRPF (not the Router's business). A packet whose destination has no route and a packet whose neighbor is
+unresolved are distinct, counted outcomes; the module drops both by default, and it can send either to a gate
+instead (`punt_miss_gate`, `punt_unresolved_gate`, D-162) -- the frame is counted either way, so the counters
+stay the record of what happened.
 
 ## Domains are cheap: `max_domains` is a bound
 

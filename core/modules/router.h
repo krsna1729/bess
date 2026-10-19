@@ -164,6 +164,14 @@ class Router final : public Module {
   // What the packet path decides from (D-155): configuration, not a guess
   // about the graph's wiring.
   bess::pb::RouteMode mode_ = bess::pb::ROUTE_MODE_NEXT_HOP_ID;
+  // Where a frame the destination path cannot forward goes, instead of being
+  // dropped (D-162): a miss and an unresolved neighbor each have their own
+  // gate, and DROP_GATE means drop. Either way the frame is counted.
+  gate_idx_t punt_miss_gate_ = DROP_GATE;
+  gate_idx_t punt_unresolved_gate_ = DROP_GATE;
+  // Which fields a group route hashes to pick its member (D-163). The proto
+  // default is the whole flow, so this only differs when a graph says so.
+  bess::route::FlowHashFields flow_fields_ = bess::route::FlowHashFields::kL3L4;
   std::atomic<uint64_t> header_write_failures_{0};
   std::atomic<uint64_t> not_ipv4_frames_{0};
   std::atomic<uint64_t> malformed_frames_{0};

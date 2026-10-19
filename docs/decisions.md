@@ -11286,3 +11286,86 @@ round-trip sample set without the IPLookup row, including the `rt/routes` cleari
 this change was prepared); buf is not installed on this workstation, so CI's "Protobuf compatibility" job is
 the standing re-check. A repository-wide search for `IPLookup`/`ip_lookup`/`iplookup` leaves only the
 historical documents and comments named above.
+
+## D-162 A miss and an unresolved neighbor can punt to a gate, beside drop and count
+
+**Status:** accepted (2026-10-19; the plan's item 3: "miss/unresolved punt policy as args beside drop+count").
+
+**Decision.** `RouterArg` gains `punt_miss_gate` and `punt_unresolved_gate`. A frame the destination path
+cannot forward -- the FIB has no route for its destination, or the route's hop names an unresolved neighbor --
+leaves on that gate instead of being dropped. 0 (the proto default) and `DROP_GATE` both mean drop, which is
+what the module did before; any other value must be a gate the graph can have (`IsValidGateValue`), and a bad
+value is refused at `Init`, like an unknown mode. The frame is counted either way, so `no_route_frames` and
+`unresolved_frames` stay the record of what happened, and `GetDesc` says when a punt is configured.
+
+**Why.** The module's drop is the right default and the wrong only answer: a controller wants the frame (a
+routing daemon's slow path, an ICMP generator, a capture), and the application that owns the policy -- the same
+split D-155 drew for the mode -- can only implement it if the module hands the frame over instead of freeing
+it. The punt is a gate, not a callback, so the graph decides what happens there with the modules it already
+has, and the packet path pays nothing: the check is a comparison against `DROP_GATE` on a path that is already
+dropping.
+
+**Consequences.** A graph that wants a miss punted wires a module to that gate and sets the arg; nothing else
+changes -- the counters, the mode, the chain and the wire format are as they were, and with neither arg set the
+behaviour is byte-identical to the previous one. Gate 0 is a real gate and is not a punt target: 0 in the field
+means "no punt" (the proto says so), and that is this shape's one asymmetry. R1 still drops; a punt is a
+graph's choice.
+
+**Evidence.** `RouterTest` 24/24 on `build/fast`, including
+`AMissAndAnUnresolvedNeighborPuntToTheirGates` (a miss leaves on the miss gate, an unresolved neighbor on the
+unresolved gate, a forwarded frame is untouched by the policy, and both counters still move) and
+`AnInvalidPuntGateIsRefused`.
+
+## D-163 A group route's flow hash reads the fields the graph names
+
+**Status:** accepted (2026-10-19; the plan's item 2: "flow-hash field choice: a parameter on the chain plus a
+module arg").
+
+**Decision.** `route::FlowHash` takes a `FlowHashFields`: `kL3L4` (the default) mixes the address pair, the
+ports and the protocol; `kL3` mixes the address pair alone. `ResolveFrame` passes the choice through to it,
+the Router module exposes it as `RouterArg.flow_hash` (`FLOW_HASH_L3_L4`, `FLOW_HASH_L3`), and the router
+appliance keeps the default. An unknown value keeps the default rather than failing `Init`.
+
+**Why.** The chain's own comment said the choice was the deployment's ("Which fields a deployment hashes is
+its own choice (D-066)") but nothing could make it: the hash was one function with one field set. A graph
+whose traffic must not be spread -- one subscriber's flows pinned to one member, or a policy that must not
+read an L4 header -- needs the address-pair-only hash, and it is the graph, not the library, that knows which.
+The choice stays in the library as a parameter rather than a second hash function, so both callers still hash
+the same way for the same frame.
+
+**Consequences.** The default is byte-identical to the previous behaviour (the fields are mixed exactly as
+before): no change to member selection, no wire change beyond the new arg, and the appliance is untouched.
+`FLOW_HASH_L3` pins every flow to one destination to the same member; the trade is deliberate -- fewer
+distinct members used, and a destination's traffic never reordered between them.
+
+**Evidence.** `RouterTest` 25/25 on `build/fast`, including
+`L3OnlyHashingPinsEveryFlowToOneDestinationToOneMember` (64 flows to one destination all take one member
+under `FLOW_HASH_L3`) beside the existing `AGroupRoutePicksOneMemberPerFlow` (the default spreads them).
+
+## D-164 A connected route is the subnet of an interface's own address
+
+**Status:** accepted (2026-10-19; the plan's item 5: "connected-route helper in the library, used by the
+appliance").
+
+**Decision.** `route::ConnectedRouteFor(address, length, egress)` (`route/connected_route.h`) returns the
+connected route an interface's address implies: the prefix is the address with its host bits cleared
+(`Ipv4Prefix::Make` refuses host bits, so clearing them is the helper's job), and the hop is
+`{egress, kIncomplete}` -- the interface itself, no neighbor resolved. The router appliance gives each of its
+interfaces an address and installs one connected route per interface at `Init`.
+
+**Why.** Every IPv4 router has these routes, and each application was writing the same three lines: mask the
+address, make the prefix, make a hop that points at the interface. The masking is the part worth owning --
+the route table's `Ipv4Prefix::Make` rejects an address with host bits, so the arithmetic belongs in one place
+where two applications cannot disagree about it. The hop's neighbor starts unresolved on purpose: a host on
+the subnet is reached by resolving it, which is the application's ARP and the neighbor table's to publish, so
+the route exists from the moment the interface does and `Bind`/`SetNextHop` is what makes it forward.
+
+**Consequences.** A connected route forwards nothing until a host on its subnet resolves, which is the honest
+state -- a router with no ARP entry drops. The appliance's table gains one route per interface (four here) and
+its `route_writes()` counts them, because they are part of the static policy; its interfaces now carry
+addresses, and the second gateway moved to 198.18.0.1 so it sits on its own interface's subnet (a gateway
+off-link is a policy error the helper cannot see).
+
+**Evidence.** `route_test.cc`'s `ConnectedRouteTest.TheSubnetOfAnInterfaceAddress` (host bits cleared, the /0,
+/8 and /32 edges, and a length above 32 refused), and the appliance's own checks in `router_appliance.cc`,
+which compare `route_count()`/`route_writes()` across a neighbor move and still see no route written.

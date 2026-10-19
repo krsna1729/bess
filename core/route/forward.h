@@ -59,11 +59,13 @@ struct FrameRoute {
 
 // The read half: the checked parse, the destination resolved in `domain` (a
 // group route picks its member with the frame's own flow hash, the one hash
-// both callers use), the neighbor check, the egress check, and the TTL read
-// before anything is written. `frame` is the packet's first segment and
-// `total_len` the whole frame (0: the span's length).
+// both callers use, reading the fields the caller names -- D-163), the neighbor
+// check, the egress check, and the TTL read before anything is written.
+// `frame` is the packet's first segment and `total_len` the whole frame (0: the
+// span's length).
 inline FrameRoute ResolveFrame(const Router &router, RouteDomainId domain,
-                               std::span<const uint8_t> frame, size_t total_len) noexcept {
+                               std::span<const uint8_t> frame, size_t total_len,
+                               FlowHashFields fields = FlowHashFields::kL3L4) noexcept {
   conntrack::ParsedFlowPacket p;
   const conntrack::ParseStatus parsed = conntrack::ParseFrame(frame, p, total_len);
   if (parsed == conntrack::ParseStatus::kNotIp) {
@@ -88,7 +90,8 @@ inline FrameRoute ResolveFrame(const Router &router, RouteDomainId domain,
   std::memcpy(&src_word, p.src.data(), sizeof(src_word));
   std::memcpy(&dst_word, p.dst.data(), sizeof(dst_word));
   const NextHop *hop = router.Resolve(
-      domain, dst.value(), FlowHash(src_word, dst_word, p.src_port, p.dst_port, p.protocol));
+      domain, dst.value(),
+      FlowHash(src_word, dst_word, p.src_port, p.dst_port, p.protocol, fields));
   if (hop == nullptr) {
     return {.verdict = ForwardVerdict::kNoRoute};
   }

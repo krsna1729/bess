@@ -34,6 +34,7 @@
 #include "dpdk.h"
 #include "runtime/runtime_state.h"
 #include "packet_pool.h"
+#include "route/connected_route.h"
 #include "route/route_table.h"
 #include "route/router.h"
 #include "testing/route_backends.h"
@@ -179,6 +180,42 @@ TEST(Ipv4PrefixTest, Validation) {
   EXPECT_EQ(RouteError::kHostBitsSet,
             Ipv4Prefix::Make(Ip(10, 0, 0, 1), 24).error());
   EXPECT_EQ(RouteError::kHostBitsSet, Ipv4Prefix::Make(1, 0).error());
+}
+
+// D-164: the connected route an interface's address implies. The subnet is the
+// address with its host bits cleared -- `Ipv4Prefix::Make` refuses them, so the
+// helper must clear them -- and the hop is the interface, no neighbor resolved.
+TEST(ConnectedRouteTest, TheSubnetOfAnInterfaceAddress) {
+  const auto if1 = dataplane::InterfaceId{uint16_t{1}};
+
+  const auto host = ConnectedRouteFor(Ip(192, 0, 2, 1), 24, if1);
+  ASSERT_TRUE(host.has_value());
+  if (!host) {
+    return;  // the assert above already failed the test
+  }
+  EXPECT_EQ(Ip(192, 0, 2, 0), host->prefix.addr()) << "the host bits are cleared";
+  EXPECT_EQ(24, host->prefix.length());
+  EXPECT_EQ(if1, host->hop.egress);
+  EXPECT_EQ(NeighborState::kIncomplete, host->hop.neighbor)
+      << "a host on the subnet is reached by resolving it";
+
+  // Every length an interface could have, including the two edges.
+  const auto eight = ConnectedRouteFor(Ip(10, 1, 2, 3), 8, if1);
+  const auto zero = ConnectedRouteFor(Ip(10, 1, 2, 3), 0, if1);
+  const auto host_route = ConnectedRouteFor(Ip(10, 1, 2, 3), 32, if1);
+  ASSERT_TRUE(eight.has_value());
+  ASSERT_TRUE(zero.has_value());
+  ASSERT_TRUE(host_route.has_value());
+  if (!eight || !zero || !host_route) {
+    return;
+  }
+  EXPECT_EQ(Ip(10, 0, 0, 0), eight->prefix.addr());
+  EXPECT_EQ(Ip(0, 0, 0, 0), zero->prefix.addr());
+  EXPECT_EQ(Ip(10, 1, 2, 3), host_route->prefix.addr());
+
+  // Not a prefix length: the configuration is wrong, and the helper says so
+  // rather than masking something meaningless.
+  EXPECT_FALSE(ConnectedRouteFor(Ip(10, 0, 0, 1), 33, if1).has_value());
 }
 
 class RouteTableTest : public bess::testing::RouteBackendTest {};
