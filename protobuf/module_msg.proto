@@ -1140,9 +1140,9 @@ message UpdateArg {
    * Update Field describes where in a packet's data to rewrite, and with what value.
    */
   message Field {
-    int64 offset = 1; /// The offset in the packet in bytes to rewrite at.
-    uint64 size = 2; /// The number of bytes to rewrite (max 8 bytes).
-    uint64 value = 3; /// The value to write into the packet, max 8 bytes.
+    int64 offset = 1; /// The offset in the packet in bytes to rewrite at. 0 or more, and offset + size must fit the 2048-byte data room.
+    uint64 size = 2; /// The number of bytes to rewrite, 1-8.
+    uint64 value = 3; /// The value to write into the packet; it must fit in `size` bytes.
   }
   repeated Field fields = 1; /// A list of Update Fields.
 }

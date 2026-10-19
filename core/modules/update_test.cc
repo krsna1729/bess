@@ -102,4 +102,58 @@ TEST(UpdateTest, FieldsResourceReplacesTheList) {
   EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &none}}));
 }
 
+// The init path and the resource path refuse the same lists. Init used to
+// index fields_ (16 entries) with no limit check, so a longer list walked
+// past it; the other two were accepted here and refused by the resource.
+TEST(UpdateTest, InitRefusesWhatTheResourceRefuses) {
+  ModuleHarness h;
+  bess::pb::UpdateArg too_many;
+  for (int i = 0; i < 17; i++) {
+    too_many.MergeFrom(Fields({{.offset = i, .size = 1, .value = 1}}));
+  }
+  EXPECT_NE("", h.CreateError("Update", too_many)) << "17 fields";
+  EXPECT_NE("", h.CreateError(
+                    "Update", Fields({{.offset = -1, .size = 1, .value = 1}})))
+      << "negative offset";
+  EXPECT_NE("", h.CreateError(
+                    "Update", Fields({{.offset = 0, .size = 1, .value = 0x142}})))
+      << "value wider than size";
+  // The top bound must not be `offset + size`: this one overflows int64_t and
+  // used to be accepted.
+  EXPECT_NE("", h.CreateError(
+                    "Update",
+                    Fields({{.offset = INT64_MAX, .size = 8, .value = 1}})))
+      << "offset at INT64_MAX";
+}
+
+// A field writes its own bytes and nothing else, including at the last byte
+// of the data room: the eight-byte load/store it replaces reached seven bytes
+// past it. The frame is the same on the old code (the neighbours were rewritten
+// with their old values), so the overrun itself is what ASan catches; this test
+// pins the bytes the write must produce.
+TEST(UpdateTest, AFieldWritesExactlyItsBytes) {
+  ModuleHarness h;
+  const Bytes full(bess::kDefaultPacketDataSize, 0);
+  Module *edge = h.Create(
+      "Update",
+      Fields({{.offset = bess::kDefaultPacketDataSize - 1, .size = 1, .value = 0xAB}}),
+      "upd_edge");
+  ASSERT_NE(nullptr, edge);
+  Bytes expected = full;
+  expected[bess::kDefaultPacketDataSize - 1] = 0xAB;
+  EXPECT_EQ(expected, Through(h, edge, full));
+
+  Module *two =
+      h.Create("Update", Fields({{.offset = 0, .size = 2, .value = 0xAABB}}), "upd_two");
+  ASSERT_NE(nullptr, two);
+  Bytes in(60, 0);
+  in[0] = 0x11;
+  in[1] = 0x22;
+  in[2] = 0x33;
+  Bytes out = in;
+  out[0] = 0xAA;
+  out[1] = 0xBB;
+  EXPECT_EQ(out, Through(h, two, in)) << "the byte after the field is untouched";
+}
+
 }  // namespace

@@ -31,9 +31,9 @@ class Update final : public Module {
   static const size_t kMaxFields = 16;
 
   struct Field {
-    be64_t mask;  /* bits with 1 won't be updated */
-    be64_t value; /* in network order */
+    be64_t value; /* in network order; the field's bytes are its first `size` */
     size_t offset;
+    uint8_t size;
   };
 
   // A "<name>/fields" value, converted: the fields and the UpdateArg they
@@ -47,6 +47,13 @@ class Update final : public Module {
   // Validates and converts one field.
   static CommandResponse ParseField(const bess::pb::UpdateArg::Field &field,
                                     Field *out);
+
+  // Validates and converts a whole field list. Init and "<name>/fields" share
+  // it, so a list one refuses the other refuses too (Init used to index
+  // fields_ without the limit check). On failure the array's contents are
+  // unspecified and *num_fields is untouched.
+  static CommandResponse ParseFields(const bess::pb::UpdateArg &arg,
+                                     Field *fields, size_t *num_fields);
 
   size_t num_fields_;
 
