@@ -1044,6 +1044,15 @@ bess::testing::Bytes SessionPacket(const char *sip, uint16_t sport, std::mt19937
                                   rng);
 }
 
+// What the Router forwards a frame as: the TTL decremented and the checksum
+// that covers it. The library's own function, not a copy -- a test that
+// recomputed the checksum could pass while the packet path wrote a wrong one.
+bess::testing::Bytes Forwarded(bess::testing::Bytes f) {
+  auto *ip = reinterpret_cast<bess::utils::Ipv4 *>(f.data() + 14);
+  EXPECT_EQ(bess::route::TtlResult::kForward, bess::route::DecrementTtl(*ip));
+  return f;
+}
+
 class SessionPacketPathTest : public SessionPipelineTest {
  protected:
   // The four modules, created referrer-first (the ExactMatch and the
@@ -1104,7 +1113,7 @@ TEST_F(SessionPacketPathTest, SessionTransactionSteersAndPolices) {
   const auto pkt1 = SessionPacket("10.1.2.3", 1234, rng_);
   const auto pkt2 = SessionPacket("10.1.2.3", 1234, rng_);
   ASSERT_EQ(60u, pkt1.size());
-  EXPECT_EQ((std::vector<bess::testing::Bytes>{pkt1}), Egress({pkt1, pkt2}));
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{Forwarded(pkt1)}), Egress({pkt1, pkt2}));
 }
 
 // A packet whose rule does not match takes the ExactMatch default gate
@@ -1124,7 +1133,7 @@ TEST_F(SessionPacketPathTest, OtherSessionsAndMissesAreDropped) {
   EXPECT_TRUE(Egress({miss, other}).empty());
   // The session's own packet still goes through.
   const auto own = SessionPacket("10.1.2.3", 1234, rng_);
-  EXPECT_EQ((std::vector<bess::testing::Bytes>{own}), Egress({own}));
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{Forwarded(own)}), Egress({own}));
 }
 
 // Removing the session -- the rule, the action, the route, the next hop and
@@ -1135,7 +1144,7 @@ TEST_F(SessionPacketPathTest, RemovedSessionIsDropped) {
   auto r = Apply(SessionOps("10.1.2.3", 1234, 1000));
   ASSERT_EQ(Outcome::kApplied, r.outcome) << (r.ops.empty() ? "" : r.ops[0].error);
   const auto pkt = SessionPacket("10.1.2.3", 1234, rng_);
-  ASSERT_EQ((std::vector<bess::testing::Bytes>{pkt}), Egress({pkt}));
+  ASSERT_EQ((std::vector<bess::testing::Bytes>{Forwarded(pkt)}), Egress({pkt}));
 
   r = Apply({
       Op::Erase("em/rules", WireKey("10.1.2.3", 1234)),
@@ -1215,7 +1224,7 @@ TEST_F(SessionPacketPathTest, WireSessionSteersPolicesAndReadsBack) {
   ASSERT_GE(want.size(), 12u);
   std::memcpy(want.data(), "\x02\x00\x00\x00\x00\x01", 6);
   std::memcpy(want.data() + 6, "\x02\x00\x00\x00\x00\x02", 6);
-  EXPECT_EQ((std::vector<bess::testing::Bytes>{want}), Egress({pkt1, pkt2}));
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{Forwarded(want)}), Egress({pkt1, pkt2}));
 
   EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&s.meter_key, &s.meter}}));
   EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&s.hop_key, &s.hop}}));
@@ -1463,7 +1472,7 @@ TEST_F(SessionPipelineTest, ConfiguredNamesResolveToOneOffset) {
   const auto pkt1 = SessionPacket("10.1.2.3", 1234, rng);
   const auto pkt2 = SessionPacket("10.1.2.3", 1234, rng);
   bess::testing::ModuleHarness h;
-  EXPECT_EQ((std::vector<bess::testing::Bytes>{pkt1}),
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{Forwarded(pkt1)}),
             h.RunPipeline(em, 0, {pkt1, pkt2}, rt, {kEgressGate})[kEgressGate]);
 
   // The meter's read and the table's write resolved to one offset: the
@@ -1512,7 +1521,7 @@ TEST_F(SessionPipelineTest, ConfiguredActionAndNextHopNamesPairWithTheirReaders)
   std::mt19937 rng{rd()};
   const auto pkt = SessionPacket("10.1.2.3", 1234, rng);
   bess::testing::ModuleHarness h;
-  EXPECT_EQ((std::vector<bess::testing::Bytes>{pkt}),
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{Forwarded(pkt)}),
             h.RunPipeline(md, 0, {pkt}, rt, {kEgressGate})[kEgressGate]);
 
   // Each configured name paired with the writer's or the reader's.

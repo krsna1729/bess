@@ -457,32 +457,61 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
   for (int i = 0; i < cnt; i++) {
     const route::NextHop *hop =
         (resolved & (uint64_t{1} << i)) != 0 ? hops[i] : nullptr;
-    const bool usable =
-        hop != nullptr && hop->neighbor == route::NeighborState::kResolved;
-    // A zero address means "not named" (D-129), and half a pair would write an
-    // invalid frame: a hop that names both is rewritten, any other is
-    // forwarded with the header it arrived with.
-    if (!usable || hop->dst_mac.IsZero() || hop->src_mac.IsZero()) {
-      gates[i] = usable ? GateOf(hop->egress) : DROP_GATE;
+    if (hop == nullptr || hop->neighbor != route::NeighborState::kResolved) {
+      gates[i] = DROP_GATE;
       continue;
     }
     gates[i] = GateOf(hop->egress);
     bess::PacketRef pkt = batch->packet(i);
-    auto rewritten = route::RewriteL2(pkt, *hop);
-    if (!rewritten &&
-        rewritten.error() == bess::packet::MutationError::kSharedStorage) {
-      // A shared payload: copy it first, then write (K4). The copy may
-      // replace the mbuf, so the batch keeps the new handle.
-      bess::PacketHandle handle = pkt.handle();
-      if (!bess::packet::EnsureWritable(handle)) {
+    // The destination mode's write path, so the two modes cannot disagree
+    // about a TTL boundary or about which addresses a hop writes (D-153): the
+    // TTL first, then the addresses when the hop names both. A frame that is
+    // not an IPv4 packet has no hop count to decrement: it keeps the TTL it
+    // arrived with and, as before, still gets the hop's addresses when it
+    // names them. A header the parser cannot read is dropped and counted,
+    // never forwarded.
+    bess::conntrack::ParsedFlowPacket parsed;
+    const bess::conntrack::ParseStatus status = bess::conntrack::ParseFrame(
+        std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), parsed,
+        pkt.total_len());
+    if (status != bess::conntrack::ParseStatus::kOk &&
+        status != bess::conntrack::ParseStatus::kNotIp &&
+        status != bess::conntrack::ParseStatus::kFragment) {
+      gates[i] = DROP_GATE;
+      header_write_failures_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    bess::PacketHandle handle = pkt.handle();
+    if (!bess::packet::EnsureWritable(handle)) {
+      gates[i] = DROP_GATE;
+      header_write_failures_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    batch->handles()[i] = handle;
+    bess::PacketRef writable(handle);
+    // A non-initial fragment still carries its IPv4 header; only its L4 header
+    // is missing. So the hop count is every IPv4 frame's, fragments included:
+    // the destination mode drops a fragment because its group hash needs ports,
+    // while this mode routes by id and forwards it with the TTL written.
+    if ((status == bess::conntrack::ParseStatus::kOk ||
+         status == bess::conntrack::ParseStatus::kFragment) &&
+        parsed.l3 == bess::conntrack::L3Kind::kIpv4) {
+      // The parse ran before EnsureWritable, and the copy may have resegmented
+      // the frame: where the header is is re-established, not assumed. Writing
+      // it through a stale offset would touch bytes outside this segment.
+      if (writable.head_len() <
+          static_cast<size_t>(parsed.l3_offset) + sizeof(bess::utils::Ipv4)) {
         gates[i] = DROP_GATE;
         header_write_failures_.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
-      batch->handles()[i] = handle;
-      rewritten = route::RewriteL2(bess::PacketRef(handle), *hop);
-    }
-    if (!rewritten) {
+      if (route::WriteForwarded(
+              std::span(writable.head_data<uint8_t *>(), writable.head_len()),
+              parsed.l3_offset, *hop) != route::TtlResult::kForward) {
+        gates[i] = DROP_GATE;
+        ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else if (!route::RewriteL2(writable, *hop)) {
       gates[i] = DROP_GATE;
       header_write_failures_.fetch_add(1, std::memory_order_relaxed);
     }
