@@ -2,15 +2,25 @@
 
 #include "control/maintenance_loop.h"
 
+#include <any>
 #include <atomic>
 #include <chrono>
+#include <expected>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <thread>
 
 #include <gtest/gtest.h>
 
 #include "control/control_plane.h"
+#include "control/resource_fill.h"
+#include "dataplane/transaction_engine.h"
 #include "framework/module_requests.h"
 #include "framework/module_tick.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
+#include "rcu/rcu_domain.h"
 #include "stats/event_hub.h"
 
 namespace bess::control {
@@ -30,6 +40,45 @@ bool WaitFor(const std::atomic<int> &value, int want) {
   }
   return true;
 }
+
+// A resource whose count and stated capacity the test sets directly, and a
+// codec that carries no entries: the watch reads only LiveCount() and
+// Capacity(), and needs the resource reachable, which is what a binding means
+// (resource_fill_test.cc has the same pair; they are small and test-local).
+class FillResource final : public dataplane::Resource {
+ public:
+  FillResource(std::string name, uint64_t *count, std::optional<uint64_t> *capacity)
+      : Resource(std::move(name), {}), count_(count), capacity_(capacity) {}
+
+  size_t LiveCount() const override { return *count_; }
+  std::optional<uint64_t> Capacity() const override { return *capacity_; }
+  bool Contains(const dataplane::ResourceKey &) const override { return false; }
+  void VisitReferences(
+      const std::function<void(const dataplane::Reference &)> &) const override {}
+  std::expected<Reservation, std::string> Reserve(const dataplane::Op &) override {
+    return std::unexpected("the fill watch never reserves");
+  }
+
+ private:
+  uint64_t *count_;
+  std::optional<uint64_t> *capacity_;
+};
+
+class StubCodec final : public framework::ResourceCodec {
+ public:
+  Kind kind() const override { return Kind::kMap; }
+  std::string key_type() const override { return "k"; }
+  std::string value_type() const override { return "v"; }
+  std::expected<dataplane::ResourceKey, std::string> Key(std::string_view,
+                                                         const std::string &) const override {
+    return std::unexpected("unused");
+  }
+  std::expected<std::any, std::string> Value(std::string_view,
+                                             const std::string &) const override {
+    return std::unexpected("unused");
+  }
+  void Entries(const EntryVisitor &) const override {}
+};
 
 TEST(MaintenanceLoopTest, DeliversPostedRequestsOnItsOwnThread) {
   ControlPlane control;
@@ -129,6 +178,37 @@ TEST(MaintenanceLoopTest, ATicksEventsReachTheLog) {
   EXPECT_EQ("7", got.events[0].fields.at("key"));
   EXPECT_EQ("9", got.events[0].fields.at("value"));
   EXPECT_EQ(1, ran.load()) << "an hour's period: one call";
+}
+
+// A crossing the fill watch finds reaches the daemon's log with the type,
+// source and fields a controller reads. The resource is over its level before
+// the loop starts, so the first sweep reports it; the watch is level-triggered
+// and does not need the crossing to happen while the loop runs.
+TEST(MaintenanceLoopTest, AFillCrossingReachesTheLog) {
+  ControlPlane control;
+  framework::RequestHub hub;
+  framework::TickHub ticks;
+  stats::EventHub log;
+  uint64_t count = 80;  // 80% of 100: the level
+  std::optional<uint64_t> capacity = 100;
+  FillResource resource("mod/table", &count, &capacity);
+  rcu::RcuDomain domain(1, 8);
+  dataplane::TransactionEngine engine(domain);
+  ASSERT_TRUE(engine.Register(&resource).has_value());
+  framework::ResourceBindings bindings;
+  const framework::ResourceBinding binding = bindings.Bind(resource, std::make_shared<StubCodec>());
+  ResourceFillWatch fills(engine, bindings);
+
+  MaintenanceLoop loop(control, hub, ticks, std::chrono::microseconds(500), &log,
+                       std::chrono::seconds(1), std::chrono::microseconds(250), &fills);
+  const stats::EventHub::ReadResult got = log.Read(1, 10, std::chrono::seconds(10));
+  ASSERT_FALSE(got.events.empty());
+  EXPECT_EQ(kResourceFillEvent, got.events[0].type);
+  EXPECT_EQ("mod", got.events[0].source);
+  EXPECT_EQ("mod/table", got.events[0].fields.at("resource"));
+  EXPECT_EQ("80", got.events[0].fields.at("count"));
+  EXPECT_EQ("80", got.events[0].fields.at("limit"));
+  EXPECT_EQ("100", got.events[0].fields.at("capacity"));
 }
 
 }  // namespace

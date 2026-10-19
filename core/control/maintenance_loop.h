@@ -32,18 +32,24 @@ namespace bess::control {
 
 class ControlPlane;
 class PressureMonitor;
+class ResourceFillWatch;
 
 class MaintenanceLoop {
  public:
   // Starts the thread. `interval` 0 disables the loop (no thread).
   // With `events`, also moves workers' events into its log every tick and
   // emits pressure transitions (sampled every `pressure_period`), and appends
-  // the events the ticks queued. Each due tick endpoint is given `tick_slice`.
+  // the events the ticks queued. Each due tick endpoint is given `tick_slice`
+  // (the hub gives each endpoint its own), and the fill watch
+  // (control/resource_fill.h, D-165) is then given a slice of its own, so one
+  // tick may spend more than one slice on control-side work. Its crossings
+  // reach the log beside the ticks' events when `events` is set.
   MaintenanceLoop(ControlPlane &control, framework::RequestHub &requests,
                   framework::TickHub &ticks, std::chrono::microseconds interval,
                   stats::EventHub *events = nullptr,
                   std::chrono::microseconds pressure_period = std::chrono::seconds(1),
-                  std::chrono::microseconds tick_slice = std::chrono::microseconds(250));
+                  std::chrono::microseconds tick_slice = std::chrono::microseconds(250),
+                  ResourceFillWatch *fills = nullptr);
   ~MaintenanceLoop();  // stops and joins: no handler runs after it returns
   MaintenanceLoop(const MaintenanceLoop &) = delete;
   MaintenanceLoop &operator=(const MaintenanceLoop &) = delete;
@@ -58,6 +64,7 @@ class MaintenanceLoop {
   framework::RequestHub &requests_;
   framework::TickHub &tick_hub_;
   const std::chrono::microseconds tick_slice_;
+  ResourceFillWatch *const fills_;
   stats::EventHub *const events_;
   const std::chrono::microseconds interval_;
   std::unique_ptr<PressureMonitor> pressure_;

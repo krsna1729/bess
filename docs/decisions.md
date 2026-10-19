@@ -11377,3 +11377,49 @@ off-link is a policy error the helper cannot see).
 **Evidence.** `route_test.cc`'s `ConnectedRouteTest.TheSubnetOfAnInterfaceAddress` (host bits cleared, the /0,
 /8 and /32 edges, and a length above 32 refused), and the appliance's own checks in `router_appliance.cc`,
 which compare `route_count()`/`route_writes()` across a neighbor move and still see no route written.
+
+## D-165 The daemon watches every resource's fill against its stated capacity
+
+**Status:** accepted (2026-10-19; the plan's item: "the built-in fill-level watch for every resource").
+
+**Decision.** The maintenance loop sweeps the registered resources every tick, under the control-plane lock,
+in a time slice of its own taken after the modules' tick endpoints have run (`control/resource_fill.h`,
+`control/maintenance_loop.cc`). A resource whose `LiveCount()` reaches `kLevelPercent` (80%) of the capacity
+it states is reported once as `bess.resource_fill` -- fields `resource`, `count`, `limit`, `capacity`, source
+the resource's module -- and is not reported again until it falls below the level and rises again. A resource
+that states no capacity, or a capacity of zero, is not watched. The reachability rule is `GetResourceStatus`'s:
+a resource without a codec binding is not reported.
+
+**Why.** `GetResourceStatus` (D-149) answers what every resource holds and what ceiling it can state, but only
+when asked: a controller that cares how full a table is had to poll it. The daemon already walks the resources
+and already runs control-side work on a clock (the maintenance loop, D-077, and the modules' tick endpoints,
+D-150), so the same facts can be reported rather than read. The level is a fraction of the stated capacity and
+not a count, so one number means the same thing for a 512-slot table and a million-key map, and it survives a
+capacity that changes with a module's configuration; 80% because a report at 100% arrives with the writes it
+was meant to prevent. A resource that states no capacity is left alone: D-149's contract is that
+`has_capacity` false means "not stated", and reporting such a resource as full would be a lie. It is
+level-triggered and once per crossing, like `ThresholdTable` (D-151), so a crossing is reported rather
+than sampled away -- for a count that only grows; a table that fills and drains within one sweep interval
+is not seen, which is why polling stays the backstop. A resource whose fill falls below the level is
+forgotten and may fire again, and so is one that stops being reachable and comes back: that is a new
+table, with no history.
+
+**Consequences.** The event is an operational one on the log `WatchEvents` streams, so a controller is told
+rather than polling, and polling stays the backstop for a lost event (a full ring, a gap) -- the rule the
+counter crossings already state. The sweep may block: it runs with the control-plane lock held, like a
+module's tick, which is the documented precedent, and it is given a slice of its own after the tick hub has
+run (the hub gives each endpoint its own slice, so a deadline taken before it could be spent already). The
+walk is a few hundred virtual calls, well inside one slice; the slice stops a longer one, and the next sweep
+starts again from the beginning, which is harmless because what has fired is remembered by name. A daemon
+whose resource count made a full walk exceed the slice would never reach the tail of it -- that is the known
+limit of keeping no cursor, and a cursor is the change to make if a graph ever gets there. No protocol
+change: the daemon only carries the event. A controller that wants its own level per resource would need a
+control RPC, which this does not add.
+
+**Evidence.** `resource_fill_test.cc`: the level (the first count that reaches it, ceil) and once per crossing,
+a fall and a rise firing again, a rise without a fall not firing twice, a capacity of 1 not full while empty,
+no capacity and zero capacity not watched, an unbound resource not watched, one that is gone or unreachable
+and comes back firing again, a capacity that grows or is withdrawn re-arming it, the slice stopping a pass and
+the next one completing it, a cut pass forgetting nothing, and `LevelOf`'s arithmetic (the ceil identity, no
+overflow at `UINT64_MAX`). `maintenance_loop_test.cc`: the crossing reaching the log with its type, source and
+fields.

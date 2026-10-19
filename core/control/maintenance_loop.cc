@@ -8,6 +8,7 @@
 
 #include "control/control_plane.h"
 #include "control/pressure_monitor.h"
+#include "control/resource_fill.h"
 #include "framework/module_requests.h"
 #include "framework/module_tick.h"
 #include "stats/event_hub.h"
@@ -17,11 +18,12 @@ namespace bess::control {
 MaintenanceLoop::MaintenanceLoop(ControlPlane &control, framework::RequestHub &requests,
                                  framework::TickHub &ticks, std::chrono::microseconds interval,
                                  stats::EventHub *events, std::chrono::microseconds pressure_period,
-                                 std::chrono::microseconds tick_slice)
+                                 std::chrono::microseconds tick_slice, ResourceFillWatch *fills)
     : control_(control),
       requests_(requests),
       tick_hub_(ticks),
       tick_slice_(tick_slice),
+      fills_(fills),
       events_(events),
       interval_(interval) {
   if (events_ != nullptr && pressure_period.count() > 0) {
@@ -50,10 +52,21 @@ void MaintenanceLoop::Run() {
   while (!stop_cv_.wait_for(wait, interval_, [this] { return stop_; })) {
     wait.unlock();
     std::optional<PressureMonitor::Sample> sample;
+    ResourceFillWatch::Result fills_result;
     {
       auto lock = control_.AcquireLock();
       delivered_.fetch_add(requests_.Deliver(), std::memory_order_relaxed);
       tick_hub_.Run(tick_slice_, ticks_.load(std::memory_order_relaxed));
+      if (fills_ != nullptr) {
+        // The sweep's own slice, measured after the hub: the hub gives each
+        // endpoint its own slice, so a deadline taken before it could already
+        // be spent, and the sweep would then stop after its first batch every
+        // tick and never reach the rest of the resources.
+        const std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::now() + tick_slice_;
+        fills_result =
+            fills_->Sweep([deadline] { return std::chrono::steady_clock::now() >= deadline; });
+      }
       if (pressure_ != nullptr && ticks_.load(std::memory_order_relaxed) % pressure_every_ == 0) {
         sample = PressureMonitor::Take();
       }
@@ -63,6 +76,13 @@ void MaintenanceLoop::Run() {
     if (events_ != nullptr) {
       for (framework::PendingEvent &e : queued) {
         events_->Emit(std::move(e.type), std::move(e.source), std::move(e.fields));
+      }
+      for (const ResourceFillWatch::Crossing &c : fills_result.crossed) {
+        events_->Emit(kResourceFillEvent, ModuleOf(c.resource),
+                      {{"resource", c.resource},
+                       {"count", std::to_string(c.count)},
+                       {"limit", std::to_string(c.limit)},
+                       {"capacity", std::to_string(c.capacity)}});
       }
     }
     if (sample) {

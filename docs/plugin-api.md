@@ -377,6 +377,16 @@ the controller reads the total before it acts. A worker event can be lost when i
 (counted, shown as `bess.events_lost`), so a consumer that cannot afford a missed report keeps
 polling as the backstop. The worker path's event also carries `worker`, the plane that crossed.
 
+**Fill levels.** A resource that states a capacity is watched by the daemon itself, with no module
+involvement: on its maintenance tick it reads every reachable resource's `LiveCount()` against the first
+count that reaches 80% of its `Capacity()` (D-165, `control/resource_fill.h`) and reports one
+`bess.resource_fill` event per crossing -- fields `resource`, `count`, `limit`, `capacity`, source the
+resource's module -- once, and again only after the fill has fallen below the level (or after the resource
+has stopped being reachable and come back, which is a new table). A resource that states no capacity (a
+tuple space that grows with the workload) is not watched, and a table that fills and drains inside one
+tick is not seen: this samples. The sweep runs with the control-plane lock held, like a module's tick, so
+a table filling up is reported without a controller polling `GetResourceStatus`.
+
 **Where a module's counters live.** A module's counters are per key and per worker, and the shared
 structure for them is `stats::KeyedCounters` (`stats/keyed_counters.h`, experimental, D-154):
 `keys` x `cells_per_key` 64-bit cells in one plane per worker, sized to the worker count the
