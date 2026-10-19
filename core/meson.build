@@ -664,6 +664,7 @@ core_public_subdir_headers = {
     'route/l3_packet.h',
     'route/neighbor_table.h',
     'route/forward.h',
+    'route/connected_route.h',
   ),
   'rcu': files(
     'rcu/rcu_domain.h',

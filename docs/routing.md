@@ -95,7 +95,10 @@ decrement twice. The Router carries neighbor *state*, not resolution: nothing in
 request (D-153) -- a graph's own resolution component resolves an address and republishes the affected next
 hops (`NeighborTable::Update` -> `Router::SetNextHop`), and what an unresolved neighbor means stays policy.
 Routes, next hops and groups are written through the module's resources (`<router>/routes`, `/next_hops`,
-`/groups`) in transactions, or directly by an application.
+`/groups`) in transactions, or directly by an application. The first routes a router usually writes are its
+connected ones: an interface's own address implies the subnet reachable on it, and
+`route::ConnectedRouteFor(address, length, egress)` (D-164) returns that prefix with a hop on the interface,
+whose neighbor stays unresolved until resolution learns it.
 
 The two recipes meet in one module. Which one runs is **configuration**, not a per-packet test: the `mode` arg
 (`ROUTE_MODE_NEXT_HOP_ID`, the default, or `ROUTE_MODE_DESTINATION`, D-155). A module decides; it does not

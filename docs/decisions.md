@@ -11341,3 +11341,31 @@ distinct members used, and a destination's traffic never reordered between them.
 **Evidence.** `RouterTest` 25/25 on `build/fast`, including
 `L3OnlyHashingPinsEveryFlowToOneDestinationToOneMember` (64 flows to one destination all take one member
 under `FLOW_HASH_L3`) beside the existing `AGroupRoutePicksOneMemberPerFlow` (the default spreads them).
+
+## D-164 A connected route is the subnet of an interface's own address
+
+**Status:** accepted (2026-10-19; the plan's item 5: "connected-route helper in the library, used by the
+appliance").
+
+**Decision.** `route::ConnectedRouteFor(address, length, egress)` (`route/connected_route.h`) returns the
+connected route an interface's address implies: the prefix is the address with its host bits cleared
+(`Ipv4Prefix::Make` refuses host bits, so clearing them is the helper's job), and the hop is
+`{egress, kIncomplete}` -- the interface itself, no neighbor resolved. The router appliance gives each of its
+interfaces an address and installs one connected route per interface at `Init`.
+
+**Why.** Every IPv4 router has these routes, and each application was writing the same three lines: mask the
+address, make the prefix, make a hop that points at the interface. The masking is the part worth owning --
+the route table's `Ipv4Prefix::Make` rejects an address with host bits, so the arithmetic belongs in one place
+where two applications cannot disagree about it. The hop's neighbor starts unresolved on purpose: a host on
+the subnet is reached by resolving it, which is the application's ARP and the neighbor table's to publish, so
+the route exists from the moment the interface does and `Bind`/`SetNextHop` is what makes it forward.
+
+**Consequences.** A connected route forwards nothing until a host on its subnet resolves, which is the honest
+state -- a router with no ARP entry drops. The appliance's table gains one route per interface (four here) and
+its `route_writes()` counts them, because they are part of the static policy; its interfaces now carry
+addresses, and the second gateway moved to 198.18.0.1 so it sits on its own interface's subnet (a gateway
+off-link is a policy error the helper cannot see).
+
+**Evidence.** `route_test.cc`'s `ConnectedRouteTest.TheSubnetOfAnInterfaceAddress` (host bits cleared, the /0,
+/8 and /32 edges, and a length above 32 refused), and the appliance's own checks in `router_appliance.cc`,
+which compare `route_count()`/`route_writes()` across a neighbor move and still see no route written.

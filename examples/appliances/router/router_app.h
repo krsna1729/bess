@@ -29,6 +29,7 @@
 
 #include "dataplane/interface_id.h"
 #include "rcu/rcu_domain.h"
+#include "route/connected_route.h"
 #include "route/forward.h"
 #include "route/neighbor_table.h"
 #include "route/router.h"
@@ -46,11 +47,14 @@ using bess::utils::Ethernet;
 
 class RouterApp {
  public:
-  // An interface: its MAC and the VRF packets arriving on it are routed in.
+  // An interface: its MAC, the VRF packets arriving on it are routed in, and
+  // its own address, which is what its connected route is made from (D-164).
   struct Interface {
     InterfaceId id;
     Ethernet::Address mac;
     RouteDomainId vrf;
+    uint32_t address;  // host order
+    uint8_t length;    // its prefix length
   };
 
   // The verdict vocabulary is the library's (route/forward.h): this path and
@@ -126,9 +130,9 @@ class RouterApp {
   size_t route_writes() const noexcept { return route_writes_; }
 
   // The static policy's addresses (host order), for callers and tests.
-  static constexpr uint32_t kGatewayA = 0xc0000201;   // 192.0.2.1 via if1 (VRF 1)
-  static constexpr uint32_t kGatewayB = 0xc0000202;   // 192.0.2.2 via if2 (VRF 1)
-  static constexpr uint32_t kGatewayC = 0xc6336401;   // 198.51.100.1 via if3 (VRF 2)
+  static constexpr uint32_t kGatewayA = 0xc0000201;  // 192.0.2.1 via if1 (VRF 1)
+  static constexpr uint32_t kGatewayB = 0xc6120001;  // 198.18.0.1 via if2 (VRF 1)
+  static constexpr uint32_t kGatewayC = 0xc6336401;  // 198.51.100.1 via if3 (VRF 2)
   static constexpr RouteDomainId kVrf1{1}, kVrf2{2};
 
  private:
@@ -142,13 +146,14 @@ class RouterApp {
   }
 
   // The static control policy (the application's): four interfaces, two VRFs
-  // that both route 10.0.0.0/8 (overlapping), an ECMP pair in VRF 1, and
-  // 172.16.0.0/12 in VRF 1 through one gateway.
+  // that both route 10.0.0.0/8 (overlapping), an ECMP pair in VRF 1,
+  // 172.16.0.0/12 in VRF 1 through one gateway, and each interface's own
+  // connected route (D-164).
   std::string ApplyStaticPolicy() {
-    interfaces_ = {Interface{InterfaceId{uint16_t{1}}, Mac(1), kVrf1},
-                   Interface{InterfaceId{uint16_t{2}}, Mac(2), kVrf1},
-                   Interface{InterfaceId{uint16_t{3}}, Mac(3), kVrf2},
-                   Interface{InterfaceId{uint16_t{4}}, Mac(4), kVrf2}};
+    interfaces_ = {Interface{InterfaceId{uint16_t{1}}, Mac(1), kVrf1, 0xc00002fe, 24},
+                   Interface{InterfaceId{uint16_t{2}}, Mac(2), kVrf1, 0xc61200fe, 24},
+                   Interface{InterfaceId{uint16_t{3}}, Mac(3), kVrf2, 0xc63364fe, 24},
+                   Interface{InterfaceId{uint16_t{4}}, Mac(4), kVrf2, 0xcb0071fe, 24}};
     for (const RouteDomainId vrf : {kVrf1, kVrf2}) {
       if (!router_->CreateDomain(vrf, bess::route::Router::Config{.max_routes = 16, .tbl8_groups = 4})) {
         return "create VRF";
@@ -177,6 +182,24 @@ class RouterApp {
       return "route";
     }
     route_writes_ = 3;
+    // The connected routes (D-164): each interface's own subnet is reachable on
+    // it, with the hop the library makes -- the interface, no neighbor resolved
+    // yet. A host on the subnet is reached by resolving it, which LearnNeighbor
+    // does; hops 1..3 above are the gateways, so these start at 4.
+    uint32_t connected_hop = 4;
+    for (const Interface &iface : interfaces_) {
+      const auto connected =
+          bess::route::ConnectedRouteFor(iface.address, iface.length, iface.id);
+      if (!connected) {
+        return "connected route";
+      }
+      const NextHopId hop_id{connected_hop++};
+      if (!router_->SetNextHop(hop_id, connected->hop) ||
+          !router_->SetRoute(iface.vrf, connected->prefix, hop_id)) {
+        return "connected route";
+      }
+      route_writes_++;
+    }
     // Resolution (ARP, in a real router) learns the gateways' MACs.
     return LearnNeighbor(InterfaceId{uint16_t{1}}, kGatewayA, Mac(0xa1)) &&
                    LearnNeighbor(InterfaceId{uint16_t{2}}, kGatewayB, Mac(0xa2)) &&
