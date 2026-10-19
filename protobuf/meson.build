@@ -73,7 +73,9 @@ test(
 
 sample_proto_name = 'supdate_msg.proto'
 sample_proto_file = files('../sample_plugin/protobuf/supdate_msg.proto')
-subdir('sample/pb')  # sample_cpp_target
+# The worked example's message: usage_report.h includes "pb/usage_msg.pb.h".
+usage_proto_file = files('../sample_plugin/protobuf/usage_msg.proto')
+subdir('sample/pb')  # sample_cpp_target, sample_usage_cpp_target
 
 # The Python client (pybess, the Python bessctl, its generated protobuf
 # packages) left with D-140: the C++ code above is the whole protobuf build.

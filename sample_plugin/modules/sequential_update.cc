@@ -173,4 +173,6 @@ ADD_MODULE(SequentialUpdate, "supdate",
            "updates packet data sequentially in a range")
 
 BESS_PLUGIN_REQUIRES("sample_sequential_update", "1.0.0",
-                     BESS_CAP_INIT_CONTEXT | BESS_CAP_RESOURCES)
+                     BESS_CAP_INIT_CONTEXT | BESS_CAP_RESOURCES |
+                         BESS_CAP_EVENTS | BESS_CAP_EVENT_SOURCES |
+                         BESS_CAP_TICKS)
