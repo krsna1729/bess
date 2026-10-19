@@ -169,6 +169,9 @@ class Router final : public Module {
   // gate, and DROP_GATE means drop. Either way the frame is counted.
   gate_idx_t punt_miss_gate_ = DROP_GATE;
   gate_idx_t punt_unresolved_gate_ = DROP_GATE;
+  // Which fields a group route hashes to pick its member (D-163). The proto
+  // default is the whole flow, so this only differs when a graph says so.
+  bess::route::FlowHashFields flow_fields_ = bess::route::FlowHashFields::kL3L4;
   std::atomic<uint64_t> header_write_failures_{0};
   std::atomic<uint64_t> not_ipv4_frames_{0};
   std::atomic<uint64_t> malformed_frames_{0};

@@ -724,6 +724,42 @@ TEST_F(RouterTest, AGroupRoutePicksOneMemberPerFlow) {
   }
 }
 
+// Which fields a group hashes is the graph's choice (D-163). `FLOW_HASH_L3`
+// reads the address pair alone, so every flow to one destination takes the
+// same member -- what a graph wants when a subscriber's traffic must not be
+// spread -- while the default spreads the flows.
+TEST_F(RouterTest, L3OnlyHashingPinsEveryFlowToOneDestinationToOneMember) {
+  bess::pb::RouterArg arg;
+  arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
+  arg.set_max_groups(1);
+  arg.set_flow_hash(bess::pb::FLOW_HASH_L3);
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeHop(rt, 2, 2, "02:00:00:00:00:cc", "02:00:00:00:00:aa");
+  MakeGroup(rt, 1, {1, 2});
+  MakeGroupRoute(rt, "198.51.100.0", 24, 0, 1);
+
+  const auto gate_of = [&](const Bytes &frame) -> int {
+    auto out = RunToDestination(rt, frame, 0, {0, 1, 2});
+    for (gate_idx_t gate : {1, 2}) {
+      if (!out[gate].empty()) {
+        return gate;
+      }
+    }
+    return -1;
+  };
+
+  // 64 flows, all to one destination: with the address pair alone hashed, the
+  // ports and the protocol cannot move any of them off the first member.
+  const int first = gate_of(FlowFrame("198.51.100.9", 4000, 1));
+  ASSERT_GE(first, 1) << "the flow was forwarded";
+  for (uint16_t port = 2; port <= 64; port++) {
+    EXPECT_EQ(first, gate_of(FlowFrame("198.51.100.9", 4000, port)))
+        << "flow " << port << " was spread: only the addresses hash (D-163)";
+  }
+}
+
 // A repeated member is a weight: it takes that many selection slots, so
 // {1, 1, 2} sends about two thirds of the flows to hop 1 -- and the rest
 // still reach hop 2, a weight is not a takeover.

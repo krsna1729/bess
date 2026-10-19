@@ -1339,6 +1339,11 @@ enum RouteMode {
   ROUTE_MODE_DESTINATION = 1; /// The packet's own IPv4 destination address, looked up in the route domain it carries: the module makes the decision, the way the router appliance does.
 }
 
+enum FlowHashFields {
+  FLOW_HASH_L3_L4 = 0; /// The address pair, the ports and the protocol: one member per flow (the default, D-163).
+  FLOW_HASH_L3 = 1; /// The address pair only: every flow to one destination takes the same member (D-163).
+}
+
 /**
  * The Router module forwards a packet to the egress its next-hop id (from
  * packet metadata) names, or -- in ROUTE_MODE_DESTINATION -- routes it by its
@@ -1359,6 +1364,7 @@ message RouterArg {
   uint64 max_groups = 7; /// Most next-hop groups (default 0: none; a route may name a group only with a nonzero bound). Together with max_next_hops, bounded by the 24-bit route value.
   uint64 punt_miss_gate = 8; /// Where a frame the FIB has no route for goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. Gate 0 is a real gate, so a punt target is any other gate. The frame is counted either way (D-162).
   uint64 punt_unresolved_gate = 9; /// Where a frame whose hop's neighbor is unresolved goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE to drop it. The frame is counted either way (D-162).
+  FlowHashFields flow_hash = 10; /// Which fields a route that names a next-hop group hashes to pick its member (default: the whole flow, D-163).
 }
 
 /**

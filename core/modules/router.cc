@@ -134,6 +134,10 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   punt_unresolved_gate_ = arg.punt_unresolved_gate() == 0
                               ? DROP_GATE
                               : static_cast<gate_idx_t>(arg.punt_unresolved_gate());
+  // The flow hash's fields (D-163): the proto default is the whole flow, and an
+  // unknown value (an arg from a newer binary) keeps that default too.
+  flow_fields_ = arg.flow_hash() == bess::pb::FLOW_HASH_L3 ? route::FlowHashFields::kL3
+                                                           : route::FlowHashFields::kL3L4;
   route::LpmRouteTable::Config config;
   config.max_routes = arg.max_routes() ? arg.max_routes() : 4096;
   config.tbl8_groups = arg.max_tbl8s() ? arg.max_tbl8s() : 256;
@@ -547,7 +551,8 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
             : route::kDefaultRouteDomainId;
     const route::FrameRoute resolved = route::ResolveFrame(
         *router_, domain,
-        std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), pkt.total_len());
+        std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), pkt.total_len(),
+        flow_fields_);
     if (resolved.verdict != route::ForwardVerdict::kForward) {
       CountVerdict(resolved.verdict);
       // A punt gate is the application's slow path (D-162): a frame the

@@ -11315,3 +11315,29 @@ graph's choice.
 `AMissAndAnUnresolvedNeighborPuntToTheirGates` (a miss leaves on the miss gate, an unresolved neighbor on the
 unresolved gate, a forwarded frame is untouched by the policy, and both counters still move) and
 `AnInvalidPuntGateIsRefused`.
+
+## D-163 A group route's flow hash reads the fields the graph names
+
+**Status:** accepted (2026-10-19; the plan's item 2: "flow-hash field choice: a parameter on the chain plus a
+module arg").
+
+**Decision.** `route::FlowHash` takes a `FlowHashFields`: `kL3L4` (the default) mixes the address pair, the
+ports and the protocol; `kL3` mixes the address pair alone. `ResolveFrame` passes the choice through to it,
+the Router module exposes it as `RouterArg.flow_hash` (`FLOW_HASH_L3_L4`, `FLOW_HASH_L3`), and the router
+appliance keeps the default. An unknown value keeps the default rather than failing `Init`.
+
+**Why.** The chain's own comment said the choice was the deployment's ("Which fields a deployment hashes is
+its own choice (D-066)") but nothing could make it: the hash was one function with one field set. A graph
+whose traffic must not be spread -- one subscriber's flows pinned to one member, or a policy that must not
+read an L4 header -- needs the address-pair-only hash, and it is the graph, not the library, that knows which.
+The choice stays in the library as a parameter rather than a second hash function, so both callers still hash
+the same way for the same frame.
+
+**Consequences.** The default is byte-identical to the previous behaviour (the fields are mixed exactly as
+before): no change to member selection, no wire change beyond the new arg, and the appliance is untouched.
+`FLOW_HASH_L3` pins every flow to one destination to the same member; the trade is deliberate -- fewer
+distinct members used, and a destination's traffic never reordered between them.
+
+**Evidence.** `RouterTest` 25/25 on `build/fast`, including
+`L3OnlyHashingPinsEveryFlowToOneDestinationToOneMember` (64 flows to one destination all take one member
+under `FLOW_HASH_L3`) beside the existing `AGroupRoutePicksOneMemberPerFlow` (the default spreads them).

@@ -48,7 +48,8 @@ BESS has exactly this split: `RouteKey{domain, prefix}` → a next-hop id, and
 next hops to republish and the application calls `Router::SetNextHop`; **routes never move**. An ARP reply is
 one object store, not a route update, so there is no churn and no transient hole. A route to a next-hop group
 is the same shape one level up: the FIB names the group, and the group's member is chosen by the frame's own
-flow hash (`route::FlowHash`), so a flow keeps one member (D-156).
+flow hash (`route::FlowHash`), so a flow keeps one member (D-156); which fields that hash reads is the graph's
+choice -- the whole flow by default, the address pair alone with `FLOW_HASH_L3` (D-163).
 
 A next hop whose egress interface is absent (`kInvalidInterfaceId`; on the module's wire, `egress_gate =
 DROP_GATE`) forwards nowhere: the chain reports `kNoEgress` and the packet ends there. That is the blackhole

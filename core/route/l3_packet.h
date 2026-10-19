@@ -68,16 +68,29 @@ inline TtlResult DecrementHopLimit(std::span<uint8_t> ipv6_header) noexcept {
 
 // The hash a route that names a next-hop group picks its member with: the
 // addresses, the ports and the protocol, mixed. Which fields a deployment
-// hashes is its own choice (D-066); what matters here is that every path
-// resolving the same group hashes the same way, so a flow keeps one member.
-// The Router module and the router appliance call this one function, so a
-// flow cannot land on different members in the two paths. `src`/`dst` are the
-// header's address words as stored (one byte order for all callers), the
-// ports are host order.
+// hashes is its own choice -- `FlowHashFields` below, the module's `flow_hash`
+// arg (D-163); what matters here is that every path resolving the same group
+// hashes the same way, so a flow keeps one member. The Router module and the
+// router appliance call this one function, so a flow cannot land on different
+// members in the two paths. `src`/`dst` are the header's address words as
+// stored (one byte order for all callers), the ports are host order.
+//
+// `kL3L4` is the whole flow: a group spreads one flow's packets over one
+// member. `kL3` is the address pair alone, which pins every flow to one
+// destination to the same member -- what a graph wants when a subscriber's
+// traffic must not be spread, or when the L4 header must not be read.
+enum class FlowHashFields : uint8_t {
+  kL3L4,
+  kL3,
+};
+
 inline uint32_t FlowHash(uint32_t src, uint32_t dst, uint16_t src_port,
-                         uint16_t dst_port, uint8_t protocol) noexcept {
-  uint64_t x = (uint64_t{src} << 32 | dst) ^
-               (uint64_t{src_port} << 24 | uint64_t{dst_port} << 8 | protocol);
+                         uint16_t dst_port, uint8_t protocol,
+                         FlowHashFields fields = FlowHashFields::kL3L4) noexcept {
+  uint64_t x = uint64_t{src} << 32u | dst;
+  if (fields == FlowHashFields::kL3L4) {
+    x ^= (uint64_t{src_port} << 24u | uint64_t{dst_port} << 8u | uint64_t{protocol});
+  }
   x ^= x >> 30;
   x *= 0xbf58476d1ce4e5b9ull;
   x ^= x >> 27;
