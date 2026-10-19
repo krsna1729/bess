@@ -343,6 +343,13 @@ class Resource {
   // a ceiling, not a promise of room (placement can refuse below it).
   virtual std::optional<uint64_t> Capacity() const { return std::nullopt; }
 
+  // The count this resource wants to be told about, or nullopt to be watched
+  // at the daemon's default level (a fraction of the capacity it states,
+  // D-165). A resource that states one is watched at that count even when it
+  // states no capacity: the module knows its own table, and a count needs no
+  // ceiling to be meaningful. Most resources inherit this and state nothing.
+  virtual std::optional<uint64_t> FillLevel() const { return std::nullopt; }
+
  private:
   friend class TransactionEngine;
 

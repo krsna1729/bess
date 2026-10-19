@@ -78,11 +78,14 @@ void MaintenanceLoop::Run() {
         events_->Emit(std::move(e.type), std::move(e.source), std::move(e.fields));
       }
       for (const ResourceFillWatch::Crossing &c : fills_result.crossed) {
-        events_->Emit(kResourceFillEvent, ModuleOf(c.resource),
-                      {{"resource", c.resource},
-                       {"count", std::to_string(c.count)},
-                       {"limit", std::to_string(c.limit)},
-                       {"capacity", std::to_string(c.capacity)}});
+        std::map<std::string, std::string> fields{
+            {"resource", c.resource},
+            {"count", std::to_string(c.count)},
+            {"limit", std::to_string(c.limit)}};
+        if (c.capacity) {
+          fields["capacity"] = std::to_string(*c.capacity);
+        }
+        events_->Emit(kResourceFillEvent, ModuleOf(c.resource), std::move(fields));
       }
     }
     if (sample) {

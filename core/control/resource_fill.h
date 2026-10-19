@@ -59,8 +59,9 @@ namespace bess::control {
 
 // The event a fill crossing is reported as. Its source is the resource's
 // module (the part of the name before the slash), its fields are "resource"
-// (the full name), "count" (what the resource held), "limit" (the count the
-// level is at for this capacity) and "capacity" (what the resource states).
+// (the full name), "count" (what the resource held) and "limit" (the count
+// the level is at), and "capacity" (what the resource states) when it states
+// one -- a resource watched at a level of its own may state none.
 inline constexpr const char *kResourceFillEvent = "bess.resource_fill";
 
 class ResourceFillWatch {
@@ -74,9 +75,9 @@ class ResourceFillWatch {
 
   struct Crossing {
     std::string resource;
-    uint64_t count = 0;     // what the resource held
-    uint64_t limit = 0;     // the count the level is at, for this capacity
-    uint64_t capacity = 0;  // what the resource states
+    uint64_t count = 0;  // what the resource held
+    uint64_t limit = 0;  // the count the level is at
+    std::optional<uint64_t> capacity;  // what the resource states, if anything
   };
   struct Result {
     std::vector<Crossing> crossed;  // fired this sweep, and now remembered
@@ -122,19 +123,30 @@ class ResourceFillWatch {
       }
       result.visited++;
       seen_.insert(name);
+      // The level is the resource's own count when it states one (a module
+      // knows its table), and otherwise a fraction of the capacity it states.
+      // A resource that states neither is not watched: D-149's "not stated"
+      // is the honest answer for a table with no number to give. A stated
+      // level of zero is read as none: it would fire for an empty resource and
+      // never fall below it, so it would sit fired for the daemon's life.
+      const std::optional<uint64_t> stated = resource->FillLevel();
       const std::optional<uint64_t> capacity = resource->Capacity();
-      if (!capacity || *capacity == 0) {
-        fired_.erase(name);
+      uint64_t limit;
+      if (stated && *stated != 0) {
+        limit = *stated;
+      } else if (capacity && *capacity != 0) {
+        limit = LevelOf(*capacity);
+      } else {
+        fired_.erase(name);  // nothing to watch it against
         continue;
       }
-      const uint64_t limit = LevelOf(*capacity);
       const uint64_t count = resource->LiveCount();
       if (count < limit) {
         fired_.erase(name);  // below the level again: it may fire once more
         continue;
       }
       if (fired_.insert(name).second) {
-        result.crossed.push_back({name, count, limit, *capacity});
+        result.crossed.push_back({name, count, limit, capacity});
       }
     }
     // A pass that saw every resource also saw which names are gone (a module

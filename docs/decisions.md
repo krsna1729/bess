@@ -11424,6 +11424,41 @@ the next one completing it, a cut pass forgetting nothing, and `LevelOf`'s arith
 overflow at `UINT64_MAX`). `maintenance_loop_test.cc`: the crossing reaching the log with its type, source and
 fields.
 
+## D-166 A resource states its own fill level, and the daemon's default is a fraction of the capacity
+
+**Status:** accepted (2026-10-19; the plan's item: "the level, tier by tier").
+
+**Decision.** `dataplane::Resource::FillLevel()` -- the shape of D-149's `Capacity()`, an
+`std::optional<uint64_t>` that most resources inherit unstated -- lets a resource state the count it wants to
+be told about (`dataplane/resource.h`). It extends D-165's watch, which reads a fraction of the capacity, and
+makes that watch's `capacity` field conditional. The fill watch resolves one level per resource: the
+resource's own count when it states one, and otherwise the daemon's default, `kLevelPercent` (80%) of the
+capacity it states
+(`control/resource_fill.h`). A resource that states neither is still not watched: D-149's "not stated" is the
+honest answer for a table with no number to give. A stated level needs no ceiling -- the module that owns the
+table knows the count -- and a stated level of zero is read as none, since it would fire for an empty resource
+and never fall below it. The crossing's `capacity` is unstated when the resource states none, and the event
+then carries no "capacity" field, rather than a zero a controller could read as a full table.
+
+**Why.** 80% is a fraction of a capacity, which is the right default for a slot table and meaningless for a
+resource that grows: a tuple space has no ceiling to take 80% of, and the module that owns it is the one that
+knows the count worth telling a controller about. A stated count also survives a capacity that changes with
+the module's configuration, and it is what a controller's own override will be (the next tier of this work, a
+control RPC, which this does not add). The order is the resource's own count, then the daemon's fraction; an
+override sits in front of both when it arrives, so this tier changes no protocol and no wire format -- the
+event keeps its fields and gains none.
+
+**Consequences.** A module that wants a threshold on a table it cannot bound (a tuple space, a queue) can now
+have one, and one that wants a different level on a bounded table can state it without the daemon's 80%
+applying. The cost is one more call per resource in the sweep, on a path that already calls `Capacity()` and
+`LiveCount()`, and a second way for a level to be decided -- which is why the crossing says which count it
+used (`limit`) and whether a capacity was stated at all.
+
+**Evidence.** `resource_fill_test.cc`: a stated level is the count it fires at (12 of a stated capacity of 100,
+which the default's 80 would not fire at, and a rise above it is the same crossing); a stated level above the
+default suppresses it (200 on a capacity of 100 does not fire at 100); a stated level watches a resource that
+states no capacity, and its crossing carries no capacity; and a stated level of zero is read as none.
+
 ## D-168 A module's metadata names are configuration, defaulting to the names a graph already uses
 
 **Status:** accepted (2026-10-19; the plan's item: "configurable metadata names").
