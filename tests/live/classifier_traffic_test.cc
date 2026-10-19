@@ -63,6 +63,20 @@ constexpr char kRandomIpv4Addresses[] =
                    {"offset": 30, "size": 4, "min": 1, "max": 4294967295},
                    {"offset": 38, "size": 2, "min": 26, "max": 26}]})";
 
+// The same, with the destination pinned to 10.0.0.0/15 (0x0a000001 to
+// 0x0a01fffe): the two /16s a route-churn test writes, so the traffic is
+// guaranteed to meet the routes that change under it.
+constexpr char kTwoSubnetIpv4Addresses[] =
+    R"({"fields": [{"offset": 12, "size": 2, "min": 2048, "max": 2048},
+                   {"offset": 14, "size": 1, "min": 69, "max": 69},
+                   {"offset": 16, "size": 2, "min": 46, "max": 46},
+                   {"offset": 20, "size": 2, "min": 0, "max": 0},
+                   {"offset": 22, "size": 1, "min": 64, "max": 64},
+                   {"offset": 23, "size": 1, "min": 17, "max": 17},
+                   {"offset": 26, "size": 4, "min": 1, "max": 4294967295},
+                   {"offset": 30, "size": 4, "min": 167772161, "max": 167903230},
+                   {"offset": 38, "size": 2, "min": 26, "max": 26}]})";
+
 std::string Base64(const Bytes &data) {
   static constexpr char kAlphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -227,7 +241,7 @@ class ClassifierTrafficTest : public LiveTest {
 TEST_F(ClassifierTrafficTest, RouterRoutesChangeWhileForwarding) {
   auto arg = Arg("RouterArg",
                  R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": 512, "max_next_hops": 2})");
-  Apply(Traffic("rt", "Router", arg.get(), {0, 1}, kRandomIpv4Addresses)
+  Apply(Traffic("rt", "Router", arg.get(), {0, 1}, kTwoSubnetIpv4Addresses)
             .Entry("rt/next_hops", *Arg("RouterNextHopIdKey", R"({"id": 1})"),
                    *Arg("RouterNextHopValue",
                         R"({"egress_gate": 0, "neighbor": "ROUTER_NEIGHBOR_STATE_RESOLVED", "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})"))
@@ -238,18 +252,24 @@ TEST_F(ClassifierTrafficTest, RouterRoutesChangeWhileForwarding) {
                    *Arg("RouterRouteValue", R"({"next_hop_id": 1})")));
   auto routes = client().Resource("rt/routes");
   ASSERT_TRUE(routes) << routes.error().message;
+  // Two /16s inside the traffic's range, alternating: one always holds a route
+  // to hop 2 while the other is erased, so a route that changed is live for the
+  // whole run and both gates must carry packets. The sum of the two gates would
+  // pass with the churn doing nothing at all -- the default route covers every
+  // destination on its own.
   const int commands = RunWhileForwarding(milliseconds(2000), [&](int i) {
-    const std::string ipv4 =
-        std::to_string(1 + (i / 2) % 200) + "." + std::to_string((i / 400) % 256) + ".0.0";
-    const std::string key = R"({"ipv4": ")" + ipv4 + R"(", "prefix_length": 16})";
-    if (i % 2 == 0) {
-      Upsert(*routes, key, R"({"next_hop_id": 2})");
-    } else {
-      Erase(*routes, key);
+    const std::string live =
+        R"({"ipv4": "10.)" + std::to_string(i % 2) + R"(.0.0", "prefix_length": 16})";
+    const std::string gone =
+        R"({"ipv4": "10.)" + std::to_string((i + 1) % 2) + R"(.0.0", "prefix_length": 16})";
+    Upsert(*routes, live, R"({"next_hop_id": 2})");
+    if (i > 0) {
+      Erase(*routes, gone);
     }
   });
   EXPECT_GT(commands, 10) << "too few transactions ran";
-  EXPECT_GT(Packets("rt", 0) + Packets("rt", 1), 0);
+  EXPECT_GT(Packets("rt", 0), 0) << "nothing took the default route's gate";
+  EXPECT_GT(Packets("rt", 1), 0) << "nothing took a route that changed while forwarding";
 }
 
 // Rules are added and cleared while a worker forwards traffic (mode G): each
