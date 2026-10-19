@@ -160,6 +160,9 @@ class Router final : public Module {
   bess::framework::ResourceBinding groups_binding_;
   bess::framework::ResourceBinding routes_binding_;
   int next_hop_id_attr_ = -1;
+  // The registered names, for the log lines that name them.
+  std::string next_hop_attr_name_;
+  std::string domain_attr_name_;
   // The route domain a packet arrived in, written by the graph's VIF; domain 0
   // when nothing writes it (D-155).
   int route_domain_attr_ = -1;

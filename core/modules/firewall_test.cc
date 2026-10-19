@@ -139,6 +139,26 @@ TEST(FirewallTest, FirstMatchWinsAndUnmatchedIsDropped) {
   EXPECT_TRUE(Passes(h, fw2, dns));
 }
 
+// The action attribute's name is configuration, so a graph with a second
+// action table over the same rules can give each its own output.
+TEST(FirewallTest, TheActionAttributeIsTheConfiguredName) {
+  ModuleHarness h;
+  bess::pb::FirewallArg policy = Rules({{.drop = false}});
+  policy.set_action_attr("flow_action");
+  Module *fw = h.Create("Firewall", policy, "fw_named");
+  ASSERT_NE(nullptr, fw);
+
+  bool wrote = false;
+  for (const auto &attr : fw->all_attrs()) {
+    if (attr.name == "flow_action") {
+      wrote = true;
+      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kWrite, attr.mode);
+    }
+    EXPECT_NE("action_id", attr.name) << "the default name was not registered";
+  }
+  EXPECT_TRUE(wrote);
+}
+
 TEST(FirewallTest, OnePolicyHoldsBothFamilies) {
   std::mt19937 rng = bess::testing::SeededRng(11);
   const Bytes v4web =
@@ -285,6 +305,25 @@ TEST(FirewallTest, RulesResourceReplacesThePolicy) {
   EXPECT_FALSE(Passes(h, fw, a));
   EXPECT_FALSE(Passes(h, fw, b));
   EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &none}}));
+}
+
+// action_attr registers the read at Init and cannot change at runtime; a
+// rules-only update must not erase it from the desired state the resource
+// reads back.
+TEST(FirewallTest, TheConfiguredActionNameSurvivesARulesUpdate) {
+  ModuleHarness h;
+  bess::pb::FirewallArg initial = Rules({{.src_ip = "10.0.0.0/8"}});
+  initial.set_action_attr("flow_action");
+  Module *fw = h.Create("Firewall", initial, "fw_named_rules");
+  ASSERT_NE(nullptr, fw);
+  const std::string rules = "fw_named_rules/rules";
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &initial}})) << "Init's name";
+
+  bess::pb::FirewallArg updated = Rules({{.src_ip = "10.0.0.0/8", .drop = true}});
+  EXPECT_EQ("", h.SetResource(rules, updated));
+  updated.set_action_attr("flow_action");
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &updated}}))
+      << "the rules changed; the Init-only name did not";
 }
 
 TEST(FirewallTest, APacketThisTableCannotJudgeIsDropped) {

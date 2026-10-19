@@ -346,7 +346,8 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
             });
           }));
 
-  next_hop_id_attr_ = AddMetadataAttr("next_hop_id",
+  next_hop_attr_name_ = arg.next_hop_attr().empty() ? "next_hop_id" : arg.next_hop_attr();
+  next_hop_id_attr_ = AddMetadataAttr(next_hop_attr_name_,
                                       sizeof(bess::utils::be32_t),
                                       bess::metadata::Attribute::AccessMode::kRead);
   if (next_hop_id_attr_ < 0) {
@@ -362,7 +363,8 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // VIF writes. No writer means domain 0, the default domain -- the same
   // attribute name the VIF uses, so a graph gets the packet's own domain with
   // no configuration on either side.
-  route_domain_attr_ = AddMetadataAttr("route_domain",
+  domain_attr_name_ = arg.domain_attr().empty() ? "route_domain" : arg.domain_attr();
+  route_domain_attr_ = AddMetadataAttr(domain_attr_name_,
                                        sizeof(bess::utils::be32_t),
                                        bess::metadata::Attribute::AccessMode::kRead);
   if (route_domain_attr_ < 0) {
@@ -402,15 +404,23 @@ int Router::OnEvent(bess::Event event) {
   if (routes_by_destination()) {
     const bool has_domain =
         bess::metadata::IsValidOffset(attr_offset(route_domain_attr_));
-    LOG(INFO) << "Router '" << name() << "': routing by destination address in "
-              << (has_domain ? "the route domain each packet carries"
-                             : "domain 0 (nothing writes 'route_domain')");
+    if (has_domain) {
+      LOG(INFO) << "Router '" << name()
+                << "': routing by destination address in the route domain read "
+                   "from '"
+                << domain_attr_name_ << "'";
+    } else {
+      LOG(INFO) << "Router '" << name()
+                << "': routing by destination address in domain 0 (nothing "
+                   "writes '"
+                << domain_attr_name_ << "')";
+    }
     return 0;
   }
   if (!bess::metadata::IsValidOffset(attr_offset(next_hop_id_attr_))) {
-    LOG(ERROR) << "Router '" << name()
-               << "': the 'next_hop_id' attribute is unreadable (is an "
-                  "ActionTable writing it?); dropping packets";
+    LOG(ERROR) << "Router '" << name() << "': the '" << next_hop_attr_name_
+               << "' attribute is unreadable (is an ActionTable writing it?); "
+                  "dropping packets";
   }
   return 0;
 }

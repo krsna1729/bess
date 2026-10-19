@@ -100,11 +100,15 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
   }
 
   using AccessMode = bess::metadata::Attribute::AccessMode;
-  action_id_attr_ =
-      AddMetadataAttr("action_id", sizeof(bess::utils::be32_t), AccessMode::kRead);
-  meter_id_attr_ =
-      AddMetadataAttr("meter_id", sizeof(bess::utils::be32_t), AccessMode::kWrite);
-  next_hop_id_attr_ = AddMetadataAttr("next_hop_id",
+  action_attr_name_ = arg.action_attr().empty() ? "action_id" : arg.action_attr();
+  metering_attr_name_ = arg.meter_attr().empty() ? "meter_id" : arg.meter_attr();
+  next_hop_attr_name_ =
+      arg.next_hop_attr().empty() ? "next_hop_id" : arg.next_hop_attr();
+  action_id_attr_ = AddMetadataAttr(action_attr_name_, sizeof(bess::utils::be32_t),
+                                    AccessMode::kRead);
+  meter_id_attr_ = AddMetadataAttr(metering_attr_name_, sizeof(bess::utils::be32_t),
+                                   AccessMode::kWrite);
+  next_hop_id_attr_ = AddMetadataAttr(next_hop_attr_name_,
                                       sizeof(bess::utils::be32_t),
                                       AccessMode::kWrite);
   if (action_id_attr_ < 0 || meter_id_attr_ < 0 || next_hop_id_attr_ < 0) {
@@ -113,7 +117,11 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
         std::span<const std::string>(&name, 1)));
     binding_.Reset();
     resource_.reset();
-    return CommandFailure(EINVAL, "add_metadata_attr() failed");
+    return CommandFailure(EINVAL,
+                          "add_metadata_attr() failed for '%s', '%s' or '%s'",
+                          action_attr_name_.c_str(),
+                          metering_attr_name_.c_str(),
+                          next_hop_attr_name_.c_str());
   }
   return CommandSuccess();
 }
@@ -143,10 +151,10 @@ int ActionTable::OnEvent(bess::Event event) {
   if (!bess::metadata::IsValidOffset(attr_offset(action_id_attr_)) ||
       !bess::metadata::IsValidOffset(attr_offset(meter_id_attr_)) ||
       !bess::metadata::IsValidOffset(attr_offset(next_hop_id_attr_))) {
-    LOG(ERROR) << "ActionTable '" << name()
-               << "': 'action_id', 'meter_id' or 'next_hop_id' is unreadable "
-                  "(is an ExactMatch writing the action id, and are a Meter "
-                  "and a Router downstream?); dropping packets";
+    LOG(ERROR) << "ActionTable '" << name() << "': '" << action_attr_name_
+               << "', '" << metering_attr_name_ << "' or '" << next_hop_attr_name_
+               << "' is unreadable (is something writing the action id, and are "
+                  "a Meter and a Router downstream?); dropping packets";
   }
   return 0;
 }

@@ -35,6 +35,8 @@ class Firewall final : public Module {
   CommandResponse Init(const bess::pb::FirewallArg &arg);
   void DeInit() override;
 
+  int OnEvent(bess::Event event) override;
+
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
  private:
@@ -80,6 +82,13 @@ class Firewall final : public Module {
   // passes, 0 when its rule names no action, so an ActionTable downstream
   // selects the action and a stale id cannot leak into a later lookup.
   int action_id_attr_ = -1;
+  // The registered output name, for the log line that names it.
+  std::string action_attr_name_;
+  // Whether action_attr was configured, so the default name (a firewall with
+  // nothing downstream) is quiet and a configured name with no reader is
+  // reported. Kept at Init: arg_ is the resource's value and is replaced by a
+  // rules update.
+  bool action_attr_configured_ = false;
 };
 
 #endif  // BESS_MODULES_FIREWALL_H_

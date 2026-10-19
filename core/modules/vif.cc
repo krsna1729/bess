@@ -12,6 +12,7 @@
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_codec.h"
 #include "utils/format.h"
+#include "utils/logging.h"
 
 namespace {
 
@@ -173,11 +174,20 @@ const Vif::Interface *Vif::LookupByIp(uint16_t vlan,
 CommandResponse Vif::Init(const bess::pb::VifArg &arg) {
   using AccessMode = bess::metadata::Attribute::AccessMode;
 
-  vif_id_attr_ = AddMetadataAttr("vif_id", sizeof(be32_t), AccessMode::kWrite);
+  vif_id_attr_configured_ = !arg.vif_id_attr().empty();
+  domain_attr_configured_ = !arg.route_domain_attr().empty();
+  vif_id_attr_name_ = arg.vif_id_attr().empty() ? "vif_id" : arg.vif_id_attr();
+  domain_attr_name_ =
+      arg.route_domain_attr().empty() ? "route_domain" : arg.route_domain_attr();
+  vif_id_attr_ =
+      AddMetadataAttr(vif_id_attr_name_, sizeof(be32_t), AccessMode::kWrite);
   route_domain_attr_ =
-      AddMetadataAttr("route_domain", sizeof(be32_t), AccessMode::kWrite);
+      AddMetadataAttr(domain_attr_name_, sizeof(be32_t), AccessMode::kWrite);
   if (vif_id_attr_ < 0 || route_domain_attr_ < 0) {
-    return CommandFailure(EINVAL, "add_metadata_attr() failed");
+    return CommandFailure(EINVAL,
+                          "add_metadata_attr() failed for '%s' or '%s'",
+                          vif_id_attr_name_.c_str(),
+                          domain_attr_name_.c_str());
   }
 
   default_gate_ = static_cast<gate_idx_t>(arg.default_gate());
@@ -313,11 +323,38 @@ CommandResponse Vif::Add(const bess::pb::VifCommandAddArg &arg) {
   return CommandSuccess();
 }
 
+int Vif::OnEvent(bess::Event event) {
+  if (event != bess::Event::PreResume) {
+    return -ENOTSUP;
+  }
+  // Metadata offsets are assigned just before this. A Vif in a graph that
+  // consumes neither name is valid and quiet; a configured name promises a
+  // reader, and its absence is a misconfiguration.
+  const auto report = [this](bool configured, const std::string &attr,
+                             const char *what) {
+    if (configured) {
+      LOG(WARNING) << "Vif '" << name() << "': nothing reads '" << attr
+                   << "'; packets carry no " << what;
+    } else {
+      VLOG(1) << "Vif '" << name() << "': nothing reads '" << attr << "'";
+    }
+  };
+  if (!bess::metadata::IsValidOffset(attr_offset(vif_id_attr_))) {
+    report(vif_id_attr_configured_, vif_id_attr_name_, "vif id");
+  }
+  if (!bess::metadata::IsValidOffset(attr_offset(route_domain_attr_))) {
+    report(domain_attr_configured_, domain_attr_name_, "route domain");
+  }
+  return 0;
+}
+
 void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const auto vif_offset = attr_offset(vif_id_attr_);
   const auto domain_offset = attr_offset(route_domain_attr_);
-  const bool write_metadata = bess::metadata::IsValidOffset(vif_offset) &&
-                              bess::metadata::IsValidOffset(domain_offset);
+  // Each write has its own offset: a name nothing reads skips only that
+  // write, never the other one (a PacketStore downstream keys on the vif id).
+  const bool write_vif = bess::metadata::IsValidOffset(vif_offset);
+  const bool write_domain = bess::metadata::IsValidOffset(domain_offset);
 
   for (bess::PacketRef pkt : batch->packets()) {
     char *head = pkt.head_data<char *>();
@@ -363,8 +400,10 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
           arp->target_ip_addr = arp->sender_ip_addr;
           arp->sender_ip_addr = iface->ip_addr;
 
-          if (write_metadata) {
+          if (write_vif) {
             _set_attr_with_offset<be32_t>(vif_offset, pkt, be32_t(iface->id));
+          }
+          if (write_domain) {
             _set_attr_with_offset<be32_t>(domain_offset, pkt,
                                           be32_t(iface->route_domain));
           }
@@ -377,8 +416,10 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // Lookup destination VIF by (vlan, dmac)
     const Interface *iface = Lookup(vlan, eth->dst_addr);
     if (iface != nullptr) {
-      if (write_metadata) {
+      if (write_vif) {
         _set_attr_with_offset<be32_t>(vif_offset, pkt, be32_t(iface->id));
+      }
+      if (write_domain) {
         _set_attr_with_offset<be32_t>(domain_offset, pkt,
                                       be32_t(iface->route_domain));
       }
