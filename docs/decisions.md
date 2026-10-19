@@ -11423,3 +11423,47 @@ and comes back firing again, a capacity that grows or is withdrawn re-arming it,
 the next one completing it, a cut pass forgetting nothing, and `LevelOf`'s arithmetic (the ceil identity, no
 overflow at `UINT64_MAX`). `maintenance_loop_test.cc`: the crossing reaching the log with its type, source and
 fields.
+
+## D-168 A module's metadata names are configuration, defaulting to the names a graph already uses
+
+**Status:** accepted (2026-10-19; the plan's item: "configurable metadata names").
+
+**Decision.** The modules that carry policy identity -- `Meter`, `ActionTable`, `Router`, `Firewall` and
+`Vif` -- register the metadata attribute names their arguments give them, defaulting to the names they had:
+`MeterArg.id_attr`, `ActionTableArg.meter_attr`, `next_hop_attr` and `action_attr`, `RouterArg.next_hop_attr`
+and `domain_attr`, `FirewallArg.action_attr`, `VifArg.vif_id_attr` and `route_domain_attr`. An unset or empty
+name is the default, so every existing graph and argument is unchanged. The names are still declared in `Init`
+and resolved at `PreResume`; only the string became configuration.
+
+Both halves of a pair are configurable: `ActionTable` reads `action_attr` and writes `meter_attr`, so a
+`Firewall` configured to write some other action-id name has a reader that can be configured to match. A name
+that nothing reads gets no offset, and each module names the unread attribute once at `PreResume` with the
+name it registered; the input readers drop on it (`Meter`, `Router` next-hop mode), `ActionTable` drops when
+any of its three attributes is unreadable, and the writers (`Firewall`, `Vif`) skip the write. A writer
+reports a *configured* name with no reader at `WARNING`, and its default name at `VLOG(1)`: a firewall
+nothing follows and a Vif nothing consumes are valid graphs, not misconfigurations.
+
+**Why.** The packet-policy pipeline carried one identity per stage, hardcoded: a classifier wrote
+`action_id`, an `ActionTable` wrote `meter_id` and `next_hop_id`, and `Meter` and `Router` read those. That is
+schema-level coupling, not a function call: a graph could not run two meters -- a flow maximum and a session
+aggregate -- over one classifier result, because both meters read the same attribute and one action table
+could write only one. The metadata scope is already the graph's coupling mechanism, and
+`Timestamp`/`Measure` already take an attribute name as an argument; this applies the same convention to the
+modules that decide policy. A module still knows nothing about its upstream: it registers a name, and the
+graph decides who writes it.
+
+**Consequences.** A graph can compose two meters, and two action tables over one action id, with no new module
+and no change to the classifier or to `ActionTable`'s transactional resource. The cost is nine strings in five
+argument messages, and that two modules which must agree (an action table's `meter_attr` and a meter's
+`id_attr`) can be configured to disagree; because the name is the whole contract, the mismatch shows up as an
+unread attribute named at `PreResume`, not as a silent default. `Vif` guards its two writes independently:
+an unread route domain no longer suppresses the VIF id that a `PacketStore` keys on.
+
+**Evidence.** `session_pipeline_test.cc`: `ConfiguredAttributeNamesAreTheOnesRegistered` -- a `Meter` with
+`id_attr = "flow_meter_id"` and an `ActionTable` with `meter_attr = "flow_meter_id"` register exactly those
+names and do not register `meter_id` -- and `ConfiguredNamesResolveToOneOffset`, which runs a packet through
+`ExactMatch` -> `ActionTable` -> `Meter` -> `Router` with the configured names, observes it at the router's
+egress, and asserts the meter's read and the table's write resolved to one offset. `firewall_test.cc`:
+`TheActionAttributeIsTheConfiguredName`; `vif_test.cc`: `TheMetadataNamesAreConfiguration`; `router_test.cc`:
+`TheSelectorAttributesAreConfiguration` -- both selector names, and neither default. The existing tests of
+all five modules run unconfigured and cover the defaults.

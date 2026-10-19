@@ -345,4 +345,31 @@ TEST(VifResourceTest, InitInterfacesAreTheResource) {
   EXPECT_EQ("", h.ReadBackDiffers(interfaces, {{&init_key, &init_value}}));
 }
 
+// The metadata names a VIF writes are configuration, so a graph can give its
+// VIF and its router matching names without an adapter between them.
+TEST_F(VifTest, TheMetadataNamesAreConfiguration) {
+  VifArg arg;
+  arg.set_vif_id_attr("port_id");
+  arg.set_route_domain_attr("vrf");
+  Vif *vif = CreateVif(arg);
+  ASSERT_NE(nullptr, vif);
+
+  bool wrote_id = false;
+  bool wrote_domain = false;
+  for (const auto &attr : vif->all_attrs()) {
+    if (attr.name == "port_id") {
+      wrote_id = true;
+      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kWrite, attr.mode);
+    }
+    if (attr.name == "vrf") {
+      wrote_domain = true;
+      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kWrite, attr.mode);
+    }
+    EXPECT_NE("vif_id", attr.name) << "the default name was not registered";
+    EXPECT_NE("route_domain", attr.name) << "the default name was not registered";
+  }
+  EXPECT_TRUE(wrote_id);
+  EXPECT_TRUE(wrote_domain);
+}
+
 }  // namespace

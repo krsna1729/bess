@@ -113,6 +113,8 @@ class Meter final : public Module {
   bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
 
   int meter_id_attr_ = -1;
+  // The attribute's registered name, for the one log line that names it.
+  std::string id_attr_name_;
 };
 
 #endif  // BESS_MODULES_METER_H_

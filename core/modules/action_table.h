@@ -85,6 +85,10 @@ class ActionTable final : public Module {
   int action_id_attr_ = -1;
   int meter_id_attr_ = -1;
   int next_hop_id_attr_ = -1;
+  // The registered names, for the log lines that name them.
+  std::string action_attr_name_;
+  std::string metering_attr_name_;
+  std::string next_hop_attr_name_;
 };
 
 #endif  // BESS_MODULES_ACTION_TABLE_H_

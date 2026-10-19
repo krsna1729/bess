@@ -46,6 +46,8 @@ class Vif final : public Module {
   CommandResponse Init(const bess::pb::VifArg &arg);
   void DeInit() override;
 
+  int OnEvent(bess::Event event) override;
+
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
   std::string GetDesc() const override;
 
@@ -97,6 +99,13 @@ class Vif final : public Module {
   gate_idx_t default_gate_ = DROP_GATE;
   int vif_id_attr_ = -1;
   int route_domain_attr_ = -1;
+  // The registered names, for the log lines that name them.
+  std::string vif_id_attr_name_;
+  std::string domain_attr_name_;
+  // Whether each name was configured, so a default (a graph that consumes
+  // neither) is quiet and a configured name with no reader is reported.
+  bool vif_id_attr_configured_ = false;
+  bool domain_attr_configured_ = false;
 
   std::unique_ptr<bess::dataplane::Resource> resource_;
   bess::framework::ResourceBinding binding_;  // after resource_ (D-044)

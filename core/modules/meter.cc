@@ -257,7 +257,10 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
 
-  meter_id_attr_ = AddMetadataAttr("meter_id", sizeof(bess::utils::be32_t),
+  // A graph with two meters -- a flow maximum and a session aggregate from one
+  // classifier result -- sets the name so each reads its own identity.
+  id_attr_name_ = arg.id_attr().empty() ? "meter_id" : arg.id_attr();
+  meter_id_attr_ = AddMetadataAttr(id_attr_name_, sizeof(bess::utils::be32_t),
                                    bess::metadata::Attribute::AccessMode::kRead);
   if (meter_id_attr_ < 0) {
     const std::string name = resource_->name();
@@ -293,9 +296,9 @@ int Meter::OnEvent(bess::Event event) {
   // valid offset means the packet path will drop everything, which is worth
   // saying once, here, rather than never.
   if (!bess::metadata::IsValidOffset(attr_offset(meter_id_attr_))) {
-    LOG(ERROR) << "Meter '" << name()
-               << "': the 'meter_id' attribute is unreadable (is an "
-                  "ActionTable writing it?); dropping packets";
+    LOG(ERROR) << "Meter '" << name() << "': the '" << id_attr_name_
+               << "' attribute is unreadable (is an ActionTable writing it?); "
+                  "dropping packets";
   }
   return 0;
 }

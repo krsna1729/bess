@@ -15,6 +15,7 @@
 
 #include "utils/ether.h"
 #include "utils/ip.h"
+#include "utils/logging.h"
 #include "utils/tcp.h"
 #include "utils/udp.h"
 
@@ -194,12 +195,37 @@ void Firewall::Install(std::unique_ptr<const Published> published) {
   init_context().rcu().ReclaimReady();
 }
 
+int Firewall::OnEvent(bess::Event event) {
+  if (event != bess::Event::PreResume) {
+    return -ENOTSUP;
+  }
+  // Metadata offsets are assigned just before this. A write attribute has an
+  // offset only when something reads it. A firewall nothing follows is a valid
+  // pure filter, so the default name is quiet; a configured name promises a
+  // reader, and its absence is a misconfiguration.
+  if (!bess::metadata::IsValidOffset(attr_offset(action_id_attr_))) {
+    if (!action_attr_configured_) {
+      VLOG(1) << "Firewall '" << name() << "': nothing reads '"
+              << action_attr_name_ << "'";
+    } else {
+      LOG(WARNING) << "Firewall '" << name() << "': nothing reads '"
+                   << action_attr_name_
+                   << "' (an ActionTable with the same action_attr downstream "
+                      "would); packets carry no action id";
+    }
+  }
+  return 0;
+}
+
 CommandResponse Firewall::Init(const bess::pb::FirewallArg &arg) {
   // D-141: the action a matching rule names goes to the packet's "action_id"
   // metadata, which an ActionTable downstream reads. The attribute has an
   // offset only when something reads it; without a reader there is nothing to
-  // write and no action to resolve.
-  action_id_attr_ = AddMetadataAttr("action_id", sizeof(bess::utils::be32_t),
+  // write and no action to resolve. A graph with two action tables sets the
+  // name so each reads its own.
+  action_attr_configured_ = !arg.action_attr().empty();
+  action_attr_name_ = arg.action_attr().empty() ? "action_id" : arg.action_attr();
+  action_id_attr_ = AddMetadataAttr(action_attr_name_, sizeof(bess::utils::be32_t),
                                     bess::metadata::Attribute::AccessMode::kWrite);
   if (action_id_attr_ < 0) {
     return CommandFailure(-action_id_attr_, "add_metadata_attr() failed");
@@ -245,6 +271,11 @@ CommandResponse Firewall::Init(const bess::pb::FirewallArg &arg) {
       // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
       [this](Staged &s, bess::dataplane::Retirer &retirer) {
         retirer.Retire(rules_.Exchange(std::move(s.published)));
+        // The resource carries the policy; action_attr registers the read at
+        // Init and cannot change at runtime. Keeping the configured name in
+        // the read-back stops a rules-only set from erasing it from the
+        // desired state.
+        s.arg.set_action_attr(arg_.action_attr());
         arg_.Swap(&s.arg);
       },
       bess::dataplane::Resource::Footprint{.retires = 1},

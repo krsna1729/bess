@@ -92,28 +92,60 @@ ExactMatch *CreateExactMatch(const std::string &name,
   return static_cast<ExactMatch *>(Create("ExactMatch", name, Pack(arg)));
 }
 
-Router *CreateRouterModule(const std::string &name) {
+Router *CreateRouterModule(const std::string &name,
+                           const std::string &next_hop_attr = "") {
   bess::pb::RouterArg arg;
   arg.set_max_routes(64);
   arg.set_max_tbl8s(16);
   arg.set_max_next_hops(64);
+  if (!next_hop_attr.empty()) {
+    arg.set_next_hop_attr(next_hop_attr);
+  }
   return static_cast<Router *>(Create("Router", name, Pack(arg)));
 }
 
-Meter *CreateMeterModule(const std::string &name, uint64_t capacity) {
+Meter *CreateMeterModule(const std::string &name, uint64_t capacity,
+                         const std::string &id_attr = "") {
   bess::pb::MeterArg arg;
   arg.set_capacity(capacity);
+  if (!id_attr.empty()) {
+    arg.set_id_attr(id_attr);
+  }
   return static_cast<Meter *>(Create("Meter", name, Pack(arg)));
 }
 
 ActionTable *CreateActionTable(const std::string &name, const std::string &meters,
-                               const std::string &next_hops,
-                               uint64_t capacity = 64) {
+                               const std::string &next_hops, uint64_t capacity = 64,
+                               const std::string &meter_attr = "",
+                               const std::string &next_hop_attr = "",
+                               const std::string &action_attr = "") {
   bess::pb::ActionTableArg arg;
   arg.set_capacity(capacity);
   arg.set_meters(meters);
   arg.set_next_hops(next_hops);
+  if (!meter_attr.empty()) {
+    arg.set_meter_attr(meter_attr);
+  }
+  if (!next_hop_attr.empty()) {
+    arg.set_next_hop_attr(next_hop_attr);
+  }
+  if (!action_attr.empty()) {
+    arg.set_action_attr(action_attr);
+  }
   return static_cast<ActionTable *>(Create("ActionTable", name, Pack(arg)));
+}
+
+// The index of `name` in the module's registered attributes, so a test names
+// the attribute it means rather than a position Init happens to assign.
+size_t AttrIndex(const Module *m, const std::string &name) {
+  const auto &attrs = m->all_attrs();
+  for (size_t i = 0; i < attrs.size(); i++) {
+    if (attrs[i].name == name) {
+      return i;
+    }
+  }
+  ADD_FAILURE() << "'" << name << "' is not registered by " << m->name();
+  return 0;
 }
 
 std::string Key(uint32_t a, uint16_t b) {
@@ -292,6 +324,42 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
     EXPECT_EQ(hops[0]->egress, bess::dataplane::InterfaceId(7));
     EXPECT_EQ(hops[0]->neighbor, bess::route::NeighborState::kResolved);
   }
+}
+
+// A module registers the metadata name it was configured with: that name is
+// what the graph resolves an offset for, so it is the whole contract between a
+// writer and a reader. Two meters over one classifier result -- a flow maximum
+// and a session aggregate -- work because each reads its own name, and neither
+// module knows the other exists.
+TEST_F(SessionPipelineTest, ConfiguredAttributeNamesAreTheOnesRegistered) {
+  ActionTable *actions = CreateActionTable("flow_actions", "flow/meters",
+                                           "rt/next_hops", 64, "flow_meter_id");
+  Meter *flow = CreateMeterModule("flow", 64, "flow_meter_id");
+  Router *rt = CreateRouterModule("rt");
+  ASSERT_NE(nullptr, actions);
+  ASSERT_NE(nullptr, flow);
+  ASSERT_NE(nullptr, rt);
+
+  const auto &meter_attrs = flow->all_attrs();
+  ASSERT_EQ(1u, meter_attrs.size());
+  EXPECT_EQ("flow_meter_id", meter_attrs[0].name);
+  EXPECT_EQ(bess::metadata::Attribute::AccessMode::kRead, meter_attrs[0].mode);
+
+  bool wrote_meter = false;
+  bool read_action = false;
+  for (const auto &attr : actions->all_attrs()) {
+    if (attr.name == "flow_meter_id") {
+      wrote_meter = true;
+      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kWrite, attr.mode);
+    }
+    if (attr.name == "action_id") {
+      read_action = true;
+      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kRead, attr.mode);
+    }
+    EXPECT_NE("meter_id", attr.name) << "the default name was not registered";
+  }
+  EXPECT_TRUE(wrote_meter);
+  EXPECT_TRUE(read_action);
 }
 
 // A transaction that would leave a dangling reference, or a value that names
@@ -1350,6 +1418,110 @@ TEST_F(SessionPacketPathTest, DeclaredTablesMatchTheBoundCodecs) {
     EXPECT_FALSE(codec->requires_paused_workers()) << t.resource;
   }
   EXPECT_EQ(3u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size());
+}
+
+// The configured names are the contract, not the registration: the graph
+// resolves one offset for a writer's name and its reader's, and the packet
+// path is the proof. SessionPacketPathTest runs the defaults.
+TEST_F(SessionPipelineTest, ConfiguredNamesResolveToOneOffset) {
+  ActionTable *at = CreateActionTable("at_cfg", "mt_cfg/meters",
+                                      "rt_cfg/next_hops", 64, "flow_meter_id");
+  ExactMatch *em = CreateExactMatch("em_cfg", "at_cfg/actions");
+  Meter *mt = CreateMeterModule("mt_cfg", 64, "flow_meter_id");
+  Router *rt = CreateRouterModule("rt_cfg");
+  ASSERT_NE(nullptr, at);
+  ASSERT_NE(nullptr, em);
+  ASSERT_NE(nullptr, mt);
+  ASSERT_NE(nullptr, rt);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 0, at, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(at, 0, mt, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(mt, Meter::kGreenGate, rt, 0, true));
+
+  auto r = Apply({
+      Op::Upsert("mt_cfg/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(100)})),
+      rt->router()->SetNextHopOp(
+          NextHopId(1),
+          HopWithEgress(bess::modules::router::InterfaceOf(kEgressGate).value())),
+      rt->router()->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
+      Op::Upsert("at_cfg/actions", bess::dataplane::EncodeKey(ActionId(1)),
+                 std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
+      Op::Upsert("em_cfg/rules", WireKey("10.1.2.3", 1234),
+                 std::any(bess::MakeGateResult(0, 1))),
+  });
+  ASSERT_EQ(Outcome::kApplied, r.outcome)
+      << (r.ops.empty() ? "" : r.ops[0].error);
+
+  // The packet traverses every module: the rule's action id is read by the
+  // table under "action_id" (its default), the table writes the meter id under
+  // the configured name, the meter reads that name, and the router forwards.
+  // Two packets against a 100-byte burst: the first is green, the second red.
+  // Had the meter not read the id the table wrote, it would read 0
+  // ("unmetered") and pass both; the single egress frame is the proof.
+  std::random_device rd;
+  std::mt19937 rng{rd()};
+  const auto pkt1 = SessionPacket("10.1.2.3", 1234, rng);
+  const auto pkt2 = SessionPacket("10.1.2.3", 1234, rng);
+  bess::testing::ModuleHarness h;
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{pkt1}),
+            h.RunPipeline(em, 0, {pkt1, pkt2}, rt, {kEgressGate})[kEgressGate]);
+
+  // The meter's read and the table's write resolved to one offset: the
+  // names, not the strings that registered them, are the contract.
+  EXPECT_EQ(mt->attr_offset(AttrIndex(mt, "flow_meter_id")),
+            at->attr_offset(AttrIndex(at, "flow_meter_id")));
+}
+
+// A custom action name needs a writer and a reader configured to match, and
+// each output needs its reader: SetMetadata writes "policy_id", the table
+// reads it and writes "flow_meter_id" and "hop_id", and the meter and the
+// router read those. Defaults are covered by SessionPacketPathTest.
+TEST_F(SessionPipelineTest, ConfiguredActionAndNextHopNamesPairWithTheirReaders) {
+  bess::pb::SetMetadataArg md_arg;
+  auto *writes_policy = md_arg.add_attrs();
+  writes_policy->set_name("policy_id");
+  writes_policy->set_size(4);
+  writes_policy->set_value_bin(std::string("\x00\x00\x00\x01", 4));
+  Module *md = Create("SetMetadata", "md_cfg", Pack(md_arg));
+  ActionTable *at = CreateActionTable("at_names", "mt_names/meters",
+                                      "rt_names/next_hops", 64,
+                                      "flow_meter_id", "hop_id", "policy_id");
+  Meter *mt = CreateMeterModule("mt_names", 64, "flow_meter_id");
+  Router *rt = CreateRouterModule("rt_names", "hop_id");
+  ASSERT_NE(nullptr, md);
+  ASSERT_NE(nullptr, at);
+  ASSERT_NE(nullptr, mt);
+  ASSERT_NE(nullptr, rt);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(md, 0, at, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(at, 0, mt, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(mt, Meter::kGreenGate, rt, 0, true));
+
+  auto r = Apply({
+      Op::Upsert("mt_names/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(1000)})),
+      rt->router()->SetNextHopOp(
+          NextHopId(1),
+          HopWithEgress(bess::modules::router::InterfaceOf(kEgressGate).value())),
+      Op::Upsert("at_names/actions", bess::dataplane::EncodeKey(ActionId(1)),
+                 std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
+  });
+  ASSERT_EQ(Outcome::kApplied, r.outcome)
+      << (r.ops.empty() ? "" : r.ops[0].error);
+
+  std::random_device rd;
+  std::mt19937 rng{rd()};
+  const auto pkt = SessionPacket("10.1.2.3", 1234, rng);
+  bess::testing::ModuleHarness h;
+  EXPECT_EQ((std::vector<bess::testing::Bytes>{pkt}),
+            h.RunPipeline(md, 0, {pkt}, rt, {kEgressGate})[kEgressGate]);
+
+  // Each configured name paired with the writer's or the reader's.
+  EXPECT_EQ(md->attr_offset(AttrIndex(md, "policy_id")),
+            at->attr_offset(AttrIndex(at, "policy_id")));
+  EXPECT_EQ(mt->attr_offset(AttrIndex(mt, "flow_meter_id")),
+            at->attr_offset(AttrIndex(at, "flow_meter_id")));
+  EXPECT_EQ(rt->attr_offset(AttrIndex(rt, "hop_id")),
+            at->attr_offset(AttrIndex(at, "hop_id")));
 }
 
 }  // namespace

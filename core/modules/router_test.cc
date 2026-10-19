@@ -430,6 +430,37 @@ TEST_F(RouterTest, DestinationRoutingForwardsOnTheFibsGateAndDecrementsTtl) {
       << "and so is everything after the checksum";
 }
 
+// The selector attributes' names are configuration: a router reads the
+// next-hop id and the route domain from the names a graph gives it, so a
+// classifier that writes its own names needs no adapter module.
+TEST_F(RouterTest, TheSelectorAttributesAreConfiguration) {
+  bess::pb::RouterArg arg;
+  arg.set_max_routes(64);
+  arg.set_max_tbl8s(16);
+  arg.set_max_next_hops(64);
+  arg.set_next_hop_attr("nh_id");
+  arg.set_domain_attr("vrf");
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt_named"));
+  ASSERT_NE(nullptr, rt);
+
+  bool read_next_hop = false;
+  bool read_domain = false;
+  for (const auto &attr : rt->all_attrs()) {
+    if (attr.name == "nh_id") {
+      read_next_hop = true;
+      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kRead, attr.mode);
+    }
+    if (attr.name == "vrf") {
+      read_domain = true;
+      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kRead, attr.mode);
+    }
+    EXPECT_NE("next_hop_id", attr.name) << "the default name was not registered";
+    EXPECT_NE("route_domain", attr.name) << "the default name was not registered";
+  }
+  EXPECT_TRUE(read_next_hop);
+  EXPECT_TRUE(read_domain);
+}
+
 // The mode decides, not the wiring: a module configured to route by
 // destination ignores a `next_hop_id` another module writes.
 TEST_F(RouterTest, TheMetadataIdIsIgnoredInDestinationMode) {

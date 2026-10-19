@@ -600,6 +600,12 @@ Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ r
   action_id_attr_ = AddMetadataAttr("action_id", sizeof(bess::utils::be32_t),
                                    bess::metadata::Attribute::AccessMode::kWrite);
   ```
+- When the name is a policy identity (what a meter reads, what an action table writes), make it configuration and keep the historical name as the default (D-168). The name is the whole contract between a writer and a reader: two `Meter`s over one classifier result read `flow_meter_id` and `session_meter_id`, and neither module knows the other exists.
+  ```cpp
+  const std::string id_attr = arg.id_attr().empty() ? "meter_id" : arg.id_attr();
+  meter_id_attr_ = AddMetadataAttr(id_attr, sizeof(bess::utils::be32_t),
+                                   bess::metadata::Attribute::AccessMode::kRead);
+  ```
 - Physical offsets are resolved at pipeline resume (`PreResume`):
   ```cpp
   int MyModule::OnEvent(bess::Event event) {

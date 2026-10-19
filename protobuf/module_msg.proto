@@ -426,6 +426,7 @@ message FirewallArg {
     optional uint32 action_id = 9; /// The ActionId a matching packet carries, 0 for none. The packet path writes it into the packet's "action_id" metadata attribute, so an ActionTable downstream selects the action this rule names (D-141). A rule that drops cannot name one.
   }
   repeated Rule rules = 1; /// The policy, in order.
+  string action_attr = 2; /// The metadata attribute a matching rule's action id is written to (default "action_id"). The reader must be configured to match -- an ActionTable with the same action_attr; with no reader the packets carry no action id (PreResume reports it once).
 }
 
 /**
@@ -1314,6 +1315,7 @@ message WorkerSplitArg {
  */
 message MeterArg {
   uint64 capacity = 1; /// Most meters this module's table holds (default 1024).
+  string id_attr = 2; /// The metadata attribute the meter id is read from (default "meter_id"). A graph with two meters -- a flow maximum and a session aggregate -- sets it so each reads its own identity.
 }
 
 /**
@@ -1329,6 +1331,9 @@ message ActionTableArg {
   uint64 capacity = 1; /// Most actions this module's table holds (default 1024).
   string meters = 2; /// Resource name of the Meter module's meters.
   string next_hops = 3; /// Resource name of the Router module's next hops.
+  string meter_attr = 4; /// The metadata attribute the action's meter id is written to (default "meter_id"). Two action tables over one action id write different meter identities this way. The name must be read downstream: with no reader the action table drops every packet (PreResume reports it once).
+  string next_hop_attr = 5; /// The metadata attribute the action's next-hop id is written to (default "next_hop_id"). As with meter_attr, a name no Router reads disables the action table.
+  string action_attr = 6; /// The metadata attribute the action id is read from (default "action_id"). A writer configured elsewhere -- a Firewall whose action_attr names another attribute -- sets this to match.
 }
 
 /**
@@ -1365,6 +1370,8 @@ message RouterArg {
   uint64 punt_miss_gate = 8; /// Where a frame the FIB has no route for goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. Gate 0 is a real gate, so a punt target is any other gate. The frame is counted either way (D-162).
   uint64 punt_unresolved_gate = 9; /// Where a frame whose hop's neighbor is unresolved goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE to drop it. The frame is counted either way (D-162).
   FlowHashFields flow_hash = 10; /// Which fields a route that names a next-hop group hashes to pick its member (default: the whole flow, D-163).
+  string next_hop_attr = 11; /// The metadata attribute next-hop mode reads the next-hop id from (default "next_hop_id").
+  string domain_attr = 12; /// The metadata attribute destination mode reads the route domain from (default "route_domain").
 }
 
 /**
@@ -1388,6 +1395,8 @@ message VifArg {
   }
   repeated Interface interfaces = 1;
   uint32 default_gate = 2;     /// Gate for unclassified traffic (default: DROP_GATE)
+  string vif_id_attr = 3;      /// The metadata attribute the VIF id is written to (default "vif_id")
+  string route_domain_attr = 4; /// The metadata attribute the route domain is written to (default "route_domain")
 }
 
 message VifCommandAddArg {
