@@ -3,7 +3,7 @@ module github.com/krsna1729/bess/sdk/go
 go 1.27.2
 
 require (
-	google.golang.org/grpc v1.83.1
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
 )
 
