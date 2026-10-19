@@ -11150,3 +11150,67 @@ erase in a missing domain is still "not found", and that the default domain gain
 domain-carrying destination ones, are unchanged. `RouteDomainTest.UnknownDomainFailsClosed` pins the direct
 API's unchanged behavior, and `RoutesInTwoDomainsInOneTransaction`'s domain-7 case -- the engine path, where
 the error became `kInvalidId` -- pins that the refusal stands.
+
+## D-159 What the eventing plan dropped: no framework sweep, no watch RPC, no built-in fill watch
+
+**Status:** accepted (2026-10-19; the plan's own follow-up: "confirm in the record that the framework sweep and
+the `ArmCounterWatches` RPC + SDK `WatchCounters` helper are dropped").
+
+**Context.** The G1.4 plan listed three pieces beside the counters themselves: a framework-side sweep over
+"counter sources" (`core/framework/counter_sources.{h,cc}`), an `ArmCounterWatches` RPC with an SDK
+`WatchCounters` helper, and a built-in fill-level watch for every resource. The user's design (D-150) replaced
+the first two before they landed: the framework owns the *clock* (`framework/module_tick.h`: a `TickEndpoint`
+with a period, a time slice the callback checks and overrun counting) and the module owns the *work*, so arming
+is the module's own action and the sweep is the module's own tick calling `framework::ThresholdTable` (D-151).
+The event path (`stats/crossing_notifier.h`, D-152) and the per-worker planes (`stats/keyed_counters.h`,
+D-154) landed on the same principle.
+
+**Decision.** The three items are dropped as framework features; the surface that replaces them is what
+`docs/plugin-api.md` documents (`ticks()`, `ThresholdTable`, the counter accessors):
+
+- **No framework sweep.** `counter_sources.{h,cc}` was drafted and never landed -- it is nowhere in the tree. A
+  framework-side registry would have had to call back into the module to read a key anyway, and the module
+  already knows which keys are armed and how to read them: `TickEndpoint` plus `ThresholdTable::Sweep` is the
+  same job with one owner instead of two.
+- **No watch RPC, no SDK helper.** Arming is the module's own `InvokeAction`, so a controller arms through the
+  module's command surface: no `control_v2.proto` field, no SDK regeneration, no daemon-side watch registry. A
+  generic `WatchCounters` would have had to know a module-specific limit shape.
+- **No built-in fill watch.** A resource's fill is a module-side fact (`LiveCount()`, a table's `size()`), and a
+  module watches its own fill in its own tick with the same `ThresholdTable` (D-151's record names fill checks
+  among the jobs). A framework-level watch over every resource would be a second mechanism for one reading.
+
+**Consequences.** These pieces are opt-in library surface: their consumers today are their tests
+(`framework/threshold_table_test.cc`, `stats/stats_test.cc`, `stats/event_hub_test.cc`) and the benchmark that
+measures the three paths (`core/stats/counter_paths_bench.cc`); no in-tree module uses them yet, and the first
+consumer will be a module that owns counters, which is the plan's own next step. A controller that wants a
+watch arms it through the owning module's action, and a module's tick is where a fill watch lives.
+
+## D-160 A hop that forwards nowhere is a blackhole route, and the module counts it
+
+**Status:** accepted (2026-10-19; the plan's item 6: "reserve a null/blackhole route value, so `0.0.0.0/0` →
+drop (OMEC's default) can be expressed per domain").
+
+**Decision.** A next hop whose `egress` is `kInvalidInterfaceId` forwards nowhere: the chain reports
+`kNoEgress` for a frame that reaches it, and the route that chose it is the blackhole shape -- a default route
+that drops, or a local `/32` for the node's own address. The library names the shape
+(`route::BlackholeNextHop()`), the module's wire can already express it (`egress_gate = DROP_GATE`, the one
+accepted value outside `[0, MAX_GATES)`; `router_gate_map.h`), and the module counts what the chain drops for
+it as `blackholed_frames`, beside `no_route_frames`.
+
+**Why.** The shape was expressible but invisible: a frame a route dropped at a hop with no interface moved no
+counter, so an operator could not see a blackhole route's traffic at all. It is also not a miss -- the route
+exists and chose that hop -- and the two want different answers (a blackhole is intentional; a miss is a gap
+in the FIB), so they are counted apart and `GetDesc` reports both. A hop with a valid egress and an unresolved
+neighbor stays `unresolved`: what drops a frame here is the absence of an interface, not the absence of an
+address.
+
+**Consequences.** A domain can now hold a default route that drops: `0.0.0.0/0` to a hop written with
+`egress_gate = DROP_GATE`. Nothing else moved -- the packet path is the same `Resolve` it was, the wire format
+is unchanged, `NextHop` is the same 16 bytes (`BlackholeNextHop()` is a factory for the existing shape), and
+`kNoEgress` is now counted where it was previously silent.
+
+**Evidence.** `RouterTest` 22/22 on `build/fast`, including the new
+`ARouteToAHopThatForwardsNowhereIsABlackhole`: a `0.0.0.0/0` route to a `DROP_GATE` hop drops the frame,
+`blackholed_frames()` is 1, `no_route_frames()` and `unresolved_frames()` stay 0, and `GetDesc` says
+"blackholed: 1". The chain itself has no separate unit test; the module's destination tests exercise it, and
+this case is the first to reach a hop that names no egress interface.

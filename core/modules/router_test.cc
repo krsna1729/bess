@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "gate.h"
 #include "module.h"
 #include "module_graph.h"
 #include "modules/router.h"
@@ -478,6 +479,25 @@ TEST_F(RouterTest, AMissAndAnUnresolvedNeighborAreDroppedAndCounted) {
   EXPECT_TRUE(miss[1].empty());
   EXPECT_EQ(1u, rt->no_route_frames());
   EXPECT_NE(std::string::npos, rt->GetDesc().find("no route: 1")) << rt->GetDesc();
+}
+
+// D-160: a hop whose egress gate is DROP_GATE names no interface, and a route
+// to it is the domain's blackhole -- `0.0.0.0/0` to such a hop is a default
+// that drops. The frame is dropped and counted apart from a miss, because the
+// route exists and chose that hop.
+TEST_F(RouterTest, ARouteToAHopThatForwardsNowhereIsABlackhole) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, DROP_GATE, nullptr, nullptr);
+  MakeRoute(rt, "0.0.0.0", 0, 0, 1);
+
+  auto out = RunToDestination(rt, FrameTo("10.1.2.3"));
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_TRUE(out[1].empty());
+  EXPECT_EQ(1u, rt->blackholed_frames());
+  EXPECT_EQ(0u, rt->no_route_frames()) << "the route exists: this is not a miss";
+  EXPECT_EQ(0u, rt->unresolved_frames()) << "a hop that forwards nowhere resolves nothing";
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("blackholed: 1")) << rt->GetDesc();
 }
 
 // TTL 0 and 1 expire (nothing is forwarded); 2 leaves as 1 -- the boundary
