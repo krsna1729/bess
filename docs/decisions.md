@@ -11093,3 +11093,60 @@ proves `route/forward.h` self-contained), builds `examples/standalone_plugin`, `
 that install, and runs `static_router`'s own checks -- 172.16.1.1 forwarded with gateway A's MACs and TTL
 64 -> 63, VRF 2 routed apart, a miss and a TTL expiry dropped with the frame unchanged -- which now execute the
 same two calls the module executes.
+
+## D-158 A route domain exists from the first route written into it
+
+**Status:** accepted (2026-10-19; the plan's item: "Lazy domain FIB creation: `max_domains` stays a bound, not
+an allocation -- the UPF's 4 domains become free").
+
+**Context.** D-046 made domains structural: `CreateDomain`/`RemoveDomain` return `kEnrolled` once the router is
+in the transaction engine, and the module created domains `0..max_domains-1` at `Init()`, before enrolling. The
+reason for the freeze is the engine's route resource, which holds raw FIB pointers and iterates the domain
+list: a *removal* while a transaction holds one of those pointers is unsafe. Creation was frozen with it, and
+that costs: every configured domain allocates its FIB (`max_routes` rules, `tbl8_groups`), so a module
+configured for the UPF's four network instances pays for four FIBs whether or not a route ever lands in one --
+the reason `veth-port.yaml` warns that "a `max_domains` in the tens fails to build on this box".
+
+**Decision.** A domain's FIB is created when it is first needed; `max_domains` is a bound on the ids, not an
+allocation:
+
+- **The route resource creates the domain it first writes into.** `RouteResource::Reserve`, for an upsert whose
+  domain does not exist yet and whose id is within `max_domains`, creates it and then places the prefix. The
+  domain is sized like the default one -- the config `Router::Create` was given, remembered as
+  `domain_config_` -- because a per-domain config is a direct caller's business (`CreateDomain`) and a
+  controller writing a route cannot state one. `CreateDomainLocked` is `CreateDomain`'s body without the
+  engine guard; the resource calls it under `mutex_`, inside the engine's own lock.
+- **An erase never creates**: an erase in a missing domain is "not found", as before.
+- **A domain beyond `max_domains` is refused** (`kInvalidId`, the id out of range -- it was reported as
+  `kUnknownDomain`), and nothing is created.
+- **The direct API is unchanged.** `SetRoute`/`RemoveRoute`/`ReplaceRouteSetAtomic` still want `CreateDomain`
+  first (`kUnknownDomain`), and `CreateDomain`/`RemoveDomain` still return `kEnrolled` after enrollment: D-023's
+  rule is that an enrolled router is written only through the engine, and the resource *is* that path, so
+  creation stays available there while the direct setters keep refusing.
+- **The module no longer pre-creates.** `Init()` enrolls an empty router; a domain appears when the first route
+  for it arrives, and a creation that fails (the FIB cannot be allocated) surfaces as a refused transaction
+  rather than a failed `Init`.
+- **This amends D-046's "Domains are structural"** in one direction: creation is safe at any time -- a
+  published slot is whole for every reader (one acquire load), and the resource runs under the engine's lock,
+  which also serializes the ledger's `VisitReferences` walk -- while removal stays frozen after enrollment.
+  D-046's `max_domains` sentence ("creates domains `0..n-1` at `Init()`") no longer describes the module.
+- **The two locks nest in both orders, and one lock above them is what makes that safe.** A transaction holds
+  the engine's lock and then takes the router's (`ApplyImpl` -> `RouteResource::Reserve`); enrollment, release
+  and the group-reference walk take the router's and then the engine's. They cannot interleave: every path that
+  takes either pair runs under the control plane's mutex (`ApplyTransaction`/`ApplyPipeline` for transactions,
+  `CreateModule`/`DestroyModule` for Init/DeInit), and only one thread holds it. TSan's lock-order detector
+  works on the observed lock-order graph and cannot see that outer lock, so the cycle it reports at `Reserve`
+  is suppressed in `tools/sanitizers/tsan.supp`, where the two edges are written down.
+
+**Consequences.** A router configured for many network instances allocates a FIB only for the instances that
+hold routes, which is what makes per-instance domains free for the UPF. A domain created by a transaction that
+then aborts stays, empty: the one visible residue, and cheaper than an allocation that never had a route.
+
+**Evidence.** `RouterTransactionTest` 34/34 (both backends; the new
+`ATransactionCreatesTheDomainItFirstWritesInto` pins that a domain the transaction first writes into appears
+with that route and its own FIB, that a write beyond `max_domains` is refused with no domain created, that an
+erase in a missing domain is still "not found", and that the default domain gains nothing) and `RouterTest`
+21/21 on `build/fast` -- the module's `Init` now enrolls an empty router and its 21 cases, including the
+domain-carrying destination ones, are unchanged. `RouteDomainTest.UnknownDomainFailsClosed` pins the direct
+API's unchanged behavior, and `RoutesInTwoDomainsInOneTransaction`'s domain-7 case -- the engine path, where
+the error became `kInvalidId` -- pins that the refusal stands.

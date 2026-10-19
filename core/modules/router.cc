@@ -156,18 +156,11 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                           route::RouteErrorName(router.error()));
   }
   router_ = std::move(*router);
-  // Domains are structural: all exist before the router is enrolled.
-  for (size_t d = 1; d < max_domains; d++) {
-    if (auto created =
-            router_->CreateDomain(route::RouteDomainId(static_cast<uint32_t>(d)),
-                                  config);
-        !created) {
-      const route::RouteError error = created.error();
-      router_.reset();
-      return CommandFailure(route::RouteErrno(error), "router: domain %zu: %s",
-                            d, route::RouteErrorName(error));
-    }
-  }
+  // Domains are not allocated here (D-158): a domain a controller first writes
+  // a route into is created by that write, so `max_domains` bounds the ids
+  // while a router configured for many network instances pays only for the ones
+  // that hold routes. A failure to create one surfaces at the route write, as a
+  // refused transaction.
   if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
     next_hops_binding_.Reset();
@@ -288,8 +281,9 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
             if (!prefix) {
               return std::unexpected(route::RouteErrorName(prefix.error()));
             }
-            // Absent means the default domain, as before domains existed; a
-            // domain the router does not have is refused when the key is used.
+            // Absent means the default domain, as before domains existed. A
+            // domain the router does not have is created by an upsert's key use
+            // (D-158); an erase in a missing domain stays "not found".
             if (key.domain() >= route::kMaxRouteDomains) {
               return std::unexpected("invalid route domain " +
                                      std::to_string(key.domain()));

@@ -43,17 +43,19 @@ std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     return std::unexpected(routes.error());
   }
   return std::unique_ptr<Router>(new Router(
-      std::move(name), std::move(*routes), max_next_hops, max_domains,
+      name, config, std::move(*routes), max_next_hops, max_domains,
       max_groups, domain));
 }
 
-Router::Router(std::string name, std::unique_ptr<LpmRouteTable> default_routes,
+Router::Router(const std::string &name, const Config &config,
+               std::unique_ptr<LpmRouteTable> default_routes,
                size_t max_next_hops, size_t max_domains, size_t max_groups,
                rcu::RcuDomain &rcu)
     : name_(name),
       rcu_(rcu),
       max_domains_(max_domains),
       max_next_hops_(static_cast<uint32_t>(max_next_hops)),
+      domain_config_(config),
       domains_(max_domains),
       default_routes_(default_routes.get()),
       domain_ids_{kDefaultRouteDomainId},
@@ -179,7 +181,22 @@ class Router::RouteResource final : public dataplane::Resource {
       return std::unexpected("wrong value type (want NextHopId or NextHopGroupId)");
     }
     if (table == nullptr) {
-      return std::unexpected(RouteErrorName(RouteError::kUnknownDomain));
+      // A domain a controller writes a route into exists from that write on
+      // (D-158): `max_domains` is a bound, not an allocation, so a router
+      // configured for many network instances pays for the ones that hold
+      // routes. Erases never create -- an erase in a missing domain is "not
+      // found" above -- and this runs under the engine's lock, so a reader
+      // (TableOf, one acquire load) sees the domain whole or not at all.
+      std::lock_guard<std::mutex> lock(router_.mutex_);
+      if (auto created =
+              router_.CreateDomainLocked(id->domain, router_.domain_config_);
+          !created) {
+        return std::unexpected(RouteErrorName(created.error()));
+      }
+      table = router_.TableOf(id->domain);
+      if (table == nullptr) {  // just created, within the bound: unreachable
+        return std::unexpected(RouteErrorName(RouteError::kUnknownDomain));
+      }
     }
     // Everything that can throw first; placing the prefix is the last step.
     auto upsert = std::make_unique<UpsertOp>(*table, prefix, value);
@@ -498,6 +515,11 @@ std::expected<void, RouteError> Router::CreateDomain(RouteDomainId domain,
   if (engine_ != nullptr) {
     return std::unexpected(RouteError::kEnrolled);
   }
+  return CreateDomainLocked(domain, config);
+}
+
+std::expected<void, RouteError> Router::CreateDomainLocked(
+    RouteDomainId domain, const Config &config) {
   const DomainSlot slot = SlotOf(domain);
   if (!domains_.ValidId(slot)) {
     return std::unexpected(RouteError::kInvalidId);
@@ -797,7 +819,8 @@ std::expected<void, RouteError> Router::ReplaceRouteSetAtomic(
   return {};
 }
 
-// Callers hold mutex_, or the router is enrolled (domains frozen), or have
+// Callers hold mutex_, or the transaction engine's lock for an enrolled router
+// (the one writer that can still create a domain holds both, D-158), or have
 // exclusive access (Enroll's check).
 size_t Router::CountRoutes() const {
   size_t count = 0;

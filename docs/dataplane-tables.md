@@ -299,7 +299,10 @@ refused. An unset port bound is 65535, not 0, because the proto field is
   index (default 1); domains live in a `SlotTable` indexed by `RouteDomainId`,
   so `Resolve(domain, ip)` / `ResolveBatch(domain, ips, hops)` are lock-free,
   need no `Module`, metadata or gates, and miss on an unknown domain.
-  `CreateDomain`/`RemoveDomain` are safe while readers run.
+  `CreateDomain`/`RemoveDomain` are safe while readers run; a domain is created
+  when it is first needed -- explicitly, or by the first route a transaction
+  writes into it (D-158) -- so `max_domains` bounds the ids without allocating
+  every FIB.
   `SetRoute`/`RemoveRoute` are the live in-place update;
   `ReplaceRouteSetAtomic(domain, routes)` builds a replacement FIB beside the
   live one, validates next hops and rte_lpm capacity before publishing, and
