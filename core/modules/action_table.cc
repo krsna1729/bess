@@ -34,6 +34,11 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
   meters_resource_ = arg.meters();
   next_hops_resource_ = arg.next_hops();
 
+  const size_t levels = arg.levels() == 0 ? 1 : arg.levels();
+  if (levels > kMaxLevels) {
+    return CommandFailure(EINVAL, "levels must be 1-%zu", kMaxLevels);
+  }
+
   if (arg.capacity() > std::numeric_limits<ActionId::rep_type>::max()) {
     return CommandFailure(EINVAL, "action capacity exceeds valid action ids");
   }
@@ -45,9 +50,11 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
       name() + "/actions", *actions_,
       [this](const Action &action) {
         std::vector<dataplane::Reference> refs;
-        if (action.meter.value() != 0) {
-          refs.push_back(
-              {meters_resource_, dataplane::EncodeKey(action.meter)});
+        for (size_t i = 0; i < action.levels; i++) {
+          if (action.meters[i].value() != 0) {
+            refs.push_back(
+                {meters_resource_, dataplane::EncodeKey(action.meters[i])});
+          }
         }
         if (action.next_hop.value() != 0) {
           refs.push_back(
@@ -68,11 +75,34 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
             }
             return dataplane::EncodeKey(ActionId(key.id()));
           },
-          [](const bess::pb::ActionValue &value)
+          [levels](const bess::pb::ActionValue &value)
               -> std::expected<std::any, std::string> {
-            return std::any(
-                Action{bess::meter::MeterId(value.meter_id()),
-                       bess::route::NextHopId(value.next_hop_id())});
+            Action action{};
+            if (value.meter_ids_size() > 0) {
+              // The list is the level count: it must match this table's, or
+              // the attribute the Meter reads would disagree with the one
+              // written here.
+              if (static_cast<size_t>(value.meter_ids_size()) != levels) {
+                return std::unexpected(
+                    "meter_ids has " + std::to_string(value.meter_ids_size()) +
+                    " ids, this table has " + std::to_string(levels) +
+                    " levels");
+              }
+              for (int i = 0; i < value.meter_ids_size(); i++) {
+                action.meters[i] =
+                    bess::meter::MeterId(value.meter_ids(i));
+              }
+              action.levels = value.meter_ids_size();
+            } else {
+              // The single-id form names level 0 and leaves the other slots
+              // at "no meter". The action still writes every slot this
+              // table's level count covers: a Meter expecting more levels
+              // must not read a neighbour slot this action never wrote.
+              action.meters[0] = bess::meter::MeterId(value.meter_id());
+              action.levels = levels;
+            }
+            action.next_hop = bess::route::NextHopId(value.next_hop_id());
+            return std::any(action);
           },
           // Every live action, as its value names it (an erased one is gone
           // at once, though it stays readable until its removal stage).
@@ -86,7 +116,14 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
               bess::pb::ActionIdKey key;
               key.set_id(id.value());
               bess::pb::ActionValue value;
-              value.set_meter_id(action->meter.value());
+              value.set_meter_id(action->meters[0].value());
+              // Only a multi-level action names the list: a one-level action
+              // reads back exactly as it was written.
+              if (action->levels > 1) {
+                for (size_t l = 0; l < action->levels; l++) {
+                  value.add_meter_ids(action->meters[l].value());
+                }
+              }
               value.set_next_hop_id(action->next_hop.value());
               visit(key, value);
             }
@@ -106,8 +143,11 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
       arg.next_hop_attr().empty() ? "next_hop_id" : arg.next_hop_attr();
   action_id_attr_ = AddMetadataAttr(action_attr_name_, sizeof(bess::utils::be32_t),
                                     AccessMode::kRead);
-  meter_id_attr_ = AddMetadataAttr(metering_attr_name_, sizeof(bess::utils::be32_t),
-                                   AccessMode::kWrite);
+  // One attribute, 4 bytes per level: every level's id is written together,
+  // so the Meter downstream reads a packet's levels in one place.
+  meter_id_attr_ = AddMetadataAttr(
+      metering_attr_name_, levels * sizeof(bess::utils::be32_t),
+      AccessMode::kWrite);
   next_hop_id_attr_ = AddMetadataAttr(next_hop_attr_name_,
                                       sizeof(bess::utils::be32_t),
                                       AccessMode::kWrite);
@@ -187,9 +227,16 @@ void ActionTable::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       continue;
     }
     _set_attr_with_offset<bess::utils::be32_t>(
-        meter_offset, pkt, bess::utils::be32_t(action->meter.value()));
-    _set_attr_with_offset<bess::utils::be32_t>(
         hop_offset, pkt, bess::utils::be32_t(action->next_hop.value()));
+    // Every level's id together: the Meter reads the slots in order.
+    for (size_t l = 0; l < action->levels; l++) {
+      const bess::metadata::mt_offset_t slot =
+          static_cast<bess::metadata::mt_offset_t>(
+              meter_offset + static_cast<int>(l) *
+                                 static_cast<int>(sizeof(bess::utils::be32_t)));
+      _set_attr_with_offset<bess::utils::be32_t>(
+          slot, pkt, bess::utils::be32_t(action->meters[l].value()));
+    }
     if (out_cnt != i) {
       batch->handles()[out_cnt] = batch->handles()[i];
     }

@@ -251,6 +251,11 @@ message ActionIdKey {
 message ActionValue {
   uint32 meter_id = 1;
   uint32 next_hop_id = 2;
+  // The action's meter per level, in policing order (flow first, the session's
+  // aggregate last). When non-empty it replaces `meter_id`: the action writes
+  // all of them into one `meter_id` attribute sized 4 * len. 0 is "no meter at
+  // this level", which the Meter passes.
+  repeated uint32 meter_ids = 3;
 }
 
 message MeterIdKey {
@@ -1316,6 +1321,11 @@ message WorkerSplitArg {
 message MeterArg {
   uint64 capacity = 1; /// Most meters this module's table holds (default 1024).
   string id_attr = 2; /// The metadata attribute the meter id is read from (default "meter_id"). A graph with two meters -- a flow maximum and a session aggregate -- sets it so each reads its own identity.
+  // How many meter ids one packet carries, in policing order: the attribute
+  // named by `id_attr` is declared 4 * levels bytes wide, and the module checks
+  // each non-zero slot in turn (green and yellow continue, red stops). Default
+  // 1, the historical one-meter packet.
+  uint32 levels = 3;
 }
 
 /**
@@ -1334,6 +1344,10 @@ message ActionTableArg {
   string meter_attr = 4; /// The metadata attribute the action's meter id is written to (default "meter_id"). Two action tables over one action id write different meter identities this way. The name must be read downstream: with no reader the action table drops every packet (PreResume reports it once).
   string next_hop_attr = 5; /// The metadata attribute the action's next-hop id is written to (default "next_hop_id"). As with meter_attr, a name no Router reads disables the action table.
   string action_attr = 6; /// The metadata attribute the action id is read from (default "action_id"). A writer configured elsewhere -- a Firewall whose action_attr names another attribute -- sets this to match.
+  // How many meter ids one action carries (default 1). The `meter_attr`
+  // attribute is declared 4 * levels bytes wide, so the Meter downstream must
+  // declare the same count; the framework refuses a size mismatch.
+  uint32 levels = 7;
 }
 
 /**

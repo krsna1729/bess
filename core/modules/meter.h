@@ -112,6 +112,10 @@ class Meter final : public Module {
   std::unique_ptr<bess::dataplane::Resource> resource_;
   bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
 
+  // How many meter ids one packet carries (the `meter_id` attribute is
+  // 4 * levels_ bytes wide). 1 is the module's historical behaviour.
+  size_t levels_ = 1;
+
   int meter_id_attr_ = -1;
   // The attribute's registered name, for the one log line that names it.
   std::string id_attr_name_;
