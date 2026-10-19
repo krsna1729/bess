@@ -18,6 +18,7 @@ import itertools
 import threading
 import time
 import uuid
+from typing import NamedTuple
 
 import grpc
 
@@ -32,6 +33,35 @@ _BUSY_CODES = (v2.ErrorDetail.RESOURCE_BUSY,)
 _CONFLICT_CODES = (v2.ErrorDetail.CONFLICT, v2.ErrorDetail.EPOCH_MISMATCH)
 
 _ids = itertools.count(1)
+
+# The event type every counter crossing is reported as, by both producers: a
+# module's tick sweeping the totals it keeps, and a worker's own count on the
+# packet path (D-150 to D-152).
+COUNTER_THRESHOLD = "bess.counter_threshold"
+
+# The `worker` of a crossing a module's tick reported: it read every worker's
+# plane, so no single one crossed.
+NO_WORKER = -1
+
+
+class CounterCrossing(NamedTuple):
+    """One counter reaching a limit a controller armed.
+
+    Who reports it decides what `value` means. A module's tick reads every
+    worker's plane, so its `value` is the key's total and `worker` is
+    `NO_WORKER`. A worker reports its own plane: `worker` names it and `value`
+    is that worker's share, which can be below the total the controller armed
+    on -- a hint to read the total, not the answer.
+    """
+
+    source: str
+    key: int
+    value: int
+    limit: int
+    worker: int
+    sequence: int
+    time_ns: int
+
 
 # The daemon attaches a failed call's typed ErrorDetail as this binary trailer
 # (core/control/api_v2.cc:486); grpc-python's RpcError.details() is the status
@@ -549,3 +579,103 @@ class Client:
             if rpc_error.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
                 return
             raise _translate(rpc_error) from rpc_error
+
+    def watch_counters(self, module, timeout=None, from_sequence=0, daemon_epoch=0):
+        """Yields the counter crossings `module` reports, as `CounterCrossing`s.
+
+        `watch_events` narrowed to `COUNTER_THRESHOLD` and to one source, with
+        the event's text fields parsed into numbers. Arming is the module's own
+        business: a module that watches counters keeps its quota set as one of
+        its resources, so a controller arms it by setting that resource in a
+        transaction -- `tx.set(client.resource("<name>/quotas"), quotas)` for a
+        module that keeps them as a singleton -- and reads it back the same way.
+        Discovery names it: `client.resources()` lists what the module has.
+        `timeout` is how a watch ends, exactly as for `watch_events`.
+
+        Three things end the watch besides the deadline, each by raising,
+        because a controller that misses a crossing has missed a quota:
+
+        * a crossing whose fields do not parse (`ValueError`): the event type
+          is a name any producer may register, so a silent skip could hide the
+          watched module's own shape changing;
+        * a gap in the log (`errors.GapError`): events the daemon no longer
+          holds, which may include one of this module's crossings;
+        * a restart (`errors.DaemonRestartedError`): everything built from
+          earlier events is void.
+
+        After either of the last two, re-read the counters and watch again. The
+        daemon's other control events never reach this helper: the request's
+        type filter drops them. A worker's ring refusing an event is reported
+        as "bess.events_lost", which names the worker rather than a module, so
+        a worker-ring loss can drop this module's own crossings without this
+        watch saying so -- a controller that must not miss one watches
+        `watch_events` directly instead. The watch starts live unless
+        `from_sequence` says otherwise.
+        """
+        for event in self.watch_events(
+            types=[COUNTER_THRESHOLD],
+            timeout=timeout,
+            from_sequence=from_sequence,
+            daemon_epoch=daemon_epoch,
+        ):
+            if event.type == "bess.gap":
+                raise errors.GapError(
+                    f"bess: the event log dropped events {event.gap_from} to "
+                    f"{event.gap_to}, so a crossing of {module!r} may be "
+                    f"missing: re-read its counters",
+                    module=module,
+                    gap_from=event.gap_from,
+                    gap_to=event.gap_to,
+                )
+            if event.type == "bess.restart":
+                raise errors.DaemonRestartedError(
+                    f"bess: the daemon restarted (epoch {event.daemon_epoch}), "
+                    f"so a watch of {module!r} must start again"
+                )
+            if event.type != COUNTER_THRESHOLD or event.source != module:
+                continue
+            yield _crossing(event)
+
+
+def _crossing(event):
+    """The `CounterCrossing` an event carries, or `ValueError` if it cannot."""
+
+    def field(name, limit):
+        text = event.fields.get(name)
+        if text is None:
+            raise ValueError(
+                f"bess: crossing from {event.source!r} has no {name!r} field "
+                f"(fields: {dict(event.fields)})"
+            )
+        # Go's strconv.ParseUint rule and range, so both SDKs accept and reject
+        # the same events: ASCII digits only, no sign, no whitespace, no
+        # underscores, and inside the field's width. int() alone would take
+        # "1_000", " 7 " and "-5" into a uint64, and would take a magnitude Go
+        # refuses.
+        if not text.isascii() or not text.isdigit():
+            raise ValueError(
+                f"bess: crossing from {event.source!r} has {name} {text!r}, "
+                f"which is not a number"
+            )
+        value = int(text)
+        if value > limit:
+            raise ValueError(
+                f"bess: crossing from {event.source!r} has {name} {text!r}, "
+                f"which is above {limit}"
+            )
+        return value
+
+    worker = NO_WORKER
+    if "worker" in event.fields:
+        # Go's CounterCrossing.Worker is an int, so the same bound applies
+        # there: a value above it is refused rather than narrowed.
+        worker = field("worker", 2**31 - 1)
+    return CounterCrossing(
+        source=event.source,
+        key=field("key", 2**64 - 1),
+        value=field("value", 2**64 - 1),
+        limit=field("limit", 2**64 - 1),
+        worker=worker,
+        sequence=event.sequence,
+        time_ns=event.time_ns,
+    )

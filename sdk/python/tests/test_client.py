@@ -12,7 +12,14 @@ import unittest
 import grpc
 
 from bess import errors
-from bess.client import Applied, Client, RetryPolicy, _translate
+from bess.client import (
+    COUNTER_THRESHOLD,
+    NO_WORKER,
+    Applied,
+    Client,
+    RetryPolicy,
+    _translate,
+)
 from bess.controlv2 import control_v2_pb2 as v2
 from bess.pipeline import PipelineBuilder, PipelineVersion, Resource
 
@@ -463,6 +470,101 @@ class ScriptedTest(unittest.TestCase):
         with self.assertRaises(errors.RejectedError) as caught:
             tx.commit()
         self.assertEqual([0], [f.index for f in caught.exception.failures])
+
+
+    def test_watch_counters_delivers_one_modules_crossings_typed(self):
+        """Only the named module's, with the text fields parsed into numbers."""
+        client, transport = self.make_client([[
+            counter_event("other", 1, key="1", value="2", limit="3"),
+            counter_event("usage", 2, key="7", value="100", limit="100"),
+            counter_event("usage", 3, key="9", value="50", limit="50", worker="3"),
+        ]])
+        seen = list(client.watch_counters("usage"))
+        self.assertEqual(2, len(seen), "another module's crossing was delivered")
+        self.assertEqual(("usage", 7, 100, 100, NO_WORKER, 2, 20), tuple(seen[0]))
+        self.assertEqual(3, seen[1].worker, "a worker's own plane reported it")
+        self.assertEqual([COUNTER_THRESHOLD], list(transport.requests[-1].types))
+
+    def test_watch_counters_raises_on_a_crossing_it_cannot_parse(self):
+        """A producer that omits a field is reported, not skipped silently."""
+        client, _ = self.make_client([[counter_event("usage", 2, key="7", limit="100")]])
+        with self.assertRaises(ValueError) as caught:
+            list(client.watch_counters("usage"))
+        self.assertIn("value", str(caught.exception))
+
+    def test_watch_counters_raises_on_a_value_that_is_not_a_number(self):
+        """int() takes "1_000", " 7 " and "-5" into a uint64; Go's ParseUint does
+        not, so the two SDKs must reject the same events."""
+        client, _ = self.make_client([[
+            counter_event("usage", 2, key="7", value="1_000", limit="100"),
+        ]])
+        with self.assertRaises(ValueError) as caught:
+            list(client.watch_counters("usage"))
+        self.assertIn("1_000", str(caught.exception))
+
+    def test_watch_counters_raises_on_a_worker_above_what_an_int_holds(self):
+        """Go's Worker is an int, so a worker that does not fit one is refused
+        rather than narrowed (CodeQL found the narrowing in the Go parse)."""
+        client, _ = self.make_client([[
+            counter_event("usage", 2, key="7", value="100", limit="100", worker="4294967295"),
+        ]])
+        with self.assertRaises(ValueError) as caught:
+            list(client.watch_counters("usage"))
+        self.assertIn("4294967295", str(caught.exception))
+
+    def test_watch_counters_draws_its_bounds_where_go_does(self):
+        """The worker bound is an int's, the key/value/limit bound is 64 bits,
+        and the check is strict, so the largest accepted worker passes."""
+        client, _ = self.make_client([[
+            counter_event("usage", 2, key="7", value="100", limit="100",
+                          worker="2147483647"),
+        ]])
+        self.assertEqual([2**31 - 1], [c.worker for c in client.watch_counters("usage")])
+
+        for field, value in (
+            ("worker", "2147483648"),
+            ("key", "18446744073709551616"),
+            ("value", "18446744073709551616"),
+            ("limit", "18446744073709551616"),
+        ):
+            fields = {"key": "7", "value": "100", "limit": "100", field: value}
+            client, _ = self.make_client([[counter_event("usage", 2, **fields)]])
+            with self.assertRaises(ValueError) as caught:
+                list(client.watch_counters("usage"))
+            self.assertIn(value, str(caught.exception), field)
+
+    def test_watch_counters_raises_on_a_gap_in_the_log(self):
+        """A gap may have held one of the module's crossings: say so, don't hide it."""
+        client, _ = self.make_client([[
+            counter_event("usage", 2, key="7", value="100", limit="100"),
+            v2.Event(type="bess.gap", gap_from=3, gap_to=9, daemon_epoch=1),
+        ]])
+        seen = []
+        with self.assertRaises(errors.GapError) as caught:
+            for crossing in client.watch_counters("usage"):
+                seen.append(crossing)
+        self.assertEqual(1, len(seen), "the crossings before the gap are delivered")
+        self.assertEqual("usage", caught.exception.module)
+        self.assertEqual((3, 9), (caught.exception.gap_from, caught.exception.gap_to))
+
+    def test_watch_counters_raises_on_a_restart(self):
+        """watch_events yields the restart raw; the helper must not pass it over."""
+        client, _ = self.make_client([[v2.Event(type="bess.restart", daemon_epoch=2)]])
+        with self.assertRaises(errors.DaemonRestartedError):
+            list(client.watch_counters("usage"))
+
+
+def counter_event(source, sequence, **fields):
+    """The event both producers emit: key, value and limit always, worker when
+    a worker's own plane crossed (D-151, D-152)."""
+    return v2.Event(
+        sequence=sequence,
+        type=COUNTER_THRESHOLD,
+        source=source,
+        daemon_epoch=1,
+        time_ns=sequence * 10,
+        fields=fields,
+    )
 
 
 if __name__ == "__main__":

@@ -50,6 +50,18 @@ to the `Client` that made it, which must outlive it. The Go SDK is the one for
 external controllers such as the UPF; the C++ SDK is the one the C++ bessctl
 (G1.7, pending) is to be built on (D-104).
 
+**Counter watches.** A module that watches its own counters keeps the limits as
+one of its resources (the sample plugin's usage report keeps `<name>/quotas`),
+so arming one is a transaction like any other, and the crossings come back on
+the event stream. The Go and Python SDKs narrow that stream for you:
+`WatchCounters` and `watch_counters(module)` ask for the
+`bess.counter_threshold` events one module reported and parse their fields into
+numbers, so a controller need not know the event's shape (`docs/plugin-api.md`
+states it). A crossing whose fields do not parse ends the watch with an error
+rather than being skipped, because a missed crossing is a missed quota; so does
+a gap in the daemon's log or a restart, which the helper raises instead of
+passing over, so a controller re-reads its counters and watches again.
+
 ## Resources: maps and singletons (D-129)
 
 A module's state is its init argument and its resources; what it does that
