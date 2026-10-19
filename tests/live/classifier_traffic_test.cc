@@ -44,6 +44,25 @@ constexpr char kRandomAddresses[] =
     R"({"fields": [{"offset": 26, "size": 4, "min": 1, "max": 4294967295},
                    {"offset": 30, "size": 4, "min": 1, "max": 4294967295}]})";
 
+// The same, plus the header a module that *parses* the frame needs: `Source`
+// generates packets with uninitialized data, so a module that reads the IPv4
+// header must be handed one (IPLookup read the destination unconditionally;
+// the Router's chain checks the version, the fragment flags, the lengths and
+// the TTL first). EtherType 0x0800, version/IHL 0x45, IPv4 total length 46 for
+// a 60-byte frame, no fragments, TTL 64, UDP whose length says 26 (the parse
+// refuses a UDP datagram whose length runs past the IPv4 total), and the two
+// addresses random.
+constexpr char kRandomIpv4Addresses[] =
+    R"({"fields": [{"offset": 12, "size": 2, "min": 2048, "max": 2048},
+                   {"offset": 14, "size": 1, "min": 69, "max": 69},
+                   {"offset": 16, "size": 2, "min": 46, "max": 46},
+                   {"offset": 20, "size": 2, "min": 0, "max": 0},
+                   {"offset": 22, "size": 1, "min": 64, "max": 64},
+                   {"offset": 23, "size": 1, "min": 17, "max": 17},
+                   {"offset": 26, "size": 4, "min": 1, "max": 4294967295},
+                   {"offset": 30, "size": 4, "min": 1, "max": 4294967295},
+                   {"offset": 38, "size": 2, "min": 26, "max": 26}]})";
+
 std::string Base64(const Bytes &data) {
   static constexpr char kAlphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -155,9 +174,12 @@ class ClassifierTrafficTest : public LiveTest {
 
   // Source -> RandomUpdate -> `name` (igate 0) on worker 0, each of
   // `ogates` to a Sink: what run_for and run_with_live_commands built.
+  // `fields` is the RandomUpdate template: the addresses alone for a module
+  // that only forwards, a whole IPv4 header for one that parses it.
   PipelineBuilder Traffic(const std::string &name, const std::string &mclass,
-                          const gp::Message *arg, const std::vector<int> &ogates) {
-    random_ = Arg("RandomUpdateArg", kRandomAddresses);
+                          const gp::Message *arg, const std::vector<int> &ogates,
+                          const char *fields = kRandomAddresses) {
+    random_ = Arg("RandomUpdateArg", fields);
     PipelineBuilder b;
     b.Worker(0, AllowedCores().at(0), "")
         .Module("src", "Source", nullptr)
@@ -205,13 +227,13 @@ class ClassifierTrafficTest : public LiveTest {
 TEST_F(ClassifierTrafficTest, RouterRoutesChangeWhileForwarding) {
   auto arg = Arg("RouterArg",
                  R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": 512, "max_next_hops": 2})");
-  Apply(Traffic("rt", "Router", arg.get(), {0, 1})
+  Apply(Traffic("rt", "Router", arg.get(), {0, 1}, kRandomIpv4Addresses)
             .Entry("rt/next_hops", *Arg("RouterNextHopIdKey", R"({"id": 1})"),
                    *Arg("RouterNextHopValue",
-                        R"({"egress_gate": 0, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})"))
+                        R"({"egress_gate": 0, "neighbor": "ROUTER_NEIGHBOR_STATE_RESOLVED", "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})"))
             .Entry("rt/next_hops", *Arg("RouterNextHopIdKey", R"({"id": 2})"),
                    *Arg("RouterNextHopValue",
-                        R"({"egress_gate": 1, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})"))
+                        R"({"egress_gate": 1, "neighbor": "ROUTER_NEIGHBOR_STATE_RESOLVED", "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})"))
             .Entry("rt/routes", *Arg("RouterRouteKey", R"({"ipv4": "0.0.0.0", "prefix_length": 0})"),
                    *Arg("RouterRouteValue", R"({"next_hop_id": 1})")));
   auto routes = client().Resource("rt/routes");
