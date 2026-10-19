@@ -141,9 +141,13 @@ struct NextHopGroup {
 // and without a search, an unknown, removed or out-of-range domain is a miss
 // (never undefined behaviour), and CreateDomain()/RemoveDomain() are safe
 // while workers resolve. Domain 0 exists from Create() and cannot be removed.
-// Domains are structural, not transactional: they are created before
-// Enroll(), and once enrolled they are frozen (kEnrolled). D-046 records why
-// a dense SlotTable and not a map or a rebuilt vector.
+// Domains are structural, not transactional, in the sense that a domain's FIB
+// is its own table, not a route in another one: the first route a transaction
+// writes into a domain creates it (D-158, CreateDomainLocked), and
+// `max_domains` bounds the ids instead of allocating them, so a router
+// configured for many network instances pays only for the ones that hold
+// routes. D-046 records why a dense SlotTable and not a map or a rebuilt
+// vector.
 //
 // Update modes, stated plainly:
 //

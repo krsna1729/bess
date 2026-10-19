@@ -126,6 +126,9 @@ stay the record of what happened.
 `max_domains` bounds the domain ids; it does not allocate them. A domain's FIB is created when it is first
 needed — explicitly (`CreateDomain`), or by the first route a transaction writes into it (D-158). A router
 configured for four network instances pays for the instances that hold routes, not for the configuration.
+That first write pays the table's build: `rte_lpm_create`/`rte_fib_create` runs synchronously, under the
+engine's lock and the router's, so a domain of 64K rules stalls control operations for the ~341 ms the cost
+table measures (1K rules, ~9 ms, `docs/dataplane-tables.md`); later writes are ordinary live updates.
 `RemoveDomain` takes an empty domain away; removal is frozen once the router is enrolled, because the engine's
 resource holds raw FIB pointers (D-046).
 

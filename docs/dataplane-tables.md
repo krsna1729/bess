@@ -758,6 +758,6 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | update-mode thresholds, writer rate | `update_scale_bench` |
 | control-ingress transport | `ingress_bench` |
 | plain vs staged body rule | `modules_table_scale_bench`, `classifier_cuckoo_scale_bench` |
-| `rte_fib` backend (correctness, D-130/D-132) | `route_route_test` (`RteFibTest.*`, every build) and the `/Fib` instances of the route tests; `route_bench` and `fib_bench` for cost |
+| `rte_fib` backend (correctness, D-130/D-132) | `route_route_test` (`RteFibTest.*`, every build) and the `/Fib` instances of the route tests; `route_bench`, `fib_bench` and `live_perf M.router/fib` for cost |
 | LPM lookup and update cost | `route_bench` |
 | meters, counters, RCU | `meter_bench`, `stats_bench`, `rcu_bench` |
