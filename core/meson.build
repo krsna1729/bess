@@ -753,6 +753,7 @@ unit_test_sources = [
   'route/lpm_resource_test.cc',
   'route/route_domain_test.cc',
   'route/l3_test.cc',
+  'route/forward_test.cc',
   'rcu/rcu_test.cc',
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',
