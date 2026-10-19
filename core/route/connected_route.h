@@ -1,8 +1,11 @@
 // The connected route an interface's address implies (D-164): the subnet the
 // address sits on is reachable on that interface. The route's hop is the
-// interface itself with no neighbor resolved -- a host on the subnet is reached
-// by resolving it, which is the application's ARP to do and the neighbor
-// table's to publish -- so the route exists from the moment the interface does.
+// interface itself with no neighbor resolved -- the hop names the interface,
+// not a neighbor, so nothing resolves it: reaching a host on the subnet is a
+// /32 route and hop the application writes when resolution learns the host
+// (`NeighborTable::Bind` is what makes a learned neighbor update a hop, and
+// binding this one to a host would point the whole subnet at that host's MAC)
+// -- so the route exists from the moment the interface does.
 //
 // Two applications must not disagree about the arithmetic: the mask is the
 // address's length, the prefix is the address with its host bits cleared (the

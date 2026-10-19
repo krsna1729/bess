@@ -251,7 +251,11 @@ class Router {
   std::expected<void, RouteError> SetRoute(RouteDomainId domain, Ipv4Prefix prefix,
                                            NextHopGroupId group);
   size_t next_hop_group_count() const;
-  // Routes naming group `id`, across all domains.
+  // Routes naming group `id`, across all domains. Enrolled, this takes the
+  // engine's lock while holding the router's -- the opposite order to a
+  // transaction's apply -- so a caller outside the engine's own paths must
+  // hold the control plane's mutex, the lock that serialises the two orders
+  // (tools/sanitizers/tsan.supp, D-158).
   size_t GroupReferences(NextHopGroupId id) const;
   // Groups naming next hop `id` (counted once per member position).
   size_t GroupMemberships(NextHopId id) const;
@@ -313,6 +317,10 @@ class Router {
   // Routes naming `id` (control-side reference count), across all domains.
   // Enrolled, routes only: a group holding the hop is GroupMemberships, and a
   // non-route resource naming it lives in the engine's ledger (D-065, D-023).
+  // Holds the router's mutex while walking the route resource, and takes no
+  // engine lock -- but a walk must not see a transaction mid-apply, so a
+  // caller outside the engine's own paths holds the control plane's mutex, as
+  // for the ForEach* walks.
   size_t RouteReferences(NextHopId id) const;
 
   // Control-side walks over the committed state, for reading it back (D-129):

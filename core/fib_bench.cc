@@ -101,11 +101,12 @@ namespace {
 
 const size_t kBatch = 32;            // PacketBatch::kMaxBurst
 const size_t kLookupKeys = 1 << 16;  // 256KB of keys: L2-resident by design
-// BESS's DROP_GATE (core/gate.h: MAX_GATES), i.e. what a route table's miss
-// emits when there is no match. Deliberately outside the generated route range
+// BESS's DROP_GATE (core/gate.h: MAX_GATES), the value the default route
+// carries here. Deliberately outside the generated route range
 // ([1, kMaxNextHop]): a sentinel that collides with a real next hop would
 // make a lookup miss indistinguishable from a correct hit, in both the gate
-// and any counter that counts hops.
+// and any counter that counts hops. (A miss is not this value: the table
+// returns LpmRouteTable::kNoDefault, above every value.)
 const uint32_t kDefaultNextHop = 8192;  // DROP_GATE
 const uint32_t kMaxNextHop = 8191;      // highest next hop a rule may use
 

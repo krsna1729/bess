@@ -127,8 +127,9 @@ stay the record of what happened.
 needed — explicitly (`CreateDomain`), or by the first route a transaction writes into it (D-158). A router
 configured for four network instances pays for the instances that hold routes, not for the configuration.
 That first write pays the table's build: `rte_lpm_create`/`rte_fib_create` runs synchronously, under the
-engine's lock and the router's, so a domain of 64K rules stalls control operations for the ~341 ms the cost
-table measures (1K rules, ~9 ms, `docs/dataplane-tables.md`); later writes are ordinary live updates.
+engine's lock and the router's, sized by the module's `max_routes`, so one transaction can block control
+operations for the length of that create — the cost table's rebuild column prices create plus every add at a
+given size, an upper bound for it (`docs/dataplane-tables.md`); later writes are ordinary live updates.
 `RemoveDomain` takes an empty domain away; removal is frozen once the router is enrolled, because the engine's
 resource holds raw FIB pointers (D-046).
 
