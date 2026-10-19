@@ -461,6 +461,25 @@ TEST_F(RouterTest, TheSelectorAttributesAreConfiguration) {
   EXPECT_TRUE(read_domain);
 }
 
+// A burst is resolved in one lookup for its run, and every frame keeps its own
+// outcome: two forwards and a miss in one batch, with the counters the scalar
+// path would have written.
+TEST_F(RouterTest, ABatchOfFramesIsResolvedAndEachKeepsItsOutcome) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  auto out = h_.RunPipeline(
+      rt, 0, {FrameTo("10.1.2.3"), FrameTo("192.0.2.1"), FrameTo("10.9.9.9")}, rt, {0, 1});
+  ASSERT_EQ(2u, out[1].size()) << "the two frames with a route";
+  EXPECT_TRUE(out[0].empty()) << "the miss is dropped, so it reaches no gate";
+  EXPECT_EQ(63, TtlOf(out[1][0])) << "the first frame was forwarded";
+  EXPECT_EQ(63, TtlOf(out[1][1])) << "and so was the third";
+  EXPECT_EQ(1u, rt->no_route_frames()) << "counted once, for the miss";
+  EXPECT_EQ(0u, rt->ttl_expired_frames());
+}
+
 // The mode decides, not the wiring: a module configured to route by
 // destination ignores a `next_hop_id` another module writes.
 TEST_F(RouterTest, TheMetadataIdIsIgnoredInDestinationMode) {

@@ -11,10 +11,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 #include "dpdk.h"
 #include "route/forward.h"
@@ -168,6 +170,147 @@ TEST_P(ForwardChainTest, TtlAtTheBoundaryIsItsOwnOutcome) {
     EXPECT_EQ(ForwardVerdict::kTtlExpired, route.verdict) << "ttl " << int(ttl);
     EXPECT_EQ(dataplane::InterfaceId(2), route.egress);
     EXPECT_EQ(nullptr, route.hop) << "nothing to write";
+  }
+}
+
+// The batch read half is the same chain, and this is the promise both callers
+// rest on (D-157): for every verdict the chain can return, a run of frames
+// resolved in one lookup must agree with the scalar path frame by frame. The
+// module's destination path resolves a whole burst this way, so a frame it
+// reports must be the frame the scalar path would have reported.
+TEST_P(ForwardChainTest, TheBatchPathAgreesWithTheScalarPathFrameByFrame) {
+  auto router = MakeRouter();
+  NextHop forward_hop;
+  forward_hop.egress = dataplane::InterfaceId(2);
+  forward_hop.neighbor = NeighborState::kResolved;
+  forward_hop.dst_mac.bytes[5] = 0x11;
+  forward_hop.src_mac.bytes[5] = 0x22;
+  RouteThrough(*router, NextHopId(1), forward_hop, Ip(203, 0, 113, 0), 24);
+
+  NextHop unresolved_hop;
+  unresolved_hop.egress = dataplane::InterfaceId(3);
+  unresolved_hop.neighbor = NeighborState::kIncomplete;
+  RouteThrough(*router, NextHopId(2), unresolved_hop, Ip(198, 51, 100, 0), 24);
+
+  RouteThrough(*router, NextHopId(3), BlackholeNextHop(), Ip(192, 0, 2, 0), 24);
+
+  // One frame per verdict: a forward, an unresolved neighbor, a blackhole hop,
+  // a miss, the TTL boundary, a non-initial fragment, a malformed frame and
+  // one that is not IP at all.
+  std::array<std::array<uint8_t, 60>, 8> storage;
+  storage[0] = Frame(Ip(203, 0, 113, 7));
+  storage[1] = Frame(Ip(198, 51, 100, 7));
+  storage[2] = Frame(Ip(192, 0, 2, 7));
+  storage[3] = Frame(Ip(203, 0, 114, 7));
+  storage[4] = Frame(Ip(203, 0, 113, 7), 1);
+  storage[5] = Frame(Ip(203, 0, 113, 7));
+  storage[5][21] = 0x20;  // the fragment field's low byte: an offset, not zero
+  storage[6] = Frame(Ip(203, 0, 113, 7));
+  storage[6][16] = 0x00;  // an IP length under 20: malformed
+  storage[6][17] = 0x0a;
+  storage[7] = Frame(Ip(203, 0, 113, 7));
+  storage[7][12] = 0x08;  // an ARP ether type: not IP
+  storage[7][13] = 0x06;
+
+  std::array<std::span<const uint8_t>, 8> frames;
+  std::array<size_t, 8> lens;
+  std::array<FrameRoute, 8> batch;
+  for (size_t i = 0; i < storage.size(); i++) {
+    frames[i] = std::span(storage[i].data(), storage[i].size());
+    lens[i] = storage[i].size();
+  }
+  ResolveFrames(*router, kDefaultRouteDomainId, frames, lens, batch);
+
+  // The scalar path is the oracle: what it decides for a frame, the batch must
+  // decide for the frame in the same position.
+  for (size_t i = 0; i < storage.size(); i++) {
+    const FrameRoute one =
+        ResolveFrame(*router, kDefaultRouteDomainId, storage[i], storage[i].size());
+    EXPECT_EQ(one.verdict, batch[i].verdict) << "frame " << i;
+    EXPECT_EQ(one.egress, batch[i].egress) << "frame " << i;
+    EXPECT_EQ(one.hop, batch[i].hop) << "frame " << i;
+    EXPECT_EQ(one.l3_offset, batch[i].l3_offset) << "frame " << i;
+  }
+  // And the verdicts are the ones the frames were built for, so the oracle is
+  // not agreeing with the batch on the wrong answer.
+  EXPECT_EQ(ForwardVerdict::kForward, batch[0].verdict);
+  EXPECT_EQ(ForwardVerdict::kUnresolved, batch[1].verdict);
+  EXPECT_EQ(ForwardVerdict::kNoEgress, batch[2].verdict);
+  EXPECT_EQ(ForwardVerdict::kNoRoute, batch[3].verdict);
+  EXPECT_EQ(ForwardVerdict::kTtlExpired, batch[4].verdict);
+  EXPECT_EQ(ForwardVerdict::kNonInitialFragment, batch[5].verdict);
+  EXPECT_EQ(ForwardVerdict::kMalformed, batch[6].verdict);
+  EXPECT_EQ(ForwardVerdict::kNotIpv4, batch[7].verdict);
+}
+
+// The two bodies' real risk is not the verdict list but the order of the checks
+// and the fields each branch sets -- the l3_offset difference this pair already
+// had. So this walks the combinations the checks read: a route or a miss, the
+// neighbor state, whether the hop names an egress, and the TTL against 0, 1, 2
+// and 64. Each combination is compared to the scalar path field by field.
+TEST_P(ForwardChainTest, TheBatchPathAgreesWithTheScalarPathOnEveryCombination) {
+  auto router = MakeRouter();
+  struct Case {
+    bool route;
+    bool resolved;
+    bool egress;
+    uint8_t ttl;
+  };
+  std::vector<Case> cases;
+  for (bool route : {false, true}) {
+    for (bool resolved : {false, true}) {
+      for (bool egress : {false, true}) {
+        for (uint8_t ttl : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{64}}) {
+          cases.push_back({route, resolved, egress, ttl});
+        }
+      }
+    }
+  }
+  // Four hops cover the neighbor and egress combinations (the router holds 8);
+  // one /24 per case routes to the hop its case names, when it has a route.
+  struct HopCase {
+    bool resolved;
+    bool egress;
+  };
+  for (const HopCase &hc : {HopCase{true, true}, HopCase{true, false}, HopCase{false, true},
+                            HopCase{false, false}}) {
+    NextHop hop;
+    if (hc.egress) {
+      hop.egress = dataplane::InterfaceId(2);
+    }
+    hop.neighbor = hc.resolved ? NeighborState::kResolved : NeighborState::kIncomplete;
+    const size_t h = (hc.resolved ? 0 : 2) + (hc.egress ? 0 : 1);
+    ASSERT_TRUE(router->SetNextHop(NextHopId(static_cast<uint32_t>(h + 1)), hop));
+  }
+  std::vector<std::array<uint8_t, 60>> storage(cases.size());
+  for (size_t i = 0; i < cases.size(); i++) {
+    if (cases[i].route) {
+      const size_t h = (cases[i].resolved ? 0 : 2) + (cases[i].egress ? 0 : 1);
+      ASSERT_TRUE(router->SetRoute(P(Ip(10, 0, static_cast<uint32_t>(i), 0), 24),
+                                   NextHopId(static_cast<uint32_t>(h + 1))));
+    }
+    storage[i] = Frame(Ip(10, 0, static_cast<uint32_t>(i), 7), cases[i].ttl);
+  }
+  for (size_t begin = 0; begin < cases.size(); begin += Router::kMaxBatch) {
+    const size_t n = std::min(cases.size() - begin, Router::kMaxBatch);
+    std::array<std::span<const uint8_t>, Router::kMaxBatch> frames;
+    std::array<size_t, Router::kMaxBatch> lens;
+    std::array<FrameRoute, Router::kMaxBatch> batch;
+    for (size_t k = 0; k < n; k++) {
+      frames[k] = std::span(storage[begin + k].data(), storage[begin + k].size());
+      lens[k] = storage[begin + k].size();
+    }
+    ResolveFrames(*router, kDefaultRouteDomainId, std::span(frames.data(), n),
+                  std::span(lens.data(), n), std::span(batch.data(), n));
+    for (size_t k = 0; k < n; k++) {
+      const size_t i = begin + k;
+      const FrameRoute one =
+          ResolveFrame(*router, kDefaultRouteDomainId, storage[i], storage[i].size());
+      EXPECT_EQ(one.verdict, batch[k].verdict) << "combination " << i;
+      EXPECT_EQ(one.egress, batch[k].egress) << "combination " << i;
+      EXPECT_EQ(one.hop, batch[k].hop) << "combination " << i;
+      EXPECT_EQ(one.l3_offset, batch[k].l3_offset) << "combination " << i;
+    }
   }
 }
 

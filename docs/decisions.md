@@ -11459,6 +11459,52 @@ which the default's 80 would not fire at, and a rise above it is the same crossi
 default suppresses it (200 on a capacity of 100 does not fire at 100); a stated level watches a resource that
 states no capacity, and its crossing carries no capacity; and a stated level of zero is read as none.
 
+## D-167 The module's destination path resolves a burst in one lookup per domain run
+
+**Status:** accepted (2026-10-19; the plan's item: "batch the destination gather and lookup").
+
+**Decision.** `route::ResolveFrames` (`route/forward.h`) is the batch read half: the same stages as
+`ResolveFrame` -- the checked parse, the flow hash, the egress and neighbor checks, the TTL read -- with the
+lookup done once for a run of frames that share one domain (`Router::ResolveBatch`, so one
+`rte_fib_lookup_bulk` for the run instead of one per frame). The Router module's destination path
+(`Router::RouteByDestination`) gathers a burst into runs of one domain and resolves each run in one call
+(`Router::ResolveRun`). A frame the parse settles -- not IP, a non-initial fragment, malformed -- is settled
+without a lookup, so the batch the lookup sees holds only the frames that have a destination to resolve. A run
+of one goes through the scalar `ResolveFrame` rather than the batch half, so a burst that hands one packet, or
+one that mixes domains (policy a controller writes) and splits at every boundary, pays no batch setup.
+`ResolveFrame` keeps its own body: it is the hot path for a single frame, which is what the appliance's
+`Process` makes.
+
+**Why.** The library's batch call was measured at 236 Mpps against 153 for the scalar body at 1K routes
+(`route_bench`'s lookup rows), and `live_perf` shows the module paying 2.2-2.9 ns more per packet on `rte_fib`
+than on `rte_lpm` -- the module resolved one frame at a time, so its FIB rows were the scalar path while the
+bench's were the batch one (`route_bench`'s own header said so). The chain could not simply be batched
+wholesale: the parse and the per-frame checks are frame-local, and only the lookup is shared, so the batch
+half is the same chain with the lookup hoisted. Both halves exist because the appliance resolves one frame at
+a time and must not pay for a batch it does not make.
+
+**Consequences.** A burst now costs one bulk lookup per domain run instead of one per frame, which is the
+change `live_perf`'s `M.router/fib` row measures. The cost is a second implementation of the chain's verdicts,
+which is a divergence risk: a test resolves one frame per verdict as a batch and compares it to the scalar
+path field by field, on both backends, so the two cannot disagree silently. The batch is bounded by
+`Router::kMaxBatch` (64), while the module's arrays are sized to the burst it can see
+(`PacketBatch::kMaxBurst`); a batch that mixes domains is split at the boundaries rather than rejected.
+
+**Evidence.** `route/forward_test.cc`: `TheBatchPathAgreesWithTheScalarPathFrameByFrame` -- a forward, an
+unresolved neighbor, a blackhole hop, a miss, the TTL boundary, a non-initial fragment, a malformed frame and
+one that is not IP, in one batch, compared to `ResolveFrame` verdict by verdict, egress, hop and l3_offset;
+and `TheBatchPathAgreesWithTheScalarPathOnEveryCombination`, the same comparison over 32 combinations of a
+route's presence, the neighbor state, the egress and the TTL (0, 1, 2, 64), which is the guard against the two
+bodies reordering a check. Both run on the rte_lpm and rte_fib backends. `modules/router_test.cc`:
+`ABatchOfFramesIsResolvedAndEachKeepsItsOutcome` -- two forwards and a miss in one burst, the miss counted
+once.
+
+**Not yet tested:** the multi-run split -- a burst that interleaves domains (1, 2, 1), which several VIFs
+merged into one Router input produce. It needs a per-packet domain writer, and `SetMetadata` writes one value
+to every packet; a test module cannot declare the attribute either, because `Module::Init(EmptyArg)` is not
+virtual, so a test module needs an arg type of its own to register one. That is test infrastructure, not a
+case, and it is tracked separately.
+
 ## D-168 A module's metadata names are configuration, defaulting to the names a graph already uses
 
 **Status:** accepted (2026-10-19; the plan's item: "configurable metadata names").
