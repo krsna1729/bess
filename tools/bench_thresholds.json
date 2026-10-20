@@ -1,0 +1,5 @@
+{
+  "default": 0.05,
+  "cv_limit": 0.10,
+  "benchmarks": {}
+}

@@ -6,9 +6,10 @@ on:
     tags: ['v*']
   pull_request:
     branches: [master, develop]
-  # Nightly: every lane and the benchmark suite on develop, even without a
-  # push (docs/ci-parity.md). A schedule runs on the default branch (master),
-  # so every checkout below names develop for it.
+  # Nightly: every lane on develop, even without a push (docs/ci-parity.md).
+  # Benchmarks are not part of this matrix: the separate nightly-bench
+  # workflow owns them (docs/benchmark-trends.md). A schedule runs on the
+  # default branch (master), so every checkout below names develop for it.
   schedule:
     - cron: '17 3 * * *'
 

@@ -98,14 +98,19 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   for pushes to `develop` and `master` (the tip's run covers every merged
   commit), and the nightly run its predecessor. Tag (release) runs always
   complete.
-- **What a pull request skips.** Benchmarks are built in every lane but run
-  only on pushes and the nightly run (at 0.001 s per case they measure
-  nothing; their setup was 80% of a gating lane's test time). clang-tidy
-  checks only the changed C++ sources, or every source when a header, a
-  `meson.build` or the tidy configuration changes; pushes and the nightly run
-  check all. Tidy runs in the clang-asan lane, so it gates. A nightly scheduled run (03:17 UTC) runs
-  every lane and the benchmarks on `develop` (named explicitly: a schedule
-  runs on the default branch, `master`).
+- **Benchmarks are not run by this matrix.** Every lane compiles them, but no
+  push, pull request or scheduled run of `ci.yml` executes the `benchmarks`
+  suite. The separate `nightly-bench.yml` workflow measures a stable subset in
+  one job and compares commits inside that run
+  ([benchmark-trends.md](benchmark-trends.md)). Local
+  `tools/ci_profile.py test` still runs the suite unless `GITHUB_ACTIONS=true`.
+  clang-tidy checks only the changed C++ sources, or every source when a
+  header, a `meson.build` or the tidy configuration changes; pushes and the
+  nightly run check all. Tidy runs in the clang-asan lane, so it gates. A
+  nightly scheduled run (03:17 UTC) runs every lane on `develop` (named
+  explicitly: a schedule runs on the default branch, `master`); the benchmark
+  workflow has its own schedule (04:47 UTC daily, 05:47 UTC Sundays for the
+  weekly trendline).
 - **Compiler cache.** CI restores a ccache per lane (the newest; pull requests
   can read `develop`'s) and uses it when `CCACHE_DIR` is set. Only pushes and
   the nightly run save one, so pull requests do not churn the repository's
