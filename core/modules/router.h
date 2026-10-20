@@ -149,6 +149,12 @@ class Router final : public Module {
   // Mode 2 (D-155): look each packet's destination address up in its domain's
   // FIB, then run the forwarding chain the appliance runs.
   void RouteByDestination(Context *ctx, bess::PacketBatch *batch);
+  // Resolves frames [begin, end) of `batch`, all in `domain`, and fills their
+  // gates: one batched lookup for a run of more than one (route/forward.h's
+  // ResolveFrames; a run of one takes the scalar ResolveFrame), then the
+  // per-frame verdict handling below.
+  void ResolveRun(bess::PacketBatch *batch, int begin, int end,
+                  bess::route::RouteDomainId domain, gate_idx_t *gates);
   // One counter per verdict the chain reports (route/forward.h). kForward is
   // not a drop; kNoEgress is the blackhole shape (D-160), counted apart from a
   // miss because the route exists and chose that hop.

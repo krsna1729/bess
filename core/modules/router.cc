@@ -541,6 +541,19 @@ void Router::CountVerdict(route::ForwardVerdict verdict) {
 // route would then pick a member by a different hash than its own first
 // fragment did. Forwarding fragments is a separate decision, and it needs a
 // hash that covers every fragment of a datagram consistently.
+namespace {
+// The domain a packet is in: 24 bits wide (Router::RouteKey packs it above the
+// prefix; route/route_domain.h), so no narrowing here -- a domain this router
+// does not hold is looked up as itself and misses instead of aliasing onto
+// another domain's FIB.
+inline route::RouteDomainId DomainOf(bess::metadata::mt_offset_t offset, bool has_domain,
+                                     bess::PacketRef pkt) {
+  return has_domain ? route::RouteDomainId(
+                          get_attr_with_offset<bess::utils::be32_t>(offset, pkt).value())
+                    : route::kDefaultRouteDomainId;
+}
+}  // namespace
+
 void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
   const int cnt = batch->cnt();
   const bess::metadata::mt_offset_t domain_offset = attr_offset(route_domain_attr_);
@@ -548,31 +561,66 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
   gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
     gates[i] = DROP_GATE;
-    bess::PacketRef pkt = batch->packet(i);
-
-    // The domain id is 24 bits wide (Router::RouteKey packs it above the
-    // prefix; route/route_domain.h): no narrowing here, so a domain this
-    // router does not hold is looked up as itself and misses instead of
-    // aliasing onto another domain's FIB.
+  }
+  // The lookup is one call for one domain's table (Router::ResolveBatch), so
+  // frames are resolved a run at a time: a batch in one domain -- the common
+  // case -- is one lookup for the whole burst, and a batch that mixes domains
+  // (policy a controller writes) is resolved in runs, where a run of one is the
+  // scalar path the module used before.
+  int begin = 0;
+  while (begin < cnt) {
     const route::RouteDomainId domain =
-        has_domain
-            ? route::RouteDomainId(
-                  get_attr_with_offset<bess::utils::be32_t>(domain_offset, pkt).value())
-            : route::kDefaultRouteDomainId;
-    const route::FrameRoute resolved = route::ResolveFrame(
-        *router_, domain,
-        std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), pkt.total_len(),
-        flow_fields_);
-    if (resolved.verdict != route::ForwardVerdict::kForward) {
-      CountVerdict(resolved.verdict);
+        DomainOf(domain_offset, has_domain, batch->packet(begin));
+    int end = begin + 1;
+    while (end < cnt && end - begin < static_cast<int>(bess::PacketBatch::kMaxBurst) &&
+           DomainOf(domain_offset, has_domain, batch->packet(end)) == domain) {
+      end++;
+    }
+    ResolveRun(batch, begin, end, domain, gates);
+    begin = end;
+  }
+  EmitBatch(ctx, batch, gates);
+}
+
+void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
+                        route::RouteDomainId domain, gate_idx_t *gates) {
+  const size_t n = static_cast<size_t>(end - begin);
+  // A run of one is the scalar path, and pays for no batch: a burst that hands
+  // one packet, or a batch that splits at every domain boundary, must not cost
+  // the batch half's arrays. A raw array, so nothing is constructed for the
+  // elements a short run does not use; ResolveFrames writes every position it
+  // is given, and the scalar path writes its one.
+  route::FrameRoute resolved[bess::PacketBatch::kMaxBurst];
+  if (n == 1) {
+    bess::PacketRef pkt = batch->packet(begin);
+    resolved[0] = route::ResolveFrame(
+        *router_, domain, std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()),
+        pkt.total_len(), flow_fields_);
+  } else {
+    std::array<std::span<const uint8_t>, bess::PacketBatch::kMaxBurst> frames;
+    std::array<size_t, bess::PacketBatch::kMaxBurst> total_lens;
+    for (size_t k = 0; k < n; k++) {
+      bess::PacketRef pkt = batch->packet(begin + static_cast<int>(k));
+      frames[k] = std::span(pkt.head_data<const uint8_t *>(), pkt.head_len());
+      total_lens[k] = pkt.total_len();
+    }
+    route::ResolveFrames(*router_, domain, std::span(frames.data(), n),
+                         std::span(total_lens.data(), n), std::span(resolved, n),
+                         flow_fields_);
+  }
+  for (size_t k = 0; k < n; k++) {
+    const int i = begin + static_cast<int>(k);
+    const route::FrameRoute &r = resolved[k];
+    if (r.verdict != route::ForwardVerdict::kForward) {
+      CountVerdict(r.verdict);
       // A punt gate is the application's slow path (D-162): a frame the
       // destination path cannot forward leaves on it instead of being
       // dropped, and it is counted either way, so the counters stay the
       // record of what happened.
       const gate_idx_t punt =
-          resolved.verdict == route::ForwardVerdict::kNoRoute
+          r.verdict == route::ForwardVerdict::kNoRoute
               ? punt_miss_gate_
-              : resolved.verdict == route::ForwardVerdict::kUnresolved
+              : r.verdict == route::ForwardVerdict::kUnresolved
                     ? punt_unresolved_gate_
                     : DROP_GATE;
       if (punt != DROP_GATE) {
@@ -580,7 +628,7 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
       }
       continue;
     }
-    const gate_idx_t gate = GateOf(resolved.egress);
+    const gate_idx_t gate = GateOf(r.egress);
     if (gate == DROP_GATE) {
       // A hop whose egress is no gate of this graph: configuration, not
       // traffic, so nothing is counted and nothing is written.
@@ -590,6 +638,7 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
     // The TTL is written whatever the hop names, so the header must be
     // writable: a shared payload is copied once (K4) and the copy replaces
     // the batch's handle.
+    bess::PacketRef pkt = batch->packet(i);
     bess::PacketHandle handle = pkt.handle();
     if (!bess::packet::EnsureWritable(handle)) {
       header_write_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -601,14 +650,14 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
     // re-established rather than assumed: writing it through a stale pointer
     // would touch bytes that are not in this segment.
     if (writable.head_len() <
-        static_cast<size_t>(resolved.l3_offset) + sizeof(bess::utils::Ipv4)) {
+        static_cast<size_t>(r.l3_offset) + sizeof(bess::utils::Ipv4)) {
       header_write_failures_.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     if (route::WriteForwarded(
-            std::span(writable.head_data<uint8_t *>(), writable.head_len()),
-            resolved.l3_offset, *resolved.hop) != route::TtlResult::kForward) {
-      // ResolveFrame refuses a TTL of 0 or 1, so this is unreachable with the
+            std::span(writable.head_data<uint8_t *>(), writable.head_len()), r.l3_offset,
+            *r.hop) != route::TtlResult::kForward) {
+      // ResolveFrames refuses a TTL of 0 or 1, so this is unreachable with the
       // same bytes; counting it keeps the boundary honest if a mutation ever
       // rewrote the header between the two calls.
       ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
@@ -616,7 +665,6 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
     }
     gates[i] = gate;
   }
-  EmitBatch(ctx, batch, gates);
 }
 
 std::string Router::GetDesc() const {

@@ -142,6 +142,108 @@ inline TtlResult WriteForwarded(std::span<uint8_t> frame, uint16_t l3_offset,
   return TtlResult::kForward;
 }
 
+// The batch read half: ResolveFrame's stages for frames that share one domain,
+// with the lookup done once for the whole batch, so a backend that has a bulk
+// lookup uses it -- one rte_fib_lookup_bulk per batch instead of one per frame,
+// which is the gap live_perf's M.router/fib row shows (D-132, K7).
+//
+// The parse and the checks are frame-local and run per frame; only the lookup
+// is shared. A frame the parse settles (not IP, a fragment, malformed) is
+// settled without a lookup, so the batch the lookup sees holds only the frames
+// that have a destination to resolve.
+//
+// Every frame must be in `domain`: the lookup is one call for one table, which
+// is what Router::ResolveBatch takes. A caller whose frames carry different
+// domains groups them, and can fall back to ResolveFrame.
+//
+// `frames[i]` is the packet's first segment and `total_lens[i]` the whole frame
+// (0: the span's length). At most Router::kMaxBatch frames.
+inline void ResolveFrames(const Router &router, RouteDomainId domain,
+                          std::span<const std::span<const uint8_t>> frames,
+                          std::span<const size_t> total_lens,
+                          std::span<FrameRoute> out,
+                          FlowHashFields fields = FlowHashFields::kL3L4) noexcept {
+  promise(frames.size() == out.size() && frames.size() == total_lens.size());
+  promise(frames.size() <= Router::kMaxBatch);
+  uint32_t dsts[Router::kMaxBatch];
+  uint32_t hashes[Router::kMaxBatch];
+  size_t positions[Router::kMaxBatch];  // where each looked-up frame came from
+  uint16_t offsets[Router::kMaxBatch];  // its IPv4 header, for the TTL read
+  // Not zeroed: the mask is the authority, and ResolveBatchIn clears the bit
+  // for a position it leaves unwritten, so only written elements are read.
+  const NextHop *hops[Router::kMaxBatch];
+  size_t batch = 0;
+  for (size_t i = 0; i < frames.size(); i++) {
+    conntrack::ParsedFlowPacket p;
+    const conntrack::ParseStatus parsed = conntrack::ParseFrame(frames[i], p, total_lens[i]);
+    if (parsed == conntrack::ParseStatus::kNotIp) {
+      out[i] = {};
+      continue;
+    }
+    if (parsed == conntrack::ParseStatus::kFragment) {
+      out[i] = {.verdict = ForwardVerdict::kNonInitialFragment};
+      continue;
+    }
+    if (parsed != conntrack::ParseStatus::kOk) {
+      out[i] = {.verdict = ForwardVerdict::kMalformed};
+      continue;
+    }
+    if (p.l3 != conntrack::L3Kind::kIpv4) {
+      out[i] = {};
+      continue;
+    }
+    // The destination in the LPM's own order and the hash a group route picks
+    // a member with, as ResolveFrame reads them.
+    utils::be32_t dst;
+    std::memcpy(&dst, p.dst.data(), sizeof(dst));
+    uint32_t src_word, dst_word;
+    std::memcpy(&src_word, p.src.data(), sizeof(src_word));
+    std::memcpy(&dst_word, p.dst.data(), sizeof(dst_word));
+    dsts[batch] = dst.value();
+    hashes[batch] = FlowHash(src_word, dst_word, p.src_port, p.dst_port, p.protocol, fields);
+    positions[batch] = i;
+    offsets[batch] = p.l3_offset;
+    out[i] = {};
+    batch++;
+  }
+  const uint64_t mask =
+      batch == 0 ? 0
+                 : router.ResolveBatch(domain, std::span(dsts, batch),
+                                       std::span(hashes, batch), std::span(hops, batch));
+  for (size_t b = 0; b < batch; b++) {
+    const size_t i = positions[b];
+    const NextHop *hop = (mask & (uint64_t{1} << b)) != 0 ? hops[b] : nullptr;
+    if (hop == nullptr) {
+      out[i].verdict = ForwardVerdict::kNoRoute;
+      continue;
+    }
+    // The egress first, as ResolveFrame has it: a hop that forwards nowhere is
+    // the blackhole shape (D-160) whatever its neighbor state says.
+    if (hop->egress == dataplane::kInvalidInterfaceId) {
+      out[i].verdict = ForwardVerdict::kNoEgress;
+      continue;
+    }
+    if (hop->neighbor != NeighborState::kResolved) {
+      out[i].verdict = ForwardVerdict::kUnresolved;
+      out[i].egress = hop->egress;
+      continue;
+    }
+    // The header offset is set where ResolveFrame sets it -- with the forward
+    // and the TTL boundary, the two verdicts a caller writes bytes for.
+    const auto *ip = reinterpret_cast<const utils::Ipv4 *>(frames[i].data() + offsets[b]);
+    if (ip->ttl <= 1) {
+      out[i].verdict = ForwardVerdict::kTtlExpired;
+      out[i].egress = hop->egress;
+      out[i].l3_offset = offsets[b];
+      continue;
+    }
+    out[i].verdict = ForwardVerdict::kForward;
+    out[i].hop = hop;
+    out[i].egress = hop->egress;
+    out[i].l3_offset = offsets[b];
+  }
+}
+
 }  // namespace bess::route
 
 #endif  // BESS_ROUTE_FORWARD_H_
