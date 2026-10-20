@@ -18,6 +18,7 @@
 #include "classifier/extract_plan.h"
 #include "classifier/concurrent_masked.h"
 #include "classifier/masked_rule_resource.h"
+#include "classifier/result_plan.h"
 #include "classifier/runtime_schema.h"
 #include "event.h"
 #include "framework/resource_bindings.h"
@@ -103,13 +104,17 @@ class WildcardMatch final : public Module {
   struct Generation {
     Generation(gate_idx_t d, bess::classifier::ExtractPlan e,
                std::shared_ptr<bess::classifier::ConcurrentMaskedTable> t,
-               size_t k, bool valid, std::vector<size_t> offsets)
+               size_t k, bool valid, std::vector<size_t> offsets,
+               std::optional<bess::classifier::ResultPlan> r,
+               size_t result_offset)
         : default_gate(d),
           extract(std::move(e)),
           table(std::move(t)),
           key_size(k),
           extraction_valid(valid),
-          baked_source_offsets(std::move(offsets)) {}
+          baked_source_offsets(std::move(offsets)),
+          result(std::move(r)),
+          baked_result_offset(result_offset) {}
 
     gate_idx_t default_gate = DROP_GATE;
     bess::classifier::ExtractPlan extract;
@@ -124,6 +129,13 @@ class WildcardMatch final : public Module {
     // Per-field source offset baked into `extract`, compared at PreResume to
     // detect graph-driven offset reassignment.
     std::vector<size_t> baked_source_offsets;
+    // With an action resource: places the ActionId of each packet's winning
+    // rule in metadata through the compiled result plan. nullopt otherwise.
+    std::optional<bess::classifier::ResultPlan> result;
+    // The metadata offset baked into `result`, or kInvalidOffset when the
+    // 'action_id' attribute had none at build time. Compared at PreResume
+    // with the source offsets: both are graph-assigned.
+    size_t baked_result_offset = kInvalidOffset;
   };
 
   using GenerationPtr = std::unique_ptr<const Generation>;
@@ -155,7 +167,8 @@ class WildcardMatch final : public Module {
   };
 
   template <typename Emit>
-  void Classify(bess::PacketBatch *batch, Emit &&emit) const;
+  void Classify(bess::PacketBatch *batch, const Generation &gen,
+                Emit &&emit) const;
 
   CommandResponse AddFieldOne(const bess::pb::Field &field, int idx);
   // Resolves FieldSpecs into a dense packed layout using current metadata

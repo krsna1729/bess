@@ -778,8 +778,17 @@ TEST_F(SessionPipelineTest, RuleResultCarriesGateAndActionTogether) {
 TEST_F(SessionPipelineTest, WildcardRuleCarriesGateAndActionTogether) {
   ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
   ASSERT_NE(nullptr, at);
+  Meter *mt = CreateMeterModule("mt", 64);
+  Router *rt = CreateRouterModule("rt");
+  ASSERT_NE(nullptr, mt);
+  ASSERT_NE(nullptr, rt);
   ASSERT_EQ(Apply({Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(3)),
-                              std::any(ActionTable::Action{MeterId(0), NextHopId(0)}))})
+                              std::any(ActionTable::Action{MeterId(0), NextHopId(1)})),
+                   rt->router()->SetNextHopOp(
+                       NextHopId(1),
+                       HopWithEgress(
+                           bess::modules::router::InterfaceOf(7).value())),
+                   rt->router()->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1))})
                 .outcome,
             Outcome::kApplied);
 
@@ -820,6 +829,30 @@ TEST_F(SessionPipelineTest, WildcardRuleCarriesGateAndActionTogether) {
   EXPECT_EQ(actions[1], 0u);
   EXPECT_EQ(gates[2], DROP_GATE);
   EXPECT_EQ(actions[2], 0u);
+
+  // The packet path places the id, not just ClassifyBatch: the harness
+  // computes the offsets as a resume does, and the downstream ActionTable
+  // resolves the placed id. A wrong byte order or offset would make the table
+  // drop the packet. The rule names gate 0, the graph's edge to the table.
+  ASSERT_EQ(Apply({Op::Upsert("wm/rules",
+                              field4(Ip(255, 255, 255, 255)) +
+                                  field4(Ip(10, 0, 0, 6)),
+                              std::any(bess::classifier::MaskedRuleResource::Value{
+                                  3, 0, 3}))})
+                .outcome,
+            Outcome::kApplied);
+  bess::testing::Bytes matched(60, 0);
+  const uint32_t addr = Ip(10, 0, 0, 6);
+  std::memcpy(matched.data() + 26, &addr, sizeof(addr));
+  bess::testing::ModuleHarness h;
+  // The table needs its own outputs read: the meter and router take the ids
+  // it writes, which is what makes those offsets resolvable.
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(wm, 0, at, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(at, 0, mt, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(mt, Meter::kGreenGate, rt, 0, true));
+  auto out = h.RunPipeline(wm, 0, {matched}, rt, {7});
+  EXPECT_EQ(1u, out[7].size())
+      << "the action table resolved the id the classifier placed";
 
   // The codec: {gate, action_id} is accepted where an action resource can
   // resolve the id, and refused where there is none.

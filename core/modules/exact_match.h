@@ -20,6 +20,7 @@
 #include "classifier/concurrent_exact.h"
 #include "classifier/exact_rule_resource.h"
 #include "classifier/extract_plan.h"
+#include "classifier/result_plan.h"
 #include "classifier/runtime_schema.h"
 #include "event.h"
 #include "framework/resource_bindings.h"
@@ -122,13 +123,17 @@ class ExactMatch final : public Module {
   struct Generation {
     Generation(gate_idx_t d, bess::classifier::ExtractPlan e,
                std::shared_ptr<bess::classifier::ConcurrentExactTable> t,
-               size_t k, bool valid, std::vector<size_t> offsets)
+               size_t k, bool valid, std::vector<size_t> offsets,
+               std::optional<bess::classifier::ResultPlan> r,
+               size_t result_offset)
         : default_gate(d),
           extract(std::move(e)),
           table(std::move(t)),
           key_size(k),
           extraction_valid(valid),
-          baked_source_offsets(std::move(offsets)) {}
+          baked_source_offsets(std::move(offsets)),
+          result(std::move(r)),
+          baked_result_offset(result_offset) {}
 
     // Read once per batch (relaxed): the "settings" resource stores it in the
     // published generation while workers run, with nothing to allocate or
@@ -148,6 +153,13 @@ class ExactMatch final : public Module {
     // metadata attr offset, or kInvalidOffset for unreadable metadata).
     // Compared at PreResume to detect graph-driven offset reassignment.
     std::vector<size_t> baked_source_offsets;
+    // Action mode: places the ActionId of each packet's packed result word in
+    // metadata through the compiled result plan. nullopt in gate mode.
+    std::optional<bess::classifier::ResultPlan> result;
+    // The metadata offset baked into `result`, or kInvalidOffset when the
+    // 'action_id' attribute had none at build time. Compared at PreResume
+    // with the source offsets: both are graph-assigned.
+    size_t baked_result_offset = kInvalidOffset;
     // The fused fixed-layout kernel (D-121): the key is one packet field of
     // 1, 2, 4 or 8 bytes, read, masked, hashed and looked up in one pass.
     // fused_width is that width, 0 for the generic extract-then-lookup path;

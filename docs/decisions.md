@@ -11551,7 +11551,7 @@ all five modules run unconfigured and cover the defaults.
 
 ## D-169 The result plan is the key plan mirrored: both destinations, masks, packed copy ops
 
-**Status:** accepted (2026-10-20; the match-result schema's scatter half, built but not yet wired into a module).
+**Status:** accepted (2026-10-20; the match-result schema's scatter half, wired into ExactMatch and WildcardMatch for the action-id placement).
 
 **Decision.** `ResultPlan` places one value record into either the packet or the metadata block, shaped like
 `ExtractPlan`. `RuntimeResultField` carries a `BufferKind destination` and a `Normalization` mask; `SourceKind`
@@ -11599,5 +11599,6 @@ plan is packet-specific. The packed form's limits are the schema's: `Validate()`
 The remaining gap to the direct copy is the per-record bounds check and the indirect kernel call, both required
 for an untrusted schema; a per-schema generated kernel is the next lever if a deployment needs it. The hot path
 is independent of the op count: a bucket is one size class, so the copy width is constant and the mask branch
-is hoisted out of the loop. Wiring `Acl` and `ExactMatch` to emit these schemas is the next commit; until then
-no module uses the plan, and the old packet-only fields are gone rather than kept beside it.
+is hoisted out of the loop. `ExactMatch` and `WildcardMatch` place their ActionId through it; a rule carrying
+its own result bytes is the next step, which is what makes an action table optional. The old packet-only fields
+are gone rather than kept beside it.
