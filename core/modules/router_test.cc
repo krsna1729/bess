@@ -269,6 +269,12 @@ class RouterTest : public ::testing::Test {
 
 // A hop that names both addresses: the frame leaves with them, on the gate the
 // hop's egress names, and every other byte of the frame is untouched.
+// Defined with the destination-mode helpers below; the hop-mode arms use the
+// same builder and reader so both modes are judged on the same bytes. The
+// default TTL stays on the definition, which follows these arms.
+Bytes FrameTo(const char *dst, uint8_t ttl);
+uint8_t TtlOf(const Bytes &frame);
+
 TEST_F(RouterTest, ANamedHopIsWrittenIntoTheFrame) {
   Router *rt = MakeRouter(1, "02:00:00:00:00:bb", "02:00:00:00:00:aa",
                           bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED);
@@ -282,28 +288,36 @@ TEST_F(RouterTest, ANamedHopIsWrittenIntoTheFrame) {
   ASSERT_EQ(frame.size(), got.size());
   EXPECT_EQ(Mac("02:00:00:00:00:bb"), DstOf(got));
   EXPECT_EQ(Mac("02:00:00:00:00:aa"), SrcOf(got));
-  EXPECT_TRUE(std::equal(frame.begin() + 12, frame.end(), got.begin() + 12))
-      << "the ethertype and everything after it are the frame's own";
+  EXPECT_TRUE(std::equal(frame.begin() + 12, frame.begin() + 14,
+                         got.begin() + 12))
+      << "the ethertype is the frame's own";
+  EXPECT_EQ(63, TtlOf(got)) << "a router decrements what it forwards";
   EXPECT_EQ(0u, rt->header_write_failures());
 }
 
-// A hop that names no addresses: the frame keeps the header it arrived with.
-// Every graph in the tree is this shape today, so this is the compatibility
-// case, not an edge one.
-TEST_F(RouterTest, AHopThatNamesNoAddressesIsForwardedUntouched) {
+// A hop that names no addresses: the frame keeps the addresses it arrived
+// with, and only the TTL changes -- the hop count is the router's, whichever
+// addresses the hop names. Every graph in the tree is this shape today, so
+// this is the compatibility case, not an edge one.
+TEST_F(RouterTest, AHopThatNamesNoAddressesKeepsItsAddresses) {
   Router *rt = MakeRouter(1, nullptr, nullptr, bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED);
   ASSERT_NE(nullptr, rt);
   const Bytes frame = Frame();
   auto out = Run(rt, frame);
 
   ASSERT_EQ(1u, out[1].size());
-  EXPECT_EQ(frame, out[1][0]) << "byte for byte what arrived";
+  const Bytes &got = out[1][0];
+  ASSERT_EQ(frame.size(), got.size());
+  EXPECT_EQ(DstOf(frame), DstOf(got));
+  EXPECT_EQ(SrcOf(frame), SrcOf(got));
+  EXPECT_EQ(63, TtlOf(got));
   EXPECT_EQ(0u, rt->header_write_failures());
 }
 
 // Half a pair is not a rewrite: writing the destination alone would put a zero
-// source address on the wire.
-TEST_F(RouterTest, AHopThatNamesOnlyOneAddressIsForwardedUntouched) {
+// source address on the wire. The TTL still moves, as it does for any IPv4
+// frame a router forwards.
+TEST_F(RouterTest, AHopThatNamesOnlyOneAddressKeepsItsAddresses) {
   Router *rt = MakeRouter(1, "02:00:00:00:00:bb", nullptr,
                           bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED);
   ASSERT_NE(nullptr, rt);
@@ -311,7 +325,11 @@ TEST_F(RouterTest, AHopThatNamesOnlyOneAddressIsForwardedUntouched) {
   auto out = Run(rt, frame);
 
   ASSERT_EQ(1u, out[1].size());
-  EXPECT_EQ(frame, out[1][0]);
+  const Bytes &got = out[1][0];
+  ASSERT_EQ(frame.size(), got.size());
+  EXPECT_EQ(DstOf(frame), DstOf(got)) << "half a pair writes nothing";
+  EXPECT_EQ(SrcOf(frame), SrcOf(got));
+  EXPECT_EQ(63, TtlOf(got));
   EXPECT_EQ(0u, rt->header_write_failures()) << "not a failure: the hop named nothing to write";
 }
 
@@ -363,6 +381,51 @@ TEST_F(RouterTest, AFrameWhoseHeaderCannotBeWrittenIsDroppedAndCounted) {
   EXPECT_EQ(1u, rt->header_write_failures());
   EXPECT_NE(std::string::npos, rt->GetDesc().find("1 header write failures"))
       << rt->GetDesc();
+}
+
+// The hop mode decrements the TTL on the hop's own write (one implementation
+// with the destination mode): a frame with a TTL of 1 is dropped and counted
+// rather than forwarded with a zero hop count.
+TEST_F(RouterTest, AHopModeExpiringTtlIsDroppedAndCounted) {
+  Router *rt = MakeRouter(1, "02:00:00:00:00:bb", "02:00:00:00:00:aa",
+                          bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED);
+  ASSERT_NE(nullptr, rt);
+  auto out = Run(rt, FrameTo("10.0.0.2", 1));
+
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_TRUE(out[1].empty()) << "expired, not forwarded";
+  EXPECT_EQ(1u, rt->ttl_expired_frames());
+  EXPECT_EQ(0u, rt->header_write_failures());
+}
+
+// TTL 2 leaves as 1: the boundary DecrementTtl documents.
+TEST_F(RouterTest, AHopModeTtlTwoLeavesAsOne) {
+  Router *rt = MakeRouter(1, "02:00:00:00:00:bb", "02:00:00:00:00:aa",
+                          bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED);
+  ASSERT_NE(nullptr, rt);
+  auto out = Run(rt, FrameTo("10.0.0.2", 2));
+
+  ASSERT_EQ(1u, out[1].size());
+  EXPECT_EQ(1, TtlOf(out[1][0]));
+  EXPECT_EQ(0u, rt->ttl_expired_frames());
+}
+
+// A non-initial fragment still carries the IPv4 header, so it leaves with the
+// hop count written: the mode routes by id, not by a hash that needs the ports
+// in the fragment this packet does not have.
+TEST_F(RouterTest, AHopModeFragmentStillDecrementsTheTtl) {
+  Router *rt = MakeRouter(1, "02:00:00:00:00:bb", "02:00:00:00:00:aa",
+                          bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED);
+  ASSERT_NE(nullptr, rt);
+  Bytes frame = FrameTo("10.0.0.2", 2);
+  frame[21] = 0x20;  // the fragment field's low byte: an offset, not zero
+  auto out = Run(rt, frame);
+
+  ASSERT_EQ(1u, out[1].size());
+  EXPECT_EQ(1, TtlOf(out[1][0]));
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), DstOf(out[1][0]));
+  EXPECT_EQ(0u, rt->ttl_expired_frames());
+  EXPECT_EQ(0u, rt->header_write_failures());
 }
 
 // An unresolved neighbor is dropped whatever it names: dropping is the choice
