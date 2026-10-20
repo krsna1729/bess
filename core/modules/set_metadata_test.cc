@@ -181,4 +181,30 @@ TEST(UpdateTest, FieldsApplyToEveryPacketInOrder) {
   }
 }
 
+// A packet-source attribute reads a fixed offset. A frame whose first segment
+// is shorter than offset + size is dropped: the old code read past its head.
+TEST(SetMetadataTest, APacketShorterThanTheExtractionIsDropped) {
+  bess::pb::SetMetadataArg arg;
+  auto *a = arg.add_attrs();
+  a->set_name("meta");
+  a->set_size(4);
+  a->set_offset(8);
+
+  bess::pb::MeterArg meter_arg;
+  meter_arg.set_id_attr("meta");  // a downstream reader, so the offset resolves
+
+  ModuleHarness h;
+  Module *md = h.Create("SetMetadata", arg);
+  Module *meter = h.Create("Meter", meter_arg);
+  ASSERT_NE(nullptr, md);
+  ASSERT_NE(nullptr, meter);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(md, 0, meter, 0, true));
+
+  auto out = h.RunPipeline(md, 0, {Bytes(11)}, meter, {0});
+  EXPECT_TRUE(out[0].empty()) << "11 bytes < offset 8 + size 4";
+
+  out = h.RunPipeline(md, 0, {Bytes(12)}, meter, {0});
+  EXPECT_EQ(1u, out[0].size()) << "12 bytes hold the whole extraction";
+}
+
 }  // namespace

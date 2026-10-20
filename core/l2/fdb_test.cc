@@ -166,6 +166,35 @@ TEST(FdbTest, FullTableRefusesAndAgingMakesRoom) {
   EXPECT_EQ(ProgramResult::kFull, limited->AddStatic(kD0, Mac(6), InterfaceId(2)));
 }
 
+TEST(FdbTest, AReservedSlotIsInvisibleUntilItIsPublished) {
+  auto fdb = Make(4);
+  ASSERT_TRUE(fdb->ReserveStatic(kD0, Mac(1)));
+  // The placeholder is a miss to the packet path, scalar and batch alike.
+  EXPECT_EQ(kInvalidInterfaceId, fdb->Lookup(kD0, Mac(1)));
+  FdbKey key = MakeKey(kD0, Mac(1));
+  std::array<InterfaceId, 1> out{};
+  EXPECT_EQ(0u, fdb->LookupBatch(std::span<const FdbKey>(&key, 1), out));
+  EXPECT_EQ(kInvalidInterfaceId, out[0]);
+  // Publishing replaces it in place, so it cannot be refused.
+  EXPECT_EQ(ProgramResult::kReplaced, fdb->AddStatic(kD0, Mac(1), InterfaceId(7)));
+  EXPECT_EQ(InterfaceId(7), fdb->Lookup(kD0, Mac(1)));
+  EXPECT_EQ(1u, fdb->LookupBatch(std::span<const FdbKey>(&key, 1), out));
+  EXPECT_EQ(InterfaceId(7), out[0]);
+  // An existing key is already placed; reserving again takes nothing.
+  EXPECT_TRUE(fdb->ReserveStatic(kD0, Mac(1)));
+  EXPECT_TRUE(fdb->Remove(kD0, Mac(1)));
+  EXPECT_EQ(kInvalidInterfaceId, fdb->Lookup(kD0, Mac(1)));
+}
+
+TEST(FdbTest, AReservationWithoutASlotIsRefused) {
+  auto fdb = Make(1);
+  ASSERT_TRUE(fdb->ReserveStatic(kD0, Mac(1)));
+  EXPECT_FALSE(fdb->ReserveStatic(kD0, Mac(2)));
+  MacAddress bcast{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
+  EXPECT_FALSE(fdb->ReserveStatic(kD0, bcast));
+  EXPECT_FALSE(fdb->ReserveStatic(BridgeDomainId(16), Mac(3)));
+}
+
 TEST(FdbTest, BatchLookupMatchesScalar) {
   auto fdb = Make(256);
   std::mt19937 rng(14);

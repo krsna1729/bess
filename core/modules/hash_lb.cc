@@ -12,6 +12,8 @@
 
 #include "arch/crc32c.h"
 #include "dataplane/member_select.h"
+#include "utils/ether.h"
+#include "utils/ip.h"
 
 static inline uint32_t hash_16(uint16_t val, uint32_t init_val) {
   return bess::arch::Crc32c(val, init_val);
@@ -34,6 +36,29 @@ static inline T Load(const char *p) {
   T v;
   std::memcpy(&v, p, sizeof(v));
   return v;
+}
+
+// The first segment must hold an Ethernet header and an IPv4 header with a
+// sane IHL, plus `after_ip` more bytes (the L4 ports). Returns the IPv4 header
+// length in bytes, or 0 when the frame is too short or not IPv4. Hashing a
+// frame the module cannot read would read past its head; hash_range needs a
+// destination, and a drop is the only answer the module has.
+static inline size_t Ipv4HeaderLength(bess::PacketRef pkt, size_t after_ip) {
+  const size_t eth_len = sizeof(bess::utils::Ethernet);
+  const size_t ip_len = sizeof(bess::utils::Ipv4);
+  if (pkt.head_len() < eth_len + ip_len + after_ip) {
+    return 0;
+  }
+  const uint8_t *head = pkt.head_data<const uint8_t *>();
+  const unsigned version_ihl = head[eth_len];
+  if ((version_ihl >> 4u) != 4u) {
+    return 0;
+  }
+  const size_t ihl = static_cast<size_t>(version_ihl & 0x0fu) * 4;
+  if (ihl < ip_len || pkt.head_len() < eth_len + ihl + after_ip) {
+    return 0;
+  }
+  return ihl;
 }
 
 // "settings" (HashLBSettings) holds mode, fields and gates; the class has no
@@ -208,6 +233,11 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL2>(
   const gate_idx_t *gates = config.gates.data();
   const uint16_t num_gates = static_cast<uint16_t>(config.gates.size());
   for (bess::PacketRef snb : batch->packets()) {
+    if (unlikely(snb.head_len() <
+                 2 * sizeof(bess::utils::Ethernet::Address))) {
+      EmitPacket(ctx, snb, DROP_GATE);
+      continue;
+    }
     uint16_t *parts = snb.head_data<uint16_t *>();
     uint16_t sum = 0;
 
@@ -228,9 +258,17 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL3>(
   const gate_idx_t *gates = config.gates.data();
   const uint16_t num_gates = static_cast<uint16_t>(config.gates.size());
   /* assumes untagged packets */
-  const int ip_offset = 14;
+  const int ip_offset = sizeof(bess::utils::Ethernet);
 
   for (bess::PacketRef snb : batch->packets()) {
+    if (unlikely(snb.head_len() <
+                 sizeof(bess::utils::Ethernet) +
+                     sizeof(bess::utils::Ipv4))) {
+      // L3 hashes only the fixed src/dst words; options (a larger IHL) may
+      // live in a later segment and do not move those offsets.
+      EmitPacket(ctx, snb, DROP_GATE);
+      continue;
+    }
     char *head = snb.head_data<char *>();
 
     uint32_t hash_val;
@@ -249,13 +287,16 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL4>(
   const gate_idx_t *gates = config.gates.data();
   const uint16_t num_gates = static_cast<uint16_t>(config.gates.size());
   /* assumes untagged packets */
-  const int ip_offset = 14;
+  const int ip_offset = sizeof(bess::utils::Ethernet);
 
   for (bess::PacketRef snb : batch->packets()) {
+    const size_t ihl = Ipv4HeaderLength(snb, 4);
+    if (unlikely(ihl == 0)) {
+      EmitPacket(ctx, snb, DROP_GATE);
+      continue;
+    }
     char *head = snb.head_data<char *>();
-    uint32_t l4_offset =
-        ip_offset + ((*(reinterpret_cast<uint8_t *>(head + ip_offset)) & 0x0F)
-                     << 2); /* ip_offset + IHL */
+    const uint32_t l4_offset = ip_offset + ihl;
     uint32_t hash_val;
     uint32_t v0 = Load<uint32_t>(head + ip_offset + 12);  /* src IP */
     v0 ^= Load<uint32_t>(head + ip_offset + 16);          /* dst IP */

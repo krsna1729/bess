@@ -104,6 +104,27 @@ TYPED_TEST(PackedMacTableTest, RandomOperationsMatchAReference) {
   }
 }
 
+TYPED_TEST(PackedMacTableTest, AReservedKeyIsAMissForBothReaders) {
+  using Table = PackedMacTable<uint32_t, TypeParam>;
+  auto t = Table::Create(64);
+  ASSERT_NE(t, nullptr);
+  const uint64_t key = Key(7);
+  [[maybe_unused]] auto guard = t->Lock();
+  ASSERT_NE(Table::kNotFound, t->Reserve(key));
+  // Occupied but value 0: a miss to the scalar and to the batch reader.
+  EXPECT_EQ(0u, t->Lookup(key));
+  uint16_t value = 0xFFFF;
+  EXPECT_EQ(0u, t->LookupBatch(std::span<const uint64_t>(&key, 1), &value));
+  EXPECT_EQ(0u, value);
+  // Publishing replaces the value in place; both readers now see it.
+  const uint32_t slot = t->Find(key);
+  ASSERT_NE(Table::kNotFound, slot);
+  t->set_value(slot, 42);
+  EXPECT_EQ(42u, t->Lookup(key));
+  EXPECT_EQ(1u, t->LookupBatch(std::span<const uint64_t>(&key, 1), &value));
+  EXPECT_EQ(42u, value);
+}
+
 TYPED_TEST(PackedMacTableTest, FillsToCapacity) {
   using Table = PackedMacTable<uint32_t, TypeParam>;
   for (size_t capacity : {1u, 7u, 1000u, 65536u}) {

@@ -184,6 +184,11 @@ class MacTable {
     return s;
   }
 
+  // A slot for a key whose value reads as a miss (0): a reservation that the
+  // caller fills before any lookup can name a real interface. Static, so
+  // aging leaves it alone.
+  uint32_t Reserve(uint64_t key) noexcept { return Insert(key, 0, 1); }
+
   // A free slot reads as value 0, flags 0.
   void Erase(uint32_t s) noexcept {
     buckets_[s / kWays].keys[s % kWays] = kEmptyKey;

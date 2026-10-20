@@ -81,12 +81,17 @@ void Replicate::DeInit() {
 void Replicate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   for (bess::PacketRef tocopy : batch->packets()) {
     for (int j = 1; j < ngates_; j++) {
-      bess::PacketRef newpkt(bess::PacketCopy(tocopy.handle()));
+      // The copy is the same packet on another gate, so the metadata written
+      // upstream is part of it; only the scratchpad starts empty.
+      bess::PacketRef newpkt(bess::PacketCopyWithMetadata(tocopy.handle()));
       if (newpkt.handle()) {
         EmitPacket(ctx, newpkt, gates_[j]);
       }
     }
-    EmitPacket(ctx, tocopy, 0);
+    // The configured list is the module's whole contract: the original is
+    // the first gate's packet, and the copies fill the rest. With no gate
+    // configured there is no list to read, so the historical gate 0 stands.
+    EmitPacket(ctx, tocopy, ngates_ > 0 ? gates_[0] : 0);
   }
 }
 

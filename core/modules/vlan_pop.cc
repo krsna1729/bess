@@ -11,7 +11,14 @@ void VLANPop::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::be16_t;
   using bess::utils::Ethernet;
 
+  int out_cnt = 0;
   for (bess::PacketRef pkt : batch->packets()) {
+    // The EtherType read is at offset 12: a shorter frame has no header to
+    // read, so it is dropped rather than read past its first segment.
+    if (unlikely(pkt.head_len() < sizeof(Ethernet))) {
+      EmitPacket(ctx, pkt, DROP_GATE);
+      continue;
+    }
     char *old_head = pkt.head_data<char *>();
     const be16_t tpid =
         reinterpret_cast<const Ethernet *>(old_head)->ether_type;
@@ -22,7 +29,9 @@ void VLANPop::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     if (tagged && pkt.adj(4)) {
       bess::arch::RemoveVlanTag(old_head);
     }
+    batch->handles()[out_cnt++] = pkt.handle();
   }
+  batch->set_cnt(out_cnt);
 
   RunNextModule(ctx, batch);
 }

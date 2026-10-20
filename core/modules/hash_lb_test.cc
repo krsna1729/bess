@@ -164,4 +164,35 @@ TEST(HashLbSettingsTest, AppliesLive) {
   EXPECT_FALSE(RequiresPausedWorkers("lb/settings"));
 }
 
+// Each mode hashes bytes at a fixed offset; a frame too short for them is
+// dropped, not read past its first segment.
+TEST(HashLbTest, AFrameShorterThanTheHashedHeaderIsDropped) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  auto none = [&](const std::vector<Bytes> &in) {
+    auto out = h.Run(lb, 0, in, kGates);
+    for (const auto &[g, pkts] : out) {
+      EXPECT_TRUE(pkts.empty()) << "gate " << g;
+    }
+  };
+
+  ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l2", {1, 2})));
+  none({Bytes(11)});  // shorter than the two MAC addresses
+
+  Bytes no_ip(33, 0);
+  no_ip[14] = 0x45;  // IPv4, IHL 5: a header, but the frame stops inside it
+  ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l3", {1, 2})));
+  none({no_ip});
+
+  Bytes no_ports(60, 0);
+  no_ports[14] = 0x4f;  // IPv4, IHL 15: 60 bytes of header, none of them here
+  ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l4", {1, 2})));
+  none({no_ports});
+
+  Bytes no_ports_short(37, 0);
+  no_ports_short[14] = 0x45;  // a 20-byte header, but not 4 bytes of ports
+  none({no_ports_short});
+}
+
 }  // namespace

@@ -283,6 +283,23 @@ class BasicFdb {
 
   // -- programming (control side of the owning worker) ----------------------------
 
+  // Reserves the slot a static entry needs, so the AddStatic that publishes
+  // it cannot be refused: a new key is inserted with value 0, which every
+  // lookup reads as a miss, and AddStatic then replaces it in place. False
+  // when the table has no slot. A caller that does not publish must Remove
+  // the key it reserved; an existing key needs no reservation.
+  bool ReserveStatic(BridgeDomainId domain, const MacAddress &mac) noexcept {
+    if (mac.multicast() || domain.value() >= max_domains_) {
+      return false;
+    }
+    [[maybe_unused]] auto guard = table_->Lock();
+    const uint64_t key = Word(MakeKey(domain, mac));
+    if (table_->Find(key) != Table::kNotFound) {
+      return true;
+    }
+    return table_->Reserve(key) != Table::kNotFound;
+  }
+
   // A static entry: never aged, never moved by learning.
   ProgramResult AddStatic(BridgeDomainId domain, const MacAddress &mac,
                           dataplane::InterfaceId interface) noexcept {

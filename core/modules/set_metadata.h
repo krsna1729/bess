@@ -67,6 +67,9 @@ class SetMetadata final : public Module {
   std::vector<struct Attr> attrs_;
   // Attributes without a valid offset (no reader downstream) are left out.
   std::vector<Op> ops_;
+  // The first-segment bytes a packet needs for every packet-sourced attr.
+  // A shorter packet is dropped before any op runs, so no op reads past it.
+  size_t min_packet_len_ = 0;
 };
 
 #endif  // BESS_MODULES_SETMETADATA_H_

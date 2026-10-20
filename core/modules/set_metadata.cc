@@ -77,7 +77,10 @@ CommandResponse SetMetadata::AddAttrOne(
     bess::utils::Copy(&value, attr.value_bin().data(), size);
   } else {
     offset = attr.offset();
-    if (offset < 0 || offset + size >= SNBUF_DATA) {
+    // Compare against the room left, not offset + size: the sum overflows int
+    // for an offset near INT_MAX and would pass the old check.
+    if (offset < 0 || static_cast<size_t>(offset) >= SNBUF_DATA ||
+        size >= SNBUF_DATA - static_cast<size_t>(offset)) {
       return CommandFailure(EINVAL, "invalid packet offset");
     }
     if (rshift_bytes * 8 != attr.rshift_bits()) {
@@ -220,25 +223,48 @@ int SetMetadata::OnEvent(bess::Event event) {
     return -ENOTSUP;
   }
   std::vector<Op> ops;
+  size_t min_packet_len = 0;
   for (size_t i = 0; i < attrs_.size(); i++) {
     const mt_offset_t mt_offset = attr_offset(i);
     if (bess::metadata::IsValidOffset(mt_offset)) {
       ops.push_back({Select(attrs_[i]), mt_offset, &attrs_[i]});
+      if (attrs_[i].offset >= 0) {
+        min_packet_len =
+            std::max(min_packet_len, static_cast<size_t>(attrs_[i].offset) +
+                                         attrs_[i].size);
+      }
     }
   }
   // PreResume also reaches a module whose worker is running (a resume of all
   // workers when some already run); the offsets are then the ones compiled,
-  // and the list a worker may be reading is left alone.
+  // and the list a worker may be reading is left alone. The bound is part of
+  // that same compiled configuration, so it is published only with a changed
+  // list -- writing it on every resume would race a running worker's read.
   const auto same = [](const Op &a, const Op &b) {
     return a.fn == b.fn && a.mt_offset == b.mt_offset && a.attr == b.attr;
   };
   if (!std::equal(ops.begin(), ops.end(), ops_.begin(), ops_.end(), same)) {
+    min_packet_len_ = min_packet_len;
     ops_ = std::move(ops);
   }
   return 0;
 }
 
 void SetMetadata::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  if (unlikely(min_packet_len_ > 0)) {
+    // A packet-source op reads a fixed offset; a frame whose first segment is
+    // shorter has no bytes to read there, so it is dropped before any op
+    // touches it (the ops themselves cannot remove packets mid-batch).
+    int out_cnt = 0;
+    for (bess::PacketRef pkt : batch->packets()) {
+      if (pkt.head_len() < min_packet_len_) {
+        EmitPacket(ctx, pkt, DROP_GATE);
+        continue;
+      }
+      batch->handles()[out_cnt++] = pkt.handle();
+    }
+    batch->set_cnt(out_cnt);
+  }
   for (const Op &op : ops_) {
     op.fn(batch, op);
   }

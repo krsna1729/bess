@@ -300,7 +300,12 @@ CommandResponse Vif::Add(const bess::pb::VifCommandAddArg &arg) {
 
   Interface iface;
   iface.id = arg.id();
-  iface.vlan = static_cast<uint16_t>(arg.vlan() & 0x0FFF);
+  // The resource codec refuses a VLAN above 12 bits; the init path is the
+  // same configuration and must refuse it too, not silently mask it to 0.
+  if (arg.vlan() > 0x0FFF) {
+    return CommandFailure(EINVAL, "invalid VLAN id: %u", arg.vlan());
+  }
+  iface.vlan = static_cast<uint16_t>(arg.vlan());
   iface.route_domain = arg.route_domain();
   iface.gate = static_cast<gate_idx_t>(arg.gate());
 
