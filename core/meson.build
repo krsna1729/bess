@@ -828,6 +828,7 @@ unit_test_sources = [
   'modules/queue_test.cc',
   'modules/round_robin_test.cc',
   'modules/vlan_push_test.cc',
+  'modules/vlan_pop_test.cc',
   'modules/mpls_pop_test.cc',
   'modules/dump_test.cc',
   'modules/worker_split_test.cc',
