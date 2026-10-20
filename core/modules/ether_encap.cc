@@ -25,31 +25,43 @@ CommandResponse EtherEncap::Init(
   return CommandSuccess();
 };
 
+bool EtherEncap::Encap(bess::PacketRef pkt,
+                       const Ethernet::Address &src,
+                       const Ethernet::Address &dst,
+                       bess::utils::be16_t ether_type) {
+  Ethernet *eth = static_cast<Ethernet *>(pkt.prepend(sizeof(*eth)));
+  if (unlikely(!eth)) {
+    return false;
+  }
+  eth->dst_addr = dst;
+  eth->src_addr = src;
+  eth->ether_type = ether_type;
+  return true;
+}
+
 void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const auto src_off = attr_offset(ATTR_R_ETHER_SRC);
   const auto dst_off = attr_offset(ATTR_R_ETHER_DST);
   const auto type_off = attr_offset(ATTR_R_ETHER_TYPE);
 
+  int out_cnt = 0;
   for (bess::PacketRef pkt : batch->packets()) {
-    Ethernet::Address ether_src;
-    Ethernet::Address ether_dst;
-    bess::utils::be16_t ether_type;
+    const Ethernet::Address ether_src =
+        get_attr_with_offset<Ethernet::Address>(src_off, pkt);
+    const Ethernet::Address ether_dst =
+        get_attr_with_offset<Ethernet::Address>(dst_off, pkt);
+    const bess::utils::be16_t ether_type =
+        get_attr_with_offset<bess::utils::be16_t>(type_off, pkt);
 
-    ether_src = get_attr_with_offset<Ethernet::Address>(src_off, pkt);
-    ether_dst = get_attr_with_offset<Ethernet::Address>(dst_off, pkt);
-    ether_type = get_attr_with_offset<bess::utils::be16_t>(type_off, pkt);
-
-    Ethernet *eth = static_cast<Ethernet *>(pkt.prepend(sizeof(*eth)));
-
-    // not enough headroom?
-    if (unlikely(!eth)) {
+    if (unlikely(!Encap(pkt, ether_src, ether_dst, ether_type))) {
+      // No headroom: forwarding the payload would put a frame on the wire
+      // without the header the graph configured. Drop and keep the rest.
+      EmitPacket(ctx, pkt, DROP_GATE);
       continue;
     }
-
-    eth->dst_addr = ether_dst;
-    eth->src_addr = ether_src;
-    eth->ether_type = ether_type;
+    batch->handles()[out_cnt++] = pkt.handle();
   }
+  batch->set_cnt(out_cnt);
 
   RunNextModule(ctx, batch);
 }
