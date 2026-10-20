@@ -3,6 +3,7 @@
 #ifndef BESS_ROUTE_L3_PACKET_H_
 #define BESS_ROUTE_L3_PACKET_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -325,6 +326,29 @@ inline size_t BuildArpReply(const ArpMessage &request, const utils::Ethernet::Ad
   return internal::WriteArp(out, request.sender_mac,
                             {utils::Arp::kReply, my_mac, request.target_ip,
                              request.sender_mac, request.sender_ip});
+}
+
+// Answers a local ARP request in place: rewrites the Ethernet frame into the
+// reply (my_mac, my_ip) would send to the requester, exactly as BuildArpReply
+// does, leaving any bytes beyond the ARP frame untouched. Returns false and
+// changes nothing when `frame` is not an IPv4-over-Ethernet request for
+// `my_ip`. The interface has already removed its VLAN tag, and the caller
+// owns the buffer. This is the local-responder half of the resolution
+// library; a VIF uses it instead of rewriting the ARP fields itself.
+inline bool AnswerArpRequest(std::span<uint8_t> frame,
+                             const utils::Ethernet::Address &my_mac,
+                             be32_t my_ip) noexcept {
+  const std::optional<ArpMessage> request = ParseArp(frame);
+  if (!request || request->opcode != utils::Arp::kRequest ||
+      request->target_ip != my_ip) {
+    return false;
+  }
+  std::array<uint8_t, kArpFrameSize> reply{};
+  if (BuildArpReply(*request, my_mac, reply) != kArpFrameSize) {
+    return false;
+  }
+  std::memcpy(frame.data(), reply.data(), kArpFrameSize);
+  return true;
 }
 
 }  // namespace bess::route

@@ -91,6 +91,20 @@ class NeighborTable {
     }
     return n->second.neighbor;
   }
+  // The neighbor `hop` is bound to, if it is bound at all. A resolver uses
+  // this to stop tracking a neighbor no next hop names any more.
+  std::optional<Key> BoundTo(NextHopId hop) const {
+    auto b = bindings_.find(hop);
+    if (b == bindings_.end()) {
+      return std::nullopt;
+    }
+    return b->second.key;
+  }
+  // Whether any next hop is bound to `key` now.
+  bool HasBindings(Key key) const {
+    auto n = neighbors_.find(key);
+    return n != neighbors_.end() && !n->second.hops.empty();
+  }
   size_t size() const noexcept { return neighbors_.size(); }
 
  private:
@@ -142,6 +156,22 @@ inline std::expected<void, RouteError> Publish(Router &router,
     }
   }
   return {};
+}
+
+// The same updates as operations on `router`'s "<router>/next_hops" resource,
+// for a caller that publishes them in one transaction through the
+// TransactionEngine (D-021): every bound next hop becomes visible together,
+// and a failed transaction leaves all of them as they were. The router must
+// be enrolled in that engine. One op per update, in the updates' order.
+inline std::vector<dataplane::Op> NextHopOps(
+    const Router &router,
+    std::span<const std::pair<NextHopId, NextHop>> updates) {
+  std::vector<dataplane::Op> ops;
+  ops.reserve(updates.size());
+  for (const auto &[id, hop] : updates) {
+    ops.push_back(router.SetNextHopOp(id, hop));
+  }
+  return ops;
 }
 
 }  // namespace bess::route

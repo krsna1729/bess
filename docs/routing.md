@@ -64,6 +64,7 @@ route exists and chose that hop (D-160).
 | `route/route_table.h` | the FIB: `LpmRouteTable` (rte_lpm or rte_fib, D-132), lock-free lookups, RCU publication, the `/0` route kept beside the structure |
 | `route/router.h` | the router: route domains, per-domain FIBs, next hops, next-hop groups, `Resolve`/`ResolveBatch`, the direct setters and the transactional resource (`Enroll`) |
 | `route/neighbor_table.h` | neighbor state keyed by (interface, address); `Bind`/`Update` return the next hops to republish |
+| `route/neighbor_resolver.h` | the IPv4 ARP state machine: solicitation, retries/backoff, aging, MAC change, failure/recovery, interface identity; returns frames and neighbor updates (`docs/neighbor-resolution.md`) |
 | `route/l3_packet.h` | packet mechanics: `DecrementTtl`, `FlowHash`, MTU, ICMPv4 errors, ARP build/parse |
 | `route/forward.h` | the IPv4 forwarding chain both callers share (D-157): `ResolveFrame` (read) and `WriteForwarded` (write) |
 | `route/lpm_resource.h` | one `LpmRouteTable` as a transaction resource (D-111): prefix → an opaque value whose meaning is the module's |
@@ -91,9 +92,11 @@ ports/vifs -> Router (domains, routes, groups, next hops) -> ports
 
 This is R1 written as a graph, and it is what replaces `IPLookup`. The chain decrements the TTL and fixes the
 checksum itself in this mode (D-155), so `UpdateTTL` has no place in this graph: wired as drawn above, it would
-decrement twice. The Router carries neighbor *state*, not resolution: nothing in the library sends an ARP or ND
-request (D-153) -- a graph's own resolution component resolves an address and republishes the affected next
-hops (`NeighborTable::Update` -> `Router::SetNextHop`), and what an unresolved neighbor means stays policy.
+decrement twice. The Router carries neighbor *state*, not resolution: the module itself sends no ARP or ND
+request (D-153). `route/neighbor_resolver.h` is the IPv4/ARP component (D-175): it emits the solicitations
+and the neighbor updates, and the graph sends the frames and republishes the affected next hops
+(`NeighborTable::Update` -> `Router::SetNextHop`), so what an unresolved neighbor means stays policy. IPv6 ND
+is not built.
 Routes, next hops and groups are written through the module's resources (`<router>/routes`, `/next_hops`,
 `/groups`) in transactions, or directly by an application. The first routes a router usually writes are its
 connected ones: an interface's own address implies the subnet reachable on it, and
@@ -145,9 +148,10 @@ than to grow a second prefix table.
 
 ## Where to look next
 
+- `docs/neighbor-resolution.md` — the resolver: state machine, identity, publication and what Vif keeps.
 - `docs/dataplane-tables.md` — the tables themselves, their capacities and their update costs.
 - `docs/decisions.md` — D-046 (domains), D-111 (the LPM resource), D-132 (the FIB backends), D-153 (address
   writes), D-155 (routing by destination), D-156 (groups), D-157 (the shared chain), D-158 (lazy domains),
-  D-160 (a hop that forwards nowhere).
+  D-160 (a hop that forwards nowhere), D-175 (neighbor resolution).
 - `examples/appliances/router/router_app.h` — R1, the reference application, and `examples/static_router` for
   the same code as a program without `bessd`.

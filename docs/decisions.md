@@ -11832,3 +11832,84 @@ deprecation windows and a blocking `buf breaking` check become meaningful.
   `bessctl/conf/samples/session_pipeline.yaml`, `core/fuzz/{resource_codec,control_transaction}_fuzz.cc`,
   `core/fuzz/seeds/{resource_codec,control_transaction}.py`, `tests/live/{stateful_modules,control_sdk}_test.cc`,
   `tests/perf/live_perf.cc`, `docs/{dataplane-tables,limits,routing}.md`.
+
+## D-175 IPv4 neighbor resolution: ARP resolver over the neighbor table and the expiry wheel
+
+**Status:** accepted (2026-10-21), experimental API. **Code:**
+`core/route/neighbor_resolver.h` (new, header-only, installed experimental),
+`core/route/l3_packet.h` (`AnswerArpRequest`), `core/route/neighbor_table.h`
+(`BoundTo`, `HasBindings`, `NextHopOps`), `core/modules/vif.cc`,
+`core/route/neighbor_resolver_test.cc`, `docs/neighbor-resolution.md`.
+
+**Context.** M15 delivered the route domain, FIB, next hops, next-hop groups,
+the control-side `NeighborTable` and the ARP packet helpers (D-065), but no
+component ran the protocol: `docs/routing.md` said so and D-065 recorded "a
+resolver module" as not done. `Vif` had one ad-hoc ARP rule -- an inline,
+field-by-field rewrite of a request for a local address into its reply -- and
+no solicitation, learning, aging, retries, MAC-change handling, failure state,
+or interface identity. Neighbor state had no timers.
+
+**Decision.**
+- **Library, not a module.** `NeighborResolver` is a single-writer control-side
+  state machine over `(InterfaceId, IPv4)` with an `ExpiryWheel`. It returns the
+  frames to send and the `NeighborTable::Updates` to publish; it owns no
+  packet, gate, Module, protobuf or worker dependency, like the rest of
+  `core/route`. `Bind` creates an entry and a next-hop binding; `OnArp`
+  consumes replies; `Poll` advances the timers; `ConfigureInterface` and
+  `RemoveInterface` change identity. Callers publish with `Publish` (one
+  `SetNextHop`) or `NextHopOps` + `TransactionEngine::Apply` (all-or-nothing).
+- **States and timing.** `kIncomplete -> kResolved -> kIncomplete` on aging,
+  `kIncomplete -> kUnreachable` after `max_probes`, and `kUnreachable ->
+  kIncomplete` on the retry interval. Retries back off from
+  `probe_interval` to `max_probe_interval`. All timing is in caller ticks
+  (`docs/expiry.md`); zero disables aging or retry. The wheel's capacity is the
+  neighbor capacity, one armed timer per entry, and each payload carries the
+  entry's arming serial so a record that outlives its entry cannot act on a
+  newer one. No second timer wheel.
+- **Interface/address identity.** `ConfigureInterface` assigns each interface a
+  generation. A reply is acted on only if the frame arrived on the entry's
+  interface, the entry's generation is current, the Ethernet destination is
+  the interface's MAC, the Ethernet source equals the ARP sender, the sender
+  address is the entry's key, the target address is the interface's current
+  own address, and the sender MAC is unicast. A reply never creates an entry.
+  A stale reply -- in flight across an address move, on another interface, or
+  for an unbound/rebound neighbor -- is ignored. `Unbind` stops resolution when
+  no next hop names the neighbor.
+- **Publication is transactional or per-object, never in-place.** The resolver
+  never mutates a `NextHop`; `NeighborTable::Update` builds new immutable
+  objects, and the dataplane reads one through `SlotTable`'s acquire load. The
+  direct path is one pointer store per hop; the transactional path is one
+  `Apply` for every bound hop (or none). A packet sees the old object or the
+  new one.
+- **Vif keeps its adapter role.** Its inline ARP rewrite is replaced by
+  `route::AnswerArpRequest` (`ParseArp` + `BuildArpReply`); VLAN stripping,
+  the (VLAN, MAC) demultiplexer, the local-address lookup, metadata and gates
+  stay. Existing Vif behavior is pinned unchanged.
+- **IPv6 ND not built.** The resolver's state machine, identity and publication
+  are address-family neutral; ND enters as another packet family over the same
+  entries when an IPv6 FIB exists.
+
+**Tests.** `core/route/neighbor_resolver_test.cc` (10/10): backoff/retry/
+failure/recovery sequence with frame contents; aging and repeated-reply
+refresh; MAC change republishing every bound hop with no route write;
+wrong-interface, moved-address, mismatched-source, unknown-sender, wrong-target
+and unusable sender-MAC rejection; configure/remove generations; rebind and
+stale-timer safety; all-or-nothing transactional publication with a rejected
+transaction leaving both hops unchanged; two concurrent RCU readers resolving
+while a writer alternates published MACs; and the in-place responder used by
+Vif. `modules_vif_test` 8/8 (including `VifTest.LocalArpResponder`) and
+`route_l3_test` 8/8 pass. The full fast-build suite (`meson test
+--no-rebuild`, 213 tests) passes except `live_conformance`'s Go half when no
+Go toolchain is on `PATH`; rerun with `MISE_GO_VERSION=1.27.2 mise exec --`,
+it passes. The build in this worktree was configured with
+`-Dbuild_benchmarks=false`: with benchmarks on, GCC 16 rejects the unrelated
+`core/utils/memory_backing_bench.cc` (`-Werror=aggressive-loop-optimizations`);
+no benchmark target contains this change.
+
+**Not done.** ND; ARP-request learning (a request is only answered locally);
+a module/application wiring that punts received ARP to the resolver; a
+per-worker sharded resolver (the library is explicitly single-writer).
+
+**Revisit when:** IPv6 ND is added, or a graph needs resolution on the packet
+path without a control-side hop (then sharding and a lock-free handoff are the
+design question, not another state machine).
