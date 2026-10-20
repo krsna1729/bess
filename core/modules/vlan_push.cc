@@ -60,17 +60,29 @@ void VLANPush::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   be32_t vlan_tag = vlan_tag_;
   be32_t qinq_tag = qinq_tag_;
 
+  int out_cnt = 0;
   for (bess::PacketRef pkt : batch->packets()) {
-    char *new_head;
-
-    if ((new_head = static_cast<char *>(pkt.prepend(4))) != nullptr) {
-      const be16_t tpid =
-          reinterpret_cast<const Ethernet *>(new_head + 4)->ether_type;
-      const be32_t tag =
-          (tpid == be16_t(Ethernet::Type::kVlan)) ? qinq_tag : vlan_tag;
-      bess::arch::InsertVlanTag(new_head, tag.raw_value());
+    // The tag decision reads the frame's EtherType: a frame too short to have
+    // one cannot be tagged, and must not leave untagged or read past its head.
+    if (unlikely(pkt.head_len() < sizeof(Ethernet))) {
+      EmitPacket(ctx, pkt, DROP_GATE);
+      continue;
     }
+    char *new_head = static_cast<char *>(pkt.prepend(4));
+    if (unlikely(new_head == nullptr)) {
+      // No headroom: the frame cannot carry the tag the graph asked for, so it
+      // is dropped rather than forwarded bare.
+      EmitPacket(ctx, pkt, DROP_GATE);
+      continue;
+    }
+    const be16_t tpid =
+        reinterpret_cast<const Ethernet *>(new_head + 4)->ether_type;
+    const be32_t tag =
+        (tpid == be16_t(Ethernet::Type::kVlan)) ? qinq_tag : vlan_tag;
+    bess::arch::InsertVlanTag(new_head, tag.raw_value());
+    batch->handles()[out_cnt++] = pkt.handle();
   }
+  batch->set_cnt(out_cnt);
 
   RunNextModule(ctx, batch);
 }

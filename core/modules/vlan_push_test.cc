@@ -85,4 +85,14 @@ TEST(VLANPushSettingsTest, RequiresPausedWorkers) {
   EXPECT_TRUE(RequiresPausedWorkers("vp/settings"));
 }
 
+// A frame too short to carry an Ethernet header has no EtherType to read; it
+// is dropped rather than tagged from past its head (or forwarded bare).
+TEST(VLANPushSettingsTest, AShortFrameIsDroppedNotTagged) {
+  ModuleHarness h;
+  Module *m = h.Create("VLANPush", Tci(1), "vp");
+  ASSERT_NE(nullptr, m);
+  auto out = h.Run(m, 0, {Bytes(13)}, {0});
+  EXPECT_TRUE(out[0].empty());
+}
+
 }  // namespace
