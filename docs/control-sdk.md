@@ -203,6 +203,20 @@ pipeline lists resources. Applying with that version as expected sends
 conflict (`kPipelineConflict`, `*PipelineConflictError`), nothing changed. A
 version without one checks only the pipeline generation.
 
+`ResetResources` empties map resources without reading their keys to the
+client: the request names one or more `<module>/<table>` resources, the
+control plane converges each to no entries and applies the erases in batches,
+under the same lock and worker-pause rules as an apply. Names are deduped; a
+resource the request does not name is untouched, and a singleton has no
+entries to clear and is a no-op. An empty list is `INVALID_ARGUMENT`, an
+unknown name is `NOT_FOUND` (nothing is erased), and a stale
+`expected_resource_generation` is `ABORTED` before any effect. The response
+lists the resources it emptied, `removed` (entries erased; 0 for an already
+empty table, which starts no transaction), the new `resource_generation` and
+the daemon epoch. This is what a sweeping controller uses for whole session
+tables; a table it must empty selectively (an ARP table shared with the
+deployment's own entry) is still read with `ReadResource`.
+
 The C++ `PipelineBuilder` lists contents: `Resource(name)` lists a resource
 (with no entry so far: the apply clears it), `Entry(name, key, value)` adds a
 map entry, `Setting(name, value)` gives a singleton its one value; on a
