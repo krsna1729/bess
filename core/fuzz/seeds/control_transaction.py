@@ -3,14 +3,16 @@
 
 Input: u64 epoch, then records [u8 ctl][u16 length][ApplyTransactionRequest]
 (ctl 0), or [u8 1] to apply the previous request again. Resources: "meters",
-"actions" (may name meters, and next hops that never register), "rules"
-(scope-snapshot capable), "hidden" (not bound), see the harness.
+"next_hops" (referenced by routes), "routes" (may name next hops, and groups
+that never register), "rules" (scope-snapshot capable), "hidden" (not bound),
+see the harness.
 """
 
 import struct
 
-from resource_codec import (action_key, action_value, any_, field_bin, field_int,
-                            ld, meter_key, rule_key, rule_value, sr_tcm, tr_tcm, u)
+from resource_codec import (any_, field_bin, field_int, ld, meter_key,
+                            next_hop_key, next_hop_value, route_key, route_value,
+                            rule_key, rule_value, sr_tcm, tr_tcm, u)
 
 EPOCH = struct.pack("<Q", 0x1234_5678_9ABC_DEF0)
 
@@ -38,13 +40,22 @@ def erase_meter(i):
     return op("meters", ("MeterIdKey", meter_key(i)), erase=True)
 
 
-def action(i, meter_id=0, next_hop=0):
-    return op("actions", ("ActionIdKey", action_key(i)),
-              ("ActionValue", action_value(meter_id, next_hop)))
+def next_hop(i, egress_gate=0):
+    return op("next_hops", ("RouterNextHopIdKey", next_hop_key(i)),
+              ("RouterNextHopValue", next_hop_value(egress_gate)))
 
 
-def erase_action(i):
-    return op("actions", ("ActionIdKey", action_key(i)), erase=True)
+def erase_next_hop(i):
+    return op("next_hops", ("RouterNextHopIdKey", next_hop_key(i)), erase=True)
+
+
+def route(ipv4, length, next_hop_id=0, group_id=0):
+    return op("routes", ("RouterRouteKey", route_key(ipv4, length)),
+              ("RouterRouteValue", route_value(next_hop_id, group_id)))
+
+
+def erase_route(ipv4, length):
+    return op("routes", ("RouterRouteKey", route_key(ipv4, length)), erase=True)
 
 
 def rule(a, b, gate):
@@ -80,7 +91,8 @@ def seq(*records):
 
 
 def seeds():
-    dependent = request([action(5, meter_id=7), meter(7)], request_id="t1")
+    dependent = request([route("10.0.0.0", 8, next_hop_id=7), next_hop(7)],
+                        request_id="t1")
     other = request([meter(8)], request_id="t1")
     return {
         "empty": EPOCH,
@@ -92,19 +104,24 @@ def seeds():
         "dependent_set": seq(rec(dependent)),
         "replay": seq(rec(dependent), REPEAT),
         "id_reused": seq(rec(dependent), rec(other)),
-        "erase_referenced": seq(rec(request([meter(7), action(5, meter_id=7)])),
-                                rec(request([erase_meter(7)])),
-                                rec(request([erase_meter(7), erase_action(5)]))),
-        "repoint_and_erase": seq(rec(request([meter(7), meter(8), action(5, meter_id=7)])),
-                                 rec(request([action(5, meter_id=8), erase_meter(7)]))),
-        "missing_reference": seq(rec(request([action(5, meter_id=9)], request_id="m"))),
-        "undeclared_reference": seq(rec(request([meter(1), action(2, next_hop=3)]))),
+        "erase_referenced": seq(rec(request([next_hop(7), route("10.0.0.0", 8, next_hop_id=7)])),
+                                rec(request([erase_next_hop(7)])),
+                                rec(request([erase_next_hop(7), erase_route("10.0.0.0", 8)]))),
+        "repoint_and_erase": seq(rec(request([next_hop(7), next_hop(8),
+                                              route("10.0.0.0", 8, next_hop_id=7)])),
+                                 rec(request([route("10.0.0.0", 8, next_hop_id=8),
+                                              erase_next_hop(7)]))),
+        "missing_reference": seq(rec(request([route("10.0.0.0", 8, next_hop_id=9)],
+                                            request_id="m"))),
+        "undeclared_reference": seq(rec(request([meter(1),
+                                                 route("10.0.0.0", 8, group_id=3)]))),
         "duplicate_key": seq(rec(request([meter(1), meter(2), meter(1, tr_tcm())]))),
         "erase_missing": seq(rec(request([meter(1), erase_meter(3)], request_id="e"))),
         "erase_with_value": seq(rec(request([op("meters", ("MeterIdKey", meter_key(1)),
                                                 ("MeterPolicyValue", sr_tcm()), erase=True)]))),
-        "wrong_key_type": seq(rec(request([op("meters", ("ActionIdKey", action_key(1)),
-                                              ("MeterPolicyValue", sr_tcm()))]))),
+        "wrong_key_type": seq(rec(request([op("meters", ("RouterNextHopIdKey",
+                                                         next_hop_key(1)),
+                                               ("MeterPolicyValue", sr_tcm()))]))),
         "missing_value": seq(rec(request([meter(1), op("meters", ("MeterIdKey", meter_key(2)))]))),
         "meter_id_zero": seq(rec(request([meter(0)]))),
         "no_profile": seq(rec(request([meter(1, b"")]))),
@@ -112,7 +129,7 @@ def seeds():
                                                          ld(2, meter_key(1)))]))),
         "truncated_key": seq(rec(request([op("meters", ("MeterIdKey", b"\x08"),
                                              ("MeterPolicyValue", sr_tcm()))]))),
-        "unknown_resource": seq(rec(request([op("next_hops", ("MeterIdKey", meter_key(1)))]))),
+        "unknown_resource": seq(rec(request([op("actions", ("MeterIdKey", meter_key(1)))]))),
         "hidden_resource": seq(rec(request([op("hidden", ("MeterIdKey", meter_key(1)),
                                                ("MeterPolicyValue", sr_tcm()))]))),
         "expected_generation": seq(rec(request([meter(1)], expected=0)),
@@ -132,14 +149,18 @@ def seeds():
                                                                   field_bin(b"\x00\x50"))),
                                                ("ExactMatchRuleValue", rule_value(gate=1)))]))),
         "rule_erase_missing": seq(rec(request([erase_rule(9, 9)]))),
-        "mixed": seq(rec(request([meter(1), meter(2), action(1, meter_id=1),
-                                  action(2, meter_id=2), action(3), rule(1, 1, 1)],
-                                 request_id="a")),
-                     rec(request([erase_action(1), erase_meter(1), action(2, meter_id=1),
-                                  meter(1)], request_id="b")),
-                     rec(request([erase_action(1), erase_action(2), erase_action(3),
-                                  erase_meter(1), erase_meter(2), erase_rule(1, 1)],
-                                 request_id="c")),
+        "mixed": seq(rec(request([meter(1), meter(2), next_hop(1), next_hop(2),
+                                  route("10.0.0.0", 8, next_hop_id=1),
+                                  route("10.1.0.0", 16, next_hop_id=2),
+                                  rule(1, 1, 1)], request_id="a")),
+                     rec(request([erase_route("10.0.0.0", 8), erase_meter(1),
+                                  route("10.1.0.0", 16, next_hop_id=1)],
+                                 request_id="b")),
+                     rec(request([erase_route("10.0.0.0", 8),
+                                  erase_route("10.1.0.0", 16),
+                                  erase_next_hop(1), erase_next_hop(2),
+                                  erase_meter(1), erase_meter(2),
+                                  erase_rule(1, 1)], request_id="c")),
                      REPEAT),
         "unparsable": seq(rec(b"\x0a\x05ab"), rec(request([meter(1)]))),
     }

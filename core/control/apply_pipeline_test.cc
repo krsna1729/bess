@@ -1841,7 +1841,6 @@ const std::map<std::string, std::string> &InitArgs() {
       {"WildcardMatch", R"({"fields": [{"offset": 26, "numBytes": 4}]})"},
       {"PortInc", R"({"port": "p0"})"},
       {"QueueInc", R"({"port": "p1"})"},
-      {"ActionTable", R"({"meters": "m_Meter/meters", "nextHops": "m_Router/next_hops"})"},
       // 60 bytes: Ethernet, IPv4 10.0.0.1 -> 10.0.0.2, UDP 1000 -> 2000.
       {"FlowGen",
        R"({"template": "AgAAAAACAgAAAAABCABFAAAuAAAAAEARAAAKAAABCgAAAgPoB9AAGgAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -1870,15 +1869,13 @@ TEST_F(ApplyPipelineTest, EveryDeclaredResourceReadsBackAsANoOp) {
     ASSERT_TRUE(control_plane_->CreatePort(port));
   }
 
-  // Classes whose argument names another module's resources come after it.
+  // Every class with resources, in a stable order.
   std::vector<std::pair<std::string, const ModuleBuilder *>> classes;
   for (const auto &[mclass, builder] : ModuleBuilder::all_module_builders()) {
     if (!builder.resource_tables().empty()) {
       classes.emplace_back(mclass, &builder);
     }
   }
-  std::stable_partition(classes.begin(), classes.end(),
-                        [](const auto &c) { return c.first != "ActionTable"; });
   std::vector<std::string> expected;
   for (const auto &[mclass, builder] : classes) {
     const google::protobuf::Descriptor *type =

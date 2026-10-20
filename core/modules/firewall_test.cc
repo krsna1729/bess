@@ -250,8 +250,8 @@ TEST(FirewallTest, RefusesRulesItCannotExpress) {
   EXPECT_EQ("", h.CreateError("Firewall", Rules({{.dst_port_low = 80, .dst_port_high = 90}})));
   EXPECT_EQ("", h.CreateError("Firewall", bess::pb::FirewallArg()));
 
-  // A rule that drops cannot name an action: the packet never reaches the
-  // ActionTable that would resolve it.
+  // A rule that drops cannot name an action: the packet never reaches a
+  // module that would resolve it.
   EXPECT_NE("", h.CreateError("Firewall", Rules({{.drop = true, .action_id = 7}})));
 }
 

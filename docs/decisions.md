@@ -11744,8 +11744,8 @@ free.
   destinations, an oversized record and a non-empty default without fields (both refused), and the fused
   path against the generic path; `SessionPipelineTest` covers rule replacement moving the reference ledger,
   a `RAW` reference naming its key verbatim, and the resource refusing the referent's erase;
-  `WildcardMatchResourceTest` round-trips record bytes; the session slice runs classifier results into
-  ActionTable's `action_id`.
+  `WildcardMatchResourceTest` round-trips record bytes; the session slice composes ExactMatch -> Meter ->
+  Router, with the rule's result fields naming both.
 
 ---
 
@@ -11780,3 +11780,37 @@ no remaining field or message was renumbered.
 
 **Revisit when** a 1.0 release is planned: that release states a wire policy, and only then do reservations,
 deprecation windows and a blocking `buf breaking` check become meaningful.
+
+## D-174 ActionTable is deleted; a classifier rule names its meter and next hop itself
+
+- **Decision.** Remove the `ActionTable` module, its `<module>/actions` resource and the
+  `ActionTableArg`, `ActionIdKey` and `ActionValue` messages. Nothing replaces the module: a rule's
+  result fields (D-172) already carry the ids and already declare the references the module's
+  resource supplied, so a session is `ExactMatch -> Meter -> Router` with the classifier writing
+  `meter_id` and `next_hop_id` from one result record.
+- **Why.** After D-172 the module's only remaining job was resolving a fixed `{meter, next hop}`
+  record into two metadata writes. That made every session pay a second module, a second table and a
+  second lookup to move bytes a rule could place directly, and it kept a module-specific action
+  model in the tree that the UPF and other appliances would have been pushed toward. The ledger
+  does not move: a `ResultField` that names `mt/meters` or `rt/next_hops` makes the rule a referrer,
+  so the engine still orders a rule after its referents, refuses a rule naming a missing entry, and
+  refuses erasing an entry a rule still names. A result field with no `reference` names nothing, as
+  D-172 documents.
+- **The slice.** `session_pipeline.yaml` and `session_pipeline_test.cc` now declare result fields
+  `meter_id` (offset 0, 4 bytes, `BE32` reference to `mt/meters`) and `next_hop_id` (offset 4,
+  4 bytes, `BE32` reference to `rt/next_hops`), and the graph is
+  `ExactMatch -> Meter -> Router`. The live session test writes meters, next hops and rules in one
+  transaction under traffic. A WildcardMatch writing a class field that an ExactMatch matches is a
+  controller composition the test shows, not a module dependency: the two classifiers share no
+  resource and neither names the other.
+- **What goes with it.** The module sources, the `core/meson.build` entry, the fuzz codec model and
+  seeds (the transaction fuzzer now exercises routes referencing next hops, keeping both the
+  declared-and-present and declared-but-unbound reference cases), the resource samples in the live
+  and performance tests, the limits and routing docs, and this tree's roadmap entries. The
+  `dataplane::ActionId` type stays: it is a `StrongId` the classifier and object-table libraries
+  use in their own contracts, not the module's id space.
+- **Code.** `core/modules/action_table.{h,cc}` (deleted), `protobuf/module_msg.proto`,
+  `core/meson.build`, `core/modules/session_pipeline_test.cc`,
+  `bessctl/conf/samples/session_pipeline.yaml`, `core/fuzz/{resource_codec,control_transaction}_fuzz.cc`,
+  `core/fuzz/seeds/{resource_codec,control_transaction}.py`, `tests/live/{stateful_modules,control_sdk}_test.cc`,
+  `tests/perf/live_perf.cc`, `docs/{dataplane-tables,limits,routing}.md`.

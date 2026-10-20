@@ -38,8 +38,9 @@ stopping traffic.
    that pause is scoped to the operation, so nothing resumes behind a caller's
    back. Keep workers quiescent for
    layout computation. Check `bess::metadata::IsValidOffset()` and drop or
-   take a default path rather than reading byte 0; ActionTable, Meter and
-   Router fail closed and report invalid offsets from `OnEvent(PreResume)`.
+   take a default path rather than reading byte 0; Meter, Router and a
+   classifier's result placement fail closed and report invalid offsets from
+   `OnEvent(PreResume)`.
    A module whose decision source is configuration rather than metadata has no
    offset to check: the Router's `ROUTE_MODE_DESTINATION` reads the packet's
    own destination instead, which is exactly why the mode is configuration and
@@ -225,19 +226,18 @@ rule whose range starts at 0 can match it. Masking is the `MaskedAddrPair16x2`
 kernel (`arch/masked_addr.h`); an IPv4 key is one 64-bit register, so its whole
 masking step is two 32-bit loads, a shift, an OR and an AND.
 
-**Actions.** A rule carries an `action_id` (an ActionId, D-141) beside its
-`drop` flag: the module writes it into the packet's `action_id` metadata, which
-an ActionTable downstream reads to select the action - its meter, its next hop
-- so a matched rule names an outcome rather than only "pass" or "drop". 0 means
-no action, and it is written on every pass so a stale id cannot reach a later
-lookup; a rule that both drops and names an action is refused (the packet never
-reaches the ActionTable that would resolve it). Two more shapes are refused
-rather than guessed at: a rule naming both families (one rule is one family,
-not a disjunction), and a port range the wrong way round. A *buffering* PDR is
-not a rule shape: the module forwards on the gate it arrived on, and the
-ActionTable entry the action selects names the next hop - including a packet
-store's input gate - so `firewall -> ActionTable -> packet_store` carries it,
-with the store's own `flows` entry holding the duration.
+**Actions.** A rule carries an `action_id` (D-141) beside its `drop` flag: the
+module writes it into the packet's `action_id` metadata, which a module
+downstream reads to select an action, so a matched rule names an outcome rather
+than only "pass" or "drop". 0 means no action, and it is written on every pass
+so a stale id cannot reach a later lookup; a rule that both drops and names an
+action is refused (the packet never reaches a module that would resolve it).
+Two more shapes are refused rather than guessed at: a rule naming both families
+(one rule is one family, not a disjunction), and a port range the wrong way
+round. A *buffering* PDR is not a rule shape: the module forwards on the gate
+it arrived on, and the module the action selects names the next hop -
+including a packet store's input gate - so `firewall -> packet_store` carries
+it, with the store's own `flows` entry holding the duration.
 
 **Sharding is the convention, not a workaround.** The key is a concrete struct,
 so a holder cannot add a dimension to it. A field that *partitions* the policy -
@@ -436,9 +436,9 @@ reference to something missing.
   references; a one-operation transaction costs about 307 ns against 44 ns
   for a direct write (P-core). Tables that do take part in references are
   written only through the engine.
-  `ExactMatch` in action mode writes its rules only through the engine
-  (`<name>/rules`): a write bypassing it would not update the
-  rule-to-action reference ledger. Gate mode keeps direct writes.
+  An `ExactMatch` whose result fields name resources writes its rules only
+  through the engine (`<name>/rules`): a write bypassing it would not update the
+  rule-to-referent ledger. A gate-only table keeps direct writes.
 - **The runtime has one engine**, `runtime().transactions()`. Call
   `Apply()` under the control-plane lock: the control plane, and a module's own
   resource writes (including an `edits_resources` action such as L2Forward's
@@ -476,11 +476,12 @@ reference to something missing.
   the TTL and the addresses; D-157), and either way writes a resolved hop's
   addresses into the frame's Ethernet header when it names both (D-032, D-153,
   D-155).
-- **ActionTable** registers `<module>/actions` (key: `EncodeKey(ActionId)`,
-  value: `{meter id, next hop id}`) and declares both the meter and the
-  next-hop resources: an action's value references them, so the engine orders
-  the meter and the next hop before the action, refuses an action naming a
-  missing one, and refuses the removal of one still named. D-032.
+- **A classifier rule's result fields are the referrers.** A `ResultField` may
+  name a resource (`mt/meters`, `rt/next_hops`) and how its bytes name an entry
+  (`RAW` or `BE32`); the rule resource declares those names, so the engine
+  orders a rule after the entries it names, refuses a rule naming a missing
+  one, and refuses the removal of one still named (D-172). That is the ledger a
+  separate action table used to supply.
 - **Meter** registers `<module>/meters` (key: `EncodeKey(MeterId)`, value: a
   profile specification) over a `MeterSetBuilder`: a transaction edits a
   private clone of the desired state, so unchanged meters keep their token
@@ -488,7 +489,7 @@ reference to something missing.
   the two-step removal SlotTable defines -- readable until the removal
   cascade reaches them, unpublishable until then. D-032.
   An erased meter stays in generations published by other upserts of the
-  same transaction until its removal stage; an old action may still name it.
+  same transaction until its removal stage; an old rule may still name it.
 - **Operational state:** the Meter module's `get_status` action reads the
   published generation without pausing workers (it is `THREAD_SAFE`). For each
   configured meter it returns the profile, the sharing mode, the TSC of the
@@ -505,7 +506,7 @@ reference to something missing.
   remain (a resource that references nothing may go with its keys), keys are
   referenced, a registered resource depends on it, or removal steps are
   pending; with workers paused, one call advances the cascade. A module that
-  may be referenced *or* hold references -- the four in the session slice --
+  may be referenced *or* hold references -- the three in the session slice --
   uses `ReleaseForTeardown` from `DeInit()` instead: declarations naming a
   released resource are left declared but unbound (a replacement module with
   the same name binds them again), live keys may leave, and dangling
@@ -530,8 +531,8 @@ reference to something missing.
 - Code: `core/dataplane/{resource.h, transaction_engine.{h,cc},
   slot_resource.h}`, `core/classifier/exact_rule_resource.h`,
   `core/classifier/masked_rule_resource.h`, `core/modules/exact_match.cc`,
-  `core/modules/wildcard_match.cc`, `core/modules/action_table.cc`,
-  `core/modules/meter.cc`, `core/modules/router.cc`, `core/route/router.cc`;
+  `core/modules/wildcard_match.cc`, `core/modules/meter.cc`,
+  `core/modules/router.cc`, `core/route/router.cc`;
   D-020 to D-024, D-032.
 
 ### `MeterSet` (metering)

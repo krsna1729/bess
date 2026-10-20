@@ -175,7 +175,7 @@ CommandResponse Firewall::ParseRules(
       return CommandFailure(
           EINVAL,
           "rule %d: a rule that drops cannot name an action - the packet "
-          "never reaches the ActionTable that would resolve it",
+          "never reaches a module that would resolve it",
           i);
     }
     parsed.action = rule.drop() ? kDrop : kPass;
@@ -210,7 +210,7 @@ int Firewall::OnEvent(bess::Event event) {
     } else {
       LOG(WARNING) << "Firewall '" << name() << "': nothing reads '"
                    << action_attr_name_
-                   << "' (an ActionTable with the same action_attr downstream "
+                   << "' (a module downstream with the same action_attr "
                       "would); packets carry no action id";
     }
   }
@@ -219,10 +219,10 @@ int Firewall::OnEvent(bess::Event event) {
 
 CommandResponse Firewall::Init(const bess::pb::FirewallArg &arg) {
   // D-141: the action a matching rule names goes to the packet's "action_id"
-  // metadata, which an ActionTable downstream reads. The attribute has an
-  // offset only when something reads it; without a reader there is nothing to
-  // write and no action to resolve. A graph with two action tables sets the
-  // name so each reads its own.
+  // metadata, which a module downstream reads. The attribute has an offset
+  // only when something reads it; without a reader there is nothing to write
+  // and no action to resolve. A graph with two readers sets the name so each
+  // reads its own.
   action_attr_configured_ = !arg.action_attr().empty();
   action_attr_name_ = arg.action_attr().empty() ? "action_id" : arg.action_attr();
   action_id_attr_ = AddMetadataAttr(action_attr_name_, sizeof(bess::utils::be32_t),
@@ -455,11 +455,10 @@ void Firewall::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const Published *published = rules_.Read();
   const FirewallTable *table =
       published == nullptr ? nullptr : published->table.get();
-  // D-141: a packet this policy passes carries the ActionId its rule names,
-  // so an ActionTable downstream resolves it; 0 when the rule names none, so a
-  // stale id cannot reach a later lookup. The offset is valid only when
-  // something reads the attribute (an ActionTable in the same graph); with no
-  // reader there is nothing to publish to.
+  // D-141: a packet this policy passes carries the action id its rule names,
+  // so a module downstream resolves it; 0 when the rule names none, so a stale
+  // id cannot reach a later lookup. The offset is valid only when something
+  // reads the attribute; with no reader there is nothing to publish to.
   const bess::metadata::mt_offset_t action_offset = attr_offset(action_id_attr_);
   const bool publish_action = bess::metadata::IsValidOffset(action_offset);
 

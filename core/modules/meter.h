@@ -20,7 +20,7 @@
 // transactional resource (G1.2b).
 //
 // Packet path: up to `levels` meter ids arrive in packet metadata (contiguous
-// be32 slots of one `meter_id` attribute that an ActionTable writes). At one
+// be32 slots of one `meter_id` attribute a classifier result writes). At one
 // TSC reading per batch, the module runs one colour-aware pass per level, in
 // order, over the packets the earlier levels let live: green and yellow
 // packets are charged to the later levels and a red packet stops, so a later

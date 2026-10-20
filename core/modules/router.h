@@ -22,7 +22,7 @@
 // wiring changed underneath it.
 //
 //  1. ROUTE_MODE_NEXT_HOP_ID (the default). The next-hop id arrives in packet
-//     metadata (a `next_hop_id` be32 attribute an ActionTable writes): the
+//     metadata (a `next_hop_id` be32 attribute a classifier result writes): the
 //     module resolves it -- one acquire load per id -- and the packet leaves
 //     on the gate that hop's egress names (in a module graph, the path to the
 //     egress port). This is the classifier's decision and the module executes

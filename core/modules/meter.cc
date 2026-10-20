@@ -227,9 +227,9 @@ class Meter::MetersResource final : public dataplane::Resource {
 };
 
 CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
-  // The level count sizes the attribute both this module and the ActionTable
-  // declare, and the framework refuses a size mismatch between them. Validate
-  // it before the resource is registered, so a refused module leaves nothing.
+  // The level count sizes the attribute this module declares, and the
+  // framework refuses a size mismatch with its writer. Validate it before the
+  // resource is registered, so a refused module leaves nothing.
   levels_ = arg.levels() == 0 ? 1 : arg.levels();
   if (levels_ * sizeof(bess::utils::be32_t) >
       bess::metadata::kMetadataAttrMaxSize) {
@@ -312,7 +312,7 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   // classifier result -- sets the name so each reads its own identity.
   id_attr_name_ = arg.id_attr().empty() ? "meter_id" : arg.id_attr();
   // One attribute, 4 bytes per level: every level's id is read from the same
-  // place the ActionTable wrote the list.
+  // place the writer placed the list.
   meter_id_attr_ = AddMetadataAttr(
       id_attr_name_, levels_ * sizeof(bess::utils::be32_t),
       bess::metadata::Attribute::AccessMode::kRead);
@@ -355,7 +355,7 @@ int Meter::OnEvent(bess::Event event) {
   // saying once, here, rather than never.
   if (!bess::metadata::IsValidOffset(attr_offset(meter_id_attr_))) {
     LOG(ERROR) << "Meter '" << name() << "': the '" << id_attr_name_
-               << "' attribute is unreadable (is an ActionTable writing it?); "
+               << "' attribute is unreadable (is anything writing it?); "
                   "dropping packets";
   }
   return 0;

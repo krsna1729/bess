@@ -86,9 +86,9 @@ size_t CurrentThreadHash() {
   return std::hash<std::thread::id>()(std::this_thread::get_id());
 }
 
-using ActionTable = ObjectTable<ActionId, TestAction>;
+using TestTable = ObjectTable<ActionId, TestAction>;
 
-std::unique_ptr<const ActionTable> BuildTable(int value, size_t capacity = 16) {
+std::unique_ptr<const TestTable> BuildTable(int value, size_t capacity = 16) {
   ObjectTableBuilder<ActionId, TestAction> builder(capacity);
   if (!builder.Emplace(ActionId(1), value)) {
     return nullptr;
@@ -98,7 +98,7 @@ std::unique_ptr<const ActionTable> BuildTable(int value, size_t capacity = 16) {
 
 // -- test-only task that holds a published generation ------------------------
 
-std::unique_ptr<RcuPtr<ActionTable>> g_published;
+std::unique_ptr<RcuPtr<TestTable>> g_published;
 std::atomic<bool> g_holding{false};
 std::atomic<bool> g_release{false};
 std::atomic<bool> g_done{false};
@@ -128,7 +128,7 @@ class TableHoldModule final : public Module {
     // Read the published table once for this invocation, hold it across a
     // publication, and resolve *after* the publication: the old generation must
     // still be valid and must still map the id to the old object.
-    const ActionTable *table = g_published->Read();
+    const TestTable *table = g_published->Read();
     if (table == nullptr) {
       return task_result{.block = false, .packets = 0, .bits = 0};
     }
@@ -183,7 +183,7 @@ class ObjectTableRcuTest : public ::testing::Test {
     g_release.store(false);
     g_done.store(false);
     g_observed.store(0);
-    g_published = std::make_unique<RcuPtr<ActionTable>>(*domain_);
+    g_published = std::make_unique<RcuPtr<TestTable>>(*domain_);
   }
 
   void TearDown() override {
@@ -253,7 +253,7 @@ TEST_F(ObjectTableRcuTest, WorkerHoldingAnOldGenerationKeepsItAlive) {
   const GracePeriod token = g_published->Publish(BuildTable(/*value=*/2));
 
   // A new reader sees the new generation immediately.
-  const ActionTable *active = g_published->Read();
+  const TestTable *active = g_published->Read();
   ASSERT_NE(nullptr, active);
   const TestAction *fresh = active->Lookup(ActionId(1));
   ASSERT_NE(nullptr, fresh);

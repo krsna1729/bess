@@ -4387,6 +4387,10 @@ rather than one call site).
        capacity bounds), 4 engine registration tests, and 4 live daemon tests
        (packet policing/steering, misses and unresolved hops, referenced
        removal and transactions under live traffic).
+     - **Superseded (D-173, 2026-10-20):** ActionTable was removed. The slice
+       is ExactMatch → Meter → Router, the rule's result fields write
+       `meter_id` and `next_hop_id` directly, and those fields declare the
+       references. The action id, the module and its messages no longer exist.
 
 122. **Standalone release link fix (D-043).**
      - **What:** the release job's `bessd` link failed (`_Unwind_Resume`
@@ -4401,8 +4405,8 @@ rather than one call site).
      - **What:** `framework/module_init_context.h` gives modules `resources()`,
        `rcu()` and `ports()` through `Module::init_context()`. All 17 non-test
        files in `core/modules` that called `runtime()` or included
-       `runtime/runtime_state.h` migrated, including ActionTable, Meter,
-       Router, ExactMatch and WildcardMatch. `check_includes.py` rejects
+       `runtime/runtime_state.h` migrated, including ActionTable (since
+       removed, D-174), Meter, Router, ExactMatch and WildcardMatch. `check_includes.py` rejects
        `runtime/` includes under `core/modules` (tests and benchmarks exempt);
        the header is part of the installed API (52 headers).
      - **Not done:** the context is still bound to the process runtime; per-
@@ -4413,8 +4417,8 @@ rather than one call site).
 124. **M4: wire codecs leave the dataplane Resource (D-044).**
      - **What:** `Resource::codec()/SetCodec()` removed; codecs are bound
        through `framework::ResourceBindings` (RAII `ResourceBinding` handles)
-       by ActionTable, Meter, Router (two resources), ExactMatch and
-       WildcardMatch; `DataplaneTransactions` reads them from the bindings.
+       by ActionTable (since removed, D-174), Meter, Router (two resources),
+       ExactMatch and WildcardMatch; `DataplaneTransactions` reads them from the bindings.
        The include checker rejects protobuf/gRPC includes in `core/dataplane`.
      - **Not done:** a protobuf-free `ResourceSchema` interface with a
        protobuf helper above it; the codec still takes protobuf type URLs.
@@ -7227,7 +7231,7 @@ classifier
 ActionId
   │
   ▼
-ActionTable[ActionId]
+action store[ActionId]
   │
   ▼
 immutable action state
@@ -8772,8 +8776,8 @@ the new public API. K1–K7 now provide the resource contracts G1 exposes.
 and Router have landed live update paths; generic Mode W operation rings stay
 consumer-driven (D-008, §31.3 item 2).
 - **G1.2b — dependency-safe transaction engine and resource providers: DONE**
-  (D-021–D-025, D-032). ExactMatch, WildcardMatch, Router, ActionTable and
-  Meter participate in dependency-ordered transactions. `ApplyTransaction`,
+  (D-021–D-025, D-032). ExactMatch, WildcardMatch, Router and Meter
+  participate in dependency-ordered transactions. `ApplyTransaction`,
   `GetTransaction` and `ListTransactionResources` provide the unary typed RPC,
   idempotency and resource discovery.
   Every mutating request (`ApplyTransaction`, `ApplyPipeline`) names the
@@ -8798,7 +8802,7 @@ consumer-driven (D-008, §31.3 item 2).
   and gets `VISIBILITY_SCOPE_SNAPSHOT`, or a typed refusal. No shipped module
   uses it yet; `VISIBILITY_ATOMIC` is deprecated and never sent.
 - **Other G1.2 follow-ons:** the live Mpps benchmark (D-027) covers unary
-  ExactMatch rule churn, not the full ActionTable→Meter→Router chain.
+  ExactMatch rule churn, not the full classifier→Meter→Router chain.
   Full-chain failure injection under traffic, `ReplaceScope` and production
   streaming/bulk RPC remain pending. The streaming proto in
   `protobuf/tests/ingress_bench.proto` is benchmark-only.
@@ -10062,7 +10066,7 @@ classifier
   ↓
 ActionId 4711
   ↓
-ActionTable[4711]
+action store[4711]
 ```
 
 Hardware:
@@ -10072,7 +10076,7 @@ NIC rte_flow
   ↓
 MARK 4711
   ↓
-ActionTable[4711]
+action store[4711]
 ```
 
 The continuation is identical.
@@ -10486,8 +10490,9 @@ with the addresses it arrived with.
 
 G1.1 pipeline desired state, the G1.2b dependency-safe transaction core and
 providers, and the G1.2c unary typed transaction RPC are implemented. D-032
-adds the generic ExactMatch → ActionTable → K5 Meter → Router session slice.
-Do not rebuild those pieces from the older G1.2 design below.
+adds the generic session slice, now ExactMatch → K5 Meter → Router with the
+classifier writing both ids from its rule result (D-174 removed the action
+table). Do not rebuild those pieces from the older G1.2 design below.
 
 Next, integrate `ScopeCell` into transaction publication so a supported
 `VISIBILITY_ATOMIC` scope switches one complete old/new policy version.
@@ -10984,10 +10989,10 @@ drive the design.
 
 | # | priority | deliverable | removes from OMEC | non-UPF consumers | status |
 |---|---|---|---|---|---|
-| 1 | P0 | **G1.2b transaction engine and providers**: reserve/publish, dependency ordering, reference safety, retirement (D-021); ExactMatch, WildcardMatch, Router, ActionTable and Meter (D-022–D-024, D-032) | manual ordering, best-effort rollback | routers, firewalls, NAT | complete |
+| 1 | P0 | **G1.2b transaction engine and providers**: reserve/publish, dependency ordering, reference safety, retirement (D-021); ExactMatch, WildcardMatch, Router and Meter (D-022–D-024, D-032) | manual ordering, best-effort rollback | routers, firewalls, NAT | complete |
 | 2 | P0 | **G1.2c unary transaction RPC:** `ApplyTransaction`, `GetTransaction`, `ListTransactionResources`, `request_id`, generations and daemon epoch (D-025) | per-rule RPC orchestration and timeout ambiguity | any controller | unary path complete; production streaming/bulk RPC and SDKs pending |
 | 3 | P0 | **Scope-snapshot publication:** one pointer store selects a complete old or new immutable policy version | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | `ScopeTable`/`ScopeResource` and `CONSISTENCY_SCOPE_SNAPSHOT` complete with two test applications (D-050); no shipped module consumes it yet |
-| 4 | P1 | **Generic session vertical slice** (D-032): action-mode ExactMatch → ActionTable → K5 Meter → Router, programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; full-chain prepare-failure and Mpps-under-update gate pending |
+| 4 | P1 | **Generic session vertical slice** (D-032): ExactMatch → K5 Meter → Router, with the meter and next-hop ids in the rule's result record (D-172, D-174), programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; full-chain prepare-failure and Mpps-under-update gate pending |
 | 5 | P0 | **External plugin package** (`bess-dev`) with an explicit header contract | vendored BESS fork | out-of-tree module authors | curated 51-header source API and installed-plugin checks complete (D-037, D-041); no C++ ABI promise |
 | 6 | P1 | **K3.8 range backend** (arbitrary source/destination ranges and precedence), differential against scalar reference | Go ternary expansion and Cartesian products | ACL, firewall rules | complete (D-038) |
 | 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance workarounds | VRFs, multi-tenant routers | complete (D-039; unified into `Router` by D-046) |
@@ -11156,11 +11161,12 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    - no global barrier, which is VPP's default for non-mp-safe handlers.
 6. **G1.2b/c core and unary RPC: DONE; scope snapshots done as a primitive (D-050).**
    D-021/D-025/D-032 and their tests establish dependency-safe transactions,
-   typed unary RPC, reference-safe ExactMatch/WildcardMatch/Router/ActionTable/
-   Meter providers, and the basic session vertical slice.
-   - The live daemon creates/removes the rule, action, meter, route and next
-     hop transactionally, then checks packets. Its traffic-under-update test
-     churns action-mode ExactMatch rules/actions, not the full meter/route chain.
+   typed unary RPC, reference-safe ExactMatch/WildcardMatch/Router/Meter
+   providers, and the basic session vertical slice.
+   - The live daemon creates/removes the rule, meter, route and next hop
+     transactionally, then checks packets. Its traffic-under-update test
+     churns ExactMatch rules and their meter/next-hop results, not the full
+     meter/route chain.
    - D-027's `live_transaction_bench.py` measures Mpps under unary ExactMatch
      rule churn; it is not a measurement of the full session chain.
    - Scope snapshots (M8, D-050): `ScopeTable<Version>`/`ScopeResource` with

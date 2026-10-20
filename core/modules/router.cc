@@ -419,7 +419,7 @@ int Router::OnEvent(bess::Event event) {
   }
   if (!bess::metadata::IsValidOffset(attr_offset(next_hop_id_attr_))) {
     LOG(ERROR) << "Router '" << name() << "': the '" << next_hop_attr_name_
-               << "' attribute is unreadable (is an ActionTable writing it?); "
+               << "' attribute is unreadable (is anything writing it?); "
                   "dropping packets";
   }
   return 0;
