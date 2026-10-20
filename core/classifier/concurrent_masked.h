@@ -72,11 +72,11 @@ class ConcurrentMaskedTable {
     int64_t priority;
     uint64_t sequence;  // command order: ties go to the later command
     uint16_t gate;      // the output gate a matching packet leaves on
-    // The ActionId of the action the rule names, 0 for none (D-141). It lives
+    // The rule's result record id, 0 for none (D-172). It lives
     // in the record, not in the packed value: bits 32-47 of the packed value
-    // keep carrying the gate, so a lookup that needs no action reads no
-    // record. Only a module with an action resource reads one.
-    uint32_t action_id;
+    // keep carrying the gate, so a lookup that needs no result reads no
+    // record. Only a module with result fields reads one.
+    uint32_t result_id;
   };
 
   // One lookup result: the winning rule's gate (out of the packed value) and
@@ -112,7 +112,7 @@ class ConcurrentMaskedTable {
   // -- writer ------------------------------------------------------------------
 
   UpsertResult Upsert(ConstBytes mask, ConstBytes value, int64_t priority,
-                      uint16_t gate, uint32_t action_id = 0);
+                      uint16_t gate, uint32_t result_id = 0);
   // False if no rule has exactly this (mask, value).
   bool Erase(ConstBytes mask, ConstBytes value);
   // Removes every rule and every tuple.
@@ -136,13 +136,13 @@ class ConcurrentMaskedTable {
     RuleId id = 0;        // the new record (upsert); 0 for an erase
     RuleId old = 0;       // the rule replaced or erased; 0 for a new rule
     uint16_t gate = 0;
-    uint32_t action_id = 0;
+    uint32_t result_id = 0;
   };
   std::expected<Prepared, UpsertResult> PrepareUpsert(ConstBytes mask,
                                                       ConstBytes value,
                                                       int64_t priority,
                                                       uint16_t gate,
-                                                      uint32_t action_id = 0);
+                                                      uint32_t result_id = 0);
   // nullopt if no rule has exactly this (mask, value).
   std::optional<Prepared> PrepareErase(ConstBytes mask, ConstBytes value);
   RuleId Commit(const Prepared &prepared) noexcept;
@@ -156,7 +156,7 @@ class ConcurrentMaskedTable {
 
   // The record a Match names (D-141). Records live in fixed chunks that are
   // never moved or freed while the table lives, so this is a plain indexed
-  // load -- the one a module with an action resource makes per winner.
+  // load -- the one a module with result fields makes per winner.
   const Rule &RuleAt(RuleId id) const noexcept { return Record(id); }
 
   // Visits every rule: fn(ConstBytes mask, ConstBytes value, const Rule &).
@@ -185,7 +185,7 @@ class ConcurrentMaskedTable {
   // Classifies `n` (<= kMaxBatch) keys packed at `stride` bytes. Writes
   // matches[i].gate and sets bit i for each key some rule matches; others are
   // left untouched. With `with_rule_id` (D-141), also writes the winning
-  // rule's id -- what a module with an action resource reads the record with;
+  // rule's id -- what a module with result fields reads the record with;
   // a gate-mode lookup does not store it, so it pays nothing for the field.
   uint64_t LookupBatch(ConstBytes keys, size_t stride, Match *matches, size_t n,
                        bool with_rule_id = true) const noexcept {

@@ -14,6 +14,8 @@
 
 #include "framework/resource_bindings.h"
 #include "dataplane/transaction_engine.h"
+#include "packet_reshape.h"
+#include "snbuf_layout.h"
 #include "utils/endian.h"
 #include "utils/format.h"
 
@@ -151,18 +153,93 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
   if (arg.has_default_gate()) {
     initial_default_gate_ = arg.default_gate();
   }
-  has_action_resource_ = !arg.action_resource().empty();
-  action_resource_ = arg.action_resource();
-  if (has_action_resource_) {
-    // D-141: the ActionId of a matching rule goes to the ActionTable in packet
-    // metadata. Added before the layout is built, so the plan bakes the field
-    // offsets this attribute introduces.
-    action_id_attr_ =
-        AddMetadataAttr("action_id", sizeof(bess::utils::be32_t),
-                        bess::metadata::Attribute::AccessMode::kWrite);
-    if (action_id_attr_ < 0) {
-      return CommandFailure(-action_id_attr_, "add_metadata_attr() failed");
+  result_specs_.clear();
+  result_reference_names_.clear();
+  result_value_size_ = 0;
+  for (const bess::pb::ResultField &field : arg.result_fields()) {
+    if (field.num_bytes() == 0) {
+      return CommandFailure(EINVAL, "a result field has zero bytes");
     }
+    if (field.value_offset() >
+        std::numeric_limits<uint32_t>::max() - field.num_bytes()) {
+      return CommandFailure(EINVAL, "a result field overflows its record");
+    }
+    ResultSpec spec;
+    spec.value_offset = field.value_offset();
+    spec.size = field.num_bytes();
+    spec.reference = field.reference();
+    spec.reference_be32 = field.reference_key() ==
+                          bess::pb::ResultField::BE32;
+    if (spec.reference_be32 && (spec.size != 4 || spec.reference.empty())) {
+      return CommandFailure(
+          EINVAL, "a BE32 reference is one 4-byte field naming a resource");
+    }
+    if (!spec.reference.empty() &&
+        std::find(result_reference_names_.begin(),
+                  result_reference_names_.end(),
+                  spec.reference) == result_reference_names_.end()) {
+      result_reference_names_.push_back(spec.reference);
+    }
+    if (field.destination_case() == bess::pb::ResultField::kAttrName) {
+      if (field.attr_name().empty()) {
+        return CommandFailure(EINVAL, "a result field has an empty attribute");
+      }
+      spec.by_attr = true;
+      spec.attr_name = field.attr_name();
+      spec.attr_id = AddMetadataAttr(
+          spec.attr_name, spec.size,
+          bess::metadata::Attribute::AccessMode::kWrite);
+      if (spec.attr_id < 0) {
+        return CommandFailure(-spec.attr_id, "%s: add_metadata_attr failed",
+                              spec.attr_name.c_str());
+      }
+    } else if (field.destination_case() == bess::pb::ResultField::kOffset) {
+      spec.by_attr = false;
+      spec.offset = field.offset();
+    } else {
+      return CommandFailure(
+          EINVAL, "a result field needs an attr_name or an offset");
+    }
+    result_value_size_ =
+        std::max(result_value_size_,
+                 static_cast<size_t>(spec.value_offset) + spec.size);
+    result_specs_.push_back(std::move(spec));
+  }
+  if (result_value_size_ > bess::classifier::RecordArena::kMaxRecordSize) {
+    return CommandFailure(
+        EINVAL, "result record is %zu bytes, the maximum is %zu",
+        result_value_size_, bess::classifier::RecordArena::kMaxRecordSize);
+  }
+  records_ = result_specs_.empty()
+                 ? nullptr
+                 : std::make_shared<bess::classifier::RecordArena>(
+                       std::max<size_t>(1, result_value_size_),
+                       init_context().rcu());
+  if (arg.has_default_result() && records_ == nullptr &&
+      !arg.default_result().empty()) {
+    return CommandFailure(EINVAL,
+                          "default_result needs at least one result field");
+  }
+  if (arg.has_default_result() && records_ != nullptr) {
+    if (arg.default_result().size() > result_value_size_) {
+      return CommandFailure(
+          EINVAL, "default_result is wider than the schema's record ("
+                      "%zu > %zu)",
+          arg.default_result().size(), result_value_size_);
+    }
+    std::vector<std::byte> record(result_value_size_, std::byte{0});
+    if (!arg.default_result().empty()) {
+      std::memcpy(record.data(), arg.default_result().data(),
+                  arg.default_result().size());
+    }
+    default_result_ = std::move(record);
+    default_record_id_ = records_->Allocate();
+    if (default_record_id_ == 0) {
+      return CommandFailure(ENOSPC, "the result arena is full");
+    }
+    bess::classifier::MutableBytes slot = records_->Record(default_record_id_);
+    std::memcpy(slot.data(), default_result_->data(),
+                default_result_->size());
   }
   GenerationPtr gen = Build(*table, default_gate, &err);
   if (gen == nullptr) {
@@ -186,30 +263,22 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
               return std::unexpected("invalid gate " +
                                      std::to_string(v.gate));
             }
-            if (!has_action_resource_ && v.action_id != 0) {
+            if (v.result.size() > result_value_size_) {
               return std::unexpected(
-                  "'action_id' needs an 'action_resource' on this "
-                  "WildcardMatch");
+                  "result is " + std::to_string(v.result.size()) +
+                  " bytes, the schema's record is " +
+                  std::to_string(result_value_size_));
             }
             return {};
           },
-          // A rule that names an action is ordered after it and refused while
-          // it is missing (G1.2b); action id 0 references nothing (D-141).
           .references = [this](const MaskedRuleResource::Value &v) {
-            if (!has_action_resource_ || v.action_id == 0) {
-              return std::vector<bess::dataplane::Reference>{};
-            }
-            return std::vector<bess::dataplane::Reference>{
-                {action_resource_,
-                 bess::dataplane::EncodeKey(
-                     bess::dataplane::ActionId(v.action_id))}};
+            return ResultReferences(v.result);
           },
-          .may_reference = has_action_resource_
-                               ? std::vector<std::string>{action_resource_}
-                               : std::vector<std::string>{}});
+          .records = records_,
+          .may_reference = result_reference_names_});
   // Typed keys and values over the RPC (D-025): values and masks per field,
   // checked and packed as the class does for a rule, and
-  // {priority, gate, action_id}.
+  // {priority, gate, result_id}.
   binding_ = init_context().codecs().Bind(
       *resource_,std::make_shared<bess::framework::TypedCodec<
                           bess::pb::WildcardMatchRuleKey,
@@ -238,13 +307,18 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
           return std::unexpected("invalid gate " +
                                  std::to_string(value.gate()));
         }
-        if (!has_action_resource_ && value.action_id() != 0) {
+        if (value.result().size() > result_value_size_) {
           return std::unexpected(
-              "'action_id' needs an 'action_resource' on this WildcardMatch");
+              "result is " + std::to_string(value.result().size()) +
+              " bytes, the schema's record is " +
+              std::to_string(result_value_size_));
         }
         return std::any(MaskedRuleResource::Value{
             value.priority(), static_cast<uint16_t>(value.gate()),
-            has_action_resource_ ? value.action_id() : 0});
+            std::vector<std::byte>(
+                reinterpret_cast<const std::byte *>(value.result().data()),
+                reinterpret_cast<const std::byte *>(value.result().data()) +
+                    value.result().size())});
       },
       // Every rule as a client sends it: per-field value and mask bytes,
       // full field width (the table holds them canonical), as the resource
@@ -271,7 +345,12 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
               }
               value.set_priority(r.priority);
               value.set_gate(r.gate);
-              value.set_action_id(r.action_id);
+              if (records_ != nullptr) {
+                const bess::classifier::ConstBytes record =
+                    records_->Lookup(r.result_id);
+                value.set_result(reinterpret_cast<const char *>(record.data()),
+                                 record.size());
+              }
               visit(key, value);
             });
       }));
@@ -328,21 +407,22 @@ void WildcardMatch::DeInit() {
   if (resource_ == nullptr) {
     return;
   }
-  auto &engine = init_context().resources();
-  if (has_action_resource_) {
-    // In action mode the rules reference an ActionTable, so they may leave
-    // with live keys while the graph is disconnected around them: the order
-    // modules are destroyed in must not decide whether a pipeline can be torn
-    // down (D-141).
+  if (!result_reference_names_.empty()) {
+    // A rule's result field names entries in other resources, so the rules
+    // may leave with live keys while the graph is disconnected around them:
+    // the order modules are destroyed in must not decide whether a pipeline
+    // can be torn down (D-172).
     const std::string name = resource_->name();
     auto released =
-        engine.ReleaseForTeardown(std::span<const std::string>(&name, 1));
+        init_context().resources().ReleaseForTeardown(
+            std::span<const std::string>(&name, 1));
     CHECK(released) << released.error();
   } else {
     // Cannot be refused: the rules reference nothing and nothing may
     // reference them; freed rule ids still in the removal cascade complete
     // here (workers are paused).
-    auto unregistered = engine.Unregister(resource_->name());
+    auto unregistered =
+        init_context().resources().Unregister(resource_->name());
     CHECK(unregistered) << unregistered.error();
   }
   binding_.Reset();
@@ -466,6 +546,50 @@ WildcardMatch::NewTable() const {
       std::move(*table));
 }
 
+std::vector<bess::dataplane::Reference> WildcardMatch::ResultReferences(
+    const std::vector<std::byte> &bytes) const {
+  std::vector<bess::dataplane::Reference> refs;
+  // Decode from the zero-padded record, the same bytes a later
+  // replacement/erase reads from the arena (D-172).
+  std::vector<std::byte> record(result_value_size_, std::byte{0});
+  if (!bytes.empty()) {
+    std::memcpy(record.data(), bytes.data(),
+                std::min(bytes.size(), record.size()));
+  }
+  for (const ResultSpec &spec : result_specs_) {
+    if (spec.reference.empty() ||
+        spec.value_offset + spec.size > record.size()) {
+      continue;
+    }
+    bool zero = true;
+    for (uint32_t i = 0; i < spec.size; i++) {
+      if (record[spec.value_offset + i] != std::byte{0}) {
+        zero = false;
+        break;
+      }
+    }
+    if (zero) {
+      continue;
+    }
+    if (spec.reference_be32) {
+      const auto *at = record.data() + spec.value_offset;
+      const uint32_t b0 = static_cast<uint32_t>(at[0]);
+      const uint32_t b1 = static_cast<uint32_t>(at[1]);
+      const uint32_t b2 = static_cast<uint32_t>(at[2]);
+      const uint32_t b3 = static_cast<uint32_t>(at[3]);
+      const uint32_t id = (b0 << 24U) | (b1 << 16U) | (b2 << 8U) | b3;
+      refs.push_back({spec.reference, bess::dataplane::EncodeKey(id)});
+    } else {
+      refs.push_back(
+          {spec.reference,
+           std::string(reinterpret_cast<const char *>(record.data() +
+                                                      spec.value_offset),
+                       spec.size)});
+    }
+  }
+  return refs;
+}
+
 WildcardMatch::GenerationPtr WildcardMatch::Build(
     std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table,
     gate_idx_t default_gate, Error *err) {
@@ -485,9 +609,60 @@ WildcardMatch::GenerationPtr WildcardMatch::Build(
   }
   CHECK_EQ(layout.key_size, table->key_len());
 
-  return std::make_unique<Generation>(
+  std::optional<bess::classifier::ResultPlan> result;
+  std::vector<size_t> result_offsets;
+  bool needs_metadata = false;
+  for (const ResultSpec &spec : result_specs_) {
+    needs_metadata = needs_metadata || spec.by_attr;
+  }
+  if (records_ != nullptr && !metadata_ready_ && needs_metadata) {
+    // Metadata offsets are resolved at PreResume; see ExactMatch::Build.
+    result_offsets.assign(result_specs_.size(), kInvalidOffset);
+  } else if (records_ != nullptr) {
+    bess::classifier::RuntimeClassifierSchema schema;
+    schema.key_size = layout.key_size;
+    schema.value_size = result_value_size_;
+    schema.bounds = bess::classifier::BoundsPolicy::kCheck;
+    for (const ResultSpec &spec : result_specs_) {
+      bess::classifier::RuntimeResultField field;
+      field.value_offset = spec.value_offset;
+      field.size = spec.size;
+      if (spec.by_attr) {
+        const bess::metadata::mt_offset_t offset =
+            attr_offset(static_cast<size_t>(spec.attr_id));
+        if (!bess::metadata::IsValidOffset(offset)) {
+          *err = std::make_pair(
+              EINVAL, "result field '" + spec.attr_name +
+                          "' has no readable metadata offset");
+          return nullptr;
+        }
+        field.destination = bess::classifier::BufferKind::kMetadata;
+        field.destination_offset =
+            static_cast<size_t>(static_cast<uint8_t>(offset));
+        result_offsets.push_back(static_cast<size_t>(
+            static_cast<uint8_t>(offset)));
+      } else {
+        field.destination = bess::classifier::BufferKind::kPacket;
+        field.destination_offset = spec.offset;
+        result_offsets.push_back(spec.offset);
+      }
+      schema.result_fields.push_back(std::move(field));
+    }
+    auto compiled = bess::classifier::ResultPlan::Compile(schema);
+    if (!compiled) {
+      *err = std::make_pair(EINVAL, "result plan: " +
+                                        compiled.error().message);
+      return nullptr;
+    }
+    result = std::move(*compiled);
+  }
+  auto gen = std::make_unique<Generation>(
       default_gate, std::move(*plan), std::move(table), layout.key_size,
-      /*extraction_valid=*/true, std::move(layout.baked_offsets));
+      /*extraction_valid=*/true, std::move(layout.baked_offsets),
+      std::move(result), std::move(result_offsets), records_);
+  gen->result_plan_deferred = !result_specs_.empty() && !metadata_ready_ &&
+                              needs_metadata;
+  return gen;
 }
 
 WildcardMatch::GenerationPtr WildcardMatch::BuildDegraded(
@@ -512,26 +687,36 @@ WildcardMatch::GenerationPtr WildcardMatch::BuildDegraded(
 
   return std::make_unique<Generation>(
       default_gate, std::move(*plan), std::move(table), layout.key_size,
-      /*extraction_valid=*/false, std::move(layout.baked_offsets));
+      /*extraction_valid=*/false, std::move(layout.baked_offsets),
+      std::nullopt,
+      std::vector<size_t>(result_specs_.size(), kInvalidOffset), records_);
 }
 
 void WildcardMatch::RefreshForResume() {
+  metadata_ready_ = true;
   const Generation *current = published_.Read();
   if (current == nullptr) {
     return;  // not initialized (or already deinitialized)
   }
 
-  // An action resource needs a readable "action_id" attribute: the packet path
-  // writes it on every hit and fails closed without it. Reported here, where a
-  // resume can still be diagnosed.
-  if (has_action_resource_ &&
-      !bess::metadata::IsValidOffset(attr_offset(action_id_attr_))) {
-    LOG(ERROR) << "WildcardMatch '" << name()
-               << "': the 'action_id' attribute is unreadable (is an "
-                  "ActionTable reading it?): matches take the default gate";
-  }
-
   bool changed = false;
+  for (size_t i = 0; i < result_specs_.size(); i++) {
+    const ResultSpec &spec = result_specs_[i];
+    const size_t now =
+        spec.by_attr
+            ? static_cast<size_t>(attr_offset(
+                  static_cast<size_t>(spec.attr_id)))
+            : kInvalidOffset;
+    if (i >= current->baked_result_offsets.size() ||
+        current->baked_result_offsets[i] != now) {
+      LOG(ERROR) << "WildcardMatch '" << name()
+                 << "': a result field's destination moved (another module "
+                    "replaced its attribute): results take their configured "
+                    "offset or stay zero";
+      changed = true;
+      break;
+    }
+  }
   for (size_t i = 0; i < field_specs_.size(); i++) {
     const FieldSpec &spec = field_specs_[i];
     size_t now;
@@ -550,7 +735,7 @@ void WildcardMatch::RefreshForResume() {
       break;
     }
   }
-  if (!changed) {
+  if (!changed && !current->result_plan_deferred) {
     return;
   }
 
@@ -673,8 +858,8 @@ Error WildcardMatch::RuleFromPb(
 // ClassifyBatch: calls emit(i, gate) once per packet, in order. `emit` is
 // inlined into each caller.
 template <typename Emit>
-inline void WildcardMatch::Classify(bess::PacketBatch *batch,
-                                    Emit &&emit) const {
+inline void WildcardMatch::Classify(bess::PacketBatch *batch, Emit &&emit,
+                                    uint64_t *out_hits) const {
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the generation mid-batch nor free it under this lookup.
   const Generation *gen = published_.Read();
@@ -734,56 +919,111 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch,
       bess::classifier::ConstBytes(keys.data(),
                                    static_cast<size_t>(cnt) * key_size),
       key_size, matches.data(), static_cast<size_t>(cnt),
-      has_action_resource_);
+      records_ != nullptr);
   hits &= valid;
+  if (out_hits != nullptr) {
+    *out_hits = hits;
+  }
 
   for (int i = 0; i < cnt; i++) {
     const bool hit = (hits & (uint64_t{1} << i)) != 0;
     const gate_idx_t gate = hit ? matches[i].gate : default_gate;
-    // D-141: an action id lives in the rule's record, so only a module with an
-    // action resource reads one, and only for a winner. A miss delivers 0, so
-    // a packet cannot carry an id from an earlier lookup.
-    const uint32_t action_id =
-        hit && has_action_resource_
-            ? gen->table->RuleAt(matches[i].rule_id).action_id
+    // A rule's record id lives in the rule record, so only a module with
+    // result fields reads one, and only for a winner. A miss reports 0.
+    const uint32_t result_id =
+        hit && records_ != nullptr
+            ? gen->table->RuleAt(matches[i].rule_id).result_id
             : 0;
-    emit(i, gate, action_id);
+    emit(i, gate, result_id);
   }
 }
 
 void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
-  const bess::metadata::mt_offset_t offset =
-      has_action_resource_ ? attr_offset(action_id_attr_)
-                           : bess::metadata::mt_offset_t{-1};
-  if (has_action_resource_ && !bess::metadata::IsValidOffset(offset)) {
-    // Fail closed: a match whose action id cannot be delivered would reach the
-    // action table with a stale id, so every packet takes the default gate.
-    // RefreshForResume() is where this is reported.
-    RunChooseModule(ctx, published_.Read()->default_gate, batch);
+  const Generation *gen = published_.Read();
+  const gate_idx_t default_gate = gen->default_gate;
+  if (!gen->extraction_valid) {
+    RunChooseModule(ctx, default_gate, batch);
     return;
   }
-  if (has_action_resource_) {
-    uint32_t action_ids[bess::PacketBatch::kMaxBurst];
-    ClassifyBatch(batch, gates, action_ids);
-    for (int i = 0; i < batch->cnt(); i++) {
-      _set_attr_with_offset<bess::utils::be32_t>(
-          offset, batch->packet(i), bess::utils::be32_t(action_ids[i]));
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  if (!gen->result) {
+    Classify(batch, [&](int i, gate_idx_t gate, uint32_t) {
+      gates[i] = gate;
+    });
+    EmitBatch(ctx, batch, gates);
+    return;
+  }
+
+  // Placement runs for every row that has a record: a hit's own, and the
+  // configured default record on a miss. A miss without one writes nothing.
+  uint32_t record_ids[bess::PacketBatch::kMaxBurst];
+  uint64_t hits = 0;
+  Classify(
+      batch,
+      [&](int i, gate_idx_t gate, uint32_t result_id) {
+        gates[i] = gate;
+        record_ids[i] = result_id;
+      },
+      &hits);
+  for (int i = 0; i < batch->cnt(); i++) {
+    if ((hits & (uint64_t{1} << static_cast<unsigned>(i))) == 0) {
+      record_ids[i] = default_record_id_;
     }
-  } else {
-    // Gate mode (D-141): no action id to deliver, so the batch is classified
-    // into gates alone -- the record read and the id store do not happen.
-    ClassifyBatch(batch, gates, nullptr);
+  }
+
+  const int cnt = batch->cnt();
+  const bool packet_fields = gen->result->required_packet_bytes() != 0;
+  std::array<bess::classifier::ConstBytes, bess::PacketBatch::kMaxBurst> values;
+  std::array<bess::classifier::DestinationView, bess::PacketBatch::kMaxBurst>
+      destinations;
+  int rows = 0;
+  for (int i = 0; i < cnt; i++) {
+    if (record_ids[i] == 0) {
+      continue;
+    }
+    bess::PacketRef pkt = batch->packet(i);
+    bess::classifier::MutableBytes packet_view;
+    if (packet_fields) {
+      bess::PacketHandle handle = pkt.handle();
+      if (!bess::packet::EnsureWritable(handle)) {
+        gates[i] = DROP_GATE;
+        continue;
+      }
+      batch->handles()[i] = handle;
+      pkt = bess::PacketRef(handle);
+      if (pkt.data_len() < gen->result->required_packet_bytes()) {
+        gates[i] = DROP_GATE;
+        continue;
+      }
+      packet_view = bess::classifier::MutableBytes(
+          pkt.head_data<std::byte *>(), static_cast<size_t>(pkt.data_len()));
+    }
+    values[rows] = gen->records->Lookup(
+        static_cast<bess::classifier::RecordArena::Id>(record_ids[i]));
+    destinations[rows] = bess::classifier::DestinationView{
+        .packet = packet_view,
+        .metadata = bess::classifier::MutableBytes(
+            reinterpret_cast<std::byte *>(pkt.metadata()), SNBUF_METADATA)};
+    rows++;
+  }
+  if (rows > 0 &&
+      !gen->result->ApplyBatch(
+          std::span<const bess::classifier::ConstBytes>(
+              values.data(), static_cast<size_t>(rows)),
+          std::span<const bess::classifier::DestinationView>(
+              destinations.data(), static_cast<size_t>(rows)))) {
+    RunChooseModule(ctx, default_gate, batch);
+    return;
   }
   EmitBatch(ctx, batch, gates);
 }
 
 void WildcardMatch::ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
-                                  uint32_t *action_ids) const {
-  Classify(batch, [&](int i, gate_idx_t gate, uint32_t action_id) {
+                                  uint32_t *result_ids) const {
+  Classify(batch, [&](int i, gate_idx_t gate, uint32_t result_id) {
     gates[i] = gate;
-    if (action_ids != nullptr) {
-      action_ids[i] = action_id;
+    if (result_ids != nullptr) {
+      result_ids[i] = result_id;
     }
   });
 }

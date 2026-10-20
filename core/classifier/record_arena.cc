@@ -104,16 +104,41 @@ void RecordArena::Abort(Id id) noexcept {
   }
 }
 
+void RecordArena::ReserveRetirement(size_t count) {
+  // Count outstanding reservations too: two transactions may each reserve one
+  // slot before either Retire() enqueues, and the queue must grow once.
+  const size_t pending = retiring_.size() + retirement_reserved_;
+  retiring_.reserve(pending + count);
+  retirement_reserved_ += count;
+}
+
+void RecordArena::CancelRetirement(size_t count) noexcept {
+  retirement_reserved_ =
+      retirement_reserved_ > count ? retirement_reserved_ - count : 0;
+}
+
 void RecordArena::Retire(Id id) {
   if (id != 0) {
+    if (retirement_reserved_ > 0) {
+      retirement_reserved_--;
+    }
     retiring_.push_back({id, domain_.StartGracePeriod()});
   }
 }
 
 void RecordArena::Reclaim() {
-  while (!retiring_.empty() && domain_.IsComplete(retiring_.front().token)) {
-    Free(retiring_.front().id);
-    retiring_.pop_front();
+  while (retiring_head_ < retiring_.size() &&
+         domain_.IsComplete(retiring_[retiring_head_].token)) {
+    Free(retiring_[retiring_head_].id);
+    retiring_head_++;
+  }
+  if (retiring_head_ == retiring_.size()) {
+    retiring_.clear();
+    retiring_head_ = 0;
+  } else if (retiring_head_ >= 1024) {
+    retiring_.erase(retiring_.begin(),
+                    retiring_.begin() + static_cast<ptrdiff_t>(retiring_head_));
+    retiring_head_ = 0;
   }
 }
 

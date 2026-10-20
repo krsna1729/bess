@@ -64,6 +64,25 @@ struct Action {
   MeterId meter;
 };
 
+// The rule's action id travels in the result record (D-172), not in the gate:
+// the id space is 32-bit and the gate is 16-bit.
+bess::classifier::RuleResult ActionRule(uint32_t id) {
+  return {static_cast<bess::gate_idx_t>(DROP_GATE),
+          {static_cast<std::byte>((id >> 24U) & 0xffU),
+           static_cast<std::byte>((id >> 16U) & 0xffU),
+           static_cast<std::byte>((id >> 8U) & 0xffU),
+           static_cast<std::byte>(id & 0xffU)}};
+}
+uint32_t RuleAction(const bess::classifier::RuleResult &v) {
+  if (v.bytes.size() != 4) {
+    return 0;
+  }
+  return (static_cast<uint32_t>(v.bytes[0]) << 24U) |
+         (static_cast<uint32_t>(v.bytes[1]) << 16U) |
+         (static_cast<uint32_t>(v.bytes[2]) << 8U) |
+         static_cast<uint32_t>(v.bytes[3]);
+}
+
 void BM_SessionEstablishRelease(benchmark::State &state) {
   const uint32_t sessions = static_cast<uint32_t>(state.range(0));
   bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
@@ -71,6 +90,7 @@ void BM_SessionEstablishRelease(benchmark::State &state) {
       8, ConcurrentExactTable::CapacityFor(sessions * 2 + 64), domain);
   SlotTable<MeterId, Meter> meters(sessions * 2 + 2);
   SlotTable<ActionId, Action> actions(sessions * 2 + 2);
+  bess::classifier::RecordArena records(4, domain);
   SlotResource<MeterId, Meter> meters_res("meters", meters);
   SlotResource<ActionId, Action> actions_res(
       "actions", actions,
@@ -80,11 +100,11 @@ void BM_SessionEstablishRelease(benchmark::State &state) {
       {"meters"});
   ExactRuleResource rules_res(
       "rules", *table,
-      [](uint64_t v) {
+      [](const bess::classifier::RuleResult &v) {
         return std::vector<Reference>{
-            {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+            {"actions", EncodeKey(ActionId(RuleAction(v)))}};
       },
-      {"actions"});
+      {"actions"}, &records);
   TransactionEngine engine(domain);
   if (!engine.Register(&meters_res)) {
     state.SkipWithError("resource registration failed");
@@ -115,9 +135,9 @@ void BM_SessionEstablishRelease(benchmark::State &state) {
     establish[3] = Op::Upsert("actions", EncodeKey(ActionId(id + 1)),
                               std::any(Action{2, MeterId(id + 1)}));
     establish[4] = Op::Upsert("rules", EncodeKey(key * 2),
-                              std::any(uint64_t{id}));
+                              std::any(ActionRule(id)));
     establish[5] = Op::Upsert("rules", EncodeKey(key * 2 + 1),
-                              std::any(uint64_t{id + 1}));
+                              std::any(ActionRule(id + 1)));
     if (engine.Apply(establish).outcome !=
         TransactionEngine::Outcome::kApplied) {
       state.SkipWithError("establish rejected");
@@ -161,7 +181,7 @@ void BM_SingleRule(benchmark::State &state) {
     const uint64_t key = k++ % 65536;
     const auto bytes = EncodeKey(key);
     if (via_engine) {
-      add[0] = Op::Upsert("rules", bytes, std::any(uint64_t{7}));
+      add[0] = Op::Upsert("rules", bytes, std::any(bess::classifier::RuleResult{7, {}}));
       del[0] = Op::Erase("rules", bytes);
       engine.Apply(add);
       engine.Apply(del);
@@ -207,6 +227,7 @@ void BM_SessionWithOnlineReader(benchmark::State &state) {
       8, ConcurrentExactTable::CapacityFor(kSessions * 2 + 64), domain);
   SlotTable<MeterId, Meter> meters(kSessions * 2 + 2);
   SlotTable<ActionId, Action> actions(kSessions * 2 + 2);
+  bess::classifier::RecordArena records(4, domain);
   SlotResource<MeterId, Meter> meters_res("meters", meters);
   SlotResource<ActionId, Action> actions_res(
       "actions", actions,
@@ -216,11 +237,11 @@ void BM_SessionWithOnlineReader(benchmark::State &state) {
       {"meters"});
   ExactRuleResource rules_res(
       "rules", *table,
-      [](uint64_t v) {
+      [](const bess::classifier::RuleResult &v) {
         return std::vector<Reference>{
-            {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+            {"actions", EncodeKey(ActionId(RuleAction(v)))}};
       },
-      {"actions"});
+      {"actions"}, &records);
   TransactionEngine engine(domain);
   if (!engine.Register(&meters_res)) {
     state.SkipWithError("resource registration failed");
@@ -250,9 +271,9 @@ void BM_SessionWithOnlineReader(benchmark::State &state) {
     establish[3] = Op::Upsert("actions", EncodeKey(ActionId(id + 1)),
                               std::any(Action{2, MeterId(id + 1)}));
     establish[4] = Op::Upsert("rules", EncodeKey(key * 2),
-                              std::any(uint64_t{id}));
+                              std::any(ActionRule(id)));
     establish[5] = Op::Upsert("rules", EncodeKey(key * 2 + 1),
-                              std::any(uint64_t{id + 1}));
+                              std::any(ActionRule(id + 1)));
     while (engine.Apply(establish).outcome !=
            TransactionEngine::Outcome::kApplied) {
       retries++;  // ids of this slot still in their removal cascade
@@ -303,6 +324,7 @@ void BM_LookupsUnderTransactions(benchmark::State &state) {
       8, ConcurrentExactTable::CapacityFor(kSessions * 2 + 64), domain);
   SlotTable<MeterId, Meter> meters(kSessions * 2 + 2);
   SlotTable<ActionId, Action> actions(kSessions * 2 + 2);
+  bess::classifier::RecordArena records(4, domain);
   SlotResource<MeterId, Meter> meters_res("meters", meters);
   SlotResource<ActionId, Action> actions_res(
       "actions", actions,
@@ -312,11 +334,11 @@ void BM_LookupsUnderTransactions(benchmark::State &state) {
       {"meters"});
   ExactRuleResource rules_res(
       "rules", *table,
-      [](uint64_t v) {
+      [](const bess::classifier::RuleResult &v) {
         return std::vector<Reference>{
-            {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+            {"actions", EncodeKey(ActionId(RuleAction(v)))}};
       },
-      {"actions"});
+      {"actions"}, &records);
   TransactionEngine engine(domain);
   if (!engine.Register(&meters_res) || !engine.Register(&actions_res) ||
       !engine.Register(&rules_res)) {
@@ -335,9 +357,9 @@ void BM_LookupsUnderTransactions(benchmark::State &state) {
                    std::any(Action{1, MeterId(up)})),
         Op::Upsert("actions", EncodeKey(ActionId(down)),
                    std::any(Action{2, MeterId(down)})),
-        Op::Upsert("rules", EncodeKey(uint64_t{2} * s), std::any(uint64_t{up})),
+        Op::Upsert("rules", EncodeKey(uint64_t{2} * s), std::any(ActionRule(up))),
         Op::Upsert("rules", EncodeKey(uint64_t{2} * s + 1),
-                   std::any(uint64_t{down}))};
+                   std::any(ActionRule(down)))};
   };
   auto release = [&](uint32_t s) {
     const uint32_t up = s + 1, down = s + 1 + kSessions;
@@ -397,8 +419,17 @@ void BM_LookupsUnderTransactions(benchmark::State &state) {
             values);
         for (uint64_t m = hits; m != 0; m &= m - 1) {
           const int i = __builtin_ctzll(m);
-          if (const Action *a =
-                  actions.Lookup(ActionId(static_cast<uint32_t>(values[i])))) {
+          const bess::classifier::ConstBytes record =
+              records.Lookup(bess::ResultIdOfResult(values[i]));
+          if (record.size() != 4) {
+            continue;
+          }
+          const uint32_t action =
+              (static_cast<uint32_t>(record[0]) << 24U) |
+              (static_cast<uint32_t>(record[1]) << 16U) |
+              (static_cast<uint32_t>(record[2]) << 8U) |
+              static_cast<uint32_t>(record[3]);
+          if (const Action *a = actions.Lookup(ActionId(action))) {
             if (const Meter *meter = meters.Lookup(a->meter)) {
               sink += meter->cir;
             }

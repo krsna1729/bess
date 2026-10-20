@@ -224,24 +224,48 @@ message QueueCommandGetStatusResponse {
  * WildcardMatch's WildcardMatchRuleKey / WildcardMatchRuleValue, in
  * bess.pb.v2.ApplyTransaction. Fields as in the add/delete commands.
  */
+// One placement of a rule's result record: num_bytes bytes starting at
+// value_offset in the rule's `result`, written to a metadata attribute
+// (attr_name) or a packet byte offset. A table's record is as wide as its
+// widest field; a shorter rule result is zero-padded, so an unwritten byte
+// reads zero rather than stale data. A hit whose packet is too short for a
+// packet destination is dropped; a miss places `default_result` if the
+// application set one, and writes nothing otherwise.
+message ResultField {
+  oneof destination {
+    string attr_name = 1;  // the metadata attribute to write
+    uint32 offset = 2;     // the packet byte offset to write
+  }
+  uint32 value_offset = 3;  // the field's start in the result record
+  uint32 num_bytes = 4;
+  // The resource this field's bytes name (e.g. "rt/next_hops"), so the
+  // transaction engine orders a rule after the entries it references and
+  // refuses their erase while the rule remains. An all-zero field references
+  // nothing. Placement never checks a reference: the packet path writes the
+  // bytes it already validated.
+  string reference = 5;
+  // How those bytes name the entry's key. RAW: the bytes are the key.
+  // BE32: the field is a 32-bit big-endian id (the metadata convention) and
+  // the key is the host-order uint32, as StrongId resources encode it.
+  enum ReferenceKey {
+    RAW = 0;
+    BE32 = 1;
+  }
+  ReferenceKey reference_key = 6;
+}
+
 message ExactMatchRuleKey {
   repeated FieldData fields = 1;
 }
 
 message ExactMatchRuleValue {
-  // The output gate a matching packet leaves on. 0 is the graph's connection
-  // to the action table; DROP_GATE (8192) drops the packet.
+  // The output gate a matching packet leaves on.
   uint64 gate = 1;
-  // The ActionId of the action a matching packet takes, 0 for none. Needs
-  // 'action_resource' on the module. The packet path writes it into the
-  // packet's "action_id" metadata attribute, and writes 0 on a miss, so a
-  // stale id cannot reach a later lookup (D-141).
-  //
-  // Both fields may be 0: on a module with an 'action_resource' that means
-  // "to the action table, with no action", which the table drops (id 0 is no
-  // action), so a rule that names neither is refused traffic rather than a
-  // codec error. Setting an action id still needs the action resource.
-  uint32 action_id = 2;
+  reserved 2;
+  reserved "action_id";  // was the action id (D-141); use result
+  // The rule's result record, placed by the module's result_fields. Shorter
+  // than the table's record size: the rest is zeros. Longer: refused.
+  bytes result = 3;
 }
 
 message ActionIdKey {
@@ -362,11 +386,11 @@ message WildcardMatchRuleValue {
   int64 priority = 1;
   // The output gate a matching packet leaves on.
   uint64 gate = 2;
-  // The ActionId of the action a matching packet takes, 0 for none. Needs
-  // 'action_resource' on the module. The packet path writes it into the
-  // packet's "action_id" metadata attribute, and writes 0 on a miss, so a
-  // stale id cannot reach a later lookup (D-141).
-  uint32 action_id = 3;
+  reserved 3;
+  reserved "action_id";  // was the action id (D-141); use result
+  // The rule's result record, placed by the module's result_fields. Shorter
+  // than the table's record size: the rest is zeros. Longer: refused.
+  bytes result = 4;
 }
 
 message WildcardMatchCommandAddArg {
@@ -511,8 +535,11 @@ message EtherEncapArg {
 message ExactMatchArg {
   repeated Field fields = 1; ///A list of ExactMatch Fields
   repeated FieldData masks = 2; /// mask(i) corresponds to the mask for field(i)
-  string action_resource = 3; /// The ActionTable's actions resource: when set, a rule may name an action (its action_id, 0 for none) and a gate of its own (0, the graph's connection to the action table, unless the rule says otherwise). The action id goes to the packet's "action_id" metadata attribute (D-141).
+  reserved 3;
+  reserved "action_resource"; /// was the action id result; use result_fields
   optional uint64 default_gate = 4; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
+  repeated ResultField result_fields = 5; /// What a match writes: each field's bytes come from the rule's result record. Empty: gate-only.
+  optional bytes default_result = 6; /// Placed on a miss, in addition to taking default_gate. Absent: a miss writes no result fields.
 }
 
 /**
@@ -1248,8 +1275,10 @@ message WildcardMatchArg {
   /// nothing on the packet path. A new mask beyond it is refused with ENOSPC.
   uint32 max_tuples = 2;
   optional uint64 default_gate = 3; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
-  /// The ActionTable's actions resource: when set, a rule may name an action (its action_id, 0 for none) as well as a gate, and the action id goes to the packet's "action_id" metadata attribute (D-141).
-  string action_resource = 4;
+  reserved 4;
+  reserved "action_resource"; /// was the action id result; use result_fields
+  repeated ResultField result_fields = 5; /// What a match writes: each field's bytes come from the rule's result record. Empty: gate-only.
+  optional bytes default_result = 6; /// Placed on a miss, in addition to taking default_gate. Absent: a miss writes no result fields.
 }
 
 /**

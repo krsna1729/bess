@@ -20,6 +20,8 @@
 #include "classifier/concurrent_exact.h"
 #include "classifier/exact_rule_resource.h"
 #include "classifier/extract_plan.h"
+#include "classifier/record_arena.h"
+#include "classifier/result_plan.h"
 #include "classifier/runtime_schema.h"
 #include "event.h"
 #include "framework/resource_bindings.h"
@@ -33,19 +35,12 @@ using google::protobuf::RepeatedPtrField;
 // does not depend on framework/exact_match_table.h.)
 using Error = std::pair<int, std::string>;
 
-// Two modes, fixed at Init():
-//
-//  - gate mode (the default): a rule's value is the output gate a matching
-//    packet leaves on, with no action.
-//  - action mode (`action_resource` set): a rule's value names the ActionId of
-//    a per-session action and, optionally, a gate of its own. The packet path
-//    writes the ActionId -- 0 when the rule names none -- into the `action_id`
-//    metadata attribute and forwards the packet on the rule's gate: gate 0
-//    unless the rule says otherwise, which is how a graph connects the
-//    classifier to an ActionTable. The rules are then a resource that
-//    references the actions they name, and one transaction can create the
-//    session's meter, next hop, route, action and rule together (G1.2b). A
-//    miss takes the default gate with action id 0 (D-141).
+// A rule's value is its output gate plus a result record. `result_fields`
+// maps slices of that record to metadata attributes or packet offsets; the
+// compiled ResultPlan places them on a hit. With no result fields the module
+// is gate-only. A miss takes the default gate; it also places
+// `default_result` when the application configured one, and otherwise writes
+// nothing.
 class ExactMatch final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
@@ -54,9 +49,6 @@ class ExactMatch final : public Module {
   // "rules" (ExactMatchRuleKey -> ExactMatchRuleValue) and "settings"
   // (ExactMatchSettings), both changed while workers run (D-129).
   static const ResourceTables resource_tables;
-
-  // Whether rules name actions rather than gates (see the class comment).
-  bool action_mode() const noexcept { return action_mode_; }
 
   // Module-level limits, preserved from the legacy ExactMatchTable-based
   // implementation for protobuf API compatibility. The classifier library
@@ -72,12 +64,12 @@ class ExactMatch final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  // What ProcessBatch decides, without emitting: gates[i] is the output gate
-  // of packet i and action_ids[i] the action id to deliver -- always 0 in gate
-  // mode, and 0 for a miss in action mode (D-141). The same code as the packet
-  // path, for tests and benchmarks driven from a registered reader thread.
+  // What ProcessBatch decides, without placing: gates[i] is the output gate
+  // of packet i and result_ids[i] the matched rule's record id (0 on a miss).
+  // The same classification as the packet path, for tests and benchmarks
+  // driven from a registered reader thread.
   void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
-                     uint32_t *action_ids) const;
+                     uint32_t *result_ids) const;
 
   // Tests (D-121): the published generation's fused-kernel key width (0 when
   // the generic path classifies), and a switch that republishes with the
@@ -104,7 +96,7 @@ class ExactMatch final : public Module {
     // ExactMatchRuleFields: rule bytes are stored WITHOUT applying the
     // configured mask, while packet/metadata bytes ARE masked on extraction.
     std::vector<std::vector<uint8_t>> fields;
-    // The gate the rule forwards to, or the action id it names (action mode).
+    // The gate the rule forwards to and its record id (packed; gate.h).
     uint64_t value;
   };
 
@@ -122,13 +114,19 @@ class ExactMatch final : public Module {
   struct Generation {
     Generation(gate_idx_t d, bess::classifier::ExtractPlan e,
                std::shared_ptr<bess::classifier::ConcurrentExactTable> t,
-               size_t k, bool valid, std::vector<size_t> offsets)
+               size_t k, bool valid, std::vector<size_t> offsets,
+               std::optional<bess::classifier::ResultPlan> r,
+               std::vector<size_t> result_offsets,
+               std::shared_ptr<bess::classifier::RecordArena> records)
         : default_gate(d),
           extract(std::move(e)),
           table(std::move(t)),
           key_size(k),
           extraction_valid(valid),
-          baked_source_offsets(std::move(offsets)) {}
+          baked_source_offsets(std::move(offsets)),
+          result(std::move(r)),
+          baked_result_offsets(std::move(result_offsets)),
+          records(std::move(records)) {}
 
     // Read once per batch (relaxed): the "settings" resource stores it in the
     // published generation while workers run, with nothing to allocate or
@@ -144,10 +142,19 @@ class ExactMatch final : public Module {
     // path then routes everything to the default gate instead of reading an
     // incorrect metadata region (fail-closed).
     bool extraction_valid = true;
+    // Init deferred a metadata result plan to the first PreResume; the
+    // offsets may be unchanged (both sentinel) but the plan must be built.
+    bool result_plan_deferred = false;
     // Per-field source offset baked into `extract` (packet byte offset, or
     // metadata attr offset, or kInvalidOffset for unreadable metadata).
     // Compared at PreResume to detect graph-driven offset reassignment.
     std::vector<size_t> baked_source_offsets;
+    // Configured result placement: the compiled plan (nullopt in gate-only
+    // mode), the metadata offsets it baked (kInvalidOffset for a packet
+    // field), and the records its ids address. Compared at PreResume.
+    std::optional<bess::classifier::ResultPlan> result;
+    std::vector<size_t> baked_result_offsets;
+    std::shared_ptr<bess::classifier::RecordArena> records;
     // The fused fixed-layout kernel (D-121): the key is one packet field of
     // 1, 2, 4 or 8 bytes, read, masked, hashed and looked up in one pass.
     // fused_width is that width, 0 for the generic extract-then-lookup path;
@@ -166,9 +173,8 @@ class ExactMatch final : public Module {
 
   // The packet path's per-batch decision, shared by ProcessBatch and
   // ClassifyBatch: calls emit(i, value, hit) once per packet, in order, where
-  // `value` is the matched rule's value (a gate in gate mode, an action id in
-  // action mode) and `hit` says whether it matched. `emit` is inlined into
-  // each caller.
+  // `value` is the matched rule's packed {gate, record id} and `hit` says
+  // whether it matched. `emit` is inlined into each caller.
   template <typename Emit>
   void Classify(bess::PacketBatch *batch, const Generation &gen,
                 Emit &&emit) const;
@@ -223,7 +229,18 @@ class ExactMatch final : public Module {
   // offsets. With `tolerate_invalid_metadata`, unreadable metadata marks the
   // layout invalid (fail-closed path) instead of failing.
   bool ComputeLayout(bool tolerate_invalid_metadata, KeyLayout *layout,
-                     Error *err);  // Fail-closed generation for unrecoverable (re)build failures on the resume
+                     Error *err);
+  // Compiles the configured result placement over the current metadata
+  // offsets. With `tolerate_invalid_metadata`, an unreadable attribute gets a
+  // placeholder placement (the degraded generation never runs it).
+  std::optional<bess::classifier::ResultPlan> CompileResultPlan(
+      size_t key_size, bool tolerate_invalid_metadata,
+      std::vector<size_t> *baked_offsets, Error *err) const;
+  // The resources a rule's result bytes name through configured references
+  // (D-172): the field's bytes are the entry key; an all-zero field names
+  // nothing.
+  std::vector<bess::dataplane::Reference> ResultReferences(
+      const std::vector<std::byte> &bytes) const;  // Fail-closed generation for unrecoverable (re)build failures on the resume
   // path: same rules/default for introspection, but extraction disabled so
   // the packet path routes everything to the default gate.
   GenerationPtr BuildDegraded(
@@ -247,12 +264,34 @@ class ExactMatch final : public Module {
   };
   std::vector<FieldSpec> field_specs_;
 
-  // Action mode (see the class comment): rules name actions, and the packet
-  // path writes the matched action id into `action_id`.
-  bool action_mode_ = false;
-  std::string action_resource_;
+  // Result fields (fixed at Init): each maps a slice of a rule's record to a
+  // metadata attribute or a packet offset. Empty: gate-only.
+  struct ResultSpec {
+    bool by_attr = true;
+    std::string attr_name;  // by_attr
+    int attr_id = -1;
+    uint32_t offset = 0;  // packet
+    uint32_t value_offset = 0;
+    uint32_t size = 0;
+    // The resource this field's bytes name, if any (D-172), and whether
+    // those bytes are a big-endian id whose key is host-order.
+    std::string reference;
+    bool reference_be32 = false;
+  };
+  std::vector<ResultSpec> result_specs_;
+  // Distinct resource names the result fields reference, for the resource's
+  // declaration (D-172).
+  std::vector<std::string> result_reference_names_;
+  // False until the graph resolves metadata offsets (PreResume). Init cannot
+  // compile metadata destinations: every attribute still reads offset 0.
+  bool metadata_ready_ = false;
+  size_t result_value_size_ = 0;
+  // The record store; null when result_specs_ is empty.
+  std::shared_ptr<bess::classifier::RecordArena> records_;
+  // Placed on a miss when the application configured one; zero-padded.
+  std::optional<std::vector<std::byte>> default_result_;
+  uint32_t default_record_id_ = 0;  // its arena id, 0 when unset
   std::optional<uint64_t> initial_default_gate_;  // as given at creation
-  int action_id_attr_ = -1;
   // Whether Build() may select the fused kernel (tests turn it off).
   bool fused_enabled_ = true;
 

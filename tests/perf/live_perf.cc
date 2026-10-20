@@ -457,7 +457,7 @@ std::vector<std::string> MSession(Build &b) {
   b.Mod("ActionTable", "at",
         R"({"capacity": 64, "meters": "mt/meters", "next_hops": "rt/next_hops"})");
   b.Mod("ExactMatch", "em",
-        R"({"fields": [{"offset": 26, "num_bytes": 4}], "action_resource": "at/actions"})");
+        R"({"fields": [{"offset": 26, "num_bytes": 4}], "result_fields": [{"attr_name": "action_id", "value_offset": 0, "num_bytes": 4, "reference": "at/actions", "reference_key": "BE32"}]})");
   b.Mod("Meter", "mt", R"({"capacity": 64})");
   b.Mod("Router", "rt", R"({"max_routes": 64, "max_tbl8s": 16, "max_next_hops": 64})");
   b.Entry("mt/meters", "MeterIdKey", R"({"id": 1})", "MeterPolicyValue",
@@ -472,7 +472,7 @@ std::vector<std::string> MSession(Build &b) {
   for (int i = 0; i < kFlows; i++) {
     b.Entry("em/rules", "ExactMatchRuleKey",
             R"({"fields": [{"value_bin": ")" + Base64(Be32(0x0a000001 + i)) + R"("}]})",
-            "ExactMatchRuleValue", R"({"action_id": 1})");
+            "ExactMatchRuleValue", R"({"result": ")" + Base64(Be32(1)) + R"("})");
   }
   return MBase(b, {{"em", 1}, {"at", 1}, {"mt", 1}, {"rt", 1}});
 }

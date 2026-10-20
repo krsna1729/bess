@@ -289,10 +289,10 @@ TEST_F(DataplaneTransactionsTest, UndecodableOperationsRejectTheTransaction) {
   {
     bess::pb::ExactMatchRuleValue val;
     val.set_gate(2);
-    val.set_action_id(5);
+    val.set_result("x");
     Pack(op.mutable_value(), val);
   }
-  expect_rejected(op, "'action_id' needs an 'action_resource'");
+  expect_rejected(op, "the schema's record is 0");
   op = ExactRule("em0", 2, 2, 2);
   op.set_erase(true);
   expect_rejected(op, "takes no value");

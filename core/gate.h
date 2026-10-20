@@ -41,24 +41,24 @@ inline bool IsValidGateValue(uint64_t raw) {
   return raw < MAX_GATES || raw == DROP_GATE;
 }
 
-// The classifier's result (D-141): one 64-bit word that names a gate and an
-// ActionId together. The gate occupies the low 16 bits (gate_idx_t), the
-// ActionId the rest. A module with no action resource leaves the ActionId 0; a
-// rule with an action and no gate of its own uses gate 0, which is how a graph
-// connects the classifier to the action table. Every combination is therefore
-// legal: {gate, 0}, {0, action}, {gate, action}, and {0, 0}.
+// The classifier's result (D-172): one 64-bit word that names a gate and a
+// result record id together. The gate occupies the low 16 bits (gate_idx_t);
+// the upper 32 bits carry the record id a module's result plan places (D-172),
+// 0 when the rule has no result. A rule with a result and no gate of its own
+// uses gate 0. Every combination is therefore legal: {gate, 0}, {0, record},
+// {gate, record}, and {0, 0}.
 inline constexpr unsigned kGateResultBits = 16;
 inline constexpr uint64_t kGateResultMask = (uint64_t{1} << kGateResultBits) - 1;
 
-inline constexpr uint64_t MakeGateResult(gate_idx_t gate, uint32_t action_id) {
-  return (static_cast<uint64_t>(action_id) << kGateResultBits) | gate;
+inline constexpr uint64_t MakeGateResult(gate_idx_t gate, uint32_t result_id) {
+  return (static_cast<uint64_t>(result_id) << kGateResultBits) | gate;
 }
 
 inline constexpr gate_idx_t GateOfResult(uint64_t result) {
   return static_cast<gate_idx_t>(result & kGateResultMask);
 }
 
-inline constexpr uint32_t ActionIdOfResult(uint64_t result) {
+inline constexpr uint32_t ResultIdOfResult(uint64_t result) {
   return static_cast<uint32_t>(result >> kGateResultBits);
 }
 

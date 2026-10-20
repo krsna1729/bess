@@ -112,7 +112,7 @@ ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::Find(
 
 ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
     ConstBytes mask, ConstBytes value, int64_t priority, uint16_t gate,
-    uint32_t action_id) {
+    uint32_t result_id) {
   promise(mask.size() == key_len_ && value.size() == key_len_);
   if (gate == kPendingResult) {
     return UpsertResult::kReservedResult;
@@ -167,7 +167,7 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
   MutableRecord(id) = {.priority = priority,
                        .sequence = next_sequence_++,
                        .gate = gate,
-                       .action_id = action_id};
+                       .result_id = result_id};
   const RuleId old = Find(*table, value);
   // The tuple's ceiling first: a reader that sees the rule sees it raised.
   auto ceiling = new_tuple ? std::make_shared<Ceiling>(priority)
@@ -245,7 +245,7 @@ std::expected<ConcurrentMaskedTable::Prepared,
               ConcurrentMaskedTable::UpsertResult>
 ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
                                      int64_t priority, uint16_t gate,
-                                     uint32_t action_id) {
+                                     uint32_t result_id) {
   promise(mask.size() == key_len_ && value.size() == key_len_);
   if (gate == kPendingResult) {
     return std::unexpected(UpsertResult::kReservedResult);
@@ -269,7 +269,7 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
     MutableRecord(pending_id_) = {.priority = INT64_MIN,
                                   .sequence = 0,
                                   .gate = kPendingResult,
-                                  .action_id = 0};
+                                  .result_id = 0};
   }
 
   const TupleList *list = tuples_.Read();
@@ -315,7 +315,7 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
     MutableRecord(id) = {.priority = priority,
                          .sequence = next_sequence_++,
                          .gate = gate,
-                         .action_id = action_id};
+                         .result_id = result_id};
     if (prepared.old == 0) {
       // A new rule: present but pending, so capacity is settled here.
       const uint64_t pending = Pack(pending_id_, kPendingResult);
@@ -351,7 +351,7 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
   }
   prepared.id = id;
   prepared.gate = gate;
-  prepared.action_id = action_id;
+  prepared.result_id = result_id;
   return prepared;
 }
 

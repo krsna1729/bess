@@ -6,7 +6,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <vector>
 
@@ -59,12 +58,21 @@ class RecordArena {
   // current grace period.
   void Retire(Id id);
 
+  // Grow the retirement queue now, on the control path, so a later Retire()
+  // from noexcept publication cannot allocate (D-172). Throws bad_alloc; the
+  // caller rejects the transaction before anything is visible. A transaction
+  // that reserves and then aborts must call CancelRetirement().
+  void ReserveRetirement(size_t count);
+  void CancelRetirement(size_t count) noexcept;
+
   [[nodiscard]] size_t record_size() const noexcept { return record_size_; }
   // Allocated ids that are not free: live, retiring and prepared records.
   [[nodiscard]] size_t in_use() const noexcept {
     return (next_id_ - 1) - free_count_;
   }
-  [[nodiscard]] size_t retiring() const noexcept { return retiring_.size(); }
+  [[nodiscard]] size_t retiring() const noexcept {
+    return retiring_.size() - retiring_head_;
+  }
 
  private:
   struct ChunkDeleter {
@@ -93,7 +101,11 @@ class RecordArena {
     Id id;
     rcu::GracePeriod token;
   };
-  std::deque<Retiring> retiring_;
+  std::vector<Retiring> retiring_;
+  size_t retiring_head_ = 0;
+  // Reservations not yet consumed by Retire(): capacity already promised, so
+  // a second reservation cannot count the same spare slot twice.
+  size_t retirement_reserved_ = 0;
   Id next_id_ = 1;  // the next id never allocated
 };
 

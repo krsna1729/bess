@@ -82,9 +82,9 @@ class TransactionEngineTest : public ::testing::Test {
         std::vector<std::string>{"meters"});
     rules_res_ = std::make_unique<ExactRuleResource>(
         "rules", *table_,
-        [](uint64_t action) {
+        [](const bess::classifier::RuleResult &action) {
           return std::vector<Reference>{
-              {"actions", EncodeKey(ActionId(static_cast<uint32_t>(action)))}};
+              {"actions", EncodeKey(ActionId(action.gate))}};
         },
         std::vector<std::string>{"actions"});
     ASSERT_TRUE(engine_.Register(meters_res_.get()));
@@ -97,7 +97,7 @@ class TransactionEngineTest : public ::testing::Test {
   }
 
   static Op Rule(uint64_t key, uint64_t action) {
-    return Op::Upsert("rules", EncodeKey(key), std::any(action));
+    return Op::Upsert("rules", EncodeKey(key), std::any(bess::classifier::RuleResult{static_cast<bess::gate_idx_t>(action), {}}));
   }
   static Op EraseRule(uint64_t key) {
     return Op::Erase("rules", EncodeKey(key));
@@ -600,14 +600,14 @@ TEST_F(TransactionEngineTest, ReferencesToAnImmediateEraseResourceAreRefused) {
   ASSERT_TRUE(other_table.has_value());
   ExactRuleResource other(
       "other_rules", **other_table,
-      [](uint64_t v) {
-        return std::vector<Reference>{{"rules", EncodeKey(v)}};
+      [](const bess::classifier::RuleResult &v) {
+        return std::vector<Reference>{{"rules", EncodeKey(v.gate)}};
       },
       {"rules"});
   ASSERT_TRUE(engine_.Register(&other));
   ASSERT_EQ(Apply({Act(1, 1, 0), Rule(10, 1)}).outcome, Outcome::kApplied);
   auto r = Apply({Op::Upsert("other_rules", EncodeKey(uint64_t{99}),
-                             std::any(uint64_t{10}))});
+                             std::any(bess::classifier::RuleResult{10, {}}))});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_NE(r.ops[0].error.find("cannot be referenced"), std::string::npos)
       << r.ops[0].error;
@@ -911,9 +911,9 @@ TEST_F(TransactionEngineTest, KeysThatCannotBePlacedRejectCleanly) {
   ASSERT_TRUE(small.has_value());
   ExactRuleResource res(
       "crowded_rules", **small,
-      [](uint64_t v) {
+      [](const bess::classifier::RuleResult &v) {
         return std::vector<Reference>{
-            {"actions", EncodeKey(ActionId(static_cast<uint32_t>(v)))}};
+            {"actions", EncodeKey(ActionId(v.gate))}};
       },
       {"actions"});
   ASSERT_TRUE(engine_.Register(&res));
@@ -939,8 +939,9 @@ TEST_F(TransactionEngineTest, KeysThatCannotBePlacedRejectCleanly) {
     }
   }
   std::vector<Op> ops;
+  ops.reserve(crowd.size());
   for (uint64_t k : crowd) {
-    ops.push_back(Op::Upsert("crowded_rules", EncodeKey(k), std::any(uint64_t{1})));
+    ops.push_back(Op::Upsert("crowded_rules", EncodeKey(k), std::any(bess::classifier::RuleResult{1, {}})));
   }
   const auto r = Apply(ops);
   ASSERT_EQ(r.outcome, Outcome::kRejected);
@@ -988,13 +989,13 @@ TEST_F(TransactionEngineTest, StatedCapacityIsACeilingTheResourceEnforces) {
   for (uint64_t first = 1; first <= capacity; first += 64) {
     std::vector<Op> ops;
     for (uint64_t k = first; k < first + 64 && k <= capacity; k++) {
-      ops.push_back(Op::Upsert("ceiling_rules", EncodeKey(k), std::any(uint64_t{1})));
+      ops.push_back(Op::Upsert("ceiling_rules", EncodeKey(k), std::any(bess::classifier::RuleResult{1, {}})));
     }
     ASSERT_EQ(Apply(ops).outcome, Outcome::kApplied) << "keys from " << first;
   }
   EXPECT_EQ(capacity, res.LiveCount()) << "the table holds what it states";
   const auto over = Apply(
-      {Op::Upsert("ceiling_rules", EncodeKey(capacity + 1), std::any(uint64_t{1}))});
+      {Op::Upsert("ceiling_rules", EncodeKey(capacity + 1), std::any(bess::classifier::RuleResult{1, {}}))});
   ASSERT_EQ(over.outcome, Outcome::kRejected);
   EXPECT_NE(over.ops[0].error.find("table full"), std::string::npos) << over.ops[0].error;
   EXPECT_EQ(capacity, res.LiveCount()) << "the refused key left nothing behind";

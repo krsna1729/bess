@@ -22,6 +22,29 @@
 #include "modules/wildcard_match.h"
 #include "pb/module_msg.pb.h"
 #include "testing/module_harness.h"
+
+namespace {
+// A refused Init must return no module; ModuleHarness treats a refusal as a
+// test failure, so negative cases go through the graph directly.
+bool CreateRefused(const std::string &class_name,
+                   const google::protobuf::Message &arg) {
+  const auto &builders = ModuleBuilder::all_module_builders();
+  const auto it = builders.find(class_name);
+  if (it == builders.end()) {
+    return false;
+  }
+  google::protobuf::Any packed;
+  if (!packed.PackFrom(arg)) {
+    return false;
+  }
+  pb_error_t perr;
+  Module *m = ModuleGraph::CreateModule(it->second, "refused", packed, &perr);
+  EXPECT_EQ(nullptr, m) << perr.errmsg();
+  return m == nullptr && perr.code() != 0;
+}
+}  // namespace
+
+#include "testing/rng.h"
 #include "testing/packet_builder.h"
 
 namespace {
@@ -769,6 +792,76 @@ TEST(WildcardMatchPacketTest, IpPairRulesPickTheGateAndMissesTakeTheDefault) {
   out = h.Run(wm, 0, {miss}, {0, 1, 2, 3});
   EXPECT_EQ((GateCounts{{3, 1}}), Counts(out));
   EXPECT_EQ((std::vector<Bytes>{miss}), out[3]);
+}
+
+// A rule's result record is placed by result_fields; a miss places
+// default_result. Bytes placed beyond the rule's value are zero.
+TEST(WildcardMatchPacketTest, ResultFieldsPlaceRecordBytes) {
+  ModuleHarness h;
+  WildcardMatchArg arg;
+  *arg.add_fields() = WmField(26, 4);
+  auto *field = arg.add_result_fields();
+  field->set_offset(40);
+  field->set_value_offset(0);
+  field->set_num_bytes(2);
+  arg.set_default_result(std::string("\xee\xff", 2));
+  Module *wm = h.Create("WildcardMatch", arg);
+  ASSERT_NE(nullptr, wm);
+
+  const auto rule = [&](const char *dip, uint64_t gate, const std::string &result) {
+    bess::pb::WildcardMatchRuleKey key =
+        WmKey({kFull4}, {IpOctets(dip)});
+    bess::pb::WildcardMatchRuleValue value;
+    value.set_priority(1);
+    value.set_gate(gate);
+    value.set_result(result);
+    return h.UpsertResource(std::string(wm->name()) + "/rules", key, value);
+  };
+  EXPECT_EQ("", rule("10.0.0.1", 1, std::string("\x11\x22", 2)));
+  EXPECT_EQ("", rule("10.0.0.2", 2, {}));
+  EXPECT_EQ("", SetDefaultGate(h, wm, 3));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes hit = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  Bytes empty = TcpPacket({.sip = "10.0.0.2", .dip = "12.34.56.78"}, rng);
+  empty[40] = 0xAA;  // must be overwritten with the zero-padded record
+  empty[41] = 0xAA;
+  const Bytes miss = TcpPacket({.sip = "10.0.0.3", .dip = "12.34.56.78"}, rng);
+
+  auto out = h.Run(wm, 0, {hit, empty, miss}, {1, 2, 3});
+  ASSERT_EQ(1u, out[1].size());
+  EXPECT_EQ((Bytes{0x11, 0x22}), Bytes(out[1][0].begin() + 40, out[1][0].begin() + 42));
+  ASSERT_EQ(1u, out[2].size());
+  EXPECT_EQ((Bytes{0, 0}), Bytes(out[2][0].begin() + 40, out[2][0].begin() + 42));
+  ASSERT_EQ(1u, out[3].size());
+  EXPECT_EQ((Bytes{0xee, 0xff}), Bytes(out[3][0].begin() + 40, out[3][0].begin() + 42));
+}
+
+// A result record wider than the arena's limit is refused at Init.
+TEST(WildcardMatchPacketTest, RejectsAnOversizedResultRecord) {
+  ModuleHarness h;
+  WildcardMatchArg arg;
+  *arg.add_fields() = WmField(26, 4);
+  auto *field = arg.add_result_fields();
+  field->set_attr_name("oversized_wm_attr");
+  field->set_value_offset(4096);
+  field->set_num_bytes(1);
+  EXPECT_TRUE(CreateRefused("WildcardMatch", arg));
+}
+
+// An explicitly empty default_result stays a no-op on a gate-only module; a
+// non-empty one needs a result field.
+TEST(WildcardMatchPacketTest, EmptyDefaultResultNeedsAFieldOnlyWhenNonEmpty) {
+  ModuleHarness h;
+  WildcardMatchArg arg;
+  *arg.add_fields() = WmField(26, 4);
+  arg.set_default_result("");
+  EXPECT_NE(nullptr, h.Create("WildcardMatch", arg));
+
+  WildcardMatchArg nonempty;
+  *nonempty.add_fields() = WmField(26, 4);
+  nonempty.set_default_result("\x01");
+  EXPECT_TRUE(CreateRefused("WildcardMatch", nonempty));
 }
 
 // Masks need not be prefixes: arbitrary bits inside each byte are matched,
