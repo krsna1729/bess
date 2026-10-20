@@ -77,12 +77,15 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
 - **Which lanes gate.** `gcc`, `clang`, `clang-tsan` (TSan over
   `tools/sanitizers/tsan_tests.txt`), `clang-asan` (ASan and UBSan, and
   clang-tidy; required since its first fully green run, 5c409d37),
-  `gcc-arm64` and `clang-arm64` (green since d040ec6d), with `Protobuf
-  compatibility`, are the required checks on `develop` (user decision,
-  2026-10-05, D-093). The arm64 lanes run on pull requests too (2026-10-18):
-  `develop` requires them, and a required check that a pull request never runs
-  can never be satisfied, so every pull request sat blocked until an admin
-  overrode the policy. The ubuntu-26.04
+  `gcc-arm64` and `clang-arm64` (green since d040ec6d) are the required checks
+  on `develop` (user decision, 2026-10-05, D-093). `Protobuf compatibility`
+  is advisory (`continue-on-error: true`, D-173) until a 1.0 compatibility
+  policy exists, and it is not a required check on `develop` (removed from the
+  branch protection rules when D-173 landed), because a job-level
+  `continue-on-error` does not change a required check's own status. The arm64 lanes run on pull requests too
+  (2026-10-18): `develop` requires them, and a required check that a pull
+  request never runs can never be satisfied, so every pull request sat blocked
+  until an admin overrode the policy. The ubuntu-26.04
   lanes stay experimental (a future distribution).
 - **Which lanes run when.** The lane table is `LANES` in `tools/ci_profile.py`;
   the workflow's `Lanes` job turns it into the matrix

@@ -457,18 +457,14 @@ func (TransactionRecord_Outcome) EnumDescriptor() ([]byte, []int) {
 //	  old version to its whole new one in one store
 //	  (CONSISTENCY_SCOPE_SNAPSHOT). There is no order between two scopes.
 //
-// VISIBILITY_ATOMIC is never sent. It named a promise ("all at once") that
-// nothing provides: the strongest guarantee is per scope, and
-// VISIBILITY_SCOPE_SNAPSHOT says so. The value stays only because removing
-// an enum value breaks `buf breaking`.
+// There is no all-at-once level: nothing provides it, and the strongest
+// guarantee is per scope, which VISIBILITY_SCOPE_SNAPSHOT names.
 type TransactionRecord_Visibility int32
 
 const (
 	TransactionRecord_VISIBILITY_UNSPECIFIED        TransactionRecord_Visibility = 0
 	TransactionRecord_VISIBILITY_DEPENDENCY_ORDERED TransactionRecord_Visibility = 1
-	// Deprecated: Marked as deprecated in control_v2.proto.
-	TransactionRecord_VISIBILITY_ATOMIC         TransactionRecord_Visibility = 2
-	TransactionRecord_VISIBILITY_SCOPE_SNAPSHOT TransactionRecord_Visibility = 3
+	TransactionRecord_VISIBILITY_SCOPE_SNAPSHOT     TransactionRecord_Visibility = 3
 )
 
 // Enum value maps for TransactionRecord_Visibility.
@@ -476,13 +472,11 @@ var (
 	TransactionRecord_Visibility_name = map[int32]string{
 		0: "VISIBILITY_UNSPECIFIED",
 		1: "VISIBILITY_DEPENDENCY_ORDERED",
-		2: "VISIBILITY_ATOMIC",
 		3: "VISIBILITY_SCOPE_SNAPSHOT",
 	}
 	TransactionRecord_Visibility_value = map[string]int32{
 		"VISIBILITY_UNSPECIFIED":        0,
 		"VISIBILITY_DEPENDENCY_ORDERED": 1,
-		"VISIBILITY_ATOMIC":             2,
 		"VISIBILITY_SCOPE_SNAPSHOT":     3,
 	}
 )
@@ -1677,7 +1671,7 @@ type WorkerPlacement struct {
 	NumaNode      int32                  `protobuf:"varint,3,opt,name=numa_node,json=numaNode,proto3" json:"numa_node,omitempty"`               // that CPU's NUMA node
 	CrossNuma     bool                   `protobuf:"varint,4,opt,name=cross_numa,json=crossNuma,proto3" json:"cross_numa,omitempty"`            // not bessd's memory node
 	SharesCore    bool                   `protobuf:"varint,5,opt,name=shares_core,json=sharesCore,proto3" json:"shares_core,omitempty"`         // an SMT sibling of another worker's CPU or a control CPU
-	OnControlCpu  bool                   `protobuf:"varint,6,opt,name=on_control_cpu,json=onControlCpu,proto3" json:"on_control_cpu,omitempty"` // a CPU reserved for control threads
+	OnControlCpu  bool                   `protobuf:"varint,6,opt,name=on_control_cpu,json=onControlCpu,proto3" json:"on_control_cpu,omitempty"` // a CPU held for control threads
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6039,7 +6033,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x03wid\x18\x01 \x01(\x05R\x03wid\x12\x17\n" +
 	"\x04core\x18\x02 \x01(\x05H\x00R\x04core\x88\x01\x01\x12\x1c\n" +
 	"\tscheduler\x18\x03 \x01(\tR\tschedulerB\a\n" +
-	"\x05_core\"\xfc\x03\n" +
+	"\x05_core\"\xca\x03\n" +
 	"\fTrafficClass\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
 	"\x06parent\x18\x02 \x01(\tR\x06parent\x12\x16\n" +
@@ -6058,8 +6052,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01B\v\n" +
 	"\t_priorityB\b\n" +
-	"\x06_shareJ\x04\b\n" +
-	"\x10\vJ\x04\b\v\x10\fR\x10leaf_module_nameR\x12leaf_module_taskid\"\xc5\x01\n" +
+	"\x06_share\"\xc5\x01\n" +
 	"\rTaskPlacement\x12\x16\n" +
 	"\x06module\x18\x01 \x01(\tR\x06module\x12\x12\n" +
 	"\x04task\x18\x02 \x01(\rR\x04task\x12\x16\n" +
@@ -6231,7 +6224,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eSTATUS_APPLIED\x10\x01\x12\x11\n" +
 	"\rSTATUS_FAILED\x10\x02\x12\x16\n" +
-	"\x12STATUS_NOT_APPLIED\x10\x03\"\x8f\x04\n" +
+	"\x12STATUS_NOT_APPLIED\x10\x03\"\xf3\x03\n" +
 	"\x11TransactionRecord\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12?\n" +
@@ -6248,12 +6241,11 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x0fOUTCOME_APPLIED\x10\x01\x12\x14\n" +
 	"\x10OUTCOME_REJECTED\x10\x02\x12\x14\n" +
 	"\x10OUTCOME_CONFLICT\x10\x03\x12\x10\n" +
-	"\fOUTCOME_BUSY\x10\x04\"\x85\x01\n" +
+	"\fOUTCOME_BUSY\x10\x04\"j\n" +
 	"\n" +
 	"Visibility\x12\x1a\n" +
 	"\x16VISIBILITY_UNSPECIFIED\x10\x00\x12!\n" +
-	"\x1dVISIBILITY_DEPENDENCY_ORDERED\x10\x01\x12\x19\n" +
-	"\x11VISIBILITY_ATOMIC\x10\x02\x1a\x02\b\x01\x12\x1d\n" +
+	"\x1dVISIBILITY_DEPENDENCY_ORDERED\x10\x01\x12\x1d\n" +
 	"\x19VISIBILITY_SCOPE_SNAPSHOT\x10\x03\"\x90\x01\n" +
 	"\x18ApplyTransactionResponse\x125\n" +
 	"\x06record\x18\x01 \x01(\v2\x1d.bess.pb.v2.TransactionRecordR\x06record\x12!\n" +
@@ -6337,7 +6329,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\vresult_type\x18\x03 \x01(\tR\n" +
 	"resultType\x12\x1f\n" +
 	"\vthread_safe\x18\x04 \x01(\bR\n" +
-	"threadSafe\"\x8d\x02\n" +
+	"threadSafe\"\xfd\x01\n" +
 	"\x11ModuleClassSchema\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04help\x18\x02 \x01(\tR\x04help\x12\"\n" +
@@ -6345,7 +6337,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x06igates\x18\x04 \x01(\rR\x06igates\x12\x16\n" +
 	"\x06ogates\x18\x05 \x01(\rR\x06ogates\x122\n" +
 	"\aactions\x18\a \x03(\v2\x18.bess.pb.v2.ActionSchemaR\aactions\x128\n" +
-	"\tresources\x18\b \x03(\v2\x1a.bess.pb.v2.ResourceSchemaR\tresourcesJ\x04\b\x06\x10\aR\bcommands\"^\n" +
+	"\tresources\x18\b \x03(\v2\x1a.bess.pb.v2.ResourceSchemaR\tresources\"^\n" +
 	"\x10PortDriverSchema\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04help\x18\x02 \x01(\tR\x04help\x12\"\n" +

@@ -28,12 +28,9 @@ message CommandResponse {
 
 /// The "Track" gate hook's argument: it has none (D-144).
 // Track counts packets and batches. Byte counting is gone: the legacy service
-// that configured the hook is deleted (D-140), so `bits` is reserved and
-// `bess_gate_bytes_total` can no longer appear.
-message TrackArg {
-  reserved 5;
-  reserved "bits";
-}
+// that configured the hook is deleted (D-140), so `bess_gate_bytes_total` no
+// longer exists.
+message TrackArg {}
 
 /// Enable/Disable tcpdump tapping at an input/output gate.
 ///
