@@ -27,8 +27,8 @@
 #define FUZZ_CHECK(cond)                                              \
   do {                                                                \
     if (!(cond)) [[unlikely]] {                                       \
-      std::fprintf(stderr, "%s:%d: fuzz oracle violated: %s\n",       \
-                   __FILE__, __LINE__, #cond);                        \
+      (void)std::fprintf(stderr, "%s:%d: fuzz oracle violated: %s\n", \
+                         __FILE__, __LINE__, #cond);                  \
       std::abort();                                                   \
     }                                                                 \
   } while (0)

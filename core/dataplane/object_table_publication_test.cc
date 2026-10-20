@@ -53,9 +53,9 @@ struct TestAction {
 std::atomic<int> TestAction::alive{0};
 std::atomic<int> TestAction::destroyed{0};
 
-using ActionTable = ObjectTable<ActionId, TestAction>;
+using TestTable = ObjectTable<ActionId, TestAction>;
 
-std::unique_ptr<const ActionTable> BuildTable(int value, size_t capacity = 16) {
+std::unique_ptr<const TestTable> BuildTable(int value, size_t capacity = 16) {
   ObjectTableBuilder<ActionId, TestAction> builder(capacity);
   if (!builder.Emplace(ActionId(1), value)) {
     return nullptr;
@@ -93,7 +93,7 @@ TEST_F(ObjectTablePublicationTest, SharedGracePeriodCoversSeveralTables) {
   ASSERT_TRUE(domain_->Register(reader).has_value());
   domain_->Online(reader);
 
-  RcuPtr<ActionTable> actions(*domain_);
+  RcuPtr<TestTable> actions(*domain_);
   RcuPtr<ObjectTable<NextHopId, NextHop>> next_hops(*domain_);
 
   actions.Initialize(BuildTable(1));
@@ -103,7 +103,7 @@ TEST_F(ObjectTablePublicationTest, SharedGracePeriodCoversSeveralTables) {
     next_hops.Initialize(std::move(builder).Build());
   }
 
-  std::unique_ptr<const ActionTable> old_actions = actions.Exchange(BuildTable(2));
+  std::unique_ptr<const TestTable> old_actions = actions.Exchange(BuildTable(2));
   std::unique_ptr<const ObjectTable<NextHopId, NextHop>> old_next_hops;
   {
     ObjectTableBuilder<NextHopId, NextHop> builder(8);
@@ -146,7 +146,7 @@ TEST_F(ObjectTablePublicationTest, PublicationStormReclaimsEveryGeneration) {
   ASSERT_TRUE(domain_->Register(reader).has_value());
   domain_->Online(reader);
 
-  RcuPtr<ActionTable> published(*domain_);
+  RcuPtr<TestTable> published(*domain_);
   published.Initialize(BuildTable(0));
 
   constexpr int kGenerations = 10000;
@@ -157,7 +157,7 @@ TEST_F(ObjectTablePublicationTest, PublicationStormReclaimsEveryGeneration) {
     while (!stop.load()) {
       domain_->Quiescent(reader);
       reader_rounds++;
-      const ActionTable *table = published.Read();
+      const TestTable *table = published.Read();
       EXPECT_NE(nullptr, table->Lookup(ActionId(1)));
     }
   });

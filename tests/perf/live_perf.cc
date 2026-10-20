@@ -451,13 +451,16 @@ Builder MWildcardMasks(int n) {
   };
 }
 
-// The session slice: ExactMatch (action mode, one rule per flow) ->
-// ActionTable -> Meter (never red) -> Router (one route).
+// The session slice: ExactMatch (one rule per flow) -> Meter (never red) ->
+// Router. A rule's result names the meter and the next hop directly.
 std::vector<std::string> MSession(Build &b) {
-  b.Mod("ActionTable", "at",
-        R"({"capacity": 64, "meters": "mt/meters", "next_hops": "rt/next_hops"})");
   b.Mod("ExactMatch", "em",
-        R"({"fields": [{"offset": 26, "num_bytes": 4}], "result_fields": [{"attr_name": "action_id", "value_offset": 0, "num_bytes": 4, "reference": "at/actions", "reference_key": "BE32"}]})");
+        R"({"fields": [{"offset": 26, "num_bytes": 4}],)"
+        R"( "result_fields": [)"
+        R"({"attr_name": "meter_id", "value_offset": 0, "num_bytes": 4,)"
+        R"( "reference": "mt/meters", "reference_key": "BE32"},)"
+        R"({"attr_name": "next_hop_id", "value_offset": 4, "num_bytes": 4,)"
+        R"( "reference": "rt/next_hops", "reference_key": "BE32"}]})");
   b.Mod("Meter", "mt", R"({"capacity": 64})");
   b.Mod("Router", "rt", R"({"max_routes": 64, "max_tbl8s": 16, "max_next_hops": 64})");
   b.Entry("mt/meters", "MeterIdKey", R"({"id": 1})", "MeterPolicyValue",
@@ -467,14 +470,13 @@ std::vector<std::string> MSession(Build &b) {
           R"({"egress_gate": 0})");
   b.Entry("rt/routes", "RouterRouteKey", R"({"ipv4": "11.0.0.0", "prefix_length": 8})",
           "RouterRouteValue", R"({"next_hop_id": 1})");
-  b.Entry("at/actions", "ActionIdKey", R"({"id": 1})", "ActionValue",
-          R"({"meter_id": 1, "next_hop_id": 1})");
   for (int i = 0; i < kFlows; i++) {
     b.Entry("em/rules", "ExactMatchRuleKey",
             R"({"fields": [{"value_bin": ")" + Base64(Be32(0x0a000001 + i)) + R"("}]})",
-            "ExactMatchRuleValue", R"({"result": ")" + Base64(Be32(1)) + R"("})");
+            "ExactMatchRuleValue",
+            R"({"result": ")" + Base64(Be32(1) + Be32(1)) + R"("})");
   }
-  return MBase(b, {{"em", 1}, {"at", 1}, {"mt", 1}, {"rt", 1}});
+  return MBase(b, {{"em", 1}, {"mt", 1}, {"rt", 1}});
 }
 
 // The FIB at module level: the Router in destination mode (D-155), 256 /16s

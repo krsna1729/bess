@@ -7,15 +7,16 @@
 // registered, so every grace period is complete at once; no EAL).
 //
 // The engine holds std::map-backed fake resources, bound as modules bind
-// theirs (codecs mirror modules/meter.cc, action_table.cc, exact_match.cc):
-//   "meters"  MeterIdKey -> MeterPolicyValue; referenced by actions, defers
-//             erases (Retirer::RemoveLater);
-//   "actions" ActionIdKey -> ActionValue; declares references to "meters"
-//             and to "next_hops", which never registers (a value naming a
-//             next hop is an undeclared reference);
-//   "rules"   ExactMatchRuleKey (fields of 4 and 2 bytes) ->
-//             ExactMatchRuleValue; provides scope-snapshot consistency;
-//   "hidden"  registered but not bound: unreachable over the RPC.
+// theirs (codecs mirror modules/meter.cc, router.cc, exact_match.cc):
+//   "meters"    MeterIdKey -> MeterPolicyValue;
+//   "next_hops" RouterNextHopIdKey -> RouterNextHopValue; referenced by
+//               routes, defers erases (Retirer::RemoveLater);
+//   "routes"    RouterRouteKey -> RouterRouteValue; declares references to
+//               "next_hops" and to "groups", which never registers (a value
+//               naming a group is an undeclared reference);
+//   "rules"     ExactMatchRuleKey (fields of 4 and 2 bytes) ->
+//               ExactMatchRuleValue; provides scope-snapshot consistency;
+//   "hidden"    registered but not bound: unreachable over the RPC.
 //
 // Input: u64 daemon epoch, then up to 32 records of [u8 ctl] and, unless
 // ctl % 4 == 1, a u16-length-prefixed serialized ApplyTransactionRequest
@@ -71,6 +72,7 @@
 #include "pb/control_v2.pb.h"
 #include "pb/module_msg.pb.h"
 #include "rcu/rcu_domain.h"
+#include "utils/ip.h"
 
 namespace {
 
@@ -92,11 +94,16 @@ using google::protobuf::util::MessageDifferencer;
 
 // What every fake resource stores: the decoded value.
 struct Val {
-  uint32_t meter = 0;     // actions: a reference to "meters" if non-zero
-  uint32_t next_hop = 0;  // actions: a reference to "next_hops" if non-zero
-  std::string blob;       // meters: the policy; rules: the gate
+  uint32_t next_hop = 0;  // routes: a reference to "next_hops" if non-zero
+  uint32_t group = 0;     // routes: a reference to "groups" if non-zero
+  std::string blob;       // meters and next hops: the value; rules: the gate
   friend bool operator==(const Val &, const Val &) = default;
 };
+
+template <typename T>
+std::string Bytes(const T &v) {
+  return std::string(reinterpret_cast<const char *>(&v), sizeof(v));
+}
 
 using State = std::map<ResourceKey, Val>;
 
@@ -117,14 +124,44 @@ ValueResult MeterValue(const bess::pb::MeterPolicyValue &value) {
   }
   return Val{0, 0, value.SerializeAsString()};
 }
-KeyResult ActionKey(const bess::pb::ActionIdKey &key) {
+KeyResult NextHopKey(const bess::pb::RouterNextHopIdKey &key) {
   if (key.id() == 0) {
-    return std::unexpected("action id 0 is invalid");
+    return std::unexpected("next hop id 0 is invalid");
   }
   return EncodeKey(uint32_t{key.id()});
 }
-ValueResult ActionValue(const bess::pb::ActionValue &value) {
-  return Val{value.meter_id(), value.next_hop_id(), {}};
+ValueResult NextHopValue(const bess::pb::RouterNextHopValue &value) {
+  if (!bess::IsValidGateValue(value.egress_gate())) {
+    return std::unexpected("invalid egress gate " +
+                           std::to_string(value.egress_gate()));
+  }
+  return Val{0, 0, value.SerializeAsString()};
+}
+KeyResult RouteKey(const bess::pb::RouterRouteKey &key) {
+  bess::utils::be32_t addr;
+  if (!bess::utils::ParseIpv4Address(key.ipv4(), &addr)) {
+    return std::unexpected("invalid IPv4 prefix address '" + key.ipv4() + "'");
+  }
+  if (key.prefix_length() > 32) {
+    return std::unexpected("invalid prefix length");
+  }
+  if (key.domain() >= 16) {
+    return std::unexpected("invalid route domain");
+  }
+  return Bytes(addr.value()) + Bytes(key.prefix_length()) + Bytes(key.domain());
+}
+ValueResult RouteValue(const bess::pb::RouterRouteValue &value) {
+  // Ids are one-based: a route names exactly one of the two, never both.
+  if (value.next_hop_id() != 0 && value.group_id() != 0) {
+    return std::unexpected("a route names a next hop or a group, not both");
+  }
+  if (value.next_hop_id() != 0) {
+    return Val{value.next_hop_id(), 0, {}};
+  }
+  if (value.group_id() != 0) {
+    return Val{0, value.group_id(), {}};
+  }
+  return std::unexpected("a route names a next hop or a group");
 }
 constexpr size_t kFieldSizes[] = {4, 2};
 KeyResult RuleKey(const bess::pb::ExactMatchRuleKey &key) {
@@ -175,11 +212,30 @@ void MeterRead(const ResourceKey &key, const Val &v, bess::pb::MeterIdKey *k,
   k->set_id(IdOf(key));
   FUZZ_CHECK(m->ParseFromString(v.blob));
 }
-void ActionRead(const ResourceKey &key, const Val &v, bess::pb::ActionIdKey *k,
-                bess::pb::ActionValue *m) {
+void NextHopRead(const ResourceKey &key, const Val &v,
+                 bess::pb::RouterNextHopIdKey *k,
+                 bess::pb::RouterNextHopValue *m) {
   k->set_id(IdOf(key));
-  m->set_meter_id(v.meter);
-  m->set_next_hop_id(v.next_hop);
+  FUZZ_CHECK(m->ParseFromString(v.blob));
+}
+void RouteRead(const ResourceKey &key, const Val &v,
+               bess::pb::RouterRouteKey *k, bess::pb::RouterRouteValue *m) {
+  uint32_t addr = 0;
+  uint32_t prefix = 0;
+  uint32_t domain = 0;
+  FUZZ_CHECK(key.size() == sizeof(addr) + sizeof(prefix) + sizeof(domain));
+  std::memcpy(&addr, key.data(), sizeof(addr));
+  std::memcpy(&prefix, key.data() + sizeof(addr), sizeof(prefix));
+  std::memcpy(&domain, key.data() + sizeof(addr) + sizeof(prefix),
+              sizeof(domain));
+  k->set_ipv4(bess::utils::ToIpv4Address(bess::utils::be32_t(addr)));
+  k->set_prefix_length(prefix);
+  k->set_domain(domain);
+  if (v.next_hop != 0) {
+    m->set_next_hop_id(v.next_hop);
+  } else {
+    m->set_group_id(v.group);
+  }
 }
 void RuleRead(const ResourceKey &key, const Val &v,
               bess::pb::ExactMatchRuleKey *k, bess::pb::ExactMatchRuleValue *m) {
@@ -275,11 +331,11 @@ class MapResource final : public Resource {
     if (declared_references().empty()) {
       return refs;
     }
-    if (v.meter != 0) {
-      refs.push_back({"meters", EncodeKey(v.meter)});
-    }
     if (v.next_hop != 0) {
       refs.push_back({"next_hops", EncodeKey(v.next_hop)});
+    }
+    if (v.group != 0) {
+      refs.push_back({"groups", EncodeKey(v.group)});
     }
     return refs;
   }
@@ -354,7 +410,8 @@ std::shared_ptr<const bess::framework::ResourceCodec> Codec(
 // -- the reference model ----------------------------------------------------------
 
 constexpr const char *kMeters = "meters";
-constexpr const char *kActions = "actions";
+constexpr const char *kNextHops = "next_hops";
+constexpr const char *kRoutes = "routes";
 constexpr const char *kRules = "rules";
 constexpr const char *kHidden = "hidden";
 
@@ -415,8 +472,11 @@ bool ModelDecode(const v2::TransactionOp &op, ModelOp *out) {
   if (op.resource() == kMeters) {
     return ModelDecodeTyped(op, MeterKey, MeterValue, out);
   }
-  if (op.resource() == kActions) {
-    return ModelDecodeTyped(op, ActionKey, ActionValue, out);
+  if (op.resource() == kNextHops) {
+    return ModelDecodeTyped(op, NextHopKey, NextHopValue, out);
+  }
+  if (op.resource() == kRoutes) {
+    return ModelDecodeTyped(op, RouteKey, RouteValue, out);
   }
   if (op.resource() == kRules) {
     return ModelDecodeTyped(op, RuleKey, RuleValue, out);
@@ -438,8 +498,9 @@ std::string Contents(const v2::ApplyTransactionRequest &request) {
 }
 
 struct Model {
-  std::map<std::string, State> state{
-      {kMeters, {}}, {kActions, {}}, {kRules, {}}, {kHidden, {}}};
+  std::map<std::string, State> state{{kMeters, {}}, {kNextHops, {}},
+                                     {kRoutes, {}}, {kRules, {}},
+                                     {kHidden, {}}};
   uint64_t generation = 0;
   struct Recorded {
     std::string contents;
@@ -451,12 +512,12 @@ struct Model {
   // left with the RCU domain and the engine's cascades.
   size_t last_retired = 0;
 
-  // References to meter `key` held by the actions in `s`.
+  // References to next hop `key` held by the routes in `s`.
   static size_t Refs(const std::map<std::string, State> &s,
                      const ResourceKey &key) {
     size_t n = 0;
-    for (const auto &[k, v] : s.at(kActions)) {
-      n += v.meter != 0 && EncodeKey(v.meter) == key;
+    for (const auto &[k, v] : s.at(kRoutes)) {
+      n += v.next_hop != 0 && EncodeKey(v.next_hop) == key;
     }
     return n;
   }
@@ -475,40 +536,48 @@ struct Expected {
 struct Fixture {
   bess::rcu::RcuDomain domain{1};
   MapResource meters{kMeters, {}, true, Consistency::kReferential};
-  MapResource actions{kActions, {kMeters, "next_hops"}, true,
-                      Consistency::kReferential};
+  MapResource next_hops{kNextHops, {}, true, Consistency::kReferential};
+  MapResource routes{kRoutes, {kNextHops, "groups"}, true,
+                     Consistency::kReferential};
   MapResource rules{kRules, {}, false, Consistency::kScopeSnapshot};
   MapResource hidden{kHidden, {}, false, Consistency::kReferential};
   TransactionEngine engine{domain};
   bess::framework::ResourceBindings bindings;
   bess::framework::ResourceBinding meters_binding;
-  bess::framework::ResourceBinding actions_binding;
+  bess::framework::ResourceBinding next_hops_binding;
+  bess::framework::ResourceBinding routes_binding;
   bess::framework::ResourceBinding rules_binding;
   std::optional<DataplaneTransactions> tx;
 
   explicit Fixture(uint64_t epoch) {
     FUZZ_CHECK(engine.Register(&meters).has_value());
-    FUZZ_CHECK(engine.Register(&actions).has_value());
+    FUZZ_CHECK(engine.Register(&next_hops).has_value());
+    FUZZ_CHECK(engine.Register(&routes).has_value());
     FUZZ_CHECK(engine.Register(&rules).has_value());
     FUZZ_CHECK(engine.Register(&hidden).has_value());
     meters_binding = bindings.Bind(meters, Codec(MeterKey, MeterValue, MeterRead, meters));
-    actions_binding =
-        bindings.Bind(actions, Codec(ActionKey, ActionValue, ActionRead, actions));
+    next_hops_binding =
+        bindings.Bind(next_hops,
+                      Codec(NextHopKey, NextHopValue, NextHopRead, next_hops));
+    routes_binding =
+        bindings.Bind(routes, Codec(RouteKey, RouteValue, RouteRead, routes));
     rules_binding = bindings.Bind(rules, Codec(RuleKey, RuleValue, RuleRead, rules));
     tx.emplace(engine, bindings, epoch);
   }
   ~Fixture() {
     tx.reset();
     rules_binding.Reset();
-    actions_binding.Reset();
+    routes_binding.Reset();
+    next_hops_binding.Reset();
     meters_binding.Reset();
   }
 
   const MapResource &Get(const std::string &name) const {
     return name == kMeters    ? meters
-           : name == kActions ? actions
-           : name == kRules   ? rules
-                              : hidden;
+           : name == kNextHops ? next_hops
+           : name == kRoutes   ? routes
+           : name == kRules    ? rules
+                               : hidden;
   }
 };
 
@@ -585,8 +654,8 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
       may_retire++;
     } else {
       may_retire += exists ? 1 : 0;
-      if (ops[i].resource == kActions && ops[i].value.next_hop != 0) {
-        return reject(i);  // "next_hops" is declared but never registered
+      if (ops[i].resource == kRoutes && ops[i].value.group != 0) {
+        return reject(i);  // "groups" is declared but never registered
       }
     }
   }
@@ -599,7 +668,7 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
   // this one unless they do not fit the budget with it; only then BUSY.
   e.busy_possible = model.last_retired + may_retire > kBudget;
 
-  // References the transaction leaves: every meter key named after it must
+  // References the transaction leaves: every next-hop key named after it must
   // exist after it. The engine reports the lowest such key.
   *after = model.state;
   for (const ModelOp &op : ops) {
@@ -611,23 +680,24 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
     }
   }
   std::set<ResourceKey> named;
-  for (const auto &[k, v] : after->at(kActions)) {
-    if (v.meter != 0) {
-      named.insert(EncodeKey(v.meter));
+  for (const auto &[k, v] : after->at(kRoutes)) {
+    if (v.next_hop != 0) {
+      named.insert(EncodeKey(v.next_hop));
     }
   }
   for (const ResourceKey &key : named) {
-    if (after->at(kMeters).contains(key)) {
+    if (after->at(kNextHops).contains(key)) {
       continue;
     }
     for (int i = 0; i < n; i++) {
-      if (ops[i].resource == kMeters && ops[i].key == key) {
+      if (ops[i].resource == kNextHops && ops[i].key == key) {
         return reject(i);  // erases a key still referenced
       }
     }
     for (int i = 0; i < n; i++) {
-      if (ops[i].resource == kActions && !ops[i].erase &&
-          ops[i].value.meter != 0 && EncodeKey(ops[i].value.meter) == key) {
+      if (ops[i].resource == kRoutes && !ops[i].erase &&
+          ops[i].value.next_hop != 0 &&
+          EncodeKey(ops[i].value.next_hop) == key) {
         return reject(i);  // references a missing key
       }
     }
@@ -643,14 +713,14 @@ void CheckState(const Fixture &f, const Model &model) {
     FUZZ_CHECK(f.Get(name).Snapshot() == state);
   }
   FUZZ_CHECK(f.engine.generation() == model.generation);
-  for (const auto &[key, value] : model.state.at(kMeters)) {
-    FUZZ_CHECK(f.engine.ReferenceCount(kMeters, key) ==
+  for (const auto &[key, value] : model.state.at(kNextHops)) {
+    FUZZ_CHECK(f.engine.ReferenceCount(kNextHops, key) ==
                Model::Refs(model.state, key));
   }
   FUZZ_CHECK(f.tx->records() == model.records.size());
   // Read-back (D-129): each bound resource's entries decode, through its own
   // codec, to exactly its committed state.
-  for (const char *name : {kMeters, kActions, kRules}) {
+  for (const char *name : {kMeters, kNextHops, kRoutes, kRules}) {
     const bess::framework::ResourceCodec *codec = f.bindings.Find(f.Get(name));
     FUZZ_CHECK(codec != nullptr);
     State read;
@@ -761,10 +831,12 @@ void CheckList(const Fixture &f, const Model &model, uint64_t epoch) {
     const google::protobuf::Descriptor *key;
     const google::protobuf::Descriptor *value;
   } want[] = {
-      {kActions, bess::pb::ActionIdKey::descriptor(),
-       bess::pb::ActionValue::descriptor()},
       {kMeters, bess::pb::MeterIdKey::descriptor(),
        bess::pb::MeterPolicyValue::descriptor()},
+      {kNextHops, bess::pb::RouterNextHopIdKey::descriptor(),
+       bess::pb::RouterNextHopValue::descriptor()},
+      {kRoutes, bess::pb::RouterRouteKey::descriptor(),
+       bess::pb::RouterRouteValue::descriptor()},
       {kRules, bess::pb::ExactMatchRuleKey::descriptor(),
        bess::pb::ExactMatchRuleValue::descriptor()},
   };

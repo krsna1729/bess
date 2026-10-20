@@ -252,6 +252,11 @@ message ResultField {
     BE32 = 1;
   }
   ReferenceKey reference_key = 6;
+  // For a BE32 reference: how many consecutive 4-byte big-endian ids the
+  // field carries (unset or 0 means one), so an 8-byte meter_id names two
+  // meter levels and each id is a separate reference. num_bytes must be
+  // 4 * reference_count. A RAW reference always carries one key.
+  uint32 reference_count = 7;
 }
 
 message ExactMatchRuleKey {
@@ -264,20 +269,6 @@ message ExactMatchRuleValue {
   // The rule's result record, placed by the module's result_fields. Shorter
   // than the table's record size: the rest is zeros. Longer: refused.
   bytes result = 3;
-}
-
-message ActionIdKey {
-  uint32 id = 1;
-}
-
-message ActionValue {
-  uint32 meter_id = 1;
-  uint32 next_hop_id = 2;
-  // The action's meter per level, in policing order (flow first, the session's
-  // aggregate last). When non-empty it replaces `meter_id`: the action writes
-  // all of them into one `meter_id` attribute sized 4 * len. 0 is "no meter at
-  // this level", which the Meter passes.
-  repeated uint32 meter_ids = 3;
 }
 
 message MeterIdKey {
@@ -448,10 +439,10 @@ message FirewallArg {
     uint32 dst_port_low = 6;   /// Inclusive lower bound (default 0).
     optional uint32 dst_port_high = 7; /// Inclusive upper bound (default 65535).
     bool drop = 8;             /// Drop matching packets instead of forwarding.
-    optional uint32 action_id = 9; /// The ActionId a matching packet carries, 0 for none. The packet path writes it into the packet's "action_id" metadata attribute, so an ActionTable downstream selects the action this rule names (D-141). A rule that drops cannot name one.
+    optional uint32 action_id = 9; /// The action id a matching packet carries, 0 for none. The packet path writes it into the packet's "action_id" metadata attribute for whatever module downstream reads it (D-141). A rule that drops cannot name one.
   }
   repeated Rule rules = 1; /// The policy, in order.
-  string action_attr = 2; /// The metadata attribute a matching rule's action id is written to (default "action_id"). The reader must be configured to match -- an ActionTable with the same action_attr; with no reader the packets carry no action id (PreResume reports it once).
+  string action_attr = 2; /// The metadata attribute a matching rule's action id is written to (default "action_id"). The reader must be configured with the same name; with no reader the packets carry no action id (PreResume reports it once).
 }
 
 /**
@@ -1424,28 +1415,6 @@ message MeterStatus {
 
 message MeterCommandGetStatusResponse {
   repeated MeterStatus meters = 1;
-}
-
-/**
- * The ActionTable module holds per-session actions: an action id (which an
- * ExactMatch rule in action mode names) resolves to a meter id and a next-hop
- * id, both written to packet metadata for the modules downstream. Actions,
- * their meters and their next hops are one transactional resource graph.
- *
- * __Input Gates__: 1
- * __Output Gates__: 1
- */
-message ActionTableArg {
-  uint64 capacity = 1; /// Most actions this module's table holds (default 1024).
-  string meters = 2; /// Resource name of the Meter module's meters.
-  string next_hops = 3; /// Resource name of the Router module's next hops.
-  string meter_attr = 4; /// The metadata attribute the action's meter id is written to (default "meter_id"). Two action tables over one action id write different meter identities this way. The name must be read downstream: with no reader the action table drops every packet (PreResume reports it once).
-  string next_hop_attr = 5; /// The metadata attribute the action's next-hop id is written to (default "next_hop_id"). As with meter_attr, a name no Router reads disables the action table.
-  string action_attr = 6; /// The metadata attribute the action id is read from (default "action_id"). A writer configured elsewhere -- a Firewall whose action_attr names another attribute -- sets this to match.
-  // How many meter ids one action carries (default 1). The `meter_attr`
-  // attribute is declared 4 * levels bytes wide, so the Meter downstream must
-  // declare the same count; the framework refuses a size mismatch.
-  uint32 levels = 7;
 }
 
 /**

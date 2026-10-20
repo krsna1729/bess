@@ -360,8 +360,6 @@ std::vector<ModuleSample> EveryResourceSample() {
            R"({"egress_gate": 7, "dst_mac": "AgAAAAAB", "src_mac": "AgAAAAAC"})"}}},
         {"groups", {{R"({"id": 1})", R"({"member_ids": [1]})"}}},
         {"routes", {{R"({"ipv4": "10.0.0.0", "prefix_length": 8})", R"({"next_hop_id": 1})"}}}}},
-      {"at", "ActionTable", R"({"capacity": 64, "meters": "mt/meters", "next_hops": "rt/next_hops"})",
-       false, {{"actions", {{R"({"id": 1})", R"({"meter_id": 1, "next_hop_id": 1})"}}}}},
       {"src", "Source", "", true, {{"settings", setting(R"({"pkt_size": 128, "burst": 7})")}}},
       {"pi", "PortInc", R"({"port": "pa"})", true, {{"settings", setting(R"({"burst": 9})")}}},
       {"qi", "QueueInc", R"({"port": "pb", "qid": 0})", true,

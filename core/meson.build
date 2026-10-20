@@ -134,7 +134,6 @@ driver_sources = files(
 module_sources = files(
   'modules/acl.cc',
   'modules/firewall.cc',
-  'modules/action_table.cc',
   'modules/arp_responder.cc',
   'modules/bpf.cc',
   'modules/bridge.cc',

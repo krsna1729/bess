@@ -323,9 +323,9 @@ Reusable `NextHop` currently contains `gate_idx_t`. That makes the reusable rout
 
 The routing library should terminate in a logical interface/forwarding identifier; the graph adapter should map that to gates.
 
-### G. `ActionTable` risks becoming an accidental universal action model
+### G. A single `{meter_id, next_hop_id}` action model must not become the generic abstraction
 
-The current session vertical slice uses an action `{meter_id, next_hop_id}`. That is excellent as a transaction/reference test and useful module, but it must not become the generic BESS action abstraction.
+The session slice once used an `ActionTable` action `{meter_id, next_hop_id}` as its transaction/reference test. D-172 and D-174 replaced it: a classifier rule's result fields write those ids (and name the resources they reference), and the module is gone. The lesson stands: no one fixed action record is the generic BESS action abstraction.
 
 ### H. Old NAT/L2/LB modules contain reusable mechanisms trapped inside module code
 
@@ -1420,7 +1420,6 @@ A staged migration can:
 
 Move these first because they exercise resource/lifetime needs:
 
-- `ActionTable`;
 - `Meter`;
 - `Router`;
 - Exact/Wildcard resource registration paths.
@@ -4675,7 +4674,7 @@ Introduce context plumbing but keep legacy direct APIs.
 
 ### Commit 7 — migrate transaction-aware modules off `runtime()`
 
-Start with ActionTable/Meter/Router/ExactMatch registration.
+Start with Meter/Router/ExactMatch registration.
 
 ### Commit 8 — resource binding extraction
 
@@ -4847,7 +4846,6 @@ This is a migration guide, not a demand for one large directory-moving commit.
 | `core/task.*`, scheduler/traffic class | execution/runtime | Clarify public/internal boundary |
 | `core/port.*` | runtime/framework device boundary | Split physical device lifecycle from logical `InterfaceId` |
 | `core/drivers/pmd.*` | drivers/runtime | Hardware-specific |
-| `core/modules/action_table.*` | module/reference vertical slice | Do not elevate its `Action` to universal type |
 | `core/modules/nat.*` | compatibility module over future NAT library | Extract mechanisms |
 | `core/modules/l2_table.h` | candidate input to L2 library | Benchmark rather than blindly move |
 | `core/modules/l2_forward.*` | compatibility module over L2 library | Thin adapter |
@@ -5592,7 +5590,6 @@ core/runtime/
 core/control/
 core/framework/
 
-core/modules/action_table.*
 core/modules/session_pipeline_test.cc
 core/modules/nat.*
 core/modules/l2_table.h

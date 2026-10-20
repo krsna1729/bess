@@ -383,9 +383,9 @@ void Router::DeInit() {
   if (router_ == nullptr) {
     return;
   }
-  // An action references these next hops, so release rather than unregister:
-  // the order modules are destroyed in must not decide whether a pipeline can
-  // be torn down.
+  // Classifier rules reference these next hops, so release rather than
+  // unregister: the order modules are destroyed in must not decide whether a
+  // pipeline can be torn down.
   auto released = router_->Release();
   CHECK(released) << released.error();
   next_hops_binding_.Reset();
@@ -419,7 +419,7 @@ int Router::OnEvent(bess::Event event) {
   }
   if (!bess::metadata::IsValidOffset(attr_offset(next_hop_id_attr_))) {
     LOG(ERROR) << "Router '" << name() << "': the '" << next_hop_attr_name_
-               << "' attribute is unreadable (is an ActionTable writing it?); "
+               << "' attribute is unreadable (is anything writing it?); "
                   "dropping packets";
   }
   return 0;

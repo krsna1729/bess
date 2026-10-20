@@ -277,6 +277,8 @@ class ExactMatch final : public Module {
     // those bytes are a big-endian id whose key is host-order.
     std::string reference;
     bool reference_be32 = false;
+    // Consecutive big-endian ids a BE32 field carries (D-172).
+    uint32_t reference_count = 1;
   };
   std::vector<ResultSpec> result_specs_;
   // Distinct resource names the result fields reference, for the resource's

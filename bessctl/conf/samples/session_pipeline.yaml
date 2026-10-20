@@ -3,21 +3,15 @@
 # A policed, routed session, all in desired state (roadmap M23, persona A:
 # the graph user). The graph is
 #
-#   Source -> Rewrite -> ExactMatch -> ActionTable -> Meter -> Router -> Sink
+#   Source -> Rewrite -> ExactMatch -> Meter -> Router -> Sink
 #
 # and everything dynamic is in the modules' tables, not in the graph: the
 # resources below are one transaction that creates the session's meter, next
-# hop, route, action and the ExactMatch rule naming that action.
+# hop, route and the ExactMatch rule whose result names both.
 #
 # Converted from session_pipeline.bess (D-104). Rewrite templates are the packets it
 # built with scapy.
 modules:
-  - name: at
-    mclass: ActionTable
-    arg:
-      capacity: "64"
-      meters: mt/meters
-      next_hops: rt/next_hops
   - name: em
     mclass: ExactMatch
     arg:
@@ -27,10 +21,15 @@ modules:
         - offset: 34
           num_bytes: 2
       result_fields:
-        - attr_name: action_id
+        - attr_name: meter_id
           value_offset: 0
           num_bytes: 4
-          reference: at/actions
+          reference: mt/meters
+          reference_key: BE32
+        - attr_name: next_hop_id
+          value_offset: 4
+          num_bytes: 4
+          reference: rt/next_hops
           reference_key: BE32
   - name: mt
     mclass: Meter
@@ -53,10 +52,8 @@ modules:
   - name: source0
     mclass: Source
 connections:
-  - upstream: at
-    downstream: mt
   - upstream: em
-    downstream: at
+    downstream: mt
   - upstream: mt
     downstream: rt
   - upstream: rewrite0
@@ -80,10 +77,8 @@ resources:
   rt/routes:
     - key: {ipv4: 10.0.0.0, prefix_length: 8}
       value: {next_hop_id: 1}
-  at/actions:
-    - key: {id: 1}
-      value: {meter_id: 1, next_hop_id: 1}
-  # The session: TCP from 10.1.2.3 port 1234.
+  # The session: TCP from 10.1.2.3 port 1234. Its 8-byte result names meter 1
+  # and next hop 1, big-endian.
   em/rules:
     - key: {fields: [{value_bin: CgECAw==}, {value_bin: BNI=}]}
-      value: {result: "AAAAAQ=="}
+      value: {result: "AAAAAQAAAAE="}

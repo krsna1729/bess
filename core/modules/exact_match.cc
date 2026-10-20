@@ -459,12 +459,18 @@ std::vector<bess::dataplane::Reference> ExactMatch::ResultReferences(
     }
     if (spec.reference_be32) {
       const auto *at = record.data() + spec.value_offset;
-      const uint32_t b0 = static_cast<uint32_t>(at[0]);
-      const uint32_t b1 = static_cast<uint32_t>(at[1]);
-      const uint32_t b2 = static_cast<uint32_t>(at[2]);
-      const uint32_t b3 = static_cast<uint32_t>(at[3]);
-      const uint32_t id = (b0 << 24U) | (b1 << 16U) | (b2 << 8U) | b3;
-      refs.push_back({spec.reference, bess::dataplane::EncodeKey(id)});
+      for (uint32_t i = 0; i < spec.reference_count; i++) {
+        const auto *chunk = at + static_cast<size_t>(i) * 4;
+        const uint32_t id =
+            (static_cast<uint32_t>(chunk[0]) << 24U) |
+            (static_cast<uint32_t>(chunk[1]) << 16U) |
+            (static_cast<uint32_t>(chunk[2]) << 8U) |
+            static_cast<uint32_t>(chunk[3]);
+        if (id == 0) {
+          continue;  // 0 names nothing at this position (D-141)
+        }
+        refs.push_back({spec.reference, bess::dataplane::EncodeKey(id)});
+      }
     } else {
       refs.push_back(
           {spec.reference,
@@ -772,9 +778,23 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
     spec.reference = field.reference();
     spec.reference_be32 = field.reference_key() ==
                           bess::pb::ResultField::BE32;
-    if (spec.reference_be32 && (spec.size != 4 || spec.reference.empty())) {
+    spec.reference_count =
+        field.reference_count() == 0 ? 1 : field.reference_count();
+    if (spec.reference_be32) {
+      if (spec.reference.empty()) {
+        return CommandFailure(EINVAL,
+                              "a BE32 reference names no resource");
+      }
+      if (static_cast<uint64_t>(spec.size) !=
+          4ull * spec.reference_count) {
+        return CommandFailure(
+            EINVAL,
+            "a BE32 reference carries reference_count 4-byte ids: num_bytes "
+            "must be 4 * reference_count");
+      }
+    } else if (spec.reference_count != 1) {
       return CommandFailure(
-          EINVAL, "a BE32 reference is one 4-byte field naming a resource");
+          EINVAL, "reference_count applies to BE32 references only");
     }
     if (!spec.reference.empty() &&
         std::find(result_reference_names_.begin(),

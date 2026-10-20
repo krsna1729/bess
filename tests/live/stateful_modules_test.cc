@@ -227,19 +227,23 @@ TEST_F(StatefulModulesTest, NatUsageCommandsWhileRunning) {
   EXPECT_GT(GatePackets("nat", 1), 0);
 }
 
-// The ExactMatch in action mode is written by transactions while a worker
-// forwards traffic through it: rules and the actions they name come and go
-// under packets, every transaction applied.
+// The ExactMatch's rules are written by transactions while a worker forwards
+// traffic through it: rules and the meter and next hop their result names come
+// and go under packets, every transaction applied. The referents exist for the
+// whole run; each rule names one of them directly (D-172), so the meter and the
+// router are on the packet path.
 TEST_F(StatefulModulesTest, SessionTransactionsWhileTrafficRuns) {
   auto src_arg = types_.Make("bess.pb.SourceArg", R"({"pkt_size": 60})");
-  auto rnd_arg = types_.Make("bess.pb.RandomUpdateArg", kRandomAddresses);
-  auto at_arg = types_.Make("bess.pb.ActionTableArg",
-                            R"({"capacity": 64, "meters": "mt/meters", "next_hops": "rt/next_hops"})");
+  auto rnd_arg = types_.Make(
+      "bess.pb.RandomUpdateArg",
+      R"({"fields": [{"offset": 34, "size": 2, "min": 1, "max": 64}]})");
   auto em_arg = types_.Make("bess.pb.ExactMatchArg",
-                            R"({"fields": [{"offset": 26, "num_bytes": 4}, {"offset": 34, "num_bytes": 2}],
-                                "result_fields": [{"attr_name": "action_id", "value_offset": 0, "num_bytes": 4,
-                                  "reference": "at/actions", "reference_key": "BE32"}],
-                                "default_gate": 0})");
+                            R"({"fields": [{"offset": 34, "num_bytes": 2}],
+                                "result_fields": [
+                                  {"attr_name": "meter_id", "value_offset": 0, "num_bytes": 4,
+                                   "reference": "mt/meters", "reference_key": "BE32"},
+                                  {"attr_name": "next_hop_id", "value_offset": 4, "num_bytes": 4,
+                                   "reference": "rt/next_hops", "reference_key": "BE32"}]})");
   auto mt_arg = types_.Make("bess.pb.MeterArg", R"({"capacity": 64})");
   auto rt_arg = types_.Make("bess.pb.RouterArg",
                             R"({"max_routes": 64, "max_tbl8s": 16, "max_next_hops": 64})");
@@ -247,43 +251,73 @@ TEST_F(StatefulModulesTest, SessionTransactionsWhileTrafficRuns) {
             .Worker(0, 0, "")
             .Module("src", "Source", src_arg.get())
             .Module("rnd", "RandomUpdate", rnd_arg.get())
-            .Module("at", "ActionTable", at_arg.get())
             .Module("em", "ExactMatch", em_arg.get())
             .Module("mt", "Meter", mt_arg.get())
             .Module("rt", "Router", rt_arg.get())
             .Module("sink", "Sink", nullptr)
-            .Chain({"src", "rnd", "em", "sink"})
+            .Chain({"src", "rnd", "em", "mt", "rt", "sink"})
             .Task(OnWorker0("src")));
 
-  auto actions = client().Resource("at/actions");
-  ASSERT_TRUE(actions) << actions.error().message;
+  auto meters = client().Resource("mt/meters");
+  ASSERT_TRUE(meters) << meters.error().message;
+  auto next_hops = client().Resource("rt/next_hops");
+  ASSERT_TRUE(next_hops) << next_hops.error().message;
   auto rules = client().Resource("em/rules");
   ASSERT_TRUE(rules) << rules.error().message;
-  // 10.<i/256>.<i%256>.1, source port 1.
+  // Source port 1..64, the one field the source and the rules share.
   auto rule_key = [&](int i) {
-    const std::vector<uint8_t> ip = {10, static_cast<uint8_t>(i / 256 % 256),
-                                     static_cast<uint8_t>(i % 256), 1};
-    return types_.Make(rules->key_type, R"({"fields": [{"value_bin": ")" + Base64(ip) +
-                                            R"("}, {"value_bin": "AAE="}]})");
+    const std::vector<uint8_t> port = {0, static_cast<uint8_t>(i + 1)};
+    return types_.Make(rules->key_type,
+                       R"({"fields": [{"value_bin": ")" + Base64(port) + R"("}]})");
   };
+  // A rule's 8-byte result: the meter id then the next-hop id, big-endian.
+  const auto result = [](uint32_t id) {
+    const std::vector<uint8_t> bytes = {
+        static_cast<uint8_t>(id >> 24U), static_cast<uint8_t>(id >> 16U),
+        static_cast<uint8_t>(id >> 8U), static_cast<uint8_t>(id),
+        static_cast<uint8_t>(id >> 24U), static_cast<uint8_t>(id >> 16U),
+        static_cast<uint8_t>(id >> 8U), static_cast<uint8_t>(id)};
+    return Base64(bytes);
+  };
+
+  // Every source port has a rule before traffic starts, and the four meters
+  // and next hops exist for the whole run (each rule references one forever).
+  {
+    auto tx = client().NewTransaction();
+    for (uint32_t id = 1; id <= 4; id++) {
+      auto meter_key =
+          types_.Make(meters->key_type, R"({"id": )" + std::to_string(id) + "}");
+      auto meter_value =
+          types_.Make(meters->value_type,
+                      R"({"tr_tcm": {"committed_rate": "1000000000",
+                                     "committed_burst": "1000000",
+                                     "peak_rate": "1000000000",
+                                     "peak_burst": "1000000"}})");
+      ASSERT_TRUE(tx.Upsert(*meters, *meter_key, *meter_value));
+      auto hop_key =
+          types_.Make(next_hops->key_type, R"({"id": )" + std::to_string(id) + "}");
+      auto hop_value =
+          types_.Make(next_hops->value_type, R"({"egress_gate": 0})");
+      ASSERT_TRUE(tx.Upsert(*next_hops, *hop_key, *hop_value));
+    }
+    for (int i = 0; i < 64; i++) {
+      auto rule_value = types_.Make(
+          rules->value_type,
+          R"({"result": ")" + result(1 + i % 4) + R"("})");
+      ASSERT_TRUE(tx.Upsert(*rules, *rule_key(i), *rule_value));
+    }
+    auto done = tx.Commit();
+    ASSERT_TRUE(done) << "seed transaction: " << done.error().message;
+  }
 
   int applied = 0;
   const int steps = RunWhileForwarding([&](int i) {
-    const std::string action_id = std::to_string(1 + i % 4);
-    auto tx = client().NewTransaction();
-    auto action_key = types_.Make(actions->key_type, R"({"id": )" + action_id + "}");
-    auto action_value = types_.Make(actions->value_type, R"({"meter_id": 0, "next_hop_id": 0})");
-    ASSERT_TRUE(tx.Upsert(*actions, *action_key, *action_value));
     const uint32_t id = 1 + i % 4;
-    const std::vector<uint8_t> result = {
-        static_cast<uint8_t>(id >> 24U), static_cast<uint8_t>(id >> 16U),
-        static_cast<uint8_t>(id >> 8U), static_cast<uint8_t>(id)};
+    auto tx = client().NewTransaction();
     auto rule_value =
-        types_.Make(rules->value_type, R"({"result": ")" + Base64(result) + R"("})");
-    ASSERT_TRUE(tx.Upsert(*rules, *rule_key(i), *rule_value));
-    if (i >= 4) {
-      ASSERT_TRUE(tx.Erase(*rules, *rule_key(i - 4)));
-    }
+        types_.Make(rules->value_type, R"({"result": ")" + result(id) + R"("})");
+    ASSERT_TRUE(tx.Upsert(*rules, *rule_key(i % 64), *rule_value));
+    ASSERT_TRUE(tx.Erase(*rules, *rule_key((i + 32) % 64)));
     auto done = tx.Commit();
     ASSERT_TRUE(done) << "transaction " << i << ": " << done.error().message;
     applied++;

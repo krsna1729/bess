@@ -140,7 +140,7 @@ class RouterTest : public ::testing::Test {
 
   // The metadata writer a graph uses for this attribute: a SetMetadata
   // setting next_hop_id = `id` (big-endian, as the Router reads it), which in
-  // a graph is what an ActionTable writes.
+  // a graph is what a classifier result writes.
   // A fresh name per call: the harness keeps every module it creates until the
   // test ends (ModuleHarness::~ModuleHarness destroys them), so a second
   // writer in one test would fail creation with a name already taken.
@@ -156,7 +156,7 @@ class RouterTest : public ::testing::Test {
   }
 
   // One frame through a writer that sets next_hop_id = 1, into `rt`: the
-  // graph a deployment has (an ActionTable upstream of the Router).
+  // graph a deployment has (a classifier result upstream of the Router).
   std::map<gate_idx_t, std::vector<Bytes>> Run(Router *rt, const Bytes &frame,
                                               std::vector<gate_idx_t> ogates = {0, 1}) {
     Module *writer = MakeWriter(1);

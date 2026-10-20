@@ -2,11 +2,11 @@
 
 // Fuzzes framework::TypedCodec (framework/resource_codec.h), the decoder the
 // transaction RPC runs on every operation's key and value, instantiated with
-// the message types modules bind (ActionTable, Meter, ExactMatch, Router).
-// The conversion functions mirror those modules' codec lambdas.
+// the message types modules bind (Meter, ExactMatch, Router). The conversion
+// functions mirror those modules' codec lambdas.
 //
-// Input: byte 0 selects the codec (bits 0-1: actions, meters, exact-match
-// rules, routes) and the side (bit 2: key or value); then a u16-length-
+// Input: byte 0 selects the codec (bits 0-1: meters, exact-match rules,
+// routes) and the side (bit 2: key or value); then a u16-length-
 // prefixed type_url; the rest of the input is the serialized message.
 //
 // Oracle, per call through the ResourceCodec interface:
@@ -91,25 +91,6 @@ bool SameKey(const KeyResult &a, const KeyResult &b, Project) {
 bool SameValue(const ValueResult &a, const ValueResult &b, Project project) {
   return a.has_value() == b.has_value() &&
          (a ? project(*a) == project(*b) : a.error() == b.error());
-}
-
-// ActionTable (modules/action_table.cc).
-struct Action {
-  uint32_t meter;
-  uint32_t next_hop;
-};
-KeyResult ActionKey(const bess::pb::ActionIdKey &key) {
-  if (key.id() == 0) {
-    return std::unexpected("action id 0 is invalid");
-  }
-  return EncodeKey(uint32_t{key.id()});
-}
-ValueResult ActionVal(const bess::pb::ActionValue &value) {
-  return std::any(Action{value.meter_id(), value.next_hop_id()});
-}
-std::string ProjectAction(const std::any &v) {
-  const Action &a = std::any_cast<const Action &>(v);
-  return Bytes(a.meter) + Bytes(a.next_hop);
 }
 
 // Meter (modules/meter.cc, PolicyFromPb).
@@ -355,12 +336,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
   switch (selector & 3) {
     case 0:
-      Run(ActionKey, ActionVal, ProjectAction, value_side, url, bytes);
-      break;
-    case 1:
       Run(MeterKey, MeterVal, ProjectPolicy, value_side, url, bytes);
       break;
-    case 2:
+    case 1:
       Run(ExactKey, ExactVal, ProjectGate, value_side, url, bytes);
       break;
     default:

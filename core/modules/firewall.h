@@ -79,8 +79,8 @@ class Firewall final : public Module {
   // table (an RCU swap: workers keep running).
   bess::framework::Singleton<bess::pb::FirewallArg, Staged> rules_resource_;
   // The packet's "action_id" (D-141): written for every packet the policy
-  // passes, 0 when its rule names no action, so an ActionTable downstream
-  // selects the action and a stale id cannot leak into a later lookup.
+  // passes, 0 when its rule names no action, so a module downstream selects
+  // the action and a stale id cannot leak into a later lookup.
   int action_id_attr_ = -1;
   // The registered output name, for the log line that names it.
   std::string action_attr_name_;

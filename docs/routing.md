@@ -75,7 +75,7 @@ route exists and chose that hop (D-160).
 `next_hop_id` metadata, and the Router resolves it and leaves on that hop's egress gate:
 
 ```
-ports/vifs -> classifier -> ActionTable (next_hop_id) -> Router -> ports -> UpdateTTL
+ports/vifs -> classifier (next_hop_id) -> Router -> ports -> UpdateTTL
 ```
 
 No routes are written; the router is a next-hop mux, and it writes no TTL -- this is the mode whose contract is
