@@ -12,6 +12,7 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -279,11 +280,17 @@ class ApiV2ServiceTest : public ::testing::Test {
     control_plane_ = std::make_unique<ControlPlane>();
     service_ = std::make_unique<ControlV2Service>(*control_plane_);
     grpc::ServerBuilder builder;
+    // The limits bessd's control server configures: a test that reads a table
+    // above 64 MiB must not pass because the client's 4 MiB default refused it.
+    builder.SetMaxReceiveMessageSize(bess::control::kMaxMessageBytes);
+    builder.SetMaxSendMessageSize(bess::control::kMaxMessageBytes);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     ASSERT_NE(nullptr, server_);
-    stub_ = v2::Control::NewStub(
-        server_->InProcessChannel(grpc::ChannelArguments()));
+    grpc::ChannelArguments arguments;
+    arguments.SetMaxReceiveMessageSize(bess::control::kMaxMessageBytes);
+    arguments.SetMaxSendMessageSize(bess::control::kMaxMessageBytes);
+    stub_ = v2::Control::NewStub(server_->InProcessChannel(arguments));
   }
 
   void TearDown() override {
@@ -775,6 +782,236 @@ TEST_F(ApiV2ServiceTest, InvokeAction) {
   EXPECT_NE(grpc::StatusCode::OK, invoke("l2", "populate", populate, Epoch(), &resp, &detail));
   EXPECT_EQ(EINVAL, detail.errno_value()) << detail.message();
   EXPECT_EQ("l2", detail.object());
+}
+
+// ReadResource streams a table in bounded pages: no single message carries the
+// whole resource, so a table above the message limit stays readable. The test
+// uses five rules and a page of two; the wire shape is the claim, not the
+// size, and the generation/epoch are the snapshot's.
+TEST_F(ApiV2ServiceTest, ReadResourcePagesTheTable) {
+  bess::pb::ExactMatchArg em;
+  bess::pb::Field *field = em.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  google::protobuf::Any em_arg;
+  ASSERT_TRUE(em_arg.PackFrom(em));
+  ASSERT_TRUE(control_plane_->CreateModule({"em", "ExactMatch", em_arg}));
+  ASSERT_TRUE(control_plane_->CreateModule({"empty", "ExactMatch", em_arg}));
+
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyTransactionRequest req;
+    req.set_request_id("stream-read-rules");
+    req.set_daemon_epoch(Epoch());
+    for (char i = 0; i < 5; i++) {
+      bess::pb::ExactMatchRuleKey key;
+      key.add_fields()->set_value_bin(std::string(4, static_cast<char>('a' + i)));
+      bess::pb::ExactMatchRuleValue value;
+      value.set_gate(1);
+      v2::TransactionOp *op = req.add_ops();
+      op->set_resource("em/rules");
+      ASSERT_TRUE(op->mutable_key()->PackFrom(key));
+      ASSERT_TRUE(op->mutable_value()->PackFrom(value));
+    }
+    v2::ApplyTransactionResponse applied;
+    const grpc::Status status = stub_->ApplyTransaction(&ctx, req, &applied);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::ReadResourceRequest req;
+    req.set_resource("em/rules");
+    req.set_max_entries(2);
+    auto reader = stub_->ReadResource(&ctx, req);
+    v2::ResourcePage page;
+    int pages = 0;
+    int entries = 0;
+    while (reader->Read(&page)) {
+      pages++;
+      entries += page.entries_size();
+      EXPECT_LE(page.entries_size(), 2) << "one page above the requested bound";
+      EXPECT_EQ("em/rules", page.resource());
+      EXPECT_NE(0u, page.resource_generation());
+      EXPECT_EQ(Epoch(), page.daemon_epoch());
+    }
+    ASSERT_TRUE(reader->Finish().ok());
+    EXPECT_EQ(5, entries);
+    EXPECT_EQ(3, pages) << "five entries at two per page";
+  }
+
+  // An empty resource still answers one page, so the caller learns the
+  // resource exists and its generation.
+  {
+    grpc::ClientContext ctx;
+    v2::ReadResourceRequest req;
+    req.set_resource("empty/rules");
+    auto reader = stub_->ReadResource(&ctx, req);
+    v2::ResourcePage page;
+    int pages = 0;
+    int entries = 0;
+    while (reader->Read(&page)) {
+      pages++;
+      entries += page.entries_size();
+    }
+    ASSERT_TRUE(reader->Finish().ok());
+    EXPECT_EQ(1, pages);
+    EXPECT_EQ(0, entries);
+  }
+
+  // A name no module registered is NOT_FOUND, as GetPipeline's is.
+  {
+    grpc::ClientContext ctx;
+    v2::ReadResourceRequest req;
+    req.set_resource("no-such/resource");
+    auto reader = stub_->ReadResource(&ctx, req);
+    v2::ResourcePage page;
+    (void)reader->Read(&page);
+    const grpc::Status status = reader->Finish();
+    EXPECT_EQ(grpc::StatusCode::NOT_FOUND, status.error_code());
+  }
+}
+
+// The page ceiling is the serialized page, framing included. A four-byte rule
+// is about 114 bytes of entry and two more inside the page (the repeated
+// field's tag and length prefix), so 30,000 rules cannot fit in one 3 MiB
+// page. The entry bound is raised past the number of rules, so only the byte
+// bound can split the stream.
+TEST_F(ApiV2ServiceTest, ReadResourceBoundsTheSerializedPage) {
+  bess::pb::ExactMatchArg em;
+  bess::pb::Field *field = em.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  google::protobuf::Any em_arg;
+  ASSERT_TRUE(em_arg.PackFrom(em));
+  // A long module name grows the page's own fields (its resource string), so
+  // the assertion also catches a budget that forgets to count them.
+  constexpr char kPaged[] =
+      "paged_rules_serialized_page_ceiling_regression_module";
+  const std::string resource = std::string(kPaged) + "/rules";
+  ASSERT_TRUE(control_plane_->CreateModule({kPaged, "ExactMatch", em_arg}));
+
+  constexpr uint32_t kRules = 30000;
+  constexpr uint32_t kChunk = 20000;
+  for (uint32_t start = 0; start < kRules; start += kChunk) {
+    grpc::ClientContext ctx;
+    v2::ApplyTransactionRequest req;
+    req.set_request_id("stream-page-" + std::to_string(start));
+    req.set_daemon_epoch(Epoch());
+    const uint32_t end = std::min(kRules, start + kChunk);
+    for (uint32_t i = start; i < end; i++) {
+      std::string key(4, '\0');
+      key[0] = static_cast<char>((i >> 24) & 0xff);
+      key[1] = static_cast<char>((i >> 16) & 0xff);
+      key[2] = static_cast<char>((i >> 8) & 0xff);
+      key[3] = static_cast<char>(i & 0xff);
+      bess::pb::ExactMatchRuleKey rule_key;
+      rule_key.add_fields()->set_value_bin(key);
+      bess::pb::ExactMatchRuleValue rule_value;
+      rule_value.set_gate(1);
+      v2::TransactionOp *op = req.add_ops();
+      op->set_resource(resource);
+      ASSERT_TRUE(op->mutable_key()->PackFrom(rule_key));
+      ASSERT_TRUE(op->mutable_value()->PackFrom(rule_value));
+    }
+    v2::ApplyTransactionResponse applied;
+    const grpc::Status status = stub_->ApplyTransaction(&ctx, req, &applied);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+
+  grpc::ClientContext ctx;
+  v2::ReadResourceRequest req;
+  req.set_resource(resource);
+  req.set_max_entries(65536);
+  auto reader = stub_->ReadResource(&ctx, req);
+  v2::ResourcePage page;
+  uint32_t pages = 0;
+  uint32_t entries = 0;
+  while (reader->Read(&page)) {
+    pages++;
+    entries += page.entries_size();
+    EXPECT_LE(page.ByteSizeLong(), 3u << 20)
+        << "a page's serialized size is the ceiling, framing included";
+  }
+  ASSERT_TRUE(reader->Finish().ok());
+  EXPECT_EQ(kRules, entries);
+  EXPECT_GT(pages, 1u) << "the byte bound split the table, not the entry count";
+}
+
+// A table above the message limit is the reason the stream exists: 700,000
+// four-byte rules are about 70 MiB when read back, above the 64 MiB limit, so
+// GetPipeline with include_resources is RESOURCE_EXHAUSTED while ReadResource
+// pages the same table at the requested 4096 entries. The rules are applied in
+// chunks so no request itself is near the limit.
+TEST_F(ApiV2ServiceTest, ReadResourceReadsATableAboveTheMessageLimit) {
+  bess::pb::ExactMatchArg em;
+  bess::pb::Field *field = em.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  google::protobuf::Any em_arg;
+  ASSERT_TRUE(em_arg.PackFrom(em));
+  ASSERT_TRUE(control_plane_->CreateModule({"big", "ExactMatch", em_arg}));
+
+  constexpr uint32_t kRules = 700000;
+  constexpr uint32_t kChunk = 20000;
+  for (uint32_t start = 0; start < kRules; start += kChunk) {
+    grpc::ClientContext ctx;
+    v2::ApplyTransactionRequest req;
+    req.set_request_id("stream-big-" + std::to_string(start));
+    req.set_daemon_epoch(Epoch());
+    const uint32_t end = std::min(kRules, start + kChunk);
+    for (uint32_t i = start; i < end; i++) {
+      std::string key(4, '\0');
+      key[0] = static_cast<char>((i >> 24) & 0xff);
+      key[1] = static_cast<char>((i >> 16) & 0xff);
+      key[2] = static_cast<char>((i >> 8) & 0xff);
+      key[3] = static_cast<char>(i & 0xff);
+      bess::pb::ExactMatchRuleKey rule_key;
+      rule_key.add_fields()->set_value_bin(key);
+      bess::pb::ExactMatchRuleValue rule_value;
+      rule_value.set_gate(1);
+      v2::TransactionOp *op = req.add_ops();
+      op->set_resource("big/rules");
+      ASSERT_TRUE(op->mutable_key()->PackFrom(rule_key));
+      ASSERT_TRUE(op->mutable_value()->PackFrom(rule_value));
+    }
+    v2::ApplyTransactionResponse applied;
+    const grpc::Status status = stub_->ApplyTransaction(&ctx, req, &applied);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::GetPipelineRequest req;
+    req.set_include_resources(true);
+    req.add_resources("big/rules");
+    v2::GetPipelineResponse resp;
+    const grpc::Status status = stub_->GetPipeline(&ctx, req, &resp);
+    EXPECT_EQ(grpc::StatusCode::RESOURCE_EXHAUSTED, status.error_code())
+        << "the table is above the one-message limit";
+  }
+
+  constexpr uint32_t kPageEntries = 4096;
+  const uint32_t want_pages = (kRules + kPageEntries - 1) / kPageEntries;
+  {
+    grpc::ClientContext ctx;
+    v2::ReadResourceRequest req;
+    req.set_resource("big/rules");
+    req.set_max_entries(kPageEntries);
+    auto reader = stub_->ReadResource(&ctx, req);
+    v2::ResourcePage page;
+    uint32_t pages = 0;
+    uint32_t entries = 0;
+    while (reader->Read(&page)) {
+      pages++;
+      entries += page.entries_size();
+      EXPECT_FALSE(page.entries().empty()) << "an empty page is not sent";
+      EXPECT_LE(page.entries_size(), kPageEntries);
+    }
+    ASSERT_TRUE(reader->Finish().ok());
+    EXPECT_EQ(kRules, entries);
+    EXPECT_EQ(want_pages, pages);
+  }
 }
 
 // GetResourceStatus: what a controller reads before it grows the graph --
