@@ -380,4 +380,30 @@ TEST(BridgeResourceTest, FlushActionForgetsLearnedMacsOnly) {
   EXPECT_EQ("", h.ReadBackDiffers(statics, {{&key, &value}}));
 }
 
+// A typed transaction can name a gate no RPC would accept. It must be refused
+// before an FDB slot is reserved: otherwise publication fails after Reserve,
+// the placeholder is never released, and repeated writes fill the table.
+TEST(BridgeResourceTest, ATypedOutOfRangeGateIsRefusedBeforeReserving) {
+  ModuleHarness h;
+  Module *br = h.Create("Bridge", BridgeArg());
+  ASSERT_NE(nullptr, br);
+  const std::string statics = br->name() + "/statics";
+  const Bridge::Mac mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}};
+  const bess::dataplane::ResourceKey key = bess::dataplane::EncodeKey(mac);
+
+  EXPECT_NE("", h.Apply({bess::dataplane::Op::Upsert(
+                statics, key, std::any(gate_idx_t{65535}))}));
+  // Above MAX_GATES but below the interface bound: the RPC refuses it, so the
+  // typed path does too.
+  EXPECT_NE("", h.Apply({bess::dataplane::Op::Upsert(
+                statics, key, std::any(gate_idx_t{MAX_GATES + 1}))}));
+  // DROP_GATE is the one valid sentinel outside [0, MAX_GATES).
+  EXPECT_EQ("", h.Apply({bess::dataplane::Op::Upsert(
+                  statics, key, std::any(gate_idx_t{DROP_GATE}))}));
+
+  // The valid gate still applies: no placeholder was left behind.
+  EXPECT_EQ("", h.Apply({bess::dataplane::Op::Upsert(
+                  statics, key, std::any(gate_idx_t{1}))}));
+}
+
 }  // namespace

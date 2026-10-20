@@ -105,35 +105,46 @@ class Bridge::StaticsResource final : public dataplane::Resource {
     if (gate == nullptr) {
       return std::unexpected("wrong value type (want a gate)");
     }
+    // The RPC codec refuses a gate outside [0, MAX_GATES) or DROP_GATE; the
+    // typed path must too, and before a slot is reserved, or publication
+    // would fail after Reserve and leave a placeholder nothing removes.
+    if (!bess::IsValidGateValue(static_cast<uint64_t>(*gate))) {
+      return std::unexpected("invalid static gate");
+    }
+    // Everything the reservation needs is allocated before the slot is
+    // taken; from there to the return no allocation can fail and leave a
+    // placeholder behind.
+    std::map<Mac, gate_idx_t> node_source;
+    node_source.emplace(mac, *gate);
+    auto staged_op = std::make_unique<UpsertOp>(
+        owner_, node_source.extract(node_source.begin()), false);
     // A MAC the FDB does not hold takes a slot (a learned one becomes
-    // static in place). Erases of this transaction may publish after its
-    // upserts, so they free nothing here.
+    // static in place). The slot is taken here, not at publication: the
+    // table's cuckoo search can fail below capacity, and Publish must not.
+    // Erases of this transaction may publish after its upserts, so they free
+    // nothing here.
     if (!existed && owner_.fdb_->Lookup(kDomain, ToL2(mac)) ==
                         dataplane::kInvalidInterfaceId) {
-      if (owner_.fdb_->size() + new_slots_ >= owner_.fdb_->capacity()) {
+      if (!owner_.fdb_->ReserveStatic(kDomain, ToL2(mac))) {
         return std::unexpected(bess::utils::Format(
             "FDB full (%zu entries)", owner_.fdb_->capacity()));
       }
-      new_slots_++;
+      staged_op->MarkReserved();
     }
-    std::map<Mac, gate_idx_t> node_source;
-    node_source.emplace(mac, *gate);
-    Reservation reservation{
-        std::make_unique<UpsertOp>(owner_,
-                                   node_source.extract(node_source.begin())),
-        {}, {}};
+    Reservation reservation{std::move(staged_op), {}, {}};
     reservation.existed = existed;
     return reservation;
   }
 
-  void EndTransaction() noexcept override { new_slots_ = 0; }
+  void EndTransaction() noexcept override {}
 
  private:
   using Node = std::map<Mac, gate_idx_t>::node_type;
 
   class UpsertOp final : public dataplane::StagedOp {
    public:
-    UpsertOp(Bridge &owner, Node node) : owner_(owner), node_(std::move(node)) {}
+    UpsertOp(Bridge &owner, Node node, bool reserved)
+        : owner_(owner), node_(std::move(node)), reserved_(reserved) {}
     void Publish(dataplane::Retirer &) noexcept override {
       const Mac mac = node_.key();
       const gate_idx_t gate = node_.mapped();
@@ -141,13 +152,11 @@ class Bridge::StaticsResource final : public dataplane::Resource {
           owner_.fdb_->AddStatic(kDomain, ToL2(mac), InterfaceOfGate(gate));
       if (result != l2::ProgramResult::kAdded &&
           result != l2::ProgramResult::kReplaced) {
-        // Reserve checked the key and the room; the table's cuckoo move
-        // search failing below its capacity is the one way here. The record
-        // stays without the MAC, so the read-back shows it missing.
         LOG(ERROR) << "Bridge '" << owner_.name()
                    << "': no FDB slot for a static entry";
         return;
       }
+      published_ = true;
       auto it = owner_.statics_.find(mac);
       if (it != owner_.statics_.end()) {
         it->second = gate;
@@ -156,9 +165,21 @@ class Bridge::StaticsResource final : public dataplane::Resource {
       }
     }
 
+    // The reservation was taken in Reserve and this operation will not
+    // publish: give the slot back.
+    void Abort() noexcept override {
+      if (reserved_ && !published_) {
+        (void)owner_.fdb_->Remove(kDomain, ToL2(node_.key()));
+      }
+    }
+
+    void MarkReserved() noexcept { reserved_ = true; }
+
    private:
     Bridge &owner_;
     Node node_;
+    bool reserved_;
+    bool published_ = false;
   };
 
   class EraseOp final : public dataplane::StagedOp {
@@ -176,8 +197,6 @@ class Bridge::StaticsResource final : public dataplane::Resource {
   };
 
   Bridge &owner_;
-  // FDB slots this transaction's upserts take (see Reserve).
-  size_t new_slots_ = 0;
 };
 
 CommandResponse Bridge::Init(const bess::pb::BridgeArg &arg) {

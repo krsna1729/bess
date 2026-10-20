@@ -243,8 +243,12 @@ class PackedMacTable {
         }
         word = ProbeWord(Alt(b1, hashes[i]), want);
       }
-      values[i] = V(static_cast<uint16_t>(ValueOf(word)));
-      hits |= uint64_t{word != 0} << i;
+      const uint32_t value = static_cast<uint32_t>(ValueOf(word));
+      values[i] = V(static_cast<uint16_t>(value));
+      // A reserved slot is occupied but holds value 0, which every reader
+      // treats as a miss; the hit bit must agree with the value, not with the
+      // occupied marker (ReserveStatic's contract: invisible until published).
+      hits |= uint64_t{value != 0} << i;
     }
     if constexpr (kShared) {
       const uint64_t all = keys.size() == 64 ? ~uint64_t{0} : (uint64_t{1} << keys.size()) - 1;
@@ -279,30 +283,19 @@ class PackedMacTable {
 
   // A slot for a new key (absent, domain 0) with `value` (1..kMaxValue) and
   // `flags` (0 or 1), or kNotFound if full or no free slot is reachable. May
-  // move other entries.
+  // move other entries. Value 0 reads as a miss; a nonzero domain does not
+  // fit.
   uint32_t Insert(uint64_t key, uint16_t value, uint8_t flags) noexcept {
-    // Value 0 reads as a miss; a nonzero domain does not fit.
-    if (size_ >= capacity_ || (key & 0xFFFF) != 0 || value == 0 || value > kMaxValue) {
+    if (value == 0 || value > kMaxValue) {
       return kNotFound;
     }
-    const uint64_t h = Hash(key);
-    const size_t b1 = h & mask_;
-    const size_t b2 = Alt(b1, h);
-    uint32_t s = FreeIn(b1);
-    if (s == kNotFound) {
-      s = FreeIn(b2);
-    }
-    if (s == kNotFound) {
-      s = MakeRoom(b1, b2);
-    }
-    if (s == kNotFound) {
-      return kNotFound;
-    }
-    ResetCold(s);
-    Store(s, Make(Mac(key), value, flags));
-    size_++;
-    return s;
+    return Place(key, value, flags);
   }
+
+  // A slot for a key whose value reads as a miss (0): a reservation that the
+  // caller fills before any lookup can name a real interface. Static, so
+  // aging leaves it alone. The key must be absent and its domain 0.
+  uint32_t Reserve(uint64_t key) noexcept { return Place(key, 0, 1); }
 
   void Erase(uint32_t s) noexcept {
     Store(s, 0);
@@ -353,6 +346,31 @@ class PackedMacTable {
 
   PackedMacTable(size_t capacity, size_t buckets, uint64_t seed)
       : capacity_(capacity), nbuckets_(buckets), mask_(buckets - 1), seed_(seed) {}
+
+  // Insert's and Reserve's shared placement: a free slot for `key`, or
+  // kNotFound if full or no free slot is reachable. May move other entries.
+  uint32_t Place(uint64_t key, uint16_t value, uint8_t flags) noexcept {
+    if (size_ >= capacity_ || (key & 0xFFFFu) != 0 || value > kMaxValue) {
+      return kNotFound;
+    }
+    const uint64_t h = Hash(key);
+    const size_t b1 = h & mask_;
+    const size_t b2 = Alt(b1, h);
+    uint32_t s = FreeIn(b1);
+    if (s == kNotFound) {
+      s = FreeIn(b2);
+    }
+    if (s == kNotFound) {
+      s = MakeRoom(b1, b2);
+    }
+    if (s == kNotFound) {
+      return kNotFound;
+    }
+    ResetCold(s);
+    Store(s, Make(Mac(key), value, flags));
+    size_++;
+    return s;
+  }
 
   // Unpredictable without failing: random_device may throw where the system
   // has no entropy source; the clock is the fallback.
