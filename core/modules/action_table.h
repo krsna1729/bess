@@ -47,10 +47,22 @@ class ActionTable final : public Module {
 
   using ActionId = bess::dataplane::ActionId;
 
-  // What a session does: which meter polices it and where it forwards.
+  // What a session does: which meters police it, in order, and where it
+  // forwards. `meters[i]` is the id at level i; 0 (and every slot at or past
+  // `levels`) is "no meter at this level", which the Meter passes. The
+  // two-argument form is the historical one-meter action, kept so existing
+  // tests and callers construct an action unchanged.
+  static constexpr size_t kMaxLevels = 4;
   struct Action {
-    bess::meter::MeterId meter;       // 0: no meter (unmetered)
-    bess::route::NextHopId next_hop;  // 0: no next hop (the Router drops)
+    bess::meter::MeterId meters[kMaxLevels]{};  // 0: no meter at that level
+    uint32_t levels = 1;                        // 1..kMaxLevels
+    bess::route::NextHopId next_hop{};          // 0: no next hop (the Router drops)
+
+    Action() = default;
+    Action(bess::meter::MeterId meter, bess::route::NextHopId hop)
+        : next_hop(hop) {
+      meters[0] = meter;
+    }
   };
 
   ActionTable() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
@@ -81,6 +93,10 @@ class ActionTable final : public Module {
   bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
   std::string meters_resource_;
   std::string next_hops_resource_;
+
+  // The table's level count (1..kMaxLevels): every action stores and writes
+  // exactly this many slots, whatever level count its record carried.
+  size_t levels_ = 1;
 
   int action_id_attr_ = -1;
   int meter_id_attr_ = -1;

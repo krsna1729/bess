@@ -14,6 +14,12 @@
 //   threads  -- one shared meter hammered by 1..4 threads, against one
 //               exclusive meter per thread: the price of kShared under
 //               contention, which is why exclusive is the default to reach for.
+//   levels   -- the multi-level record: one action names an ordered list of
+//               meter ids and the Meter checks each in turn. The row is the
+//               loop's body -- a lookup plus one CheckColorAware per level over
+//               a 32-packet batch -- swept 1..4 levels, all green and with the
+//               first level red (the short-circuit: later buckets are not
+//               charged for what the first dropped).
 //
 // Time is synthetic (a fixed cycle step per packet or batch) so rows are
 // reproducible and refill arithmetic is exercised; reading the TSC is a
@@ -204,6 +210,62 @@ void BM_BatchMeterSet(benchmark::State &state) {
 }
 BENCHMARK(BM_BatchMeterSet)
     ->ArgsProduct({{1, 1024, 16384, 262144, 1048576}, {0, 1}});
+
+// -- levels: the module's loop, one pass per level ---------------------------
+
+// The multi-level record's loop body as the module runs it: for each level the
+// slot's id is resolved per packet (MeterSet::Lookup over shared meters, as
+// Meter builds them) and a colour-aware check covers the packets the levels
+// before it let live. The delta between adjacent `levels` rows is the marginal
+// level; `first level red` shows the short-circuit, where later buckets are
+// skipped.
+constexpr TrTcmSpec kTinyBucket{1, 1, 1, 1};  // every packet over the burst
+// Refills faster than the batch can spend, so a whole run of checks stays
+// green: one 3,200-cycle iteration refills 100 GB/s * 3,200 / TSC -- ~107 kB
+// at 3 GHz, and still ~53 kB at a 6 GHz TSC -- against at most 48 kB of
+// packets (32 x 1500 B); the 1 MiB burst absorbs any remainder. kSpec drains
+// after a few iterations and would time the red short-circuit instead.
+constexpr TrTcmSpec kGreenBucket{100'000'000'000ull, 1ull << 20u,
+                                 100'000'000'000ull, 1ull << 20u};
+
+void BM_BatchLevels(benchmark::State &state) {
+  const size_t levels = static_cast<size_t>(state.range(0));
+  const bool first_red = state.range(1) != 0;
+
+  MeterSetBuilder builder(levels);
+  for (size_t l = 0; l < levels; l++) {
+    if (!builder.Add(MeterId(static_cast<uint32_t>(l + 1)),
+                     first_red && l == 0 ? kTinyBucket : kGreenBucket,
+                     MeterSharing::kShared)) {
+      state.SkipWithError("meter allocation failed");
+      return;
+    }
+  }
+  std::unique_ptr<const MeterSet> set = builder.Build();
+  const std::vector<uint32_t> lengths = PacketLengths(kBatch);
+
+  uint64_t now = rte_get_tsc_cycles();
+  std::array<MeterColor, kBatch> colors;
+  for (auto _ : state) {
+    now += kCyclesPerPacket * kBatch;
+    colors.fill(MeterColor::kGreen);
+    for (size_t l = 0; l < levels; l++) {
+      for (size_t i = 0; i < kBatch; i++) {
+        if (first_red && colors[i] == MeterColor::kRed) {
+          continue;  // a dead packet is not charged to the later levels
+        }
+        // The module resolves each surviving packet's id here, per level.
+        MeterState *meter =
+            set->Lookup(MeterId(static_cast<uint32_t>(l + 1)));
+        colors[i] = meter->CheckColorAware(now, lengths[i], colors[i]);
+      }
+    }
+    benchmark::DoNotOptimize(colors);
+  }
+  state.SetItemsProcessed(state.iterations() * kBatch);
+  state.SetLabel(first_red ? "levels: first level red" : "levels: all green");
+}
+BENCHMARK(BM_BatchLevels)->ArgsProduct({{1, 2, 3, 4}, {0, 1}});
 
 // -- contention --------------------------------------------------------------
 

@@ -148,6 +148,94 @@ TEST(MeterStateTest, ColorAwareNeverImprovesInputColour) {
             state->CheckColorAware(t0, 1, MeterColor::kGreen));
 }
 
+// -- RFC-derived expectations -------------------------------------------------
+//
+// The differential tests prove BESS matches rte_meter; these state what both
+// must do in the RFCs' own terms, so a change in DPDK's arithmetic or a wrong
+// profile translation shows up as a failed RFC rule, not just a diff.
+
+// RFC 2698 section 2: over PIR is red, over CIR (within PIR) is yellow, else
+// green. CIR 1000 B/s, PIR 3000 B/s, both bursts 1000 B; one second of TSC is
+// one second of refill, so the token counts below are exact.
+TEST(MeterRfc2698Test, ColoursFollowTheCommittedAndPeakBuckets) {
+  const MeterProfile profile = MustProfile(TrTcmSpec{1000, 1000, 3000, 1000});
+  MeterStatePtr state = MustState(profile, MeterSharing::kWorkerExclusive);
+  const uint64_t hz = profile.tsc_hz();
+  const uint64_t t0 = Access::last_time(*state);
+
+  // Both buckets hold 1000: exactly green, and both are emptied.
+  EXPECT_EQ(MeterColor::kGreen, state->Check(t0, 1000));
+  // Half a second: CIR has added 500, PIR 1500 (capped at PBS). 700 fits the
+  // peak bucket but not the committed one: yellow, and only peak is debited.
+  EXPECT_EQ(MeterColor::kYellow, state->Check(t0 + hz / 2, 700));
+  // Another half second: committed 500 + 500 = 1000, peak 300 + 1500 capped
+  // at 1000. 600 is green against both.
+  EXPECT_EQ(MeterColor::kGreen, state->Check(t0 + hz, 600));
+  // At the same instant the peak bucket holds 400, below 500: red.
+  EXPECT_EQ(MeterColor::kRed, state->Check(t0 + hz, 500));
+}
+
+// RFC 2698 section 2.4 (colour-aware): a pre-coloured packet is never
+// improved; a yellow packet is tested against PIR only and is debited to the
+// peak bucket; a red packet charges nothing.
+TEST(MeterRfc2698Test, ColourAwareKeepsAMarkedPacketAtOrBelowItsColour) {
+  const MeterProfile profile = MustProfile(TrTcmSpec{1000, 1000, 3000, 1000});
+  MeterStatePtr state = MustState(profile, MeterSharing::kWorkerExclusive);
+  const uint64_t hz = profile.tsc_hz();
+  const uint64_t t0 = Access::last_time(*state);
+
+  // Both buckets are full, yet a yellow packet stays yellow (it would be
+  // green if the meter ignored its input colour) and pays from peak only.
+  EXPECT_EQ(MeterColor::kYellow,
+            state->CheckColorAware(t0, 1, MeterColor::kYellow));
+  // A red packet stays red and is not charged.
+  EXPECT_EQ(MeterColor::kRed,
+            state->CheckColorAware(t0, 1, MeterColor::kRed));
+  // Committed has 1000, peak 999: a green 999 is green (peak emptied).
+  EXPECT_EQ(MeterColor::kGreen,
+            state->CheckColorAware(t0, 999, MeterColor::kGreen));
+  // Half a second later committed holds 501, peak is back to 1000. 600 fits
+  // peak, not committed: the green input becomes yellow, never stays green.
+  EXPECT_EQ(MeterColor::kYellow,
+            state->CheckColorAware(t0 + hz / 2, 600, MeterColor::kGreen));
+}
+
+// RFC 2697: within CBS is green, beyond CBS but within EBS is yellow, else
+// red. CIR 1000 B/s, CBS 1000 B, EBS 1000 B.
+TEST(MeterRfc2697Test, SrTcmUsesTheCommittedAndExcessBuckets) {
+  const MeterProfile profile = MustProfile(SrTcmSpec{1000, 1000, 1000});
+  MeterStatePtr state = MustState(profile, MeterSharing::kWorkerExclusive);
+  const uint64_t t0 = Access::last_time(*state);
+
+  EXPECT_EQ(MeterColor::kGreen, state->Check(t0, 1000));
+  EXPECT_EQ(MeterColor::kYellow, state->Check(t0, 500));
+  EXPECT_EQ(MeterColor::kRed, state->Check(t0, 600));
+
+  // Colour-aware, full buckets: yellow input stays yellow; a yellow packet
+  // with no excess tokens left is red, never green.
+  MeterStatePtr fresh = MustState(profile, MeterSharing::kWorkerExclusive);
+  const uint64_t f0 = Access::last_time(*fresh);
+  EXPECT_EQ(MeterColor::kYellow,
+            fresh->CheckColorAware(f0, 1, MeterColor::kYellow));
+  EXPECT_EQ(MeterColor::kYellow,
+            fresh->CheckColorAware(f0, 999, MeterColor::kYellow));
+  EXPECT_EQ(MeterColor::kRed,
+            fresh->CheckColorAware(f0, 1, MeterColor::kYellow));
+}
+
+// RFC 4115: within CIR is green, beyond CIR but within EIR is yellow, else
+// red; green debits committed only and yellow debits excess only.
+TEST(MeterRfc4115Test, ColoursFollowTheCommittedAndExcessRates) {
+  const MeterProfile profile =
+      MustProfile(TrTcmRfc4115Spec{1000, 1000, 2000, 1000});
+  MeterStatePtr state = MustState(profile, MeterSharing::kWorkerExclusive);
+  const uint64_t t0 = Access::last_time(*state);
+
+  EXPECT_EQ(MeterColor::kGreen, state->Check(t0, 1000));  // committed 0
+  EXPECT_EQ(MeterColor::kYellow, state->Check(t0, 1000));  // excess 0
+  EXPECT_EQ(MeterColor::kRed, state->Check(t0, 1));
+}
+
 // A `now` older than the meter's last update must not refill it. Raw
 // rte_meter wraps the unsigned interval and refills fully -- the reference copy
 // below shows that hazard is real -- while the BESS state clamps.

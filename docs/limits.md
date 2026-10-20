@@ -78,6 +78,7 @@ Columns:
 | Bridge | domains; interface ids | 65,535; 65,535 | `MacTable::kMaxDomains`, `kMaxValue` | `max_domains` up to the bound | refused |
 | Meter | meters | default 1,024 | `MeterArg.capacity` | yes (up to the id width) | EINVAL |
 | ActionTable | actions | default 1,024 | `ActionTableArg.capacity` | yes (up to the id width) | EINVAL |
+| ActionTable | meter ids per action (levels) | 4 | `ActionTable::kMaxLevels` | `ActionTableArg.levels` 1–4; `MeterArg.levels` 1–8 (`kMetadataAttrMaxSize / 4`) | EINVAL |
 | Router | next hops | 16M − 1 | `LpmRouteTable::kMaxValue` | `max_next_hops` up to the bound | EINVAL "router capacity exceeds backend limits" |
 | Router | next-hop groups | 16M − 1 − `max_next_hops` | `LpmRouteTable::kMaxValue` (shares the bound with `max_next_hops`) | `max_groups` up to the bound; 0 (the default) registers the empty resource | EINVAL "router capacity exceeds backend limits" |
 | Router | route domains | 16M | `route::kMaxRouteDomains` | `max_domains` up to the bound | EINVAL |
