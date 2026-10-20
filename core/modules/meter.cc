@@ -21,7 +21,11 @@
 namespace dataplane = bess::dataplane;
 namespace meter = bess::meter;
 
-const Commands Meter::cmds = {};
+const Commands Meter::cmds = {
+    {"get_status", "MeterCommandGetStatusArg",
+     MODULE_CMD_FUNC(&Meter::CommandGetStatus), Command::THREAD_SAFE,
+     "MeterCommandGetStatusResponse"},
+};
 
 const ResourceTables Meter::resource_tables = {
     ResourceTable::Map<bess::pb::MeterIdKey, bess::pb::MeterPolicyValue>(
@@ -77,6 +81,19 @@ bess::pb::MeterPolicyValue PolicyToPb(const meter::MeterProfileSpec &spec) {
     pb->set_excess_burst(rfc->excess_burst);
   }
   return value;
+}
+
+// MeterStateSnapshot's bucket kinds as the wire enum.
+bess::pb::MeterBucketKind PbKind(meter::MeterBucketKind kind) {
+  switch (kind) {
+    case meter::MeterBucketKind::kCommitted:
+      return bess::pb::METER_BUCKET_COMMITTED;
+    case meter::MeterBucketKind::kExcess:
+      return bess::pb::METER_BUCKET_EXCESS;
+    case meter::MeterBucketKind::kPeak:
+      return bess::pb::METER_BUCKET_PEAK;
+  }
+  return bess::pb::METER_BUCKET_COMMITTED;
 }
 
 }  // namespace
@@ -522,6 +539,61 @@ void Meter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
 std::string Meter::GetDesc() const {
   return bess::utils::Format("%zu meters", live_->size());
+}
+
+CommandResponse Meter::CommandGetStatus(
+    const bess::pb::MeterCommandGetStatusArg &arg) {
+  // The published generation is what packets see. Reading it here is the same
+  // RCU read a worker does, so a concurrent transaction cannot invalidate the
+  // pointer; each meter's Inspect() takes that meter's own check lock when the
+  // meter is shared.
+  const meter::MeterSet *set = published_.Read();
+  bess::pb::MeterCommandGetStatusResponse response;
+
+  auto append = [&](meter::MeterId id) {
+    meter::MeterState *state = set->Lookup(id);
+    if (state == nullptr) {
+      return false;
+    }
+    const meter::MeterStateSnapshot snapshot = state->Inspect();
+    bess::pb::MeterStatus *status = response.add_meters();
+    status->set_meter_id(id.value());
+    *status->mutable_policy() = PolicyToPb(snapshot.spec);
+    status->set_shared(snapshot.sharing == meter::MeterSharing::kShared);
+    status->set_last_update_tsc(snapshot.last_update_tsc);
+    for (const meter::MeterBucketState &bucket : snapshot.buckets) {
+      bess::pb::MeterBucketState *out = status->add_buckets();
+      out->set_kind(PbKind(bucket.kind));
+      out->set_tokens(bucket.tokens);
+      out->set_limit(bucket.limit);
+    }
+    return true;
+  };
+
+  if (arg.meter_ids().empty()) {
+    // The control side's committed set, which is what the resource read-back
+    // (GetPipeline) shows. A retiring meter is already absent there even
+    // though packets may still resolve its id until the removal cascade.
+    for (const auto &entry : policies_) {
+      if (!retiring_.contains(entry.first)) {
+        append(entry.first);
+      }
+    }
+  } else {
+    for (uint32_t raw : arg.meter_ids()) {
+      if (raw == 0) {
+        return CommandFailure(EINVAL, "meter id 0 is invalid");
+      }
+      const meter::MeterId id(raw);
+      // An erased meter stays in the published generation until the removal
+      // cascade, so packets may still resolve it, but the control side is
+      // already treating it as absent (as the resource read-back does).
+      if (retiring_.contains(id) || !append(id)) {
+        return CommandFailure(ENOENT, "meter %u is not configured", raw);
+      }
+    }
+  }
+  return CommandSuccess(response);
 }
 
 ADD_MODULE(Meter, "meter",

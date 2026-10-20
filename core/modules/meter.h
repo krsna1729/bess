@@ -44,6 +44,17 @@
 // meter's own spinlock. A worker-exclusive meter is faster but needs a
 // placement guarantee this module cannot verify; a pipeline that pins a
 // session to one worker can use MeterSet directly (K5).
+//
+// Operational state: `get_status` (a THREAD_SAFE action) reads meters without
+// stopping traffic. For each meter it returns the profile, the sharing mode,
+// the TSC of the last update, and both token buckets with their current
+// tokens and limits. A shared meter is read under the same spinlock its
+// checks take, so the reading is coherent and the packet path gains no
+// atomic, lock or write. The reading is per meter state, never a module-wide
+// total: this module creates shared meters, so the reply reports each as
+// shared; a worker-exclusive meter's state belongs to its owner and is only
+// coherent when that worker is not running it (MeterState::Inspect documents
+// the core API's contract).
 class Meter final : public Module {
  public:
   static const gate_idx_t kNumOGates = 3;
@@ -67,6 +78,12 @@ class Meter final : public Module {
   int OnEvent(bess::Event event) override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
+
+  // The `get_status` action: read-only inspection of the meters' profiles and
+  // token state. It takes no locks beyond each shared meter's own check lock,
+  // so it runs while workers keep metering (THREAD_SAFE).
+  CommandResponse CommandGetStatus(
+      const bess::pb::MeterCommandGetStatusArg &arg);
 
   std::string GetDesc() const override;
 

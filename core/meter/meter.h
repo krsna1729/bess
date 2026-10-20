@@ -4,6 +4,7 @@
 #define BESS_METER_METER_H_
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -203,6 +204,37 @@ struct MeterStateDeleter {
 
 using MeterStatePtr = std::unique_ptr<MeterState, MeterStateDeleter>;
 
+// Which bucket a MeterBucketState describes. `rte_meter` keeps two buckets per
+// meter, both measured in the same unit Check() is charged in (bytes or
+// packets; the library does not interpret it).
+enum class MeterBucketKind : uint8_t {
+  kCommitted,  // the C bucket (all three algorithms)
+  kExcess,     // the E bucket (srTCM, RFC 4115)
+  kPeak,       // the P bucket (trTCM, RFC 2698)
+};
+
+// One token bucket as Inspect() reads it.
+struct MeterBucketState {
+  MeterBucketKind kind = MeterBucketKind::kCommitted;
+  uint64_t tokens = 0;  // tokens available at last_update_tsc
+  uint64_t limit = 0;   // capacity: CBS, EBS or PBS
+};
+
+// A read-only reading of one meter's mutable state: the profile it runs, the
+// two buckets, and when those buckets were last updated. `tokens` is the
+// bucket content as of `last_update_tsc` -- rte_meter refills only when a
+// check runs, so this is not projected forward to the time of the read.
+struct MeterStateSnapshot {
+  MeterAlgorithm algorithm = MeterAlgorithm::kSrTcm;
+  MeterProfileSpec spec;
+  MeterSharing sharing = MeterSharing::kWorkerExclusive;
+  // The TSC of the meter's last check -- or the TSC at which its buckets were
+  // initialized, for a meter that has never been checked.
+  uint64_t last_update_tsc = 0;
+  // Committed first, then the excess (srTCM, RFC 4115) or peak (trTCM) bucket.
+  std::array<MeterBucketState, 2> buckets{};
+};
+
 // One meter: `rte_meter`'s token buckets, the profile they run under, and the
 // BESS-owned fields around them. Exactly one cache line, so exclusive meters
 // run by different workers never false-share.
@@ -226,6 +258,24 @@ class alignas(RTE_CACHE_LINE_SIZE) MeterState {
 
   const MeterProfile &profile() const noexcept { return *profile_; }
   MeterSharing sharing() const noexcept { return sharing_; }
+
+  // Reads this meter's token buckets, profile and last update without
+  // touching the packet path.
+  //
+  //   - kShared: takes the meter's own check spinlock, so the reading is
+  //     consistent with concurrent checks and the lock is the one the packet
+  //     path already uses. Nothing is added to a check.
+  //   - kWorkerExclusive: there is no lock by design. The caller must
+  //     guarantee that the owning worker is not running this meter (it is
+  //     paused, or the call is made on the owning worker); reading it beside
+  //     a running check would be the same caller bug as checking it from two
+  //     workers.
+  //
+  // The snapshot carries `sharing` so a caller can see which promise it got.
+  // It is per meter state, not summed across anything: a worker-exclusive
+  // meter's tokens are its owner's, and a shared meter's are its one shared
+  // bucket pair.
+  MeterStateSnapshot Inspect() const noexcept;
 
   // Colour-blind check of `bytes` at TSC time `now`.
   MeterColor Check(uint64_t now, uint32_t bytes) noexcept {

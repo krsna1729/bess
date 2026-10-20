@@ -263,6 +263,135 @@ TEST(MeterStateTest, StaleTimestampDoesNotRefill) {
   EXPECT_EQ(MeterColor::kRed, state->Check(0, 1000));
 }
 
+// Inspect() reports the never-updated state (full buckets at the creation
+// stamp), then the same meter after a check: the committed bucket is debited,
+// the peak bucket is not, and the last update is the check's TSC.
+TEST(MeterStateTest, InspectReportsBucketsProfileAndLastUpdate) {
+  const MeterProfile profile = MustProfile(TrTcmSpec{1, 1000, 1, 2000});
+  MeterStatePtr state = MustState(profile, MeterSharing::kShared);
+  const uint64_t t0 = Access::last_time(*state);
+
+  MeterStateSnapshot fresh = state->Inspect();
+  EXPECT_EQ(MeterAlgorithm::kTrTcm, fresh.algorithm);
+  EXPECT_EQ(profile.spec(), fresh.spec);
+  EXPECT_EQ(MeterSharing::kShared, fresh.sharing);
+  EXPECT_EQ(t0, fresh.last_update_tsc);
+  ASSERT_EQ(2u, fresh.buckets.size());
+  EXPECT_EQ(MeterBucketKind::kCommitted, fresh.buckets[0].kind);
+  EXPECT_EQ(1000u, fresh.buckets[0].tokens);
+  EXPECT_EQ(1000u, fresh.buckets[0].limit);
+  EXPECT_EQ(MeterBucketKind::kPeak, fresh.buckets[1].kind);
+  EXPECT_EQ(2000u, fresh.buckets[1].tokens);
+  EXPECT_EQ(2000u, fresh.buckets[1].limit);
+
+  const uint64_t t1 = t0 + profile.tsc_hz();
+  ASSERT_EQ(MeterColor::kGreen, state->Check(t1, 600));
+  MeterStateSnapshot checked = state->Inspect();
+  EXPECT_EQ(t1, checked.last_update_tsc);
+  EXPECT_EQ(400u, checked.buckets[0].tokens);
+  // A trTCM green packet debits the peak bucket too: it held 2000 (refilled
+  // and capped) and is now 1400.
+  EXPECT_EQ(1400u, checked.buckets[1].tokens);
+}
+
+// A drained meter and a check bigger than either bucket: the reading keeps
+// reporting zero tokens rather than a negative/wrapped value, and the limits
+// stay the configured capacities.
+TEST(MeterStateTest, InspectReportsSaturatedAndOverLimitBuckets) {
+  const MeterProfile profile = MustProfile(TrTcmSpec{1, 1000, 1, 2000});
+  MeterStatePtr state = MustState(profile, MeterSharing::kShared);
+  const uint64_t t0 = Access::last_time(*state);
+
+  // A trTCM green packet debits both buckets. 1000 green leaves committed 0
+  // and peak 1000; two 500-byte yellow packets then drain the peak bucket.
+  ASSERT_EQ(MeterColor::kGreen, state->Check(t0, 1000));
+  ASSERT_EQ(MeterColor::kYellow, state->Check(t0, 500));
+  ASSERT_EQ(MeterColor::kYellow, state->Check(t0, 500));
+  MeterStateSnapshot drained = state->Inspect();
+  EXPECT_EQ(0u, drained.buckets[0].tokens);
+  EXPECT_EQ(0u, drained.buckets[1].tokens);
+  EXPECT_EQ(1000u, drained.buckets[0].limit);
+  EXPECT_EQ(2000u, drained.buckets[1].limit);
+
+  EXPECT_EQ(MeterColor::kRed, state->Check(t0, 1500));  // larger than both
+  MeterStateSnapshot over = state->Inspect();
+  EXPECT_EQ(0u, over.buckets[0].tokens);
+  EXPECT_EQ(0u, over.buckets[1].tokens);
+}
+
+// The unlocked branch, single-threaded: a worker-exclusive meter is inspected
+// correctly when its owner is quiescent, and the snapshot says so, so a caller
+// can tell it did not get the shared-meter lock guarantee.
+TEST(MeterStateTest, InspectReadsAWorkerExclusiveMeterWhenQuiescent) {
+  const MeterProfile profile = MustProfile(TrTcmSpec{1, 1000, 1, 2000});
+  MeterStatePtr state = MustState(profile, MeterSharing::kWorkerExclusive);
+
+  MeterStateSnapshot fresh = state->Inspect();
+  EXPECT_EQ(MeterSharing::kWorkerExclusive, fresh.sharing);
+  EXPECT_EQ(1000u, fresh.buckets[0].tokens);
+  EXPECT_EQ(1000u, fresh.buckets[0].limit);
+  EXPECT_EQ(2000u, fresh.buckets[1].tokens);
+  EXPECT_EQ(2000u, fresh.buckets[1].limit);
+
+  const uint64_t now = Access::last_time(*state);
+  ASSERT_EQ(MeterColor::kGreen, state->Check(now, 100));
+  MeterStateSnapshot checked = state->Inspect();
+  EXPECT_EQ(MeterSharing::kWorkerExclusive, checked.sharing);
+  EXPECT_EQ(now, checked.last_update_tsc);
+  EXPECT_EQ(900u, checked.buckets[0].tokens);
+  EXPECT_EQ(1900u, checked.buckets[1].tokens);
+}
+
+// The read path beside running checks: every snapshot is taken under the same
+// spinlock a shared check takes, so a reader never observes a half-updated
+// bucket pair. (Under TSan this test is the race detector's proof; without it,
+// the invariants below are what a torn snapshot would break.) The profile has
+// CIR == PIR and equal bursts, so every coherent snapshot keeps the committed
+// bucket at or above the peak bucket; a pair read between a green check's two
+// token stores can invert that.
+TEST(MeterStateTest, InspectIsCoherentUnderConcurrentChecks) {
+  const MeterProfile profile =
+      MustProfile(TrTcmSpec{1'000'000, 1000, 1'000'000, 1000});
+  MeterStatePtr state = MustState(profile, MeterSharing::kShared);
+
+  constexpr int kWriters = 3;
+  constexpr int kChecksPerWriter = 100000;
+  std::atomic<int> done{0};
+  std::atomic<uint64_t> reads{0};
+  std::atomic<bool> torn{false};
+
+  std::vector<std::thread> writers;
+  writers.reserve(kWriters);
+  for (int t = 0; t < kWriters; t++) {
+    writers.emplace_back([&] {
+      for (int i = 0; i < kChecksPerWriter; i++) {
+        state->Check(MeterNow(), 64);
+      }
+      done.fetch_add(1, std::memory_order_release);
+    });
+  }
+  std::thread reader([&] {
+    do {
+      const MeterStateSnapshot snapshot = state->Inspect();
+      if (snapshot.buckets[0].tokens > snapshot.buckets[0].limit ||
+          snapshot.buckets[1].tokens > snapshot.buckets[1].limit ||
+          snapshot.buckets[1].tokens > snapshot.buckets[0].tokens ||
+          snapshot.buckets[0].kind != MeterBucketKind::kCommitted ||
+          snapshot.buckets[1].kind != MeterBucketKind::kPeak) {
+        torn.store(true, std::memory_order_relaxed);
+      }
+      reads.fetch_add(1, std::memory_order_relaxed);
+    } while (done.load(std::memory_order_acquire) < kWriters);
+  });
+  for (auto &writer : writers) {
+    writer.join();
+  }
+  reader.join();
+
+  EXPECT_FALSE(torn.load(std::memory_order_relaxed));
+  EXPECT_GT(reads.load(std::memory_order_relaxed), 0u);
+}
+
 // The differential proof: for every algorithm, colour mode and sharing mode,
 // a BESS meter and a raw rte_meter context started from the same bucket state
 // agree on every colour of a long randomized sequence.

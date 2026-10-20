@@ -797,6 +797,7 @@ unit_test_sources = [
   'modules/exact_match_test.cc',
   'modules/generic_encap_test.cc',
   'modules/hash_lb_test.cc',
+  'modules/meter_test.cc',
   'modules/exact_match_transaction_test.cc',
   'modules/transaction_conformance_test.cc',
   'modules/queue_out_test.cc',
