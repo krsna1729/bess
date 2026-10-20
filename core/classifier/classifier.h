@@ -28,6 +28,7 @@ enum class ClassifierErrorCode : uint8_t {
   kResultOutOfBounds,
   kOverlappingFields,
   kInvalidSource,
+  kInvalidDestination,
   kInvalidPlan,
 };
 
@@ -40,10 +41,16 @@ struct ClassifierError {
 template <typename T>
 using ClassifierResult = std::expected<T, ClassifierError>;
 
-enum class SourceKind : uint8_t {
+// The two buffers a plan reads or writes: the packet's bytes and the packet's
+// metadata block. A key plan gathers from them; a result plan scatters to
+// them. One enum for both directions.
+enum class BufferKind : uint8_t {
   kPacket,
   kMetadata,
 };
+
+// The key side's historical name for the same two buffers.
+using SourceKind = BufferKind;
 
 enum class BoundsPolicy : uint8_t {
   // The caller guarantees every configured source range is available.

@@ -11548,3 +11548,56 @@ egress, and asserts the meter's read and the table's write resolved to one offse
 `TheActionAttributeIsTheConfiguredName`; `vif_test.cc`: `TheMetadataNamesAreConfiguration`; `router_test.cc`:
 `TheSelectorAttributesAreConfiguration` -- both selector names, and neither default. The existing tests of
 all five modules run unconfigured and cover the defaults.
+
+## D-169 The result plan is the key plan mirrored: both destinations, masks, packed copy ops
+
+**Status:** accepted (2026-10-20; the match-result schema's scatter half, built but not yet wired into a module).
+
+**Decision.** `ResultPlan` places one value record into either the packet or the metadata block, shaped like
+`ExtractPlan`. `RuntimeResultField` carries a `BufferKind destination` and a `Normalization` mask; `SourceKind`
+becomes an alias of `BufferKind`, one enum for both directions. `Apply`/`ApplyBatch` take a `DestinationView
+{ packet, metadata }`, and the plan compiles one bound per destination buffer (`required_packet_bytes_`,
+`required_metadata_bytes_`) so a pair is checked once, not once per op. Adjacent unmasked ranges in one buffer
+coalesce. Coalesced ops are packed into 16-byte `PackedOp` records (32-bit offsets, 16-bit width, destination,
+mask flag) grouped by destination, mask state and size class 1/2/4/8/16/32/other; the one-op case selects a
+straight-line kernel with width and mask state as template parameters. A mask is applied as `value & mask`, as
+in the extract plan.
+
+**Why.** The old plan was packet-only and broadcast: one value size, one destination offset, one copy. OMEC's
+match actions write values of several widths into the packet *and* into metadata, sometimes through a mask
+(`set_field` with a mask is a read-modify-write). The key plan already solved the hard half -- compile a schema
+once, dispatch on constant widths, check the buffer -- and the result plan is the same problem with the operands
+swapped. Keeping two enums and two shapes would have left the classifier with two conventions for one graph.
+
+**Evidence.** `core/classifier/result_plan_test.cc` (7 tests): `WritesPacketBytesAndMetadataInOneCall` -- one
+record fills a field in each buffer, and nothing else; `CoalescesCompatiblePlacementFields` -- adjacent ranges
+in one buffer become one op; `ACoalescedRunStopsAtThePackedWidth` -- two fields each within the 16-bit width,
+but whose run is not, stay two ops; `MasksPreventCoalescingAndNormalizeTheValue` -- a masked field is copied as
+`value & mask`, never merged, and the input and mask buffers are untouched; `AppliesExactValueRangesToMetadata`
+-- a field's bytes land at their offset; `RejectsOffsetsThePackedFormCannotHold` -- an offset of 2^32 is refused
+by both `Validate()` and `Compile()` with `kResultOutOfBounds`, because the packed form cannot hold it;
+`BatchPlacementUsesOnePlanCallAndChecksSpans` -- a batch writes every record and fails a pair whose buffers are
+short. `extract_plan_test.cc` (14) and `runtime_schema_test.cc` (6) pass with the shared
+`BufferKind`/`Normalization`, and the schema fuzz corpus replays every seed. `classifier_bench` at batch 32,
+this host (i9-13900H, `build/fast`, `-O2 -g` with `_GLIBCXX_ASSERTIONS`), medians of 3:
+
+| Shape at 32 records | ns / packet |
+| --- | --- |
+| direct 16-byte copy (lower bound) | 1.08 |
+| one 16-byte op, compiled | 3.72 |
+| four adjacent 4-byte fields (coalesced to one op) | 3.84 |
+| four 4-byte fields scattered in metadata | 16.4 |
+| one masked 4-byte field | 4.03 |
+| two packet + two metadata fields | 20.9 |
+
+The same benchmark measured 9.6 ns/packet for the previous per-op `memcpy` plan; the wide size classes and the
+packed ops brought it to 3.7. Coalescing is the largest lever: four adjacent outputs cost one copy, not four.
+
+**Consequences.** A module asks the classifier for a schema naming both destination and mask; nothing in the
+plan is packet-specific. The packed form's limits are the schema's: `Validate()` rejects a result offset past
+2^32-1 or a width past 2^16-1, so validation, both plans and the fuzz oracle agree on what is representable.
+The remaining gap to the direct copy is the per-record bounds check and the indirect kernel call, both required
+for an untrusted schema; a per-schema generated kernel is the next lever if a deployment needs it. The hot path
+is independent of the op count: a bucket is one size class, so the copy width is constant and the mask branch
+is hoisted out of the loop. Wiring `Acl` and `ExactMatch` to emit these schemas is the next commit; until then
+no module uses the plan, and the old packet-only fields are gone rather than kept beside it.

@@ -2,6 +2,7 @@
 
 #include "classifier/extract_plan.h"
 
+#include "classifier/plan_copy.h"
 #include "utils/common.h"
 
 #include <algorithm>
@@ -15,74 +16,6 @@ namespace {
 
 ConstBytes Source(const SourceView &view, SourceKind kind) {
   return kind == SourceKind::kPacket ? view.packet : view.metadata;
-}
-
-// Exact-width copy: constant sizes compile to single loads/stores (no libc
-// memcpy call for the common 1/2/4/8-byte fields); unaligned-safe via memcpy
-// semantics. Never over-reads: exactly `size` source bytes are touched.
-inline void CopyBytes(std::byte *dst, const std::byte *src,
-                      size_t size) noexcept {
-  switch (size) {
-    case 1:
-      dst[0] = src[0];
-      break;
-    case 2:
-      std::memcpy(dst, src, 2);
-      break;
-    case 4:
-      std::memcpy(dst, src, 4);
-      break;
-    case 8:
-      std::memcpy(dst, src, 8);
-      break;
-    default:
-      std::memcpy(dst, src, size);
-      break;
-  }
-}
-
-// Exact-width copy + mask. Width-specific ANDs keep masked 1/2/4/8-byte
-// fields on the same single-instruction path as unmasked ones.
-inline void CopyMasked(std::byte *dst, const std::byte *src, size_t size,
-                       const std::byte *mask) noexcept {
-  switch (size) {
-    case 1:
-      dst[0] = static_cast<std::byte>(src[0] & mask[0]);
-      break;
-    case 2: {
-      uint16_t v;
-      uint16_t m;
-      std::memcpy(&v, src, 2);
-      std::memcpy(&m, mask, 2);
-      v &= m;
-      std::memcpy(dst, &v, 2);
-      break;
-    }
-    case 4: {
-      uint32_t v;
-      uint32_t m;
-      std::memcpy(&v, src, 4);
-      std::memcpy(&m, mask, 4);
-      v &= m;
-      std::memcpy(dst, &v, 4);
-      break;
-    }
-    case 8: {
-      uint64_t v;
-      uint64_t m;
-      std::memcpy(&v, src, 8);
-      std::memcpy(&m, mask, 8);
-      v &= m;
-      std::memcpy(dst, &v, 8);
-      break;
-    }
-    default:
-      std::memcpy(dst, src, size);
-      for (size_t k = 0; k < size; k++) {
-        dst[k] &= mask[k];
-      }
-      break;
-  }
 }
 
 // Unchecked op execution: the caller has established that the source spans
