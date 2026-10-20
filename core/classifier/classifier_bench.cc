@@ -20,9 +20,11 @@
 #include "dpdk.h"
 namespace {
 
+using bess::classifier::BufferKind;
 using bess::classifier::Byte;
 using bess::classifier::ByteKey;
 using bess::classifier::ConstBytes;
+using bess::classifier::DestinationView;
 using bess::classifier::ExactTable;
 using bess::classifier::MutableBytes;
 using bess::classifier::ResultPlan;
@@ -45,7 +47,10 @@ RuntimeClassifierSchema ResultSchema() {
   return RuntimeClassifierSchema{
       .key_size = 1,
       .value_size = 16,
-      .result_fields = {{0, 12, 16}},
+      .result_fields = {{.destination = BufferKind::kMetadata,
+                         .value_offset = 0,
+                         .destination_offset = 12,
+                         .size = 16}},
   };
 }
 
@@ -59,7 +64,7 @@ void BM_DirectExtract(benchmark::State &state) {
     }
     benchmark::DoNotOptimize(output);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 void BM_CompiledExtract(benchmark::State &state) {
@@ -85,7 +90,7 @@ void BM_CompiledExtract(benchmark::State &state) {
     benchmark::DoNotOptimize(valid);
     benchmark::DoNotOptimize(output);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 void BM_DirectPlace(benchmark::State &state) {
@@ -98,7 +103,7 @@ void BM_DirectPlace(benchmark::State &state) {
     }
     benchmark::DoNotOptimize(metadata);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 void BM_CompiledPlace(benchmark::State &state) {
@@ -111,10 +116,10 @@ void BM_CompiledPlace(benchmark::State &state) {
     return result;
   }();
   std::array<std::byte, kBatch * 32> metadata{};
-  std::array<MutableBytes, kBatch> destinations = [&]() {
-    std::array<MutableBytes, kBatch> result{};
+  std::array<DestinationView, kBatch> destinations = [&]() {
+    std::array<DestinationView, kBatch> result{};
     for (size_t i = 0; i < kBatch; i++) {
-      result[i] = MutableBytes(metadata).subspan(i * 32, 32);
+      result[i].metadata = MutableBytes(metadata).subspan(i * 32, 32);
     }
     return result;
   }();
@@ -127,13 +132,157 @@ void BM_CompiledPlace(benchmark::State &state) {
   for (auto _ : state) {
     if (!plan->ApplyBatch(
             std::span<const ConstBytes>(values).first(batch),
-            std::span<MutableBytes>(destinations).first(batch))) {
+            std::span<DestinationView>(destinations).first(batch))) {
       state.SkipWithError("result plan execution failed");
       return;
     }
     benchmark::DoNotOptimize(metadata);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
+}
+
+// Four 4-byte outputs at `start + i * step`. step 4 is contiguous (one 16-byte
+// coalesced op); step 17 is four separate stores.
+RuntimeClassifierSchema FourFields(size_t start, size_t step) {
+  RuntimeClassifierSchema schema;
+  schema.key_size = 1;
+  schema.value_size = 16;
+  for (size_t i = 0; i < 4; i++) {
+    schema.result_fields.push_back(RuntimeResultField{
+        .destination = BufferKind::kMetadata,
+        .value_offset = i * 4,
+        .destination_offset = start + i * step,
+        .size = 4});
+  }
+  return schema;
+}
+
+void BM_DirectPlace16(benchmark::State &state) {
+  const std::array<std::byte, 16> value{};
+  std::array<std::byte, kBatch * 64> metadata{};
+  const size_t batch = static_cast<size_t>(state.range(0));
+  for (auto _ : state) {
+    for (size_t i = 0; i < batch; i++) {
+      std::memcpy(metadata.data() + i * 64, value.data(), value.size());
+    }
+    benchmark::DoNotOptimize(metadata);
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
+}
+
+void RunCompiledPlace(benchmark::State &state,
+                      const RuntimeClassifierSchema &schema) {
+  const std::array<std::byte, 16> value{};
+  const std::array<ConstBytes, kBatch> values = [&]() {
+    std::array<ConstBytes, kBatch> result{};
+    for (ConstBytes &entry : result) {
+      entry = ConstBytes(value);
+    }
+    return result;
+  }();
+  std::array<std::byte, kBatch * 64> metadata{};
+  std::array<DestinationView, kBatch> destinations = [&]() {
+    std::array<DestinationView, kBatch> result{};
+    for (size_t i = 0; i < kBatch; i++) {
+      result[i].metadata = MutableBytes(metadata).subspan(i * 64, 64);
+    }
+    return result;
+  }();
+  const size_t batch = static_cast<size_t>(state.range(0));
+  auto plan = ResultPlan::Compile(schema);
+  if (!plan.has_value()) {
+    state.SkipWithError("failed to compile result plan");
+    return;
+  }
+  for (auto _ : state) {
+    if (!plan->ApplyBatch(std::span<const ConstBytes>(values).first(batch),
+                          std::span<DestinationView>(destinations).first(batch))) {
+      state.SkipWithError("result plan execution failed");
+      return;
+    }
+    benchmark::DoNotOptimize(metadata);
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
+}
+
+void BM_CompiledPlace4Contiguous(benchmark::State &state) {
+  RunCompiledPlace(state, FourFields(0, 4));
+}
+
+void BM_CompiledPlace4Scattered(benchmark::State &state) {
+  RunCompiledPlace(state, FourFields(0, 17));
+}
+
+void BM_CompiledPlaceMasked(benchmark::State &state) {
+  RuntimeClassifierSchema schema{
+      .key_size = 1,
+      .value_size = 4,
+      .result_fields = {{.destination = BufferKind::kMetadata,
+                         .value_offset = 0,
+                         .destination_offset = 0,
+                         .size = 4,
+                         .normalization = {.mask = {Byte{0xff}, Byte{0x0f},
+                                                    Byte{0xff}, Byte{0x0f}}}}},
+  };
+  RunCompiledPlace(state, schema);
+}
+
+void BM_CompiledPlaceMixed(benchmark::State &state) {
+  RuntimeClassifierSchema schema{
+      .key_size = 1,
+      .value_size = 16,
+      .result_fields =
+          {{.destination = BufferKind::kPacket,
+            .value_offset = 0,
+            .destination_offset = 12,
+            .size = 4},
+           {.destination = BufferKind::kPacket,
+            .value_offset = 4,
+            .destination_offset = 20,
+            .size = 4},
+           {.destination = BufferKind::kMetadata,
+            .value_offset = 8,
+            .destination_offset = 0,
+            .size = 4},
+           {.destination = BufferKind::kMetadata,
+            .value_offset = 12,
+            .destination_offset = 4,
+            .size = 4}},
+  };
+  const std::array<std::byte, 16> value{};
+  const std::array<ConstBytes, kBatch> values = [&]() {
+    std::array<ConstBytes, kBatch> result{};
+    for (ConstBytes &entry : result) {
+      entry = ConstBytes(value);
+    }
+    return result;
+  }();
+  std::array<std::byte, kBatch * 64> packets{};
+  std::array<std::byte, kBatch * 64> metadata{};
+  std::array<DestinationView, kBatch> destinations = [&]() {
+    std::array<DestinationView, kBatch> result{};
+    for (size_t i = 0; i < kBatch; i++) {
+      result[i].packet = MutableBytes(packets).subspan(i * 64, 64);
+      result[i].metadata = MutableBytes(metadata).subspan(i * 64, 64);
+    }
+    return result;
+  }();
+  const size_t batch = static_cast<size_t>(state.range(0));
+  auto plan = ResultPlan::Compile(schema);
+  if (!plan.has_value()) {
+    state.SkipWithError("failed to compile result plan");
+    return;
+  }
+  for (auto _ : state) {
+    if (!plan->ApplyBatch(std::span<const ConstBytes>(values).first(batch),
+                          std::span<DestinationView>(destinations).first(batch))) {
+      state.SkipWithError("result plan execution failed");
+      return;
+    }
+    benchmark::DoNotOptimize(packets);
+    benchmark::DoNotOptimize(metadata);
+  }
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 struct TypedBackend {
@@ -165,7 +314,7 @@ void BM_DirectTypedLookup(benchmark::State &state) {
     }
     benchmark::DoNotOptimize(sink);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 void BM_TypedTableLookup(benchmark::State &state) {
@@ -180,13 +329,18 @@ void BM_TypedTableLookup(benchmark::State &state) {
     }
     benchmark::DoNotOptimize(sink);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 BENCHMARK(BM_DirectExtract)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 BENCHMARK(BM_CompiledExtract)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 BENCHMARK(BM_DirectPlace)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 BENCHMARK(BM_CompiledPlace)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
+BENCHMARK(BM_DirectPlace16)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
+BENCHMARK(BM_CompiledPlace4Contiguous)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
+BENCHMARK(BM_CompiledPlace4Scattered)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
+BENCHMARK(BM_CompiledPlaceMasked)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
+BENCHMARK(BM_CompiledPlaceMixed)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 BENCHMARK(BM_DirectTypedLookup)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 BENCHMARK(BM_TypedTableLookup)->Arg(1)->Arg(8)->Arg(16)->Arg(32);
 
@@ -238,7 +392,7 @@ void BM_Cuckoo_TypedBatch_Hit(benchmark::State &state) {
     benchmark::DoNotOptimize(hits);
     benchmark::DoNotOptimize(results);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 void BM_Small_TypedBatch_Hit(benchmark::State &state) {
@@ -263,7 +417,7 @@ void BM_Small_TypedBatch_Hit(benchmark::State &state) {
     benchmark::DoNotOptimize(hits);
     benchmark::DoNotOptimize(results);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 void BM_RteHashData_Bulk_Hit(benchmark::State &state) {
@@ -293,7 +447,7 @@ void BM_RteHashData_Bulk_Hit(benchmark::State &state) {
     benchmark::DoNotOptimize(hits);
     benchmark::DoNotOptimize(results);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 void BM_RteHashPosition_Bulk_Hit(benchmark::State &state) {
@@ -322,7 +476,7 @@ void BM_RteHashPosition_Bulk_Hit(benchmark::State &state) {
     benchmark::DoNotOptimize(hits);
     benchmark::DoNotOptimize(results);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 void BM_DirectExact_Bulk_Hit(benchmark::State &state) {
@@ -345,7 +499,7 @@ void BM_DirectExact_Bulk_Hit(benchmark::State &state) {
     benchmark::DoNotOptimize(hits);
     benchmark::DoNotOptimize(results);
   }
-  state.SetItemsProcessed(state.iterations() * batch);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * batch));
 }
 
 BENCHMARK(BM_Cuckoo_TypedBatch_Hit)->Arg(1)->Arg(8)->Arg(16)->Arg(32);

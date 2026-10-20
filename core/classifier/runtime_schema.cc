@@ -73,6 +73,11 @@ ClassifierResult<void> RuntimeClassifierSchema::Validate() const {
       return Error(ClassifierErrorCode::kZeroFieldSize,
                    "classifier result field has zero size", i);
     }
+    if (field.destination != BufferKind::kPacket &&
+        field.destination != BufferKind::kMetadata) {
+      return Error(ClassifierErrorCode::kInvalidDestination,
+                   "classifier result field has an invalid destination", i);
+    }
     if (!Fits(field.value_offset, field.size, value_size)) {
       return Error(ClassifierErrorCode::kResultOutOfBounds,
                    "classifier result field exceeds value size", i);
@@ -82,11 +87,28 @@ ClassifierResult<void> RuntimeClassifierSchema::Validate() const {
       return Error(ClassifierErrorCode::kResultOutOfBounds,
                    "classifier result destination overflows", i);
     }
+    // The result plan packs an op's offsets into 32 bits and its width into
+    // 16, so a schema no plan can hold is invalid rather than compilable.
+    if (field.value_offset > std::numeric_limits<uint32_t>::max() ||
+        field.destination_offset > std::numeric_limits<uint32_t>::max() ||
+        field.size > std::numeric_limits<uint16_t>::max()) {
+      return Error(ClassifierErrorCode::kResultOutOfBounds,
+                   "classifier result field exceeds the plan's packed limits",
+                   i);
+    }
+    if (!field.normalization.mask.empty() &&
+        field.normalization.mask.size() != field.size) {
+      return Error(ClassifierErrorCode::kInvalidPlan,
+                   "classifier result normalization mask size mismatch", i);
+    }
   }
 
+  // Two fields may write the same offset in different buffers; only a shared
+  // destination can overlap.
   for (size_t i = 0; i < result_fields.size(); i++) {
     for (size_t j = i + 1; j < result_fields.size(); j++) {
-      if (Overlaps(result_fields[i], result_fields[j],
+      if (result_fields[i].destination == result_fields[j].destination &&
+          Overlaps(result_fields[i], result_fields[j],
                    &RuntimeResultField::destination_offset)) {
         return Error(ClassifierErrorCode::kOverlappingFields,
                      "classifier result destinations overlap", j);

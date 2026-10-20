@@ -25,10 +25,16 @@ struct RuntimeKeyField {
   Normalization normalization;
 };
 
+// Where one output goes: the packet's bytes, or its metadata block. The
+// mirror of RuntimeKeyField: it has a source, a mask and a size; this has a
+// destination, a mask and a size. An empty mask writes the value as it is; a
+// non-empty one writes value & mask, as the key side normalizes.
 struct RuntimeResultField {
+  BufferKind destination = BufferKind::kMetadata;
   size_t value_offset = 0;
   size_t destination_offset = 0;
   size_t size = 0;
+  Normalization normalization;
 };
 
 // Resolved control-plane input. Metadata names and protobuf objects must be

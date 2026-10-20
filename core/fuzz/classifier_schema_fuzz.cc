@@ -62,7 +62,9 @@
 namespace {
 
 using bess::classifier::BoundsPolicy;
+using bess::classifier::BufferKind;
 using bess::classifier::ConstBytes;
+using bess::classifier::DestinationView;
 using bess::classifier::ExtractPlan;
 using bess::classifier::MutableBytes;
 using bess::classifier::ResultPlan;
@@ -157,17 +159,30 @@ bool RefValidate(const RuntimeClassifierSchema &s) {
     }
   }
   for (const RuntimeResultField &f : s.result_fields) {
+    if (f.destination != BufferKind::kPacket &&
+        f.destination != BufferKind::kMetadata) {
+      return false;
+    }
     if (f.size == 0 || !Within(f.value_offset, f.size, s.value_size) ||
-        !End(f.destination_offset, f.size)) {
+        !End(f.destination_offset, f.size) ||
+        f.value_offset > std::numeric_limits<uint32_t>::max() ||
+        f.destination_offset > std::numeric_limits<uint32_t>::max() ||
+        f.size > std::numeric_limits<uint16_t>::max() ||
+        (!f.normalization.mask.empty() &&
+         f.normalization.mask.size() != f.size)) {
       return false;
     }
   }
   // Destination overlap: two half-open ranges intersect iff the later start
-  // precedes the earlier end.
+  // precedes the earlier end. The two buffers are independent, so ranges in
+  // different destinations may overlap.
   for (size_t i = 0; i < s.result_fields.size(); i++) {
     for (size_t j = 0; j < i; j++) {
       const RuntimeResultField &a = s.result_fields[i];
       const RuntimeResultField &b = s.result_fields[j];
+      if (a.destination != b.destination) {
+        continue;
+      }
       const size_t start = std::max(a.destination_offset, b.destination_offset);
       const size_t end = std::min(*End(a.destination_offset, a.size),
                                   *End(b.destination_offset, b.size));
@@ -445,7 +460,9 @@ void FuzzResult(const RuntimeClassifierSchema &s, const ResultPlan &plan,
     Fill(metadata, 61);
     const Bytes before = metadata;
     const bool want = RefApplyFits(s, value.size(), metadata.size());
-    const bool got = plan.Apply(ConstBytes(value), MutableBytes(metadata));
+    const DestinationView destination{.packet = {},
+                                      .metadata = MutableBytes(metadata)};
+    const bool got = plan.Apply(ConstBytes(value), destination);
     FUZZ_CHECK(got == want);
     if (want) {
       Bytes expected = before;
@@ -473,16 +490,20 @@ void FuzzResult(const RuntimeClassifierSchema &s, const ResultPlan &plan,
     batch_metadata.push_back(std::move(metadata));
 
     Bytes single = befores.back();
-    const bool ok = plan.Apply(ConstBytes(values[i]), MutableBytes(single));
+    const DestinationView single_destination{.packet = {},
+                                             .metadata = MutableBytes(single)};
+    const bool ok = plan.Apply(ConstBytes(values[i]), single_destination);
     FUZZ_CHECK(ok == RefApplyFits(s, values[i].size(), single.size()));
     want_all = want_all && ok;
   }
   std::vector<ConstBytes> value_spans(values.begin(), values.end());
-  std::vector<MutableBytes> metadata_spans;
+  std::vector<DestinationView> destinations;
+  destinations.reserve(batch_metadata.size());
   for (Bytes &m : batch_metadata) {
-    metadata_spans.emplace_back(m);
+    destinations.push_back(
+        DestinationView{.packet = {}, .metadata = MutableBytes(m)});
   }
-  const bool got_all = plan.ApplyBatch(value_spans, metadata_spans);
+  const bool got_all = plan.ApplyBatch(value_spans, destinations);
   FUZZ_CHECK(got_all == want_all);
   for (size_t i = 0; i < batch; i++) {
     if (got_all) {
