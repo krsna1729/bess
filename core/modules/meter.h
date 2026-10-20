@@ -5,6 +5,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -119,6 +120,17 @@ class Meter final : public Module {
   // How many meter ids one packet carries (the `meter_id` attribute is
   // 4 * levels_ bytes wide). 1 is the module's historical behaviour.
   size_t levels_ = 1;
+
+  // What the meters charge: the whole frame (historical), the IP datagram
+  // (L3), the transport segment inside it (L4), or every frame byte from
+  // `byte_offset_` on (CUSTOM).
+  enum class ByteBasis : uint8_t { kL2, kL3, kL4, kCustom };
+  ByteBasis byte_basis_ = ByteBasis::kL2;
+  uint32_t byte_offset_ = 0;
+
+  // The bytes this packet is charged at `byte_basis_`, or nullopt when the
+  // packet cannot be measured (then it is dropped, never forwarded unmetered).
+  std::optional<uint32_t> AccountedBytes(bess::PacketRef pkt) const;
 
   int meter_id_attr_ = -1;
   // The attribute's registered name, for the one log line that names it.
