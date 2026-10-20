@@ -1070,6 +1070,7 @@ TEST_F(ApiV2ServiceTest, ResetResourcesErasesOnlyTheNamedTables) {
   {
     grpc::ClientContext ctx;
     v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
     req.add_resources("take/rules");
     auto before = control_plane_->ReadResource("take/rules");
     ASSERT_TRUE(before.has_value());
@@ -1090,6 +1091,7 @@ TEST_F(ApiV2ServiceTest, ResetResourcesErasesOnlyTheNamedTables) {
   {
     grpc::ClientContext ctx;
     v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
     req.add_resources("take/rules");
     req.add_resources("take/rules");  // one resource, once
     v2::ResetResourcesResponse resp;
@@ -1103,6 +1105,7 @@ TEST_F(ApiV2ServiceTest, ResetResourcesErasesOnlyTheNamedTables) {
   {
     grpc::ClientContext ctx;
     v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
     req.add_resources("keep/rules");
     req.set_expected_resource_generation(generation - 1);
     v2::ResetResourcesResponse resp;
@@ -1114,6 +1117,18 @@ TEST_F(ApiV2ServiceTest, ResetResourcesErasesOnlyTheNamedTables) {
   {
     grpc::ClientContext ctx;
     v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch() + 1);  // a daemon that restarted since the read
+    req.add_resources("keep/rules");
+    v2::ResetResourcesResponse resp;
+    const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
+    EXPECT_EQ(grpc::StatusCode::FAILED_PRECONDITION, status.error_code());
+    EXPECT_EQ(1, count("keep/rules")) << "a foreign epoch erased an entry";
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
     req.add_resources("no-such/table");
     v2::ResetResourcesResponse resp;
     const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
@@ -1123,6 +1138,7 @@ TEST_F(ApiV2ServiceTest, ResetResourcesErasesOnlyTheNamedTables) {
   {
     grpc::ClientContext ctx;
     v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
     v2::ResetResourcesResponse resp;
     const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
     EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, status.error_code());

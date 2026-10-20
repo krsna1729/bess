@@ -646,6 +646,9 @@ grpc::Status ControlV2Service::ReadResource(
 grpc::Status ControlV2Service::ResetResources(
     grpc::ServerContext *context, const v2::ResetResourcesRequest *request,
     v2::ResetResourcesResponse *response) {
+  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
+    return *refused;
+  }
   std::vector<std::string> names(request->resources().begin(),
                                  request->resources().end());
   std::optional<uint64_t> expected;

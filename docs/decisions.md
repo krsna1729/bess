@@ -11640,8 +11640,8 @@ generation for a later write. `GetPipeline` is unchanged.
 **Status:** accepted (2026-10-20; the bounded clear D-129's restart wall asked for).
 
 **Decision.** `Control.ResetResources` takes one or more `<module>/<table>` names and
-converges each to no entries in the daemon. It checks an optional
-`expected_resource_generation` before any effect, dedupes names, and runs the
+converges each to no entries in the daemon. It requires the daemon epoch, checks an
+optional `expected_resource_generation` before any effect, dedupes names, and runs the
 convergence through the same `ApplyResourcesLocked` as a desired-state apply: a
 resource whose workers read it unsynchronized changes with the workers paused, and a
 large map clear is split by `ApplyBatched` instead of one oversized transaction. The
@@ -11660,8 +11660,9 @@ read plus per-key erase, now with `ReadResource` pages (D-170).
 **Evidence.** `core/control/api_v2_test.cc`:
 `ResetResourcesErasesOnlyTheNamedTables` -- only the named table is emptied, the other
 keeps its entry, a repeat is `removed = 0` with no generation change, duplicate names
-collapse to one, a stale expected generation is `ABORTED` and erases nothing, an
-unknown name is `NOT_FOUND`, and an empty request is `INVALID_ARGUMENT`.
+collapse to one, a stale expected generation is `ABORTED` and erases nothing, a
+foreign daemon epoch is `FAILED_PRECONDITION` and erases nothing, an unknown name is
+`NOT_FOUND`, and an empty request is `INVALID_ARGUMENT`.
 
 **Consequences.** A controller empties a whole table without a readback; graph-owned
 resources, module arguments and unlisted tables are untouched. A singleton needs a

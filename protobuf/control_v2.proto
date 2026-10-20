@@ -247,6 +247,7 @@ message ResourcePage {
 message ResetResourcesRequest {
   repeated string resources = 1;  // at least one "<module>/<table>"
   optional uint64 expected_resource_generation = 2;  // stale: conflict, nothing erased
+  uint64 daemon_epoch = 3;                           // as in ApplyTransaction
 }
 message ResetResourcesResponse {
   repeated string resources = 1;  // deduped, in request order
