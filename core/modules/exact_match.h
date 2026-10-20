@@ -30,7 +30,7 @@
 
 using google::protobuf::RepeatedPtrField;
 // (bess::framework::Error is the same alias; defined locally so this module
-// no longer depends on framework/exact_match_table.h, which HashLB still uses.)
+// does not depend on framework/exact_match_table.h.)
 using Error = std::pair<int, std::string>;
 
 // Two modes, fixed at Init():

@@ -9,19 +9,26 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <map>
 #include <random>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "arch/crc32c.h"
+#include "dataplane/member_select.h"
 #include "dataplane/transaction_engine.h"
+#include "framework/exact_match_table.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "module_graph.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
+#include "testing/rng.h"
 
 namespace {
 
@@ -83,6 +90,84 @@ bess::pb::HashLBArg LbArg(std::initializer_list<int64_t> gates) {
     arg.add_gates(g);
   }
   return arg;
+}
+
+// -- custom fields ----------------------------------------------------------------
+
+bess::pb::Field OffsetField(int64_t offset, uint32_t bytes) {
+  bess::pb::Field f;
+  f.set_offset(offset);
+  f.set_num_bytes(bytes);
+  return f;
+}
+
+bess::pb::Field AttrField(const std::string &name, uint32_t bytes) {
+  bess::pb::Field f;
+  f.set_attr_name(name);
+  f.set_num_bytes(bytes);
+  return f;
+}
+
+bess::pb::HashLBSettings FieldSettings(
+    const std::vector<gate_idx_t> &gates,
+    const std::vector<bess::pb::Field> &fields) {
+  bess::pb::HashLBSettings s;
+  s.set_mode("");
+  for (gate_idx_t g : gates) {
+    s.add_gates(g);
+  }
+  for (const bess::pb::Field &f : fields) {
+    *s.add_fields() = f;
+  }
+  return s;
+}
+
+// The custom tuple's hash as the module has always computed it: CRC32C over
+// the key bytes (the fields' bytes in field order) zero-padded to whole 8-byte
+// words -- ExactMatchKeyHash over the field table the module built. The gate
+// is that hash mapped over the gate list (RangeSelect). The extractor is
+// shared with the classifier now; a valid packet's gate must not change.
+uint32_t KeyHash(const Bytes &key) {
+  uint32_t hash = 0;
+  size_t at = 0;
+  for (; at + sizeof(uint64_t) <= key.size(); at += sizeof(uint64_t)) {
+    uint64_t word;
+    std::memcpy(&word, key.data() + at, sizeof(word));
+    hash = bess::arch::Crc32c(word, hash);
+  }
+  if (at < key.size()) {
+    uint64_t word = 0;
+    std::memcpy(&word, key.data() + at, key.size() - at);
+    hash = bess::arch::Crc32c(word, hash);
+  }
+  return hash;
+}
+
+gate_idx_t ExpectedGate(const Bytes &key,
+                        const std::vector<gate_idx_t> &gates) {
+  return gates[bess::dataplane::RangeSelect(KeyHash(key), gates.size())];
+}
+
+// The hash the module's old field table (framework/exact_match_table.h,
+// no longer used by the module) computes for `pkt` over packet-offset fields:
+// the oracle the shared extractor's key must reproduce. Its key bytes are
+// ExactMatchKeyHash's input, zero-padded to the table's aligned key size.
+uint32_t LegacyKeyHash(bess::framework::ExactMatchTable<int> &table,
+                       const Bytes &pkt) {
+  const bess::framework::ExactMatchKey key = table.MakeKey(pkt.data());
+  const bess::framework::ExactMatchKeyHash hash(table.total_key_size());
+  return hash(key);
+}
+
+// The gate `out` holds `pkt` on (the packets under test are distinct).
+gate_idx_t GateOf(const std::map<gate_idx_t, std::vector<Bytes>> &out,
+                  const Bytes &pkt) {
+  for (const auto &[gate, pkts] : out) {
+    if (std::find(pkts.begin(), pkts.end(), pkt) != pkts.end()) {
+      return gate;
+    }
+  }
+  return DROP_GATE;
 }
 
 // True when "<resource>"'s codec says applying it requires paused workers.
@@ -162,6 +247,188 @@ TEST(HashLbSettingsTest, AppliesLive) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("HashLB", LbArg({1, 2}), "lb"));
   EXPECT_FALSE(RequiresPausedWorkers("lb/settings"));
+}
+
+// The custom tuple's key is the fields' bytes in field order and its gate is
+// the hash over that key, unchanged from the field table this mode used to
+// build.
+TEST(HashLbCustomFieldsTest, MultiFieldKeyAndBucketSelectionAreUnchanged) {
+  const std::vector<Bytes> pkts = Flows();
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  ASSERT_EQ("", h.SetResource(
+                    "lb/settings",
+                    FieldSettings(kGates, {OffsetField(26, 4),   // IPv4 src
+                                           OffsetField(30, 4),   // IPv4 dst
+                                           OffsetField(34, 2),   // TCP sport
+                                           OffsetField(36, 2)})));
+
+  const auto out = h.Run(lb, 0, pkts, kGates);
+  GatesUsed(out, pkts);
+  // The module's previous key constructor and hash, over the same fields: the
+  // shared extractor must hash the same bytes.
+  bess::framework::ExactMatchTable<int> legacy;
+  ASSERT_EQ(0, legacy.AddField(26, 4, 0, 0).first);
+  ASSERT_EQ(0, legacy.AddField(30, 4, 0, 1).first);
+  ASSERT_EQ(0, legacy.AddField(34, 2, 0, 2).first);
+  ASSERT_EQ(0, legacy.AddField(36, 2, 0, 3).first);
+
+  std::set<gate_idx_t> used;
+  for (const Bytes &pkt : pkts) {
+    ASSERT_GE(pkt.size(), 38u);
+    const Bytes key(pkt.begin() + 26, pkt.begin() + 38);
+    EXPECT_EQ(LegacyKeyHash(legacy, pkt), KeyHash(key))
+        << "the multi-field key is unchanged";
+    const gate_idx_t expected = ExpectedGate(key, kGates);
+    EXPECT_EQ(expected, GateOf(out, pkt)) << "packet of " << pkt.size();
+    used.insert(expected);
+  }
+  EXPECT_GT(used.size(), 1u) << "the tuple spreads flows over the gates";
+}
+
+// A key shorter than 8 bytes is hashed zero-padded, as the word-aligned field
+// table always did: a 1-byte field is one byte and seven zeros.
+TEST(HashLbCustomFieldsTest, ASubWordFieldKeepsItsPaddingAndGate) {
+  const std::vector<Bytes> pkts = Flows();
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  ASSERT_EQ("", h.SetResource("lb/settings",
+                              FieldSettings(kGates, {OffsetField(35, 1)})));
+
+  const auto out = h.Run(lb, 0, pkts, kGates);
+  GatesUsed(out, pkts);
+  // The old field table's key for a 1-byte field: one byte, seven zeros.
+  bess::framework::ExactMatchTable<int> legacy;
+  ASSERT_EQ(0, legacy.AddField(35, 1, 0, 0).first);
+  for (const Bytes &pkt : pkts) {
+    const Bytes key(pkt.begin() + 35, pkt.begin() + 36);
+    EXPECT_EQ(LegacyKeyHash(legacy, pkt), KeyHash(key));
+    EXPECT_EQ(ExpectedGate(key, kGates), GateOf(out, pkt));
+  }
+}
+
+// A field may name a metadata attribute declared at creation: its bytes join
+// the key in field order, and the extraction plan is rebuilt on the resume
+// that assigns the attribute's offset.
+TEST(HashLbCustomFieldsTest, AFieldMayBeAMetadataAttribute) {
+  ModuleHarness h;
+  const bess::pb::HashLBSettings field_settings =
+      FieldSettings(kGates, {AttrField("hashlb_tuple_meta", 2),
+                             OffsetField(26, 4)});
+  bess::pb::HashLBArg arg = LbArg({1, 2});
+  *arg.mutable_fields() = field_settings.fields();
+  Module *lb = h.Create("HashLB", arg, "lb");
+  ASSERT_NE(nullptr, lb);
+  ASSERT_EQ("", h.SetResource("lb/settings", field_settings));
+
+  std::mt19937 rng = bess::testing::SeededRng(11);
+  const Bytes pkt = TcpPacket(
+      {.sip = "10.9.8.7", .dip = "10.1.0.1", .sport = 1234, .dport = 80}, rng);
+  const std::vector<std::string> values = {std::string("\x77\x90", 2),
+                                           std::string("\x88\x80", 2)};
+  // One writer per value, through a Merge: two branches write the same
+  // attribute, as the ExactMatch metadata tests do.
+  Module *merge = h.Create("Merge", bess::pb::MergeArg());
+  ASSERT_NE(nullptr, merge);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(merge, 0, lb, 0, true));
+  std::set<gate_idx_t> used;
+  for (size_t i = 0; i < values.size(); i++) {
+    bess::pb::SetMetadataArg tag;
+    auto *attr = tag.add_attrs();
+    attr->set_name("hashlb_tuple_meta");
+    attr->set_size(2);
+    attr->set_value_bin(values[i]);
+    Module *set = h.Create("SetMetadata", tag, "tag" + std::to_string(i));
+    ASSERT_NE(nullptr, set);
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(set, 0, merge,
+                                             static_cast<gate_idx_t>(i), true));
+
+    const auto out = h.RunPipeline(set, 0, {pkt}, lb, kGates);
+    Bytes key(values[i].begin(), values[i].end());
+    key.insert(key.end(), pkt.begin() + 26, pkt.begin() + 30);
+    const gate_idx_t expected = ExpectedGate(key, kGates);
+    EXPECT_EQ(expected, GateOf(out, pkt)) << "metadata value " << i;
+    used.insert(expected);
+
+    // Re-applying the fields rebuilds the plan around the already registered
+    // attribute (re-registering it would fail with EEXIST) and keeps the gate.
+    ASSERT_EQ("", h.SetResource("lb/settings", field_settings));
+    EXPECT_EQ(expected,
+              GateOf(h.RunPipeline(set, 0, {pkt}, lb, kGates), pkt))
+        << "re-applied fields, metadata value " << i;
+  }
+  EXPECT_GT(used.size(), 1u) << "the attribute's bytes are part of the key";
+}
+
+// A live settings update cannot register a new metadata attribute: its offset
+// is assigned by a resume, and a resource write does not resume. The refusal
+// leaves the published configuration unchanged.
+TEST(HashLbCustomFieldsTest, ALiveUpdateCannotAddAMetadataAttribute) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  const bess::pb::HashLBSettings good =
+      FieldSettings(kGates, {OffsetField(26, 4)});
+  ASSERT_EQ("", h.SetResource("lb/settings", good));
+  EXPECT_NE("", h.SetResource(
+                    "lb/settings",
+                    FieldSettings(kGates, {AttrField("hashlb_live_meta", 2),
+                                           OffsetField(26, 4)})));
+  EXPECT_EQ("", h.ReadBackDiffers("lb/settings", {{nullptr, &good}}))
+      << "the refused update changed the published settings";
+}
+
+// A packet short for any field has no key at all -- not a partial one -- and
+// is dropped, like a short frame in the fixed modes. (The harness injects
+// single-segment packets; a chained packet's later segment is equally out of
+// reach of a field, and kCheck fails extraction the same way.)
+TEST(HashLbCustomFieldsTest, AShortPacketHasNoKeyAndIsDropped) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  ASSERT_EQ("", h.SetResource(
+                    "lb/settings",
+                    FieldSettings(kGates, {OffsetField(14, 2),
+                                           OffsetField(30, 4)})));
+
+  for (const Bytes &short_pkt : {Bytes(20), Bytes(31), Bytes(33)}) {
+    const auto out = h.Run(lb, 0, {short_pkt}, kGates);
+    for (const auto &[gate, pkts] : out) {
+      EXPECT_TRUE(pkts.empty()) << "gate " << gate << ", " << short_pkt.size()
+                                << " bytes";
+    }
+  }
+
+  // One byte more and both fields fit: the packet has a gate again.
+  std::mt19937 rng = bess::testing::SeededRng(3);
+  const Bytes fits =
+      TcpPacket({.sip = "10.0.0.1", .dip = "10.0.0.2", .sport = 1, .dport = 2},
+                rng);
+  const auto out = h.Run(lb, 0, {fits}, kGates);
+  EXPECT_NE(DROP_GATE, GateOf(out, fits));
+}
+
+// The custom tuple's limits, as the field table enforced them.
+TEST(HashLbCustomFieldsTest, FieldLimitsAreEnforced) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  const bess::pb::HashLBSettings good =
+      FieldSettings(kGates, {OffsetField(26, 4)});
+  ASSERT_EQ("", h.SetResource("lb/settings", good));
+
+  EXPECT_NE("", h.SetResource("lb/settings",
+                              FieldSettings(kGates, {OffsetField(26, 0)})));
+  EXPECT_NE("", h.SetResource("lb/settings",
+                              FieldSettings(kGates, {OffsetField(26, 9)})));
+  EXPECT_NE("", h.SetResource("lb/settings",
+                              FieldSettings(kGates, {OffsetField(1025, 1)})));
+  const std::vector<bess::pb::Field> nine(9, OffsetField(26, 1));
+  EXPECT_NE("", h.SetResource("lb/settings", FieldSettings(kGates, nine)));
+  EXPECT_EQ("", h.ReadBackDiffers("lb/settings", {{nullptr, &good}}))
+      << "refused fields change nothing";
 }
 
 // Each mode hashes bytes at a fixed offset; a frame too short for them is

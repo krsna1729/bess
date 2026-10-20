@@ -235,8 +235,7 @@ meter/stats row by D-091; the fuzz row by CI replaying the corpora; the hardware
 R4 on the installed tree by D-094; "direct appliance build does not require framework" by D-095.
 Still partial, each with its record: the update-under-load and memory-at-scale matrices have named gaps
 (performance-contract.md); no checked-in assembly-shape artifact (binary inspection is outside this program's
-tooling); arm64 and sanitizer lanes are not yet gating; `framework/exact_match_table.h`
-remains as HashLB's field extractor; "no BESS action language" is a review rule without a mechanical check (the
+tooling); arm64 and sanitizer lanes are not yet gating; "no BESS action language" is a review rule without a mechanical check (the
 runtime's side has one: `check_includes.py` forbids `core/runtime/` every networking battery). Hardware certification (C-HW) is tracked separately and not run.
 
 ### Roadmap phase audit (2026-09-24)

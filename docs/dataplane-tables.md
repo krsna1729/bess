@@ -620,6 +620,9 @@ reference to something missing.
   once per generation and extracts a batch of keys with bounds checks. Short
   or multi-segment packets fail extraction, and the module sends them to its
   default gate instead of reading past the data.
+- **Used by:** ExactMatch and WildcardMatch (their keys), and HashLB's custom
+  tuple (its key, hashed rather than matched). HashLB has no default gate, so
+  a packet it cannot extract a key for is dropped.
 
 ## 5. Built-in modules today
 
@@ -630,7 +633,7 @@ reference to something missing.
 | WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list; transactions through resource `<module>/rules` | D-014, D-024 |
 | L2Forward | `PackedMacTable<SingleWriter>` (one-word slots, 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, moves destination-first under a sequence number readers re-check on a miss, no grace period. Multi-entry `add`/`populate` are all-or-nothing per command (validation plus rollback), but not dataplane-atomic: packets see entries one by one | D-017, D-073 |
 | ACL | `std::vector` of rules, linear scan | G: `add` copies, appends and publishes (all or nothing) | D-017; `rte_acl` (G-only) is the candidate for large rule sets |
-| HashLB | configuration only (`ExactMatchTable` for field layout) | G: one `RcuPtr<Config>`, read once per batch | D-017 |
+| HashLB | configuration only (one `classifier::ExtractPlan` for the custom tuple, rebuilt at resume) | G: one `RcuPtr<Config>`, read once per batch | D-017 |
 | URLFilter | `Trie` per host | Pause | legacy: cleartext HTTP only; a modern SNI classifier is recorded in MODERNIZATION §31.6 |
 | BPF | compiled filters | Pause | deferred: G together with the `rte_bpf` decision (MODERNIZATION §31.6) |
 | NAT | `nat::Nat`: bindings on `WorkerFlowTable` (internal endpoint key, external alias), `PortPool` bitmaps, expiry wheel | worker-owned (the packet path creates mappings) | one worker; D-068 |
