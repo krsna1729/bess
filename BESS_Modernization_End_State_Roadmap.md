@@ -4846,7 +4846,6 @@ This is a migration guide, not a demand for one large directory-moving commit.
 | `core/task.*`, scheduler/traffic class | execution/runtime | Clarify public/internal boundary |
 | `core/port.*` | runtime/framework device boundary | Split physical device lifecycle from logical `InterfaceId` |
 | `core/drivers/pmd.*` | drivers/runtime | Hardware-specific |
-| `core/modules/action_table.*` | module/reference vertical slice | Do not elevate its `Action` to universal type |
 | `core/modules/nat.*` | compatibility module over future NAT library | Extract mechanisms |
 | `core/modules/l2_table.h` | candidate input to L2 library | Benchmark rather than blindly move |
 | `core/modules/l2_forward.*` | compatibility module over L2 library | Thin adapter |
@@ -5591,7 +5590,6 @@ core/runtime/
 core/control/
 core/framework/
 
-core/modules/action_table.*
 core/modules/session_pipeline_test.cc
 core/modules/nat.*
 core/modules/l2_table.h

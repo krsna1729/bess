@@ -52,7 +52,7 @@ file is the reasoning.
 | D-029 | DPDK memory for the dataplane: dynamic hugepages, in-memory EAL, IOVA chosen by DPDK | accepted |
 | D-030 | Container-friendly bessd startup: environment, auto-detection, graceful termination | accepted |
 | D-031 | Daemon instance identity follows the RPC listen address | accepted |
-| D-032 | The session vertical slice: ExactMatch → ActionTable → Meter → Router as one transactional graph | accepted |
+| D-032 | The session vertical slice: ExactMatch → ActionTable → Meter → Router as one transactional graph | accepted; superseded in part by D-172 and D-174 |
 | D-033 | Framework contracts, runtime ownership, and extension boundaries | accepted |
 | D-034 | Packet-pool fast paths and CuckooMap lookup recovery | accepted |
 | D-035 | Four-way performance characterization and dataplane clawback roadmap | accepted |
@@ -2596,19 +2596,19 @@ adds an explicit multi-process DPDK sharing mode.
 
 ## D-032 The session vertical slice: ExactMatch → ActionTable → Meter → Router as one transactional graph
 
-**Status:** accepted (2026-09-29).
+**Status:** accepted (2026-09-29); superseded in part by D-172 and D-174. The slice is now
+`ExactMatch → Meter → Router`: a classifier rule's result fields carry the meter and next-hop ids
+and name those resources (D-172), and the ActionTable module is deleted (D-174).
 **Code:**
 
-- `core/modules/action_table.{h,cc}`, `core/modules/meter.{h,cc}`,
-  `core/modules/router.{h,cc}`;
-- `core/modules/exact_match.{h,cc}` (action mode), `core/route/router.{h,cc}`
-  (`LookupNextHop`/`LookupNextHops`, `Release`), `core/route/route_table.h`
-  (`RouteErrno`);
+- `core/modules/meter.{h,cc}`, `core/modules/router.{h,cc}`;
+- `core/modules/exact_match.{h,cc}` (result fields and references, D-172),
+  `core/route/router.{h,cc}` (`LookupNextHop`/`LookupNextHops`, `Release`),
+  `core/route/route_table.h` (`RouteErrno`);
 - `core/dataplane/transaction_engine.{h,cc}` (references bound when their
   resource registers, `ReleaseForTeardown`);
 - tests: `core/modules/session_pipeline_test.cc`,
-  `core/dataplane/transaction_engine_test.cc` (two registration tests),
-  `bessctl/module_tests/session_pipeline.py`.
+  `core/dataplane/transaction_engine_test.cc` (two registration tests).
 
 **Context.** D-021's acceptance matrix asked for "an in-process ExactMatch →
 Action → Meter → Router pipeline". The substrates were landed (K5's MeterSet,
@@ -10537,6 +10537,10 @@ rule as given missed rules (unmasked addresses) and found rules it should not (a
 a full 0..65535 range being no check). Both fixes are the sharing above, which is the point: one predicate, one
 validation, one normalization, so the two structures cannot drift.
 
+**Amended 2026-10-21 (D-174).** The `ActionTable` half of the 2026-10-18 amendment is historical: the module
+is deleted, so no stock module resolves a firewall rule's `action_id` any more. `Firewall` keeps the field and
+its `action_attr` (D-141) until its own migration; a graph that consumes the id must do so with its own module.
+
 ## D-148 The desired-state clear is bounded in the daemon, not in the client
 
 **Context.** A pipeline that lists a resource owns its contents, so an empty list clears a map - the operation a
@@ -11565,6 +11569,14 @@ egress, and asserts the meter's read and the table's write resolved to one offse
 `TheSelectorAttributesAreConfiguration` -- both selector names, and neither default. The existing tests of
 all five modules run unconfigured and cover the defaults.
 
+\*\*Amended 2026-10-21 (D-174).** The `ActionTable` half of this record is historical: the module and its
+`ActionTableArg.meter_attr`/`next_hop_attr`/`action_attr` names are deleted, and the evidence above that pairs
+two `ActionTable`s or reads `flow_meter_id` through one no longer exists. A classifier rule's result fields now
+write `meter_id` and `next_hop_id` (and name them as references), so the configurable names that remain are the
+readers' (`MeterArg.id_attr`, `RouterArg.next_hop_attr`/`domain_attr`), `FirewallArg.action_attr`, and
+`VifArg`'s two. The decision itself still holds: a metadata name that couples a writer and a reader is
+configuration, not a constant.
+
 ## D-169 The result plan is the key plan mirrored: both destinations, masks, packed copy ops
 
 **Status:** accepted (2026-10-20; the match-result schema's scatter half, built but not yet wired into a module).
@@ -11694,7 +11706,8 @@ free.
 
 - A rule's result is a gate plus an opaque byte record: `classifier::RuleResult{gate, bytes}`. The module's
   argument carries `result_fields` (`ResultField`: `attr_name` or packet `offset`, `value_offset`,
-  `num_bytes`) and an optional `default_result`. A non-empty list creates a `classifier::RecordArena` whose
+  `num_bytes`, and for a reference `reference_count`) and an optional `default_result`. A non-empty list
+  creates a `classifier::RecordArena` whose
   record is as wide as the widest field and a `classifier::ResultPlan`; an empty list leaves the module
   gate-only, with no arena. The record ceiling is `RecordArena::kMaxRecordSize` (4096); a configuration
   above it is refused at `Init`, not a CHECK at the first write. A non-empty `default_result` needs at least
@@ -11720,13 +11733,15 @@ free.
   on ActionTable. Result fields make placement configuration: the same rule can write a meter id, a next hop,
   a class and an action id, and the classifier names none of them. A controller composes
   `classifier -> Meter/Router` directly; `ActionTable` is no longer needed on the classifier's path.
-- **References survive the ActionTable.** A result field may name a resource (`reference`, e.g.
-  `rt/next_hops`); `reference_key` says how: `RAW` uses the bytes verbatim, `BE32` treats the field as a
-  32-bit big-endian id (the metadata convention) and builds the host-order key that `StrongId` resources use.
-  An all-zero field names nothing. The rule resource
+- **References outlive the module that motivated them (D-174).** A result field may name a resource
+  (`reference`, e.g. `rt/next_hops`); `reference_key` says how: `RAW` uses the bytes verbatim, `BE32` reads
+  `reference_count` consecutive 32-bit big-endian ids (unset or 0 means one; `num_bytes` must be
+  `4 * reference_count`) and builds the host-order key of each id. An 8-byte `meter_id` with
+  `reference_count: 2` therefore names both meter levels, as ActionTable's two meter slots did. Each zero
+  id names nothing at its position, and an all-zero field names nothing. The rule resource
   declares those names with the engine and returns the referenced keys from the rule's bytes, so a rule is
-  ordered after the entries it names and its referents cannot be erased while it remains -- exactly the
-  ledger ActionTable supplied. The checks run only in `Reserve`; the packet path writes the bytes it already
+  ordered after the entries it names and its referents cannot be erased while it remains -- the ledger
+  ActionTable used to supply. The checks run only in `Reserve`; the packet path writes the bytes it already
   validated and never looks a reference up. A rule with a field slice shorter than the field is
   zero-padded, so the field reads zero and names nothing. The reserve, retire and publish steps of a rule
   write allocate no memory: the arena's record vector and its retirement queue reserve before the
@@ -11744,6 +11759,8 @@ free.
   destinations, an oversized record and a non-empty default without fields (both refused), and the fused
   path against the generic path; `SessionPipelineTest` covers rule replacement moving the reference ledger,
   a `RAW` reference naming its key verbatim, and the resource refusing the referent's erase;
+  `AMultiLevelMeterFieldReferencesEveryLevel` names two meter levels from one `reference_count: 2` field
+  and `WildcardResultReferencesReleaseAtTeardown` releases a wildcard rule's references at teardown;
   `WildcardMatchResourceTest` round-trips record bytes; the session slice composes ExactMatch -> Meter ->
   Router, with the rule's result fields naming both.
 
@@ -11787,7 +11804,8 @@ deprecation windows and a blocking `buf breaking` check become meaningful.
   `ActionTableArg`, `ActionIdKey` and `ActionValue` messages. Nothing replaces the module: a rule's
   result fields (D-172) already carry the ids and already declare the references the module's
   resource supplied, so a session is `ExactMatch -> Meter -> Router` with the classifier writing
-  `meter_id` and `next_hop_id` from one result record.
+  `meter_id` and `next_hop_id` from one result record. A multi-level meter keeps the parity the module
+  had: its 8-byte `meter_id` sets `reference_count: 2`, so both levels are references of the rule.
 - **Why.** After D-172 the module's only remaining job was resolving a fixed `{meter, next hop}`
   record into two metadata writes. That made every session pay a second module, a second table and a
   second lookup to move bytes a rule could place directly, and it kept a module-specific action

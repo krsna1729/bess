@@ -561,6 +561,50 @@ TEST_F(SessionPipelineTest, TeardownIgnoresDestructionOrder) {
       << "a resource outlived its module";
 }
 
+// A wildcard rule's result can name another resource, so its teardown must
+// release the referrers rather than unregistering a resource with live keys.
+// Names destroy the router (the referent) before the wildcard table.
+TEST_F(SessionPipelineTest, WildcardResultReferencesReleaseAtTeardown) {
+  Router *rt = CreateRouterModule("a_router");
+  bess::pb::WildcardMatchArg wm_arg;
+  auto *wf = wm_arg.add_fields();
+  wf->set_offset(26);
+  wf->set_num_bytes(4);
+  auto *field = wm_arg.add_result_fields();
+  field->set_attr_name("next_hop_id");
+  field->set_value_offset(0);
+  field->set_num_bytes(4);
+  field->set_reference("a_router/next_hops");
+  field->set_reference_key(bess::pb::ResultField::BE32);
+  auto *wm = static_cast<WildcardMatch *>(
+      Create("WildcardMatch", "b_wm", Pack(wm_arg)));
+  ASSERT_NE(nullptr, rt);
+  ASSERT_NE(nullptr, wm);
+
+  const auto ip_bytes = [](const char *ip) {
+    const auto bytes = bess::testing::Ip4(ip);
+    return std::string(bytes.begin(), bytes.end());
+  };
+  const bess::utils::be32_t hop_id(1);
+  const std::vector<std::byte> record(
+      reinterpret_cast<const std::byte *>(&hop_id),
+      reinterpret_cast<const std::byte *>(&hop_id) + sizeof(hop_id));
+  ASSERT_EQ(Apply({rt->router()->SetNextHopOp(NextHopId(1), HopWithEgress(7)),
+                   Op::Upsert("b_wm/rules",
+                              ip_bytes("255.255.255.0") +
+                                  ip_bytes("10.1.0.0"),
+                              std::any(bess::classifier::MaskedRuleResource::
+                                           Value{1, 0, record}))})
+                .outcome,
+            Outcome::kApplied);
+  const auto hop_key = bess::dataplane::EncodeKey(NextHopId(1));
+  EXPECT_EQ(Engine().ReferenceCount("a_router/next_hops", hop_key), 1u);
+
+  ModuleGraph::DestroyAllModules();
+  EXPECT_TRUE(Engine().ResourceNames().empty())
+      << "a resource outlived its module";
+}
+
 TEST_F(SessionPipelineTest, RouterCodecRejectsOutOfRangePrefix) {
   Router *rt = CreateRouterModule("rt");
   ASSERT_NE(nullptr, rt);
@@ -701,6 +745,83 @@ TEST_F(SessionPipelineTest, ReferenceLedgerFollowsRuleReplacement) {
   EXPECT_EQ(Apply({Op::Erase("mt/meters", meter2)}).outcome, Outcome::kApplied);
 }
 
+// A two-level meter's 8-byte result is two BE32 ids; a field that carries
+// several ids names each of them (reference_count), so both levels are in the
+// ledger and neither can be erased while the rule remains.
+TEST_F(SessionPipelineTest, AMultiLevelMeterFieldReferencesEveryLevel) {
+  bess::pb::ExactMatchArg arg;
+  auto *f = arg.add_fields();
+  f->set_offset(26);
+  f->set_num_bytes(4);
+  auto *meter = arg.add_result_fields();
+  meter->set_attr_name("meter_id");
+  meter->set_value_offset(0);
+  meter->set_num_bytes(8);
+  meter->set_reference("mt/meters");
+  meter->set_reference_key(bess::pb::ResultField::BE32);
+  meter->set_reference_count(2);
+  auto *hop = arg.add_result_fields();
+  hop->set_attr_name("next_hop_id");
+  hop->set_value_offset(8);
+  hop->set_num_bytes(4);
+  hop->set_reference("rt/next_hops");
+  hop->set_reference_key(bess::pb::ResultField::BE32);
+  auto *em = static_cast<ExactMatch *>(Create("ExactMatch", "em", Pack(arg)));
+  Meter *mt = CreateMeterModule("mt", 64, "", 2);
+  Router *rt = CreateRouterModule("rt");
+  ASSERT_NE(nullptr, em);
+  ASSERT_NE(nullptr, mt);
+  ASSERT_NE(nullptr, rt);
+
+  // The meter's two levels, the next hop, and the rule naming all three.
+  std::string record = SessionRecord(1, 2);  // both meter levels
+  const bess::utils::be32_t hop_bytes(1);
+  record.append(reinterpret_cast<const char *>(&hop_bytes), sizeof(hop_bytes));
+  auto applied = Apply({Op::Upsert("mt/meters",
+                                   bess::dataplane::EncodeKey(MeterId(1)),
+                                   std::any(bess::meter::MeterProfileSpec{
+                                       SlowMeter(1000)})),
+                        Op::Upsert("mt/meters",
+                                   bess::dataplane::EncodeKey(MeterId(2)),
+                                   std::any(bess::meter::MeterProfileSpec{
+                                       SlowMeter(1000)})),
+                        rt->router()->SetNextHopOp(NextHopId(1), HopWithEgress(7)),
+                        Op::Upsert("em/rules",
+                                   Key(Ip(10, 0, 0, 1), 0).substr(0, 4),
+                                   RuleWithBytes(record))});
+  std::string errs;
+  for (const auto &op : applied.ops) {
+    errs += op.error + "; ";
+  }
+  ASSERT_EQ(applied.outcome, Outcome::kApplied) << errs;
+  const auto meter1 = bess::dataplane::EncodeKey(MeterId(1));
+  const auto meter2 = bess::dataplane::EncodeKey(MeterId(2));
+  const auto hop1 = bess::dataplane::EncodeKey(NextHopId(1));
+  EXPECT_EQ(Engine().ReferenceCount("mt/meters", meter1), 1u);
+  EXPECT_EQ(Engine().ReferenceCount("mt/meters", meter2), 1u);
+  EXPECT_EQ(Engine().ReferenceCount("rt/next_hops", hop1), 1u);
+
+  for (const auto &op : {Op::Erase("mt/meters", meter1),
+                         Op::Erase("mt/meters", meter2)}) {
+    auto refused = Apply({op});
+    ASSERT_EQ(refused.outcome, Outcome::kRejected);
+    EXPECT_NE(refused.ops[0].error.find("still referenced"), std::string::npos);
+  }
+  auto refused = Apply({rt->router()->RemoveNextHopOp(NextHopId(1))});
+  ASSERT_EQ(refused.outcome, Outcome::kRejected);
+  EXPECT_NE(refused.ops[0].error.find("still referenced"), std::string::npos);
+
+  // Both levels are released with the rule.
+  ASSERT_EQ(Apply({Op::Erase("em/rules",
+                             Key(Ip(10, 0, 0, 1), 0).substr(0, 4))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(Apply({Op::Erase("mt/meters", meter1)}).outcome, Outcome::kApplied);
+  EXPECT_EQ(Apply({Op::Erase("mt/meters", meter2)}).outcome, Outcome::kApplied);
+  EXPECT_EQ(Apply({rt->router()->RemoveNextHopOp(NextHopId(1))}).outcome,
+            Outcome::kApplied);
+}
+
 // RAW references use the field bytes as the target key, so a resource keyed by
 // a host-order id is named by EncodeKey(id) rather than a BE32 wire id.
 TEST_F(SessionPipelineTest, RawReferenceNamesTheKeyVerbatim) {
@@ -731,6 +852,42 @@ TEST_F(SessionPipelineTest, RawReferenceNamesTheKeyVerbatim) {
   EXPECT_EQ(Engine().ReferenceCount("rt_raw/next_hops", hop), 1u);
   EXPECT_EQ(Apply({rt->router()->RemoveNextHopOp(NextHopId(1))}).outcome,
             Outcome::kRejected);
+}
+
+// A BE32 field carries reference_count consecutive 4-byte ids; that count is
+// what decides how many entries the rule's result names.
+TEST_F(SessionPipelineTest, ResultReferenceCountIsValidated) {
+  const auto make = [](uint32_t num_bytes, uint32_t reference_count,
+                       bess::pb::ResultField::ReferenceKey key) {
+    bess::pb::ExactMatchArg arg;
+    auto *f = arg.add_fields();
+    f->set_offset(26);
+    f->set_num_bytes(4);
+    auto *r = arg.add_result_fields();
+    r->set_offset(40);
+    r->set_value_offset(0);
+    r->set_num_bytes(num_bytes);
+    r->set_reference(key == bess::pb::ResultField::BE32 ? "mt/meters" : "");
+    r->set_reference_key(key);
+    r->set_reference_count(reference_count);
+    return Pack(arg);
+  };
+  const auto create = [](const google::protobuf::Any &arg, pb_error_t *error) {
+    return ModuleGraph::CreateModule(
+        ModuleBuilder::all_module_builders().at("ExactMatch"), "em", arg,
+        error);
+  };
+
+  pb_error_t error;
+  EXPECT_NE(nullptr, create(make(8, 2, bess::pb::ResultField::BE32), &error));
+  ModuleGraph::DestroyAllModules();
+
+  EXPECT_EQ(nullptr, create(make(8, 1, bess::pb::ResultField::BE32), &error));
+  EXPECT_EQ(EINVAL, error.code());
+  EXPECT_EQ(nullptr, create(make(8, 0, bess::pb::ResultField::BE32), &error));
+  EXPECT_EQ(EINVAL, error.code());
+  EXPECT_EQ(nullptr, create(make(4, 2, bess::pb::ResultField::RAW), &error));
+  EXPECT_EQ(EINVAL, error.code());
 }
 
 TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathWithResultFields) {

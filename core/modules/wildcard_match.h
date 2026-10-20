@@ -236,6 +236,8 @@ class WildcardMatch final : public Module {
     uint32_t size = 0;
     std::string reference;
     bool reference_be32 = false;
+    // Consecutive big-endian ids a BE32 field carries (D-172).
+    uint32_t reference_count = 1;
   };
   std::vector<ResultSpec> result_specs_;
   std::vector<std::string> result_reference_names_;

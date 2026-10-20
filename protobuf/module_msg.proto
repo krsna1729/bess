@@ -252,6 +252,11 @@ message ResultField {
     BE32 = 1;
   }
   ReferenceKey reference_key = 6;
+  // For a BE32 reference: how many consecutive 4-byte big-endian ids the
+  // field carries (unset or 0 means one), so an 8-byte meter_id names two
+  // meter levels and each id is a separate reference. num_bytes must be
+  // 4 * reference_count. A RAW reference always carries one key.
+  uint32 reference_count = 7;
 }
 
 message ExactMatchRuleKey {

@@ -383,9 +383,9 @@ void Router::DeInit() {
   if (router_ == nullptr) {
     return;
   }
-  // An action references these next hops, so release rather than unregister:
-  // the order modules are destroyed in must not decide whether a pipeline can
-  // be torn down.
+  // Classifier rules reference these next hops, so release rather than
+  // unregister: the order modules are destroyed in must not decide whether a
+  // pipeline can be torn down.
   auto released = router_->Release();
   CHECK(released) << released.error();
   next_hops_binding_.Reset();

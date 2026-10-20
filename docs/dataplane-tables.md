@@ -396,7 +396,7 @@ reference to something missing.
     value bytes, value = `{priority, result}`).
 
   Each takes a function naming the keys a value refers to (a rule's
-  action, an action's meter).
+  meter and next hop).
 - **Declared dependencies, not ranks:** a resource names, when constructed,
   the resources its values may reference (`SlotResource(name, table,
   references_fn, {"meters"})`). The engine derives the publication order from
@@ -480,8 +480,9 @@ reference to something missing.
   name a resource (`mt/meters`, `rt/next_hops`) and how its bytes name an entry
   (`RAW` or `BE32`); the rule resource declares those names, so the engine
   orders a rule after the entries it names, refuses a rule naming a missing
-  one, and refuses the removal of one still named (D-172). That is the ledger a
-  separate action table used to supply.
+  one, and refuses the removal of one still named (D-172, D-174). A field that
+  carries several `BE32` ids (a two-level meter) names each of them
+  (`reference_count`).
 - **Meter** registers `<module>/meters` (key: `EncodeKey(MeterId)`, value: a
   profile specification) over a `MeterSetBuilder`: a transaction edits a
   private clone of the desired state, so unchanged meters keep their token

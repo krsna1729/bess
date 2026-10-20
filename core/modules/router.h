@@ -68,7 +68,7 @@
 // Control path: `<module>/next_hops`, `<module>/groups` (sized by
 // `max_groups`; a route names a next hop or a group) and `<module>/routes`
 // are resources, so one transaction can create a session's next hop, the
-// route to it, the action that names it and the rule that selects the action. An enrolled
+// route to it and the rule whose result names the hop. An enrolled
 // router has one writer, the engine: the direct setters refuse with kEnrolled,
 // and the engine's ledger replaces the router's own reference counts. New
 // routes are placed during prepare with the value their addresses already

@@ -32,12 +32,12 @@
 // meter at this level" and passes it.
 //
 // Control path: `<module>/meters` is a resource, so one transaction can create
-// a meter together with the action that names it and the rule that selects
-// that action. A meter is an immutable policy over mutable token state that
+// a meter together with the rule whose result names it. A meter is an
+// immutable policy over mutable token state that
 // survives unrelated updates (K5): reconfiguring one meter publishes a
 // generation in which every other meter keeps its buckets. An erase keeps the
 // meter readable for one removal-cascade stage -- a reader may still hold its
-// id from an action's old value -- and then publishes a generation without it,
+// id from a rule's old result -- and then publishes a generation without it,
 // so the id cannot be reused until then (SlotTable's two-step removal, D-021).
 //
 // Meters are shared: any worker may check one, and each check takes the

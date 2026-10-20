@@ -4387,7 +4387,7 @@ rather than one call site).
        capacity bounds), 4 engine registration tests, and 4 live daemon tests
        (packet policing/steering, misses and unresolved hops, referenced
        removal and transactions under live traffic).
-     - **Superseded (D-173, 2026-10-20):** ActionTable was removed. The slice
+     - **Superseded (D-174, 2026-10-20):** ActionTable was removed. The slice
        is ExactMatch → Meter → Router, the rule's result fields write
        `meter_id` and `next_hop_id` directly, and those fields declare the
        references. The action id, the module and its messages no longer exist.

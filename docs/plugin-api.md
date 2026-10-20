@@ -613,10 +613,10 @@ Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ r
 - A write happens only where something reads: offsets are computed from writer to reader, so an attribute nothing reads gets **no offset at all** and the write is skipped. A module that publishes a result must therefore tolerate a graph that does not consume it - and a graph that expects the result must contain a reader, or the producer silently writes nothing.
 - Attributes are declared during `Init`:
   ```cpp
-  action_id_attr_ = AddMetadataAttr("action_id", sizeof(bess::utils::be32_t),
-                                   bess::metadata::Attribute::AccessMode::kWrite);
+  meter_id_attr_ = AddMetadataAttr("meter_id", sizeof(bess::utils::be32_t),
+                                   bess::metadata::Attribute::AccessMode::kRead);
   ```
-- When the name is a policy identity (what a meter reads, what an action table writes), make it configuration and keep the historical name as the default (D-168). The name is the whole contract between a writer and a reader: two `Meter`s over one classifier result read `flow_meter_id` and `session_meter_id`, and neither module knows the other exists.
+- When the name is a policy identity (what a meter reads, what a classifier rule's result writes), make it configuration and keep the historical name as the default (D-168). The name is the whole contract between a writer and a reader: two `Meter`s over one classifier result read `flow_meter_id` and `session_meter_id`, and neither module knows the other exists.
   ```cpp
   const std::string id_attr = arg.id_attr().empty() ? "meter_id" : arg.id_attr();
   meter_id_attr_ = AddMetadataAttr(id_attr, sizeof(bess::utils::be32_t),
