@@ -142,12 +142,12 @@ class LifecycleTest : public ::testing::Test {
         std::vector<std::string>{"meters"});
     rules_res_ = std::make_unique<ExactRuleResource>(
         "rules", *table_,
-        [](uint64_t action) {
-          if (action == kThrowingValue) {
+        [](const bess::classifier::RuleResult &action) {
+          if (action.gate == kThrowingValue) {
             throw std::bad_alloc();  // a reference callback that fails
           }
           return std::vector<Reference>{
-              {"actions", EncodeKey(ActionId(static_cast<uint32_t>(action)))}};
+              {"actions", EncodeKey(ActionId(action.gate))}};
         },
         std::vector<std::string>{"actions"});
     faulty_meters_ = std::make_unique<FaultyResource>(*meters_res_, injector_);
@@ -169,7 +169,7 @@ class LifecycleTest : public ::testing::Test {
   static constexpr uint64_t kThrowingValue = 666;
 
   static Op Rule(uint64_t key, uint64_t action) {
-    return Op::Upsert("rules", EncodeKey(key), std::any(action));
+    return Op::Upsert("rules", EncodeKey(key), std::any(bess::classifier::RuleResult{static_cast<bess::gate_idx_t>(action), {}}));
   }
   static Op EraseRule(uint64_t key) {
     return Op::Erase("rules", EncodeKey(key));
@@ -356,10 +356,10 @@ TEST_F(LifecycleTest, RejectionsAfterReservationUndoTheirOwnReservation) {
   // (never declared: refused).
   ExactRuleResource refs_rules(
       "refs_rules", **other_table,
-      [](uint64_t v) {
+      [](const bess::classifier::RuleResult &v) {
         std::vector<Reference> refs;
-        if (v == 1) {
-          refs.push_back(Reference{"rules", EncodeKey(v)});
+        if (v.gate == 1) {
+          refs.push_back(Reference{"rules", EncodeKey(v.gate)});
         } else {
           refs.push_back(Reference{"meters", EncodeKey(MeterId(1))});
         }
@@ -372,9 +372,9 @@ TEST_F(LifecycleTest, RejectionsAfterReservationUndoTheirOwnReservation) {
   const Snapshot before = Take();
   const std::vector<std::vector<Op>> cases = {
       // a reference into an immediate-erase resource
-      {Op::Upsert("refs_rules", EncodeKey(uint64_t{7}), std::any(uint64_t{1}))},
+      {Op::Upsert("refs_rules", EncodeKey(uint64_t{7}), std::any(bess::classifier::RuleResult{1, {}}))},
       // an undeclared reference
-      {Op::Upsert("refs_rules", EncodeKey(uint64_t{8}), std::any(uint64_t{2}))},
+      {Op::Upsert("refs_rules", EncodeKey(uint64_t{8}), std::any(bess::classifier::RuleResult{2, {}}))},
       // a missing referent, after an earlier pending key
       {Rule(20, 1), Rule(21, 9)},
       // erasing a referenced key, with a new pending key in the same batch
@@ -794,9 +794,9 @@ struct World {
         std::vector<std::string>{"meters"});
     rules_res = std::make_unique<ExactRuleResource>(
         "rules", *table,
-        [](uint64_t action) {
+        [](const bess::classifier::RuleResult &action) {
           return std::vector<Reference>{
-              {"actions", EncodeKey(ActionId(static_cast<uint32_t>(action)))}};
+              {"actions", EncodeKey(ActionId(action.gate))}};
         },
         std::vector<std::string>{"actions"});
     // Wrapped (never armed) to check that every resource asked to reserve
@@ -869,7 +869,7 @@ struct World {
 };
 
 Op WRule(uint64_t key, uint64_t action) {
-  return Op::Upsert("rules", EncodeKey(key), std::any(action));
+  return Op::Upsert("rules", EncodeKey(key), std::any(bess::classifier::RuleResult{static_cast<bess::gate_idx_t>(action), {}}));
 }
 Op WAct(uint32_t id, uint16_t gate, uint32_t meter) {
   return Op::Upsert("actions", EncodeKey(ActionId(id)),

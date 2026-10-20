@@ -39,6 +39,7 @@
 #include <google/protobuf/any.pb.h>
 #include <google/protobuf/util/message_differencer.h>
 
+#include "classifier/rule_result.h"
 #include "dataplane/resource.h"
 #include "framework/resource_codec.h"
 #include "fuzz/fuzz_support.h"
@@ -181,13 +182,16 @@ ValueResult ExactVal(const bess::pb::ExactMatchRuleValue &value) {
   if (!bess::IsValidGateValue(value.gate())) {
     return std::unexpected("invalid gate " + std::to_string(value.gate()));
   }
-  if (value.action_id() != 0) {
-    return std::unexpected("'action_id' needs an 'action_resource'");
+  if (!value.result().empty()) {
+    return std::unexpected("result is " +
+                           std::to_string(value.result().size()) +
+                           " bytes, the schema's record is 0");
   }
-  return std::any(uint64_t{value.gate()});
+  return std::any(bess::classifier::RuleResult{
+      static_cast<bess::gate_idx_t>(value.gate()), {}});
 }
 std::string ProjectGate(const std::any &v) {
-  return Bytes(std::any_cast<uint64_t>(v));
+  return Bytes(std::any_cast<const bess::classifier::RuleResult &>(v).gate);
 }
 
 // Router routes (modules/router.cc).

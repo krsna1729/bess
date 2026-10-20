@@ -414,7 +414,9 @@ class PublishConformanceTest : public ::testing::Test {
   }
 
   Op ExactUpsert(uint64_t key, uint64_t value) {
-    return Op::Upsert("rules", ExactKey(key), std::any(value));
+    return Op::Upsert(
+        "rules", ExactKey(key),
+        std::any(classifier::RuleResult{static_cast<gate_idx_t>(value), {}}));
   }
 
   Op ExactErase(uint64_t key) {
@@ -433,7 +435,7 @@ class PublishConformanceTest : public ::testing::Test {
 
   Op MaskedUpsert(uint64_t value, int64_t priority, uint16_t gate) {
     return Op::Upsert("masked", MaskedKey(value),
-                      std::any(classifier::MaskedRuleResource::Value{priority, gate}));
+                      std::any(classifier::MaskedRuleResource::Value{priority, gate, {}}));
   }
 
   Op MaskedErase(uint64_t value) {

@@ -97,7 +97,8 @@ ExactMatch *CreateModule(const char *name, size_t rules) {
     ops.push_back(bess::dataplane::Op::Upsert(
         std::string(name) + "/rules",
         Key(static_cast<uint32_t>(r), static_cast<uint16_t>(r)),
-        std::any(uint64_t{1 + r % 63})));
+        std::any(bess::classifier::RuleResult{
+            static_cast<gate_idx_t>(1 + r % 63), {}})));
   }
   if (bess::runtime::runtime().transactions().Apply(ops).outcome !=
       bess::dataplane::TransactionEngine::Outcome::kApplied) {
@@ -195,8 +196,12 @@ void BM_ClassifyUnderTransactions(benchmark::State &state) {
   auto establish = [](uint32_t s) {
     const uint64_t gate = 1 + s % 63;
     return std::vector<Op>{
-        Op::Upsert("ul/rules", Key(s, 1), std::any(gate)),
-        Op::Upsert("dl/rules", Key(s, 2), std::any(gate))};
+        Op::Upsert("ul/rules", Key(s, 1),
+                   std::any(bess::classifier::RuleResult{
+                       static_cast<gate_idx_t>(gate), {}})),
+        Op::Upsert("dl/rules", Key(s, 2),
+                   std::any(bess::classifier::RuleResult{
+                       static_cast<gate_idx_t>(gate), {}}))};
   };
   auto release = [](uint32_t s) {
     return std::vector<Op>{Op::Erase("ul/rules", Key(s, 1)),

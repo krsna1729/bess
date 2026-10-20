@@ -61,7 +61,9 @@ std::string Key(uint32_t a, uint16_t b) {
 }
 
 Op Add(const std::string &module, uint32_t a, uint16_t b, uint64_t gate) {
-  return Op::Upsert(module + "/rules", Key(a, b), std::any(gate));
+  return Op::Upsert(
+      module + "/rules", Key(a, b),
+      std::any(bess::classifier::RuleResult{static_cast<gate_idx_t>(gate), {}}));
 }
 
 Op Remove(const std::string &module, uint32_t a, uint16_t b) {
@@ -154,7 +156,7 @@ TEST_F(ExactMatchTransactionTest, RulesAreAResourceWhileTheModuleExists) {
 
   // Wrong key width and invalid gates are refused by the resource.
   r = Engine().Apply(std::vector<Op>{
-      Op::Upsert("em/rules", std::string(4, 'x'), std::any(uint64_t{1}))});
+      Op::Upsert("em/rules", std::string(4, 'x'), std::any(bess::classifier::RuleResult{1, {}}))});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_NE(r.ops[0].error.find("6"), std::string::npos);
   r = Apply({Add("em", 9, 9, MAX_GATES + 1)});

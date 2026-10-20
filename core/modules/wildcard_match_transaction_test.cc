@@ -74,7 +74,7 @@ Op Add(const std::string &module, uint32_t mask_a, uint16_t mask_b,
        uint32_t a, uint16_t b, int64_t priority, uint16_t gate) {
   return Op::Upsert(module + "/rules",
                     Bytes(mask_a, mask_b) + Bytes(a & mask_a, b & mask_b),
-                    std::any(MaskedRuleResource::Value{priority, gate}));
+                    std::any(MaskedRuleResource::Value{priority, gate, {}}));
 }
 
 Op Remove(const std::string &module, uint32_t mask_a, uint16_t mask_b,
@@ -132,8 +132,8 @@ class Packets {
       batch.add(bess::PacketRef(handles_[first + i]));
     }
     std::vector<gate_idx_t> gates(n);
-    std::vector<uint32_t> action_ids(n);
-    m->ClassifyBatch(&batch, gates.data(), action_ids.data());
+    std::vector<uint32_t> result_ids(n);
+    m->ClassifyBatch(&batch, gates.data(), result_ids.data());
     return gates;
   }
 
@@ -166,11 +166,11 @@ TEST_F(WildcardMatchTransactionTest, RulesAreAResourceWhileTheModuleExists) {
             (std::vector<gate_idx_t>{5, DROP_GATE}));
   // A value with bits outside its mask, a wrong key size, an invalid gate.
   auto r = Apply({Op::Upsert("wm/rules", Bytes(0xff, 0) + Bytes(0x100, 0),
-                             std::any(MaskedRuleResource::Value{1, 1}))});
+                             std::any(MaskedRuleResource::Value{1, 1, {}}))});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_NE(r.ops[0].error.find("outside its mask"), std::string::npos);
   r = Apply({Op::Upsert("wm/rules", Bytes(0, 0),
-                        std::any(MaskedRuleResource::Value{1, 1}))});
+                        std::any(MaskedRuleResource::Value{1, 1, {}}))});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   r = Apply({Add("wm", kAll, 0, 12, 0, 1, MAX_GATES + 1)});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
@@ -257,7 +257,9 @@ TEST_F(WildcardMatchTransactionTest, OneTransactionAcrossModuleKinds) {
   Packets packets(1);
   packets.Set(0, 40, 4);
   auto exact = [](uint64_t gate) {
-    return Op::Upsert("em/rules", Bytes(40, 4), std::any(gate));
+    return Op::Upsert(
+        "em/rules", Bytes(40, 4),
+        std::any(bess::classifier::RuleResult{static_cast<gate_idx_t>(gate), {}}));
   };
   auto r = Apply({exact(7), Add("wm", kAll, kPort, 40, 4, 1, MAX_GATES + 1)});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
@@ -326,7 +328,7 @@ TEST_F(WildcardMatchTransactionTest, FreedIdsReturnThroughTheCascade) {
   auto regate = [&](uint16_t gate) {
     return engine.Apply(std::vector<Op>{Op::Upsert(
         "masked", Bytes(kAll, 0) + Bytes(9, 0),
-        std::any(MaskedRuleResource::Value{1, gate}))});
+        std::any(MaskedRuleResource::Value{1, gate, {}}))});
   };
   ASSERT_EQ(regate(1).outcome, Outcome::kApplied);
   const size_t steady = table->ids_in_use();

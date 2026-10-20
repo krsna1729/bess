@@ -26,6 +26,29 @@
 #include "modules/exact_match.h"
 #include "pb/module_msg.pb.h"
 #include "testing/module_harness.h"
+
+namespace {
+// A refused Init must return no module; ModuleHarness treats a refusal as a
+// test failure, so negative cases go through the graph directly.
+bool CreateRefused(const std::string &class_name,
+                   const google::protobuf::Message &arg) {
+  const auto &builders = ModuleBuilder::all_module_builders();
+  const auto it = builders.find(class_name);
+  if (it == builders.end()) {
+    return false;
+  }
+  google::protobuf::Any packed;
+  if (!packed.PackFrom(arg)) {
+    return false;
+  }
+  pb_error_t perr;
+  Module *m = ModuleGraph::CreateModule(it->second, "refused", packed, &perr);
+  EXPECT_EQ(nullptr, m) << perr.errmsg();
+  return m == nullptr && perr.code() != 0;
+}
+}  // namespace
+
+#include "testing/rng.h"
 #include "testing/packet_builder.h"
 
 namespace {
@@ -42,11 +65,11 @@ using bess::testing::ModuleHarness;
 struct EmRule {
   ExactMatchRuleKey key;
   uint64_t gate_value = 0;
-  uint64_t action_value = 0;
+  std::string result_value;
   uint64_t gate() const { return gate_value; }
-  uint64_t action_id() const { return action_value; }
+  const std::string &result() const { return result_value; }
   void set_gate(uint64_t g) { gate_value = g; }
-  void set_action_id(uint64_t a) { action_value = a; }
+  void set_result(std::string r) { result_value = std::move(r); }
   int fields_size() const { return key.fields_size(); }
   const bess::pb::FieldData &fields(int i) const { return key.fields(i); }
   bess::pb::FieldData *add_fields() { return key.add_fields(); }
@@ -70,8 +93,8 @@ struct EmConfig {
   std::string DebugString() const {
     std::string out = "default_gate: " + std::to_string(gate_value);
     for (const EmRule &r : rule_list) {
-      out += "\nrule: gate " + std::to_string(r.gate()) + " action " +
-             std::to_string(r.action_id()) + " fields " +
+      out += "\nrule: gate " + std::to_string(r.gate()) + " result " +
+             std::to_string(r.result().size()) + "B fields " +
              std::to_string(r.fields_size());
     }
     return out;
@@ -83,7 +106,7 @@ struct EmConfig {
     for (size_t i = 0; i < rule_list.size(); i++) {
       const EmRule &a = rule_list[i];
       const EmRule &b = o.rule_list[i];
-      if (a.gate() != b.gate() || a.action_id() != b.action_id() ||
+      if (a.gate() != b.gate() || a.result() != b.result() ||
           a.fields_size() != b.fields_size()) {
         return false;
       }
@@ -103,7 +126,7 @@ struct EmConfig {
 std::string AddRule(ModuleHarness &h, Module *m, const EmRule &rule) {
   ExactMatchRuleValue value;
   value.set_gate(rule.gate());
-  value.set_action_id(rule.action_id());
+  value.set_result(rule.result());
   return h.UpsertResource(std::string(m->name()) + "/rules", rule.key, value);
 }
 
@@ -150,7 +173,7 @@ std::string Restore(ModuleHarness &h, Module *m, const EmConfig &config) {
   for (const EmRule &rule : config.rules()) {
     ExactMatchRuleValue value;
     value.set_gate(rule.gate());
-    value.set_action_id(rule.action_id());
+    value.set_result(rule.result());
     google::protobuf::Any packed_key;
     google::protobuf::Any packed_value;
     EXPECT_TRUE(packed_key.PackFrom(rule.key));
@@ -200,17 +223,18 @@ EmConfig ReadConfig(ModuleHarness &h, Module *m) {
     EmRule *rule = config.add_rules();
     rule->key = key;
     rule->set_gate(value.gate());
-    rule->set_action_id(value.action_id());
+    rule->set_result(value.result());
   }
   std::sort(config.mutable_rules()->begin(), config.mutable_rules()->end(),
             [](const EmRule &a, const EmRule &b) {
               // ReadConfig's order, for a stable comparison (the table's own
               // iteration order is not what the module promises): by the
               // rule's value first.
-              const uint64_t av = a.gate() != 0 ? a.gate() : a.action_id();
-              const uint64_t bv = b.gate() != 0 ? b.gate() : b.action_id();
-              if (av != bv) {
-                return av < bv;
+              if (a.gate() != b.gate()) {
+                return a.gate() < b.gate();
+              }
+              if (a.result() != b.result()) {
+                return a.result() < b.result();
               }
               for (int i = 0; i < a.fields_size(); i++) {
                 if (a.fields(i).value_bin() != b.fields(i).value_bin()) {
@@ -535,6 +559,165 @@ TEST(ExactMatchPacketTest, IpPairRulesPickTheGateAndMissesTakeTheDefault) {
   out = h.Run(em, 0, {miss}, {0, 1, 2, 3});
   EXPECT_EQ((std::map<gate_idx_t, size_t>{{3, 1}}), Counts(out));
   EXPECT_EQ((std::vector<Bytes>{miss}), out[3]);
+}
+
+// A rule's result record is placed by result_fields: bytes 0-1 go to packet
+// offset 40, and a miss places default_result there instead (or leaves the
+// packet alone when none is configured).
+TEST(ExactMatchPacketTest, ResultFieldsPlaceRecordBytes) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  auto *field = arg.add_result_fields();
+  field->set_offset(40);
+  field->set_value_offset(0);
+  field->set_num_bytes(2);
+  arg.set_default_result(std::string("\xee\xff", 2));
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+  EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 1, "\x11\x22"}));
+  EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.2")}), 2, {}}));
+  EXPECT_EQ("", SetDefaultGate(h, em, 3));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes hit = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  Bytes empty = TcpPacket({.sip = "10.0.0.2", .dip = "12.34.56.78"}, rng);
+  empty[40] = 0xAA;  // must be overwritten with the zero-padded record
+  empty[41] = 0xAA;
+  const Bytes miss = TcpPacket({.sip = "10.0.0.3", .dip = "12.34.56.78"}, rng);
+
+  auto out = h.Run(em, 0, {hit, empty, miss}, {1, 2, 3});
+  ASSERT_EQ(1u, out[1].size());
+  EXPECT_EQ((Bytes{0x11, 0x22}), Bytes(out[1][0].begin() + 40, out[1][0].begin() + 42));
+  ASSERT_EQ(1u, out[2].size());
+  EXPECT_EQ((Bytes{0, 0}), Bytes(out[2][0].begin() + 40, out[2][0].begin() + 42))
+      << "a rule with no result writes zero-padded bytes";
+  ASSERT_EQ(1u, out[3].size());
+  EXPECT_EQ((Bytes{0xee, 0xff}), Bytes(out[3][0].begin() + 40, out[3][0].begin() + 42))
+      << "a miss places default_result";
+}
+
+// A result record wider than the arena's limit is refused at Init, not a
+// CHECK crash inside RecordArena.
+TEST(ExactMatchResultConfigTest, RejectsAnOversizedRecord) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  auto *field = arg.add_result_fields();
+  field->set_attr_name("oversized_em_attr");
+  field->set_value_offset(4096);
+  field->set_num_bytes(1);
+  EXPECT_TRUE(CreateRefused("ExactMatch", arg));
+}
+
+// default_result without a result field is either absent or refused; an
+// explicitly empty value stays a no-op rather than dereferencing a null arena.
+TEST(ExactMatchResultConfigTest, EmptyDefaultResultNeedsAFieldOnlyWhenNonEmpty) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  arg.set_default_result("");
+  EXPECT_NE(nullptr, h.Create("ExactMatch", arg));
+
+  ExactMatchArg nonempty;
+  *nonempty.add_fields() = OffsetField(26, 4);
+  nonempty.set_default_result("\x01");
+  EXPECT_TRUE(CreateRefused("ExactMatch", nonempty));
+}
+
+// An explicitly empty default_result with a field is a zero record, not "write
+// nothing": the packet path must clear the destination.
+TEST(ExactMatchPacketTest, EmptyDefaultWithAFieldWritesZeros) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  auto *field = arg.add_result_fields();
+  field->set_offset(40);
+  field->set_value_offset(0);
+  field->set_num_bytes(2);
+  arg.set_default_gate(0);
+  arg.set_default_result("");
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+
+  auto rng = bess::testing::SeededRng(1);
+  Bytes miss = TcpPacket({.sip = "10.0.0.2", .dip = "12.34.56.78"}, rng);
+  miss[40] = 0xAA;
+  miss[41] = 0xAA;
+  auto out = h.Run(em, 0, {miss}, {0});
+  ASSERT_EQ((std::map<gate_idx_t, size_t>{{0, 1}}), Counts(out));
+  EXPECT_EQ((Bytes{0, 0}), Bytes(out[0][0].begin() + 40, out[0][0].begin() + 42));
+}
+
+// A metadata result destination with no reader never gets a valid offset. The
+// first PreResume must build the deferred plan and fail closed to the default
+// gate rather than forwarding a hit with no placement.
+TEST(ExactMatchPacketTest, UnresolvedMetadataResultFailsClosedOnFirstResume) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  auto *field = arg.add_result_fields();
+  field->set_attr_name("em_unread_attr");
+  field->set_value_offset(0);
+  field->set_num_bytes(4);
+  arg.set_default_gate(1);
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+  EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 0,
+                                      std::string(4, '\x07')}));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  auto out = h.Run(em, 0, {pkt}, {0, 1});
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(out));
+}
+
+// Two metadata outputs are distinct destinations once the graph resolves their
+// offsets; Init must not treat both unresolved zeros as the same destination.
+TEST(ExactMatchResultConfigTest, TwoMetadataOutputsAreDistinct) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  auto *a = arg.add_result_fields();
+  a->set_attr_name("em_meter_id");
+  a->set_value_offset(0);
+  a->set_num_bytes(4);
+  auto *b = arg.add_result_fields();
+  b->set_attr_name("em_next_hop_id");
+  b->set_value_offset(4);
+  b->set_num_bytes(4);
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+  const std::string record("\x00\x00\x00\x07\x00\x00\x00\x09", 8);
+  EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 1, record}));
+
+  // Both attributes need a reader for the framework to assign them storage;
+  // the module itself only writes them.
+  bess::pb::MetadataTestArg read;
+  (*read.mutable_read())["em_meter_id"] = 4;
+  (*read.mutable_read())["em_next_hop_id"] = 4;
+  Module *reader = h.Create("MetadataTest", read);
+  ASSERT_NE(nullptr, reader);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, reader, 0, true));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  auto out = h.RunPipeline(em, 0, {pkt}, reader, {0});
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{0, 1}}), Counts(out));
+  size_t meter = em->all_attrs().size(), hop = meter;
+  for (size_t i = 0; i < em->all_attrs().size(); i++) {
+    const auto &attr = em->all_attrs()[i];
+    if (attr.name == "em_meter_id") {
+      meter = i;
+    } else if (attr.name == "em_next_hop_id") {
+      hop = i;
+    }
+  }
+  ASSERT_LT(meter, em->all_attrs().size());
+  ASSERT_LT(hop, em->all_attrs().size());
+  EXPECT_NE(em->attr_offset(meter), bess::metadata::kMetadataOffsetNoWrite);
+  EXPECT_NE(em->attr_offset(hop), bess::metadata::kMetadataOffsetNoWrite);
+  EXPECT_NE(em->attr_offset(meter), em->attr_offset(hop));
 }
 
 // A field may be a metadata attribute: three SetMetadata writers feed one
@@ -870,7 +1053,7 @@ class RandomPackets {
   // The gates `em` sends every packet to, 32 at a time.
   std::vector<gate_idx_t> Classify(const ExactMatch *em) const {
     std::vector<gate_idx_t> gates(handles_.size());
-    std::vector<uint32_t> action_ids(handles_.size());
+    std::vector<uint32_t> result_ids(handles_.size());
     for (size_t first = 0; first < handles_.size();
          first += bess::PacketBatch::kMaxBurst) {
       const size_t n =
@@ -881,7 +1064,7 @@ class RandomPackets {
         batch.add(bess::PacketRef(handles_[first + i]));
       }
       em->ClassifyBatch(&batch, gates.data() + first,
-                        action_ids.data() + first);
+                        result_ids.data() + first);
     }
     return gates;
   }

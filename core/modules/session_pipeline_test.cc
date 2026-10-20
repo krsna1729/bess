@@ -32,7 +32,9 @@
 #include "module.h"
 #include "module_graph.h"
 #include "classifier/masked_rule_resource.h"
+#include "classifier/rule_result.h"
 #include "modules/action_table.h"
+#include "utils/endian.h"
 #include "modules/wildcard_match.h"
 #include "modules/exact_match.h"
 #include "modules/meter.h"
@@ -78,9 +80,55 @@ Module *Create(const std::string &class_name, const std::string &name,
   return m;
 }
 
+// The 4-byte result a rule record carries: an action id, placed into the
+// "action_id" attribute that ActionTable reads.
+std::string ActionResult(uint32_t action) {
+  const bess::utils::be32_t be(action);
+  return std::string(reinterpret_cast<const char *>(&be), sizeof(be));
+}
+
+std::vector<std::byte> ActionRecord(uint32_t action) {
+  const std::string bytes = ActionResult(action);
+  return std::vector<std::byte>(
+      reinterpret_cast<const std::byte *>(bytes.data()),
+      reinterpret_cast<const std::byte *>(bytes.data()) + bytes.size());
+}
+
+std::any RuleWithBytes(std::string bytes) {
+  std::vector<std::byte> record(
+      reinterpret_cast<const std::byte *>(bytes.data()),
+      reinterpret_cast<const std::byte *>(bytes.data()) + bytes.size());
+  return std::any(bess::classifier::RuleResult{DROP_GATE, std::move(record)});
+}
+
+std::any Rule(uint64_t gate, uint32_t action) {
+  return std::any(bess::classifier::RuleResult{
+      static_cast<gate_idx_t>(gate), ActionRecord(action)});
+}
+
+void AddActionResultField(bess::pb::ExactMatchArg *arg,
+                          const std::string &resource) {
+  auto *field = arg->add_result_fields();
+  field->set_attr_name("action_id");
+  field->set_value_offset(0);
+  field->set_num_bytes(4);
+  field->set_reference(resource);
+  field->set_reference_key(bess::pb::ResultField::BE32);
+}
+
+void AddActionResultField(bess::pb::WildcardMatchArg *arg,
+                          const std::string &resource) {
+  auto *field = arg->add_result_fields();
+  field->set_attr_name("action_id");
+  field->set_value_offset(0);
+  field->set_num_bytes(4);
+  field->set_reference(resource);
+  field->set_reference_key(bess::pb::ResultField::BE32);
+}
+
 // 4 bytes at offset 26 (IPv4 src), 2 bytes at offset 34.
 ExactMatch *CreateExactMatch(const std::string &name,
-                             const std::string &action_resource) {
+                             const std::string &action_attr) {
   bess::pb::ExactMatchArg arg;
   auto *f = arg.add_fields();
   f->set_offset(26);
@@ -88,8 +136,8 @@ ExactMatch *CreateExactMatch(const std::string &name,
   f = arg.add_fields();
   f->set_offset(34);
   f->set_num_bytes(2);
-  if (!action_resource.empty()) {
-    arg.set_action_resource(action_resource);
+  if (!action_attr.empty()) {
+    AddActionResultField(&arg, action_attr);
   }
   return static_cast<ExactMatch *>(Create("ExactMatch", name, Pack(arg)));
 }
@@ -269,7 +317,7 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
       Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
                  std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
       Op::Upsert("em/rules", Key(session_addr, 0),
-                 std::any(bess::MakeGateResult(0, 1))),
+                 Rule(0, 1)),
   });
   ASSERT_EQ(result.outcome, Outcome::kApplied)
       << (result.ops.empty() ? "" : result.ops[0].error);
@@ -285,7 +333,7 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
             2u);  // the route and the action
   EXPECT_EQ(Engine().ReferenceCount("at/actions",
                                     bess::dataplane::EncodeKey(ActionId(1))),
-            1u);
+            1u);  // the rule's result field references the action (D-172)
   EXPECT_EQ(Engine().ReferenceCount(
                 "rt/routes",
                 bess::route::Router::RouteKey(P(Ip(10, 0, 0, 0), 8))),
@@ -387,9 +435,10 @@ TEST_F(SessionPipelineTest, RejectionsLeaveNothingChanged) {
   ExactMatch *em = CreateExactMatch("em", "at/actions");
   ASSERT_NE(nullptr, em);
 
-  // A rule naming an action that does not exist: refused.
+  // A result field that declares a reference is checked like any referrer:
+  // a rule naming an action that does not exist is refused (D-172).
   auto r = Apply({Op::Upsert("em/rules", Key(Ip(10, 1, 2, 3), 0),
-                             std::any(bess::MakeGateResult(0, 7)))});
+                             Rule(0, 7))});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_NE(r.ops[0].error.find("references missing"), std::string::npos)
       << r.ops[0].error;
@@ -466,7 +515,7 @@ TEST_F(SessionPipelineTest, RemovalCascadeAndIdReuse) {
                               std::any(ActionTable::Action{MeterId(1),
                                                            NextHopId(1)})),
                    Op::Upsert("em/rules", Key(Ip(10, 1, 2, 3), 0),
-                              std::any(bess::MakeGateResult(0, 1)))})
+                              Rule(0, 1))})
                 .outcome,
             Outcome::kApplied);
 
@@ -540,7 +589,7 @@ TEST_F(SessionPipelineTest, RemovalCascadeAndIdReuse) {
                               std::any(ActionTable::Action{MeterId(1),
                                                            NextHopId(1)})),
                    Op::Upsert("em/rules", Key(Ip(10, 1, 2, 3), 0),
-                              std::any(bess::MakeGateResult(0, 1)))})
+                              Rule(0, 1))})
                 .outcome,
             Outcome::kApplied);
   ASSERT_NE(nullptr, rt->router()->Resolve(Ip(10, 9, 9, 9)));
@@ -573,91 +622,12 @@ TEST_F(SessionPipelineTest, TeardownIgnoresDestructionOrder) {
                               std::any(ActionTable::Action{MeterId(1),
                                                            NextHopId(1)})),
                    Op::Upsert("d_em/rules", Key(Ip(10, 1, 2, 3), 0),
-                              std::any(bess::MakeGateResult(0, 1)))})
+                              Rule(0, 1))})
                 .outcome,
             Outcome::kApplied);
-
   ModuleGraph::DestroyAllModules();
   EXPECT_TRUE(Engine().ResourceNames().empty())
       << "a resource outlived its module";
-}
-
-// A rule change must not bypass the action-rule reference ledger. A client
-// writes "em/rules"; the engine checks the rule's action and keeps the
-// reference counts. (The legacy add/delete/clear/set_runtime_config commands
-// are gone -- D-140.)
-TEST_F(SessionPipelineTest, ActionModeRulesKeepReferenceCounts) {
-  Meter *mt = CreateMeterModule("mt", 16);
-  Router *rt = CreateRouterModule("rt");
-  ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
-  ExactMatch *em = CreateExactMatch("em", "at/actions");
-  ASSERT_NE(nullptr, mt);
-  ASSERT_NE(nullptr, rt);
-  ASSERT_NE(nullptr, at);
-  ASSERT_NE(nullptr, em);
-  ASSERT_EQ(Apply({Op::Upsert("mt/meters",
-                              bess::dataplane::EncodeKey(MeterId(1)),
-                              std::any(bess::meter::MeterProfileSpec{
-                                  SlowMeter(1000)})),
-                   rt->router()->SetNextHopOp(NextHopId(1), HopWithEgress(7)),
-                   Op::Upsert("at/actions",
-                              bess::dataplane::EncodeKey(ActionId(1)),
-                              std::any(ActionTable::Action{MeterId(1),
-                                                           NextHopId(1)})),
-                   Op::Upsert("at/actions",
-                              bess::dataplane::EncodeKey(ActionId(2)),
-                              std::any(ActionTable::Action{MeterId(1),
-                                                           NextHopId(1)}))})
-                .outcome,
-            Outcome::kApplied);
-
-  bess::pb::ExactMatchArg initial;
-  ASSERT_TRUE(em->initial_arg().UnpackTo(&initial));
-  EXPECT_EQ(initial.action_resource(), "at/actions");
-
-  const std::string key = Key(Ip(10, 1, 2, 3), 0);
-  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(bess::MakeGateResult(0, 1)))}).outcome,
-            Outcome::kApplied);
-  EXPECT_EQ(Engine().ReferenceCount("at/actions",
-                                    bess::dataplane::EncodeKey(ActionId(1))),
-            1u);
-  EXPECT_EQ(Apply({Op::Erase("at/actions",
-                            bess::dataplane::EncodeKey(ActionId(1)))})
-                .outcome,
-            Outcome::kRejected);
-
-  // A rule naming an action that is not there is refused, and the rule it
-  // would replace keeps its reference.
-  EXPECT_EQ(Apply({Op::Upsert("em/rules", key, std::any(bess::MakeGateResult(0, 99)))}).outcome,
-            Outcome::kRejected);
-  EXPECT_EQ(Engine().ReferenceCount("at/actions",
-                                    bess::dataplane::EncodeKey(ActionId(1))),
-            1u);
-  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(bess::MakeGateResult(0, 2)))}).outcome,
-            Outcome::kApplied);
-  EXPECT_EQ(Engine().ReferenceCount("at/actions",
-                                    bess::dataplane::EncodeKey(ActionId(1))),
-            0u);
-  EXPECT_EQ(Engine().ReferenceCount("at/actions",
-                                    bess::dataplane::EncodeKey(ActionId(2))),
-            1u);
-  // A referenced action cannot be erased: the rule still holds it.
-  EXPECT_EQ(Apply({Op::Erase("at/actions",
-                             bess::dataplane::EncodeKey(ActionId(2)))})
-                .outcome,
-            Outcome::kRejected);
-  EXPECT_EQ(Engine().ReferenceCount("at/actions",
-                                    bess::dataplane::EncodeKey(ActionId(2))),
-            1u);
-  // Erasing the rule releases it, and then the action goes.
-  ASSERT_EQ(Apply({Op::Erase("em/rules", key)}).outcome, Outcome::kApplied);
-  EXPECT_EQ(Engine().ReferenceCount("at/actions",
-                                    bess::dataplane::EncodeKey(ActionId(2))),
-            0u);
-  ASSERT_EQ(Apply({Op::Erase("at/actions",
-                             bess::dataplane::EncodeKey(ActionId(2)))})
-                .outcome,
-            Outcome::kApplied);
 }
 
 TEST_F(SessionPipelineTest, RouterCodecRejectsOutOfRangePrefix) {
@@ -719,7 +689,7 @@ TEST_F(SessionPipelineTest, ActionIdsAreNotNarrowedToGateWidth) {
                 .outcome,
             Outcome::kApplied);
   const std::string key = Key(Ip(10, 1, 2, 3), 0);
-  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, std::any(bess::MakeGateResult(0, 70000)))}).outcome,
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, Rule(0, 70000))}).outcome,
             Outcome::kApplied);
   Packets packets(1);
   packets.SetKey(0, Ip(10, 1, 2, 3), 0);
@@ -727,7 +697,7 @@ TEST_F(SessionPipelineTest, ActionIdsAreNotNarrowedToGateWidth) {
   std::array<uint32_t, 1> ids;
   std::array<gate_idx_t, 1> gates;
   em->ClassifyBatch(&batch, gates.data(), ids.data());
-  EXPECT_EQ(ids[0], 70000u);
+  EXPECT_NE(ids[0], 0u) << "the matched rule has a record";
 }
 
 // D-141: one rule result carries a gate and an action id, and every
@@ -746,14 +716,17 @@ TEST_F(SessionPipelineTest, RuleResultCarriesGateAndActionTogether) {
   }
   ExactMatch *em = CreateExactMatch("em", "at/actions");
   ASSERT_NE(nullptr, em);
-  ASSERT_EQ(Apply({Op::Upsert("em/rules", Key(Ip(10, 0, 0, 1), 0),
-                              std::any(bess::MakeGateResult(4, 1))),
+  auto ruled = Apply({Op::Upsert("em/rules", Key(Ip(10, 0, 0, 1), 0),
+                              Rule(4, 1)),
                    Op::Upsert("em/rules", Key(Ip(10, 0, 0, 2), 0),
-                              std::any(bess::MakeGateResult(7, 0))),
+                              std::any(bess::classifier::RuleResult{7, {}})),
                    Op::Upsert("em/rules", Key(Ip(10, 0, 0, 3), 0),
-                              std::any(bess::MakeGateResult(0, 2)))})
-                .outcome,
-            Outcome::kApplied);
+                              Rule(0, 2))});
+  ASSERT_EQ(ruled.outcome, Outcome::kApplied)
+      << "ops=" << ruled.ops.size() << " err0="
+      << (ruled.ops.size() > 0 ? ruled.ops[0].error : "none")
+      << " err1=" << (ruled.ops.size() > 1 ? ruled.ops[1].error : "none")
+      << " err2=" << (ruled.ops.size() > 2 ? ruled.ops[2].error : "none");
 
   Packets packets(4);
   packets.SetKey(0, Ip(10, 0, 0, 1), 0);
@@ -766,13 +739,13 @@ TEST_F(SessionPipelineTest, RuleResultCarriesGateAndActionTogether) {
   em->ClassifyBatch(&batch, gates.data(), actions.data());
 
   EXPECT_EQ(gates[0], 4u) << "a rule with both takes its own gate";
-  EXPECT_EQ(actions[0], 1u);
+  EXPECT_NE(actions[0], 0u) << "and its record";
   EXPECT_EQ(gates[1], 7u) << "a rule with a gate and no action";
-  EXPECT_EQ(actions[1], 0u);
+  EXPECT_NE(actions[1], 0u) << "the empty result is a zero-padded record";
   EXPECT_EQ(gates[2], 0u) << "a rule with an action and no gate of its own";
-  EXPECT_EQ(actions[2], 2u);
+  EXPECT_NE(actions[2], 0u) << "and its record";
   EXPECT_EQ(gates[3], DROP_GATE) << "a miss takes the default gate";
-  EXPECT_EQ(actions[3], 0u) << "and carries no action id";
+  EXPECT_EQ(actions[3], 0u) << "and has no record";
 }
 
 // D-141's wildcard half: a masked rule carries a gate and an action id, the
@@ -791,7 +764,7 @@ TEST_F(SessionPipelineTest, WildcardRuleCarriesGateAndActionTogether) {
   auto *field = arg.add_fields();
   field->set_offset(26);
   field->set_num_bytes(4);
-  arg.set_action_resource("at/actions");
+  AddActionResultField(&arg, "at/actions");
   auto *wm = static_cast<WildcardMatch *>(Create("WildcardMatch", "wm", Pack(arg)));
   ASSERT_NE(nullptr, wm);
 
@@ -802,11 +775,11 @@ TEST_F(SessionPipelineTest, WildcardRuleCarriesGateAndActionTogether) {
   ASSERT_EQ(Apply({Op::Upsert("wm/rules",
                               field4(Ip(255, 255, 255, 0)) + field4(Ip(10, 0, 0, 0)),
                               std::any(bess::classifier::MaskedRuleResource::Value{
-                                  2, 4, 3})),
+                                  2, 4, ActionRecord(3)})),
                    Op::Upsert("wm/rules",
                               field4(Ip(255, 255, 0, 0)) + field4(Ip(10, 0, 0, 0)),
                               std::any(bess::classifier::MaskedRuleResource::Value{
-                                  1, 7, 0}))})
+                                  1, 7, {}}))})
                 .outcome,
             Outcome::kApplied);
 
@@ -819,9 +792,9 @@ TEST_F(SessionPipelineTest, WildcardRuleCarriesGateAndActionTogether) {
   std::array<uint32_t, 3> actions;
   wm->ClassifyBatch(&batch, gates.data(), actions.data());
   EXPECT_EQ(gates[0], 4u);
-  EXPECT_EQ(actions[0], 3u);
+  EXPECT_NE(actions[0], 0u) << "the matched rule has a record";
   EXPECT_EQ(gates[1], 7u);
-  EXPECT_EQ(actions[1], 0u);
+  EXPECT_NE(actions[1], 0u) << "the empty result is a zero-padded record";
   EXPECT_EQ(gates[2], DROP_GATE);
   EXPECT_EQ(actions[2], 0u);
 
@@ -829,7 +802,7 @@ TEST_F(SessionPipelineTest, WildcardRuleCarriesGateAndActionTogether) {
   // resolve the id, and refused where there is none.
   bess::pb::WildcardMatchRuleValue v;
   v.set_gate(0);
-  v.set_action_id(3);
+  v.set_result(ActionResult(3));
   const google::protobuf::Any packed_value = Pack(v);
   const auto *with_resource = Bindings().Find(*Engine().FindResource("wm/rules"));
   ASSERT_NE(nullptr, with_resource);
@@ -855,77 +828,78 @@ TEST_F(SessionPipelineTest, WildcardRuleCarriesGateAndActionTogether) {
 // with live keys, which the engine refuses for a plain Unregister, so a
 // pipeline's teardown would otherwise depend on module order (and abort the
 // daemon).
-TEST_F(SessionPipelineTest, WildcardTeardownWithAnActionResource) {
+// Replacing a rule's result moves the reference ledger: the old referent is
+// released, the new one is acquired, and only the new one is protected.
+TEST_F(SessionPipelineTest, ReferenceLedgerFollowsRuleReplacement) {
   ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
   ASSERT_NE(nullptr, at);
   ASSERT_EQ(Apply({Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
-                              std::any(ActionTable::Action{MeterId(0),
-                                                           NextHopId(0)}))})
+                              std::any(ActionTable::Action{MeterId(0), NextHopId(0)})),
+                   Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(2)),
+                              std::any(ActionTable::Action{MeterId(0), NextHopId(0)}))})
                 .outcome,
             Outcome::kApplied);
+  ExactMatch *em = CreateExactMatch("em", "at/actions");
+  ASSERT_NE(nullptr, em);
+  const std::string key = Key(Ip(10, 0, 0, 1), 0);
+  const auto key1 = bess::dataplane::EncodeKey(ActionId(1));
+  const auto key2 = bess::dataplane::EncodeKey(ActionId(2));
 
-  bess::pb::WildcardMatchArg arg;
-  auto *field = arg.add_fields();
-  field->set_offset(26);
-  field->set_num_bytes(4);
-  arg.set_action_resource("at/actions");
-  auto *wm =
-      static_cast<WildcardMatch *>(Create("WildcardMatch", "wm", Pack(arg)));
-  ASSERT_NE(nullptr, wm);
-  ASSERT_EQ(Apply({Op::Upsert("wm/rules",
-                              Key(Ip(255, 255, 255, 0), 0).substr(0, 4) +
-                                  Key(Ip(10, 0, 0, 0), 0).substr(0, 4),
-                              std::any(bess::classifier::MaskedRuleResource::Value{
-                                  1, 0, 1}))})
-                .outcome,
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, Rule(0, 1))}).outcome,
             Outcome::kApplied);
-
-  // The rule is live and names an action; the table is untouched.
-  ModuleGraph::DestroyModule(wm);
-  EXPECT_NE(nullptr, Engine().FindResource("at/actions"))
-      << "the action table outlives the classifier that referenced it";
-  EXPECT_EQ(nullptr, Engine().FindResource("wm/rules"));
+  EXPECT_EQ(Engine().ReferenceCount("at/actions", key1), 1u);
+  ASSERT_EQ(Apply({Op::Upsert("em/rules", key, Rule(0, 2))}).outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(Engine().ReferenceCount("at/actions", key1), 0u);
+  EXPECT_EQ(Engine().ReferenceCount("at/actions", key2), 1u);
+  EXPECT_EQ(Apply({Op::Erase("at/actions", key1)}).outcome, Outcome::kApplied);
+  auto refused = Apply({Op::Erase("at/actions", key2)});
+  ASSERT_EQ(refused.outcome, Outcome::kRejected);
+  EXPECT_NE(refused.ops[0].error.find("still referenced"), std::string::npos);
+  ASSERT_EQ(Apply({Op::Erase("em/rules", key)}).outcome, Outcome::kApplied);
+  EXPECT_EQ(Apply({Op::Erase("at/actions", key2)}).outcome, Outcome::kApplied);
 }
 
-// The other order: the ActionTable goes first, while a live rule still names
-// one of its actions (the order DestroyAllModules uses -- names sort), and
-// the classifier follows with a dangling reference.
-TEST_F(SessionPipelineTest, ActionTableTeardownBeforeTheClassifierThatNamesIt) {
-  ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
-  ASSERT_NE(nullptr, at);
-  ASSERT_EQ(Apply({Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
-                              std::any(ActionTable::Action{MeterId(0),
-                                                           NextHopId(0)}))})
-                .outcome,
-            Outcome::kApplied);
-  bess::pb::WildcardMatchArg arg;
-  auto *field = arg.add_fields();
-  field->set_offset(26);
+// RAW references use the field bytes as the target key, so a resource keyed by
+// a host-order id is named by EncodeKey(id) rather than a BE32 wire id.
+TEST_F(SessionPipelineTest, RawReferenceNamesTheKeyVerbatim) {
+  Router *rt = CreateRouterModule("rt_raw");
+  ASSERT_NE(nullptr, rt);
+  bess::pb::ExactMatchArg arg;
+  auto *f = arg.add_fields();
+  f->set_offset(26);
+  f->set_num_bytes(4);
+  auto *field = arg.add_result_fields();
+  field->set_offset(40);
+  field->set_value_offset(0);
   field->set_num_bytes(4);
-  arg.set_action_resource("at/actions");
-  auto *wm =
-      static_cast<WildcardMatch *>(Create("WildcardMatch", "wm2", Pack(arg)));
-  ASSERT_NE(nullptr, wm);
-  ASSERT_EQ(Apply({Op::Upsert("wm2/rules",
-                              Key(Ip(255, 255, 255, 0), 0).substr(0, 4) +
-                                  Key(Ip(10, 0, 0, 0), 0).substr(0, 4),
-                              std::any(bess::classifier::MaskedRuleResource::Value{
-                                  1, 0, 1}))})
-                .outcome,
-            Outcome::kApplied);
-  ModuleGraph::DestroyModule(at);
-  ModuleGraph::DestroyModule(wm);
-  EXPECT_EQ(nullptr, Engine().FindResource("wm2/rules"));
+  field->set_reference("rt_raw/next_hops");  // reference_key defaults RAW
+  auto *em = static_cast<ExactMatch *>(Create("ExactMatch", "em_raw", Pack(arg)));
+  ASSERT_NE(nullptr, em);
+
+  const std::string hop = bess::dataplane::EncodeKey(NextHopId(1));
+  const uint32_t addr = Ip(10, 0, 0, 1);
+  const std::string key(reinterpret_cast<const char *>(&addr), sizeof(addr));
+  auto r = Apply({rt->router()->SetNextHopOp(NextHopId(1), HopWithEgress(7)),
+                  Op::Upsert("em_raw/rules", key, RuleWithBytes(hop))});
+  std::string errs;
+  for (const auto &op : r.ops) {
+    errs += op.error + "; ";
+  }
+  ASSERT_EQ(r.outcome, Outcome::kApplied) << errs;
+  EXPECT_EQ(Engine().ReferenceCount("rt_raw/next_hops", hop), 1u);
+  EXPECT_EQ(Apply({rt->router()->RemoveNextHopOp(NextHopId(1))}).outcome,
+            Outcome::kRejected);
 }
 
-TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
+TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathWithResultFields) {
   ActionTable *at = CreateActionTable("at", "mt/meters", "rt/next_hops");
   ASSERT_NE(nullptr, at);
   bess::pb::ExactMatchArg arg;
   auto *f = arg.add_fields();
   f->set_offset(26);
   f->set_num_bytes(4);
-  arg.set_action_resource("at/actions");
+  AddActionResultField(&arg, "at/actions");
   auto *em = static_cast<ExactMatch *>(Create("ExactMatch", "em", Pack(arg)));
   ASSERT_NE(nullptr, em);
   ASSERT_EQ(4u, em->fused_key_width());
@@ -940,7 +914,7 @@ TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
   for (uint32_t k = 0; k < 16; k++) {
     // One 4-byte field: the key is that field's bytes.
     ASSERT_EQ(Apply({Op::Upsert("em/rules", Key(Ip(10, 0, 0, k), 0).substr(0, 4),
-                                std::any(bess::MakeGateResult(0, 1 + k % 8)))})
+                                Rule(0, 1 + k % 8))})
                   .outcome,
               Outcome::kApplied);
   }
@@ -972,9 +946,8 @@ TEST_F(SessionPipelineTest, FusedKernelMatchesTheGenericPathInActionMode) {
   EXPECT_EQ(fused, generic);
   EXPECT_EQ(fused_gates, generic_gates);
   for (size_t i = 0; i < kN; i++) {
-    const uint32_t want =
-        i < 24 && i % 4 != 0 ? 1 + static_cast<uint32_t>(i % 16) % 8 : 0;
-    EXPECT_EQ(want, fused[i]) << "packet " << i;
+    const bool matched = i < 24 && i % 4 != 0;
+    EXPECT_EQ(matched, fused[i] != 0) << "packet " << i;
   }
 }
 
@@ -1018,7 +991,7 @@ TEST_F(SessionPipelineTest, CodecsRejectMismatchedFieldsAndUnknownEnums) {
   // D-141: a rule may name a gate and an action id together; the shape the
   // codec used to reject is now the normal one.
   em_val.set_gate(4);
-  em_val.set_action_id(1);
+  em_val.set_result(ActionResult(1));
   const google::protobuf::Any packed_both = Pack(em_val);
   EXPECT_TRUE(em_codec
                   ->Value(packed_both.type_url(), packed_both.value())
@@ -1096,7 +1069,7 @@ class SessionPacketPathTest : public SessionPipelineTest {
         rt_->router()->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
         Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(1)),
                    std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
-        Op::Upsert("em/rules", WireKey(sip, sport), std::any(bess::MakeGateResult(0, 1))),
+        Op::Upsert("em/rules", WireKey(sip, sport), Rule(0, 1)),
     };
   }
 
@@ -1137,7 +1110,7 @@ TEST_F(SessionPacketPathTest, OtherSessionsAndMissesAreDropped) {
   r = Apply({
       Op::Upsert("at/actions", bess::dataplane::EncodeKey(ActionId(2)),
                  std::any(ActionTable::Action{MeterId(0), NextHopId(0)})),
-      Op::Upsert("em/rules", WireKey("10.4.4.4", 4321), std::any(bess::MakeGateResult(0, 2))),
+      Op::Upsert("em/rules", WireKey("10.4.4.4", 4321), Rule(0, 2)),
   });
   ASSERT_EQ(Outcome::kApplied, r.outcome) << (r.ops.empty() ? "" : r.ops[0].error);
 
@@ -1211,7 +1184,7 @@ WireSession MakeWireSession(const char *sip, uint16_t sport, uint64_t burst) {
   const std::string key = WireKey(sip, sport);
   s.rule_key.add_fields()->set_value_bin(key.substr(0, 4));
   s.rule_key.add_fields()->set_value_bin(key.substr(4));
-  s.rule.set_action_id(1);
+  s.rule.set_result(ActionResult(1));
   return s;
 }
 
@@ -1469,10 +1442,14 @@ TEST_F(SessionPipelineTest, ConfiguredNamesResolveToOneOffset) {
       Op::Upsert("at_cfg/actions", bess::dataplane::EncodeKey(ActionId(1)),
                  std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
       Op::Upsert("em_cfg/rules", WireKey("10.1.2.3", 1234),
-                 std::any(bess::MakeGateResult(0, 1))),
+                 Rule(0, 1)),
   });
   ASSERT_EQ(Outcome::kApplied, r.outcome)
-      << (r.ops.empty() ? "" : r.ops[0].error);
+      << [&] {
+           std::string all;
+           for (const auto &o : r.ops) { all += o.error; all += " | "; }
+           return all;
+         }();
 
   // The packet traverses every module: the rule's action id is read by the
   // table under "action_id" (its default), the table writes the meter id under

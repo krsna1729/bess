@@ -26,7 +26,12 @@ modules:
           num_bytes: 4
         - offset: 34
           num_bytes: 2
-      action_resource: at/actions
+      result_fields:
+        - attr_name: action_id
+          value_offset: 0
+          num_bytes: 4
+          reference: at/actions
+          reference_key: BE32
   - name: mt
     mclass: Meter
     arg:
@@ -81,4 +86,4 @@ resources:
   # The session: TCP from 10.1.2.3 port 1234.
   em/rules:
     - key: {fields: [{value_bin: CgECAw==}, {value_bin: BNI=}]}
-      value: {action_id: 1}
+      value: {result: "AAAAAQ=="}

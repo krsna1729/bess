@@ -18,6 +18,8 @@
 #include "classifier/extract_plan.h"
 #include "classifier/concurrent_masked.h"
 #include "classifier/masked_rule_resource.h"
+#include "classifier/record_arena.h"
+#include "classifier/result_plan.h"
 #include "classifier/runtime_schema.h"
 #include "event.h"
 #include "framework/resource_bindings.h"
@@ -70,12 +72,12 @@ class WildcardMatch final : public Module {
   void DeInit() override;
 
   // What ProcessBatch decides, without emitting: gates[i] is the output gate
-  // of packet i and, when the module has an action resource, action_ids[i] is
-  // the action id to deliver (0 for a miss, D-141). The same code as the
+  // of packet i and result_ids[i] is the matched rule's record id (0 on a
+  // miss, and when the module has no result fields). The same code as the
   // packet path, for tests and benchmarks that drive the module from a
   // registered reader thread.
   void ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
-                     uint32_t *action_ids) const;
+                     uint32_t *result_ids) const;
 
   std::string GetDesc() const override;
 
@@ -103,13 +105,19 @@ class WildcardMatch final : public Module {
   struct Generation {
     Generation(gate_idx_t d, bess::classifier::ExtractPlan e,
                std::shared_ptr<bess::classifier::ConcurrentMaskedTable> t,
-               size_t k, bool valid, std::vector<size_t> offsets)
+               size_t k, bool valid, std::vector<size_t> offsets,
+               std::optional<bess::classifier::ResultPlan> r,
+               std::vector<size_t> result_offsets,
+               std::shared_ptr<bess::classifier::RecordArena> records)
         : default_gate(d),
           extract(std::move(e)),
           table(std::move(t)),
           key_size(k),
           extraction_valid(valid),
-          baked_source_offsets(std::move(offsets)) {}
+          baked_source_offsets(std::move(offsets)),
+          result(std::move(r)),
+          baked_result_offsets(std::move(result_offsets)),
+          records(std::move(records)) {}
 
     gate_idx_t default_gate = DROP_GATE;
     bess::classifier::ExtractPlan extract;
@@ -121,9 +129,18 @@ class WildcardMatch final : public Module {
     // path then routes everything to the default gate instead of reading an
     // incorrect metadata region (fail-closed).
     bool extraction_valid = true;
+    // Init deferred a metadata result plan to the first PreResume; the
+    // offsets may be unchanged (both sentinel) but the plan must be built.
+    bool result_plan_deferred = false;
     // Per-field source offset baked into `extract`, compared at PreResume to
     // detect graph-driven offset reassignment.
     std::vector<size_t> baked_source_offsets;
+    // Configured result placement: the compiled plan (nullopt in gate-only
+    // mode), the offsets it baked (kInvalidOffset for a packet field), and
+    // the records its ids address. Compared at PreResume.
+    std::optional<bess::classifier::ResultPlan> result;
+    std::vector<size_t> baked_result_offsets;
+    std::shared_ptr<bess::classifier::RecordArena> records;
   };
 
   using GenerationPtr = std::unique_ptr<const Generation>;
@@ -155,7 +172,8 @@ class WildcardMatch final : public Module {
   };
 
   template <typename Emit>
-  void Classify(bess::PacketBatch *batch, Emit &&emit) const;
+  void Classify(bess::PacketBatch *batch, Emit &&emit,
+                uint64_t *out_hits = nullptr) const;
 
   CommandResponse AddFieldOne(const bess::pb::Field &field, int idx);
   // Resolves FieldSpecs into a dense packed layout using current metadata
@@ -207,12 +225,31 @@ class WildcardMatch final : public Module {
   size_t max_tuples_ = kDefaultMaxTuples;
   std::optional<uint64_t> initial_default_gate_;  // as given at creation
 
-  // Action mode (D-141): the argument names an action resource, so a rule may
-  // carry an ActionId, which the packet path writes into the "action_id"
-  // metadata attribute (0 on a miss). Fixed at Init().
-  bool has_action_resource_ = false;
-  std::string action_resource_;
-  int action_id_attr_ = -1;
+  // Result fields (fixed at Init): each maps a slice of a rule's record to a
+  // metadata attribute or a packet offset. Empty: gate-only.
+  struct ResultSpec {
+    bool by_attr = true;
+    std::string attr_name;
+    int attr_id = -1;
+    uint32_t offset = 0;
+    uint32_t value_offset = 0;
+    uint32_t size = 0;
+    std::string reference;
+    bool reference_be32 = false;
+  };
+  std::vector<ResultSpec> result_specs_;
+  std::vector<std::string> result_reference_names_;
+  bool metadata_ready_ = false;
+  size_t result_value_size_ = 0;
+  std::shared_ptr<bess::classifier::RecordArena> records_;
+  std::optional<std::vector<std::byte>> default_result_;
+  uint32_t default_record_id_ = 0;
+
+  // The resources a rule's result bytes name through configured references
+  // (D-172); an all-zero field names nothing.
+  std::vector<bess::dataplane::Reference> ResultReferences(
+      const std::vector<std::byte> &bytes) const;
+
 
   // The live rule table (also held by the published generation).
   std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table_;

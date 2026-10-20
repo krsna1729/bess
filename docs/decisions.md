@@ -160,7 +160,7 @@ file is the reasoning.
 | D-138 | `live_perf` is C++ (`tests/perf/live_perf`, a client of the C++ SDK over control_v2): pipelines and table entries go in as one transaction, ns per packet from the measured modules' Track gate counters over a client-timed window; master is no longer a build it drives; `F.hook` dropped (no v2 `track_gate`); `tools/live_perf.py` is gone. It found two control_v2 defects, both fixed: transactional WildcardMatch rules never reordered the tuple list (D-098 amendment), and `ApplyPipeline` ignored `skip_default_hooks` | accepted |
 | D-139 | `live_transaction_bench` is C++ on the SDK (`tests/perf/live_transaction_bench`): the same pipeline, rates and report against a running bessd, the default gate as `em/settings`, gate counters and busy answers from metrics; `tools/live_transaction_bench.py` is gone; the perf clients share `tests/perf/schema_types.h` | accepted |
 | D-140 | The legacy service is gone: no `BESSControl` RPC, `service.proto`, pybess, Python bessctl, `bess-python` package, legacy-only module commands, `LEGACY_ONLY`/`Exposure` or gate-hook command table (plugin API 4); each module's `cmds` entries are its actions, `get_initial_arg` is `GetPipeline`'s `Module.arg`, and state is changed through resources (`edits_resources` marks an action that edits one) | accepted |
-| D-141 | One classifier result carries a gate and an ActionId: the result is one 64-bit word, the gate in the low 16 bits and the ActionId above it (`MakeGateResult`/`GateOfResult`/`ActionIdOfResult`), every combination legal; the ActionId is a metadata write (0 on a miss, and 0 when the rule names no action) and a transactional reference, so a rule with a nonzero id is ordered after its action and refused while that action is missing; both classifiers' batch helpers deliver both halves | accepted |
+| D-141 | Superseded for ExactMatch and WildcardMatch by D-172; Firewall keeps `action_id`. One classifier result carries a gate and an ActionId: the result is one 64-bit word, the gate in the low 16 bits and the ActionId above it (`MakeGateResult`/`GateOfResult`/`ActionIdOfResult`), every combination legal; the ActionId is a metadata write (0 on a miss, and 0 when the rule names no action) and a transactional reference, so a rule with a nonzero id is ordered after its action and refused while that action is missing; both classifiers' batch helpers deliver both halves | superseded (classifiers) by D-172 |
 | D-142 | A plugin's protobuf descriptors are process-lifetime: `dlopen` registers them in the daemon's process-global pool and protobuf never frees them, so the ASan lane suppresses exactly those registrations rather than the lane losing leak detection | accepted |
 | D-143 | The protobuf surface keeps only what runs: the legacy command messages went with the service that could call them (a message is API surface a client can name, and a schema every generator compiles), so only what a live call or a resource uses remains | accepted |
 | D-144 | The gate byte counter is gone: `TrackArg.bits` was its only switch and every hook was installed with the default arg, so `bess_gate_bytes_total` could never appear; the feature went with it, while the field number and name stay reserved so no client can silently write the old one | accepted |
@@ -11669,3 +11669,60 @@ resources, module arguments and unlisted tables are untouched. A singleton needs
 value write, not a reset. The reset is batched, so a failure after some batches leaves
 those committed, exactly as a resource-bearing apply does; callers treat a failed sweep
 as partial, not atomic.
+
+## D-172 A classifier rule carries a result record, not an action reference
+
+- A rule's result is a gate plus an opaque byte record: `classifier::RuleResult{gate, bytes}`. The module's
+  argument carries `result_fields` (`ResultField`: `attr_name` or packet `offset`, `value_offset`,
+  `num_bytes`) and an optional `default_result`. A non-empty list creates a `classifier::RecordArena` whose
+  record is as wide as the widest field and a `classifier::ResultPlan`; an empty list leaves the module
+  gate-only, with no arena. The record ceiling is `RecordArena::kMaxRecordSize` (4096); a configuration
+  above it is refused at `Init`, not a CHECK at the first write. A non-empty `default_result` needs at least
+  one field; an explicitly empty one is a no-op and is not an error.
+- A plan with only packet destinations compiles at `Init` (their offsets are literal). A plan with any
+  metadata destination compiles at `PreResume`, when the graph has resolved each attribute's offset; until
+  then placement is disabled and a hit forwards the packet with its bytes unchanged. Each metadata
+  destination is checked on its own, so two fields can share an unresolved zero offset before `PreResume`
+  without being treated as one destination.
+- The rule table stores a record id beside the gate: ExactMatch packs `{gate, record id}` with
+  `ResultIdOfResult` (the ActionId slot keeps its width and position); WildcardMatch stores the record id in
+  its rule record and its lookup returns it next to the gate. Every rule with fields allocates a record;
+  an empty result value becomes an all-zero record rather than no record, so a reference field always reads
+  its whole width and an all-zero field names nothing. The arena zero-pads a shorter rule value, so a byte no
+  field covers reads zero; a value longer than the record is refused.
+- A hit places the fields on the packet: a metadata attribute gets the bytes at the compiled offset, a packet
+  destination gets them at its byte offset. A packet too short for a packet destination is dropped rather
+  than partly written; an `ApplyBatch` failure fails the whole batch closed to the default gate.
+- A miss takes `default_gate` and, when `default_result` is set, places it; otherwise it writes nothing. A
+  hit with an empty result writes the zero record. That is how a graph gives unmatched traffic its own
+  action fields without a catch-all rule.
+- **Why.** Action placement was one hard-coded metadata write (`action_id`), and it made a classifier depend
+  on ActionTable. Result fields make placement configuration: the same rule can write a meter id, a next hop,
+  a class and an action id, and the classifier names none of them. A controller composes
+  `classifier -> Meter/Router` directly; `ActionTable` is no longer needed on the classifier's path.
+- **References survive the ActionTable.** A result field may name a resource (`reference`, e.g.
+  `rt/next_hops`); `reference_key` says how: `RAW` uses the bytes verbatim, `BE32` treats the field as a
+  32-bit big-endian id (the metadata convention) and builds the host-order key that `StrongId` resources use.
+  An all-zero field names nothing. The rule resource
+  declares those names with the engine and returns the referenced keys from the rule's bytes, so a rule is
+  ordered after the entries it names and its referents cannot be erased while it remains -- exactly the
+  ledger ActionTable supplied. The checks run only in `Reserve`; the packet path writes the bytes it already
+  validated and never looks a reference up. A rule with a field slice shorter than the field is
+  zero-padded, so the field reads zero and names nothing. The reserve, retire and publish steps of a rule
+  write allocate no memory: the arena's record vector and its retirement queue reserve before the
+  transaction commits, so a failed allocation cannot leave a published table with an unfinished record.
+- **Consequence.** A result field with no `reference` is opaque: writing four bytes that look like a next-hop
+  id establishes nothing, and erasing that next hop is allowed. A field that must keep the guarantee
+  configures one. `ExactMatchArg.action_resource` and `WildcardMatchArg.action_resource` are reserved so no
+  client can silently write the old field. This supersedes D-141 for both classifiers; Firewall keeps its
+  `action_id` field until its own migration.
+- **Code.** `core/classifier/rule_result.h`, `core/classifier/result_plan.h`, `core/classifier/record_arena.h`,
+  `core/classifier/exact_rule_resource.h`, `core/classifier/masked_rule_resource.h`,
+  `core/modules/exact_match.{h,cc}`, `core/modules/wildcard_match.{h,cc}`, `protobuf/module_msg.proto`.
+- **Evidence.** `ExactMatchPacketTest` and `WildcardMatchPacketTest` cover metadata and packet destinations,
+  the zero-padded default, a short packet, a miss with and without `default_result`, two distinct metadata
+  destinations, an oversized record and a non-empty default without fields (both refused), and the fused
+  path against the generic path; `SessionPipelineTest` covers rule replacement moving the reference ledger,
+  a `RAW` reference naming its key verbatim, and the resource refusing the referent's erase;
+  `WildcardMatchResourceTest` round-trips record bytes; the session slice runs classifier results into
+  ActionTable's `action_id`.

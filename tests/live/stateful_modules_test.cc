@@ -237,7 +237,9 @@ TEST_F(StatefulModulesTest, SessionTransactionsWhileTrafficRuns) {
                             R"({"capacity": 64, "meters": "mt/meters", "next_hops": "rt/next_hops"})");
   auto em_arg = types_.Make("bess.pb.ExactMatchArg",
                             R"({"fields": [{"offset": 26, "num_bytes": 4}, {"offset": 34, "num_bytes": 2}],
-                                "action_resource": "at/actions", "default_gate": 0})");
+                                "result_fields": [{"attr_name": "action_id", "value_offset": 0, "num_bytes": 4,
+                                  "reference": "at/actions", "reference_key": "BE32"}],
+                                "default_gate": 0})");
   auto mt_arg = types_.Make("bess.pb.MeterArg", R"({"capacity": 64})");
   auto rt_arg = types_.Make("bess.pb.RouterArg",
                             R"({"max_routes": 64, "max_tbl8s": 16, "max_next_hops": 64})");
@@ -272,7 +274,12 @@ TEST_F(StatefulModulesTest, SessionTransactionsWhileTrafficRuns) {
     auto action_key = types_.Make(actions->key_type, R"({"id": )" + action_id + "}");
     auto action_value = types_.Make(actions->value_type, R"({"meter_id": 0, "next_hop_id": 0})");
     ASSERT_TRUE(tx.Upsert(*actions, *action_key, *action_value));
-    auto rule_value = types_.Make(rules->value_type, R"({"action_id": )" + action_id + "}");
+    const uint32_t id = 1 + i % 4;
+    const std::vector<uint8_t> result = {
+        static_cast<uint8_t>(id >> 24U), static_cast<uint8_t>(id >> 16U),
+        static_cast<uint8_t>(id >> 8U), static_cast<uint8_t>(id)};
+    auto rule_value =
+        types_.Make(rules->value_type, R"({"result": ")" + Base64(result) + R"("})");
     ASSERT_TRUE(tx.Upsert(*rules, *rule_key(i), *rule_value));
     if (i >= 4) {
       ASSERT_TRUE(tx.Erase(*rules, *rule_key(i - 4)));

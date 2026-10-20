@@ -444,15 +444,15 @@ reference to something missing.
   resource writes (including an `edits_resources` action such as L2Forward's
   `populate`), touch the same tables.
 - **Modules taking part today:** ExactMatch registers its rules as
-  `<module>/rules` (key: the fields' bytes in order; value: the packed result -- the output gate and, when the
-  module names an action resource, the ActionId of the action the rule takes, D-141) from `Init()` to
+  `<module>/rules` (key: the fields' bytes in order; value: the output gate and the rule's result record id,
+  whose bytes `result_fields` places on a hit, D-172) from `Init()` to
   `DeInit()`, so one transaction can change the rules of
   several ExactMatch instances. Its table grows during prepare when a new
   key does not fit (`ExactRuleResource::Hooks::make_room`); pending keys
   move to the new table with the rest. D-022, D-032.
 - **WildcardMatch** registers its rules as `<module>/rules` (key: packed
-  mask then packed value; value: `{priority, gate, action_id}`, where a nonzero
-  action id is a reference to the module's action resource, D-141) through
+  mask then packed value; value: `{priority, gate, result}`, where `result` is the
+  rule's record bytes and `result_fields` places them on a hit, D-172) through
   `MaskedRuleResource`. A rule being prepared sits in its tuple naming a
   record that loses to every rule and alone reads as a miss; the table's
   lookup filters it, so the packet path is unchanged. The result 0xFFFF is

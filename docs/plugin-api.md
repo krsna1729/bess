@@ -237,6 +237,20 @@ a client can do to it is an **action**.
   since the ceiling moves. A ceiling is not a promise of room: a hash table's
   placement can refuse before the table is full, and a refused transaction
   leaves nothing behind.
+- **Rule results are configured, not hard-coded (D-172).** A classifier rule's
+  value is a gate plus an opaque byte record. The module's argument carries
+  `result_fields` (each maps a record slice to a metadata attribute or a packet
+  offset) and an optional `default_result` for a miss; `Init` compiles them
+  into a `classifier::ResultPlan` and a `classifier::RecordArena`, and the rule
+  table stores a record id beside the gate. A field may name a `reference`
+  resource: `RAW` uses its bytes as the entry's key, `BE32` treats them as a
+  32-bit big-endian id (the metadata convention) and builds the host-order
+  key, the rule resource declares the names with the engine, and the engine
+  orders a rule after the entries it names and refuses their erase while it
+  remains. An all-zero field references
+  nothing, and the packet path never resolves a reference: it writes bytes the
+  transaction already validated. With no result fields the module is gate-only
+  and pays nothing for the generality.
 - **Actions** are the `cmds` entries: verbs that are not state (a lookup, a
   flush, a counter read, a table generator). `InvokeAction` runs them and
   `GetSchema` lists them, with `result_type` naming the message an action puts

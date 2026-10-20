@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "classifier/concurrent_masked.h"
+#include "classifier/record_arena.h"
 #include "dataplane/resource.h"
 
 namespace bess::classifier {
@@ -35,10 +36,9 @@ class MaskedRuleResource final : public dataplane::Resource {
   struct Value {
     int64_t priority = 0;
     uint16_t gate = 0;
-    // The action the rule takes, 0 for none (D-141): a nonzero id is a
-    // reference the owner resolves, and only a module with an action resource
-    // ever sets one.
-    uint32_t action_id = 0;
+    // The rule's result record: variable on the wire, zero-padded to the
+    // arena's record when the rule is published.
+    std::vector<std::byte> result;
   };
   using Result = std::expected<void, std::string>;
   using ReferencesFn =
@@ -50,6 +50,8 @@ class MaskedRuleResource final : public dataplane::Resource {
     // Refuses values the owner does not accept (e.g. an invalid gate).
     std::function<Result(const Value &)> check_value;
     ReferencesFn references;
+    // Where result records live; null when the table has no result fields.
+    std::shared_ptr<RecordArena> records;
     std::vector<std::string> may_reference;
   };
 
@@ -57,7 +59,8 @@ class MaskedRuleResource final : public dataplane::Resource {
       : Resource(std::move(name), std::move(hooks.may_reference)),
         table_(std::move(hooks.table)),
         check_value_(std::move(hooks.check_value)),
-        references_(std::move(hooks.references)) {}
+        references_(std::move(hooks.references)),
+        records_(std::move(hooks.records)) {}
 
   static dataplane::ResourceKey Key(ConstBytes mask, ConstBytes value) {
     dataplane::ResourceKey key(reinterpret_cast<const char *>(mask.data()),
@@ -79,7 +82,7 @@ class MaskedRuleResource final : public dataplane::Resource {
     }
     const auto rule = Find(*table_(), key);
     return rule ? references_(Value{rule->priority, rule->gate,
-                                    rule->action_id})
+                                    Load(rule->result_id)})
                 : std::vector<dataplane::Reference>{};
   }
   void VisitReferences(
@@ -90,8 +93,8 @@ class MaskedRuleResource final : public dataplane::Resource {
     }
     table_()->ForEach([&](ConstBytes, ConstBytes,
                           const ConcurrentMaskedTable::Rule &rule) {
-      for (const auto &ref : references_(Value{rule.priority, rule.gate,
-                                               rule.action_id})) {
+      for (const auto &ref : references_(
+               Value{rule.priority, rule.gate, Load(rule.result_id)})) {
         visit(ref);
       }
     });
@@ -113,18 +116,44 @@ class MaskedRuleResource final : public dataplane::Resource {
     if (previous && references_) {
       previous_references =
           references_(Value{previous->priority, previous->gate,
-                            previous->action_id});
+                            Load(previous->result_id)});
     }
+    // A reservation made before a fallible preparation: cancel it unless the
+    // staged rule takes ownership. No allocation.
+    struct ReservationGuard {
+      RecordArena *arena = nullptr;
+      bool held = false;
+      ~ReservationGuard() noexcept {
+        if (held) {
+          arena->CancelRetirement(1);
+        }
+      }
+      void Reserve(RecordArena *a) {
+        a->ReserveRetirement(1);
+        arena = a;
+        held = true;
+      }
+      void Transfer() noexcept { held = false; }
+    };
+
     if (op.kind == dataplane::OpKind::kErase) {
       if (!previous) {
         return std::unexpected("not found");
       }
-      auto staged = std::make_unique<StagedRule>(table);
+      auto staged = std::make_unique<StagedRule>(table, records_);
+      ReservationGuard retire_guard;
+      if (records_ != nullptr && previous->result_id != 0) {
+        retire_guard.Reserve(records_.get());
+      }
       auto prepared = table->PrepareErase(mask, value);
       if (!prepared) {
         return std::unexpected("not found");
       }
-      staged->Arm(std::move(*prepared));
+      if (retire_guard.held) {
+        staged->RetireOnPublish();
+        retire_guard.Transfer();
+      }
+      staged->Arm(std::move(*prepared), 0);
       Reservation erase{std::move(staged), {}};
       erase.footprint.removals = 1;  // the freed id, a grace period later
       erase.existed = true;
@@ -140,20 +169,58 @@ class MaskedRuleResource final : public dataplane::Resource {
         return std::unexpected(ok.error());
       }
     }
+    if (records_ != nullptr && v->result.size() > records_->record_size()) {
+      return std::unexpected("result is " +
+                             std::to_string(v->result.size()) +
+                             " bytes, the schema's record is " +
+                             std::to_string(records_->record_size()));
+    }
     // Everything that can throw first; preparing the rule, the step with a
     // physical effect, is last (and Arm() cannot throw).
     std::vector<dataplane::Reference> references;
     if (references_) {
       references = references_(*v);
     }
-    auto staged = std::make_unique<StagedRule>(table);
+    uint32_t record_id = 0;
+    // Before ownership moves into the staged rule, every throw must return the
+    // unpublished id exactly once.
+    struct IdGuard {
+      RecordArena *arena;
+      uint32_t *id;
+      ~IdGuard() noexcept {
+        if (arena != nullptr && *id != 0) {
+          arena->Abort(*id);
+        }
+      }
+    } guard{records_.get(), &record_id};
+    if (records_ != nullptr) {
+      record_id = records_->Allocate();
+      if (record_id == 0) {
+        return std::unexpected("result arena full");
+      }
+      MutableBytes slot = records_->Record(record_id);
+      std::memset(slot.data(), 0, slot.size());
+      if (!v->result.empty()) {
+        std::memcpy(slot.data(), v->result.data(), v->result.size());
+      }
+    }
+    auto staged = std::make_unique<StagedRule>(table, records_);
+    ReservationGuard retire_guard;
+    if (records_ != nullptr && previous && previous->result_id != 0) {
+      retire_guard.Reserve(records_.get());
+    }
     auto prepared = table->PrepareUpsert(mask, value, v->priority, v->gate,
-                                         v->action_id);
+                                         record_id);
     if (!prepared) {
       return std::unexpected(Describe(prepared.error()));
     }
     const bool replaces = prepared->old != 0;
-    staged->Arm(std::move(*prepared));
+    if (retire_guard.held && replaces) {
+      staged->RetireOnPublish();
+      retire_guard.Transfer();
+    }
+    staged->Arm(std::move(*prepared), record_id);
+    record_id = 0;  // owned by the staged rule now
     Reservation upsert{std::move(staged), std::move(references)};
     upsert.footprint.removals = replaces ? 1 : 0;
     upsert.existed = previous.has_value();
@@ -168,6 +235,15 @@ class MaskedRuleResource final : public dataplane::Resource {
   static ConstBytes ValueBytes(const dataplane::ResourceKey &key, size_t len) {
     return ConstBytes(reinterpret_cast<const std::byte *>(key.data()) + len,
                       len);
+  }
+
+  // The stored record bytes for a rule's id.
+  std::vector<std::byte> Load(uint32_t id) const {
+    if (records_ == nullptr) {
+      return {};
+    }
+    const ConstBytes bytes = records_->Lookup(id);
+    return std::vector<std::byte>(bytes.begin(), bytes.end());
   }
 
   static std::optional<ConcurrentMaskedTable::Rule> Find(
@@ -202,41 +278,64 @@ class MaskedRuleResource final : public dataplane::Resource {
   // that table, not a successor (hence the weak reference in the cascade).
   class StagedRule final : public dataplane::StagedOp {
    public:
-    explicit StagedRule(std::shared_ptr<ConcurrentMaskedTable> table)
-        : table_(std::move(table)) {}
-    void Arm(ConcurrentMaskedTable::Prepared prepared) noexcept {
+    StagedRule(std::shared_ptr<ConcurrentMaskedTable> table,
+               std::shared_ptr<RecordArena> records)
+        : table_(std::move(table)), records_(std::move(records)) {}
+    void RetireOnPublish() noexcept { retirement_reserved_ = true; }
+    void Arm(ConcurrentMaskedTable::Prepared prepared,
+             uint32_t record_id) noexcept {
       prepared_ = std::move(prepared);
+      record_id_ = record_id;
       armed_ = true;
     }
     void Publish(dataplane::Retirer &retirer) noexcept override {
       const ConcurrentMaskedTable::RuleId freed = table_->Commit(prepared_);
       armed_ = false;
       if (freed != 0) {
+        // The freed rule record is still readable; take the record id it
+        // names now, and retire both ids after the removal cascade.
+        const uint32_t old_record =
+            records_ != nullptr ? table_->RuleAt(freed).result_id : 0;
         retirer.RemoveLater(
             [table = std::weak_ptr<ConcurrentMaskedTable>(table_),
-             freed](dataplane::Retirer &) {
+             records = records_, freed, old_record](dataplane::Retirer &) {
               if (auto t = table.lock()) {
+                if (records != nullptr && old_record != 0) {
+                  records->Retire(old_record);
+                }
                 t->Recycle(freed);
               }
             });
+        retirement_reserved_ = false;  // the callback consumes it
       }
     }
     void Abort() noexcept override {
       if (armed_) {
         table_->Cancel(prepared_);
+        if (records_ != nullptr && record_id_ != 0) {
+          records_->Abort(record_id_);
+        }
         armed_ = false;
+      }
+      if (records_ != nullptr && retirement_reserved_) {
+        records_->CancelRetirement(1);
+        retirement_reserved_ = false;
       }
     }
 
    private:
     std::shared_ptr<ConcurrentMaskedTable> table_;
+    std::shared_ptr<RecordArena> records_;
     ConcurrentMaskedTable::Prepared prepared_;
+    uint32_t record_id_ = 0;
     bool armed_ = false;
+    bool retirement_reserved_ = false;
   };
 
   std::function<std::shared_ptr<ConcurrentMaskedTable>()> table_;
   std::function<Result(const Value &)> check_value_;
   ReferencesFn references_;
+  std::shared_ptr<RecordArena> records_;
 };
 
 }  // namespace bess::classifier
