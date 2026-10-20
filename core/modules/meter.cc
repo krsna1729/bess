@@ -16,6 +16,7 @@
 #include "dataplane/transaction_engine.h"
 #include "utils/endian.h"
 #include "utils/format.h"
+#include "utils/ip.h"
 
 namespace dataplane = bess::dataplane;
 namespace meter = bess::meter;
@@ -219,6 +220,29 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
                           bess::metadata::kMetadataAttrMaxSize /
                               sizeof(bess::utils::be32_t));
   }
+  switch (arg.byte_basis()) {
+    case bess::pb::METER_BYTE_BASIS_L2:
+      byte_basis_ = ByteBasis::kL2;
+      break;
+    case bess::pb::METER_BYTE_BASIS_L3:
+      byte_basis_ = ByteBasis::kL3;
+      break;
+    case bess::pb::METER_BYTE_BASIS_L4:
+      byte_basis_ = ByteBasis::kL4;
+      break;
+    case bess::pb::METER_BYTE_BASIS_CUSTOM:
+      byte_basis_ = ByteBasis::kCustom;
+      break;
+    default:
+      return CommandFailure(EINVAL, "unknown byte_basis");
+  }
+  byte_offset_ = arg.byte_offset();
+  if (byte_offset_ > 65535) {
+    return CommandFailure(EINVAL, "byte_offset must be 0-65535");
+  }
+  if (byte_basis_ == ByteBasis::kL2 && byte_offset_ != 0) {
+    return CommandFailure(EINVAL, "byte_offset must be 0 for the L2 basis");
+  }
   if (arg.capacity() > std::numeric_limits<meter::MeterId::rep_type>::max()) {
     return CommandFailure(EINVAL, "meter capacity exceeds valid meter ids");
   }
@@ -353,6 +377,65 @@ void Meter::EndTransaction() noexcept {
   published_staged_ = false;
 }
 
+std::optional<uint32_t> Meter::AccountedBytes(bess::PacketRef pkt) const {
+  const uint32_t frame_len = pkt.total_len();
+  if (byte_basis_ == ByteBasis::kL2) {
+    return frame_len;
+  }
+  if (byte_basis_ == ByteBasis::kCustom) {
+    if (frame_len < byte_offset_) {
+      return std::nullopt;
+    }
+    return frame_len - byte_offset_;
+  }
+
+  // L3 and L4 parse the IP header at byte_offset_: its version, IHL and
+  // lengths live in the first six bytes (options may be in a later segment).
+  if (pkt.head_len() < byte_offset_ + 4) {
+    return std::nullopt;
+  }
+  const uint8_t *ip = pkt.head_data<const uint8_t *>() + byte_offset_;
+  const uint8_t version = static_cast<unsigned>(ip[0]) >> 4u;
+  if (version == 4) {
+    const uint32_t ihl = (ip[0] & 0x0fu) * 4;
+    const uint32_t total = (static_cast<uint32_t>(ip[2]) << 8u) | ip[3];
+    if (ihl < sizeof(bess::utils::Ipv4) || total < ihl ||
+        frame_len < byte_offset_ + total) {
+      return std::nullopt;
+    }
+    return byte_basis_ == ByteBasis::kL4 ? total - ihl : total;
+  }
+  if (version == 6) {
+    // The payload length is at offset 4. Zero is either an empty packet (a
+    // valid IPv6 datagram, for example Next Header 59) or a jumbogram: RFC
+    // 2675 gives a jumbogram length 0 and puts the real length in a Jumbo
+    // Payload option inside a Hop-by-Hop header, which is the next header.
+    if (pkt.head_len() < byte_offset_ + 6) {
+      return std::nullopt;
+    }
+    const uint32_t payload = (static_cast<uint32_t>(ip[4]) << 8u) | ip[5];
+    if (payload == 0) {
+      if (pkt.head_len() < byte_offset_ + 7) {
+        return std::nullopt;  // cannot see the next header
+      }
+      if (ip[6] == 0) {
+        return std::nullopt;  // a Hop-by-Hop header at length 0: jumbogram
+                              // (or malformed), which these bases cannot size
+      }
+      if (frame_len < byte_offset_ + 40) {
+        return std::nullopt;
+      }
+      return byte_basis_ == ByteBasis::kL4 ? 0 : 40;
+    }
+    const uint32_t total = 40 + payload;  // the fixed IPv6 header
+    if (frame_len < byte_offset_ + total) {
+      return std::nullopt;
+    }
+    return byte_basis_ == ByteBasis::kL4 ? payload : total;
+  }
+  return std::nullopt;  // not an IP packet
+}
+
 void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
   const int cnt = batch->cnt();
   const bess::metadata::mt_offset_t offset = attr_offset(meter_id_attr_);
@@ -370,9 +453,13 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
   const uint64_t now = meter::MeterNow();
   const size_t levels = levels_;
   std::array<bool, bess::PacketBatch::kMaxBurst> alive;
+  std::array<std::optional<uint32_t>, bess::PacketBatch::kMaxBurst> costs;
   for (int i = 0; i < cnt; i++) {
     gates[i] = kGreenGate;
     alive[i] = true;
+    // The packet's charge is level-independent; a packet the basis cannot
+    // measure is dropped at its first non-zero meter id.
+    costs[i] = AccountedBytes(batch->packet(i));
   }
   // One pass per level, over the packets the levels before it let live: a
   // packet a level marks red is not charged to the levels after it, so the
@@ -393,6 +480,14 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
       if (id.value() == 0) {
         continue;  // no meter at this level
       }
+      if (!costs[i]) {
+        // The configured accounting cannot measure this packet (a short
+        // frame, a non-IP one, a malformed header): dropping it is the only
+        // answer that does not forward it unmetered.
+        gates[i] = DROP_GATE;
+        alive[i] = false;
+        continue;
+      }
       meter::MeterState *state = set->Lookup(id);
       if (state == nullptr) {
         // A dangling id is dropped rather than forwarded unmetered, as with
@@ -401,8 +496,9 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
         alive[i] = false;
         continue;
       }
+      const uint32_t cost = costs[i].value_or(0);
       const meter::MeterColor color = state->CheckColorAware(
-          now, pkt.total_len(), static_cast<meter::MeterColor>(gates[i]));
+          now, cost, static_cast<meter::MeterColor>(gates[i]));
       // MeterColor's values are the output gates: green 0, yellow 1, red 2.
       gates[i] = static_cast<gate_idx_t>(color);
       if (color == meter::MeterColor::kRed) {

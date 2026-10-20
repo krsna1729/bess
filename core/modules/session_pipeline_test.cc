@@ -51,6 +51,7 @@ using bess::dataplane::TransactionEngine;
 using bess::meter::MeterId;
 using bess::route::Ipv4Prefix;
 using bess::route::NextHopId;
+using bess::testing::Bytes;
 using Outcome = TransactionEngine::Outcome;
 
 TransactionEngine &Engine() { return bess::runtime::runtime().transactions(); }
@@ -1844,6 +1845,193 @@ TEST_F(SessionPipelineTest, TwoLevelsPoliceInOrderAndARedChargesNoLaterLevel) {
   out = h.RunPipeline(flow_b, 0, {other}, mt, {0, 2});
   EXPECT_EQ(1u, out[0].size()) << "the red packet charged no later level";
   EXPECT_TRUE(out[2].empty());
+}
+
+// Every basis charges exactly the bytes it names. A threshold pair proves the
+// number: a committed burst equal to the charge is green, one byte less is
+// yellow. L3 parses the version itself and accepts both families; L4 counts
+// the transport segment (header + data), so the same basis charges a UDP
+// segment 12 bytes and a TCP segment 24 bytes -- it does not parse the
+// transport protocol, only the IP header's length.
+TEST_F(SessionPipelineTest, TheAccountingBasisChoosesTheChargedBytes) {
+  bess::testing::ModuleHarness h;
+  bess::testing::PacketBuilder ub;
+  const Bytes udp = ub.Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+                        .IPv4("10.1.2.3", "10.9.9.9")
+                        .Udp(1234, 80)
+                        .Payload("abcd")
+                        .Build();
+  bess::testing::PacketBuilder tb;
+  const Bytes tcp = tb.Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+                        .IPv4("10.1.2.3", "10.9.9.9")
+                        .Tcp(1234, 80)
+                        .Payload("abcd")
+                        .Build();
+  Bytes v6(66, 0);  // 14 Ethernet + 40 IPv6 + 12 bytes of payload
+  v6[12] = 0x86;
+  v6[13] = 0xdd;
+  v6[14] = 0x60;  // version 6
+  v6[18] = 0;
+  v6[19] = 12;  // payload length
+
+  int next = 0;
+  // The gate the one packet leaves on under `basis` and a committed burst of
+  // `cbs` bytes.
+  const auto gate_for = [&](bess::pb::MeterByteBasis basis, uint32_t off,
+                            const Bytes &pkt, uint32_t cbs) -> int {
+    const std::string name = "mt_basis_" + std::to_string(next++);
+    bess::pb::MeterArg marg;
+    marg.set_capacity(16);
+    marg.set_byte_basis(basis);
+    marg.set_byte_offset(off);
+    Meter *mt = static_cast<Meter *>(Create("Meter", name, Pack(marg)));
+    EXPECT_NE(nullptr, mt);
+    auto r = Apply({
+        Op::Upsert(name + "/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                   std::any(bess::meter::MeterProfileSpec{
+                       bess::meter::TrTcmSpec{1, cbs, 1'000'000, 1000}})),
+    });
+    EXPECT_EQ(Outcome::kApplied, r.outcome)
+        << (r.ops.empty() ? "" : r.ops[0].error);
+
+    bess::pb::SetMetadataArg md;
+    auto *a = md.add_attrs();
+    a->set_name("meter_id");
+    a->set_size(4);
+    a->set_value_bin(std::string("\0\0\0\x01", 4));
+    Module *writer = Create("SetMetadata", name + "_md", Pack(md));
+    EXPECT_NE(nullptr, writer);
+    EXPECT_EQ(0, ModuleGraph::ConnectModules(writer, 0, mt, 0, true));
+    auto out = h.RunPipeline(writer, 0, {pkt}, mt, {0, 1, 2});
+    for (gate_idx_t g = 0; g < 3; g++) {
+      if (!out[g].empty()) {
+        return g;
+      }
+    }
+    return 3;  // dropped
+  };
+  const auto expect_cost = [&](bess::pb::MeterByteBasis basis, uint32_t off,
+                               const Bytes &pkt, uint32_t bytes) {
+    EXPECT_EQ(0, gate_for(basis, off, pkt, bytes)) << bytes;
+    EXPECT_EQ(1, gate_for(basis, off, pkt, bytes - 1)) << bytes;
+  };
+
+  expect_cost(bess::pb::METER_BYTE_BASIS_L2, 0, udp, udp.size());
+  expect_cost(bess::pb::METER_BYTE_BASIS_L3, 14, udp, 32);   // 20 + 8 + 4
+  expect_cost(bess::pb::METER_BYTE_BASIS_L4, 14, udp, 12);     // 8 + 4
+  expect_cost(bess::pb::METER_BYTE_BASIS_L4, 14, tcp, 24);     // 20 + 4
+  expect_cost(bess::pb::METER_BYTE_BASIS_L3, 14, v6, 52);    // 40 + 12
+  expect_cost(bess::pb::METER_BYTE_BASIS_L4, 14, v6, 12);
+  expect_cost(bess::pb::METER_BYTE_BASIS_CUSTOM, 14, udp, 32);
+
+  // An empty IPv6 packet (Next Header 59) is measurable: 40 bytes at L3 and
+  // an empty transport segment at L4.
+  Bytes empty_v6(54, 0);
+  empty_v6[12] = 0x86;
+  empty_v6[13] = 0xdd;
+  empty_v6[14] = 0x60;
+  empty_v6[20] = 59;
+  expect_cost(bess::pb::METER_BYTE_BASIS_L3, 14, empty_v6, 40);
+  EXPECT_EQ(0, gate_for(bess::pb::METER_BYTE_BASIS_L4, 14, empty_v6, 1))
+      << "an empty transport segment charges 0 bytes";
+
+  // Two empty packets at a one-byte committed burst: a zero charge leaves both
+  // green; a charge of one byte would make the second yellow.
+  {
+    const std::string name = "mt_basis_empty_pair";
+    bess::pb::MeterArg marg;
+    marg.set_capacity(16);
+    marg.set_byte_basis(bess::pb::METER_BYTE_BASIS_L4);
+    marg.set_byte_offset(14);
+    Meter *mt = static_cast<Meter *>(Create("Meter", name, Pack(marg)));
+    ASSERT_NE(nullptr, mt);
+    auto r = Apply({
+        Op::Upsert(name + "/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                   std::any(bess::meter::MeterProfileSpec{
+                       bess::meter::TrTcmSpec{1, 1, 1'000'000, 1000}})),
+    });
+    ASSERT_EQ(Outcome::kApplied, r.outcome)
+        << (r.ops.empty() ? "" : r.ops[0].error);
+    bess::pb::SetMetadataArg md;
+    auto *a = md.add_attrs();
+    a->set_name("meter_id");
+    a->set_size(4);
+    a->set_value_bin(std::string("\0\0\0\x01", 4));
+    Module *writer = Create("SetMetadata", name + "_md", Pack(md));
+    ASSERT_NE(nullptr, writer);
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, mt, 0, true));
+    auto out = h.RunPipeline(writer, 0, {empty_v6, empty_v6}, mt, {0, 1, 2});
+    EXPECT_EQ(2u, out[0].size()) << "both empty segments charged 0 bytes";
+    EXPECT_TRUE(out[1].empty());
+    EXPECT_TRUE(out[2].empty());
+  }
+}
+
+// A packet the basis cannot measure is dropped when it names a meter: an
+// unknown IP version, and an offset past the frame.
+TEST_F(SessionPipelineTest, AnUnmeasurablePacketIsDropped) {
+  bess::testing::ModuleHarness h;
+  const auto run = [&](const std::string &name, bess::pb::MeterByteBasis basis,
+                       uint32_t off, const Bytes &pkt) {
+    bess::pb::MeterArg marg;
+    marg.set_capacity(16);
+    marg.set_byte_basis(basis);
+    marg.set_byte_offset(off);
+    Meter *mt = static_cast<Meter *>(Create("Meter", name, Pack(marg)));
+    EXPECT_NE(nullptr, mt);
+    auto r = Apply({
+        Op::Upsert(name + "/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                   std::any(bess::meter::MeterProfileSpec{SlowMeter(1000)})),
+    });
+    EXPECT_EQ(Outcome::kApplied, r.outcome)
+        << (r.ops.empty() ? "" : r.ops[0].error);
+    bess::pb::SetMetadataArg md;
+    auto *a = md.add_attrs();
+    a->set_name("meter_id");
+    a->set_size(4);
+    a->set_value_bin(std::string("\0\0\0\x01", 4));
+    Module *writer = Create("SetMetadata", name + "_md", Pack(md));
+    EXPECT_NE(nullptr, writer);
+    EXPECT_EQ(0, ModuleGraph::ConnectModules(writer, 0, mt, 0, true));
+    return h.RunPipeline(writer, 0, {pkt}, mt, {0, 1, 2});
+  };
+
+  auto not_ip = run("mt_bad_ip", bess::pb::METER_BYTE_BASIS_L3, 0, Bytes(64, 0));
+  EXPECT_TRUE(not_ip[0].empty());
+  EXPECT_TRUE(not_ip[1].empty());
+  EXPECT_TRUE(not_ip[2].empty()) << "a non-IP frame was forwarded unmetered";
+
+  Bytes jumbogram(54, 0);  // length 0 with a Hop-by-Hop next header
+  jumbogram[14] = 0x60;
+  jumbogram[20] = 0;
+  auto jumbo = run("mt_bad_jumbo", bess::pb::METER_BYTE_BASIS_L3, 14, jumbogram);
+  EXPECT_TRUE(jumbo[0].empty());
+  EXPECT_TRUE(jumbo[1].empty());
+  EXPECT_TRUE(jumbo[2].empty()) << "a jumbogram was metered at 40 bytes";
+
+  auto short_frame = run("mt_bad_from", bess::pb::METER_BYTE_BASIS_CUSTOM, 64,
+                         Bytes(8, 0));
+  EXPECT_TRUE(short_frame[0].empty());
+  EXPECT_TRUE(short_frame[1].empty());
+  EXPECT_TRUE(short_frame[2].empty()) << "a frame before the offset was metered";
+}
+
+// The basis and its offset are validated when the module is created.
+TEST_F(SessionPipelineTest, TheAccountingBasisIsValidated) {
+  bess::testing::ModuleHarness h;
+  bess::pb::MeterArg l2_offset;
+  l2_offset.set_byte_basis(bess::pb::METER_BYTE_BASIS_L2);
+  l2_offset.set_byte_offset(14);
+  EXPECT_NE("", h.CreateError("Meter", l2_offset));
+
+  bess::pb::MeterArg huge_offset;
+  huge_offset.set_byte_basis(bess::pb::METER_BYTE_BASIS_CUSTOM);
+  huge_offset.set_byte_offset(65536);
+  EXPECT_NE("", h.CreateError("Meter", huge_offset));
+
+  bess::pb::MeterArg unknown;
+  unknown.set_byte_basis(static_cast<bess::pb::MeterByteBasis>(7));
+  EXPECT_NE("", h.CreateError("Meter", unknown));
 }
 
 }  // namespace

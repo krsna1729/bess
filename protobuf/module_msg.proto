@@ -1308,6 +1308,21 @@ message WorkerSplitArg {
   map<uint32, uint32> worker_gates = 1; // ogate -> worker mask
 }
 
+// Which bytes a meter charges. The historical unit, and the default, is the
+// whole L2 frame. L3 counts the IP datagram (IPv4 or IPv6, parsed from the
+// version nibble at `byte_offset` if the packet carries no parsed protocol);
+// L4 counts the transport segment inside it, which is the same figure for UDP
+// and TCP (their headers are part of the segment). CUSTOM counts every frame
+// byte at or after `byte_offset` (a tunnel payload, for example). A packet the
+// chosen basis cannot measure -- a short frame, a malformed header, an
+// unknown version -- is dropped, never forwarded unmetered.
+enum MeterByteBasis {
+  METER_BYTE_BASIS_L2 = 0;      // the whole frame (total_len)
+  METER_BYTE_BASIS_L3 = 1;      // the IP datagram (IPv4 total, or IPv6 40 + payload)
+  METER_BYTE_BASIS_L4 = 2;      // the transport segment (the IP payload)
+  METER_BYTE_BASIS_CUSTOM = 3;  // frame bytes from byte_offset on
+}
+
 /**
  * The Meter module polices packets against per-session meters (K5), with the
  * meter set changed transactionally (G1.2b): the meter ids come from packet
@@ -1328,6 +1343,11 @@ message MeterArg {
   // each non-zero slot in turn (green and yellow continue, red stops). Default
   // 1, the historical one-meter packet.
   uint32 levels = 3;
+  MeterByteBasis byte_basis = 4; /// Which bytes are charged (default L2: the whole frame).
+  // The first byte the basis counts from. For IP, the offset of the IP header
+  // in the frame (0 for a bare IP packet, 14 for an untagged Ethernet frame,
+  // 18 with one VLAN tag); for FROM, the first counted byte. Must be 0 for L2.
+  uint32 byte_offset = 5;
 }
 
 /**
