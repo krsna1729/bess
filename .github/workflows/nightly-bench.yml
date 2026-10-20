@@ -1,0 +1,300 @@
+name: Nightly benchmarks
+
+# Trend-oriented benchmarks, separate from ci.yml's build-and-test matrix.
+# One x86_64 gcc runner measures a stable subset at several develop commits in
+# one job, so every comparison is between values taken on the same CPU minutes
+# apart. Nothing is compared across nights or across runners; the history
+# branch is a report, not a baseline (docs/benchmark-trends.md).
+#
+#   nightly (daily):  the last N develop commits (default 10)
+#   weekly (Sunday):  one commit per day for the last 7 days, a trendline
+#
+# A flagged commit is measured a second time in the same job before an issue
+# opens; one deduplicated issue per benchmark is opened, commented or closed.
+on:
+  schedule:
+    - cron: '47 4 * * *'   # nightly
+    - cron: '47 5 * * 0'   # weekly trendline (Sunday)
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'Which run: nightly commits, or the weekly trendline'
+        type: choice
+        options: [nightly, weekly]
+        default: nightly
+      commits:
+        description: 'Nightly: number of develop commits (10; 5 halves the run)'
+        default: '10'
+      days:
+        description: 'Weekly: number of UTC days'
+        default: '7'
+      dry_run:
+        description: 'Print the plan and commands without building or publishing'
+        type: boolean
+        default: false
+
+# A second run waits rather than cancelling the first: a cancelled run would
+# leave history without the record it just measured.
+concurrency:
+  group: nightly-bench
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # push the benchmarks history branch
+  issues: write     # open/comment/close one issue per regression
+
+env:
+  BENCH_LANE: --cc gcc-14 --cxx g++-14 --name bench --release-semantics
+  CCACHE_MAXSIZE: 2G
+  CCACHE_COMPRESS: 'true'
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  bench:
+    name: Benchmark trend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: develop
+          # Full history: the weekly plan asks for the newest commit before
+          # each UTC day's midnight, and the nightly plan walks the branch.
+          fetch-depth: 0
+
+      - name: Resolve the run's paths
+        run: |
+          {
+            echo "BENCH_TOOL=${RUNNER_TEMP}/bench-tools/bench_trend.py"
+            echo "BENCH_PROFILE=${RUNNER_TEMP}/bench-tools/ci_profile.py"
+            echo "BENCH_CONFIG=${RUNNER_TEMP}/bench-tools/bench_thresholds.json"
+            echo "RUN_DIR=${RUNNER_TEMP}/bench-run"
+            echo "HISTORY_DIR=${RUNNER_TEMP}/bench-history"
+          } >> "$GITHUB_ENV"
+
+      - name: Resolve the run's shape
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            kind='${{ inputs.kind }}'
+            commits='${{ inputs.commits }}'
+            days='${{ inputs.days }}'
+            dry='${{ inputs.dry_run }}'
+          elif [ "${SCHEDULE}" = "47 5 * * 0" ]; then
+            kind=weekly; commits=10; days=7; dry=false
+          else
+            kind=nightly; commits=10; days=7; dry=false
+          fi
+          {
+            echo "BENCH_KIND=${kind}"
+            echo "BENCH_COMMITS=${commits}"
+            echo "BENCH_DAYS=${days}"
+            echo "BENCH_DRY_RUN=${dry}"
+            echo "RUN_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "HISTORY_URL=https://github.com/${GITHUB_REPOSITORY}/blob/benchmarks/bench-history.jsonl"
+          } >> "$GITHUB_ENV"
+          echo "kind=${kind} commits=${commits} days=${days} dry_run=${dry}"
+
+      - name: Check the runner supports the CPU floor
+        run: |
+          echo "CPU=$(python3 tools/ci_profile.py cpu)" >> "$GITHUB_ENV"
+          python3 tools/ci_profile.py check-cpu
+
+      - name: Install build dependencies
+        run: |
+          sudo bash env/install-deps.sh runtime
+          sudo bash env/install-deps.sh build
+
+      - name: Cache DPDK
+        uses: actions/cache@v6
+        with:
+          path: deps
+          key: dpdk-bess-bench-x86_64-${{ env.CPU }}-${{ hashFiles('deps/dpdk.json', 'deps/dpdk-patches/**', 'tools/bootstrap_dpdk.py') }}
+
+      # The per-commit loop rebuilds the same targets with a different source
+      # tree; ccache makes commits that touch one subsystem cheap.
+      - name: Locate the compiler cache
+        run: echo "CCACHE_DIR=${{ runner.temp }}/ccache" >> "$GITHUB_ENV"
+
+      - name: Restore compiler output
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-bench-x86_64-${{ github.run_id }}
+          restore-keys: ccache-bench-x86_64-
+
+      # The orchestration tools are copied out of the checkout: the loop then
+      # checks out older commits, and the copy keeps driving the run while the
+      # tree under it changes.
+      - name: Keep the orchestration tools stable
+        run: |
+          mkdir -p "$(dirname "$BENCH_TOOL")" "$RUN_DIR"
+          cp tools/bench_trend.py tools/ci_profile.py tools/bench_thresholds.json \
+            "$(dirname "$BENCH_TOOL")/"
+          echo "BENCH_TARGETS=$(python3 "$BENCH_TOOL" targets)" >> "$GITHUB_ENV"
+
+      - name: Bootstrap pinned DPDK
+        run: |
+          if [ "${BENCH_DRY_RUN}" = "true" ]; then
+            echo "+ python3 \"$BENCH_PROFILE\" bootstrap $BENCH_LANE --root \"$GITHUB_WORKSPACE\""
+            echo "+ PKG_CONFIG_PATH=<bootstrap --print-pkg-config-path> pkg-config --variable=libdir libdpdk"
+            exit 0
+          fi
+          python3 "$BENCH_PROFILE" bootstrap $BENCH_LANE --root "$GITHUB_WORKSPACE"
+
+      - name: Record the DPDK library path
+        if: env.BENCH_DRY_RUN != 'true'
+        run: |
+          libdir="$(PKG_CONFIG_PATH="$(python3 tools/bootstrap_dpdk.py --variant bench --print-pkg-config-path)" \
+            pkg-config --variable=libdir libdpdk)"
+          echo "BENCH_DPDK_LIBDIR=${libdir}" >> "$GITHUB_ENV"
+          echo "DPDK libdir: ${libdir}"
+
+      - name: Plan the run
+        run: |
+          python3 "$BENCH_TOOL" --repo "$GITHUB_WORKSPACE" plan \
+            --kind "$BENCH_KIND" --ref develop \
+            --commits "$BENCH_COMMITS" --days "$BENCH_DAYS" \
+            --out "$RUN_DIR/run.json" --shas > "$RUN_DIR/shas.txt"
+          echo "Commits this run measures:"
+          cat "$RUN_DIR/shas.txt"
+
+      # One tree, checked out commit by commit: DPDK stays bootstrapped and
+      # Meson/ccache reuse everything the previous commit did not change.
+      # `ci_profile.py bench-build` is the compiler authority; it configures
+      # with the gcc lane's pinned compiler and compiles only the subset.
+      - name: Build and measure each commit
+        run: |
+          while IFS= read -r sha; do
+            [ -n "$sha" ] || continue
+            echo "::group::bench ${sha}"
+            if [ "${BENCH_DRY_RUN}" = "true" ]; then
+              python3 "$BENCH_TOOL" --repo "$GITHUB_WORKSPACE" run-one \
+                --run "$RUN_DIR/run.json" --commit "$sha" \
+                --build-dir "$GITHUB_WORKSPACE/build/bench" --dry-run
+              echo "::endgroup::"
+              continue
+            fi
+            git -C "$GITHUB_WORKSPACE" checkout -q --detach "$sha"
+            python3 "$BENCH_PROFILE" bench-build $BENCH_LANE \
+              --root "$GITHUB_WORKSPACE" --bench-targets $BENCH_TARGETS
+            LD_LIBRARY_PATH="${BENCH_DPDK_LIBDIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+              python3 "$BENCH_TOOL" --repo "$GITHUB_WORKSPACE" run-one \
+                --run "$RUN_DIR/run.json" --commit "$sha" \
+                --build-dir "$GITHUB_WORKSPACE/build/bench"
+            echo "::endgroup::"
+          done < "$RUN_DIR/shas.txt"
+          if [ "${BENCH_DRY_RUN}" != "true" ]; then
+            git -C "$GITHUB_WORKSPACE" checkout -q develop
+          fi
+
+      - name: Compare commits inside this run
+        if: success() && env.BENCH_DRY_RUN != 'true'
+        run: |
+          python3 "$BENCH_TOOL" analyze --run "$RUN_DIR/run.json" \
+            --out "$RUN_DIR/verdicts.json" --config "$BENCH_CONFIG"
+
+      # "Reproduces on a second run" means a second sample on this runner now:
+      # the candidate commit is checked out again, rebuilt (incremental) and
+      # measured once more before any issue can open.
+      - name: Confirm flagged commits with a second sample
+        if: success() && env.BENCH_DRY_RUN != 'true'
+        run: |
+          mapfile -t rerun < <(python3 "$BENCH_TOOL" rerun-shas \
+            --verdicts "$RUN_DIR/verdicts.json")
+          if [ "${#rerun[@]}" -eq 0 ]; then
+            echo "No commit needs a confirmation run"
+            exit 0
+          fi
+          for sha in "${rerun[@]}"; do
+            echo "::group::confirm ${sha}"
+            git -C "$GITHUB_WORKSPACE" checkout -q --detach "$sha"
+            python3 "$BENCH_PROFILE" bench-build $BENCH_LANE \
+              --root "$GITHUB_WORKSPACE" --bench-targets $BENCH_TARGETS
+            LD_LIBRARY_PATH="${BENCH_DPDK_LIBDIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+              python3 "$BENCH_TOOL" --repo "$GITHUB_WORKSPACE" run-one \
+                --run "$RUN_DIR/run.json" --commit "$sha" --confirm \
+                --build-dir "$GITHUB_WORKSPACE/build/bench"
+            echo "::endgroup::"
+          done
+          git -C "$GITHUB_WORKSPACE" checkout -q develop
+          python3 "$BENCH_TOOL" analyze --run "$RUN_DIR/run.json" \
+            --out "$RUN_DIR/verdicts.json" --config "$BENCH_CONFIG"
+
+      - name: Check out the history branch
+        if: success() && env.BENCH_DRY_RUN != 'true'
+        run: |
+          git fetch origin benchmarks --depth=1 || true
+          if git rev-parse --verify -q origin/benchmarks >/dev/null; then
+            git worktree add --detach "$HISTORY_DIR" origin/benchmarks
+          else
+            # First run: create the orphan branch the history lives on.
+            git worktree add --detach "$HISTORY_DIR" HEAD
+            git -C "$HISTORY_DIR" checkout -q --orphan benchmarks
+            git -C "$HISTORY_DIR" rm -rfq --cached . || true
+            find "$HISTORY_DIR" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          fi
+
+      - name: Open, update or close one issue per benchmark
+        if: success() && env.BENCH_DRY_RUN != 'true'
+        run: |
+          gh label create bench-regression --repo "$GITHUB_REPOSITORY" \
+            --color BFD4F2 --description "Nightly benchmark regression" \
+            2>/dev/null || true
+          gh issue list --repo "$GITHUB_REPOSITORY" --label bench-regression \
+            --state open --limit 200 --json number,title,body,labels,comments \
+            > "$RUN_DIR/open-issues.json"
+          python3 "$BENCH_TOOL" issues \
+            --verdicts "$RUN_DIR/verdicts.json" \
+            --history "$HISTORY_DIR/bench-history.jsonl" \
+            --open-issues "$RUN_DIR/open-issues.json" \
+            --out "$RUN_DIR/actions.json" \
+            --github-repo "$GITHUB_REPOSITORY" \
+            --history-url "$HISTORY_URL" --run-url "$RUN_URL" --apply
+
+      - name: Append the run to the history
+        if: success() && env.BENCH_DRY_RUN != 'true'
+        run: |
+          python3 "$BENCH_TOOL" history --run "$RUN_DIR/run.json" \
+            --verdicts "$RUN_DIR/verdicts.json" \
+            --history "$HISTORY_DIR/bench-history.jsonl" --run-url "$RUN_URL"
+          git -C "$HISTORY_DIR" add bench-history.jsonl
+          if git -C "$HISTORY_DIR" diff --cached --quiet; then
+            echo "History unchanged"
+            exit 0
+          fi
+          git -C "$HISTORY_DIR" -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "bench: ${BENCH_KIND} run $(date -u +%Y-%m-%dT%H:%MZ)"
+          if git -C "$HISTORY_DIR" rev-parse --verify -q origin/benchmarks >/dev/null; then
+            for attempt in 1 2 3; do
+              git -C "$HISTORY_DIR" fetch origin benchmarks --depth=1 || true
+              if git -C "$HISTORY_DIR" rebase origin/benchmarks \
+                  && git -C "$HISTORY_DIR" push origin HEAD:benchmarks; then
+                exit 0
+              fi
+              git -C "$HISTORY_DIR" rebase --abort 2>/dev/null || true
+              sleep $((attempt * 10))
+            done
+            echo "::error::could not push the benchmarks history branch"
+            exit 1
+          fi
+          git -C "$HISTORY_DIR" push origin HEAD:benchmarks
+
+      - name: Save compiler output
+        if: success() && env.BENCH_DRY_RUN != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-bench-x86_64-${{ github.run_id }}
+
+      - name: Upload the run record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-run-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bench-run/run.json
+            ${{ runner.temp }}/bench-run/verdicts.json
+          if-no-files-found: ignore

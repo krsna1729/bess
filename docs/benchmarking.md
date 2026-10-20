@@ -3,6 +3,12 @@
 How to produce numbers that can be trusted and compared. Decisions in
 [decisions.md](decisions.md) cite benchmarks run this way (D-016).
 
+CI's nightly benchmark workflow measures a fixed subset at several `develop`
+commits in one job and flags within-run regressions; see
+[benchmark-trends.md](benchmark-trends.md) for the workflow, thresholds and
+the `benchmarks` history branch. The rest of this document is for manual,
+comparable A/B measurement.
+
 ## Build
 
 - Benchmark a **release** build compiled for the machine you measure on:

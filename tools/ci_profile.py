@@ -13,6 +13,9 @@ defined here and nowhere else.
     tools/ci_profile.py info --compiler clang    # resolved setup and divergences
     tools/ci_profile.py build --compiler gcc     # one step (they are re-runnable)
     tools/ci_profile.py check-cpu                # does this CPU meet the floor?
+    tools/ci_profile.py bench-build --compiler gcc --name bench --release-semantics \
+        --bench-targets $(tools/bench_trend.py targets)   # one benchmark subset
+    tools/ci_profile.py test --compiler gcc --root /path/to/tree  # another tree
 
 Steps, in CI order: bootstrap (DPDK), configure, build, verify-dpdk, layers,
 test, verify-install, clean-tree. `all` runs them in that order. clean-tree
@@ -20,6 +23,11 @@ fails if the build or the tests left the source tree changed (a modified or
 untracked, non-ignored file): a build writes only to its build directory. Run
 alone it requires a clean tree; under `all` it compares with the tree as `all`
 found it, so uncommitted work of your own is not blamed on the build.
+`bench-build` (not part of `all`) configures and compiles only the named
+benchmark targets; the nightly benchmark workflow uses it for each commit
+(docs/benchmark-trends.md). `--root` points every path at another working
+tree, so a stable copy of this script can drive that loop while the tree
+under it is checked out to older commits.
 
 The CPU floor is per architecture (CPU_FLOOR): the machine's architecture picks
 it, for BESS (-Dcpu) and for DPDK (tools/bootstrap_dpdk.py). `--arch` shows
@@ -253,11 +261,13 @@ class Setup:
             self.name = args.name or (f'ci-{family}' + ('-generic' if self.arch_generic else '')
                                       + ('-release' if self.release_semantics else '')
                                       + SANITIZERS.get(self.sanitize, ''))
-        self.build_dir = ROOT / 'build' / self.name
-        self.stage = ROOT / 'build' / f'stage-{self.name}'
-        self.standalone = ROOT / 'build' / f'standalone-{self.name}'
-        self.sdk_client = ROOT / 'build' / f'sdk-client-{self.name}'
-        self.stage_pkgconfig = ROOT / 'build' / f'stage-pkgconfig-{self.name}'
+        self.root = Path(args.root).resolve() if args.root else ROOT
+        self.build_dir = self.root / 'build' / self.name
+        self.stage = self.root / 'build' / f'stage-{self.name}'
+        self.standalone = self.root / 'build' / f'standalone-{self.name}'
+        self.sdk_client = self.root / 'build' / f'sdk-client-{self.name}'
+        self.stage_pkgconfig = self.root / 'build' / f'stage-pkgconfig-{self.name}'
+        self.bench_targets = args.bench_targets or []
         self.variant = self.name
         jobs = args.jobs or (4 if self.in_ci else min(LOCAL_JOB_CAP, os.cpu_count() or 1))
         if not self.in_ci and jobs > LOCAL_JOB_CAP:
@@ -285,17 +295,17 @@ class Setup:
         except (OSError, subprocess.CalledProcessError):
             return 'not installed'
 
-    def run(self, command, env=None, cwd=ROOT, **kwargs):
+    def run(self, command, env=None, cwd=None, **kwargs):
         shown = ' '.join(str(c) for c in command)
         print(f'+ {shown}', flush=True)
         if self.dry_run:
             return subprocess.CompletedProcess(command, 0, '', '')
         return subprocess.run([str(c) for c in command], env=env or self.env,
-                              cwd=cwd, check=True, **kwargs)
+                              cwd=cwd or self.root, check=True, **kwargs)
 
     def dpdk_pkgconfig(self):
         out = subprocess.run(
-            [sys.executable, ROOT / 'tools' / 'bootstrap_dpdk.py',
+            [sys.executable, self.root / 'tools' / 'bootstrap_dpdk.py',
              '--variant', self.variant, '--print-pkg-config-path'],
             capture_output=True, text=True, check=True, env=self.env)
         return out.stdout.strip()
@@ -317,7 +327,7 @@ class Setup:
 
 
 def step_bootstrap(s):
-    s.run([sys.executable, ROOT / 'tools' / 'bootstrap_dpdk.py',
+    s.run([sys.executable, s.root / 'tools' / 'bootstrap_dpdk.py',
            '--af-xdp', 'required', '--cpu', s.cpu, '--profile', DPDK_PROFILE,
            '--variant', s.variant, '-j', s.jobs])
 
@@ -332,6 +342,36 @@ def step_configure(s):
 
 def step_build(s):
     s.run(['meson', 'compile', '-C', s.build_dir, '-j', s.jobs],
+          env=s.env_with_dpdk())
+
+
+def step_bench_build(s):
+    """Configure and compile only the benchmark targets one run measures.
+
+    The nightly benchmark workflow and its per-commit loop configure with this
+    script's compiler and Meson options (the same authority as a lane) but
+    compile the selected executable targets, not the whole tree:
+    `tools/bench_trend.py targets` prints them. A target an older commit does
+    not have (the commit predates that benchmark) is skipped with a warning:
+    the run records fewer instances instead of losing the whole timeline.
+    """
+    step_configure(s)
+    targets = list(s.bench_targets or ['benchmarks'])
+    if s.bench_targets and not s.dry_run:
+        targets_json = subprocess.run(
+            ['meson', 'introspect', str(s.build_dir), '--targets'],
+            capture_output=True, text=True, check=True, env=s.env_with_dpdk()).stdout
+        known = {target['name'] for target in json.loads(targets_json)}
+        present = [t for t in targets if t.rsplit('/', 1)[-1] in known]
+        missing = sorted(set(targets) - set(present))
+        if missing:
+            print(f'bench-build: not defined by this commit: {", ".join(missing)}',
+                  file=sys.stderr)
+        targets = present
+    if not targets:
+        print('bench-build: no requested target exists in this commit')
+        return
+    s.run(['meson', 'compile', '-C', s.build_dir, '-j', s.jobs, *targets],
           env=s.env_with_dpdk())
 
 
@@ -350,15 +390,15 @@ def step_verify_dpdk(s):
 
 
 def step_layers(s):
-    s.run([sys.executable, ROOT / 'tools' / 'check_includes.py', '--self-test'])
-    s.run([sys.executable, ROOT / 'tools' / 'check_includes.py'])
-    s.run([sys.executable, ROOT / 'tools' / 'check_arch.py', '--self-test'])
-    s.run([sys.executable, ROOT / 'tools' / 'check_arch.py'])
-    s.run([sys.executable, ROOT / 'tools' / 'check_limits.py', '--self-test'])
-    s.run([sys.executable, ROOT / 'tools' / 'check_limits.py'])
+    s.run([sys.executable, s.root / 'tools' / 'check_includes.py', '--self-test'])
+    s.run([sys.executable, s.root / 'tools' / 'check_includes.py'])
+    s.run([sys.executable, s.root / 'tools' / 'check_arch.py', '--self-test'])
+    s.run([sys.executable, s.root / 'tools' / 'check_arch.py'])
+    s.run([sys.executable, s.root / 'tools' / 'check_limits.py', '--self-test'])
+    s.run([sys.executable, s.root / 'tools' / 'check_limits.py'])
     # The local DPDK patch series (D-131): names, trailers, and that it
     # applies in order to a pristine extraction.
-    s.run([sys.executable, ROOT / 'tools' / 'bootstrap_dpdk.py', '--check-patches'])
+    s.run([sys.executable, s.root / 'tools' / 'bootstrap_dpdk.py', '--check-patches'])
 
 
 def symbolizer():
@@ -384,7 +424,7 @@ def step_test(s):
         # process-lifetime descriptor tables for a dlopen()ed plugin (D-142).
         # Leak suppressions are LSan's, and ASan rejects a file that has them
         # ("failed to parse suppressions"), so they go in LSAN_OPTIONS.
-        env['LSAN_OPTIONS'] = ('suppressions=' + str(ROOT / 'tools' / 'lsan.supp'))
+        env['LSAN_OPTIONS'] = ('suppressions=' + str(s.root / 'tools' / 'lsan.supp'))
         env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1:external_symbolizer_path=' + symbolizer()
         s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs',
                '--no-suite', 'live',
@@ -393,24 +433,25 @@ def step_test(s):
     if s.sanitize == 'thread':
         step_test_tsan(s)
         return
-    # Benchmarks are built in every lane; pull requests do not run them (at
-    # 0.001 s per case they measure nothing, and their setup was 80% of the
-    # test step). Pushes and the nightly run execute them.
+    # Benchmarks are built in every lane but never run here: the benchmark
+    # trend job (.github/workflows/nightly-bench.yml) owns the timings, and at
+    # 0.001 s per case a push's run measured nothing anyway (their setup was
+    # 80% of the test step). A local `test` still runs them, as it always has.
     skip = (['--no-suite', 'benchmarks']
-            if os.environ.get('GITHUB_EVENT_NAME') == 'pull_request' else [])
+            if os.environ.get('GITHUB_ACTIONS') == 'true' else [])
     s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs', *skip],
           env=s.env_with_dpdk())
 
 
 def step_test_tsan(s):
     env = s.env_with_dpdk()
-    env['TSAN_OPTIONS'] = ('suppressions=' + str(ROOT / 'tools/sanitizers/tsan.supp')
+    env['TSAN_OPTIONS'] = ('suppressions=' + str(s.root / 'tools/sanitizers/tsan.supp')
                            + ' halt_on_error=1 second_deadlock_stack=1'
                            + ' external_symbolizer_path=' + symbolizer())
     env['LD_LIBRARY_PATH'] = os.pathsep.join(
         filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))
     tests = []
-    for line in (ROOT / 'tools/sanitizers/tsan_tests.txt').read_text().splitlines():
+    for line in (s.root / 'tools/sanitizers/tsan_tests.txt').read_text().splitlines():
         line = line.split('#', 1)[0].strip()
         if line:
             name, *rest = line.split()
@@ -460,7 +501,7 @@ def step_verify_install(s):
     env['PKG_CONFIG_PATH'] = os.pathsep.join([str(staged_pc), env['PKG_CONFIG_PATH']])
     env['CXX'] = s.env['CXX']
     include = stage_prefix / 'include/bess'
-    s.run([sys.executable, ROOT / 'tools' / 'check_installed_headers.py',
+    s.run([sys.executable, s.root / 'tools' / 'check_installed_headers.py',
            '--include-dir', include / 'core', '--march', s.cpu], env=env)
     # A fresh builddir: a configured one keeps the bess-dev it resolved before.
     shutil.rmtree(s.standalone, ignore_errors=True)
@@ -531,37 +572,37 @@ def step_verify_install(s):
     check_plugins(s.standalone, 'ConformancePlugins')
     # The reference appliances (M24), built from the installed tree as plugins;
     # their graph path moves packets and their direct path passes self_test.
-    appliances = ROOT / 'build' / f'appliances-{s.name}'
+    appliances = s.root / 'build' / f'appliances-{s.name}'
     shutil.rmtree(appliances, ignore_errors=True)
     s.run(['meson', 'setup', appliances, 'examples/appliances'], env=env)
     s.run(['meson', 'compile', '-C', appliances], env=env)
     check_plugins(appliances, 'Appliances')
     # A third-party library on the installed primitives, built and tested
     # without bessd (M23, persona E).
-    battery = ROOT / 'build' / f'battery-{s.name}'
+    battery = s.root / 'build' / f'battery-{s.name}'
     shutil.rmtree(battery, ignore_errors=True)
     s.run(['meson', 'setup', battery, 'examples/sdk_battery'], env=env)
     s.run(['meson', 'test', '-C', battery, '--print-errorlogs'], env=env)
     # R1's application as a program without bessd, linked from the installed
     # route, dataplane and RCU archives and DPDK (D-095); it forwards a frame.
-    static_router = ROOT / 'build' / f'static-router-{s.name}'
+    static_router = s.root / 'build' / f'static-router-{s.name}'
     shutil.rmtree(static_router, ignore_errors=True)
     s.run(['meson', 'setup', static_router, 'examples/static_router'], env=env)
     s.run(['meson', 'test', '-C', static_router, '--print-errorlogs'],
           env={**env, 'LD_LIBRARY_PATH': os.pathsep.join(
               filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
     # API samples, one per public library, compiled from the install (M23).
-    samples = ROOT / 'build' / f'samples-{s.name}'
+    samples = s.root / 'build' / f'samples-{s.name}'
     shutil.rmtree(samples, ignore_errors=True)
     s.run(['meson', 'setup', samples, 'examples/sdk_samples'], env=env)
     s.run(['meson', 'compile', '-C', samples], env=env)
 
 
-def tree_state():
+def tree_state(root=ROOT):
     """{path: content hash} of every modified or untracked non-ignored file."""
     out = subprocess.run(
         ['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
-        cwd=ROOT, capture_output=True, check=True).stdout.decode()
+        cwd=root, capture_output=True, check=True).stdout.decode()
     state = {}
     fields = out.split('\0')
     i = 0
@@ -573,7 +614,7 @@ def tree_state():
         path = entry[3:]
         if entry[0] in 'RC':
             i += 1  # the origin path of a rename or copy follows
-        file = ROOT / path
+        file = root / path
         state[path] = (hashlib.sha256(file.read_bytes()).hexdigest()
                        if file.is_file() else 'absent')
     return state
@@ -583,7 +624,7 @@ def step_clean_tree(s):
     if s.dry_run:
         print('+ git status --porcelain (fails if the build changed the source tree)')
         return
-    now = tree_state()
+    now = tree_state(s.root)
     changed = {path for path in now.keys() | s.tree_before.keys()
                if now.get(path) != s.tree_before.get(path)}
     if changed:
@@ -601,9 +642,9 @@ def step_tidy(s):
     if s.sanitize != 'address':
         print('skipped: clang-tidy runs in the clang-asan lane')
         return
-    s.run([sys.executable, ROOT / 'tools' / 'check_tidy.py', '--self-test'])
+    s.run([sys.executable, s.root / 'tools' / 'check_tidy.py', '--self-test'])
     files = []
-    changed = pull_request_changes()
+    changed = pull_request_changes(s.root)
     if changed is not None:
         if any(path.endswith(('.h', '.hh', '.hpp')) for path in changed) or any(
                 Path(path).name in ('meson.build', '.clang-tidy', 'tidy_baseline.json',
@@ -616,16 +657,16 @@ def step_tidy(s):
                 return
             print(f'tidy: the {len(sources)} changed source(s) only (pushes check all)')
             files = ['--files', '|'.join(re.escape(path) + '$' for path in sources)]
-    s.run([sys.executable, ROOT / 'tools' / 'check_tidy.py', '--build-dir', s.build_dir,
+    s.run([sys.executable, s.root / 'tools' / 'check_tidy.py', '--build-dir', s.build_dir,
            '--jobs', s.jobs, '--strict', *files], env=s.env_with_dpdk())
 
 
-def pull_request_changes():
+def pull_request_changes(root=ROOT):
     """The files a pull request changes, or None outside one. CI checks out
     the merge commit, whose first parent is the base branch tip."""
     if os.environ.get('GITHUB_EVENT_NAME') != 'pull_request':
         return None
-    out = subprocess.run(['git', 'diff', '--name-only', 'HEAD^1', 'HEAD'], cwd=ROOT,
+    out = subprocess.run(['git', 'diff', '--name-only', 'HEAD^1', 'HEAD'], cwd=root,
                          capture_output=True, text=True)
     if out.returncode != 0:
         print('could not list the pull request\'s changes; checking everything')
@@ -658,12 +699,12 @@ def step_live_perf(s):
     if s.dry_run:
         print('+ ' + ' '.join(str(c) for c in cmd))
         return
-    result = subprocess.run([str(c) for c in cmd], env=env, cwd=ROOT)
+    result = subprocess.run([str(c) for c in cmd], env=env, cwd=s.root)
     if result.returncode != 0:
         print(f'live-perf: exited {result.returncode} (report-only, not a failure)')
 
 
-EXTRA_STEPS = [('live-perf', step_live_perf)]
+EXTRA_STEPS = [('live-perf', step_live_perf), ('bench-build', step_bench_build)]
 
 
 # The release job (publish-release in ci.yml): a static standalone bessd built
@@ -686,7 +727,7 @@ def release_meson_options(s):
 
 
 def step_release_bootstrap(s):
-    s.run([sys.executable, ROOT / 'tools' / 'bootstrap_dpdk.py',
+    s.run([sys.executable, s.root / 'tools' / 'bootstrap_dpdk.py',
            '--af-xdp', 'required', '--cpu', s.cpu, '--profile', 'full',
            '--variant', s.variant, '-j', s.jobs])
 
@@ -734,7 +775,7 @@ def step_release_verify(s):
 
 
 def client_build_dir(s):
-    return ROOT / 'build' / f'client-{s.name}'
+    return s.root / 'build' / f'client-{s.name}'
 
 
 def step_release_client(s):
@@ -901,6 +942,13 @@ def main():
     parser.add_argument('--cc')
     parser.add_argument('--cxx')
     parser.add_argument('--name', help='lane name (build/<name>)')
+    parser.add_argument('--root',
+                        help='working tree to configure and build (default: the one '
+                             'containing this script); bench-build uses it to drive a '
+                             'per-commit benchmark loop from a stable copy of the tool')
+    parser.add_argument('--bench-targets', nargs='+',
+                        help='bench-build: Meson target names (default: the whole '
+                             'benchmarks run_target)')
     parser.add_argument('--arch', choices=sorted(CPU_FLOOR),
                         help='show another architecture (only with --dry-run or info)')
     parser.add_argument('--arch-generic', action='store_true',
@@ -936,7 +984,7 @@ def main():
         info(s)
         return 0
     if args.step == 'all' and not args.dry_run:
-        s.tree_before = tree_state()
+        s.tree_before = tree_state(s.root)
     groups = {'all': STEPS, 'release': RELEASE_STEPS}
     for name, function in STEPS + RELEASE_STEPS + EXTRA_STEPS:
         if args.step == name or name in [n for n, _ in groups.get(args.step, [])]:
