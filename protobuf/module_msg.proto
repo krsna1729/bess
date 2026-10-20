@@ -1348,6 +1348,16 @@ message MeterArg {
   // in the frame (0 for a bare IP packet, 14 for an untagged Ethernet frame,
   // 18 with one VLAN tag); for FROM, the first counted byte. Must be 0 for L2.
   uint32 byte_offset = 5;
+  // What one packet is charged. Bytes is the historical unit (and what a
+  // bit-rate QER's MBR/GBR mean); Packets makes the same buckets count
+  // packets, so a profile of `peak_rate: 1000` is 1000 packets a second -- the
+  // unit of the QER's Packet Rate (8.2.63) and the serving-PLMN rate control.
+  // With PACKETS the basis and its offset are unused.
+  enum MeterCost {
+    METER_COST_BYTES = 0;
+    METER_COST_PACKETS = 1;
+  }
+  MeterCost cost = 6;
 }
 
 /**

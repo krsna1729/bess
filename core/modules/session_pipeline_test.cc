@@ -108,7 +108,9 @@ Router *CreateRouterModule(const std::string &name,
 
 Meter *CreateMeterModule(const std::string &name, uint64_t capacity,
                          const std::string &id_attr = "",
-                         uint32_t levels = 0) {
+                         uint32_t levels = 0,
+                         bess::pb::MeterArg::MeterCost cost =
+                             bess::pb::MeterArg::METER_COST_BYTES) {
   bess::pb::MeterArg arg;
   arg.set_capacity(capacity);
   if (!id_attr.empty()) {
@@ -117,6 +119,7 @@ Meter *CreateMeterModule(const std::string &name, uint64_t capacity,
   if (levels != 0) {
     arg.set_levels(levels);
   }
+  arg.set_cost(cost);
   return static_cast<Meter *>(Create("Meter", name, Pack(arg)));
 }
 
@@ -2032,6 +2035,76 @@ TEST_F(SessionPipelineTest, TheAccountingBasisIsValidated) {
   bess::pb::MeterArg unknown;
   unknown.set_byte_basis(static_cast<bess::pb::MeterByteBasis>(7));
   EXPECT_NE("", h.CreateError("Meter", unknown));
+}
+
+// A packet-rate meter charges one unit per packet, whatever its length: a
+// two-packet burst admits two 60-byte frames. A byte meter with the same
+// profile would refuse the first (60 bytes against a burst of 2).
+TEST_F(SessionPipelineTest, APacketRateMeterChargesOneUnitPerPacket) {
+  bess::pb::SetMetadataArg md_arg;
+  auto *writes = md_arg.add_attrs();
+  writes->set_name("meter_id");
+  writes->set_size(4);
+  writes->set_value_bin(std::string("\x00\x00\x00\x01", 4));
+  Module *md = Create("SetMetadata", "md_cost", Pack(md_arg));
+  Meter *mt = CreateMeterModule("mt_cost", 64, "", 0,
+                                bess::pb::MeterArg::METER_COST_PACKETS);
+  ASSERT_NE(nullptr, md);
+  ASSERT_NE(nullptr, mt);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(md, 0, mt, 0, true));
+
+  auto r = Apply({Op::Upsert("mt_cost/meters",
+                             bess::dataplane::EncodeKey(MeterId(1)),
+                             std::any(bess::meter::MeterProfileSpec{SlowMeter(2)}))});
+  ASSERT_EQ(Outcome::kApplied, r.outcome)
+      << (r.ops.empty() ? "" : r.ops[0].error);
+
+  std::random_device rd;
+  std::mt19937 rng{rd()};
+  const auto first = SessionPacket("10.1.2.3", 1234, rng);
+  const auto second = SessionPacket("10.1.2.3", 1234, rng);
+  const auto third = SessionPacket("10.1.2.3", 1234, rng);
+  bess::testing::ModuleHarness h;
+
+  auto out = h.RunPipeline(md, 0, {first, second}, mt, {0, 2});
+  EXPECT_EQ(2u, out[0].size()) << "two packets fit a two-packet burst";
+  EXPECT_TRUE(out[2].empty());
+
+  out = h.RunPipeline(md, 0, {third}, mt, {0, 2});
+  EXPECT_TRUE(out[0].empty());
+  ASSERT_EQ(1u, out[2].size()) << "the third is over the burst";
+}
+
+// A packet-rate meter charges one unit for any frame: the byte basis that
+// would fail a non-IP frame closed in byte mode is not consulted.
+TEST_F(SessionPipelineTest, APacketRateMeterIgnoresTheByteBasis) {
+  bess::pb::SetMetadataArg md_arg;
+  auto *writes = md_arg.add_attrs();
+  writes->set_name("meter_id");
+  writes->set_size(4);
+  writes->set_value_bin(std::string("\x00\x00\x00\x01", 4));
+  Module *md = Create("SetMetadata", "md_cost_basis", Pack(md_arg));
+  bess::pb::MeterArg marg;
+  marg.set_capacity(64);
+  marg.set_cost(bess::pb::MeterArg::METER_COST_PACKETS);
+  marg.set_byte_basis(bess::pb::METER_BYTE_BASIS_L3);
+  Meter *mt = static_cast<Meter *>(Create("Meter", "mt_cost_basis", Pack(marg)));
+  ASSERT_NE(nullptr, md);
+  ASSERT_NE(nullptr, mt);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(md, 0, mt, 0, true));
+
+  auto r = Apply(
+      {Op::Upsert("mt_cost_basis/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                  std::any(bess::meter::MeterProfileSpec{SlowMeter(1)}))});
+  ASSERT_EQ(Outcome::kApplied, r.outcome)
+      << (r.ops.empty() ? "" : r.ops[0].error);
+
+  // A frame with no IP header: unmeasurable under the L3 basis, and still one
+  // packet to a packet-rate meter.
+  bess::testing::ModuleHarness h;
+  auto out = h.RunPipeline(md, 0, {Bytes(64, 0)}, mt, {0, 2});
+  EXPECT_EQ(1u, out[0].size()) << "the non-IP frame is one packet";
+  EXPECT_TRUE(out[2].empty());
 }
 
 }  // namespace
