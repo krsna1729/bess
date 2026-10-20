@@ -263,6 +263,14 @@ PacketHandle PacketClone(PacketHandle src);
 // facilities. BESS's private metadata is not copied.
 PacketHandle PacketCopy(PacketHandle src);
 
+// The same two operations, with BESS's private metadata (SNBUF_METADATA
+// bytes) copied from the source. The scratchpad is not copied in either
+// direction. A module that mirrors a packet -- a replicate, a flood -- chooses
+// one of these explicitly rather than inheriting a hidden copy rule; DPDK
+// allocation failure returns nullptr, and a clone shares the payload.
+PacketHandle PacketCloneWithMetadata(PacketHandle src);
+PacketHandle PacketCopyWithMetadata(PacketHandle src);
+
 // Defined here because both PacketRef and PacketBatch must be complete.
 inline PacketRef PacketBatch::packet(size_t i) { return PacketRef(handles()[i]); }
 

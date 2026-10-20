@@ -5,6 +5,7 @@
 #include "packet.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 
@@ -36,6 +37,30 @@ PacketHandle PacketClone(PacketHandle src) {
 PacketHandle PacketCopy(PacketHandle src) {
   DCHECK(src != nullptr);
   return rte_pktmbuf_copy(src, src->pool, 0, src->pkt_len);
+}
+
+namespace {
+
+// The private area starts with the metadata; the scratchpad after it is
+// the module's own and is deliberately left zeroed on the new packet.
+void CopyMetadata(PacketHandle src, PacketHandle dst) {
+  if (dst != nullptr) {
+    std::memcpy(rte_mbuf_to_priv(dst), rte_mbuf_to_priv(src), SNBUF_METADATA);
+  }
+}
+
+}  // namespace
+
+PacketHandle PacketCloneWithMetadata(PacketHandle src) {
+  PacketHandle dst = PacketClone(src);
+  CopyMetadata(src, dst);
+  return dst;
+}
+
+PacketHandle PacketCopyWithMetadata(PacketHandle src) {
+  PacketHandle dst = PacketCopy(src);
+  CopyMetadata(src, dst);
+  return dst;
 }
 
 std::string PacketRef::Dump() const {

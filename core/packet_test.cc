@@ -187,6 +187,33 @@ TEST(PacketCopyTest, CopiesBytesWithoutBessPrivateMetadata) {
   bess::PacketFree(src);
 }
 
+// The explicit variants carry the private metadata; the payload-only ones
+// above leave it zeroed. The scratchpad is never copied.
+TEST(PacketCopyTest, CopyAndCloneWithMetadataCarryThePrivateBytes) {
+  bess::PlainPacketPool pool(16);
+  bess::PacketHandle src = pool.Alloc();
+  ASSERT_NE(src, nullptr);
+  bess::PacketRef src_ref(src);
+  ASSERT_NE(src_ref.append(4), nullptr);
+  src_ref.metadata<uint32_t *>()[0] = 0x12345678;
+  src_ref.scratchpad<uint32_t *>()[0] = 0x9abcdef0;
+
+  bess::PacketHandle copied = bess::PacketCopyWithMetadata(src);
+  ASSERT_NE(copied, nullptr);
+  bess::PacketRef copied_ref(copied);
+  EXPECT_EQ(copied_ref.metadata<uint32_t *>()[0], 0x12345678);
+  EXPECT_EQ(copied_ref.scratchpad<uint32_t *>()[0], 0) << "scratch is not copied";
+  bess::PacketFree(copied);
+
+  bess::PacketHandle cloned = bess::PacketCloneWithMetadata(src);
+  ASSERT_NE(cloned, nullptr);
+  bess::PacketRef cloned_ref(cloned);
+  EXPECT_EQ(cloned_ref.metadata<uint32_t *>()[0], 0x12345678);
+  bess::PacketFree(cloned);
+
+  bess::PacketFree(src);
+}
+
 TEST(PacketCopyTest, CopiesChainedBytesIntoIndependentSegments) {
   bess::PlainPacketPool pool(16);
   const size_t len = pool.data_room_size() + 64;

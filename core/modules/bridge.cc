@@ -287,7 +287,9 @@ void Bridge::Flood(Context *ctx, bess::PacketRef pkt, gate_idx_t,
     return;
   }
   for (size_t g = 1; g < flood_gates.size(); g++) {
-    bess::PacketRef copy(bess::PacketCopy(pkt.handle()));
+    // A flooded copy is the same frame on another port: the metadata an
+    // upstream module wrote (tenant, meter id) is part of the packet.
+    bess::PacketRef copy(bess::PacketCopyWithMetadata(pkt.handle()));
     if (copy.handle() != nullptr) {
       EmitPacket(ctx, copy, flood_gates[g]);
     }

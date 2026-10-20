@@ -81,7 +81,9 @@ void Replicate::DeInit() {
 void Replicate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   for (bess::PacketRef tocopy : batch->packets()) {
     for (int j = 1; j < ngates_; j++) {
-      bess::PacketRef newpkt(bess::PacketCopy(tocopy.handle()));
+      // The copy is the same packet on another gate, so the metadata written
+      // upstream is part of it; only the scratchpad starts empty.
+      bess::PacketRef newpkt(bess::PacketCopyWithMetadata(tocopy.handle()));
       if (newpkt.handle()) {
         EmitPacket(ctx, newpkt, gates_[j]);
       }
