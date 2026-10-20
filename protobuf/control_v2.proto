@@ -237,6 +237,24 @@ message ResourcePage {
   uint64 daemon_epoch = 4;
 }
 
+// Empty the named map resources in the daemon, without reading their keys to
+// the client: the control plane converges each one to no entries and applies
+// the resulting erases in batches. A resource the request does not name is
+// untouched; a singleton has no entries to clear and is a no-op. The dispatch
+// happens under the same lock and pause rules as a desired-state apply: a
+// resource whose workers read it unsynchronized changes with the workers
+// paused. A name no module registered is NOT_FOUND.
+message ResetResourcesRequest {
+  repeated string resources = 1;  // at least one "<module>/<table>"
+  optional uint64 expected_resource_generation = 2;  // stale: conflict, nothing erased
+}
+message ResetResourcesResponse {
+  repeated string resources = 1;  // deduped, in request order
+  uint64 removed = 2;             // entries erased (0 for an already-empty table)
+  uint64 resource_generation = 3; // after the clear
+  uint64 daemon_epoch = 4;
+}
+
 message ValidatePipelineRequest {
   Pipeline pipeline = 1;
 }
@@ -724,6 +742,7 @@ message GetResourceStatusResponse {
 service Control {
   rpc GetPipeline(GetPipelineRequest) returns (GetPipelineResponse) {}
   rpc ReadResource(ReadResourceRequest) returns (stream ResourcePage) {}
+  rpc ResetResources(ResetResourcesRequest) returns (ResetResourcesResponse) {}
   rpc ValidatePipeline(ValidatePipelineRequest)
       returns (ValidatePipelineResponse) {}
   rpc DiffPipeline(DiffPipelineRequest) returns (DiffPipelineResponse) {}

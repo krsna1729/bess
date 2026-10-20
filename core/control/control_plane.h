@@ -179,6 +179,19 @@ class ControlPlane {
   // entries and the dataplane generation they were read at. Unknown names are
   // NOT_FOUND, as ReadPipeline's are.
   ControlResult<Versioned<ResourceSpec>> ReadResource(const std::string& name) const;
+  // Empty the named map resources without sending their keys to the client:
+  // each is converged to no entries and the erases are applied in batches,
+  // with the same pause rule as a desired-state apply. Duplicate names are
+  // removed; a singleton is a no-op (it has no entries); an unknown name is
+  // NOT_FOUND and nothing is erased. A stale expected resource generation is
+  // a conflict before any effect.
+  struct ResourceReset {
+    std::vector<std::string> resources;  // deduped, request order
+    size_t removed = 0;                  // entries erased
+  };
+  ControlResult<Versioned<ResourceReset>> ResetResources(
+      std::vector<std::string> names,
+      std::optional<uint64_t> expected_resource_generation);
   ControlResult<Versioned<PipelineDiff>> DiffPipelineVersioned(
       const PipelineSpec& desired) const;
   ControlResult<Versioned<PipelinePlan>> PlanPipelineVersioned(
