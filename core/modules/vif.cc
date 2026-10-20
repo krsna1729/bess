@@ -5,12 +5,14 @@
 #include <any>
 #include <cstring>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 
 #include "arch/vlan.h"
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_codec.h"
+#include "route/l3_packet.h"
 #include "utils/format.h"
 #include "utils/logging.h"
 
@@ -388,23 +390,20 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     Ethernet *eth = pkt.head_data<Ethernet *>();
 
-    // Handle ARP Requests for local VIF addresses
-    if (eth->ether_type == be16_t(Ethernet::Type::kArp) &&
-        pkt.head_len() >= sizeof(Ethernet) + sizeof(Arp)) {
-      Arp *arp = reinterpret_cast<Arp *>(eth + 1);
-      if (arp->opcode == be16_t(Arp::Opcode::kRequest)) {
-        const Interface *iface = LookupByIp(vlan, arp->target_ip_addr);
-        if (iface != nullptr) {
-          // Generate ARP Reply in-place
-          arp->opcode = be16_t(Arp::Opcode::kReply);
-          eth->dst_addr = eth->src_addr;
-          eth->src_addr = iface->mac_addr;
-
-          arp->target_hw_addr = arp->sender_hw_addr;
-          arp->sender_hw_addr = iface->mac_addr;
-          arp->target_ip_addr = arp->sender_ip_addr;
-          arp->sender_ip_addr = iface->ip_addr;
-
+    // Handle ARP requests for local VIF addresses: the resolution library's
+    // local responder rewrites the frame into the reply (l3_packet.h,
+    // AnswerArpRequest); the fields, the in-place packet and the gate are
+    // unchanged.
+    if (eth->ether_type == be16_t(Ethernet::Type::kArp)) {
+      uint8_t *bytes = pkt.head_data<uint8_t *>();
+      const std::span<uint8_t> frame(bytes, pkt.head_len());
+      const std::optional<bess::route::ArpMessage> arp =
+          bess::route::ParseArp(frame);
+      if (arp && arp->opcode == bess::utils::Arp::kRequest) {
+        const Interface *iface = LookupByIp(vlan, arp->target_ip);
+        if (iface != nullptr &&
+            bess::route::AnswerArpRequest(frame, iface->mac_addr,
+                                          iface->ip_addr)) {
           if (write_vif) {
             _set_attr_with_offset<be32_t>(vif_offset, pkt, be32_t(iface->id));
           }
