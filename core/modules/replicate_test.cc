@@ -49,6 +49,26 @@ TEST(ReplicateTest, CopiesEachPacketToEveryGate) {
   }
 }
 
+// The configured list is the module's whole contract: the original leaves on
+// the first configured gate, not on the hardcoded gate 0.
+TEST(ReplicateTest, TheOriginalLeavesOnTheFirstConfiguredGate) {
+  ModuleHarness h;
+  Module *rep = h.Create("Replicate", Gates({2, 3}));
+  ASSERT_NE(nullptr, rep);
+  std::random_device rd;
+  std::mt19937 rng(rd());
+  const Bytes pkt =
+      bess::testing::TcpPacket(FlowSpec{.sip = "22.22.22.22", .dip = "22.22.22.22"}, rng);
+
+  auto out = h.Run(rep, 0, {pkt}, {0, 1, 2, 3});
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_TRUE(out[1].empty());
+  ASSERT_EQ(1u, out[2].size()) << "the original";
+  EXPECT_EQ(pkt, out[2][0]);
+  ASSERT_EQ(1u, out[3].size()) << "the copy";
+  EXPECT_EQ(pkt, out[3][0]);
+}
+
 // Gates are int64 on the wire and were narrowed unchecked: each must name
 // one of the module's 32 output gates.
 TEST(ReplicateTest, GatesAreValidated) {

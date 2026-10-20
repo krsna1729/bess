@@ -86,7 +86,10 @@ void Replicate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         EmitPacket(ctx, newpkt, gates_[j]);
       }
     }
-    EmitPacket(ctx, tocopy, 0);
+    // The configured list is the module's whole contract: the original is
+    // the first gate's packet, and the copies fill the rest. With no gate
+    // configured there is no list to read, so the historical gate 0 stands.
+    EmitPacket(ctx, tocopy, ngates_ > 0 ? gates_[0] : 0);
   }
 }
 
