@@ -39,6 +39,11 @@ class ControlStub:
                 request_serializer=control__v2__pb2.GetPipelineRequest.SerializeToString,
                 response_deserializer=control__v2__pb2.GetPipelineResponse.FromString,
                 _registered_method=True)
+        self.ReadResource = channel.unary_stream(
+                '/bess.pb.v2.Control/ReadResource',
+                request_serializer=control__v2__pb2.ReadResourceRequest.SerializeToString,
+                response_deserializer=control__v2__pb2.ResourcePage.FromString,
+                _registered_method=True)
         self.ValidatePipeline = channel.unary_unary(
                 '/bess.pb.v2.Control/ValidatePipeline',
                 request_serializer=control__v2__pb2.ValidatePipelineRequest.SerializeToString,
@@ -110,6 +115,12 @@ class ControlServicer:
     """Missing associated documentation comment in .proto file."""
 
     def GetPipeline(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReadResource(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -200,6 +211,11 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.GetPipeline,
                     request_deserializer=control__v2__pb2.GetPipelineRequest.FromString,
                     response_serializer=control__v2__pb2.GetPipelineResponse.SerializeToString,
+            ),
+            'ReadResource': grpc.unary_stream_rpc_method_handler(
+                    servicer.ReadResource,
+                    request_deserializer=control__v2__pb2.ReadResourceRequest.FromString,
+                    response_serializer=control__v2__pb2.ResourcePage.SerializeToString,
             ),
             'ValidatePipeline': grpc.unary_unary_rpc_method_handler(
                     servicer.ValidatePipeline,
@@ -294,6 +310,33 @@ class Control:
             '/bess.pb.v2.Control/GetPipeline',
             control__v2__pb2.GetPipelineRequest.SerializeToString,
             control__v2__pb2.GetPipelineResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadResource(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/bess.pb.v2.Control/ReadResource',
+            control__v2__pb2.ReadResourceRequest.SerializeToString,
+            control__v2__pb2.ResourcePage.FromString,
             options,
             channel_credentials,
             insecure,

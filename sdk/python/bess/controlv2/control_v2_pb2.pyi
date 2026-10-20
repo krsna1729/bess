@@ -274,6 +274,26 @@ class GetPipelineResponse(_message.Message):
     resource_generation: int
     def __init__(self, pipeline: _Optional[_Union[Pipeline, _Mapping]] = ..., generation: _Optional[int] = ..., daemon_epoch: _Optional[int] = ..., workers: _Optional[_Iterable[_Union[WorkerPlacement, _Mapping]]] = ..., resource_generation: _Optional[int] = ...) -> None: ...
 
+class ReadResourceRequest(_message.Message):
+    __slots__ = ("resource", "max_entries")
+    RESOURCE_FIELD_NUMBER: _ClassVar[int]
+    MAX_ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    resource: str
+    max_entries: int
+    def __init__(self, resource: _Optional[str] = ..., max_entries: _Optional[int] = ...) -> None: ...
+
+class ResourcePage(_message.Message):
+    __slots__ = ("resource", "entries", "resource_generation", "daemon_epoch")
+    RESOURCE_FIELD_NUMBER: _ClassVar[int]
+    ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    RESOURCE_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    resource: str
+    entries: _containers.RepeatedCompositeFieldContainer[ResourceEntry]
+    resource_generation: int
+    daemon_epoch: int
+    def __init__(self, resource: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[ResourceEntry, _Mapping]]] = ..., resource_generation: _Optional[int] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
+
 class ValidatePipelineRequest(_message.Message):
     __slots__ = ("pipeline",)
     PIPELINE_FIELD_NUMBER: _ClassVar[int]

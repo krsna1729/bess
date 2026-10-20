@@ -9,9 +9,9 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DOCKER=${DOCKER:-docker}
-# Pinned by digest (golang:1.25.14), and protoc a fixed release checked by
+# Pinned by digest (golang:1.27.2, the version sdk/go/go.mod pins), and protoc a fixed release checked by
 # sha256: the output must not change unless this repository does.
-IMAGE=golang:1.25@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80
+IMAGE=golang:1.27.2@sha256:2d658507a011f1eadc0114d7a421b312b2e77d9042a24036a26e267cc9231677
 PROTOC_VERSION=31.1
 PROTOC_SHA256=96553041f1a91ea0efee963cb16f462f5985b4d65365f3907414c360044d8065
 PROTOC_GEN_GO=v1.36.10

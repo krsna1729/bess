@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	Control_GetPipeline_FullMethodName              = "/bess.pb.v2.Control/GetPipeline"
+	Control_ReadResource_FullMethodName             = "/bess.pb.v2.Control/ReadResource"
 	Control_ValidatePipeline_FullMethodName         = "/bess.pb.v2.Control/ValidatePipeline"
 	Control_DiffPipeline_FullMethodName             = "/bess.pb.v2.Control/DiffPipeline"
 	Control_PlanPipeline_FullMethodName             = "/bess.pb.v2.Control/PlanPipeline"
@@ -41,6 +42,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ControlClient interface {
 	GetPipeline(ctx context.Context, in *GetPipelineRequest, opts ...grpc.CallOption) (*GetPipelineResponse, error)
+	ReadResource(ctx context.Context, in *ReadResourceRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ResourcePage], error)
 	ValidatePipeline(ctx context.Context, in *ValidatePipelineRequest, opts ...grpc.CallOption) (*ValidatePipelineResponse, error)
 	DiffPipeline(ctx context.Context, in *DiffPipelineRequest, opts ...grpc.CallOption) (*DiffPipelineResponse, error)
 	PlanPipeline(ctx context.Context, in *PlanPipelineRequest, opts ...grpc.CallOption) (*PlanPipelineResponse, error)
@@ -73,6 +75,25 @@ func (c *controlClient) GetPipeline(ctx context.Context, in *GetPipelineRequest,
 	}
 	return out, nil
 }
+
+func (c *controlClient) ReadResource(ctx context.Context, in *ReadResourceRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ResourcePage], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[0], Control_ReadResource_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ReadResourceRequest, ResourcePage]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_ReadResourceClient = grpc.ServerStreamingClient[ResourcePage]
 
 func (c *controlClient) ValidatePipeline(ctx context.Context, in *ValidatePipelineRequest, opts ...grpc.CallOption) (*ValidatePipelineResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -166,7 +187,7 @@ func (c *controlClient) GetSchema(ctx context.Context, in *GetSchemaRequest, opt
 
 func (c *controlClient) WatchEvents(ctx context.Context, in *WatchEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[0], Control_WatchEvents_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[1], Control_WatchEvents_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -218,6 +239,7 @@ func (c *controlClient) GetResourceStatus(ctx context.Context, in *GetResourceSt
 // for forward compatibility.
 type ControlServer interface {
 	GetPipeline(context.Context, *GetPipelineRequest) (*GetPipelineResponse, error)
+	ReadResource(*ReadResourceRequest, grpc.ServerStreamingServer[ResourcePage]) error
 	ValidatePipeline(context.Context, *ValidatePipelineRequest) (*ValidatePipelineResponse, error)
 	DiffPipeline(context.Context, *DiffPipelineRequest) (*DiffPipelineResponse, error)
 	PlanPipeline(context.Context, *PlanPipelineRequest) (*PlanPipelineResponse, error)
@@ -243,6 +265,9 @@ type UnimplementedControlServer struct{}
 
 func (UnimplementedControlServer) GetPipeline(context.Context, *GetPipelineRequest) (*GetPipelineResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetPipeline not implemented")
+}
+func (UnimplementedControlServer) ReadResource(*ReadResourceRequest, grpc.ServerStreamingServer[ResourcePage]) error {
+	return status.Errorf(codes.Unimplemented, "method ReadResource not implemented")
 }
 func (UnimplementedControlServer) ValidatePipeline(context.Context, *ValidatePipelineRequest) (*ValidatePipelineResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ValidatePipeline not implemented")
@@ -321,6 +346,17 @@ func _Control_GetPipeline_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _Control_ReadResource_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ReadResourceRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ControlServer).ReadResource(m, &grpc.GenericServerStream[ReadResourceRequest, ResourcePage]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_ReadResourceServer = grpc.ServerStreamingServer[ResourcePage]
 
 func _Control_ValidatePipeline_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ValidatePipelineRequest)
@@ -610,6 +646,11 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ReadResource",
+			Handler:       _Control_ReadResource_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "WatchEvents",
 			Handler:       _Control_WatchEvents_Handler,
