@@ -294,6 +294,26 @@ class ResourcePage(_message.Message):
     daemon_epoch: int
     def __init__(self, resource: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[ResourceEntry, _Mapping]]] = ..., resource_generation: _Optional[int] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
 
+class ResetResourcesRequest(_message.Message):
+    __slots__ = ("resources", "expected_resource_generation")
+    RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_RESOURCE_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    resources: _containers.RepeatedScalarFieldContainer[str]
+    expected_resource_generation: int
+    def __init__(self, resources: _Optional[_Iterable[str]] = ..., expected_resource_generation: _Optional[int] = ...) -> None: ...
+
+class ResetResourcesResponse(_message.Message):
+    __slots__ = ("resources", "removed", "resource_generation", "daemon_epoch")
+    RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    REMOVED_FIELD_NUMBER: _ClassVar[int]
+    RESOURCE_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    resources: _containers.RepeatedScalarFieldContainer[str]
+    removed: int
+    resource_generation: int
+    daemon_epoch: int
+    def __init__(self, resources: _Optional[_Iterable[str]] = ..., removed: _Optional[int] = ..., resource_generation: _Optional[int] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
+
 class ValidatePipelineRequest(_message.Message):
     __slots__ = ("pipeline",)
     PIPELINE_FIELD_NUMBER: _ClassVar[int]
