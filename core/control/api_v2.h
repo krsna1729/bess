@@ -84,6 +84,9 @@ class ControlV2Service final : public pb::v2::Control::Service {
   grpc::Status GetPipeline(grpc::ServerContext *context,
                            const pb::v2::GetPipelineRequest *request,
                            pb::v2::GetPipelineResponse *response) override;
+  grpc::Status ReadResource(
+      grpc::ServerContext *context, const pb::v2::ReadResourceRequest *request,
+      grpc::ServerWriter<pb::v2::ResourcePage> *writer) override;
   grpc::Status ValidatePipeline(
       grpc::ServerContext *context,
       const pb::v2::ValidatePipelineRequest *request,

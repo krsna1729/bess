@@ -202,7 +202,8 @@ message WorkerPlacement {
 // With include_resources, the pipeline lists its resources' contents too
 // (every resource, or those named in `resources`), so a manifest read back
 // and applied again changes nothing. A response above the message limit is
-// RESOURCE_EXHAUSTED: name fewer resources.
+// RESOURCE_EXHAUSTED: name fewer resources, or read a large table with
+// ReadResource, which pages it.
 message GetPipelineRequest {
   bool include_resources = 1;
   repeated string resources = 2;  // with include_resources: only these (empty: all)
@@ -217,6 +218,23 @@ message GetPipelineResponse {
   // The dataplane transaction generation (ApplyTransaction's) the resource
   // contents were read at.
   uint64 resource_generation = 5;
+}
+
+// One resource's committed entries, in bounded pages, as one server-streamed
+// call. A GetPipeline response carries every named resource in one message
+// and is refused above kMaxMessageBytes; this stream never builds one message
+// for the table, so a table larger than that limit is readable without naming
+// fewer resources. The entries are a snapshot taken when the call starts; the
+// generation is that snapshot's.
+message ReadResourceRequest {
+  string resource = 1;       // "<module>/<table>", as ListTransactionResources names it
+  uint32 max_entries = 2;    // per page; 0: 4096, capped at 65536
+}
+message ResourcePage {
+  string resource = 1;
+  repeated ResourceEntry entries = 2;
+  uint64 resource_generation = 3;  // the snapshot's dataplane generation
+  uint64 daemon_epoch = 4;
 }
 
 message ValidatePipelineRequest {
@@ -705,6 +723,7 @@ message GetResourceStatusResponse {
 
 service Control {
   rpc GetPipeline(GetPipelineRequest) returns (GetPipelineResponse) {}
+  rpc ReadResource(ReadResourceRequest) returns (stream ResourcePage) {}
   rpc ValidatePipeline(ValidatePipelineRequest)
       returns (ValidatePipelineResponse) {}
   rpc DiffPipeline(DiffPipelineRequest) returns (DiffPipelineResponse) {}

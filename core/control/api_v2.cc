@@ -564,6 +564,85 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *context,
   return grpc::Status::OK;
 }
 
+grpc::Status ControlV2Service::ReadResource(
+    grpc::ServerContext *context, const v2::ReadResourceRequest *request,
+    grpc::ServerWriter<v2::ResourcePage> *writer) {
+  // One snapshot under the control-plane lock, then pages outside it: the
+  // stream may block on a slow client, and holding the lock across the writes
+  // would hold every writer behind it. The generation is the snapshot's, so a
+  // reader can tell whether a later page is from the same dataplane state.
+  auto read = control_plane_.ReadResource(request->resource());
+  if (!read) {
+    return ToStatus(read.error(), context);
+  }
+  // The budget is the whole serialized page -- its own fields, and for each
+  // entry the repeated field's tag and length prefix -- not the entries alone:
+  // framing is bytes on the wire, and the client decodes all of them.
+  constexpr size_t kPageBytes = 3 << 20;  // below kMaxMessageBytes
+  constexpr size_t kEntryTagBytes = 1;    // field 2, so a one-byte tag
+  constexpr uint32_t kMaxPageEntries = 65536;
+  size_t max_entries =
+      request->max_entries() == 0 ? 4096 : request->max_entries();
+  max_entries = std::min<size_t>(max_entries, kMaxPageEntries);
+
+  v2::ResourcePage page;
+  page.set_resource(read->value.name);
+  page.set_resource_generation(read->resource_generation);
+  page.set_daemon_epoch(transactions_.epoch());
+  size_t count = 0;
+  size_t bytes = page.ByteSizeLong();
+  auto flush = [&]() -> std::optional<grpc::Status> {
+    if (count != 0 || (page.entries_size() == 0 && read->value.entries.empty())) {
+      if (!writer->Write(page)) {
+        return grpc::Status(grpc::StatusCode::CANCELLED, "the reader went away");
+      }
+      page.mutable_entries()->Clear();
+      count = 0;
+      bytes = page.ByteSizeLong();
+    }
+    if (context->IsCancelled()) {
+      return grpc::Status(grpc::StatusCode::CANCELLED, "the reader cancelled");
+    }
+    return std::nullopt;
+  };
+  for (const ResourceEntrySpec &entry : read->value.entries) {
+    v2::ResourceEntry candidate;
+    if (!entry.key.type_url().empty()) {
+      *candidate.mutable_key() = entry.key;
+    }
+    *candidate.mutable_value() = entry.value;
+    const size_t entry_bytes = candidate.ByteSizeLong();
+    if (entry_bytes >
+        static_cast<size_t>(kMaxMessageBytes) - (64 << 10)) {
+      // One entry this large cannot leave in any page: refuse it by name
+      // rather than let the transport fail the stream mid-table.
+      ControlError error = Err(E2BIG, "resource '%s': one entry is %zu bytes",
+                               read->value.name.c_str(), entry_bytes);
+      error.code = ControlErrorCode::kResourceExhausted;
+      error.field = "resource";
+      return ToStatus(error, context);
+    }
+    const size_t framed_bytes =
+        kEntryTagBytes +
+        google::protobuf::io::CodedOutputStream::VarintSize32(
+            static_cast<uint32_t>(entry_bytes)) +
+        entry_bytes;
+    if (count != 0 &&
+        (count >= max_entries || bytes + framed_bytes > kPageBytes)) {
+      if (auto stopped = flush(); stopped) {
+        return *stopped;
+      }
+    }
+    *page.add_entries() = std::move(candidate);
+    count++;
+    bytes += framed_bytes;
+  }
+  if (auto stopped = flush(); stopped) {
+    return *stopped;
+  }
+  return grpc::Status::OK;
+}
+
 grpc::Status ControlV2Service::ValidatePipeline(
     grpc::ServerContext *context, const v2::ValidatePipelineRequest *request,
     v2::ValidatePipelineResponse *response) {

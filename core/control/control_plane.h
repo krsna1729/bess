@@ -175,6 +175,10 @@ class ControlPlane {
     std::vector<ResourceSpec> resources;  // by name
   };
   ControlResult<Versioned<PipelineRead>> ReadPipeline(const ResourceQuery& query) const;
+  // One resource's contents as one snapshot, for the streamed read: the
+  // entries and the dataplane generation they were read at. Unknown names are
+  // NOT_FOUND, as ReadPipeline's are.
+  ControlResult<Versioned<ResourceSpec>> ReadResource(const std::string& name) const;
   ControlResult<Versioned<PipelineDiff>> DiffPipelineVersioned(
       const PipelineSpec& desired) const;
   ControlResult<Versioned<PipelinePlan>> PlanPipelineVersioned(
