@@ -1,26 +1,33 @@
 # Compatibility
 
-What a BESS release promises, and how each promise is checked. The details
-live in the documents linked; this page is the summary a user of a release
+What a BESS build promises, and how each promise is checked. The details
+live in the documents linked; this page is the summary a user of a build
 reads (roadmap M26).
+
+## Pre-1.0 policy
+
+No BESS release has shipped (no tag, no published artifact). The installed
+C++ headers keep their public/experimental/internal classification and the
+plugin ABI checks below; the protobuf surface has no compatibility promise
+(D-173).
 
 ## Wire protocol (gRPC / protobuf)
 
-The protobuf API (`protobuf/`) is the primary compatibility boundary: the
-generic `bess.pb.v2.Control` service. The legacy `BESSControl` service is gone
+The protobuf API (`protobuf/`) is the primary control boundary: the generic
+`bess.pb.v2.Control` service. The legacy `BESSControl` service is gone
 (D-140), so its methods are no longer served.
 
-- Changes are wire- and JSON-compatible: `buf breaking` (rule set
-  `WIRE_JSON`, `buf.yaml`) runs on every pull request against the target
-  branch (CI job "Protobuf compatibility", a required check on `develop`).
-  A deliberate break is declared with the `buf skip breaking` label and a
-  decision record.
-- Removed meanings keep their numbers: a value that no longer applies stays
-  defined and documented as never sent (for example
-  `TransactionRecord.VISIBILITY_ATOMIC`), so old clients still decode.
+- The surface may change without compatibility guarantees (D-173). A field,
+  enum value or message that no longer applies is deleted outright: its
+  number and name are not reserved, and no deprecation window is promised.
+- `buf breaking` (`WIRE_JSON`, `buf.yaml`, CI job "Protobuf compatibility")
+  runs and is advisory until a 1.0 compatibility policy exists. It is not a
+  required check, and a reported break does not block a pull request. No
+  `buf skip breaking` label is used.
 - Clients in other languages implement the protocol from the `.proto` files
-  alone; the Go SDK (`sdk/go`) and the C++ SDK (`sdk/cpp`) are convenience and
-  correctness layers over it (docs/control-sdk.md), not a second protocol.
+  of the revision they target; the Go SDK (`sdk/go`) and the C++ SDK
+  (`sdk/cpp`) are convenience and correctness layers over it
+  (docs/control-sdk.md), not a second protocol.
 
 ## C++ source API
 
@@ -53,9 +60,9 @@ running daemon in the test suite.
 - Experimental headers and options say so in `tools/api_classes.json` and in
   their decision records; nothing experimental is a dependency of a public
   header.
-- A deprecated API keeps working for at least one release after the release
-  that announces its replacement, and its removal is a decision record.
-  Protobuf fields and enum values are never reused (above).
+- A deprecated C++ API keeps working for at least one release after the
+  release that announces its replacement, and its removal is a decision
+  record. Protobuf has no such window before 1.0 (above).
 
 ## Recorded breaks
 
@@ -63,9 +70,8 @@ running daemon in the test suite.
   from the API: a manifest that names `mclass: IPLookup` no longer applies,
   the C++ class is removed, and `IPLookupArg`, `IPLookupRouteKey` and
   `IPLookupRouteValue` are deleted from `protobuf/module_msg.proto`.
-  `buf breaking` (`WIRE_JSON`, D-026) reports the deletions clean - deleting
-  a message is not one of its rules - so the CI job did not fail and no
-  `buf skip breaking` label was needed; this entry is the record. The
+  No release ever shipped them, and before 1.0 a deleted name is removed
+  outright rather than reserved (D-173); this entry is the record. The
   replacement is the `Router` (D-155): the same route table (LPM or FIB),
   routes that name a next hop or, with `max_groups`, a group (D-156), and
   next hops that carry link addresses. `ROUTE_MODE_DESTINATION` routes a

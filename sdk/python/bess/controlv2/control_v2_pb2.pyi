@@ -508,11 +508,9 @@ class TransactionRecord(_message.Message):
         __slots__ = ()
         VISIBILITY_UNSPECIFIED: _ClassVar[TransactionRecord.Visibility]
         VISIBILITY_DEPENDENCY_ORDERED: _ClassVar[TransactionRecord.Visibility]
-        VISIBILITY_ATOMIC: _ClassVar[TransactionRecord.Visibility]
         VISIBILITY_SCOPE_SNAPSHOT: _ClassVar[TransactionRecord.Visibility]
     VISIBILITY_UNSPECIFIED: TransactionRecord.Visibility
     VISIBILITY_DEPENDENCY_ORDERED: TransactionRecord.Visibility
-    VISIBILITY_ATOMIC: TransactionRecord.Visibility
     VISIBILITY_SCOPE_SNAPSHOT: TransactionRecord.Visibility
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     OUTCOME_FIELD_NUMBER: _ClassVar[int]

@@ -46,7 +46,7 @@ file is the reasoning.
 | D-023 | Router as a resource provider: routes placed invisibly, one writer when enrolled | accepted |
 | D-024 | WildcardMatch as a resource provider: pending rules that lose to every rule | accepted |
 | D-025 | The dataplane transaction RPC: typed per-resource values, request ids, a daemon epoch | accepted |
-| D-026 | gRPC and protobuf practice: what changed, on what evidence | accepted |
+| D-026 | gRPC and protobuf practice: what changed, on what evidence | accepted; `buf breaking` is advisory by D-173 |
 | D-027 | Placement inside the inherited CPU set; control threads off worker CPUs | accepted |
 | D-028 | Packet-path writers: partitioned or shared tables, chosen on numbers | accepted |
 | D-029 | DPDK memory for the dataplane: dynamic hugepages, in-memory EAL, IOVA chosen by DPDK | accepted |
@@ -159,11 +159,11 @@ file is the reasoning.
 | D-137 | The plugin checks are C++ live tests on the SDK: `sample_plugin_load` (`tests/live/sample_plugin_test.cc`: --modules load, the incompatible probe refused, the shipped `sequential_update.yaml` run, unload refused while a module lives) and verify-install's installed-tree plugins (`live_standalone_plugins`: conformance plugins and appliances, R4's resources over transactions); `check_sample_plugin.py` and `check_standalone_plugins.py` are gone | accepted |
 | D-138 | `live_perf` is C++ (`tests/perf/live_perf`, a client of the C++ SDK over control_v2): pipelines and table entries go in as one transaction, ns per packet from the measured modules' Track gate counters over a client-timed window; master is no longer a build it drives; `F.hook` dropped (no v2 `track_gate`); `tools/live_perf.py` is gone. It found two control_v2 defects, both fixed: transactional WildcardMatch rules never reordered the tuple list (D-098 amendment), and `ApplyPipeline` ignored `skip_default_hooks` | accepted |
 | D-139 | `live_transaction_bench` is C++ on the SDK (`tests/perf/live_transaction_bench`): the same pipeline, rates and report against a running bessd, the default gate as `em/settings`, gate counters and busy answers from metrics; `tools/live_transaction_bench.py` is gone; the perf clients share `tests/perf/schema_types.h` | accepted |
-| D-140 | The legacy service is gone: no `BESSControl` RPC, `service.proto`, pybess, Python bessctl, `bess-python` package, legacy-only module commands, `LEGACY_ONLY`/`Exposure` or gate-hook command table (plugin API 4); each module's `cmds` entries are its actions, `get_initial_arg` is `GetPipeline`'s `Module.arg`, and state is changed through resources (`edits_resources` marks an action that edits one) | accepted |
+| D-140 | The legacy service is gone: no `BESSControl` RPC, `service.proto`, pybess, Python bessctl, `bess-python` package, legacy-only module commands, `LEGACY_ONLY`/`Exposure` or gate-hook command table (plugin API 4); each module's `cmds` entries are its actions, `get_initial_arg` is `GetPipeline`'s `Module.arg`, and state is changed through resources (`edits_resources` marks an action that edits one) | accepted; compatibility policy superseded by D-173 |
 | D-141 | Superseded for ExactMatch and WildcardMatch by D-172; Firewall keeps `action_id`. One classifier result carries a gate and an ActionId: the result is one 64-bit word, the gate in the low 16 bits and the ActionId above it (`MakeGateResult`/`GateOfResult`/`ActionIdOfResult`), every combination legal; the ActionId is a metadata write (0 on a miss, and 0 when the rule names no action) and a transactional reference, so a rule with a nonzero id is ordered after its action and refused while that action is missing; both classifiers' batch helpers deliver both halves | superseded (classifiers) by D-172 |
 | D-142 | A plugin's protobuf descriptors are process-lifetime: `dlopen` registers them in the daemon's process-global pool and protobuf never frees them, so the ASan lane suppresses exactly those registrations rather than the lane losing leak detection | accepted |
-| D-143 | The protobuf surface keeps only what runs: the legacy command messages went with the service that could call them (a message is API surface a client can name, and a schema every generator compiles), so only what a live call or a resource uses remains | accepted |
-| D-144 | The gate byte counter is gone: `TrackArg.bits` was its only switch and every hook was installed with the default arg, so `bess_gate_bytes_total` could never appear; the feature went with it, while the field number and name stay reserved so no client can silently write the old one | accepted |
+| D-143 | The protobuf surface keeps only what runs: the legacy command messages went with the service that could call them (a message is API surface a client can name, and a schema every generator compiles), so only what a live call or a resource uses remains | accepted; `buf breaking` reliance superseded by D-173 |
+| D-144 | The gate byte counter is gone: `TrackArg.bits` was its only switch and every hook was installed with the default arg, so `bess_gate_bytes_total` could never appear; the feature went with it, while the field number and name stay reserved so no client can silently write the old one | accepted; reserved-number policy superseded by D-173 |
 | D-145 | The Go SDK ships as a nested module under module-prefixed tags (`sdk/go/vX.Y.Z`), consumed by pinning a tag or a commit; unpinned queries resolve through the repository's default branch, which is `develop`, while `master` stays the archival upstream mirror and no branch is renamed; `go.work` is a machine-local development shortcut, never how a consumer builds | accepted |
 | D-146 | C++, Python and Go are all first-class control_v2 SDKs, and the Python one is rebuilt clean-room: a fresh client taking `pybess.sdk`'s place - the same transaction discipline (one request id per logical transaction, recovery through `GetTransaction`, the daemon epoch, typed resources and typed outcomes) over the same wire, with no legacy service and no place in the runtime package (D-135). It amends D-104's count of two supported SDKs | accepted |
 | D-147 | The firewall table: a masked 5-tuple policy where a port range costs no tuple (the ports are checked after the group's masked key, so a range adds no group, no mask and no entry - what WildcardMatch cannot do without spending 2n-2 prefixes per field of its budget, D-102), IPv4 and IPv6 in one table (the family is part of a group's identity, so a v4 rule never sees a v6 packet and a rule with no prefix sees both), the first match in rule order wins, and a packet the table cannot judge is dropped rather than passed by a catch-all; the module publishes the whole policy as one `<name>/rules` singleton (D-129). Amended 2026-10-18: the same policy can be **scanned** (`FirewallScan`) rather than indexed, sharing the index's predicate, validation and normalization so the two cannot drift | accepted |
@@ -2251,6 +2251,11 @@ regressions". gRPC 1.83 (C++), grpcio 1.84 and protobuf 7.36 (upb) in
 Python, protoc 36.1, buf 1.73. Each item was kept only with evidence; two
 were measured and dropped.
 
+**Compatibility policy:** the `buf breaking` item is superseded by D-173.
+Before 1.0 the protobuf surface has no wire-compatibility promise, deleted
+names are not reserved, and `buf breaking` runs advisory rather than as a
+merge gate.
+
 **Adopted:**
 
 | item | evidence |
@@ -3756,6 +3761,8 @@ it is what makes a stray interface id drop instead of reaching a wrong gate.
 ## D-050 Explicit transaction consistency: referential vs scope-snapshot (M8)
 
 **Status:** accepted (2026-10-02).
+**Compatibility policy:** the `VISIBILITY_ATOMIC` reservation and its `buf breaking` reason are superseded
+by D-173; the value is removed.
 **Code:** `core/dataplane/scope.h` (new; replaces `scope_cell.h`),
 `core/dataplane/{resource.h,slot_resource.h,transaction_engine.{h,cc}}`,
 `core/dataplane/scope_snapshot_test.cc` (replaces `scope_cell_test.cc`),
@@ -10160,6 +10167,7 @@ tools in turn: rate 0: 26.77 vs 26.80 Mpps (C++ vs Python); 1000 tx/s: 26.69 vs 
 ## D-140 The legacy service is gone
 
 **Status:** accepted (2026-10-16; D-104's product boundary, completed).
+**Compatibility policy:** superseded by D-173; the removal stands.
 
 **Problem.** `BESSControl` (`protobuf/service.proto`, `core/bessctl.cc`) was still served beside control_v2, with
 pybess and the Python bessctl as its clients (D-135 shipped them as an optional `bess-python` package) and
@@ -10311,6 +10319,9 @@ Arch), two further environment-specific reports need switching off to run that t
 
 ## D-143 The protobuf surface keeps only what runs: the legacy command messages are gone
 
+**Status:** accepted. **Compatibility policy:** its reliance on `buf breaking` is superseded by D-173; the
+reference-based prune stands, and a deleted name is now removed outright rather than reserved.
+
 - The legacy `BESSControl` service is gone (D-140), and with it every command only that service could call.
   Their argument and reply messages stayed: a message is API surface a client can name, a schema every
   language's bindings generate, and a name the JSON form of the API owns.
@@ -10347,6 +10358,9 @@ refused the same way it was after D-140: an unknown type from `GetSchema`.
 ---
 
 ## D-144 The gate byte counter is gone; its switch was never reachable
+
+**Status:** accepted. **Compatibility policy:** its reserved-number rationale is superseded by D-173;
+`TrackArg` now has no fields and no reservations.
 
 - `TrackArg.bits` was the byte counter's only switch. `core/gate_hooks/track.cc:21` read it, and
   `OGate::AddTrackHook` installs the hook with a default `TrackArg` (`core/module_graph.cc:320`), so in every
@@ -11220,6 +11234,8 @@ this case is the first to reach a hop that names no egress interface.
 ## D-161 IPLookup is retired
 
 **Status:** accepted (2026-10-19; the recorded break D-155 scheduled for its own commit).
+**Compatibility policy:** its `buf breaking` evidence is superseded by D-173; the deleted names are removed
+outright, with no reservation.
 **Code:** deleted: `core/modules/ip_lookup.{h,cc}`, `core/modules/ip_lookup_test.cc`,
 `bessctl/conf/samples/iplookup.yaml`, three messages in `protobuf/module_msg.proto` (`IPLookupArg`,
 `IPLookupRouteKey`, `IPLookupRouteValue`) and `core/meson.build`'s entries; migrated:
@@ -11672,6 +11688,10 @@ as partial, not atomic.
 
 ## D-172 A classifier rule carries a result record, not an action reference
 
+**Status:** accepted. **Compatibility policy:** the `action_resource` reservations and their "no client can
+silently write the old field" rationale are superseded by D-173; those fields are deleted and their numbers are
+free.
+
 - A rule's result is a gate plus an opaque byte record: `classifier::RuleResult{gate, bytes}`. The module's
   argument carries `result_fields` (`ResultField`: `attr_name` or packet `offset`, `value_offset`,
   `num_bytes`) and an optional `default_result`. A non-empty list creates a `classifier::RecordArena` whose
@@ -11726,3 +11746,37 @@ as partial, not atomic.
   a `RAW` reference naming its key verbatim, and the resource refusing the referent's erase;
   `WildcardMatchResourceTest` round-trips record bytes; the session slice runs classifier results into
   ActionTable's `action_id`.
+
+---
+
+## D-173 No wire-compatibility promise before 1.0
+
+**Status:** accepted (2026-10-20). Supersedes the compatibility-policy parts of D-026, D-050, D-140, D-143,
+D-144, D-161 and D-172.
+
+- No BESS release has shipped (no tag, no published artifact), so there is no compatibility obligation to
+  carry. The protobuf surface may change without compatibility guarantees until a 1.0 policy exists.
+- A field, enum value or message that no longer applies is deleted outright. Its number and name are removed,
+  not reserved: reservations protect clients of a released wire format, and there are none. Live fields and
+  messages keep their current numbers; nothing is renumbered.
+- `buf breaking` stays configured (`buf.yaml`) and the "Protobuf compatibility" CI job still runs, but it is
+  advisory: `continue-on-error: true` at job level, not a merge gate, and no `buf skip breaking` label. A
+  job-level failure still shows the job's own status, so D-173 also removed "Protobuf compatibility" from
+  the branch protection rules. The check becomes a gate only with a 1.0 compatibility policy.
+- The C++ header classification (public/experimental/internal) and the plugin ABI/API checks are unchanged:
+  they keep the installed extension boundary honest, not a promise of wire compatibility.
+
+**Consequences.** Removed from the protos in this change: `TrackArg`'s `reserved 5; reserved "bits";`;
+`TrafficClass`'s `reserved 10, 11; reserved "leaf_module_name", "leaf_module_taskid";`;
+`ModuleClassSchema`'s `reserved 6; reserved "commands";`; `ExactMatchRuleValue`'s `reserved 2; reserved
+"action_id";`; `WildcardMatchRuleValue`'s `reserved 3; reserved "action_id";`; `ExactMatchArg`'s
+`reserved 3; reserved "action_resource";`; `WildcardMatchArg`'s `reserved 4; reserved "action_resource";`;
+and `TransactionRecord.VISIBILITY_ATOMIC = 2 [deprecated = true]`. No live field or message was removed, and
+no remaining field or message was renumbered.
+
+**Code.** `protobuf/{bess_msg,control_v2,module_msg}.proto`, `.github/workflows/ci.yml`,
+`docs/compatibility.md`, `docs/architecture.md`, `docs/ci-parity.md`, `sdk/go/controlv2`,
+`sdk/python/bess/controlv2`.
+
+**Revisit when** a 1.0 release is planned: that release states a wire policy, and only then do reservations,
+deprecation windows and a blocking `buf breaking` check become meaningful.

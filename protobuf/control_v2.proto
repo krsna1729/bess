@@ -74,8 +74,6 @@ message TrafficClass {
   map<string, int64> max_burst = 9;
   // A module's own (leaf) class is not a traffic class of desired state: its
   // placement is a TaskPlacement.
-  reserved 10, 11;
-  reserved "leaf_module_name", "leaf_module_taskid";
 }
 
 // Where a module's task is scheduled: under a traffic class, or at the root
@@ -196,7 +194,7 @@ message WorkerPlacement {
   int32 numa_node = 3;      // that CPU's NUMA node
   bool cross_numa = 4;      // not bessd's memory node
   bool shares_core = 5;     // an SMT sibling of another worker's CPU or a control CPU
-  bool on_control_cpu = 6;  // a CPU reserved for control threads
+  bool on_control_cpu = 6;  // a CPU held for control threads
 }
 
 // With include_resources, the pipeline lists its resources' contents too
@@ -436,14 +434,11 @@ message TransactionRecord {
   //   VISIBILITY_SCOPE_SNAPSHOT: each scope it touched switched from its whole
   //     old version to its whole new one in one store
   //     (CONSISTENCY_SCOPE_SNAPSHOT). There is no order between two scopes.
-  // VISIBILITY_ATOMIC is never sent. It named a promise ("all at once") that
-  // nothing provides: the strongest guarantee is per scope, and
-  // VISIBILITY_SCOPE_SNAPSHOT says so. The value stays only because removing
-  // an enum value breaks `buf breaking`.
+  // There is no all-at-once level: nothing provides it, and the strongest
+  // guarantee is per scope, which VISIBILITY_SCOPE_SNAPSHOT names.
   enum Visibility {
     VISIBILITY_UNSPECIFIED = 0;
     VISIBILITY_DEPENDENCY_ORDERED = 1;
-    VISIBILITY_ATOMIC = 2 [deprecated = true];
     VISIBILITY_SCOPE_SNAPSHOT = 3;
   }
   string request_id = 1;
@@ -590,8 +585,6 @@ message ModuleClassSchema {
   string init_arg_type = 3;
   uint32 igates = 4;  // input gates the class accepts
   uint32 ogates = 5;  // output gates
-  reserved 6;
-  reserved "commands";  // D-115's commands: actions and resources since D-129
   repeated ActionSchema actions = 7;      // sorted by name
   repeated ResourceSchema resources = 8;  // sorted by table
 }

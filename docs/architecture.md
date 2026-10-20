@@ -99,7 +99,6 @@ A transaction asks for one of two consistency levels (`ApplyTransactionRequest.c
    - Create new objects a version will name in a *referential* transaction first (nothing can name them yet), then switch the scope in a scope-snapshot transaction. A scope-snapshot request that includes any other resource (so it would become visible operation by operation) is refused with `Outcome::kUnsupported` in C++ and, over gRPC, `UNIMPLEMENTED` with error detail `UNSUPPORTED_TRANSACTION` (field `consistency`, object the resource, the reason in the message). Nothing is applied, nothing is recorded under the `request_id`, and a level the daemon does not know is `INVALID_ARGUMENT`.
    - A scope-snapshot transaction that cannot be fully prepared (a failed reservation, an exception, a missing referent) leaves every old scope visible.
    - Erasing a scope leaves its last version readable until the removal cascade, then `Lookup` returns null; a packet operation must handle a missing scope.
-   - `VISIBILITY_ATOMIC` in the wire enum is deprecated and never sent. It promised "all at once", which nothing provides.
 
 ---
 

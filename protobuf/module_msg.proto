@@ -261,8 +261,6 @@ message ExactMatchRuleKey {
 message ExactMatchRuleValue {
   // The output gate a matching packet leaves on.
   uint64 gate = 1;
-  reserved 2;
-  reserved "action_id";  // was the action id (D-141); use result
   // The rule's result record, placed by the module's result_fields. Shorter
   // than the table's record size: the rest is zeros. Longer: refused.
   bytes result = 3;
@@ -386,8 +384,6 @@ message WildcardMatchRuleValue {
   int64 priority = 1;
   // The output gate a matching packet leaves on.
   uint64 gate = 2;
-  reserved 3;
-  reserved "action_id";  // was the action id (D-141); use result
   // The rule's result record, placed by the module's result_fields. Shorter
   // than the table's record size: the rest is zeros. Longer: refused.
   bytes result = 4;
@@ -535,8 +531,6 @@ message EtherEncapArg {
 message ExactMatchArg {
   repeated Field fields = 1; ///A list of ExactMatch Fields
   repeated FieldData masks = 2; /// mask(i) corresponds to the mask for field(i)
-  reserved 3;
-  reserved "action_resource"; /// was the action id result; use result_fields
   optional uint64 default_gate = 4; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
   repeated ResultField result_fields = 5; /// What a match writes: each field's bytes come from the rule's result record. Empty: gate-only.
   optional bytes default_result = 6; /// Placed on a miss, in addition to taking default_gate. Absent: a miss writes no result fields.
@@ -1275,8 +1269,6 @@ message WildcardMatchArg {
   /// nothing on the packet path. A new mask beyond it is refused with ENOSPC.
   uint32 max_tuples = 2;
   optional uint64 default_gate = 3; /// The gate of a packet no rule matches (default: drop); set_default_gate changes it later.
-  reserved 4;
-  reserved "action_resource"; /// was the action id result; use result_fields
   repeated ResultField result_fields = 5; /// What a match writes: each field's bytes come from the rule's result record. Empty: gate-only.
   optional bytes default_result = 6; /// Placed on a miss, in addition to taking default_gate. Absent: a miss writes no result fields.
 }
