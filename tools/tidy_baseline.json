@@ -46,11 +46,6 @@
       "cert-err33-c": 2,
       "performance-unnecessary-copy-initialization": 1
     },
-    "core/framework/exact_match_table.h": {
-      "bugprone-assignment-in-if-condition": 2,
-      "bugprone-implicit-widening-of-multiplication-result": 1,
-      "misc-redundant-expression": 1
-    },
     "core/framework/plugin_check.cc": {
       "cert-err33-c": 4
     },
@@ -118,9 +113,6 @@
       "cppcoreguidelines-narrowing-conversions": 1
     },
     "core/modules/generic_encap.cc": {
-      "cppcoreguidelines-narrowing-conversions": 2
-    },
-    "core/modules/hash_lb.cc": {
       "cppcoreguidelines-narrowing-conversions": 2
     },
     "core/modules/l2_forward.cc": {

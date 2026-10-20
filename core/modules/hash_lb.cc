@@ -4,16 +4,27 @@
 
 #include "hash_lb.h"
 
+#include <array>
+#include <cstddef>
 #include <cstring>
 #include <expected>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "arch/crc32c.h"
+#include "classifier/runtime_schema.h"
 #include "dataplane/member_select.h"
+#include "event.h"
+#include "metadata.h"
+#include "snbuf_layout.h"
 #include "utils/ether.h"
+#include "utils/format.h"
 #include "utils/ip.h"
+#include "utils/logging.h"
+
+namespace classifier = bess::classifier;
 
 static inline uint32_t hash_16(uint16_t val, uint32_t init_val) {
   return bess::arch::Crc32c(val, init_val);
@@ -85,21 +96,138 @@ void HashLB::Install(Config config) {
   init_context().rcu().ReclaimReady();
 }
 
-CommandResponse HashLB::ApplyMode(const bess::pb::HashLBCommandSetModeArg &arg,
-                                  Config *config) const {
-  if (arg.fields_size()) {
-    auto fields = std::make_shared<ExactMatchTable<int>>();
-    for (int i = 0; i < arg.fields_size(); i++) {
-      const auto &f = arg.fields(i);
-      const auto err = fields->AddField(f.offset(), f.num_bytes(), 0, i);
-      if (err.first) {
-        return CommandFailure(-err.first, "Error adding field %d: %s", i,
-                              err.second.c_str());
+CommandResponse HashLB::ResolveAttr(const std::string &name, size_t size,
+                                    int *attr_id, bool allow_new) {
+  for (const ResolvedAttr &attr : resolved_attrs_) {
+    if (attr.name != name) {
+      continue;
+    }
+    if (attr.size != size) {
+      return CommandFailure(EINVAL,
+                            "attribute '%s' is %zu bytes, not %zu",
+                            name.c_str(), attr.size, size);
+    }
+    *attr_id = attr.attr_id;
+    return CommandSuccess();
+  }
+  if (!allow_new) {
+    return CommandFailure(
+        EINVAL,
+        "attribute '%s' is not registered: a live update cannot add one "
+        "(declare it when the module is created)",
+        name.c_str());
+  }
+  const int id = AddMetadataAttr(name, size,
+                                 bess::metadata::Attribute::AccessMode::kRead);
+  if (id < 0) {
+    return CommandFailure(-id, "attribute '%s' cannot be read", name.c_str());
+  }
+  resolved_attrs_.push_back(ResolvedAttr{name, size, id});
+  *attr_id = id;
+  return CommandSuccess();
+}
+
+CommandResponse HashLB::ParseFields(
+    const google::protobuf::RepeatedPtrField<bess::pb::Field> &fields,
+    std::vector<FieldSpec> *specs, bool allow_new_attrs) {
+  if (fields.size() > kMaxFields) {
+    return CommandFailure(EINVAL, "HashLB can have at most %d fields",
+                          kMaxFields);
+  }
+  specs->clear();
+  specs->reserve(static_cast<size_t>(fields.size()));
+  for (int i = 0; i < fields.size(); i++) {
+    const bess::pb::Field &f = fields.Get(i);
+    const int64_t size = f.num_bytes();
+    if (size < 1 || size > kMaxFieldSize) {
+      return CommandFailure(EINVAL,
+                            "Error adding field %d: 'size' must be in [1,%d]",
+                            i, kMaxFieldSize);
+    }
+    FieldSpec spec;
+    spec.size = static_cast<size_t>(size);
+    if (f.position_case() == bess::pb::Field::kAttrName) {
+      spec.source = classifier::SourceKind::kMetadata;
+      CommandResponse err =
+          ResolveAttr(f.attr_name(), spec.size, &spec.attr_id, allow_new_attrs);
+      if (err.has_error()) {
+        return err;
       }
+    } else {
+      spec.source = classifier::SourceKind::kPacket;
+      if (f.offset() > static_cast<uint32_t>(kMaxFieldOffset)) {
+        return CommandFailure(EINVAL, "Error adding field %d: invalid 'offset'",
+                              i);
+      }
+      spec.source_offset = f.offset();
+    }
+    specs->push_back(spec);
+  }
+  return CommandSuccess();
+}
+
+CommandResponse HashLB::BuildExtraction(
+    const std::vector<FieldSpec> &specs,
+    std::shared_ptr<const FieldExtraction> *extraction) const {
+  // Dense key: each field's bytes after the previous ones, in field order.
+  // The plan checks each source's extent (BoundsPolicy::kCheck), so a packet
+  // too short for a field fails extraction instead of being read past its
+  // first segment.
+  classifier::RuntimeClassifierSchema schema;
+  schema.bounds = classifier::BoundsPolicy::kCheck;
+  schema.key_fields.reserve(specs.size());
+  size_t key_offset = 0;
+  for (size_t i = 0; i < specs.size(); i++) {
+    const FieldSpec &spec = specs[i];
+    classifier::RuntimeKeyField field;
+    field.key_offset = key_offset;
+    field.size = spec.size;
+    field.source = spec.source;
+    if (spec.source == classifier::SourceKind::kPacket) {
+      field.source_offset = spec.source_offset;
+    } else {
+      // Baked in: a metadata offset is assigned by the resume, so the plan is
+      // rebuilt then (OnEvent). The check proves the offset is non-negative;
+      // mt_offset_t is int8_t, so widen through unsigned char.
+      const bess::metadata::mt_offset_t offset =
+          attr_offset(static_cast<size_t>(spec.attr_id));
+      if (!bess::metadata::IsValidOffset(offset)) {
+        return CommandFailure(
+            EINVAL, "Error adding field %zu: attribute has no readable offset",
+            i);
+      }
+      field.source_offset = static_cast<size_t>(static_cast<uint8_t>(offset));
+    }
+    key_offset += spec.size;
+    schema.key_fields.push_back(field);
+  }
+  schema.key_size = key_offset;
+  auto plan = classifier::ExtractPlan::Compile(schema);
+  if (!plan) {
+    return CommandFailure(EINVAL, "Error adding fields: %s",
+                          plan.error().message.c_str());
+  }
+  *extraction =
+      std::make_shared<const FieldExtraction>(std::move(*plan), specs.size());
+  return CommandSuccess();
+}
+
+CommandResponse HashLB::ApplyMode(const bess::pb::HashLBCommandSetModeArg &arg,
+                                  Config *config, bool allow_new_attrs) {
+  if (arg.fields_size()) {
+    std::vector<FieldSpec> specs;
+    CommandResponse err = ParseFields(arg.fields(), &specs, allow_new_attrs);
+    if (err.has_error()) {
+      return err;
+    }
+    std::shared_ptr<const FieldExtraction> extraction;
+    err = BuildExtraction(specs, &extraction);
+    if (err.has_error()) {
+      return err;
     }
     config->mode = Mode::kOther;
-    config->hasher = ExactMatchKeyHash(fields->total_key_size());
-    config->fields_table = std::move(fields);
+    config->field_specs = std::move(specs);
+    config->extraction = std::move(extraction);
   } else if (arg.mode() == "l2") {
     config->mode = Mode::kL2;
   } else if (arg.mode() == "l3") {
@@ -108,6 +236,11 @@ CommandResponse HashLB::ApplyMode(const bess::pb::HashLBCommandSetModeArg &arg,
     config->mode = Mode::kL4;
   } else {
     return CommandFailure(EINVAL, "available LB modes: l2, l3, l4");
+  }
+  if (config->mode != Mode::kOther) {
+    // The custom tuple is kOther's; the mode replaces it.
+    config->field_specs.clear();
+    config->extraction.reset();
   }
   config->settings.set_mode(arg.mode());
   *config->settings.mutable_fields() = arg.fields();
@@ -152,7 +285,7 @@ CommandResponse HashLB::Init(const bess::pb::HashLBArg &arg) {
     bess::pb::HashLBCommandSetModeArg mode_arg;
     mode_arg.set_mode(arg.mode());
     *mode_arg.mutable_fields() = arg.fields();
-    ret = ApplyMode(mode_arg, &config);
+    ret = ApplyMode(mode_arg, &config, /*allow_new_attrs=*/true);
     if (ret.has_error()) {
       return ret;
     }
@@ -178,7 +311,9 @@ CommandResponse HashLB::Init(const bess::pb::HashLBArg &arg) {
         bess::pb::HashLBCommandSetModeArg mode_arg;
         mode_arg.set_mode(v.mode());
         *mode_arg.mutable_fields() = v.fields();
-        err = ApplyMode(mode_arg, &next);
+        // A live write does not resume: it cannot register a new attribute
+        // (its offset would still be zero), so only Init may do that.
+        err = ApplyMode(mode_arg, &next, /*allow_new_attrs=*/false);
         if (err.has_error()) {
           return std::unexpected(err.error().errmsg());
         }
@@ -202,28 +337,93 @@ void HashLB::DeInit() {
 
 std::string HashLB::GetDesc() const {
   const Config *config = config_.Read();
-  return bess::utils::Format("%zu fields",
-                             config ? config->fields_table->num_fields() : 0);
+  return bess::utils::Format(
+      "%zu fields",
+      config != nullptr && config->extraction != nullptr
+          ? config->extraction->num_fields
+          : 0);
+}
+
+int HashLB::OnEvent(bess::Event event) {
+  if (event != bess::Event::PreResume) {
+    return -ENOTSUP;
+  }
+  const Config *current = config_.Read();
+  if (current == nullptr || current->mode != Mode::kOther) {
+    return 0;
+  }
+  // A metadata offset is assigned by the resume, after Init built the first
+  // plan against a placeholder; the plan bakes the offset in, so rebuild it.
+  Config next = *current;
+  std::shared_ptr<const FieldExtraction> extraction;
+  CommandResponse err = BuildExtraction(next.field_specs, &extraction);
+  if (err.has_error()) {
+    // There is no key to hash: fail closed rather than hash a wrong region.
+    LOG(ERROR) << "HashLB '" << name() << "': " << err.error().errmsg()
+               << "; dropping every packet until the fields are set again";
+  }
+  next.extraction = std::move(extraction);
+  Install(std::move(next));
+  return 0;
+}
+
+// The custom tuple's hash: CRC32C over the key bytes, zero-padded to whole
+// 8-byte words. This is the layout and hash the field table this mode used to
+// build produced (fields packed in order, ExactMatchKeyHash over the padded
+// words), so no flow changes gate.
+static inline uint32_t HashKey(const std::byte *key, size_t key_size) {
+  uint32_t hash = 0;
+  size_t at = 0;
+  for (; at + sizeof(uint64_t) <= key_size; at += sizeof(uint64_t)) {
+    hash = bess::arch::Crc32c(
+        Load<uint64_t>(reinterpret_cast<const char *>(key) + at), hash);
+  }
+  if (at < key_size) {
+    uint64_t tail = 0;
+    std::memcpy(&tail, key + at, key_size - at);
+    hash = bess::arch::Crc32c(tail, hash);
+  }
+  return hash;
 }
 
 template <>
 inline void HashLB::DoProcessBatch<HashLB::Mode::kOther>(
     Context *ctx, bess::PacketBatch *batch, const Config &config) {
-  void *bufs[bess::PacketBatch::kMaxBurst];
-  ExactMatchKey keys[bess::PacketBatch::kMaxBurst];
-
-  size_t cnt = batch->cnt();
+  // Only reached with a plan; ProcessBatch drops everything without one.
+  const classifier::ExtractPlan &plan = config.extraction->plan;
+  const size_t key_size = plan.key_size();
+  CHECK_LE(key_size, kMaxKeyBytes);
+  std::array<classifier::SourceView, bess::PacketBatch::kMaxBurst> sources;
+  std::array<std::byte, bess::PacketBatch::kMaxBurst * kMaxKeyBytes> keys;
+  const size_t cnt = batch->cnt();
   for (size_t i = 0; i < cnt; i++) {
-    bufs[i] = batch->packet(i).head_data<void *>();
+    const bess::PacketRef pkt = batch->packet(i);
+    // The first segment only: a field reaching past it (a short packet, or a
+    // chained packet's later segment) fails extraction under kCheck rather
+    // than being read out of bounds.
+    sources[i].packet = classifier::ConstBytes(
+        pkt.head_data<const std::byte *>(),
+        static_cast<size_t>(pkt.data_len()));
+    sources[i].metadata = classifier::ConstBytes(
+        pkt.metadata<const std::byte *>(), SNBUF_METADATA);
   }
-
-  config.fields_table->MakeKeys((const void **)bufs, keys, cnt);
+  // The key is dense (every field's bytes, in order), so a successful
+  // extraction writes every byte of the row: no pre-zeroing is needed. A
+  // failed extraction writes nothing and the row is not hashed (the packet is
+  // dropped).
+  const uint64_t extracted = plan.ExecuteBatch(
+      std::span<const classifier::SourceView>(sources).first(cnt),
+      classifier::MutableBytes(keys.data(), cnt * key_size), key_size);
   const gate_idx_t *gates = config.gates.data();
   const uint16_t num_gates = static_cast<uint16_t>(config.gates.size());
-
   for (size_t i = 0; i < cnt; i++) {
-    EmitPacket(ctx, batch->packet(i),
-               gates[hash_range(config.hasher(keys[i]), num_gates)]);
+    const bess::PacketRef pkt = batch->packet(i);
+    if (!(extracted & (uint64_t{1} << i))) {
+      EmitPacket(ctx, pkt, DROP_GATE);
+      continue;
+    }
+    const uint32_t hash = HashKey(keys.data() + i * key_size, key_size);
+    EmitPacket(ctx, pkt, gates[hash_range(hash, num_gates)]);
   }
 }
 
@@ -325,7 +525,14 @@ void HashLB::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       DoProcessBatch<Mode::kL4>(ctx, batch, config);
       break;
     case Mode::kOther:
-      DoProcessBatch<Mode::kOther>(ctx, batch, config);
+      if (config.extraction == nullptr) {
+        // Fail closed (see OnEvent): no key, so no packet has a gate.
+        for (bess::PacketRef pkt : batch->packets()) {
+          EmitPacket(ctx, pkt, DROP_GATE);
+        }
+      } else {
+        DoProcessBatch<Mode::kOther>(ctx, batch, config);
+      }
       break;
     default:
       DCHECK(0);

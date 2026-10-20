@@ -71,6 +71,7 @@ Columns:
 | Rewrite / FlowGen | template | 1,536 B | `Rewrite::kMaxTemplateSize`, `MAX_TEMPLATE_SIZE` (`flowgen.h`) | No | EINVAL "template is too big" |
 | Replicate | gates | 32 | `Replicate::kMaxGates` | No | EINVAL |
 | HashLB | gates | 16,384 | `HashLB::kMaxGates` | No | EINVAL |
+| HashLB | custom-tuple fields; bytes per field; packet offset | 8; 8; 0-1,024 | `HashLB::kMaxFields`, `kMaxFieldSize`, `kMaxFieldOffset` | No | EINVAL |
 | RandomSplit / RoundRobin | gates | 16,384 | `MAX_SPLIT_GATES`, `MAX_RR_GATES` | No | EINVAL |
 | VLANSplit | gates | 4,096 (one per VID) | `kNumOGates` | No | — |
 | WorkerSplit | gates | 64 (one per worker) | `kNumOGates` | No | — |
