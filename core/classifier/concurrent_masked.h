@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -18,6 +17,7 @@
 #include "classifier/backend.h"
 #include "classifier/concurrent_exact.h"
 #include "classifier/masked_exact.h"
+#include "classifier/record_arena.h"
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
 
@@ -100,8 +100,6 @@ class ConcurrentMaskedTable {
   static constexpr uint16_t kPendingResult = 0xFFFF;
 
   static constexpr size_t kMaxBatch = 64;
-  static constexpr uint32_t kChunkBits = 10;  // 1024 records per chunk
-  static constexpr uint32_t kMaxChunks = 1u << 14;  // 16M rules
 
   static std::expected<std::unique_ptr<ConcurrentMaskedTable>, std::string>
   Create(uint32_t key_len, size_t max_tuples, rcu::RcuDomain &domain);
@@ -177,12 +175,10 @@ class ConcurrentMaskedTable {
   size_t max_tuples() const noexcept { return max_tuples_; }
   uint32_t key_len() const noexcept { return key_len_; }
   // Rule ids retired but not yet past their grace period.
-  size_t retiring_ids() const noexcept { return retiring_.size(); }
+  size_t retiring_ids() const noexcept { return records_.retiring(); }
   // Rule ids not free: live rules, retiring ids, prepared records and the
   // pending record.
-  size_t ids_in_use() const noexcept {
-    return (next_id_ - 1) - free_ids_.size();
-  }
+  size_t ids_in_use() const noexcept { return records_.in_use(); }
 
   // -- reader -------------------------------------------------------------------
 
@@ -270,11 +266,6 @@ class ConcurrentMaskedTable {
   struct TupleList {
     std::vector<Tuple> tuples;
   };
-  struct Retiring {
-    RuleId id;
-    rcu::GracePeriod token;
-  };
-
   ConcurrentMaskedTable(uint32_t key_len, size_t max_tuples,
                         rcu::RcuDomain &domain);
 
@@ -322,16 +313,13 @@ class ConcurrentMaskedTable {
   }
 
   const Rule &Record(RuleId id) const noexcept {
-    const Rule *chunk =
-        chunks_[id >> kChunkBits].load(std::memory_order_acquire);
-    return chunk[id & ((1u << kChunkBits) - 1)];
+    return *reinterpret_cast<const Rule *>(records_.Lookup(id).data());
   }
-  Rule &MutableRecord(RuleId id);
+  Rule &MutableRecord(RuleId id) {
+    return *reinterpret_cast<Rule *>(records_.Record(id).data());
+  }
 
   // Writer helpers.
-  RuleId AllocateId();         // 0 when out of ids
-  void RetireId(RuleId id);
-  void ReclaimIds();
   std::shared_ptr<ConcurrentExactTable> NewTupleTable(size_t rules) const;
   // A copy of `from` at least twice its capacity; nullptr on failure.
   std::shared_ptr<ConcurrentExactTable> Grown(
@@ -355,17 +343,12 @@ class ConcurrentMaskedTable {
   rcu::RcuDomain &domain_;
   detail::MaskBatchFn mask_batch_;
   rcu::RcuPtr<TupleList> tuples_;
-  std::unique_ptr<std::atomic<Rule *>[]> chunks_;  // kMaxChunks entries
-  std::vector<std::unique_ptr<Rule[]>> chunk_storage_;
-  RuleId next_id_ = 1;
+  // Rule records live here, addressed by RuleId (write-once; grace-period
+  // recycling). A reader's load is an acquire load of the chunk base.
+  RecordArena records_;
   uint64_t next_sequence_ = 1;
-  std::vector<RuleId> free_ids_;
   // The record every pending entry names (allocated on first use).
   RuleId pending_id_ = 0;
-  // Prepared, not yet committed or cancelled: free_ids_ keeps room for each,
-  // so Cancel() does not allocate.
-  size_t prepared_ = 0;
-  std::deque<Retiring> retiring_;
   size_t size_ = 0;
 };
 

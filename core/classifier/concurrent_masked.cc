@@ -34,10 +34,7 @@ ConcurrentMaskedTable::ConcurrentMaskedTable(uint32_t key_len,
       domain_(domain),
       mask_batch_(detail::SelectMaskBatch(key_len)),
       tuples_(domain),
-      chunks_(new std::atomic<Rule *>[kMaxChunks]) {
-  for (uint32_t c = 0; c < kMaxChunks; c++) {
-    chunks_[c].store(nullptr, std::memory_order_relaxed);
-  }
+      records_(sizeof(Rule), domain) {
   tuples_.Initialize(std::make_unique<TupleList>());
 }
 
@@ -45,44 +42,6 @@ ConcurrentMaskedTable::~ConcurrentMaskedTable() {
   // The table is destroyed with the last generation that maps it, which is
   // itself retired past a grace period: no reader can hold the tuple list.
   tuples_.ResetQuiesced();
-}
-
-ConcurrentMaskedTable::Rule &ConcurrentMaskedTable::MutableRecord(RuleId id) {
-  return chunk_storage_[id >> kChunkBits][id & ((1u << kChunkBits) - 1)];
-}
-
-ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::AllocateId() {
-  ReclaimIds();
-  if (!free_ids_.empty()) {
-    const RuleId id = free_ids_.back();
-    free_ids_.pop_back();
-    return id;
-  }
-  const RuleId id = next_id_;
-  const uint32_t chunk = id >> kChunkBits;
-  if (chunk >= kMaxChunks) {
-    return 0;
-  }
-  if (chunk == chunk_storage_.size()) {
-    chunk_storage_.push_back(std::make_unique<Rule[]>(1u << kChunkBits));
-    // Published before any id in it is: readers reach a chunk only through
-    // an id they loaded from a table, which the table add releases later.
-    chunks_[chunk].store(chunk_storage_.back().get(),
-                         std::memory_order_release);
-  }
-  next_id_++;
-  return id;
-}
-
-void ConcurrentMaskedTable::RetireId(RuleId id) {
-  retiring_.push_back({id, domain_.StartGracePeriod()});
-}
-
-void ConcurrentMaskedTable::ReclaimIds() {
-  while (!retiring_.empty() && domain_.IsComplete(retiring_.front().token)) {
-    free_ids_.push_back(retiring_.front().id);
-    retiring_.pop_front();
-  }
 }
 
 std::shared_ptr<ConcurrentExactTable> ConcurrentMaskedTable::NewTupleTable(
@@ -200,7 +159,7 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
     replaced = true;
   }
 
-  const RuleId id = AllocateId();
+  const RuleId id = records_.Allocate();
   if (id == 0) {
     return UpsertResult::kFull;
   }
@@ -219,7 +178,7 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
     table = Grown(*table);
     if (table == nullptr || table->Upsert(value, Pack(id, gate)) ==
                                 ConcurrentExactTable::UpsertResult::kFull) {
-      free_ids_.push_back(id);  // never published: reusable at once
+      records_.Abort(id);  // never published: reusable at once
       return UpsertResult::kFull;
     }
     replaced = true;
@@ -236,7 +195,7 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
     PublishTuples(std::move(next));
   }
   if (old != 0) {
-    RetireId(old);
+    records_.Retire(old);
     return UpsertResult::kUpdated;
   }
   size_++;
@@ -300,9 +259,8 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
   // Everything that allocates without a visible effect first.
   Prepared prepared{std::vector<std::byte>(mask.begin(), mask.end()),
                     std::vector<std::byte>(value.begin(), value.end())};
-  free_ids_.reserve(free_ids_.size() + prepared_ + 2);
   if (pending_id_ == 0) {
-    pending_id_ = AllocateId();
+    pending_id_ = records_.Allocate();
     if (pending_id_ == 0) {
       return std::unexpected(UpsertResult::kFull);
     }
@@ -341,7 +299,7 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
     }
     replaced = true;
   }
-  const RuleId id = AllocateId();
+  const RuleId id = records_.Allocate();
   if (id == 0) {
     return std::unexpected(UpsertResult::kFull);
   }
@@ -359,7 +317,7 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
       if (table == nullptr ||
           table->Upsert(value, pending) ==
               ConcurrentExactTable::UpsertResult::kFull) {
-        free_ids_.push_back(id);  // never named: reusable at once
+        records_.Abort(id);  // never named: reusable at once
         return std::unexpected(UpsertResult::kFull);
       }
       replaced = true;
@@ -382,7 +340,6 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
   prepared.id = id;
   prepared.gate = gate;
   prepared.action_id = action_id;
-  prepared_++;
   return prepared;
 }
 
@@ -401,7 +358,6 @@ ConcurrentMaskedTable::PrepareErase(ConstBytes mask, ConstBytes value) {
   Prepared prepared{std::vector<std::byte>(mask.begin(), mask.end()),
                     std::vector<std::byte>(value.begin(), value.end())};
   prepared.old = old;
-  prepared_++;
   return prepared;
 }
 
@@ -428,7 +384,6 @@ ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::Commit(
     // An emptied tuple stays until the next prepare or command drops it
     // (republishing the list would allocate here).
   }
-  prepared_--;
   return prepared.old;
 }
 
@@ -441,13 +396,12 @@ void ConcurrentMaskedTable::Cancel(const Prepared &prepared) noexcept {
       list->tuples[index].table->Erase(
           ConstBytes(prepared.value.data(), prepared.value.size()));
     }
-    free_ids_.push_back(prepared.id);  // never named; room reserved
+    records_.Abort(prepared.id);  // never named
   }
-  prepared_--;
 }
 
 void ConcurrentMaskedTable::Recycle(RuleId id) {
-  free_ids_.push_back(id);
+  records_.Abort(id);
   DropEmptyTuples();
 }
 
@@ -463,7 +417,7 @@ bool ConcurrentMaskedTable::Erase(ConstBytes mask, ConstBytes value) {
     if (id == 0 || !tuple.table->Erase(value)) {
       return false;
     }
-    RetireId(id);
+    records_.Retire(id);
     size_--;
     if (tuple.table->size() == 0) {
       // The mask's last rule: the tuple goes, and with it a slot of the
@@ -489,7 +443,7 @@ void ConcurrentMaskedTable::Clear() {
   // the old list and loads one of these ids.
   PublishTuples(std::make_unique<TupleList>());
   for (const RuleId id : ids) {
-    RetireId(id);
+    records_.Retire(id);
   }
   size_ = 0;
 }

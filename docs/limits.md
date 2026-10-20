@@ -63,7 +63,8 @@ Columns:
 | ExactMatch | rules | grows by doubling; memory only | `EnsureCapacity` (D-010) | — | ENOSPC only if a table cannot be built |
 | WildcardMatch | fields; bytes per field | 8; 8 | `WildcardMatch::kMaxFields`, `kMaxFieldSize` | No | EINVAL at init |
 | WildcardMatch | distinct masks in use | 8 (master's `MAX_TUPLES`) | `WildcardMatchArg.max_tuples`, 1–1,024 (`kMaxTuplesLimit`) | yes, at init | ENOSPC "too many distinct masks"; a mask is freed when its last rule goes |
-| WildcardMatch | rules | 16M (`ConcurrentMaskedTable::kMaxChunks` × 1,024) | No | ENOSPC "rule table is full" |
+| WildcardMatch | rules | 16M (`RecordArena::kMaxChunks` × 1,024) | No | ENOSPC "rule table is full" |
+| WildcardMatch | rule record size | 4,096 B | `RecordArena::kMaxRecordSize` (`classifier/record_arena.h`) | No | the arena's constructor `CHECK`s; a rule record is far smaller |
 | GenericEncap | fields; bytes per field | 8; 8 | `MAX_FIELDS`, `MAX_FIELD_SIZE` (`generic_encap.h`) | No | EINVAL "at most 8 fields" |
 | Update | fields | 16 | `Update::kMaxFields` | No | EINVAL |
 | RandomUpdate | fields | 16 | `kMaxVariable` (`random_update.h`) | No | EINVAL |
