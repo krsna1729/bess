@@ -1014,6 +1014,137 @@ TEST_F(ApiV2ServiceTest, ReadResourceReadsATableAboveTheMessageLimit) {
   }
 }
 
+// ResetResources empties only the tables it names, in the daemon: no key is
+// read over the wire, and the unlisted table keeps its entries. The expected
+// resource generation is checked before anything changes.
+TEST_F(ApiV2ServiceTest, ResetResourcesErasesOnlyTheNamedTables) {
+  bess::pb::ExactMatchArg em;
+  bess::pb::Field *field = em.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  google::protobuf::Any em_arg;
+  ASSERT_TRUE(em_arg.PackFrom(em));
+  ASSERT_TRUE(control_plane_->CreateModule({"take", "ExactMatch", em_arg}));
+  ASSERT_TRUE(control_plane_->CreateModule({"keep", "ExactMatch", em_arg}));
+
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyTransactionRequest req;
+    req.set_request_id("reset-rules");
+    req.set_daemon_epoch(Epoch());
+    const char *keys[] = {"aaaa", "bbbb", "cccc", "dddd"};
+    int i = 0;
+    for (const char *resource : {"take/rules", "take/rules", "take/rules",
+                                 "keep/rules"}) {
+      bess::pb::ExactMatchRuleKey key;
+      key.add_fields()->set_value_bin(keys[i++]);
+      bess::pb::ExactMatchRuleValue value;
+      value.set_gate(1);
+      v2::TransactionOp *op = req.add_ops();
+      op->set_resource(resource);
+      ASSERT_TRUE(op->mutable_key()->PackFrom(key));
+      ASSERT_TRUE(op->mutable_value()->PackFrom(value));
+    }
+    v2::ApplyTransactionResponse applied;
+    const grpc::Status status = stub_->ApplyTransaction(&ctx, req, &applied);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+
+  auto count = [&](const std::string &name) {
+    grpc::ClientContext ctx;
+    v2::ReadResourceRequest req;
+    req.set_resource(name);
+    auto reader = stub_->ReadResource(&ctx, req);
+    v2::ResourcePage page;
+    int entries = 0;
+    while (reader->Read(&page)) {
+      entries += page.entries_size();
+    }
+    EXPECT_TRUE(reader->Finish().ok());
+    return entries;
+  };
+  EXPECT_EQ(3, count("take/rules"));
+  EXPECT_EQ(1, count("keep/rules"));
+
+  uint64_t generation = 0;
+  {
+    grpc::ClientContext ctx;
+    v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
+    req.add_resources("take/rules");
+    auto before = control_plane_->ReadResource("take/rules");
+    ASSERT_TRUE(before.has_value());
+    req.set_expected_resource_generation(before->resource_generation);
+    v2::ResetResourcesResponse resp;
+    const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    ASSERT_EQ(1, resp.resources_size());
+    EXPECT_EQ("take/rules", resp.resources(0));
+    EXPECT_EQ(3, resp.removed());
+    EXPECT_NE(0u, resp.resource_generation());
+    EXPECT_EQ(Epoch(), resp.daemon_epoch());
+    generation = resp.resource_generation();
+  }
+  EXPECT_EQ(0, count("take/rules"));
+  EXPECT_EQ(1, count("keep/rules")) << "a table the request did not name was touched";
+
+  {
+    grpc::ClientContext ctx;
+    v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
+    req.add_resources("take/rules");
+    req.add_resources("take/rules");  // one resource, once
+    v2::ResetResourcesResponse resp;
+    const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    EXPECT_EQ(1, resp.resources_size());
+    EXPECT_EQ(0, resp.removed());
+    EXPECT_EQ(generation, resp.resource_generation()) << "an empty table is no transaction";
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
+    req.add_resources("keep/rules");
+    req.set_expected_resource_generation(generation - 1);
+    v2::ResetResourcesResponse resp;
+    const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
+    EXPECT_EQ(grpc::StatusCode::ABORTED, status.error_code());
+    EXPECT_EQ(1, count("keep/rules")) << "a stale request erased an entry";
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch() + 1);  // a daemon that restarted since the read
+    req.add_resources("keep/rules");
+    v2::ResetResourcesResponse resp;
+    const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
+    EXPECT_EQ(grpc::StatusCode::FAILED_PRECONDITION, status.error_code());
+    EXPECT_EQ(1, count("keep/rules")) << "a foreign epoch erased an entry";
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
+    req.add_resources("no-such/table");
+    v2::ResetResourcesResponse resp;
+    const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
+    EXPECT_EQ(grpc::StatusCode::NOT_FOUND, status.error_code());
+  }
+
+  {
+    grpc::ClientContext ctx;
+    v2::ResetResourcesRequest req;
+    req.set_daemon_epoch(Epoch());
+    v2::ResetResourcesResponse resp;
+    const grpc::Status status = stub_->ResetResources(&ctx, req, &resp);
+    EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, status.error_code());
+  }
+}
+
 // GetResourceStatus: what a controller reads before it grows the graph --
 // what the resources hold, the daemon's own memory, the reclamation budget it
 // would draw on, and the workers that would carry the change. One call, so a

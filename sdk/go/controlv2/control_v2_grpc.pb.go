@@ -22,6 +22,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Control_GetPipeline_FullMethodName              = "/bess.pb.v2.Control/GetPipeline"
 	Control_ReadResource_FullMethodName             = "/bess.pb.v2.Control/ReadResource"
+	Control_ResetResources_FullMethodName           = "/bess.pb.v2.Control/ResetResources"
 	Control_ValidatePipeline_FullMethodName         = "/bess.pb.v2.Control/ValidatePipeline"
 	Control_DiffPipeline_FullMethodName             = "/bess.pb.v2.Control/DiffPipeline"
 	Control_PlanPipeline_FullMethodName             = "/bess.pb.v2.Control/PlanPipeline"
@@ -43,6 +44,7 @@ const (
 type ControlClient interface {
 	GetPipeline(ctx context.Context, in *GetPipelineRequest, opts ...grpc.CallOption) (*GetPipelineResponse, error)
 	ReadResource(ctx context.Context, in *ReadResourceRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ResourcePage], error)
+	ResetResources(ctx context.Context, in *ResetResourcesRequest, opts ...grpc.CallOption) (*ResetResourcesResponse, error)
 	ValidatePipeline(ctx context.Context, in *ValidatePipelineRequest, opts ...grpc.CallOption) (*ValidatePipelineResponse, error)
 	DiffPipeline(ctx context.Context, in *DiffPipelineRequest, opts ...grpc.CallOption) (*DiffPipelineResponse, error)
 	PlanPipeline(ctx context.Context, in *PlanPipelineRequest, opts ...grpc.CallOption) (*PlanPipelineResponse, error)
@@ -94,6 +96,16 @@ func (c *controlClient) ReadResource(ctx context.Context, in *ReadResourceReques
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Control_ReadResourceClient = grpc.ServerStreamingClient[ResourcePage]
+
+func (c *controlClient) ResetResources(ctx context.Context, in *ResetResourcesRequest, opts ...grpc.CallOption) (*ResetResourcesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResetResourcesResponse)
+	err := c.cc.Invoke(ctx, Control_ResetResources_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func (c *controlClient) ValidatePipeline(ctx context.Context, in *ValidatePipelineRequest, opts ...grpc.CallOption) (*ValidatePipelineResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -240,6 +252,7 @@ func (c *controlClient) GetResourceStatus(ctx context.Context, in *GetResourceSt
 type ControlServer interface {
 	GetPipeline(context.Context, *GetPipelineRequest) (*GetPipelineResponse, error)
 	ReadResource(*ReadResourceRequest, grpc.ServerStreamingServer[ResourcePage]) error
+	ResetResources(context.Context, *ResetResourcesRequest) (*ResetResourcesResponse, error)
 	ValidatePipeline(context.Context, *ValidatePipelineRequest) (*ValidatePipelineResponse, error)
 	DiffPipeline(context.Context, *DiffPipelineRequest) (*DiffPipelineResponse, error)
 	PlanPipeline(context.Context, *PlanPipelineRequest) (*PlanPipelineResponse, error)
@@ -268,6 +281,9 @@ func (UnimplementedControlServer) GetPipeline(context.Context, *GetPipelineReque
 }
 func (UnimplementedControlServer) ReadResource(*ReadResourceRequest, grpc.ServerStreamingServer[ResourcePage]) error {
 	return status.Errorf(codes.Unimplemented, "method ReadResource not implemented")
+}
+func (UnimplementedControlServer) ResetResources(context.Context, *ResetResourcesRequest) (*ResetResourcesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ResetResources not implemented")
 }
 func (UnimplementedControlServer) ValidatePipeline(context.Context, *ValidatePipelineRequest) (*ValidatePipelineResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ValidatePipeline not implemented")
@@ -357,6 +373,24 @@ func _Control_ReadResource_Handler(srv interface{}, stream grpc.ServerStream) er
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Control_ReadResourceServer = grpc.ServerStreamingServer[ResourcePage]
+
+func _Control_ResetResources_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResetResourcesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).ResetResources(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_ResetResources_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).ResetResources(ctx, req.(*ResetResourcesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _Control_ValidatePipeline_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ValidatePipelineRequest)
@@ -595,6 +629,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetPipeline",
 			Handler:    _Control_GetPipeline_Handler,
+		},
+		{
+			MethodName: "ResetResources",
+			Handler:    _Control_ResetResources_Handler,
 		},
 		{
 			MethodName: "ValidatePipeline",

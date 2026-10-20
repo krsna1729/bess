@@ -1939,6 +1939,58 @@ ControlPlane::ReadResource(const std::string &name) const {
   return read;
 }
 
+ControlResult<ControlPlane::Versioned<ControlPlane::ResourceReset>>
+ControlPlane::ResetResources(
+    std::vector<std::string> names,
+    std::optional<uint64_t> expected_resource_generation) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  dataplane::TransactionEngine &engine = runtime::runtime().transactions();
+  if (expected_resource_generation.has_value() &&
+      *expected_resource_generation != engine.generation()) {
+    ControlError error =
+        Err(ESTALE, "expected resource generation %llu, active resource generation %llu",
+            static_cast<unsigned long long>(*expected_resource_generation),
+            static_cast<unsigned long long>(engine.generation()));
+    error.code = ControlErrorCode::kConflict;
+    error.field = "expected_resource_generation";
+    return std::unexpected(error);
+  }
+  if (names.empty()) {
+    ControlError error = Err(EINVAL, "resources: at least one name is required");
+    error.field = "resources";
+    return std::unexpected(error);
+  }
+  std::vector<std::string> unique;
+  unique.reserve(names.size());
+  for (std::string &name : names) {
+    if (name.empty()) {
+      ControlError error = Err(EINVAL, "resources: a name is required");
+      error.field = "resources";
+      return std::unexpected(error);
+    }
+    if (std::find(unique.begin(), unique.end(), name) == unique.end()) {
+      unique.push_back(std::move(name));
+    }
+  }
+  std::vector<ResourceSpec> specs;
+  specs.reserve(unique.size());
+  for (const std::string &name : unique) {
+    ResourceSpec spec;
+    spec.name = name;  // no entries: converge to empty
+    specs.push_back(std::move(spec));
+  }
+  auto removed = ApplyResourcesLocked(specs);
+  if (!removed) {
+    return std::unexpected(removed.error());
+  }
+  Versioned<ResourceReset> reset;
+  reset.value.resources = std::move(unique);
+  reset.value.removed = *removed;
+  reset.generation = runtime::runtime().generation();
+  reset.resource_generation = engine.generation();
+  return reset;
+}
+
 ControlResult<ControlPlane::Versioned<PipelineDiff>>
 ControlPlane::DiffPipelineVersioned(const PipelineSpec &desired) const {
   std::lock_guard<std::mutex> lock(mutex_);

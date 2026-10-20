@@ -11634,3 +11634,38 @@ refusal is the server's, not gRPC's 4 MiB default). The Go and Python SDKs are r
 one stream each; page bounds are the caller's `max_entries` and the 3 MiB ceiling.
 The snapshot is one resource's, so its generation is the one to use as an expected
 generation for a later write. `GetPipeline` is unchanged.
+
+## D-171 ResetResources empties a named table without a key round trip
+
+**Status:** accepted (2026-10-20; the bounded clear D-129's restart wall asked for).
+
+**Decision.** `Control.ResetResources` takes one or more `<module>/<table>` names and
+converges each to no entries in the daemon. It requires the daemon epoch, checks an
+optional `expected_resource_generation` before any effect, dedupes names, and runs the
+convergence through the same `ApplyResourcesLocked` as a desired-state apply: a
+resource whose workers read it unsynchronized changes with the workers paused, and a
+large map clear is split by `ApplyBatched` instead of one oversized transaction. The
+response carries the names, `removed`, the new `resource_generation` and the epoch. An
+empty request is `INVALID_ARGUMENT`, an unknown name is `NOT_FOUND` with nothing erased,
+and a singleton has no entries and is a no-op.
+
+**Why.** The UPF's startup sweep read every key of every session table only to send an
+erase for it, which made the daemon's 64 MiB response limit (D-129) the ceiling on how
+many sessions could be swept. The daemon already owns the keys: converging the resource
+to empty states the same operation in one request, and the existing convergence path
+already batches it and handles paused workers. Selective clears cannot use it -- an ARP
+table holds the deployment's own entry next to the subscribers' -- and those remain a
+read plus per-key erase, now with `ReadResource` pages (D-170).
+
+**Evidence.** `core/control/api_v2_test.cc`:
+`ResetResourcesErasesOnlyTheNamedTables` -- only the named table is emptied, the other
+keeps its entry, a repeat is `removed = 0` with no generation change, duplicate names
+collapse to one, a stale expected generation is `ABORTED` and erases nothing, a
+foreign daemon epoch is `FAILED_PRECONDITION` and erases nothing, an unknown name is
+`NOT_FOUND`, and an empty request is `INVALID_ARGUMENT`.
+
+**Consequences.** A controller empties a whole table without a readback; graph-owned
+resources, module arguments and unlisted tables are untouched. A singleton needs a
+value write, not a reset. The reset is batched, so a failure after some batches leaves
+those committed, exactly as a resource-bearing apply does; callers treat a failed sweep
+as partial, not atomic.

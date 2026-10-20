@@ -643,6 +643,31 @@ grpc::Status ControlV2Service::ReadResource(
   return grpc::Status::OK;
 }
 
+grpc::Status ControlV2Service::ResetResources(
+    grpc::ServerContext *context, const v2::ResetResourcesRequest *request,
+    v2::ResetResourcesResponse *response) {
+  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
+    return *refused;
+  }
+  std::vector<std::string> names(request->resources().begin(),
+                                 request->resources().end());
+  std::optional<uint64_t> expected;
+  if (request->has_expected_resource_generation()) {
+    expected = request->expected_resource_generation();
+  }
+  auto reset = control_plane_.ResetResources(std::move(names), expected);
+  if (!reset) {
+    return ToStatus(reset.error(), context);
+  }
+  for (const std::string &name : reset->value.resources) {
+    response->add_resources(name);
+  }
+  response->set_removed(reset->value.removed);
+  response->set_resource_generation(reset->resource_generation);
+  response->set_daemon_epoch(transactions_.epoch());
+  return grpc::Status::OK;
+}
+
 grpc::Status ControlV2Service::ValidatePipeline(
     grpc::ServerContext *context, const v2::ValidatePipelineRequest *request,
     v2::ValidatePipelineResponse *response) {
