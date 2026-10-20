@@ -195,6 +195,57 @@ std::expected<MeterState *, MeterError> MeterState::ConstructAt(
   return state;
 }
 
+MeterStateSnapshot MeterState::Inspect() const noexcept {
+  MeterStateSnapshot snapshot;
+  snapshot.algorithm = profile_->algorithm();
+  snapshot.spec = profile_->spec();
+  snapshot.sharing = sharing_;
+
+  auto read = [&] {
+    snapshot.last_update_tsc = last_time_;
+    switch (profile_->algorithm()) {
+      case MeterAlgorithm::kSrTcm: {
+        const rte_meter_srtcm &m = rte_.srtcm;
+        snapshot.buckets[0] = {MeterBucketKind::kCommitted, m.tc,
+                               profile_->srtcm()->cbs};
+        snapshot.buckets[1] = {MeterBucketKind::kExcess, m.te,
+                               profile_->srtcm()->ebs};
+        break;
+      }
+      case MeterAlgorithm::kTrTcm: {
+        const rte_meter_trtcm &m = rte_.trtcm;
+        snapshot.buckets[0] = {MeterBucketKind::kCommitted, m.tc,
+                               profile_->trtcm()->cbs};
+        snapshot.buckets[1] = {MeterBucketKind::kPeak, m.tp,
+                               profile_->trtcm()->pbs};
+        break;
+      }
+      case MeterAlgorithm::kTrTcmRfc4115: {
+        const rte_meter_trtcm_rfc4115 &m = rte_.rfc4115;
+        snapshot.buckets[0] = {MeterBucketKind::kCommitted, m.tc,
+                               profile_->rfc4115()->cbs};
+        snapshot.buckets[1] = {MeterBucketKind::kExcess, m.te,
+                               profile_->rfc4115()->ebs};
+        break;
+      }
+    }
+  };
+
+  if (sharing_ == MeterSharing::kShared) {
+    // Same lock Check() takes; a snapshot is a reader, so it changes nothing
+    // the packet path has to pay for.
+    auto *lock = const_cast<rte_spinlock_t *>(&lock_);
+    rte_spinlock_lock(lock);
+    read();
+    rte_spinlock_unlock(lock);
+  } else {
+    // kWorkerExclusive: no synchronization exists; the caller owns
+    // quiescence (see the header).
+    read();
+  }
+  return snapshot;
+}
+
 std::expected<MeterStatePtr, MeterError> MeterState::Create(
     const MeterProfile &profile, MeterSharing sharing, int socket) {
   void *memory = rte_malloc_socket("bess_meter_state", sizeof(MeterState),

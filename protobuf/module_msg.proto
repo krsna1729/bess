@@ -1390,6 +1390,51 @@ message MeterArg {
 }
 
 /**
+ * The Meter module's `get_status` action returns the profile and the mutable
+ * token state of configured meters, as they stand now. An empty
+ * `meter_ids` lists every meter the module holds; an id that names no live
+ * meter is refused (ENOENT). A meter being retired -- erased, but still in the
+ * published generation until the removal cascade -- is no longer live.
+ *
+ * The reading is per meter state, not an aggregate. A meter's `shared` flag
+ * says whether that state is checked under the meter's own spinlock (the
+ * module creates shared meters, so every entry here is normally shared) or
+ * owned by one worker (a kWorkerExclusive meter, whose state is coherent only
+ * while that worker is not running it).
+ */
+message MeterCommandGetStatusArg {
+  repeated uint32 meter_ids = 1; /// Empty: every configured meter.
+}
+
+enum MeterBucketKind {
+  METER_BUCKET_COMMITTED = 0; /// The C bucket (all meter algorithms).
+  METER_BUCKET_EXCESS = 1;    /// The E bucket (srTCM, RFC 4115).
+  METER_BUCKET_PEAK = 2;      /// The P bucket (trTCM, RFC 2698).
+}
+
+message MeterBucketState {
+  MeterBucketKind kind = 1;
+  uint64 tokens = 2; /// Tokens available at `last_update_tsc`, in the meter's unit.
+  uint64 limit = 3;  /// Bucket capacity (CBS, EBS or PBS), in the same unit.
+}
+
+message MeterStatus {
+  uint32 meter_id = 1;
+  MeterPolicyValue policy = 2; /// The profile the meter is running.
+  bool shared = 3; /// Whether checks of this meter take its own spinlock.
+  // The TSC of the meter's last check -- or of its bucket initialization, for
+  // a meter that has never been checked. rte_meter refills only on a check,
+  // so the bucket reading is as of this time, not projected to now.
+  uint64 last_update_tsc = 4;
+  // Committed first, then the excess (srTCM, RFC 4115) or peak (trTCM) bucket.
+  repeated MeterBucketState buckets = 5;
+}
+
+message MeterCommandGetStatusResponse {
+  repeated MeterStatus meters = 1;
+}
+
+/**
  * The ActionTable module holds per-session actions: an action id (which an
  * ExactMatch rule in action mode names) resolves to a meter id and a next-hop
  * id, both written to packet metadata for the modules downstream. Actions,

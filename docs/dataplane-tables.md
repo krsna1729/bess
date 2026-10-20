@@ -489,6 +489,17 @@ reference to something missing.
   cascade reaches them, unpublishable until then. D-032.
   An erased meter stays in generations published by other upserts of the
   same transaction until its removal stage; an old action may still name it.
+- **Operational state:** the Meter module's `get_status` action reads the
+  published generation without pausing workers (it is `THREAD_SAFE`). For each
+  configured meter it returns the profile, the sharing mode, the TSC of the
+  last update, and the committed and excess/peak buckets with their current
+  tokens and limits. It takes no new lock and adds no write, atomic or
+  reference count to the packet path: a shared meter is read under the same
+  spinlock its check takes, so the pair of buckets is a coherent snapshot.
+  The reading is per meter state, never a module-wide total; a
+  worker-exclusive meter's tokens belong to its owner and are only coherent
+  when that worker is not running the meter (the core
+  `MeterState::Inspect()` contract).
 - **A module must release its resources before destroying their tables.**
   `Unregister` refuses (with the reason) while keys that may reference others
   remain (a resource that references nothing may go with its keys), keys are
@@ -537,7 +548,12 @@ reference to something missing.
   - `kShared` meters take the meter's own spinlock on each check. That is
     correct, but it serializes contending workers on one cache line.
 
-  See `meter/meter.h`.
+  `MeterState::Inspect()` reads a state without changing that: a shared meter
+  is read under its check lock, while a worker-exclusive meter has no lock by
+  design and its owner must be quiescent for the read. The snapshot reports
+  the meter's `sharing` mode, its profile, the last-update TSC and both token
+  buckets; it is a reading of one state, never a sum over workers. See
+  `meter/meter.h`.
 
 ### `CounterSet`, `WorkerHistogram`, `WorkerLocal<T>` (worker-owned)
 
