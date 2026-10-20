@@ -94,6 +94,10 @@ class ActionTable final : public Module {
   std::string meters_resource_;
   std::string next_hops_resource_;
 
+  // The table's level count (1..kMaxLevels): every action stores and writes
+  // exactly this many slots, whatever level count its record carried.
+  size_t levels_ = 1;
+
   int action_id_attr_ = -1;
   int meter_id_attr_ = -1;
   int next_hop_id_attr_ = -1;

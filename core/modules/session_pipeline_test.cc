@@ -28,6 +28,7 @@
 #include "framework/resource_bindings.h"
 #include "dataplane/transaction_engine.h"
 #include "meter/meter.h"
+#include "metadata.h"
 #include "module.h"
 #include "module_graph.h"
 #include "classifier/masked_rule_resource.h"
@@ -1577,6 +1578,213 @@ TEST_F(SessionPipelineTest, AOneIdActionFillsEverySlotOfATwoLevelTable) {
   EXPECT_EQ(2u, action->levels) << "the table's level count, not the form's";
   EXPECT_EQ(1u, action->meters[0].value());
   EXPECT_EQ(0u, action->meters[1].value()) << "the second slot is no meter";
+}
+
+// The public typed path can carry an Action built with the historical
+// two-argument constructor, whose record names one level. The table must still
+// write every slot it owns: a stale slot 1 is a meter id this action never
+// meant, and the Meter would read it. A poisoned slot 1 (id 2, red) proves it:
+// only a write of 0 leaves the packet green.
+TEST_F(SessionPipelineTest, ATypedOneLevelActionWritesEveryTableSlot) {
+  bess::testing::ModuleHarness h;
+  Meter *mt = CreateMeterModule("mt_slot", 64, "", 2);
+  ActionTable *at = CreateActionTable("at_slot", "mt_slot/meters",
+                                      "rt_slot/next_hops", 64, "", "", "", 2);
+  Router *rt = CreateRouterModule("rt_slot");
+  ASSERT_NE(nullptr, mt);
+  ASSERT_NE(nullptr, at);
+  ASSERT_NE(nullptr, rt);
+
+  // action_id 1, and meter_id pre-filled as [0, 2]: the table rewrites slot 0
+  // with meter 1 and must clear slot 1.
+  bess::pb::SetMetadataArg md_arg;
+  auto *action_attr = md_arg.add_attrs();
+  action_attr->set_name("action_id");
+  action_attr->set_size(4);
+  action_attr->set_value_bin(std::string("\0\0\0\x01", 4));
+  auto *meter_attr = md_arg.add_attrs();
+  meter_attr->set_name("meter_id");
+  meter_attr->set_size(8);
+  meter_attr->set_value_bin(std::string("\0\0\0\0\0\0\0\x02", 8));
+  Module *writer = Create("SetMetadata", "md_slot", Pack(md_arg));
+  ASSERT_NE(nullptr, writer);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, at, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(at, 0, mt, 0, true));
+  // The Router reads next_hop_id, so the graph's attributes are readable;
+  // only a green packet reaches it.
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(mt, Meter::kGreenGate, rt, 0, true));
+
+  auto r = Apply({
+      Op::Upsert("mt_slot/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(1000)})),
+      // The poison: a one-byte burst, so any packet it polices is red.
+      Op::Upsert("mt_slot/meters", bess::dataplane::EncodeKey(MeterId(2)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(1)})),
+      rt->router()->SetNextHopOp(
+          NextHopId(1),
+          HopWithEgress(bess::modules::router::InterfaceOf(kEgressGate).value())),
+      rt->router()->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
+      Op::Upsert("at_slot/actions", bess::dataplane::EncodeKey(ActionId(1)),
+                 std::any(ActionTable::Action{MeterId(1), NextHopId(1)})),
+  });
+  ASSERT_EQ(Outcome::kApplied, r.outcome)
+      << (r.ops.empty() ? "" : r.ops[0].error);
+  ASSERT_NE(nullptr, at->LookupAction(ActionId(1)));
+  EXPECT_EQ(1u, at->LookupAction(ActionId(1))->levels)
+      << "the typed record names one level";
+
+  std::random_device rd;
+  std::mt19937 rng{rd()};
+  const auto pkt = SessionPacket("10.1.2.3", 1234, rng);
+  auto out = h.RunPipeline(writer, 0, {pkt}, rt, {kEgressGate});
+  EXPECT_EQ(1u, out[kEgressGate].size())
+      << "slot 1 was cleared to 0, not left as the poisoned meter";
+}
+
+// Yellow survives: a level that marks a packet yellow must not be reset to
+// green by the next level (colour-aware checks never improve a packet). The
+// second packet empties level 0's committed bucket but fits its peak bucket.
+TEST_F(SessionPipelineTest, AYellowLevelIsNotResetByALaterLevel) {
+  bess::testing::ModuleHarness h;
+  bess::pb::SetMetadataArg md_arg;
+  auto *attr = md_arg.add_attrs();
+  attr->set_name("meter_id");
+  attr->set_size(8);
+  // Level 0: the yellow-producing flow meter; level 1: the generous session
+  // meter, which must take the yellow input as yellow, not re-colour it green.
+  attr->set_value_bin(std::string("\0\0\0\x02\0\0\0\x01", 8));
+  Module *md = Create("SetMetadata", "md_yellow", Pack(md_arg));
+  Meter *mt = CreateMeterModule("mt_yellow", 64, "", 2);
+  ASSERT_NE(nullptr, md);
+  ASSERT_NE(nullptr, mt);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(md, 0, mt, 0, true));
+
+  std::random_device rd;
+  std::mt19937 rng{rd()};
+  const auto first = SessionPacket("10.1.2.3", 1234, rng);
+  const auto second = SessionPacket("10.1.2.3", 1234, rng);
+  const uint64_t len = first.size();
+  auto r = Apply({
+      Op::Upsert("mt_yellow/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(1000)})),
+      // Committed burst is exactly one packet; the peak bucket holds many, so
+      // the second packet in the same batch is yellow (RFC 2698).
+      Op::Upsert("mt_yellow/meters", bess::dataplane::EncodeKey(MeterId(2)),
+                 std::any(bess::meter::MeterProfileSpec{
+                     bess::meter::TrTcmSpec{1, len, 1'000'000, 1000}})),
+  });
+  ASSERT_EQ(Outcome::kApplied, r.outcome)
+      << (r.ops.empty() ? "" : r.ops[0].error);
+
+  auto out = h.RunPipeline(md, 0, {first, second}, mt, {0, 1, 2});
+  EXPECT_EQ(1u, out[0].size()) << "the first packet is green at both levels";
+  ASSERT_EQ(1u, out[1].size())
+      << "the second is yellow at level 0 and stays yellow through level 1";
+  EXPECT_EQ(std::vector<bess::testing::Bytes>{second}, out[1]);
+  EXPECT_TRUE(out[2].empty());
+}
+
+// A zero id is "no meter at this level" and passes; an unknown nonzero id is
+// dropped rather than forwarded unmetered, at any level.
+TEST_F(SessionPipelineTest, ZeroIdsPassAtEveryLevel) {
+  bess::testing::ModuleHarness h;
+  Meter *mt = CreateMeterModule("mt_zero", 64, "", 2);
+  ASSERT_NE(nullptr, mt);
+  bess::pb::SetMetadataArg md_arg;
+  auto *attr = md_arg.add_attrs();
+  attr->set_name("meter_id");
+  attr->set_size(8);
+  attr->set_value_bin(std::string("\0\0\0\0\0\0\0\0", 8));
+  Module *md = Create("SetMetadata", "md_zero", Pack(md_arg));
+  ASSERT_NE(nullptr, md);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(md, 0, mt, 0, true));
+
+  std::random_device rd;
+  std::mt19937 rng{rd()};
+  auto out = h.RunPipeline(md, 0, {SessionPacket("10.1.2.3", 1234, rng)}, mt,
+                           {0, 1, 2});
+  EXPECT_EQ(1u, out[0].size()) << "id 0 is no meter at either level";
+  EXPECT_TRUE(out[1].empty());
+  EXPECT_TRUE(out[2].empty());
+}
+
+TEST_F(SessionPipelineTest, AnUnknownIdAboveLevelZeroDropsThePacket) {
+  bess::testing::ModuleHarness h;
+  Meter *mt = CreateMeterModule("mt_unknown", 64, "", 2);
+  ASSERT_NE(nullptr, mt);
+  auto r = Apply({
+      Op::Upsert("mt_unknown/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(1000)})),
+  });
+  ASSERT_EQ(Outcome::kApplied, r.outcome)
+      << (r.ops.empty() ? "" : r.ops[0].error);
+
+  bess::pb::SetMetadataArg md_arg;
+  auto *attr = md_arg.add_attrs();
+  attr->set_name("meter_id");
+  attr->set_size(8);
+  attr->set_value_bin(std::string("\0\0\0\x01\0\0\0\x63", 8));  // 1, 99
+  Module *md = Create("SetMetadata", "md_unknown", Pack(md_arg));
+  ASSERT_NE(nullptr, md);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(md, 0, mt, 0, true));
+
+  std::random_device rd;
+  std::mt19937 rng{rd()};
+  auto out = h.RunPipeline(md, 0, {SessionPacket("10.1.2.3", 1234, rng)}, mt,
+                           {0, 1, 2});
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_TRUE(out[1].empty());
+  EXPECT_TRUE(out[2].empty()) << "an unknown id at level 1 was forwarded";
+}
+
+// The level count is bounded, and a list-form record's length must equal the
+// table's count; the single-id form is the one compatible spelling and fills
+// the table's slots.
+TEST_F(SessionPipelineTest, LevelCountsAreBoundedAndAMismatchedListIsRefused) {
+  bess::testing::ModuleHarness h;
+  bess::pb::ActionTableArg too_many;
+  too_many.set_meters("m/meters");
+  too_many.set_next_hops("r/next_hops");
+  too_many.set_levels(static_cast<uint32_t>(ActionTable::kMaxLevels) + 1);
+  EXPECT_NE("", h.CreateError("ActionTable", too_many));
+
+  bess::pb::MeterArg meter_too_many;
+  meter_too_many.set_levels(
+      static_cast<uint32_t>(bess::metadata::kMetadataAttrMaxSize /
+                            sizeof(bess::utils::be32_t)) +
+      1);
+  EXPECT_NE("", h.CreateError("Meter", meter_too_many));
+
+  ActionTable *at = CreateActionTable("at_bound", "mt_bound/meters",
+                                      "rt_bound/next_hops", 64, "", "", "", 2);
+  ASSERT_NE(nullptr, at);
+  ASSERT_NE(nullptr, CreateMeterModule("mt_bound", 64, "", 2));
+  ASSERT_NE(nullptr, CreateRouterModule("rt_bound"));
+  auto applied = Apply({
+      Op::Upsert("mt_bound/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(1000)})),
+  });
+  ASSERT_EQ(Outcome::kApplied, applied.outcome)
+      << (applied.ops.empty() ? "" : applied.ops[0].error);
+
+  bess::pb::ActionIdKey key;
+  key.set_id(1);
+  bess::pb::ActionValue one_of_two;
+  one_of_two.add_meter_ids(1);  // a list of 1 for a 2-level table
+  EXPECT_NE("", h.UpsertResource("at_bound/actions", key, one_of_two));
+
+  bess::pb::ActionValue legacy;
+  legacy.set_meter_id(1);  // the historical spelling: accepted
+  EXPECT_EQ("", h.UpsertResource("at_bound/actions", key, legacy));
+
+  // An unknown id at a level above 0 is refused at apply, not only found on
+  // the packet path: the list form declares level 1 = 99, which is no meter.
+  bess::pb::ActionIdKey unknown_key;
+  unknown_key.set_id(2);
+  bess::pb::ActionValue with_unknown;
+  with_unknown.add_meter_ids(1);
+  with_unknown.add_meter_ids(99);
+  EXPECT_NE("", h.UpsertResource("at_bound/actions", unknown_key, with_unknown));
 }
 
 // A two-level record is policed in order: green and yellow keep charging the

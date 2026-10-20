@@ -1310,10 +1310,12 @@ message WorkerSplitArg {
 
 /**
  * The Meter module polices packets against per-session meters (K5), with the
- * meter set changed transactionally (G1.2b): the meter id comes from packet
- * metadata, the meter runs colour-blind on the packet's byte count, and the
- * packet leaves on the gate that is its colour -- 0 green, 1 yellow, 2 red.
- * An id that names no meter is dropped; id 0 (no meter) is green.
+ * meter set changed transactionally (G1.2b): the meter ids come from packet
+ * metadata, one per level, and each is checked colour-aware, in order. Green
+ * and yellow packets are charged to the later levels; a red one stops and is
+ * not charged to them. The packet leaves on the gate that is its worst
+ * colour -- 0 green, 1 yellow, 2 red. An id that names no meter is dropped;
+ * id 0 means "no meter at this level" and passes it.
  *
  * __Input Gates__: 1
  * __Output Gates__: 3 (green, yellow, red)

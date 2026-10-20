@@ -38,6 +38,7 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
   if (levels > kMaxLevels) {
     return CommandFailure(EINVAL, "levels must be 1-%zu", kMaxLevels);
   }
+  levels_ = levels;
 
   if (arg.capacity() > std::numeric_limits<ActionId::rep_type>::max()) {
     return CommandFailure(EINVAL, "action capacity exceeds valid action ids");
@@ -117,10 +118,10 @@ CommandResponse ActionTable::Init(const bess::pb::ActionTableArg &arg) {
               key.set_id(id.value());
               bess::pb::ActionValue value;
               value.set_meter_id(action->meters[0].value());
-              // Only a multi-level action names the list: a one-level action
+              // Only a multi-level table names the list: a one-level table
               // reads back exactly as it was written.
-              if (action->levels > 1) {
-                for (size_t l = 0; l < action->levels; l++) {
+              if (levels_ > 1) {
+                for (size_t l = 0; l < levels_; l++) {
                   value.add_meter_ids(action->meters[l].value());
                 }
               }
@@ -228,14 +229,19 @@ void ActionTable::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
     _set_attr_with_offset<bess::utils::be32_t>(
         hop_offset, pkt, bess::utils::be32_t(action->next_hop.value()));
-    // Every level's id together: the Meter reads the slots in order.
-    for (size_t l = 0; l < action->levels; l++) {
+    // Every slot this table's level count covers: the record may name fewer
+    // levels (a typed Action with the historical constructor names one), and
+    // the rest are 0, "no meter at this level". The Meter reads contiguous
+    // 4-byte slots, so a slot left unwritten would be stale metadata.
+    for (size_t l = 0; l < levels_; l++) {
       const bess::metadata::mt_offset_t slot =
           static_cast<bess::metadata::mt_offset_t>(
               meter_offset + static_cast<int>(l) *
                                  static_cast<int>(sizeof(bess::utils::be32_t)));
+      const bess::meter::MeterId id =
+          l < action->levels ? action->meters[l] : bess::meter::MeterId{};
       _set_attr_with_offset<bess::utils::be32_t>(
-          slot, pkt, bess::utils::be32_t(action->meters[l].value()));
+          slot, pkt, bess::utils::be32_t(id.value()));
     }
     if (out_cnt != i) {
       batch->handles()[out_cnt] = batch->handles()[i];

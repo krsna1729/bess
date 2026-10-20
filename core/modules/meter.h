@@ -18,13 +18,17 @@
 // Per-session metering: K5's MeterSet as a module, and its meters as a
 // transactional resource (G1.2b).
 //
-// Packet path: the meter id arrives in packet metadata (a `meter_id` be32
-// attribute that an ActionTable writes), the meter runs colour-blind on the
-// packet's byte count at one TSC reading per batch, and the packet leaves on
-// the gate that is its colour: 0 green, 1 yellow, 2 red. So the policy is the
-// graph -- connect 0 and 1 to a forwarding module and leave 2 unconnected,
-// and red packets are dropped as deadends. An id that names no meter is
-// dropped rather than forwarded unmetered; id 0 (no meter) is green.
+// Packet path: up to `levels` meter ids arrive in packet metadata (contiguous
+// be32 slots of one `meter_id` attribute that an ActionTable writes). At one
+// TSC reading per batch, the module runs one colour-aware pass per level, in
+// order, over the packets the earlier levels let live: green and yellow
+// packets are charged to the later levels and a red packet stops, so a later
+// (session) bucket is not billed for what an earlier (flow) bucket dropped.
+// The packet leaves on the gate that is its worst colour: 0 green, 1 yellow,
+// 2 red. So the policy is the graph -- connect 0 and 1 to a forwarding module
+// and leave 2 unconnected, and red packets are dropped as deadends. An id that
+// names no meter is dropped rather than forwarded unmetered; id 0 means "no
+// meter at this level" and passes it.
 //
 // Control path: `<module>/meters` is a resource, so one transaction can create
 // a meter together with the action that names it and the rule that selects
