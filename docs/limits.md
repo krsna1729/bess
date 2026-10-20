@@ -29,6 +29,7 @@ Columns:
 | Burst size | 32 packets | `PacketBatch::kMaxBurst` (`pktbatch.h`) | No | ABI-wide constant |
 | Batches per task run | 256 | `MAX_PBATCH_CNT` (`task.h`) | No | `CHECK` abort (a graph that fans out past it is a bug, D-061) |
 | gRPC message size, each way | 64 MiB | `kMaxMessageBytes` (`control/api_v2.h`) | No | RESOURCE_EXHAUSTED; a `GetPipeline` with resources larger than this is refused (`RESOURCE_EXHAUSTED`, `EMSGSIZE`): ask for fewer resources by name (D-129), or read one large table with `ReadResource` (D-170), which pages it instead of building one message. `ReadResource` defaults to 4096 entries per page (capped at 65536) and bounds a page at 3 MiB; an entry above about 64 MiB is still `RESOURCE_EXHAUSTED`, so one entry remains one message |
+| Resource page entries (ReadResource) | 4096 default, 65536 maximum | `kMaxPageEntries` (`control/api_v2.cc`), `ReadResourceRequest.max_entries` | Per request | The request's value is clamped to the maximum; a page is also bounded at 3 MiB of serialized message (about 70 MiB of entries was tested), a larger single entry travelling alone |
 | Default gRPC port | 10514 | `kDefaultPort` (`runtime/opts.cc`) | `--grpc_url` (or the deprecated `-p`) | — |
 | Default bind address | 127.0.0.1 | `kDefaultBindAddr` (`runtime/opts.cc`) | `-b` | — |
 | HTTP adapter (JSON API, events, `/metrics`, page; D-125) | off | `FLAGS_http_addr` (`runtime/opts.cc`) | `--http_addr HOST:PORT` (the host is required; only a loopback host keeps it local) | — |
