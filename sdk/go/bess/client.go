@@ -358,6 +358,7 @@ type Client struct {
 	epoch      uint64
 	epochKnown bool
 	conn       *grpc.ClientConn
+	control    pb.ControlClient // the generated client, for Control()
 }
 
 // Dial connects to bessd's gRPC endpoint (no TLS, like bessd).
@@ -378,7 +379,10 @@ func Dial(target string, opts ...grpc.DialOption) (*Client, error) {
 
 // NewClient uses an existing connection.
 func NewClient(conn grpc.ClientConnInterface, retry RetryPolicy) *Client {
-	return newClient(grpcTransport{c: pb.NewControlClient(conn), a: pb.NewAdminClient(conn)}, retry, time.Sleep)
+	c := newClient(grpcTransport{c: pb.NewControlClient(conn), a: pb.NewAdminClient(conn)},
+		retry, time.Sleep)
+	c.control = pb.NewControlClient(conn)
+	return c
 }
 
 func newClient(t transport, retry RetryPolicy, sleep func(time.Duration)) *Client {
@@ -621,6 +625,12 @@ func WithResources(names ...string) PipelineQuery {
 		r.Resources = names
 	}
 }
+
+// Control is the generated control client, for the calls this package has no
+// wrapper for (ReadResource's pages, ResetResources). It is nil on a Client
+// built by the package's tests from a fake transport. A mutating call must
+// name the daemon epoch it was built under; the wrappers here set it for you.
+func (c *Client) Control() pb.ControlClient { return c.control }
 
 // Pipeline is the active pipeline as desired state.
 func (c *Client) Pipeline(ctx context.Context, query ...PipelineQuery) (PipelineSnapshot, error) {

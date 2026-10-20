@@ -2028,6 +2028,7 @@ type ResetResourcesRequest struct {
 	state                      protoimpl.MessageState `protogen:"open.v1"`
 	Resources                  []string               `protobuf:"bytes,1,rep,name=resources,proto3" json:"resources,omitempty"`                                                                              // at least one "<module>/<table>"
 	ExpectedResourceGeneration *uint64                `protobuf:"varint,2,opt,name=expected_resource_generation,json=expectedResourceGeneration,proto3,oneof" json:"expected_resource_generation,omitempty"` // stale: conflict, nothing erased
+	DaemonEpoch                uint64                 `protobuf:"varint,3,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`                                                      // as in ApplyTransaction
 	unknownFields              protoimpl.UnknownFields
 	sizeCache                  protoimpl.SizeCache
 }
@@ -2072,6 +2073,13 @@ func (x *ResetResourcesRequest) GetResources() []string {
 func (x *ResetResourcesRequest) GetExpectedResourceGeneration() uint64 {
 	if x != nil && x.ExpectedResourceGeneration != nil {
 		return *x.ExpectedResourceGeneration
+	}
+	return 0
+}
+
+func (x *ResetResourcesRequest) GetDaemonEpoch() uint64 {
+	if x != nil {
+		return x.DaemonEpoch
 	}
 	return 0
 }
@@ -6122,10 +6130,11 @@ const file_control_v2_proto_rawDesc = "" +
 	"\bresource\x18\x01 \x01(\tR\bresource\x123\n" +
 	"\aentries\x18\x02 \x03(\v2\x19.bess.pb.v2.ResourceEntryR\aentries\x12/\n" +
 	"\x13resource_generation\x18\x03 \x01(\x04R\x12resourceGeneration\x12!\n" +
-	"\fdaemon_epoch\x18\x04 \x01(\x04R\vdaemonEpoch\"\x9d\x01\n" +
+	"\fdaemon_epoch\x18\x04 \x01(\x04R\vdaemonEpoch\"\xc0\x01\n" +
 	"\x15ResetResourcesRequest\x12\x1c\n" +
 	"\tresources\x18\x01 \x03(\tR\tresources\x12E\n" +
-	"\x1cexpected_resource_generation\x18\x02 \x01(\x04H\x00R\x1aexpectedResourceGeneration\x88\x01\x01B\x1f\n" +
+	"\x1cexpected_resource_generation\x18\x02 \x01(\x04H\x00R\x1aexpectedResourceGeneration\x88\x01\x01\x12!\n" +
+	"\fdaemon_epoch\x18\x03 \x01(\x04R\vdaemonEpochB\x1f\n" +
 	"\x1d_expected_resource_generation\"\xa4\x01\n" +
 	"\x16ResetResourcesResponse\x12\x1c\n" +
 	"\tresources\x18\x01 \x03(\tR\tresources\x12\x18\n" +

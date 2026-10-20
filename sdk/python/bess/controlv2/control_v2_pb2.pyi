@@ -295,12 +295,14 @@ class ResourcePage(_message.Message):
     def __init__(self, resource: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[ResourceEntry, _Mapping]]] = ..., resource_generation: _Optional[int] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
 
 class ResetResourcesRequest(_message.Message):
-    __slots__ = ("resources", "expected_resource_generation")
+    __slots__ = ("resources", "expected_resource_generation", "daemon_epoch")
     RESOURCES_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_RESOURCE_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
     resources: _containers.RepeatedScalarFieldContainer[str]
     expected_resource_generation: int
-    def __init__(self, resources: _Optional[_Iterable[str]] = ..., expected_resource_generation: _Optional[int] = ...) -> None: ...
+    daemon_epoch: int
+    def __init__(self, resources: _Optional[_Iterable[str]] = ..., expected_resource_generation: _Optional[int] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
 
 class ResetResourcesResponse(_message.Message):
     __slots__ = ("resources", "removed", "resource_generation", "daemon_epoch")
