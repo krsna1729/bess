@@ -327,6 +327,22 @@ TEST(VifResourceTest, InterfacesRefuseBadKeysAndValues) {
 }
 
 // The init argument's interfaces are what the resource reads back.
+// The init path is the resource path: a VLAN the codec refuses is refused at
+// creation too, not silently masked to another id.
+TEST(VifResourceTest, InitRefusesAVlanTheResourceRefuses) {
+  VifArg arg;
+  auto *iface = arg.add_interfaces();
+  iface->set_id(1);
+  iface->set_mac_addr("02:00:00:00:00:01");
+  iface->set_vlan(4096);
+  ModuleHarness bad;
+  EXPECT_NE("", bad.CreateError("Vif", arg));
+
+  iface->set_vlan(4095);  // the largest valid VLAN
+  ModuleHarness ok;
+  EXPECT_EQ("", ok.CreateError("Vif", arg));
+}
+
 TEST(VifResourceTest, InitInterfacesAreTheResource) {
   ModuleHarness h;
   VifArg arg;
