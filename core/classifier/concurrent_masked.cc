@@ -303,39 +303,51 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
   if (id == 0) {
     return std::unexpected(UpsertResult::kFull);
   }
-  // Written now, named by the table only at Commit() (its release store).
-  MutableRecord(id) = {.priority = priority,
-                       .sequence = next_sequence_++,
-                       .gate = gate,
-                       .action_id = action_id};
-  if (prepared.old == 0) {
-    // A new rule: present but pending, so capacity is settled here.
-    const uint64_t pending = Pack(pending_id_, kPendingResult);
-    if (table->Upsert(value, pending) ==
-        ConcurrentExactTable::UpsertResult::kFull) {
-      table = Grown(*table);
-      if (table == nullptr ||
-          table->Upsert(value, pending) ==
-              ConcurrentExactTable::UpsertResult::kFull) {
-        records_.Abort(id);  // never named: reusable at once
-        return std::unexpected(UpsertResult::kFull);
+  // From the id's allocation on, a refused allocation must return the id:
+  // the record is not named by any published table until Commit(), so
+  // Abort() is exact. A new rule's pending entry is only ever placed in a
+  // table that is published below (an existing tuple is republished with
+  // PublishTuples, a grown one is not live yet), so the id is all that can
+  // leak. (External review: a failure in the tuple-list copy used to leave
+  // the record allocated.)
+  try {
+    // Written now, named by the table only at Commit() (its release store).
+    MutableRecord(id) = {.priority = priority,
+                         .sequence = next_sequence_++,
+                         .gate = gate,
+                         .action_id = action_id};
+    if (prepared.old == 0) {
+      // A new rule: present but pending, so capacity is settled here.
+      const uint64_t pending = Pack(pending_id_, kPendingResult);
+      if (table->Upsert(value, pending) ==
+          ConcurrentExactTable::UpsertResult::kFull) {
+        table = Grown(*table);
+        if (table == nullptr ||
+            table->Upsert(value, pending) ==
+                ConcurrentExactTable::UpsertResult::kFull) {
+          records_.Abort(id);  // never named: reusable at once
+          return std::unexpected(UpsertResult::kFull);
+        }
+        replaced = true;
       }
-      replaced = true;
     }
-  }
-  if (new_tuple || replaced) {
-    auto next = std::make_unique<TupleList>(*list);
-    if (new_tuple) {
-      // A pending entry never wins: the ceiling rises at Commit(). The order
-      // counts the rule now.
-      auto ceiling =
-          std::make_shared<Ceiling>(std::numeric_limits<int64_t>::min());
-      ceiling->order = priority;
-      next->tuples.push_back({prepared.mask, table, std::move(ceiling)});
-    } else {
-      next->tuples[index].table = table;
+    if (new_tuple || replaced) {
+      auto next = std::make_unique<TupleList>(*list);
+      if (new_tuple) {
+        // A pending entry never wins: the ceiling rises at Commit(). The
+        // order counts the rule now.
+        auto ceiling =
+            std::make_shared<Ceiling>(std::numeric_limits<int64_t>::min());
+        ceiling->order = priority;
+        next->tuples.push_back({prepared.mask, table, std::move(ceiling)});
+      } else {
+        next->tuples[index].table = std::move(table);
+      }
+      PublishTuples(std::move(next));
     }
-    PublishTuples(std::move(next));
+  } catch (...) {
+    records_.Abort(id);
+    throw;
   }
   prepared.id = id;
   prepared.gate = gate;
