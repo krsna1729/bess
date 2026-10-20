@@ -15,6 +15,7 @@ classifier_sources = files(
   'classifier/concurrent_masked.cc',
   'classifier/firewall_table.cc',
   'classifier/extract_plan.cc',
+  'classifier/record_arena.cc',
   'classifier/result_plan.cc',
   'classifier/runtime_schema.cc',
 )
@@ -727,6 +728,7 @@ unit_test_sources = [
   'classifier/rte_hash_exact_test.cc',
   'classifier/concurrent_exact_test.cc',
   'classifier/concurrent_masked_test.cc',
+  'classifier/record_arena_test.cc',
   'classifier/small_exact_test.cc',
   'classifier/direct_exact_test.cc',
   'dataplane/batch_stages_test.cc',
