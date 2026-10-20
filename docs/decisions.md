@@ -11601,3 +11601,36 @@ for an untrusted schema; a per-schema generated kernel is the next lever if a de
 is independent of the op count: a bucket is one size class, so the copy width is constant and the mask branch
 is hoisted out of the loop. Wiring `Acl` and `ExactMatch` to emit these schemas is the next commit; until then
 no module uses the plan, and the old packet-only fields are gone rather than kept beside it.
+
+## D-170 A large resource is read as bounded pages, not one message
+
+**Status:** accepted (2026-10-20; the streamed read the 64 MiB ceiling asked for).
+
+**Decision.** `Control.ReadResource` is one resource per server-streamed call. Its
+`ResourcePage` carries the resource name, the entries, the snapshot's
+`resource_generation` and the daemon epoch; `max_entries` is per page (default 4096,
+capped at 65536) and a page is also bounded at 3 MiB of serialized message, below
+`kMaxMessageBytes` and counting the page's own fields and each entry's framing; an
+entry larger than that travels alone. The control plane takes one snapshot under its
+lock and the handler writes pages outside it, so a slow client does not hold up a writer. An unknown
+resource is `NOT_FOUND`, as a `GetPipeline` read is; an entry above
+`kMaxMessageBytes - 64 KiB` is refused by name with `RESOURCE_EXHAUSTED` rather than
+failing the transport mid-stream.
+
+**Why.** `GetPipeline` with `include_resources` builds one response and refuses above
+64 MiB (`RESOURCE_EXHAUSTED`, D-129). Naming fewer resources reduces the sum but not
+one large table, which is the table the UPF's ARP sweep and URR readback need. A stream
+is additive: it never builds one message for the table, and `GetPipeline` keeps its
+all-or-nothing snapshot.
+
+**Evidence.** `core/control/api_v2_test.cc`: `ReadResourcePagesTheTable` (five rules at
+two per page, three pages, one empty page for an empty resource, `NOT_FOUND` for an
+unknown name) and `ReadResourceReadsATableAboveTheMessageLimit` (700,000 rules, a table above
+64 MiB refused by `GetPipeline` and read back in 171 pages with the same
+entries; the test's channel and server carry bessd's 64 MiB limits so the
+refusal is the server's, not gRPC's 4 MiB default). The Go and Python SDKs are regenerated from the proto.
+
+**Consequences.** A caller that needs more than one resource loops over the names,
+one stream each; page bounds are the caller's `max_entries` and the 3 MiB ceiling.
+The snapshot is one resource's, so its generation is the one to use as an expected
+generation for a later write. `GetPipeline` is unchanged.
