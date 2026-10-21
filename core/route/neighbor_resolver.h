@@ -127,19 +127,24 @@ class NeighborResolver {
   };
 
   // The identity of an interface for resolution: what it sends from (MAC and
-  // own address) and how it is named. Addresses are host order, as in Key;
-  // the packet helpers convert at the wire boundary.
+  // own addresses) and how it is named. The IPv4 address is host order, as the
+  // key stores it; IPv6 is the 16-byte address (unspecified :: means none).
+  // The packet helpers convert at the wire boundary.
   struct Interface {
     dataplane::InterfaceId id;
     utils::Ethernet::Address mac;
-    uint32_t ipv4;  // its own address; zero: no address, cannot solicit
+    uint32_t ipv4 = 0;  // zero: no IPv4 address, cannot send ARP
+    utils::Ipv6Address ipv6{};  // :: means none, cannot send NS
   };
 
-  // One ARP request to put on the wire. `frame` is a complete Ethernet frame
-  // (kArpFrameSize bytes); a port that needs the 60-byte minimum pads it.
+  // One solicitation to put on the wire: an ARP request or a Neighbor
+  // Solicitation. `frame` has room for either (kMaxNeighborFrameSize);
+  // `length` is what the packet helper wrote, and a port that needs the
+  // 60-byte Ethernet minimum pads it.
   struct Solicitation {
     dataplane::InterfaceId egress;
-    std::array<uint8_t, kArpFrameSize> frame;
+    std::array<uint8_t, kMaxNeighborFrameSize> frame;
+    size_t length = 0;
   };
 
   // What one call produced: frames to send and neighbor changes to publish.
@@ -189,7 +194,7 @@ class NeighborResolver {
                                                           uint64_t now) {
     auto it = interfaces_.find(iface.id);
     if (it != interfaces_.end() && it->second.mac == iface.mac &&
-        it->second.ipv4 == iface.ipv4) {
+        it->second.ipv4 == iface.ipv4 && it->second.ipv6 == iface.ipv6) {
       return Progress{};
     }
     uint32_t epoch = it == interfaces_.end() ? 1 : it->second.epoch + 1;
@@ -218,7 +223,7 @@ class NeighborResolver {
     // before, and only before any neighbor is committed; if it throws, nothing
     // else has changed and the same call retried converges.
     interfaces_.insert_or_assign(
-        iface.id, StoredInterface{iface.mac, iface.ipv4, epoch});
+        iface.id, StoredInterface{iface.mac, iface.ipv4, iface.ipv6, epoch});
     for (NeighborTable::Prepared &update : prepared) {
       neighbors_.Commit(update);
       AppendUpdates(std::move(update.updates), out);
@@ -282,11 +287,21 @@ class NeighborResolver {
     if (iface == interfaces_.end()) {
       return std::unexpected("unknown interface");
     }
-    if (key.ipv4 == 0 || key.ipv4 == 0xffffffffu) {
-      return std::unexpected("invalid neighbor address");
-    }
-    if (key.ipv4 == iface->second.ipv4) {
-      return std::unexpected("an interface cannot be its own neighbor");
+    if (key.address.is_ipv4()) {
+      if (key.address.ipv4() == 0 || key.address.ipv4() == 0xffffffffu) {
+        return std::unexpected("invalid neighbor address");
+      }
+      if (key.address.ipv4() == iface->second.ipv4) {
+        return std::unexpected("an interface cannot be its own neighbor");
+      }
+    } else {
+      const utils::Ipv6Address address = key.address.ipv6();
+      if (address.IsUnspecified() || address.IsMulticast()) {
+        return std::unexpected("invalid neighbor address");
+      }
+      if (address == iface->second.ipv6) {
+        return std::unexpected("an interface cannot be its own neighbor");
+      }
     }
     const bool key_exists = entries_.contains(key);
     const std::optional<NeighborTable::Bound> previous =
@@ -465,6 +480,87 @@ class NeighborResolver {
     return out;
   }
 
+  // Feeds one IPv6 Neighbor Discovery frame received on `ingress` to the
+  // resolver. Only Neighbor Advertisements are learned from; Neighbor
+  // Solicitations are the local responder's (AnswerNeighborSolicitationInPlace
+  // in l3_packet.h). The advertisement names its neighbor by target address,
+  // not by source: a non-proxy advertisement has source == target, which this
+  // library requires, and its target link-layer option (or the Ethernet
+  // source when the option is absent) is the address to publish. A solicited
+  // advertisement may override a resolved MAC; an unsolicited one may not
+  // (`override` is the O flag). A reply never creates an entry.
+  Progress OnNd(uint64_t now, dataplane::InterfaceId ingress,
+                std::span<const uint8_t> frame) {
+    Progress out = NewProgress();
+    auto iface = interfaces_.find(ingress);
+    if (iface == interfaces_.end()) {
+      return out;
+    }
+    const std::optional<NdMessage> advertisement =
+        ParseNeighborDiscovery(frame);
+    if (!advertisement ||
+        advertisement->type != NdType::kNeighborAdvertisement) {
+      return out;
+    }
+    utils::Ethernet eth;
+    std::memcpy(&eth, frame.data(), sizeof(eth));
+    // A solicited advertisement is unicast to our current address and MAC;
+    // an unsolicited one (RFC 4861's MAC-change notification) goes to
+    // all-nodes. Anything else -- an old own address, another group, another
+    // interface's MAC -- is not this generation's neighbor.
+    const bool to_us = eth.dst_addr == iface->second.mac &&
+                       advertisement->destination_ip == iface->second.ipv6;
+    const bool to_all_nodes =
+        eth.dst_addr == AllNodesMac() &&
+        advertisement->destination_ip == AllNodesAddress();
+    if ((!to_us && !to_all_nodes) ||
+        advertisement->source_ip != advertisement->target_ip ||
+        advertisement->source_ip.IsLoopback()) {
+      // Not for this interface, a proxied advertisement (unsupported), or a
+      // source that is not a link address.
+      return out;
+    }
+    const utils::Ethernet::Address mac =
+        advertisement->target_ll.value_or(advertisement->source_mac);
+    if (mac.IsZero() || mac.IsBroadcast() ||
+        (static_cast<unsigned>(mac.bytes[0]) & 1u) != 0 ||
+        mac == iface->second.mac) {
+      return out;
+    }
+    const Key key{ingress, advertisement->target_ip};
+    auto entry = entries_.find(key);
+    if (entry == entries_.end() ||
+        entry->second.epoch != iface->second.epoch) {
+      return out;
+    }
+    const auto current = neighbors_.Find(key);
+    if (current && current->state == NeighborState::kResolved &&
+        !advertisement->override && current->mac != mac) {
+      // RFC 4861 override semantics: a resolved neighbor keeps its MAC unless
+      // the advertisement says to override it.
+      return out;
+    }
+    // Same staging as OnArp: the table update and output space first, then the
+    // aging timer in place (Reschedule), and only with the timer in place is
+    // the resolved state committed. A refused arming leaves the entry, its
+    // timer and the table as they were and ignores the advertisement.
+    NeighborTable::Prepared prepared =
+        neighbors_.Prepare(key, NeighborState::kResolved, mac);
+    out.updates.reserve(prepared.updates.size());
+    if (timing_.reachable_lifetime != 0) {
+      if (!Arm(key, entry->second, now, timing_.reachable_lifetime)) {
+        return out;
+      }
+    } else {
+      Disarm(entry->second);
+    }
+    neighbors_.Commit(prepared);
+    entry->second.state = NeighborState::kResolved;
+    entry->second.probes = 0;
+    AppendUpdates(std::move(prepared.updates), out);
+    return out;
+  }
+
   // Advances the resolver's timers by at most `budget` wheel units, emitting
   // the solicitations and transitions that are due. Call it between batches
   // on the resolver's thread, with the scheduler's cached time and a bounded
@@ -537,14 +633,24 @@ class NeighborResolver {
       AppendUpdates(std::move(plan.prepared.updates), out);
       if (plan.solicit) {
         auto iface = interfaces_.find(plan.key.interface);
-        if (iface != interfaces_.end() && iface->second.ipv4 != 0 &&
-            !iface->second.mac.IsZero()) {
+        if (iface != interfaces_.end() && !iface->second.mac.IsZero()) {
           Solicitation solicitation;
           solicitation.egress = plan.key.interface;
-          const size_t wrote = BuildArpRequest(
-              iface->second.mac, utils::be32_t(iface->second.ipv4),
-              utils::be32_t(plan.key.ipv4), solicitation.frame);
-          if (wrote == kArpFrameSize) {
+          size_t wrote = 0;
+          if (plan.key.address.is_ipv4()) {
+            if (iface->second.ipv4 != 0) {
+              wrote = BuildArpRequest(iface->second.mac,
+                                      utils::be32_t(iface->second.ipv4),
+                                      utils::be32_t(plan.key.address.ipv4()),
+                                      solicitation.frame);
+            }
+          } else if (!iface->second.ipv6.IsUnspecified()) {
+            wrote = BuildNeighborSolicitation(
+                iface->second.mac, iface->second.ipv6,
+                plan.key.address.ipv6(), solicitation.frame);
+          }
+          if (wrote != 0) {
+            solicitation.length = wrote;
             out.solicitations.push_back(solicitation);
           }
         }
@@ -602,6 +708,7 @@ class NeighborResolver {
   struct StoredInterface {
     utils::Ethernet::Address mac;
     uint32_t ipv4;
+    utils::Ipv6Address ipv6;
     uint32_t epoch;
   };
 

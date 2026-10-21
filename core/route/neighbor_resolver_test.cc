@@ -56,7 +56,24 @@ Ethernet::Address Mac(const char *text) {
 
 NeighborResolver::Interface Iface(InterfaceId id, const char *mac,
                                   uint32_t address) {
-  return NeighborResolver::Interface{id, Mac(mac), address};
+  return NeighborResolver::Interface{id, Mac(mac), address, {}};
+}
+
+Ipv6Address Ipv6(const char *text) {
+  const auto parsed = bess::utils::ParseIpv6Address(text);
+  EXPECT_TRUE(parsed.has_value()) << text;
+  return parsed.value_or(Ipv6Address{});
+}
+
+NdMessage Nd(std::optional<NdMessage> message) {
+  EXPECT_TRUE(message.has_value());
+  return message.value_or(
+      NdMessage{NdType::kNeighborSolicitation});
+}
+
+NeighborResolver::Interface Iface6(InterfaceId id, const char *mac,
+                                   const char *ipv6) {
+  return NeighborResolver::Interface{id, Mac(mac), 0, Ipv6(ipv6)};
 }
 
 NeighborResolver::Key Key(InterfaceId id, uint32_t address) {
@@ -87,7 +104,7 @@ std::unique_ptr<NeighborResolver> MakeResolver(
 // The reply a neighbor with `sender_mac` sends to the solicitation in
 // `request_frame`: its own MAC and address to us, addressed to our MAC.
 std::array<uint8_t, kArpFrameSize> ReplyTo(
-    const std::array<uint8_t, kArpFrameSize> &request_frame,
+    std::span<const uint8_t> request_frame,
     const Ethernet::Address &sender_mac) {
   const auto request = ParseArp(request_frame);
   std::array<uint8_t, kArpFrameSize> reply{};
@@ -447,7 +464,8 @@ TEST(NeighborResolverTest, RetainedLearningDiesWithTheInterfaceGeneration) {
   auto rebound = resolver->Bind(NextHopId(2), key, 20);
   ASSERT_TRUE(rebound.has_value());
   EXPECT_EQ(NeighborState::kIncomplete, rebound->neighbor);
-  EXPECT_EQ(Mac("02:00:00:00:00:09"), rebound->src_mac);
+  EXPECT_EQ(Mac("02:00:00:00:00:09"),
+              rebound.value_or(NextHop{}).src_mac);
   progress = resolver->Poll(30, 16);
   ASSERT_EQ(1u, progress.solicitations.size());
   EXPECT_EQ(Mac("02:00:00:00:00:09"),
@@ -732,8 +750,10 @@ TEST(NeighborResolverFaultTest, ConfigureAllocationFailureLeavesIdentityWhole) {
     if (!resolver) {
       return;
     }
-    const auto binding = resolver->table().BindingOf(NextHopId(1));
-    if (!binding) {
+    const auto binding_opt = resolver->table().BindingOf(NextHopId(1));
+    const NeighborTable::Bound binding =
+        binding_opt.value_or(NeighborTable::Bound{});
+    if (!binding_opt.has_value()) {
       ADD_FAILURE() << "binding";
       return;
     }
@@ -767,7 +787,8 @@ TEST(NeighborResolverFaultTest, ConfigureAllocationFailureLeavesIdentityWhole) {
     EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
     const auto unchanged = resolver->table().BindingOf(NextHopId(1));
     ASSERT_TRUE(unchanged.has_value());
-    EXPECT_EQ(binding->src_mac, unchanged->src_mac);
+    EXPECT_EQ(binding.src_mac,
+              unchanged.value_or(NeighborTable::Bound{}).src_mac);
     EXPECT_EQ(1u, resolver->armed());
 
     // Retrying the same change (the old identity is still current) commits.
@@ -775,12 +796,16 @@ TEST(NeighborResolverFaultTest, ConfigureAllocationFailureLeavesIdentityWhole) {
     ASSERT_TRUE(retried.has_value());
     EXPECT_EQ(2u, resolver->interface_epoch(kIface1));
     EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
-    EXPECT_EQ(1u, retried->updates.size());
+    EXPECT_EQ(1u,
+              retried.value_or(NeighborResolver::Progress{}).updates.size());
     EXPECT_EQ(Mac("02:00:00:00:00:09"),
-              retried->updates[0].second.src_mac);
+              retried.value_or(NeighborResolver::Progress{})
+                  .updates[0]
+                  .second.src_mac);
     const auto rebound = resolver->table().BindingOf(NextHopId(1));
     ASSERT_TRUE(rebound.has_value());
-    EXPECT_EQ(Mac("02:00:00:00:00:09"), rebound->src_mac);
+    EXPECT_EQ(Mac("02:00:00:00:00:09"),
+              rebound.value_or(NeighborTable::Bound{}).src_mac);
   });
   EXPECT_GT(points, 0u);
 }
@@ -795,8 +820,10 @@ TEST(NeighborResolverFaultTest, RemoveAllocationFailureLeavesInterfaceWhole) {
     if (!resolver) {
       return;
     }
-    const auto binding = resolver->table().BindingOf(NextHopId(1));
-    if (!binding) {
+    const auto binding_opt = resolver->table().BindingOf(NextHopId(1));
+    const NeighborTable::Bound binding =
+        binding_opt.value_or(NeighborTable::Bound{});
+    if (!binding_opt.has_value()) {
       ADD_FAILURE() << "binding";
       return;
     }
@@ -827,7 +854,8 @@ TEST(NeighborResolverFaultTest, RemoveAllocationFailureLeavesInterfaceWhole) {
     EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
     const auto unchanged = resolver->table().BindingOf(NextHopId(1));
     ASSERT_TRUE(unchanged.has_value());
-    EXPECT_EQ(binding->src_mac, unchanged->src_mac);
+    EXPECT_EQ(binding.src_mac,
+              unchanged.value_or(NeighborTable::Bound{}).src_mac);
     EXPECT_EQ(1u, resolver->armed());
 
     progress = resolver->RemoveInterface(kIface1);
@@ -835,6 +863,623 @@ TEST(NeighborResolverFaultTest, RemoveAllocationFailureLeavesInterfaceWhole) {
     EXPECT_EQ(1u, progress.updates.size());
     EXPECT_EQ(NeighborState::kUnreachable, State(*resolver, key).state);
     EXPECT_EQ(0u, resolver->armed());
+  });
+  EXPECT_GT(points, 0u);
+}
+
+// -- IPv6 neighbor discovery ---------------------------------------------------
+
+constexpr size_t kEthFrameWithoutOption =
+    sizeof(Ethernet) + kIpv6HeaderSize + kNdMessageSize;
+
+const Ipv6Address kMy6 = Ipv6("fe80::1");
+const Ipv6Address kPeer6 = Ipv6("fe80::2");
+const Ipv6Address kOther6 = Ipv6("fe80::3");
+
+// An NA from `sender` (source and target both it) to our address.
+std::array<uint8_t, kNdFrameSize> Advertisement(
+    const Ipv6Address &address, const Ethernet::Address &sender_mac,
+    bool solicited = true, bool override = true,
+    const Ipv6Address &destination_ip = kMy6,
+    const Ethernet::Address &destination_mac = Mac("02:00:00:00:00:01")) {
+  std::array<uint8_t, kNdFrameSize> frame{};
+  EXPECT_EQ(kNdFrameSize, BuildNeighborAdvertisement(
+                              sender_mac, address, address, destination_mac,
+                              destination_ip, solicited, override, frame));
+  return frame;
+}
+
+// The ND analogue: one IPv6 neighbor resolved at tick 10, aging at 110.
+std::unique_ptr<NeighborResolver> NdResolved(NeighborResolver::Key *key) {
+  auto resolver = MakeResolver();
+  if (!resolver) {
+    return nullptr;
+  }
+  if (!resolver
+           ->ConfigureInterface(
+               Iface6(kIface1, "02:00:00:00:00:01", "fe80::1"), 0)
+           .has_value()) {
+    ADD_FAILURE() << "configure";
+    return nullptr;
+  }
+  *key = NeighborResolver::Key(kIface1, kPeer6);
+  if (!resolver->Bind(NextHopId(1), *key, 0).has_value()) {
+    ADD_FAILURE() << "bind";
+    return nullptr;
+  }
+  if (resolver->Poll(10, 16).solicitations.size() != 1) {
+    ADD_FAILURE() << "solicitation";
+    return nullptr;
+  }
+  if (resolver
+          ->OnNd(10, kIface1, Advertisement(kPeer6, Mac("02:00:00:00:00:aa")))
+          .updates.size() != 1) {
+    ADD_FAILURE() << "reply";
+    return nullptr;
+  }
+  return resolver;
+}
+
+TEST(NeighborResolverTest, NdSolicitationResolvesAndAges) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(
+                  Iface6(kIface1, "02:00:00:00:00:01", "fe80::1"), 0)
+                  .has_value());
+  const NeighborResolver::Key key(kIface1, kPeer6);
+  auto bound = resolver->Bind(NextHopId(1), key, 0);
+  ASSERT_TRUE(bound.has_value());
+  const NextHop initial = bound.value_or(NextHop{});
+  EXPECT_EQ(NeighborState::kIncomplete, initial.neighbor);
+
+  auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  EXPECT_EQ(kNdFrameSize, progress.solicitations[0].length);
+  EXPECT_EQ(kIface1, progress.solicitations[0].egress);
+  const NdMessage solicitation = Nd(ParseNeighborDiscovery(
+      std::span<const uint8_t>(progress.solicitations[0].frame.data(),
+                               progress.solicitations[0].length)));
+  EXPECT_EQ(NdType::kNeighborSolicitation, solicitation.type);
+  EXPECT_EQ(kMy6, solicitation.source_ip);
+  EXPECT_EQ(SolicitedNodeAddress(kPeer6), solicitation.destination_ip);
+  EXPECT_EQ(kPeer6, solicitation.target_ip);
+  EXPECT_EQ(Mac("02:00:00:00:00:01"), solicitation.source_mac);
+  const auto *eth = reinterpret_cast<const Ethernet *>(
+      progress.solicitations[0].frame.data());
+  EXPECT_EQ(SolicitedNodeMac(kPeer6), eth->dst_addr);
+  EXPECT_EQ(Mac("02:00:00:00:00:01"), eth->src_addr);
+
+  progress = resolver->OnNd(
+      10, kIface1,
+      Advertisement(kPeer6, Mac("02:00:00:00:00:aa")));
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kResolved, progress.updates[0].second.neighbor);
+  EXPECT_EQ(Mac("02:00:00:00:00:aa"), progress.updates[0].second.dst_mac);
+  EXPECT_EQ(Mac("02:00:00:00:00:01"), progress.updates[0].second.src_mac);
+  EXPECT_EQ(kIface1, progress.updates[0].second.egress);
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+
+  // Aging takes it out of service and solicits again over ND.
+  progress = resolver->Poll(110, 16);
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kIncomplete, progress.updates[0].second.neighbor);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  EXPECT_EQ(NdType::kNeighborSolicitation,
+            Nd(ParseNeighborDiscovery(std::span<const uint8_t>(
+                   progress.solicitations[0].frame.data(),
+                   progress.solicitations[0].length)))
+                .type);
+}
+
+TEST(NeighborResolverTest, NdAdvertisementsFollowMacAndOverrideSemantics) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(
+                  Iface6(kIface1, "02:00:00:00:00:01", "fe80::1"), 0)
+                  .has_value());
+  const NeighborResolver::Key key(kIface1, kPeer6);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  ASSERT_EQ(1u, resolver->Poll(10, 16).solicitations.size());
+  ASSERT_EQ(1u,
+            resolver
+                ->OnNd(10, kIface1,
+                       Advertisement(kPeer6, Mac("02:00:00:00:00:aa")))
+                .updates.size());
+
+  // An unsolicited advertisement without override cannot replace a resolved
+  // MAC.
+  EXPECT_TRUE(resolver
+                  ->OnNd(20, kIface1,
+                         Advertisement(kPeer6, Mac("02:00:00:00:00:bb"),
+                                       /*solicited=*/false,
+                                       /*override=*/false))
+                  .empty());
+  EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+
+  // A solicited (or overriding) one can, including the RFC 4861 unsolicited
+  // form sent to all-nodes.
+  auto progress = resolver->OnNd(
+      20, kIface1,
+      Advertisement(kPeer6, Mac("02:00:00:00:00:bb"), false, true,
+                    bess::route::AllNodesAddress(),
+                    bess::route::AllNodesMac()));
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), progress.updates[0].second.dst_mac);
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), State(*resolver, key).mac);
+}
+
+TEST(NeighborResolverTest, NdRetriesFailAndRecover) {
+  NeighborResolver::Config config = TestConfig();
+  config.timing.max_probes = 2;
+  auto resolver = MakeResolver(config);
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(
+                  Iface6(kIface1, "02:00:00:00:00:01", "fe80::1"), 0)
+                  .has_value());
+  const NeighborResolver::Key key(kIface1, kPeer6);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+
+  EXPECT_EQ(1u, resolver->Poll(10, 16).solicitations.size());
+  EXPECT_EQ(1u, resolver->Poll(20, 16).solicitations.size());
+  auto progress = resolver->Poll(40, 16);
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kUnreachable, progress.updates[0].second.neighbor);
+
+  progress = resolver->Poll(90, 16);
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kIncomplete, progress.updates[0].second.neighbor);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  progress = resolver->OnNd(
+      90, kIface1, Advertisement(kPeer6, Mac("02:00:00:00:00:aa")));
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+}
+
+TEST(NeighborResolverTest, NdIdentityRejectsWrongInterfaceTargetAndSource) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(
+                  Iface6(kIface1, "02:00:00:00:00:01", "fe80::1"), 0)
+                  .has_value());
+  ASSERT_TRUE(resolver->ConfigureInterface(
+                  Iface6(kIface2, "02:00:00:00:00:02", "fe80::10"), 0)
+                  .has_value());
+  const NeighborResolver::Key key(kIface1, kPeer6);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  ASSERT_EQ(1u, resolver->Poll(10, 16).solicitations.size());
+  const auto good = Advertisement(kPeer6, Mac("02:00:00:00:00:aa"));
+
+  // Another interface, another target, a source that is not the target, the
+  // wrong Ethernet destination, and an unusable sender MAC are all ignored.
+  std::array<uint8_t, kNdFrameSize> for_iface2{};
+  ASSERT_EQ(kNdFrameSize,
+            BuildNeighborAdvertisement(Mac("02:00:00:00:00:aa"), kPeer6, kPeer6,
+                                       Mac("02:00:00:00:00:02"),
+                                       Ipv6("fe80::10"), true, true,
+                                       for_iface2));
+  EXPECT_TRUE(resolver->OnNd(10, kIface2, for_iface2).empty());
+  EXPECT_TRUE(resolver->OnNd(10, kIface2, good).empty());
+  EXPECT_TRUE(
+      resolver->OnNd(10, kIface1,
+                     Advertisement(kOther6, Mac("02:00:00:00:00:aa")))
+          .empty());
+  EXPECT_TRUE(resolver
+                  ->OnNd(10, kIface1,
+                         [&] {
+                           std::array<uint8_t, kNdFrameSize> frame{};
+                           EXPECT_EQ(kNdFrameSize, BuildNeighborAdvertisement(
+                                                       Mac("02:00:00:00:00:aa"),
+                                                       kPeer6, kOther6,
+                                                       Mac("02:00:00:00:00:01"),
+                                                       kMy6, true, true,
+                                                       frame));
+                           return frame;
+                         }())
+                  .empty());
+  auto wrong_dst = good;
+  reinterpret_cast<Ethernet *>(wrong_dst.data())->dst_addr =
+      Mac("02:00:00:00:00:cc");
+  EXPECT_TRUE(resolver->OnNd(10, kIface1, wrong_dst).empty());
+  EXPECT_TRUE(
+      resolver->OnNd(10, kIface1,
+                     Advertisement(kPeer6, Mac("00:00:00:00:00:00")))
+          .empty());
+  EXPECT_TRUE(
+      resolver->OnNd(10, kIface1,
+                     Advertisement(kPeer6, Mac("01:00:5e:00:00:01")))
+          .empty());
+  EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+
+  // A moved address starts a new generation; an advertisement in flight for
+  // the old identity is stale, and the same frame under the new one is fresh.
+  const auto reconfigured = resolver->ConfigureInterface(
+      Iface6(kIface1, "02:00:00:00:00:01", "fe80::11"), 20);
+  ASSERT_TRUE(reconfigured.has_value());
+  EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+  EXPECT_TRUE(resolver->OnNd(20, kIface1, good).empty());
+  EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+  EXPECT_EQ(1u,
+            resolver
+                ->OnNd(20, kIface1,
+                       Advertisement(kPeer6, Mac("02:00:00:00:00:aa"), true,
+                                     true, Ipv6("fe80::11")))
+                .updates.size());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+}
+
+TEST(NeighborResolverTest, NdParsingRejectsMalformedAndBadChecksums) {
+  Ipv6Address target = kPeer6;
+  std::array<uint8_t, kNdFrameSize> frame{};
+  ASSERT_EQ(kNdFrameSize,
+            BuildNeighborSolicitation(Mac("02:00:00:00:00:01"), kMy6, target,
+                                      frame));
+  const NdMessage message = Nd(ParseNeighborDiscovery(frame));
+  EXPECT_EQ(NdType::kNeighborSolicitation, message.type);
+  EXPECT_EQ(kPeer6, message.target_ip);
+  ASSERT_TRUE(message.source_ll.has_value());
+  EXPECT_EQ(Mac("02:00:00:00:00:01"),
+            message.source_ll.value_or(Ethernet::Address{}));
+
+  // Hop limit must be 255.
+  auto bad = frame;
+  bad[14 + 7] = 64;
+  EXPECT_FALSE(ParseNeighborDiscovery(bad).has_value());
+  // Next header must be ICMPv6.
+  bad = frame;
+  bad[14 + 6] = 17;
+  EXPECT_FALSE(ParseNeighborDiscovery(bad).has_value());
+  // Version must be 6.
+  bad = frame;
+  bad[14] = 0x40;
+  EXPECT_FALSE(ParseNeighborDiscovery(bad).has_value());
+  // The checksum covers the pseudo-header and the payload.
+  bad = frame;
+  bad[14 + 40 + 8] ^= 0x01u;
+  EXPECT_FALSE(ParseNeighborDiscovery(bad).has_value());
+  // A truncated option.
+  bad = frame;
+  bad[14 + 40 + 25] = 2;  // option claims 16 bytes, only 8 remain
+  EXPECT_FALSE(ParseNeighborDiscovery(bad).has_value());
+  // A zero-length option.
+  bad = frame;
+  bad[14 + 40 + 25] = 0;
+  EXPECT_FALSE(ParseNeighborDiscovery(bad).has_value());
+  // A link-layer option that disagrees with the Ethernet source.
+  bad = frame;
+  std::memset(bad.data() + 14 + 40 + 26, 0xee, 6);
+  EXPECT_FALSE(ParseNeighborDiscovery(bad).has_value());
+  EXPECT_FALSE(ParseNeighborDiscovery(
+                   std::span<const uint8_t>(frame.data(), frame.size() - 1))
+                   .has_value());
+
+  // The multicast mapping is the last 24 bits.
+  const Ipv6Address address = Ipv6("2001:db8::1234:5678");
+  const Ipv6Address solicited = SolicitedNodeAddress(address);
+  EXPECT_EQ(Ipv6("ff02::1:ff34:5678"), solicited);
+  EXPECT_EQ(Mac("33:33:ff:34:56:78"), SolicitedNodeMac(address));
+  EXPECT_EQ(Mac("33:33:00:00:00:01"), bess::route::AllNodesMac());
+  EXPECT_EQ(Ipv6("ff02::1"), bess::route::AllNodesAddress());
+}
+
+TEST(NeighborResolverTest, AnswerNeighborSolicitationHandlesUnicastAndDad) {
+  const Ethernet::Address my_mac = Mac("02:00:00:00:00:01");
+  const Ethernet::Address peer_mac = Mac("02:00:00:00:00:aa");
+  std::array<uint8_t, kNdFrameSize> solicitation{};
+  ASSERT_EQ(kNdFrameSize,
+            BuildNeighborSolicitation(peer_mac, kPeer6, kMy6, solicitation));
+  const auto original = solicitation;
+  ASSERT_TRUE(AnswerNeighborSolicitationInPlace(solicitation, my_mac, kMy6));
+  NdMessage answer = Nd(ParseNeighborDiscovery(solicitation));
+  EXPECT_EQ(NdType::kNeighborAdvertisement, answer.type);
+  EXPECT_TRUE(answer.solicited);
+  EXPECT_TRUE(answer.override);
+  EXPECT_EQ(kMy6, answer.source_ip);
+  EXPECT_EQ(kPeer6, answer.destination_ip);
+  EXPECT_EQ(peer_mac,
+            reinterpret_cast<Ethernet *>(solicitation.data())->dst_addr);
+  ASSERT_TRUE(answer.target_ll.has_value());
+  EXPECT_EQ(my_mac, answer.target_ll.value_or(Ethernet::Address{}));
+
+  // A solicitation for another address is left alone.
+  auto other = original;
+  EXPECT_FALSE(
+      AnswerNeighborSolicitationInPlace(other, my_mac, Ipv6("fe80::99")));
+  EXPECT_EQ(original, other);
+
+  // A duplicate-address-detection solicitation (source ::, no source
+  // link-layer option) is answered to all-nodes without S or O, in the
+  // solicitation's own 78-byte size.
+  std::array<uint8_t, kEthFrameWithoutOption> dad{};
+  ASSERT_EQ(kEthFrameWithoutOption,
+            internal::WriteIpv6Nd(dad, SolicitedNodeMac(kMy6), peer_mac,
+                                  Ipv6Address{}, SolicitedNodeAddress(kMy6),
+                                  kNdMessageSize));
+  uint8_t *payload = dad.data() + sizeof(Ethernet) + kIpv6HeaderSize;
+  payload[0] = static_cast<uint8_t>(NdType::kNeighborSolicitation);
+  std::memcpy(payload + 8, kMy6.bytes, 16);
+  const uint16_t checksum = internal::Icmpv6ChecksumSum(
+      Ipv6Address{}, SolicitedNodeAddress(kMy6),
+      std::span<const uint8_t>(payload, kNdMessageSize));
+  payload[2] = static_cast<uint8_t>(checksum & 0xffu);
+  payload[3] = static_cast<uint8_t>(checksum >> 8u);
+
+  EXPECT_TRUE(AnswerNeighborSolicitationInPlace(dad, my_mac, kMy6));
+  answer = Nd(ParseNeighborDiscovery(dad));
+  EXPECT_EQ(NdType::kNeighborAdvertisement, answer.type);
+  EXPECT_FALSE(answer.solicited);
+  EXPECT_FALSE(answer.override);
+  EXPECT_EQ(AllNodesAddress(), answer.destination_ip);
+  EXPECT_EQ(AllNodesMac(),
+            reinterpret_cast<Ethernet *>(dad.data())->dst_addr);
+  EXPECT_FALSE(answer.target_ll.has_value());
+}
+
+TEST(NeighborResolverTest, NdConcurrentPublishAndLookupNeverSeeAHalfUpdate) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  LpmRouteTable::Config config;
+  auto made = Router::Create("neighbor_nd_concurrent", config, 4, domain);
+  ASSERT_TRUE(made.has_value());
+  Router &router = **made;
+  const Ethernet::Address mac_a = Mac("02:00:00:00:00:aa");
+  const Ethernet::Address mac_b = Mac("02:00:00:00:00:bb");
+  const Ethernet::Address my_mac = Mac("02:00:00:00:00:01");
+  NextHop initial;
+  initial.egress = kIface1;
+  initial.neighbor = NeighborState::kResolved;
+  initial.dst_mac = mac_a;
+  initial.src_mac = my_mac;
+  ASSERT_TRUE(router.SetNextHop(NextHopId(1), initial));
+
+  NeighborResolver::Config resolver_config = TestConfig();
+  resolver_config.timing.reachable_lifetime = 1000000;
+  auto resolver = MakeResolver(resolver_config);
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(
+                  Iface6(kIface1, "02:00:00:00:00:01", "fe80::1"), 0)
+                  .has_value());
+  const NeighborResolver::Key key(kIface1, kPeer6);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  ASSERT_EQ(1u, resolver->Poll(10, 16).solicitations.size());
+  auto initial_updates = resolver->OnNd(
+      10, kIface1, Advertisement(kPeer6, mac_a));
+  ASSERT_EQ(1u, initial_updates.updates.size());
+  ASSERT_TRUE(Publish(router, initial_updates.updates));
+
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> bad{0}, lookups{0};
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 2; r++) {
+    const uint32_t reader_id = 50 + r;
+    ASSERT_TRUE(domain.Register(reader_id).has_value());
+    readers.emplace_back([&, reader_id] {
+      domain.Online(reader_id);
+      uint64_t local = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        const NextHop *hop = router.LookupNextHop(NextHopId(1));
+        if (hop == nullptr || hop->neighbor != NeighborState::kResolved ||
+            hop->egress != kIface1 || hop->src_mac != my_mac ||
+            (hop->dst_mac != mac_a && hop->dst_mac != mac_b)) {
+          bad++;
+        }
+        local++;
+        domain.Quiescent(reader_id);
+      }
+      lookups += local;
+      domain.Offline(reader_id);
+    });
+  }
+
+  uint64_t now = 10;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const Ethernet::Address &mac = (now & uint64_t{1}) ? mac_a : mac_b;
+    auto updates = resolver->OnNd(
+        now++, kIface1, Advertisement(kPeer6, mac));
+    if (!updates.updates.empty()) {
+      ASSERT_TRUE(Publish(router, updates.updates));
+    }
+  }
+  stop = true;
+  for (auto &t : readers) {
+    t.join();
+  }
+  for (int r = 0; r < 2; r++) {
+    domain.Unregister(50 + r);
+  }
+  EXPECT_EQ(0u, bad.load()) << "of " << lookups.load() << " lookups";
+  EXPECT_GT(lookups.load(), 100u);
+}
+
+TEST(NeighborResolverFaultTest, NdPollAllocationFailureLosesNoTimer) {
+  const size_t points = ForEachFailurePoint([&](size_t fail_at) {
+    NeighborResolver::Key key;
+    auto resolver = NdResolved(&key);
+    if (!resolver) {
+      return;
+    }
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+    EXPECT_EQ(1u, resolver->armed());
+    bool threw = false;
+    bool injected = false;
+    NeighborResolver::Progress progress;
+    {
+      AllocationFaults faults(fail_at);
+      try {
+        progress = resolver->Poll(110, 16);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+    }
+    if (!injected) {
+      EXPECT_FALSE(threw);
+      EXPECT_EQ(1u, progress.updates.size());
+      EXPECT_EQ(1u, progress.solicitations.size());
+      EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+      return;
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+    EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+    EXPECT_EQ(1u, resolver->armed());
+    progress = resolver->Poll(110, 16);
+    EXPECT_EQ(1u, progress.updates.size());
+    EXPECT_EQ(1u, progress.solicitations.size());
+    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+  });
+  EXPECT_GT(points, 0u);
+}
+
+TEST(NeighborResolverFaultTest, NdAdvertisementAllocationFailureKeepsTimer) {
+  const size_t points = ForEachFailurePoint([&](size_t fail_at) {
+    NeighborResolver::Key key(kIface1, kPeer6);
+    auto resolver = MakeResolver();
+    if (!resolver) {
+      return;
+    }
+    if (!resolver
+             ->ConfigureInterface(
+                 Iface6(kIface1, "02:00:00:00:00:01", "fe80::1"), 0)
+             .has_value() ||
+        !resolver->Bind(NextHopId(1), key, 0).has_value()) {
+      ADD_FAILURE() << "setup";
+      return;
+    }
+    if (resolver->Poll(10, 16).solicitations.size() != 1) {
+      ADD_FAILURE() << "solicitation";
+      return;
+    }
+    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+    EXPECT_EQ(1u, resolver->armed());
+    bool threw = false;
+    bool injected = false;
+    NeighborResolver::Progress progress;
+    {
+      AllocationFaults faults(fail_at);
+      try {
+        progress = resolver->OnNd(
+            10, kIface1,
+            Advertisement(kPeer6, Mac("02:00:00:00:00:aa")));
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+    }
+    if (!injected) {
+      EXPECT_FALSE(threw);
+      EXPECT_EQ(1u, progress.updates.size());
+      EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+      return;
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+    EXPECT_EQ(1u, resolver->armed());
+    EXPECT_EQ(1u,
+              resolver
+                  ->OnNd(10, kIface1,
+                         Advertisement(kPeer6, Mac("02:00:00:00:00:aa")))
+                  .updates.size());
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+  });
+  EXPECT_GT(points, 0u);
+}
+
+TEST(NeighborResolverFaultTest, NdConfigureAllocationFailureKeepsIdentity) {
+  const NeighborResolver::Interface moved =
+      Iface6(kIface1, "02:00:00:00:00:09", "fe80::1");
+  const size_t points = ForEachFailurePoint([&](size_t fail_at) {
+    NeighborResolver::Key key;
+    auto resolver = NdResolved(&key);
+    if (!resolver) {
+      return;
+    }
+    const auto binding_opt = resolver->table().BindingOf(NextHopId(1));
+    const NeighborTable::Bound binding =
+        binding_opt.value_or(NeighborTable::Bound{});
+    if (!binding_opt.has_value()) {
+      ADD_FAILURE() << "binding";
+      return;
+    }
+    EXPECT_EQ(1u, resolver->interface_epoch(kIface1));
+    bool threw = false;
+    bool injected = false;
+    std::expected<NeighborResolver::Progress, std::string> progress;
+    {
+      AllocationFaults faults(fail_at);
+      try {
+        progress = resolver->ConfigureInterface(moved, 20);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+    }
+    if (!injected) {
+      EXPECT_FALSE(threw);
+      EXPECT_TRUE(progress.has_value());
+      EXPECT_EQ(2u, resolver->interface_epoch(kIface1));
+      EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+      return;
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(1u, resolver->interface_epoch(kIface1));
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+    EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+    const auto unchanged = resolver->table().BindingOf(NextHopId(1));
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(binding.src_mac,
+              unchanged.value_or(NeighborTable::Bound{}).src_mac);
+    EXPECT_EQ(1u, resolver->armed());
+
+    auto retried = resolver->ConfigureInterface(moved, 20);
+    ASSERT_TRUE(retried.has_value());
+    const NeighborResolver::Progress retried_progress =
+        retried.value_or(NeighborResolver::Progress{});
+    EXPECT_EQ(2u, resolver->interface_epoch(kIface1));
+    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+    ASSERT_EQ(1u, retried_progress.updates.size());
+    EXPECT_EQ(Mac("02:00:00:00:00:09"),
+              retried_progress.updates[0].second.src_mac);
+  });
+  EXPECT_GT(points, 0u);
+}
+
+TEST(NeighborResolverFaultTest, NdRemoveAllocationFailureKeepsInterface) {
+  const size_t points = ForEachFailurePoint([&](size_t fail_at) {
+    NeighborResolver::Key key;
+    auto resolver = NdResolved(&key);
+    if (!resolver) {
+      return;
+    }
+    EXPECT_EQ(1u, resolver->interface_epoch(kIface1));
+    bool threw = false;
+    bool injected = false;
+    NeighborResolver::Progress progress;
+    {
+      AllocationFaults faults(fail_at);
+      try {
+        progress = resolver->RemoveInterface(kIface1);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+    }
+    if (!injected) {
+      EXPECT_FALSE(threw);
+      EXPECT_EQ(0u, resolver->interface_epoch(kIface1));
+      EXPECT_EQ(1u, progress.updates.size());
+      EXPECT_EQ(NeighborState::kUnreachable, State(*resolver, key).state);
+      return;
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(1u, resolver->interface_epoch(kIface1));
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+    EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+    EXPECT_EQ(1u, resolver->armed());
+    progress = resolver->RemoveInterface(kIface1);
+    EXPECT_EQ(0u, resolver->interface_epoch(kIface1));
+    EXPECT_EQ(1u, progress.updates.size());
+    EXPECT_EQ(NeighborState::kUnreachable, State(*resolver, key).state);
   });
   EXPECT_GT(points, 0u);
 }
