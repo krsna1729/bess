@@ -48,6 +48,7 @@ class BPF final : public Module {
   struct Staged {
     OwnedFilters compiled;
     bess::pb::BPFArg arg;
+    gate_idx_t default_gate = 0;
   };
 
   static bool Match(const bess::utils::Filter &, u_char *, u_int, u_int);
@@ -58,9 +59,8 @@ class BPF final : public Module {
   static void FreeFilters(std::vector<bess::utils::Filter> *filters);
 
   void ProcessBatch1Filter(Context *ctx, bess::PacketBatch *batch);
-
+  gate_idx_t default_gate_ = 0;
   std::vector<bess::utils::Filter> filters_;
-  // The filters as given, in order (control side): "<name>/filters" reads it
   // back and writes it whole.
   bess::pb::BPFArg arg_;
   // "<name>/filters" (D-129): the whole filter list; setting it replaces the

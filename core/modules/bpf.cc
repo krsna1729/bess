@@ -38,11 +38,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <expected>
+#include <format>
 #include <string>
 #include <utility>
 
 #include "bpf.h"
 #include "utils/bpf.h"
+#include "utils/endian.h"
 
 /* -------------------------------------------------------------------------
  * Module code begins from here
@@ -59,6 +61,15 @@ const ResourceTables BPF::resource_tables = {
     ResourceTable::Singleton<bess::pb::BPFArg>("filters", true)};
 
 CommandResponse BPF::Init(const bess::pb::BPFArg &arg) {
+  if (arg.has_default_gate()) {
+    if (arg.default_gate() >= MAX_GATES) {
+      return CommandFailure(EINVAL, "default_gate %lu is invalid; must be < %u",
+                            arg.default_gate(), MAX_GATES);
+    }
+    default_gate_ = static_cast<gate_idx_t>(arg.default_gate());
+  } else {
+    default_gate_ = 0;
+  }
   // The init argument's filters, compiled and sorted as the resource's are:
   // a filter that does not compile refuses the creation. OwnedFilters frees
   // the list it replaced.
@@ -88,7 +99,15 @@ CommandResponse BPF::Init(const bess::pb::BPFArg &arg) {
   auto registered = filters_resource_.Register(
       init_context().resources(), init_context().codecs(), name() + "/filters",
       [](const bess::pb::BPFArg &v) -> std::expected<Staged, std::string> {
-        Staged staged{{}, v};
+        Staged staged{{}, v, 0};
+        if (v.has_default_gate()) {
+          if (v.default_gate() >= MAX_GATES) {
+            return std::unexpected(
+                std::format("default_gate {} is invalid; must be < {}",
+                            v.default_gate(), MAX_GATES));
+          }
+          staged.default_gate = static_cast<gate_idx_t>(v.default_gate());
+        }
         std::vector<bess::utils::Filter> &filters = staged.compiled.filters;
         filters.reserve(v.filters_size());
         for (const auto &f : v.filters()) {
@@ -110,6 +129,7 @@ CommandResponse BPF::Init(const bess::pb::BPFArg &arg) {
       [this](Staged &s) {
         filters_.swap(s.compiled.filters);
         arg_.Swap(&s.arg);
+        default_gate_ = s.default_gate;
       },
       [this] { return arg_; }, [this] { return HasRunningWorker(); });
   if (!registered) {
@@ -151,11 +171,31 @@ CommandResponse BPF::Compile(const bess::pb::BPFArg::Filter &f,
   if (!pcap) {
     return CommandFailure(ENOMEM, "failed to create BPF compile context");
   }
-  const int compile_ret = pcap_compile(pcap, &il, filter.exp.c_str(), 1,
-                                       PCAP_NETMASK_UNKNOWN);
+  const int compile_ret =
+      pcap_compile(pcap, &il, filter.exp.c_str(), 1, PCAP_NETMASK_UNKNOWN);
   pcap_close(pcap);
   if (compile_ret == -1) {
     return CommandFailure(EINVAL, "BPF compilation error");
+  }
+
+  // Detect single comparison fast paths (16-bit or 32-bit equality):
+  if (il.bf_len == 4 && il.bf_insns[0].code == (BPF_LD | BPF_H | BPF_ABS) &&
+      il.bf_insns[1].code == (BPF_JMP | BPF_JEQ | BPF_K) &&
+      il.bf_insns[2].code == (BPF_RET | BPF_K) && il.bf_insns[2].k != 0 &&
+      il.bf_insns[3].code == (BPF_RET | BPF_K) && il.bf_insns[3].k == 0) {
+    filter.fast_kind = bess::utils::Filter::FastKind::k16Bit;
+    filter.fast_offset = il.bf_insns[0].k;
+    filter.fast_val = il.bf_insns[1].k;
+  } else if (il.bf_len == 4 &&
+             il.bf_insns[0].code == (BPF_LD | BPF_W | BPF_ABS) &&
+             il.bf_insns[1].code == (BPF_JMP | BPF_JEQ | BPF_K) &&
+             il.bf_insns[2].code == (BPF_RET | BPF_K) &&
+             il.bf_insns[2].k != 0 &&
+             il.bf_insns[3].code == (BPF_RET | BPF_K) &&
+             il.bf_insns[3].k == 0) {
+    filter.fast_kind = bess::utils::Filter::FastKind::k32Bit;
+    filter.fast_offset = il.bf_insns[0].k;
+    filter.fast_val = il.bf_insns[1].k;
   }
 
 #ifdef __x86_64
@@ -168,7 +208,6 @@ CommandResponse BPF::Compile(const bess::pb::BPFArg::Filter &f,
 #else
   filter.il_code = il;
 #endif
-
   *out = std::move(filter);
   return CommandSuccess();
 }
@@ -191,43 +230,105 @@ inline bool BPF::Match(const bess::utils::Filter &filter, u_char *pkt,
 }
 
 void BPF::ProcessBatch1Filter(Context *ctx, bess::PacketBatch *batch) {
-  const bess::utils::Filter &filter = filters_[0];
+  const size_t cnt = batch->cnt();
+  if (cnt == 0)
+    return;
 
-  for (bess::PacketRef pkt : batch->packets()) {
-    if (Match(filter, pkt.head_data<u_char *>(), pkt.total_len(),
-              pkt.head_len())) {
-      EmitPacket(ctx, pkt, filter.gate);
-    } else {
-      EmitPacket(ctx, pkt);
+  gate_idx_t ogates[bess::PacketBatch::kMaxBurst];
+  const auto &filter = filters_[0];
+  const gate_idx_t match_gate = static_cast<gate_idx_t>(filter.gate);
+
+  if (filter.fast_kind == bess::utils::Filter::FastKind::k16Bit) {
+    const size_t off = filter.fast_offset;
+    const uint16_t want_be = bess::utils::be16_t(filter.fast_val).raw_value();
+
+    for (size_t i = 0; i < cnt; i++) {
+      rte_prefetch0(batch->packet(i).head_data());
     }
+
+#pragma GCC unroll 4
+    for (size_t i = 0; i < cnt; i++) {
+      bess::PacketRef pkt = batch->packet(i);
+      if (pkt.head_len() < off + 2) [[unlikely]] {
+        ogates[i] = default_gate_;
+        continue;
+      }
+      uint16_t val = 0;
+      std::memcpy(&val, pkt.head_data<const uint8_t *>() + off, sizeof(val));
+      ogates[i] = (val == want_be) ? match_gate : default_gate_;
+    }
+    EmitBatch(ctx, batch, ogates);
+    return;
   }
+
+  if (filter.fast_kind == bess::utils::Filter::FastKind::k32Bit) {
+    const size_t off = filter.fast_offset;
+    const uint32_t want_be = bess::utils::be32_t(filter.fast_val).raw_value();
+
+    for (size_t i = 0; i < cnt; i++) {
+      rte_prefetch0(batch->packet(i).head_data());
+    }
+
+#pragma GCC unroll 4
+    for (size_t i = 0; i < cnt; i++) {
+      bess::PacketRef pkt = batch->packet(i);
+      if (pkt.head_len() < off + 4) [[unlikely]] {
+        ogates[i] = default_gate_;
+        continue;
+      }
+      uint32_t val = 0;
+      std::memcpy(&val, pkt.head_data<const uint8_t *>() + off, sizeof(val));
+      ogates[i] = (val == want_be) ? match_gate : default_gate_;
+    }
+    EmitBatch(ctx, batch, ogates);
+    return;
+  }
+
+  for (size_t i = 0; i < cnt; i++) {
+    bess::PacketRef pkt = batch->packet(i);
+    ogates[i] = Match(filter, pkt.head_data<u_char *>(), pkt.total_len(),
+                      pkt.head_len())
+                    ? match_gate
+                    : default_gate_;
+  }
+  EmitBatch(ctx, batch, ogates);
 }
 
 void BPF::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  int n_filters = filters_.size();
-
-  if (n_filters == 0) {
-    RunNextModule(ctx, batch);
+  const size_t cnt = batch->cnt();
+  if (cnt == 0)
     return;
-  } else if (n_filters == 1) {
+
+  const size_t n_filters = filters_.size();
+  if (n_filters == 0) {
+    if (default_gate_ == 0) {
+      RunNextModule(ctx, batch);
+    } else {
+      gate_idx_t ogates[bess::PacketBatch::kMaxBurst];
+      std::fill_n(ogates, cnt, default_gate_);
+      EmitBatch(ctx, batch, ogates);
+    }
+    return;
+  }
+  if (n_filters == 1) {
     ProcessBatch1Filter(ctx, batch);
     return;
   }
 
-  // slow version for general cases
-  for (bess::PacketRef pkt : batch->packets()) {
-    gate_idx_t gate = 0;  // default gate for unmatched pkts
-
-    // high priority filters are checked first
-    for (const bess::utils::Filter &filter : filters_) {
+  gate_idx_t ogates[bess::PacketBatch::kMaxBurst];
+  for (size_t i = 0; i < cnt; i++) {
+    bess::PacketRef pkt = batch->packet(i);
+    gate_idx_t gate = default_gate_;
+    for (const auto &filter : filters_) {
       if (Match(filter, pkt.head_data<uint8_t *>(), pkt.total_len(),
                 pkt.head_len())) {
         gate = filter.gate;
         break;
       }
     }
-    EmitPacket(ctx, pkt, gate);
+    ogates[i] = gate;
   }
+  EmitBatch(ctx, batch, ogates);
 }
 
 ADD_MODULE(BPF, "bpf", "classifies packets with pcap-filter(7) syntax")
