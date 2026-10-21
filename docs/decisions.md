@@ -11925,3 +11925,79 @@ per-worker sharded resolver (the library is explicitly single-writer).
 **Revisit when:** IPv6 ND is added, or a graph needs resolution on the packet
 path without a control-side hop (then sharding and a lock-free handoff are the
 design question, not another state machine).
+
+## D-176 IPv6 neighbor discovery on the same resolver and neighbor table
+
+**Status:** accepted (2026-10-21), experimental API. **Code:**
+`core/route/neighbor_resolver.h` (`OnNd`, IPv6 `Key`/`Interface`),
+`core/route/neighbor_table.h` (family-keyed `NeighborAddress`), `core/route/l3_packet.h`
+(ND parse/build and `AnswerNeighborSolicitation`), `core/modules/vif.*`,
+`protobuf/module_msg.proto` (`VifInterfaceValue.ipv6_addr`),
+`core/route/neighbor_resolver_test.cc`, `core/modules/vif_test.cc`,
+`docs/neighbor-resolution.md`.
+
+**Context.** D-175 built the ARP state machine and deliberately left ND out:
+the state machine, interface identity, publication and timer ownership were
+address-family neutral, but the key, packet helpers and Vif responder were
+IPv4. The neighbor table's key was `(InterfaceId, uint32_t)`, so an ND packet
+had nowhere to go without a second table or a second resolver.
+
+**Decision.**
+- **One resolver, one table, one timer wheel.** The key becomes
+  `NeighborAddress{family, bytes[16]}` with IPv4 (4 bytes) and IPv6 (16 bytes)
+  constructors; `NeighborTable` stores it whole. Entries, capacity, epoch,
+  bindings, `ExpiryWheel`, `Publish` and `NextHopOps` are unchanged. No ND
+  timers exist outside the existing wheel.
+- **ND is packet mechanics plus a callback.** `ParseNeighborDiscovery` and
+  the builders validate/emit Ethernet+IPv6+ICMPv6 ND, the solicited-node
+  mapping, S/O/R flags and link-layer options. `NeighborResolver::OnNd`
+  applies the same entry/epoch/interface rules as `OnArp`: only `Bind` creates
+  an entry; ingress and epoch must match; the target must be the sender (no
+  proxy); the Ethernet destination must be the interface MAC; sender MAC must
+  be unicast; source/target must be unicast, non-unspecified and non-loopback;
+  an unsolicited advertisement replaces a resolved MAC only when O is set.
+  `Poll` sends NS with the source link-layer option when the interface has an
+  IPv6 address and a MAC. `OnNd` stages its table update and output space and
+  arms or reschedules the aging timer before committing, like `OnArp`; a
+  timer refusal ignores the advertisement rather than keeping a resolved
+  neighbor with no timer.
+- **Vif answers, it still does not resolve.** `Vif` calls
+  `AnswerNeighborSolicitation`: a normal NS becomes a solicited NA, and a DAD
+  NS (source `::`, no SLL) is answered to all-nodes with S clear. Every answer
+  carries the target link-layer option -- RFC 4861 7.2.4 requires it because
+  the solicitation's destination is multicast -- so a 78-byte DAD solicitation
+  produces an 86-byte answer and `Vif` grows the packet within its tailroom;
+  with the option present the O flag is set. Validation also requires a DAD
+  solicitation's destination to be the target's solicited-node group
+  (RFC 4861 7.1.1). Vif adds `ipv6_addr` to its interface and its resource
+  readback; the address is not a demux key and is not metadata.
+- **FIB stays IPv4.** IPv6 next hops use the existing `NextHop` shape, so an
+  IPv6 FIB can be added without changing adjacency or publication. Until
+  then, applications bind IPv6 neighbors directly.
+
+**Bugs found by the tests.** ND checksums are stored network order; the first
+builder wrote the folded host-order value byte-swapped. `AllNodesMac()` left
+three bytes of its Ethernet address uninitialized, so an unsolicited
+advertisement addressed to all-nodes would not match. Both were caught before
+commit by the frame/parse and all-nodes tests.
+
+**Tests.** `core/route/neighbor_resolver_test.cc`: NS mapping and frame
+contents, NA resolving with the interface source MAC, aging and re-solicitation,
+unsolicited/override MAC semantics, retry/failure/recovery, wrong
+interface/target/source, Ethernet destination and unusable MAC rejection,
+malformed IP/ICMP/option/checksum/hop-limit cases including a solicited
+all-nodes advertisement, a DAD solicitation with a unicast destination
+rejected and its multicast answer carrying TLL, timestamp/multicast helpers,
+the unspecified interface-address guard,
+concurrent publish/lookup, and the ND variants of the fault-injection tests.
+`modules_vif_test` adds `LocalNeighborSolicitationResponder` (normal and DAD
+answers, the latter growing the 78-byte frame to the 86-byte answer) and keeps
+the ARP and resource tests unchanged.
+
+**Not done.** IPv6 FIB/routes; Router Advertisement, redirects, duplicate
+address detection as a resolver state, proxy NDP, and source-address scope
+selection (no zone id). A resolver module/graph wiring still has to hand
+received ARP/ND frames to the control-side writer.
+
+**Revisit when:** an IPv6 FIB or a resolver module is added, or an application
+needs scoped link-local addresses on more than one interface.

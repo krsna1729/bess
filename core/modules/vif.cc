@@ -23,6 +23,7 @@ using bess::utils::Arp;
 using bess::utils::be16_t;
 using bess::utils::be32_t;
 using bess::utils::Ethernet;
+using bess::utils::Ipv6Address;
 using bess::utils::Vlan;
 
 uint64_t MacToUint64(const Ethernet::Address &addr) {
@@ -90,7 +91,8 @@ class Vif::InterfacesResource final : public dataplane::Resource {
     } else {
       staged.interfaces_by_id[id] = iface;
     }
-    BuildIndexes(staged.interfaces_by_id, &staged.mac_table, &staged.arp_table);
+    BuildIndexes(staged.interfaces_by_id, &staged.mac_table, &staged.arp_table,
+                 &staged.nd_table);
     Reservation reservation{std::make_unique<PublishOp>(owner_), {}, {}};
     reservation.existed = existed;
     return reservation;
@@ -114,19 +116,23 @@ class Vif::InterfacesResource final : public dataplane::Resource {
 };
 
 void Vif::BuildIndexes(const InterfaceMap &interfaces, MacIndex *mac_table,
-                       ArpIndex *arp_table) {
+                       ArpIndex *arp_table, NdIndex *nd_table) {
   mac_table->clear();
   arp_table->clear();
+  nd_table->clear();
   for (const auto &[id, iface] : interfaces) {
     (*mac_table)[{iface.vlan, MacToUint64(iface.mac_addr)}] = &iface;
     if (iface.ip_addr.value() != 0) {
       (*arp_table)[{iface.vlan, iface.ip_addr.value()}] = &iface;
     }
+    if (!iface.ipv6_addr.IsUnspecified()) {
+      (*nd_table)[{iface.vlan, iface.ipv6_addr}] = &iface;
+    }
   }
 }
 
 void Vif::RebuildTables() {
-  BuildIndexes(interfaces_by_id_, &mac_table_, &arp_table_);
+  BuildIndexes(interfaces_by_id_, &mac_table_, &arp_table_, &nd_table_);
 }
 
 Vif::Staged &Vif::BeginTransaction() {
@@ -146,6 +152,7 @@ void Vif::PublishStaged() noexcept {
     interfaces_by_id_.swap(staged_->interfaces_by_id);
     mac_table_.swap(staged_->mac_table);
     arp_table_.swap(staged_->arp_table);
+    nd_table_.swap(staged_->nd_table);
     published_staged_ = true;
   }
 }
@@ -168,6 +175,15 @@ const Vif::Interface *Vif::LookupByIp(uint16_t vlan,
                                       bess::utils::be32_t ip) const {
   auto it = arp_table_.find({vlan, ip.value()});
   if (it != arp_table_.end()) {
+    return it->second;
+  }
+  return nullptr;
+}
+
+const Vif::Interface *Vif::LookupByIpv6(uint16_t vlan,
+                                        const Ipv6Address &ip) const {
+  auto it = nd_table_.find({vlan, ip});
+  if (it != nd_table_.end()) {
     return it->second;
   }
   return nullptr;
@@ -200,6 +216,7 @@ CommandResponse Vif::Init(const bess::pb::VifArg &arg) {
     add_arg.set_vlan(iface_pb.vlan());
     add_arg.set_mac_addr(iface_pb.mac_addr());
     add_arg.set_ip_addr(iface_pb.ip_addr());
+    add_arg.set_ipv6_addr(iface_pb.ipv6_addr());
     add_arg.set_route_domain(iface_pb.route_domain());
     add_arg.set_gate(iface_pb.gate());
 
@@ -246,6 +263,15 @@ CommandResponse Vif::Init(const bess::pb::VifArg &arg) {
               return std::unexpected("invalid IPv4 address: '" +
                                      value.ip_addr() + "'");
             }
+            if (!value.ipv6_addr().empty()) {
+              const auto parsed =
+                  bess::utils::ParseIpv6Address(value.ipv6_addr());
+              if (!parsed) {
+                return std::unexpected("invalid IPv6 address: '" +
+                                       value.ipv6_addr() + "'");
+              }
+              iface.ipv6_addr = *parsed;
+            }
             return std::any(iface);
           },
           // Read back as a client sends an interface: the MAC in lower case
@@ -262,6 +288,9 @@ CommandResponse Vif::Init(const bess::pb::VifArg &arg) {
               }
               if (iface.ip_addr.value() != 0) {
                 value.set_ip_addr(bess::utils::ToIpv4Address(iface.ip_addr));
+              }
+              if (!iface.ipv6_addr.IsUnspecified()) {
+                value.set_ipv6_addr(bess::utils::ToIpv6Address(iface.ipv6_addr));
               }
               value.set_route_domain(iface.route_domain);
               value.set_gate(iface.gate);
@@ -323,6 +352,15 @@ CommandResponse Vif::Add(const bess::pb::VifCommandAddArg &arg) {
       return CommandFailure(EINVAL, "invalid IPv4 address: '%s'",
                             arg.ip_addr().c_str());
     }
+  }
+
+  if (!arg.ipv6_addr().empty()) {
+    const auto parsed = bess::utils::ParseIpv6Address(arg.ipv6_addr());
+    if (!parsed) {
+      return CommandFailure(EINVAL, "invalid IPv6 address: '%s'",
+                            arg.ipv6_addr().c_str());
+    }
+    iface.ipv6_addr = *parsed;
   }
 
   interfaces_by_id_[iface.id] = iface;
@@ -413,6 +451,51 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
           }
           EmitPacket(ctx, pkt, iface->gate);
           continue;
+        }
+      }
+    }
+
+    // Answer a Neighbor Solicitation for a local IPv6 address. The ARP path
+    // above is unchanged; this is the same local-responder split for ND. The
+    // answer always carries the target link-layer option (RFC 4861 7.2.4),
+    // so it is kNdFrameSize even for a DAD solicitation that had no option:
+    // the packet grows into its tailroom.
+    if (eth->ether_type == be16_t(Ethernet::Type::kIpv6)) {
+      uint8_t *bytes = pkt.head_data<uint8_t *>();
+      const std::span<const uint8_t> frame(bytes, pkt.head_len());
+      const std::optional<bess::route::NdMessage> nd =
+          bess::route::ParseNeighborDiscovery(frame);
+      if (nd && nd->type == bess::route::NdType::kNeighborSolicitation) {
+        const Interface *iface = LookupByIpv6(vlan, nd->target_ip);
+        // The answer is always kNdFrameSize. A linear packet grows into its
+        // tailroom (or shrinks) with both lengths updated; a chained packet's
+        // later segments are not ours to rewrite, so only a first segment of
+        // exactly the answer's size is replaced, leaving every segment length
+        // (and pkt_len) unchanged.
+        const bool linear = pkt.is_linear();
+        if (iface != nullptr &&
+            (linear || pkt.head_len() == bess::route::kNdFrameSize)) {
+          const size_t capacity =
+              pkt.head_len() + (linear ? pkt.tailroom() : 0);
+          const std::span<uint8_t> out(bytes, capacity);
+          const size_t answered = bess::route::AnswerNeighborSolicitation(
+              frame, iface->mac_addr, iface->ipv6_addr, out);
+          if (answered != 0) {
+            if (write_vif) {
+              _set_attr_with_offset<be32_t>(vif_offset, pkt,
+                                            be32_t(iface->id));
+            }
+            if (write_domain) {
+              _set_attr_with_offset<be32_t>(domain_offset, pkt,
+                                            be32_t(iface->route_domain));
+            }
+            if (linear) {
+              pkt.set_data_len(static_cast<uint16_t>(answered));
+              pkt.set_total_len(static_cast<uint32_t>(answered));
+            }
+            EmitPacket(ctx, pkt, iface->gate);
+            continue;
+          }
         }
       }
     }

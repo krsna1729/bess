@@ -10,6 +10,14 @@ using bess::utils::be32_t;
 namespace {
 
 using bess::utils::Ipv4Prefix;
+using bess::utils::Ipv6Address;
+using bess::utils::ParseIpv6Address;
+using bess::utils::ToIpv6Address;
+
+Ipv6Address Required(std::optional<Ipv6Address> address) {
+  EXPECT_TRUE(address.has_value());
+  return address.value_or(Ipv6Address{});
+}
 
 TEST(IPTest, AddressInStr) {
   be32_t a(192 << 24 | 168 << 16 | 100 << 8 | 199);
@@ -111,6 +119,51 @@ TEST(IPTest, PrefixCalc) {
     Ipv4Prefix p("0.0.0.0/" + std::to_string(i));
     EXPECT_EQ(i, p.prefix_length());
   }
+}
+
+TEST(IPTest, Ipv6ParseAndFormat) {
+  struct Case {
+    const char *text;
+    const char *canonical;
+    uint8_t first;
+    uint8_t last;
+  };
+  const Case cases[] = {
+      {"::", "::", 0, 0},
+      {"::1", "::1", 0, 1},
+      {"fe80::1", "fe80::1", 0xfe, 1},
+      {"2001:db8::1234:5678", "2001:db8::1234:5678", 0x20, 0x78},
+      {"2001:0DB8:0000:0000:0000:0000:0000:0001", "2001:db8::1", 0x20, 1},
+      {"0:0:0:0:0:0:0:0", "::", 0, 0},
+      {"1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7:8", 0, 8},
+      {"1:2:3:4:5:6:7::", "1:2:3:4:5:6:7:0", 0, 0},
+      {"::2:3:4:5:6:7:8", "0:2:3:4:5:6:7:8", 0, 8},
+  };
+  for (const Case &c : cases) {
+    const Ipv6Address parsed = Required(ParseIpv6Address(c.text));
+    EXPECT_EQ(c.first, parsed.bytes[0]) << c.text;
+    EXPECT_EQ(c.last, parsed.bytes[15]) << c.text;
+    EXPECT_EQ(c.canonical, ToIpv6Address(parsed)) << c.text;
+  }
+
+  EXPECT_TRUE(Required(ParseIpv6Address("::1")).IsLoopback());
+  EXPECT_TRUE(Required(ParseIpv6Address("fe80::1")).IsLinkLocal());
+  EXPECT_TRUE(Required(ParseIpv6Address("ff02::1")).IsMulticast());
+  EXPECT_TRUE(Required(ParseIpv6Address("::")).IsUnspecified());
+  EXPECT_FALSE(Required(ParseIpv6Address("2001:db8::1")).IsLinkLocal());
+
+  for (const char *bad :
+       {"", ":", ":::", "1::2::3", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9",
+        "1:2:3:4:5:6:7:8::", "::1:2:3:4:5:6:7:8", "12345::",
+        "1::2:3:4:5:6:7:8", "fe80::1%eth0", "::ffff:192.0.2.1", " fe80::1",
+        "fe80::1 ", "fe80:::1", "fe80::1:"}) {
+    EXPECT_FALSE(ParseIpv6Address(bad).has_value()) << bad;
+  }
+
+  // Every canonical form round trips.
+  const Ipv6Address address =
+      Required(ParseIpv6Address("2001:db8:0:1:2:3:4:5"));
+  EXPECT_EQ(address, Required(ParseIpv6Address(ToIpv6Address(address))));
 }
 
 }  // namespace (unnamed)

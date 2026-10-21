@@ -1473,6 +1473,7 @@ message VifArg {
     string ip_addr = 4;        /// Local IPv4 address for ARP responder (optional)
     uint32 route_domain = 5;   /// Associated L3 VRF Route Domain ID
     uint32 gate = 6;           /// Egress/demux output gate
+    string ipv6_addr = 7;      /// Local IPv6 address for ND responder (optional)
   }
   repeated Interface interfaces = 1;
   uint32 default_gate = 2;     /// Gate for unclassified traffic (default: DROP_GATE)
@@ -1487,6 +1488,7 @@ message VifCommandAddArg {
   string ip_addr = 4;
   uint32 route_domain = 5;
   uint32 gate = 6;
+  string ipv6_addr = 7;
 }
 
 /// The key of a Vif's "<module>/interfaces" resource (D-129): the logical VIF
@@ -1505,6 +1507,7 @@ message VifInterfaceValue {
   string ip_addr = 3;        /// Local IPv4 address for ARP responder (optional)
   uint32 route_domain = 4;   /// Associated L3 VRF Route Domain ID
   uint32 gate = 5;           /// Egress/demux output gate
+  string ipv6_addr = 6;      /// Local IPv6 address for ND responder (optional)
 }
 
 /**
