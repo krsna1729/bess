@@ -814,20 +814,33 @@ laptop, so record the platform power profile too.
 
 #### Corrected EM/WM placement comparison
 
-The final implementation uses inline `RecordArena` accessors. This corrected
-`M.place/*` sweep covers N=1,024 and 65,536, uniform widths M=1..8,
-`mixed8` / `mixed16`, and all configured second-table ratios. All 256 placement
-cases passed the path validator. Values below are median `cycles/packet /
-ns/packet` after subtracting `M.base` per run.
+The final implementation uses inline `RecordArena` accessors. The matrix
+varies:
 
-| classifier | direct inline | two-stage (R=100%) | direct cost reduction |
-|---|---:|---:|---:|
-| EM | 56.27 / 21.71 | 133.52 / 51.42 | 57.8% |
-| WM | 84.89 / 32.71 | 167.25 / 64.44 | 49.2% |
+- Rule-table size N: 1,024 or 65,536.
+- Uniform result size M: 1–8 four-byte fields (4–32 bytes).
+- Heterogeneous value mix: `mixed8` uses 4+2+1+1-byte fields; `mixed16`
+  uses 8+4+2+1+1-byte fields.
+- Second-table ratio R: 100%, 50%, 30%, 20%, 10%, or 5%; mixed layouts use
+  100%, 50%, and 20%.
 
-R=100% gives one second-table entry per action and compares the same 20
-geometries. Across all configured ratios, median two-stage cost was 125.93
-cycles / 48.53 ns for EM→EM and 157.43 cycles / 60.69 ns for WM→EM.
+Both direct EM/WM and two-stage EM→EM / WM→EM are measured. Packet size is
+fixed at 64 bytes and the lookup key at four bytes; there is no packet-size or
+key-width sweep. All 256 placement cases passed the path validator. Values
+below are median `cycles/packet / ns/packet` after subtracting `M.base` per run.
+
+| R | cases | EM inline | EM→EM | WM inline | WM→EM |
+|---:|---:|---:|---:|---:|---:|
+| 100% | 20 | 56.27 / 21.71 | 133.52 / 51.42 | 84.89 / 32.71 | 167.25 / 64.44 |
+| 50% | 20 | 56.27 / 21.71 | 130.06 / 50.10 | 84.89 / 32.71 | 165.56 / 63.80 |
+| 30% | 16 | 56.27 / 21.71 | 124.22 / 47.89 | 84.89 / 32.71 | 156.06 / 60.14 |
+| 20% | 20 | 56.27 / 21.71 | 127.06 / 48.96 | 84.89 / 32.71 | 158.34 / 61.02 |
+| 10% | 16 | 56.27 / 21.71 | 121.28 / 46.76 | 84.89 / 32.71 | 152.02 / 58.58 |
+| 5% | 16 | 56.27 / 21.71 | 119.91 / 46.22 | 84.89 / 32.71 | 151.23 / 58.28 |
+
+Direct inline is 53.1–57.9% lower-cost than EM→EM and 43.9–49.2% lower-cost
+than WM→EM across the measured ratios. No two-stage case beat direct placement:
+0/216 matched classifier/ratio/geometry cases, in either measured round.
 
 These are the first valid placement comparisons. The earlier claimed
 `up to 27 cycles/packet` reduction and crossover figures are withdrawn:
@@ -843,3 +856,16 @@ A 10-round, 3 s/round repeat at M=4, N=65,536 in the final build:
 | WM | 101.65 / 39.17 | 215.77 / 83.14 |
 
 Raw repeat: `.scratch/recordarena-evidence/repeat10-m4-n65536.json`.
+
+#### Engineering guidance
+
+Prefer direct result placement when each classifier rule already determines
+the final result metadata. It costs 53.1–57.9% less for EM and 43.9–49.2% less
+for WM across the tested ratios than EM→EM / WM→EM. Keep a second stage when
+shared action indirection is a real control-plane requirement; this benchmark
+does not measure the memory or update-cost tradeoff.
+
+“Inline” here means one classifier lookup produces the final result; it does
+not mean arbitrary-width data is embedded in an `rte_hash` scalar. The current
+implementation uses RecordArena for arbitrary-width records. This benchmark
+compares lookup topologies, not `rte_hash` value APIs.
