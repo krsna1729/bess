@@ -11865,7 +11865,12 @@ or interface identity. Neighbor state had no timers.
   (`docs/expiry.md`); zero disables aging or retry. The wheel's capacity is the
   neighbor capacity, one armed timer per entry, and each payload carries the
   entry's arming serial so a record that outlives its entry cannot act on a
-  newer one. No second timer wheel.
+  newer one. No second timer wheel. A live timer is re-armed in place (same
+  node, new payload), so a reply stream spends no capacity; a `Schedule`
+  refusal -- possible when wheel nodes are quarantined -- is never ignored: a
+  reply is dropped with the entry unchanged, `Bind` rolls back, and an entry a
+  `Poll`/`ConfigureInterface` transition cannot arm is removed rather than
+  left without a timer.
 - **Interface/address identity.** `ConfigureInterface` assigns each interface a
   generation. A reply is acted on only if the frame arrived on the entry's
   interface, the entry's generation is current, the Ethernet destination is

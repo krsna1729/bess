@@ -234,6 +234,28 @@ class ExpiryWheel {
     return true;
   }
 
+  // Moves the timer to `deadline` and replaces its payload, reusing the node:
+  // no free node is needed and the node's generation does not advance, so a
+  // holder can re-arm a live timer indefinitely without spending capacity.
+  // False -- and nothing happens -- if the handle is stale or the timer is the
+  // one being delivered by the running Poll.
+  bool Reschedule(ExpiryHandle handle, Tick deadline,
+                  const Payload &payload) noexcept {
+    Node *node = Resolve(handle);
+    if (node == nullptr || Delivering(handle.id.value())) {
+      return false;
+    }
+    const bool later = Diff(deadline, node->deadline) >= 0;
+    node->deadline = deadline;
+    node->payload = payload;
+    if (!later) {
+      const uint32_t index = handle.id.value();
+      Unlink(index);
+      Place(index);
+    }
+    return true;
+  }
+
   // Disarms the timer. False if the handle is stale (it already fired, was
   // cancelled, or never existed). Safe from inside a Poll callback.
   bool Cancel(ExpiryHandle handle) noexcept {

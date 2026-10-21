@@ -69,7 +69,13 @@ namespace bess::route {
 // (`dataplane/expiry_wheel.h`) instead of keeping a second timer wheel. Each
 // neighbor has at most one armed timer, its capacity is the configured
 // neighbor capacity, and a payload carries the entry's arming serial so a
-// record that outlives its entry cannot act on a newer one. The resolver is
+// record that outlives its entry cannot act on a newer one. A live timer is
+// re-armed in place (same node), so replies spend no wheel capacity; a new
+// node is needed only for an entry without one, and if the wheel refuses it
+// (quarantined nodes lower the usable capacity) the caller never keeps an
+// untimed neighbor: a reply is dropped, Bind rolls back, and a Poll or
+// ConfigureInterface transition that cannot arm removes the entry. The
+// resolver is
 // single-threaded: its writer (a module's control side, the maintenance
 // thread, or an application's own thread) calls Bind, ConfigureInterface,
 // OnArp and Poll; packets read only the published NextHop objects, which are
@@ -218,11 +224,17 @@ class NeighborResolver {
       AppendUpdates(std::move(update.updates), out);
       auto entry = entries_.find(update.key);
       if (entry != entries_.end()) {
-        Disarm(entry->second);
         entry->second.epoch = epoch;
         entry->second.state = NeighborState::kIncomplete;
         entry->second.probes = 0;
-        Arm(update.key, entry->second, now, timing_.first_probe);
+        if (!Arm(update.key, entry->second, now, timing_.first_probe)) {
+          // No usable timer node: forget the entry rather than keep a
+          // neighbor that can never solicit. The committed update already
+          // leaves the hop incomplete, which is what resolution being
+          // unavailable looks like to the dataplane.
+          Disarm(entry->second);
+          entries_.erase(entry);
+        }
       }
     }
     return out;
@@ -430,21 +442,26 @@ class NeighborResolver {
         arp->sender_mac == iface->second.mac) {
       return out;
     }
-    // All fallible work first: the update vector's space, then the table's
-    // own update. Only then is the timer cancelled and the resolver state
-    // changed, so a refused allocation leaves the entry and its timer as
-    // they were.
-    out.updates.reserve(neighbors_.BindingCount(key));
-    NeighborTable::Updates updates =
-        neighbors_.Update(key, NeighborState::kResolved, arp->sender_mac);
-    Disarm(entry->second);
+    // Stage every fallible allocation first: the table update and the output
+    // space. The resolved state is then committed only with its aging timer in
+    // place: a live timer is rescheduled in place, and a refused arming (the
+    // wheel has no usable node left) leaves the entry, its timer and the table
+    // as they were and the reply is ignored. A lifetime of zero means "do not
+    // age".
+    NeighborTable::Prepared prepared =
+        neighbors_.Prepare(key, NeighborState::kResolved, arp->sender_mac);
+    out.updates.reserve(prepared.updates.size());
+    if (timing_.reachable_lifetime != 0) {
+      if (!Arm(key, entry->second, now, timing_.reachable_lifetime)) {
+        return out;
+      }
+    } else {
+      Disarm(entry->second);
+    }
+    neighbors_.Commit(prepared);
     entry->second.state = NeighborState::kResolved;
     entry->second.probes = 0;
-    AppendUpdates(std::move(updates), out);
-    // A lifetime of zero means "do not age".
-    if (timing_.reachable_lifetime != 0) {
-      Arm(key, entry->second, now, timing_.reachable_lifetime);
-    }
+    AppendUpdates(std::move(prepared.updates), out);
     return out;
   }
 
@@ -533,7 +550,14 @@ class NeighborResolver {
         }
       }
       if (plan.arm) {
-        ArmAt(plan.key, entry->second, plan.deadline);
+        if (!ArmAt(plan.key, entry->second, plan.deadline)) {
+          // The wheel refused a new node for a timer the entry needs: forget
+          // the entry rather than keep a neighbor that nothing will age,
+          // retry or recover. The committed plan state (incomplete or
+          // unreachable) already took the MAC out of service.
+          Disarm(entry->second);
+          entries_.erase(entry);
+        }
       }
     }
     return out;
@@ -618,15 +642,24 @@ class NeighborResolver {
                                               : timing_.max_probe_interval;
   }
 
-  // Arms the entry's one timer at an absolute deadline.
+  // Arms the entry's one timer at an absolute deadline. A live timer is
+  // rescheduled in place (same node, new deadline and payload): re-arming on a
+  // reply therefore spends no wheel capacity and the node's generation never
+  // advances, so a steady reply stream cannot exhaust the wheel. A new node is
+  // needed only when the entry has no live timer, and then a refusal is
+  // returned to the caller.
   bool ArmAt(const Key &key, Entry &entry, uint64_t deadline) {
+    entry.serial++;
+    const TimerPayload payload{key, entry.serial, deadline};
+    if (entry.timer != dataplane::kNoExpiry &&
+        wheel_->Reschedule(entry.timer, deadline, payload)) {
+      return true;
+    }
     if (entry.timer != dataplane::kNoExpiry) {
       wheel_->Cancel(entry.timer);
       entry.timer = dataplane::kNoExpiry;
     }
-    entry.serial++;
-    const dataplane::ExpiryHandle handle =
-        wheel_->Schedule(deadline, TimerPayload{key, entry.serial, deadline});
+    const dataplane::ExpiryHandle handle = wheel_->Schedule(deadline, payload);
     if (handle == dataplane::kNoExpiry) {
       entry.serial--;
       return false;
@@ -703,7 +736,13 @@ class NeighborResolver {
         continue;
       }
       entry->second.timer = dataplane::kNoExpiry;
-      ArmAt(payload.key, entry->second, payload.deadline);
+      if (!ArmAt(payload.key, entry->second, payload.deadline)) {
+        // Recovery cannot restore this timer; the entry would otherwise stay
+        // without one forever, so it leaves the resolver with the table's
+        // last committed state.
+        Disarm(entry->second);
+        entries_.erase(entry);
+      }
     }
   }
 

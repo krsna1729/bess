@@ -95,7 +95,17 @@ the probe count, the reachable lifetime and the unreachable retry. Zero
 disables aging or retry respectively. The resolver uses one `ExpiryWheel` of
 neighbor capacity -- not a second timer wheel -- with one armed timer per entry
 and an arming serial in each payload so a record that outlives its entry
-cannot touch a newer one.
+cannot touch a newer one. Re-arming a live timer (a reply refreshing the
+lifetime, an identity change) reschedules it in place: the same node, a new
+deadline and payload, no capacity spent and no generation advance, so a steady
+reply stream cannot exhaust the wheel. A new node is needed only when an entry
+has no live timer; the wheel's usable capacity falls when a node's generation
+is exhausted (quarantined), so `Schedule` can still refuse. A refusal is
+handled, never ignored: `OnArp` leaves the entry, its timer and the table
+untouched and ignores the reply, `Bind` rolls back, and an entry whose `Poll`
+or `ConfigureInterface` transition cannot be armed is dropped rather than kept
+without a timer (its committed state is incomplete/unreachable, so the hop
+does not forward).
 
 ## Publication and the packet path
 
@@ -126,9 +136,11 @@ due wheel records, plans every transition (including its next-hop update
 vector) and reserves the output before committing anything, and if a plan's
 allocation is refused it re-arms every due entry at the deadline its record
 carried before rethrowing (the wheel had already spent those nodes). `OnArp`
-stages its update and output space before cancelling the reply's timer. A
-refused call therefore leaves the neighbor table, the published adjacency and
-the timers exactly as they were, and the same call retried converges.
+stages its update and output space and commits the resolved state only once
+its aging timer is in place, so a timer refusal leaves the entry and its timer
+as they were. A refused call therefore leaves the neighbor table, the
+published adjacency and the timers exactly as they were, and the same call
+retried converges.
 `NeighborResolverFaultTest` fails every allocation point of Poll, Configure and
 Remove in turn and checks that invariant.
 
