@@ -205,6 +205,15 @@ class RouterTest : public ::testing::Test {
     EXPECT_EQ("", h_.UpsertResource("rt/next_hops", key, value));
   }
 
+  // A local next hop (D-178): delivery to this node, no egress, no addresses.
+  void MakeLocalHop(Router *rt, uint32_t id) {
+    bess::pb::RouterNextHopIdKey key;
+    key.set_id(id);
+    bess::pb::RouterNextHopValue value;
+    value.set_kind(bess::pb::ROUTER_NEXT_HOP_KIND_LOCAL);
+    EXPECT_EQ("", h_.UpsertResource("rt/next_hops", key, value));
+  }
+
   // One route in one domain, naming `hop`.
   void MakeRoute(Router *rt, const char *prefix, uint32_t length, uint32_t domain, uint32_t hop) {
     bess::pb::RouterRouteKey key;
@@ -670,12 +679,13 @@ TEST_F(RouterTest, ARouteToAHopThatForwardsNowhereIsABlackhole) {
   EXPECT_NE(std::string::npos, rt->GetDesc().find("blackholed: 1")) << rt->GetDesc();
 }
 
-// The same blackhole hop, with a neighbor state nothing ever resolved: a local
-// /32, or a hop a controller wrote before any resolution. The route still ends
-// the frame -- the neighbor state of a hop that forwards nowhere decides
-// nothing (router.h) -- so it must not be counted as an unresolved neighbor,
-// and with a punt gate armed (D-162) it must not take it either: a route meant
-// to end the packet must not hand it to a slow path.
+// The same blackhole hop, with a neighbor state nothing ever resolved: a hop a
+// controller wrote before any resolution. The route still ends the frame -- the
+// neighbor state of a hop that forwards nowhere decides nothing (router.h) --
+// so it must not be counted as an unresolved neighbor, and with a punt gate
+// armed (D-162) it must not take it either: a route meant to end the packet
+// must not hand it to a slow path. A local /32 is a different hop kind now
+// (D-178); this is the intentional-drop shape.
 TEST_F(RouterTest, ABlackholeHopIsNotAnUnresolvedNeighbor) {
   Router *rt = MakePuntingRouter(/*miss_gate=*/2, /*unresolved_gate=*/3);
   ASSERT_NE(nullptr, rt);
@@ -744,6 +754,92 @@ TEST_F(RouterTest, AMissAndAnUnresolvedNeighborPuntToTheirGates) {
   ASSERT_EQ(1u, routed[1].size()) << "the hop's own egress gate";
   EXPECT_TRUE(routed[2].empty());
   EXPECT_TRUE(routed[3].empty());
+}
+
+// D-178: a local route is delivery, not forwarding. The node's own address
+// leaves on the local gate, the frame is untouched (no TTL decrement, no L2
+// rewrite), and the counter is its own outcome -- not a miss, an unresolved
+// neighbor or a blackhole. Another host on the same subnet is still the
+// connected route, and a destination outside it is still a miss.
+TEST_F(RouterTest, ALocalAddressIsDeliveredToItsOwnGate) {
+  bess::pb::RouterArg arg;
+  arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
+  arg.set_punt_miss_gate(2);
+  arg.set_punt_unresolved_gate(3);
+  arg.set_punt_local_gate(4);
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, nullptr, nullptr, bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);
+  MakeLocalHop(rt, 2);
+  MakeRoute(rt, "192.0.2.0", 24, 0, 1);
+  MakeRoute(rt, "192.0.2.7", 32, 0, 2);
+
+  const std::vector<gate_idx_t> ogates = {0, 1, 2, 3, 4};
+  auto local = RunToDestination(rt, FrameTo("192.0.2.7"), 0, ogates);
+  ASSERT_EQ(1u, local[4].size()) << "the local gate";
+  EXPECT_TRUE(local[1].empty()) << "not forwarded";
+  EXPECT_TRUE(local[2].empty());
+  EXPECT_TRUE(local[3].empty());
+  EXPECT_EQ(1u, rt->local_frames());
+  EXPECT_EQ(0u, rt->no_route_frames());
+  EXPECT_EQ(0u, rt->unresolved_frames());
+  EXPECT_EQ(0u, rt->blackholed_frames());
+  EXPECT_EQ(FrameTo("192.0.2.7"), local[4][0])
+      << "delivery writes nothing: no TTL, no addresses";
+
+  // The connected route still decides another host on the subnet.
+  auto host = RunToDestination(rt, FrameTo("192.0.2.8"), 0, ogates);
+  EXPECT_TRUE(host[4].empty());
+  ASSERT_EQ(1u, host[3].size()) << "the unresolved punt gate";
+  EXPECT_EQ(1u, rt->unresolved_frames());
+
+  auto miss = RunToDestination(rt, FrameTo("203.0.113.1"), 0, ogates);
+  ASSERT_EQ(1u, miss[2].size()) << "the miss punt gate";
+  EXPECT_TRUE(miss[4].empty());
+  EXPECT_EQ(1u, rt->no_route_frames());
+
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("local: 1")) << rt->GetDesc();
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("a local address punts to gate 4"))
+      << rt->GetDesc();
+}
+
+// The id mode has no punt gates (D-162): a next-hop id naming a local hop is
+// not forwarded, and it is counted as local rather than as a miss.
+TEST_F(RouterTest, ALocalHopInTheIdModeIsNotForwarded) {
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", bess::pb::RouterArg(), "rt"));
+  ASSERT_NE(nullptr, rt);
+  MakeLocalHop(rt, 1);
+
+  auto out = Run(rt, FrameTo("192.0.2.7"), {0, 1});
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_TRUE(out[1].empty()) << "a local hop is never forwarded";
+  EXPECT_EQ(1u, rt->local_frames());
+}
+
+// A local hop's canonical form is kind LOCAL alone; it is refused when it
+// also names an egress gate or an adjacency (D-129, D-178).
+TEST_F(RouterTest, ALocalHopIsCanonicalAndRejectsAnEgressOrAddresses) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeLocalHop(rt, 7);
+  bess::pb::RouterNextHopIdKey key;
+  key.set_id(7);
+  bess::pb::RouterNextHopValue canonical;
+  canonical.set_kind(bess::pb::ROUTER_NEXT_HOP_KIND_LOCAL);
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&key, &canonical}}));
+
+  bess::pb::RouterNextHopIdKey other_key;
+  other_key.set_id(8);
+  bess::pb::RouterNextHopValue with_gate;
+  with_gate.set_kind(bess::pb::ROUTER_NEXT_HOP_KIND_LOCAL);
+  with_gate.set_egress_gate(1);
+  EXPECT_NE("", h_.UpsertResource("rt/next_hops", other_key, with_gate));
+
+  bess::pb::RouterNextHopValue with_mac;
+  with_mac.set_kind(bess::pb::ROUTER_NEXT_HOP_KIND_LOCAL);
+  const std::array<uint8_t, 6> mac = Mac("02:00:00:00:00:aa");
+  with_mac.set_dst_mac(reinterpret_cast<const char *>(mac.data()), mac.size());
+  EXPECT_NE("", h_.UpsertResource("rt/next_hops", other_key, with_mac));
 }
 
 // A punt gate that is not a gate this graph can have is refused at Init, like

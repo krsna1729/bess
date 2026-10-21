@@ -39,6 +39,7 @@ stats_sources = files(
 route_sources = files(
   'route/route_table.cc',
   'route/router.cc',
+  'route/connected_routes.cc',
 )
 packet_sources = files(
   'packet.cc',
@@ -666,6 +667,7 @@ core_public_subdir_headers = {
     'route/neighbor_resolver.h',
     'route/forward.h',
     'route/connected_route.h',
+    'route/connected_routes.h',
   ),
   'rcu': files(
     'rcu/rcu_domain.h',
@@ -757,6 +759,7 @@ unit_test_sources = [
   'route/l3_test.cc',
   'route/neighbor_resolver_test.cc',
   'route/forward_test.cc',
+  'route/connected_routes_test.cc',
   'rcu/rcu_test.cc',
   'rcu/rcu_ptr_test.cc',
   'rcu/rcu_worker_test.cc',

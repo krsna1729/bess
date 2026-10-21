@@ -119,8 +119,9 @@ class Router final : public Module {
   // What destination routing dropped, by reason (relaxed, as above): a frame
   // that is not IP, one whose headers do not parse, one that is not the first
   // fragment of its datagram, one the FIB has no route for, one whose hop's
-  // neighbor is not resolved, one whose TTL ran out, and one whose hop forwards
-  // nowhere (a blackhole route, D-160).
+  // neighbor is not resolved, one whose TTL ran out, one whose hop forwards
+  // nowhere (a blackhole route, D-160), and one the route says is this node's
+  // own address (local delivery, D-178).
   uint64_t not_ipv4_frames() const noexcept {
     return not_ipv4_frames_.load(std::memory_order_relaxed);
   }
@@ -141,6 +142,11 @@ class Router final : public Module {
   }
   uint64_t blackholed_frames() const noexcept {
     return blackholed_frames_.load(std::memory_order_relaxed);
+  }
+  // Frames a local route addressed to this node (D-178). Counted in both modes;
+  // where they went is punt_local_gate, DROP_GATE meaning no local path.
+  uint64_t local_frames() const noexcept {
+    return local_frames_.load(std::memory_order_relaxed);
   }
 
  private:
@@ -180,6 +186,10 @@ class Router final : public Module {
   // gate, and DROP_GATE means drop. Either way the frame is counted.
   gate_idx_t punt_miss_gate_ = DROP_GATE;
   gate_idx_t punt_unresolved_gate_ = DROP_GATE;
+  // Where a frame to this node's own address goes (D-178): no kernel path
+  // exists in a dataplane graph, so the graph names the slow path (a stack
+  // adapter, a control endpoint) or drops. Either way it is counted.
+  gate_idx_t punt_local_gate_ = DROP_GATE;
   // Which fields a group route hashes to pick its member (D-163). The proto
   // default is the whole flow, so this only differs when a graph says so.
   bess::route::FlowHashFields flow_fields_ = bess::route::FlowHashFields::kL3L4;
@@ -193,6 +203,9 @@ class Router final : public Module {
   // A route sent the frame to a hop that names no egress interface: the
   // blackhole shape (D-160), counted apart from a miss.
   std::atomic<uint64_t> blackholed_frames_{0};
+  // A route said the destination is this node's address (D-178): delivery, not
+  // a drop and not a miss.
+  std::atomic<uint64_t> local_frames_{0};
 };
 
 #endif  // BESS_MODULES_ROUTER_H_

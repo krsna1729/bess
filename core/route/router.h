@@ -46,18 +46,29 @@ enum class NeighborState : uint8_t {
   kUnreachable,  // resolution failed
 };
 
+// What a route's hop does with a packet that reaches it (D-178).
+enum class NextHopKind : uint8_t {
+  kForward,  // forward out `egress`, subject to `neighbor`
+  kLocal,    // deliver to this node: no egress, no neighbor, no L2 rewrite
+};
+
 // Where a route leads (K7): the egress interface, the neighbor state, and the
 // L2 addresses to write when the neighbor is resolved. What to do with packets
 // toward an unresolved neighbor (queue, punt, drop) is the application's.
 //
-// A hop with no egress interface (`kInvalidInterfaceId`) forwards nowhere: the
-// chain reports `kNoEgress` for a frame that reaches it, and the caller counts
-// that as its own outcome. It is the shape of a blackhole route -- a default
-// route that drops, a prefix this node refuses to forward (D-160,
-// `BlackholeNextHop()`) -- and of a local /32, the node's own address, which is
-// not forwarded either. Such a hop names no addresses and its neighbor state is
-// irrelevant: a route to it is meant to end the packet, not to resolve
-// anything.
+// `kind` says whether the hop forwards or delivers locally. A local hop
+// (`LocalNextHop()`) is the node's own address: the chain reports
+// `kLocalDelivery` for a frame that reaches it and the caller decides where a
+// local packet goes (a punt/local gate, a stack, a socket -- BESS has no
+// kernel path here). A local hop names no egress and no addresses, and its
+// neighbor state is irrelevant.
+//
+// A forwarding hop with no egress interface (`kInvalidInterfaceId`) forwards
+// nowhere: the chain reports `kNoEgress` for a frame that reaches it, and the
+// caller counts that as its own outcome. It is the shape of a blackhole route
+// -- a default route that drops, a prefix this node refuses to forward (D-160,
+// `BlackholeNextHop()`). Such a hop names no addresses and its neighbor state
+// is irrelevant: a route to it is meant to end the packet.
 //
 // `egress` is a logical interface (`dataplane::InterfaceId`, zero = none), not
 // a graph gate: the owner maps it to a gate, a port and queue, or a hardware
@@ -65,6 +76,9 @@ enum class NeighborState : uint8_t {
 struct NextHop {
   dataplane::InterfaceId egress = dataplane::kInvalidInterfaceId;
   NeighborState neighbor = NeighborState::kIncomplete;
+  // Uses the byte the interface/neighbor pair left as padding: the hop stays
+  // 16 bytes (D-060).
+  NextHopKind kind = NextHopKind::kForward;
   utils::Ethernet::Address dst_mac{};
   utils::Ethernet::Address src_mac{};
 };
@@ -76,13 +90,24 @@ static_assert(sizeof(NextHop) == 16, "a next hop is 16 bytes");
 
 // A next hop that forwards nowhere: no egress interface (D-160). A route to it
 // blackholes a prefix -- `0.0.0.0/0` to this is the domain's default that
-// drops, and it is the shape a local /32 uses for the node's own address. What
-// the chain reports for it (`kNoEgress`) is a caller's outcome to count, and it
-// is not a miss: the route exists.
+// drops. What the chain reports for it (`kNoEgress`) is a caller's outcome to
+// count, and it is not a miss: the route exists.
 inline NextHop BlackholeNextHop() noexcept {
   NextHop hop;
   hop.egress = dataplane::kInvalidInterfaceId;
   hop.neighbor = NeighborState::kResolved;
+  return hop;
+}
+
+// A next hop that delivers to this node (D-178): the route is a local one, the
+// node's own address, and the chain reports `kLocalDelivery` rather than
+// forwarding. There is no egress, no neighbor to resolve and no address to
+// write; where the packet then goes is the caller's policy (a local/punt gate).
+inline NextHop LocalNextHop() noexcept {
+  NextHop hop;
+  hop.egress = dataplane::kInvalidInterfaceId;
+  hop.neighbor = NeighborState::kResolved;
+  hop.kind = NextHopKind::kLocal;
   return hop;
 }
 

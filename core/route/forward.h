@@ -34,6 +34,7 @@ namespace bess::route {
 // Why a forwarding attempt did or did not put the frame on a wire.
 enum class ForwardVerdict : uint8_t {
   kForward,             // TTL decremented, the hop's addresses written
+  kLocalDelivery,       // the destination is this node's own address (D-178)
   kNotIpv4,             // a valid frame that is not an IPv4 packet
   kMalformed,           // a header does not fit or its lengths are inconsistent
   kNonInitialFragment,  // no L4 header: a group route would hash by something
@@ -94,6 +95,11 @@ inline FrameRoute ResolveFrame(const Router &router, RouteDomainId domain,
       FlowHash(src_word, dst_word, p.src_port, p.dst_port, p.protocol, fields));
   if (hop == nullptr) {
     return {.verdict = ForwardVerdict::kNoRoute};
+  }
+  // A local route is delivery, not forwarding (D-178): it has no egress and no
+  // neighbor, so it is settled before either is consulted.
+  if (hop->kind == NextHopKind::kLocal) {
+    return {.verdict = ForwardVerdict::kLocalDelivery};
   }
   // The egress first: a hop that forwards nowhere is the blackhole shape
   // (D-160) whatever its neighbor state says, and router.h promises that state
@@ -215,6 +221,11 @@ inline void ResolveFrames(const Router &router, RouteDomainId domain,
     const NextHop *hop = (mask & (uint64_t{1} << b)) != 0 ? hops[b] : nullptr;
     if (hop == nullptr) {
       out[i].verdict = ForwardVerdict::kNoRoute;
+      continue;
+    }
+    // Delivery, not forwarding (D-178), before either leg of the hop is read.
+    if (hop->kind == NextHopKind::kLocal) {
+      out[i].verdict = ForwardVerdict::kLocalDelivery;
       continue;
     }
     // The egress first, as ResolveFrame has it: a hop that forwards nowhere is

@@ -56,6 +56,22 @@ std::expected<route::NeighborState, std::string> NeighborFromPb(
   }
 }
 
+// The RPC's hop kind (D-178). Unset means forward, so every value written
+// before local delivery existed keeps its meaning.
+std::expected<route::NextHopKind, std::string> KindFromPb(
+    bess::pb::RouterNextHopKind kind) {
+  switch (kind) {
+    case bess::pb::ROUTER_NEXT_HOP_KIND_UNSPECIFIED:
+    case bess::pb::ROUTER_NEXT_HOP_KIND_FORWARD:
+      return route::NextHopKind::kForward;
+    case bess::pb::ROUTER_NEXT_HOP_KIND_LOCAL:
+      return route::NextHopKind::kLocal;
+    default:
+      return std::unexpected("invalid next hop kind " +
+                             std::to_string(static_cast<int>(kind)));
+  }
+}
+
 // A 6-byte MAC, or the zero address when the field is absent.
 std::expected<bess::utils::Ethernet::Address, std::string> MacFromPb(
     const std::string &bytes, const char *what) {
@@ -79,6 +95,13 @@ std::expected<bess::utils::Ethernet::Address, std::string> MacFromPb(
 // reads back in this form.
 bess::pb::RouterNextHopValue NextHopToPb(const route::NextHop &hop) {
   bess::pb::RouterNextHopValue value;
+  // A local hop is canonical as kind LOCAL alone: no egress, no neighbor, no
+  // MACs, so the desired state that form describes applies as a no-op (D-129,
+  // D-178). A forwarding hop omits the kind, which reads back as the default.
+  if (hop.kind == route::NextHopKind::kLocal) {
+    value.set_kind(bess::pb::ROUTER_NEXT_HOP_KIND_LOCAL);
+    return value;
+  }
   value.set_egress_gate(bess::modules::router::GateOf(hop.egress));
   switch (hop.neighbor) {
     case route::NeighborState::kResolved:
@@ -123,10 +146,12 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // spelling, and both mean drop and count. Any other value must be a gate
   // this graph can have; gate 0 itself is a real gate and is not a target.
   if (!bess::IsValidGateValue(arg.punt_miss_gate()) ||
-      !bess::IsValidGateValue(arg.punt_unresolved_gate())) {
-    return CommandFailure(EINVAL, "invalid punt gate %llu/%llu",
+      !bess::IsValidGateValue(arg.punt_unresolved_gate()) ||
+      !bess::IsValidGateValue(arg.punt_local_gate())) {
+    return CommandFailure(EINVAL, "invalid punt gate %llu/%llu/%llu",
                           static_cast<unsigned long long>(arg.punt_miss_gate()),
-                          static_cast<unsigned long long>(arg.punt_unresolved_gate()));
+                          static_cast<unsigned long long>(arg.punt_unresolved_gate()),
+                          static_cast<unsigned long long>(arg.punt_local_gate()));
   }
   punt_miss_gate_ = arg.punt_miss_gate() == 0
                         ? DROP_GATE
@@ -134,6 +159,9 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   punt_unresolved_gate_ = arg.punt_unresolved_gate() == 0
                               ? DROP_GATE
                               : static_cast<gate_idx_t>(arg.punt_unresolved_gate());
+  punt_local_gate_ = arg.punt_local_gate() == 0
+                         ? DROP_GATE
+                         : static_cast<gate_idx_t>(arg.punt_local_gate());
   // The flow hash's fields (D-163): the proto default is the whole flow, and an
   // unknown value (an arg from a newer binary) keeps that default too.
   flow_fields_ = arg.flow_hash() == bess::pb::FLOW_HASH_L3 ? route::FlowHashFields::kL3
@@ -222,8 +250,28 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
               return std::unexpected(neighbor.error());
             }
             hop.neighbor = *neighbor;
+            auto kind = KindFromPb(value.kind());
+            if (!kind) {
+              return std::unexpected(kind.error());
+            }
+            hop.kind = *kind;
             hop.dst_mac = *dst;
             hop.src_mac = *src;
+            // A local hop delivers to this node: it cannot name an adjacency,
+            // and it names no interface (the wire's zero default is accepted,
+            // as is the canonical DROP_GATE read-back). Anything else is a hop
+            // that both forwards and delivers (D-178).
+            if (hop.kind == route::NextHopKind::kLocal) {
+              if (value.egress_gate() != 0 && value.egress_gate() != DROP_GATE) {
+                return std::unexpected(
+                    "a local next hop names no egress gate");
+              }
+              if (!hop.dst_mac.IsZero() || !hop.src_mac.IsZero()) {
+                return std::unexpected(
+                    "a local next hop names no MAC addresses");
+              }
+              hop.egress = bess::dataplane::kInvalidInterfaceId;
+            }
             return std::any(hop);
           },
           [this](const auto &visit) {
@@ -465,7 +513,20 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
   for (int i = 0; i < cnt; i++) {
     const route::NextHop *hop =
         (resolved & (uint64_t{1} << i)) != 0 ? hops[i] : nullptr;
-    if (hop == nullptr || hop->neighbor != route::NeighborState::kResolved) {
+    if (hop == nullptr) {
+      gates[i] = DROP_GATE;
+      continue;
+    }
+    // A local hop is delivery, not forwarding (D-178). This mode has no punt
+    // gates (D-162): a caller that put a local hop behind a next-hop id gets
+    // its packet dropped and counted, not forwarded. Destination mode is where
+    // a graph names the local path.
+    if (hop->kind == route::NextHopKind::kLocal) {
+      local_frames_.fetch_add(1, std::memory_order_relaxed);
+      gates[i] = DROP_GATE;
+      continue;
+    }
+    if (hop->neighbor != route::NeighborState::kResolved) {
       gates[i] = DROP_GATE;
       continue;
     }
@@ -528,10 +589,14 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
 }
 
 // One counter per verdict the chain reports (route/forward.h). kForward is not
-// a drop; kNoEgress is the blackhole shape (D-160), counted apart from a miss
-// because the route exists and chose that hop.
+// a drop; kLocalDelivery is a delivery (D-178); kNoEgress is the blackhole
+// shape (D-160), counted apart from a miss because the route exists and chose
+// that hop.
 void Router::CountVerdict(route::ForwardVerdict verdict) {
   switch (verdict) {
+    case route::ForwardVerdict::kLocalDelivery:
+      local_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
     case route::ForwardVerdict::kNotIpv4:
       not_ipv4_frames_.fetch_add(1, std::memory_order_relaxed);
       return;
@@ -652,13 +717,17 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
       // A punt gate is the application's slow path (D-162): a frame the
       // destination path cannot forward leaves on it instead of being
       // dropped, and it is counted either way, so the counters stay the
-      // record of what happened.
+      // record of what happened. A local route's frame is not a failure: it is
+      // delivered to this node's local path, and its gate is the one the graph
+      // gave for that (D-178).
       const gate_idx_t punt =
           r.verdict == route::ForwardVerdict::kNoRoute
               ? punt_miss_gate_
               : r.verdict == route::ForwardVerdict::kUnresolved
                     ? punt_unresolved_gate_
-                    : DROP_GATE;
+                    : r.verdict == route::ForwardVerdict::kLocalDelivery
+                          ? punt_local_gate_
+                          : DROP_GATE;
       if (punt != DROP_GATE) {
         gates[i] = punt;
       }
@@ -707,15 +776,17 @@ std::string Router::GetDesc() const {
   std::string desc;
   if (!routes_by_destination()) {
     desc = bess::utils::Format(
-        "%zu routes, %zu next hops, %zu groups, %zu header write failures, next-hop id from metadata",
+        "%zu routes, %zu next hops, %zu groups, %zu header write failures, %zu local, "
+        "next-hop id from metadata",
         router_->route_count(), router_->next_hop_count(),
         router_->next_hop_group_count(),
-        static_cast<size_t>(header_write_failures()));
+        static_cast<size_t>(header_write_failures()),
+        static_cast<size_t>(local_frames()));
   } else {
     desc = bess::utils::Format(
         "%zu routes, %zu next hops, %zu groups, %zu header write failures, routing by "
         "destination (not ipv4: %zu, malformed: %zu, non-initial fragments: %zu, "
-        "no route: %zu, unresolved: %zu, ttl expired: %zu, blackholed: %zu)",
+        "no route: %zu, unresolved: %zu, ttl expired: %zu, blackholed: %zu, local: %zu)",
         router_->route_count(), router_->next_hop_count(),
         router_->next_hop_group_count(),
         static_cast<size_t>(header_write_failures()),
@@ -723,7 +794,8 @@ std::string Router::GetDesc() const {
         static_cast<size_t>(non_initial_fragments()), static_cast<size_t>(no_route_frames()),
         static_cast<size_t>(unresolved_frames()),
         static_cast<size_t>(ttl_expired_frames()),
-        static_cast<size_t>(blackholed_frames()));
+        static_cast<size_t>(blackholed_frames()),
+        static_cast<size_t>(local_frames()));
     // A punt is configuration a reader has to know about (D-162): without it,
     // the counters above mean "dropped". Only the destination path has punt
     // gates -- the next-hop-id path forwards what the attribute names and
@@ -734,6 +806,10 @@ std::string Router::GetDesc() const {
     if (punt_unresolved_gate_ != DROP_GATE) {
       desc += bess::utils::Format(", an unresolved neighbor punts to gate %d",
                                   punt_unresolved_gate_);
+    }
+    if (punt_local_gate_ != DROP_GATE) {
+      desc += bess::utils::Format(", a local address punts to gate %d",
+                                  punt_local_gate_);
     }
   }
   return desc;
