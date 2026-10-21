@@ -475,6 +475,7 @@ message BPFArg {
     int64 gate = 3; ///What gate to forward packets that match this BPF to.
   }
   repeated Filter filters = 1; /// The BPF initialized function takes a list of BPF filters.
+  optional uint64 default_gate = 2; /// The gate of a packet no filter matches (default: 0).
 }
 
 /**
