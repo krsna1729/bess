@@ -78,7 +78,16 @@ reply's sender and target addresses, its Ethernet source/destination and a
 unicast sender MAC all agree with the current identity. A reply in flight when
 an address moves is therefore a stale record, not an update to a newer
 neighbor. A reply never creates an entry: only `Bind` does, so unsolicited
-frames cannot populate the table.
+frames cannot populate the table. `Unbind` leaves a learned neighbor in the
+table (a later bind in the same generation may reuse it), but configuring the
+interface with a new MAC or address, and removing it, walk every neighbor key
+on that interface -- bound or not -- and invalidate that learning, so a rebind
+cannot resurrect a MAC learned under an old interface identity. A rebind also
+moves the bindings' captured source MAC, so the republished next hops send
+from the interface's current MAC. `Bind` enforces the neighbor-entry bound
+itself (a neighbor with aging disabled holds no timer), permits a full table
+when the rebind releases its old neighbor's last hop, and rolls the binding
+back if the wheel refuses the new timer.
 
 Timing is in caller ticks, matching `ExpiryWheel` and `docs/expiry.md`: the
 first probe, the retry interval with exponential backoff capped at a maximum,
@@ -96,8 +105,12 @@ for the new immutable objects and returns them:
 - direct users call `Publish(router, updates)`, which is one
   `Router::SetNextHop` per bound hop: one pointer store each, no FIB write;
 - transactional users build `NextHopOps(router, updates)` and apply them in
-  one `TransactionEngine::Apply`: all bound next hops become visible together,
-  or the transaction is rejected and none does.
+  one `TransactionEngine::Apply`: all-or-nothing (a refused transaction makes
+  none of them visible), in the engine's referential order -- each next-hop
+  object is replaced whole, one at a time, so a packet may see one hop's new
+  adjacency and another's old one before the transaction finishes. This is
+  not a snapshot: the Router's next-hop resource is referential, and a
+  `kScopeSnapshot` request is refused.
 
 In both cases a packet-path lookup (`Router::Resolve` /
 `LookupNextHop`) obtains one whole `NextHop` pointer through the `SlotTable`'s

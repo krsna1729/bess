@@ -201,16 +201,18 @@ class NeighborResolver {
   Progress RemoveInterface(dataplane::InterfaceId id) {
     interfaces_.erase(id);
     Progress out = NewProgress();
-    for (auto it = entries_.begin(); it != entries_.end();) {
-      if (it->first.interface != id) {
-        ++it;
-        continue;
+    const std::vector<Key> keys = neighbors_.KeysForInterface(id);
+    for (const Key &key : keys) {
+      // Allocations before the table or the resolver changes.
+      out.updates.reserve(out.updates.size() + neighbors_.BindingCount(key));
+      NeighborTable::Updates updates = neighbors_.Update(
+          key, NeighborState::kUnreachable, utils::Ethernet::Address{});
+      auto entry = entries_.find(key);
+      if (entry != entries_.end()) {
+        Disarm(entry->second);
+        entries_.erase(entry);
       }
-      Disarm(it->second);
-      AppendUpdates(neighbors_.Update(it->first, NeighborState::kUnreachable,
-                                      utils::Ethernet::Address{}),
-                    out);
-      it = entries_.erase(it);
+      AppendUpdates(std::move(updates), out);
     }
     return out;
   }
@@ -231,8 +233,33 @@ class NeighborResolver {
     if (key.ipv4 == iface->second.ipv4) {
       return std::unexpected("an interface cannot be its own neighbor");
     }
+    const bool key_exists = entries_.contains(key);
+    const std::optional<NeighborTable::Bound> previous =
+        neighbors_.BindingOf(hop);
+    // A rebind that takes the hop off its only neighbor releases that
+    // neighbor's entry (and timer), so it may take the new key even when the
+    // table is full.
+    const bool releases_entry =
+        !key_exists && previous && previous->key != key &&
+        entries_.contains(previous->key) &&
+        neighbors_.BindingCount(previous->key) == 1;
+    if (!key_exists && entries_.size() >= capacity_ && !releases_entry) {
+      return std::unexpected("neighbor capacity exhausted");
+    }
+
+    // What a rebind would drop, kept until the new timer is armed so a
+    // failure can put both the binding and the timer back.
+    std::optional<Key> released_key;
+    Entry released_entry;
+    std::optional<uint64_t> released_deadline;
+    if (releases_entry) {
+      const auto old = entries_.find(previous->key);
+      released_key = previous->key;
+      released_entry = old->second;
+      released_deadline = wheel_->DeadlineOf(released_entry.timer);
+    }
+
     auto [entry, inserted] = entries_.try_emplace(key);
-    const std::optional<Key> previous = neighbors_.BoundTo(hop);
     NextHop initial;
     try {
       initial = neighbors_.Bind(hop, key, iface->second.mac);
@@ -242,18 +269,21 @@ class NeighborResolver {
       }
       throw;
     }
-    if (previous && *previous != key && !neighbors_.HasBindings(*previous)) {
-      // The rebind took the hop off another neighbor, which may now have no
-      // hops left: stop resolving it too.
-      auto stale = entries_.find(*previous);
+    if (!inserted) {
+      DropIfUnbound(previous, key);
+      return initial;
+    }
+
+    // Free the released neighbor's timer before arming the new one, so a
+    // full wheel still has room for the moving hop.
+    if (released_key) {
+      auto stale = entries_.find(*released_key);
       if (stale != entries_.end()) {
         Disarm(stale->second);
         entries_.erase(stale);
       }
     }
-    if (!inserted) {
-      return initial;
-    }
+
     entry->second.epoch = iface->second.epoch;
     const auto learned = neighbors_.Find(key);
     const NeighborState state =
@@ -274,12 +304,34 @@ class NeighborResolver {
       armed = Arm(key, entry->second, now, timing_.first_probe);
     }
     if (!armed) {
-      // The wheel cannot hold the timer: do not leave an entry that would
-      // never be resolved.
-      neighbors_.Unbind(hop);
+      // The wheel refused the new timer. Put the hop back where it was (a
+      // prior binding, or no binding at all) and restore the released
+      // neighbor's timer, so a refused rebind changes nothing.
+      if (previous) {
+        try {
+          (void)neighbors_.Bind(hop, previous->key, previous->src_mac);
+        } catch (...) {
+          // The table cannot usually fail here (the maps already hold the
+          // nodes); leaving the hop unbound is the safe fallback.
+          neighbors_.Unbind(hop);
+        }
+      } else {
+        neighbors_.Unbind(hop);
+      }
       entries_.erase(entry);
+      if (released_key) {
+        auto [restored, fresh] =
+            entries_.try_emplace(*released_key, released_entry);
+        if (fresh) {
+          restored->second.timer = dataplane::kNoExpiry;
+          if (released_deadline) {
+            ArmAt(*released_key, restored->second, *released_deadline);
+          }
+        }
+      }
       return std::unexpected("timer capacity exhausted");
     }
+    DropIfUnbound(previous, key);
     return initial;
   }
 
@@ -287,12 +339,13 @@ class NeighborResolver {
   // being resolved here; a learned entry stays in the neighbor table but has
   // no timers and no solicitations.
   void Unbind(NextHopId hop) {
-    const std::optional<Key> key = neighbors_.BoundTo(hop);
+    const std::optional<NeighborTable::Bound> binding =
+        neighbors_.BindingOf(hop);
     neighbors_.Unbind(hop);
-    if (!key || neighbors_.HasBindings(*key)) {
+    if (!binding || neighbors_.HasBindings(binding->key)) {
       return;
     }
-    auto entry = entries_.find(*key);
+    auto entry = entries_.find(binding->key);
     if (entry != entries_.end()) {
       Disarm(entry->second);
       entries_.erase(entry);
@@ -334,12 +387,17 @@ class NeighborResolver {
         arp->sender_mac == iface->second.mac) {
       return out;
     }
+    // All fallible work first: the update vector's space, then the table's
+    // own update. Only then is the timer cancelled and the resolver state
+    // changed, so a refused allocation leaves the entry and its timer as
+    // they were.
+    out.updates.reserve(neighbors_.BindingCount(key));
+    NeighborTable::Updates updates =
+        neighbors_.Update(key, NeighborState::kResolved, arp->sender_mac);
     Disarm(entry->second);
     entry->second.state = NeighborState::kResolved;
     entry->second.probes = 0;
-    AppendUpdates(neighbors_.Update(key, NeighborState::kResolved,
-                                    arp->sender_mac),
-                  out);
+    AppendUpdates(std::move(updates), out);
     // A lifetime of zero means "do not age".
     if (timing_.reachable_lifetime != 0) {
       Arm(key, entry->second, now, timing_.reachable_lifetime);
@@ -445,16 +503,13 @@ class NeighborResolver {
                                               : timing_.max_probe_interval;
   }
 
-  // Arms the entry's one timer for `now + delay`, clamped by the wheel's
-  // After() so a very long lifetime cannot wrap into the past.
-  bool Arm(const Key &key, Entry &entry, uint64_t now, uint64_t delay) {
+  // Arms the entry's one timer at an absolute deadline.
+  bool ArmAt(const Key &key, Entry &entry, uint64_t deadline) {
     if (entry.timer != dataplane::kNoExpiry) {
       wheel_->Cancel(entry.timer);
       entry.timer = dataplane::kNoExpiry;
     }
     entry.serial++;
-    const uint64_t deadline =
-        dataplane::ExpiryWheel<TimerPayload>::After(now, delay);
     const dataplane::ExpiryHandle handle =
         wheel_->Schedule(deadline, TimerPayload{key, entry.serial});
     if (handle == dataplane::kNoExpiry) {
@@ -465,12 +520,44 @@ class NeighborResolver {
     return true;
   }
 
+  // Arms the entry's one timer for `now + delay`, clamped by the wheel's
+  // After() so a very long lifetime cannot wrap into the past.
+  bool Arm(const Key &key, Entry &entry, uint64_t now, uint64_t delay) {
+    return ArmAt(key, entry,
+                 dataplane::ExpiryWheel<TimerPayload>::After(now, delay));
+  }
+
+  // Records `state` for `key` after reserving the output space first: every
+  // allocation this needs happens before the table or the resolver changes,
+  // so a refused allocation leaves both as they were and the caller can
+  // retry. The returned updates fit in `out` without allocating.
+  NeighborTable::Updates StageUpdate(const Key &key, NeighborState state,
+                                     const utils::Ethernet::Address &mac,
+                                     Progress &out) {
+    out.updates.reserve(out.updates.size() + neighbors_.BindingCount(key));
+    return neighbors_.Update(key, state, mac);
+  }
+
   void Disarm(Entry &entry) {
     if (entry.timer != dataplane::kNoExpiry) {
       wheel_->Cancel(entry.timer);
       entry.timer = dataplane::kNoExpiry;
     }
     entry.serial++;
+  }
+
+  // The neighbor's entry is no longer named by any hop: stop resolving it.
+  void DropIfUnbound(const std::optional<NeighborTable::Bound> &previous,
+                     const Key &key) {
+    if (!previous || previous->key == key ||
+        neighbors_.HasBindings(previous->key)) {
+      return;
+    }
+    auto stale = entries_.find(previous->key);
+    if (stale != entries_.end()) {
+      Disarm(stale->second);
+      entries_.erase(stale);
+    }
   }
 
   // A due timer for `key`'s entry.
@@ -488,20 +575,20 @@ class NeighborResolver {
       // Aging or the retry of a failed attempt: solicit again. A resolved
       // neighbor loses its MAC until a reply arrives (NeighborTable::Make
       // clears it for an incomplete state).
+      NeighborTable::Updates updates = StageUpdate(
+          key, NeighborState::kIncomplete, utils::Ethernet::Address{}, out);
       entry.state = NeighborState::kIncomplete;
       entry.probes = 0;
-      AppendUpdates(neighbors_.Update(key, NeighborState::kIncomplete,
-                                      utils::Ethernet::Address{}),
-                    out);
+      AppendUpdates(std::move(updates), out);
     }
 
     if (entry.probes >= timing_.max_probes) {
       // The attempt is over: publish failure and wait for the retry interval.
+      NeighborTable::Updates updates = StageUpdate(
+          key, NeighborState::kUnreachable, utils::Ethernet::Address{}, out);
       entry.state = NeighborState::kUnreachable;
       entry.probes = 0;
-      AppendUpdates(neighbors_.Update(key, NeighborState::kUnreachable,
-                                      utils::Ethernet::Address{}),
-                    out);
+      AppendUpdates(std::move(updates), out);
       if (timing_.unreachable_retry != 0) {
         Arm(key, entry, now, timing_.unreachable_retry);
       }
@@ -524,22 +611,33 @@ class NeighborResolver {
     Arm(key, entry, now, RetryDelay(entry.probes));
   }
 
-  // Re-arms every neighbor on `id` from the interface's new identity.
+  // Re-arms every neighbor on `id` from the interface's new identity. It
+  // walks the neighbor table, not only the resolver's entries, so learning
+  // retained for neighbors that currently have no bound next hop is
+  // invalidated too: a later Bind must not reuse a MAC learned under the old
+  // interface generation.
   Progress ResetInterfaceEntries(dataplane::InterfaceId id, uint64_t now) {
     Progress out = NewProgress();
     const auto iface = interfaces_.find(id);
-    for (auto &[key, entry] : entries_) {
-      if (key.interface != id) {
-        continue;
+    const std::vector<Key> keys = neighbors_.KeysForInterface(id);
+    for (const Key &key : keys) {
+      // Reserve the output before the fallible table update; the table
+      // update itself builds all of its objects before changing anything.
+      out.updates.reserve(out.updates.size() + neighbors_.BindingCount(key));
+      NeighborTable::Updates updates = neighbors_.Reconfigure(
+          key, iface->second.mac, NeighborState::kIncomplete,
+          utils::Ethernet::Address{});
+      auto entry = entries_.find(key);
+      if (entry != entries_.end()) {
+        Disarm(entry->second);
+        entry->second.epoch = iface->second.epoch;
+        entry->second.state = NeighborState::kIncomplete;
+        entry->second.probes = 0;
       }
-      Disarm(entry);
-      entry.epoch = iface->second.epoch;
-      entry.state = NeighborState::kIncomplete;
-      entry.probes = 0;
-      AppendUpdates(neighbors_.Update(key, NeighborState::kIncomplete,
-                                      utils::Ethernet::Address{}),
-                    out);
-      Arm(key, entry, now, timing_.first_probe);
+      AppendUpdates(std::move(updates), out);
+      if (entry != entries_.end()) {
+        Arm(key, entry->second, now, timing_.first_probe);
+      }
     }
     return out;
   }

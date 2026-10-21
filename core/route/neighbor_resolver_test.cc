@@ -382,6 +382,11 @@ TEST(NeighborResolverTest, ConfigureAndRemoveRestartResolutionSafely) {
   progress = resolver->ConfigureInterface(moved, 20).value();
   ASSERT_EQ(1u, progress.updates.size());
   EXPECT_EQ(NeighborState::kIncomplete, progress.updates[0].second.neighbor);
+  // The binding captured the old source MAC; the republished hop must carry
+  // the new one, or RewriteL2 would keep transmitting the old interface MAC.
+  for (const auto &[id, hop] : progress.updates) {
+    EXPECT_EQ(Mac("02:00:00:00:00:09"), hop.src_mac);
+  }
   progress = resolver->Poll(30, 16);
   ASSERT_EQ(1u, progress.solicitations.size());
   EXPECT_EQ(Mac("02:00:00:00:00:09"),
@@ -404,6 +409,113 @@ TEST(NeighborResolverTest, ConfigureAndRemoveRestartResolutionSafely) {
                   .empty());
   EXPECT_FALSE(resolver->Bind(NextHopId(2), Key(kIface1, kPeer2), 30)
                    .has_value());
+}
+
+TEST(NeighborResolverTest, RetainedLearningDiesWithTheInterfaceGeneration) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01",
+                                                 kMyIp),
+                                           0)
+                  .has_value());
+  const NeighborResolver::Key key = Key(kIface1, kPeer1);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  progress = resolver->OnArp(10, kIface1,
+                             ReplyTo(progress.solicitations[0].frame,
+                                     Mac("02:00:00:00:00:aa")));
+  ASSERT_EQ(1u, progress.updates.size());
+
+  // Unbinding leaves the learned neighbor in NeighborTable (by design: a
+  // later Bind may reuse a still-valid answer). The resolver's own entry and
+  // timer are gone.
+  resolver->Unbind(NextHopId(1));
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+  EXPECT_EQ(0u, resolver->size());
+  EXPECT_EQ(0u, resolver->armed());
+
+  // A new interface generation must invalidate that retained learning even
+  // though no hop is bound: a rebind must not resurrect the old MAC.
+  progress = resolver->ConfigureInterface(
+                 Iface(kIface1, "02:00:00:00:00:09", kMyIp), 20)
+                 .value();
+  EXPECT_TRUE(progress.empty());
+  EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+  auto rebound = resolver->Bind(NextHopId(2), key, 20);
+  ASSERT_TRUE(rebound.has_value());
+  EXPECT_EQ(NeighborState::kIncomplete, rebound->neighbor);
+  EXPECT_EQ(Mac("02:00:00:00:00:09"), rebound->src_mac);
+  progress = resolver->Poll(30, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  EXPECT_EQ(Mac("02:00:00:00:00:09"),
+            ParseArp(progress.solicitations[0].frame)
+                .value_or(ArpMessage{})
+                .sender_mac);
+
+  // Removal invalidates retained learning too, including when no hop is
+  // bound: re-adding the interface must not revive the old MAC.
+  progress = resolver->OnArp(30, kIface1,
+                             ReplyTo(progress.solicitations[0].frame,
+                                     Mac("02:00:00:00:00:aa")));
+  ASSERT_EQ(1u, progress.updates.size());
+  resolver->Unbind(NextHopId(2));
+  EXPECT_TRUE(resolver->RemoveInterface(kIface1).empty());
+  EXPECT_EQ(NeighborState::kUnreachable, State(*resolver, key).state);
+  ASSERT_TRUE(resolver->ConfigureInterface(
+                  Iface(kIface1, "02:00:00:00:00:01", kMyIp), 40)
+                  .has_value());
+  auto after_remove = resolver->Bind(NextHopId(3), key, 40);
+  ASSERT_TRUE(after_remove.has_value());
+  EXPECT_NE(NeighborState::kResolved, after_remove->neighbor);
+  EXPECT_EQ(Ethernet::Address{}, after_remove->dst_mac);
+}
+
+TEST(NeighborResolverTest, CapacityAccountsForANeighborTheRebindReleases) {
+  NeighborResolver::Config config = TestConfig();
+  config.capacity = 1;
+  auto resolver = MakeResolver(config);
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01",
+                                                 kMyIp),
+                                           0)
+                  .has_value());
+  const NeighborResolver::Key key_a = Key(kIface1, kPeer1);
+  const NeighborResolver::Key key_b = Key(kIface1, kPeer2);
+  const NeighborResolver::Key key_c = Key(kIface1, 0x0a000004);
+
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key_a, 0).has_value());
+  EXPECT_EQ(1u, resolver->size());
+  EXPECT_EQ(1u, resolver->armed());
+
+  // The hop moves to a new neighbor: its old one has no hops left, so the
+  // entry and timer are released and the full table accepts the new key.
+  auto moved = resolver->Bind(NextHopId(1), key_b, 0);
+  ASSERT_TRUE(moved.has_value());
+  EXPECT_EQ(1u, resolver->size());
+  EXPECT_EQ(1u, resolver->armed());
+  EXPECT_FALSE(resolver->Find(key_a).has_value());
+  auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  EXPECT_EQ(be32_t(kPeer2),
+            ParseArp(progress.solicitations[0].frame)
+                .value_or(ArpMessage{})
+                .target_ip);
+
+  // A new key with no hop to release is refused; a second hop on the same
+  // key is not a new entry.
+  EXPECT_FALSE(resolver->Bind(NextHopId(2), key_c, 10).has_value());
+  ASSERT_TRUE(resolver->Bind(NextHopId(2), key_b, 10).has_value());
+  // Moving hop 1 would leave hop 2 on B, so C still needs a second entry.
+  EXPECT_FALSE(resolver->Bind(NextHopId(1), key_c, 10).has_value());
+  EXPECT_EQ(1u, resolver->size());
+  EXPECT_EQ(1u, resolver->armed());
+  progress = resolver->Poll(20, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  EXPECT_EQ(be32_t(kPeer2),
+            ParseArp(progress.solicitations[0].frame)
+                .value_or(ArpMessage{})
+                .target_ip);
 }
 
 TEST(NeighborResolverTest, RebindStartsFreshStateAndRejectsBadKeys) {
@@ -437,6 +549,38 @@ TEST(NeighborResolverTest, RebindStartsFreshStateAndRejectsBadKeys) {
   EXPECT_FALSE(resolver->Bind(NextHopId(3), Key(kIface1, 0), 100).has_value());
   EXPECT_FALSE(resolver->Bind(NextHopId(3), Key(kIface1, 0xffffffffu), 100)
                    .has_value());
+}
+
+TEST(NeighborResolverTest, CapacityCountsNeighborsWhoseTimerIsGone) {
+  NeighborResolver::Config config = TestConfig();
+  config.capacity = 1;
+  config.timing.reachable_lifetime = 0;  // a resolved neighbor is not timed
+  auto resolver = MakeResolver(config);
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01",
+                                                 kMyIp),
+                                           0)
+                  .has_value());
+  const NeighborResolver::Key key_a = Key(kIface1, kPeer1);
+  const NeighborResolver::Key key_b = Key(kIface1, kPeer2);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key_a, 0).has_value());
+  auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  ASSERT_EQ(1u, resolver->OnArp(10, kIface1,
+                                ReplyTo(progress.solicitations[0].frame,
+                                        Mac("02:00:00:00:00:aa")))
+                    .updates.size());
+  EXPECT_EQ(1u, resolver->size());
+  EXPECT_EQ(0u, resolver->armed());  // resolved, aging disabled
+
+  // The entry limit is about neighbors, not armed timers.
+  EXPECT_FALSE(resolver->Bind(NextHopId(2), key_b, 10).has_value());
+  // The hop's own entry is released by moving it, so the rebind fits. The
+  // old neighbor's learning stays in the table (same interface generation),
+  // but the resolver tracks only the new entry.
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key_b, 10).has_value());
+  EXPECT_EQ(1u, resolver->size());
+  EXPECT_TRUE(resolver->Find(key_b).has_value());
 }
 
 // -- publication ---------------------------------------------------------------
@@ -489,8 +633,10 @@ TEST(NeighborResolverTest, ATransactionPublishesAllAdjacencyOrNone) {
   ASSERT_EQ(2u, progress.updates.size());
   std::vector<dataplane::Op> change_ops =
       NextHopOps(router, progress.updates);
-  // A next hop that does not exist rejects the whole transaction: the first
-  // update must not become visible on its own.
+  // A next hop that does not exist rejects the whole transaction, so neither
+  // update becomes visible. Publication is referential (per hop, each object
+  // whole), not a snapshot: this asserts rejection, not simultaneous
+  // visibility.
   NextHop bogus = progress.updates[0].second;
   change_ops.push_back(router.SetNextHopOp(NextHopId(99), bogus));
   result = engine.Apply(change_ops);

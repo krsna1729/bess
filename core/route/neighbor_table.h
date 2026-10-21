@@ -84,6 +84,35 @@ class NeighborTable {
     return updates;
   }
 
+  // Records a neighbor state and moves every hop bound to `key` to
+  // `src_mac`, returning every bound next hop's new object whether or not its
+  // state changed. An interface identity change uses this: the hops that stay
+  // bound must send from the interface's new MAC, which only the bindings
+  // know (Bind captured it), and the caller needs a new object for each of
+  // them. All updates are built before anything changes, so a refused
+  // allocation leaves the table as it was.
+  Updates Reconfigure(Key key, const utils::Ethernet::Address &src_mac,
+                      NeighborState state,
+                      const utils::Ethernet::Address &mac) {
+    auto n = neighbors_.find(key);
+    if (n == neighbors_.end()) {
+      return {};
+    }
+    Entry &entry = n->second;
+    const Neighbor next{state, mac};
+    Updates updates;
+    updates.reserve(entry.hops.size());
+    for (const NextHopId hop : entry.hops) {
+      updates.emplace_back(hop, Make(key, next, src_mac));
+    }
+    for (const NextHopId hop : entry.hops) {
+      bindings_.at(hop).src_mac = src_mac;
+    }
+    entry.learned = true;
+    entry.neighbor = next;
+    return updates;
+  }
+
   std::optional<Neighbor> Find(Key key) const {
     auto n = neighbors_.find(key);
     if (n == neighbors_.end()) {
@@ -91,19 +120,43 @@ class NeighborTable {
     }
     return n->second.neighbor;
   }
-  // The neighbor `hop` is bound to, if it is bound at all. A resolver uses
-  // this to stop tracking a neighbor no next hop names any more.
-  std::optional<Key> BoundTo(NextHopId hop) const {
+  // A next hop's binding: the neighbor it names and the source MAC Bind
+  // captured for it.
+  struct Bound {
+    Key key;
+    utils::Ethernet::Address src_mac;
+  };
+  // The binding of `hop`, if it is bound at all. A resolver uses this to
+  // stop tracking a neighbor no next hop names any more, and to restore a
+  // binding it moved.
+  std::optional<Bound> BindingOf(NextHopId hop) const {
     auto b = bindings_.find(hop);
     if (b == bindings_.end()) {
       return std::nullopt;
     }
-    return b->second.key;
+    return Bound{b->second.key, b->second.src_mac};
   }
   // Whether any next hop is bound to `key` now.
   bool HasBindings(Key key) const {
     auto n = neighbors_.find(key);
     return n != neighbors_.end() && !n->second.hops.empty();
+  }
+  // Next hops bound to `key` now (zero for an absent key).
+  size_t BindingCount(Key key) const {
+    auto n = neighbors_.find(key);
+    return n == neighbors_.end() ? 0 : n->second.hops.size();
+  }
+  // Every neighbor key on `interface`, in key order. Control side only; a
+  // resolver uses it to invalidate retained learning when an interface's
+  // identity changes, including neighbors no hop is bound to any more.
+  std::vector<Key> KeysForInterface(dataplane::InterfaceId interface) const {
+    std::vector<Key> keys;
+    for (const auto &[key, entry] : neighbors_) {
+      if (key.interface == interface) {
+        keys.push_back(key);
+      }
+    }
+    return keys;
   }
   size_t size() const noexcept { return neighbors_.size(); }
 
@@ -159,10 +212,16 @@ inline std::expected<void, RouteError> Publish(Router &router,
 }
 
 // The same updates as operations on `router`'s "<router>/next_hops" resource,
-// for a caller that publishes them in one transaction through the
-// TransactionEngine (D-021): every bound next hop becomes visible together,
-// and a failed transaction leaves all of them as they were. The router must
-// be enrolled in that engine. One op per update, in the updates' order.
+// for a caller that publishes them through the TransactionEngine (D-021). The
+// transaction is all-or-nothing: if any operation is refused, none of the
+// updates is visible. Visibility is the engine's referential order, not a
+// snapshot -- upserts are published one next hop at a time (each object
+// replaced whole), so a packet may see one hop's new adjacency and another's
+// old one until the transaction finishes. That is enough for a neighbor
+// update, where every next hop is independent; code that needs all of them to
+// switch in one store must not use this (the Router's next-hop resource is
+// kReferential and a kScopeSnapshot request is refused). The router must be
+// enrolled in that engine. One op per update, in the updates' order.
 inline std::vector<dataplane::Op> NextHopOps(
     const Router &router,
     std::span<const std::pair<NextHopId, NextHop>> updates) {

@@ -11879,8 +11879,9 @@ or interface identity. Neighbor state had no timers.
   never mutates a `NextHop`; `NeighborTable::Update` builds new immutable
   objects, and the dataplane reads one through `SlotTable`'s acquire load. The
   direct path is one pointer store per hop; the transactional path is one
-  `Apply` for every bound hop (or none). A packet sees the old object or the
-  new one.
+  `Apply` for every bound hop, all-or-nothing but in the engine's referential
+  order (per-hop visibility, not a simultaneous switch). A packet sees an old
+  object or a new one, never a partial one.
 - **Vif keeps its adapter role.** Its inline ARP rewrite is replaced by
   `route::AnswerArpRequest` (`ParseArp` + `BuildArpReply`); VLAN stripping,
   the (VLAN, MAC) demultiplexer, the local-address lookup, metadata and gates
@@ -11889,15 +11890,18 @@ or interface identity. Neighbor state had no timers.
   are address-family neutral; ND enters as another packet family over the same
   entries when an IPv6 FIB exists.
 
-**Tests.** `core/route/neighbor_resolver_test.cc` (10/10): backoff/retry/
+**Tests.** `core/route/neighbor_resolver_test.cc` (13/13): backoff/retry/
 failure/recovery sequence with frame contents; aging and repeated-reply
-refresh; MAC change republishing every bound hop with no route write;
-wrong-interface, moved-address, mismatched-source, unknown-sender, wrong-target
-and unusable sender-MAC rejection; configure/remove generations; rebind and
-stale-timer safety; all-or-nothing transactional publication with a rejected
-transaction leaving both hops unchanged; two concurrent RCU readers resolving
-while a writer alternates published MACs; and the in-place responder used by
-Vif. `modules_vif_test` 8/8 (including `VifTest.LocalArpResponder`) and
+refresh; MAC change republishing every bound hop with no route write and an
+interface MAC change moving the bindings' source MAC; wrong-interface,
+moved-address, mismatched-source, unknown-sender, wrong-target and unusable
+sender-MAC rejection; configure/remove generations, including invalidation of
+learning retained after Unbind; entry capacity with and without armed timers,
+and a capacity-one rebind that releases its old entry; rebind and stale-timer
+safety; all-or-nothing (referential-order) transactional publication with a
+rejected transaction leaving both hops unchanged; two concurrent RCU readers
+resolving while a writer alternates published MACs; and the in-place responder
+used by Vif. `modules_vif_test` 8/8 (including `VifTest.LocalArpResponder`) and
 `route_l3_test` 8/8 pass. The full fast-build suite (`meson test
 --no-rebuild`, 213 tests) passes except `live_conformance`'s Go half when no
 Go toolchain is on `PATH`; rerun with `MISE_GO_VERSION=1.27.2 mise exec --`,
