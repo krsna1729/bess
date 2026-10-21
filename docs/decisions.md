@@ -12001,3 +12001,81 @@ received ARP/ND frames to the control-side writer.
 
 **Revisit when:** an IPv6 FIB or a resolver module is added, or an application
 needs scoped link-local addresses on more than one interface.
+## D-177 A metadata reader declares its contract: best-effort, required, or optional with a default
+
+**Status:** accepted (2026-10-21; the plan's item: "required vs optional-with-default vs best-effort, plus a graph validation report").
+
+**Decision.** `Attribute` gains a `Contract` beside its access mode. Best-effort is the default and keeps today's
+behavior: an unresolved reader gets `kMetadataOffsetNoRead` and the module decides. Required makes
+`ComputeMetadataOffsets()` return `-EINVAL` and name the module and attribute when no upstream module writes the
+attribute on every path that reaches the reader; `ResumeAll` returns that error before running any worker, and a
+transaction that commits a graph whose resume the metadata hook refuses reports "pipeline committed, but resume
+failed" and leaves those workers paused. Optional-with-default gives a provider-less reader
+`kMetadataOffsetDefault` and the value declared through `AddMetadataAttrWithDefault()`; `Module::ResolveAttr<T>()`
+resolves once at PreResume and `get_attr_with_default()` returns the value without touching packet metadata. A
+writer that appears at the next resume replaces the default with a normal offset.
+
+The contract is a reader's statement; a writer's contract is ignored. Modes stay orthogonal: `kRead`, `kWrite`
+and `kUpdate` mean what they did, and the contract only describes the read side's missing-provider case. The
+existing three-argument `AddMetadataAttr()` is best-effort, so no module changed behavior by compiler default.
+
+Every computation also fills a read-only `MetadataReport`: writers without a reader, readers without a writer,
+unsatisfied required declarations, defaults applied, and declarations of one name that disagree about contract or
+default bytes or that a reader sees from more than one writer scope. It is a snapshot of the last resolution, not a new graph walk; `GetPipeline` returns it with
+`include_metadata: true` (the existing read RPC, no new one) and `bessctl metadata` prints it.
+
+**Survey of the old model.** Offsets are computed at resume from writer to reader. A declaration is `kRead`,
+`kWrite` or `kUpdate`; an unread write gets `kMetadataOffsetNoWrite` (the write is skipped, and a writer reports
+it itself when its name is configuration), and an unwritten read gets `kMetadataOffsetNoRead`. The modules that
+consume that negative offset split into three groups. (1) *Hard readers, best-effort by construction*: `Meter`
+(`meter_id`), `Router` in next-hop mode (`next_hop_id`), `PacketStore` (the first configured key; no key means
+flow id 0), `ExactMatch`/`WildcardMatch` result fields and `HashLB`'s read fields, `Measure`'s timestamp (falls
+back to the packet's embedded timestamp), `Split`, `Timestamp` and `Vif` writes. They either drop/count or skip
+the read. (2) *A hand-written default*: `Router`'s route domain in destination mode, domain 0 when no VIF writes
+it. (3) *Configuration with no reader*: writers whose attribute name is configuration (`Firewall`, `Vif`);
+they skip the write and log at the priority their contract implies. The only safe injection point
+for a default is the reader's once-per-batch state at PreResume: packet pools are populated before offsets exist,
+`PacketCopy`/`PacketClone` do not carry metadata, and zeroing or stamping each packet would put a write on the hot
+path. That is why `kDefault` resolves into `ResolvedAttr`, not into packet bytes.
+
+**Why.** The framework knew only two things about a missing writer: warn and give the reader an invalid offset.
+Every module then re-invented the same decisions. `Router`'s route domain is the clear in-tree default: D-155
+made it domain 0 when no VIF writes it, with a local `has_domain` branch and a private `DomainOf` fallback; that is
+a default contract written by hand. `Meter` and `Router`'s next-hop mode instead drop and log, which is a
+best-effort contract, and a graph author has no way to say "this reader cannot run without a provider" except by
+reading the source. Making the contract declarative lets the framework refuse a broken resume once, with names,
+and lets a report show the graph's metadata shape before packets are lost. Defaults cannot be injected into packet
+buffers at resume - packets are allocated before offsets exist, copies do not carry metadata, and a per-packet
+write would put work on the hot path - so the resolved default lives in the module's once-per-batch state and the
+packet path reads a constant only when the offset is absent.
+
+**Consequences.** A required contract turns a silent drop into a refused resume; operators must either wire a
+writer or opt for best-effort/default. A refused apply is committed and cannot roll back (the same shape as a
+failed retire): the error says so and workers stay paused until a later apply/resume resolves it. Defaults and
+reports are computed only with workers paused. The report is per-process (the default metadata pipeline) and is
+empty until the first resume/apply. `bessctl metadata` and a GetPipeline field add no protocol call and no
+per-packet code; the existing `get_attr_with_offset()` path is unchanged. `Router`'s route domain is the only
+module migrated, because its default was already established by D-155; other readers keep their explicit failure
+handling until a case has a clearly correct default.
+
+**Evidence.** `metadata_test.cc`: `BestEffortIsTheDefaultAndUnchanged` (an unresolved three-argument reader keeps
+`kMetadataOffsetNoRead` and is reported), `RequiredWithoutProviderFailsResume` (returns `-EINVAL`, the report names
+module/attribute, offsets still filled for diagnostics), `RequiredWithProviderResolves`, and
+`DefaultAppliesUntilAProviderAppears` (reader resolves to the declared bytes with no packet read; after a writer is
+connected and offsets recomputed, the same resolved attribute reads the packet's bytes). `ReportListsUnreadWriters
+AndConflicts`, `ReportFlagsContractDisagreement` and
+`ReportFlagsAReaderReachedFromTwoWriterScopes` cover the writer-without-reader and conflict categories.
+`router_test.cc`: `TheDefaultRouteDomainAppliesWithoutAWriter` routes in domain 0 with the attribute at
+`kMetadataOffsetDefault`, and `AWriterReplacesTheDefaultRouteDomain` shows a VIF-written domain picking its own
+FIB. `api_v2_test.cc`: `MetadataContractsRefuseResumeAndAppearInTheReport` applies a module declaring one
+attribute of each contract, observes `ResumeAll` fail with `EINVAL` naming `required_attr`/`c`, and reads the same
+three categories back from `GetPipeline(include_metadata)`, and
+`ACommittedApplyWhoseResumeFailsLeavesWorkersPaused` replaces a running graph with one whose commit retirement
+fails the required contract: the apply reports `INVALID_ARGUMENT` with field `resume` and "pipeline committed,
+but resume failed", and the workers stay paused. `GetPipeline` snapshots the report under the control plane's
+mutex. The existing metadata graph tests, Router tests, and the full functional suite (213/213) pass.
+
+**Code.** `core/metadata.{h,cc}`, `core/module.{h,cc}`, `core/resume_hook.{h,cc}`,
+`core/resume_hooks/{metadata,task_graph}.{h,cc}`, `core/worker.{h,cc}`, `core/control/{api_v2.cc,control_plane.cc,
+transaction.cc}`, `core/modules/router.{h,cc}`, `protobuf/control_v2.proto`, the C++ SDK and `bessctl/main.cc`,
+`docs/plugin-api.md`, and the SDK's generated control_v2 code.
