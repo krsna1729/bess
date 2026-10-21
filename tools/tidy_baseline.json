@@ -86,7 +86,7 @@
       "performance-unnecessary-copy-initialization": 2
     },
     "core/modules/bpf.cc": {
-      "cppcoreguidelines-narrowing-conversions": 4
+      "cppcoreguidelines-narrowing-conversions": 3
     },
     "core/modules/buffer.cc": {
       "bugprone-multi-level-implicit-pointer-conversion": 4,
