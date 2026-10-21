@@ -84,12 +84,139 @@ class NeighborTable {
     return updates;
   }
 
+  // Everything an update needs, built without changing the table. Prepare()
+  // is the fallible half (it allocates the update vector); Commit() is
+  // noexcept and changes the neighbor and, when `src_mac` is set, every
+  // binding's source MAC. A caller that changes several neighbors at once
+  // prepares them all first, so a refused allocation leaves every one of them
+  // untouched; this is what an interface identity change and the timer wheel's
+  // due transitions use.
+  struct Prepared {
+    Key key{};
+    Neighbor neighbor{};
+    Updates updates;
+    std::optional<utils::Ethernet::Address> src_mac;
+    bool changed = false;
+  };
+
+  Prepared Prepare(Key key, NeighborState state,
+                   const utils::Ethernet::Address &mac,
+                   std::optional<utils::Ethernet::Address> src_mac =
+                       std::nullopt) const {
+    Prepared prepared;
+    prepared.key = key;
+    prepared.neighbor = Neighbor{state, mac};
+    prepared.src_mac = src_mac;
+    auto n = neighbors_.find(key);
+    if (n == neighbors_.end()) {
+      return prepared;
+    }
+    bool differs = n->second.neighbor.state != state ||
+                   n->second.neighbor.mac != mac;
+    if (src_mac) {
+      for (const NextHopId hop : n->second.hops) {
+        if (bindings_.at(hop).src_mac != *src_mac) {
+          differs = true;
+          break;
+        }
+      }
+    }
+    if (!differs) {
+      return prepared;
+    }
+    prepared.changed = true;
+    prepared.updates.reserve(n->second.hops.size());
+    for (const NextHopId hop : n->second.hops) {
+      const utils::Ethernet::Address &src =
+          src_mac ? *src_mac : bindings_.at(hop).src_mac;
+      prepared.updates.emplace_back(hop, Make(key, prepared.neighbor, src));
+    }
+    return prepared;
+  }
+
+  // Makes a prepared update visible. Infallible: every allocation happened in
+  // Prepare(). A key that vanished meanwhile (its last hop unbound) is left
+  // alone.
+  void Commit(Prepared &prepared) noexcept {
+    if (!prepared.changed) {
+      return;
+    }
+    auto n = neighbors_.find(prepared.key);
+    if (n == neighbors_.end()) {
+      return;
+    }
+    if (prepared.src_mac) {
+      for (const NextHopId hop : n->second.hops) {
+        auto b = bindings_.find(hop);
+        if (b != bindings_.end()) {
+          b->second.src_mac = *prepared.src_mac;
+        }
+      }
+    }
+    n->second.learned = true;
+    n->second.neighbor = prepared.neighbor;
+  }
+
+  // Records a neighbor state and moves every hop bound to `key` to
+  // `src_mac`, returning the bound next hops' new objects when the state or a
+  // binding's source MAC changed (empty otherwise). An interface identity
+  // change uses this: the hops that stay bound must send from the interface's
+  // new MAC, which only the bindings know (Bind captured it), and the caller
+  // needs a new object for each of them. It is Prepare() + Commit() for one
+  // key; a caller changing several keys stages all of them with Prepare()
+  // first.
+  Updates Reconfigure(Key key, const utils::Ethernet::Address &src_mac,
+                      NeighborState state,
+                      const utils::Ethernet::Address &mac) {
+    Prepared prepared = Prepare(key, state, mac, src_mac);
+    Commit(prepared);
+    return std::move(prepared.updates);
+  }
+
   std::optional<Neighbor> Find(Key key) const {
     auto n = neighbors_.find(key);
     if (n == neighbors_.end()) {
       return std::nullopt;
     }
     return n->second.neighbor;
+  }
+  // A next hop's binding: the neighbor it names and the source MAC Bind
+  // captured for it.
+  struct Bound {
+    Key key;
+    utils::Ethernet::Address src_mac;
+  };
+  // The binding of `hop`, if it is bound at all. A resolver uses this to
+  // stop tracking a neighbor no next hop names any more, and to restore a
+  // binding it moved.
+  std::optional<Bound> BindingOf(NextHopId hop) const {
+    auto b = bindings_.find(hop);
+    if (b == bindings_.end()) {
+      return std::nullopt;
+    }
+    return Bound{b->second.key, b->second.src_mac};
+  }
+  // Whether any next hop is bound to `key` now.
+  bool HasBindings(Key key) const {
+    auto n = neighbors_.find(key);
+    return n != neighbors_.end() && !n->second.hops.empty();
+  }
+  // Next hops bound to `key` now (zero for an absent key).
+  size_t BindingCount(Key key) const {
+    auto n = neighbors_.find(key);
+    return n == neighbors_.end() ? 0 : n->second.hops.size();
+  }
+  // Every neighbor key on `interface`, in key order. Control side only; a
+  // resolver uses it to invalidate retained learning when an interface's
+  // identity changes, including neighbors no hop is bound to any more.
+  std::vector<Key> KeysForInterface(dataplane::InterfaceId interface) const {
+    std::vector<Key> keys;
+    for (const auto &[key, entry] : neighbors_) {
+      if (key.interface == interface) {
+        keys.push_back(key);
+      }
+    }
+    return keys;
   }
   size_t size() const noexcept { return neighbors_.size(); }
 
@@ -142,6 +269,28 @@ inline std::expected<void, RouteError> Publish(Router &router,
     }
   }
   return {};
+}
+
+// The same updates as operations on `router`'s "<router>/next_hops" resource,
+// for a caller that publishes them through the TransactionEngine (D-021). The
+// transaction is all-or-nothing: if any operation is refused, none of the
+// updates is visible. Visibility is the engine's referential order, not a
+// snapshot -- upserts are published one next hop at a time (each object
+// replaced whole), so a packet may see one hop's new adjacency and another's
+// old one until the transaction finishes. That is enough for a neighbor
+// update, where every next hop is independent; code that needs all of them to
+// switch in one store must not use this (the Router's next-hop resource is
+// kReferential and a kScopeSnapshot request is refused). The router must be
+// enrolled in that engine. One op per update, in the updates' order.
+inline std::vector<dataplane::Op> NextHopOps(
+    const Router &router,
+    std::span<const std::pair<NextHopId, NextHop>> updates) {
+  std::vector<dataplane::Op> ops;
+  ops.reserve(updates.size());
+  for (const auto &[id, hop] : updates) {
+    ops.push_back(router.SetNextHopOp(id, hop));
+  }
+  return ops;
 }
 
 }  // namespace bess::route

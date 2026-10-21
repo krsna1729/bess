@@ -178,6 +178,34 @@ TEST(ExpiryWheel, AFullEngineRefusesAndChangesNothing) {
   EXPECT_NE(kNoExpiry, wheel->Schedule(2000, 5));
 }
 
+TEST(ExpiryWheel, RescheduleReusesAFullEngineNode) {
+  // A full wheel has no free node, but a live timer can still be re-armed:
+  // deadline and payload change in place and the handle (the node's
+  // generation) stays valid, so a refresh stream never spends capacity.
+  auto wheel = Make<Wheel>(1, 0);
+  const ExpiryHandle h = wheel->Schedule(100, 1);
+  ASSERT_NE(h, kNoExpiry);
+  EXPECT_TRUE(wheel->full());
+
+  ASSERT_TRUE(wheel->Reschedule(h, 200, 2));
+  EXPECT_TRUE(wheel->Alive(h));
+  EXPECT_EQ(1u, wheel->size());
+  EXPECT_TRUE(wheel->full());
+  EXPECT_EQ(200u, *wheel->DeadlineOf(h));
+  EXPECT_TRUE(Drain(*wheel, 199).empty());
+  EXPECT_EQ((std::vector<uint64_t>{2}), Drain(*wheel, 200));
+
+  // A spent handle cannot touch the node that reused it.
+  EXPECT_FALSE(wheel->Reschedule(h, 300, 3));
+
+  // Moving a live timer earlier re-places the same node.
+  auto earlier = Make<Wheel>(1, 0);
+  const ExpiryHandle g = earlier->Schedule(500, 4);
+  ASSERT_TRUE(earlier->Reschedule(g, 10, 5));
+  EXPECT_TRUE(Drain(*earlier, 9).empty());
+  EXPECT_EQ((std::vector<uint64_t>{5}), Drain(*earlier, 10));
+}
+
 // -- handles ----------------------------------------------------------------------
 
 TEST(ExpiryWheel, AStaleHandleCannotTouchTheTimerThatReusedItsNode) {
