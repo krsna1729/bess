@@ -238,6 +238,18 @@ ClassifierResult<ResultPlan> ResultPlan::Compile(
   } else if (packed.size() == 2) {
     kernel = &ResultPlan::ApplyTwoOps;
     kind = ResultKernel::kTwoOp;
+  } else if (packed.size() == 3) {
+    kernel = &ResultPlan::ApplyNOps<3>;
+  } else if (packed.size() == 4) {
+    kernel = &ResultPlan::ApplyNOps<4>;
+  } else if (packed.size() == 5) {
+    kernel = &ResultPlan::ApplyNOps<5>;
+  } else if (packed.size() == 6) {
+    kernel = &ResultPlan::ApplyNOps<6>;
+  } else if (packed.size() == 7) {
+    kernel = &ResultPlan::ApplyNOps<7>;
+  } else if (packed.size() == 8) {
+    kernel = &ResultPlan::ApplyNOps<8>;
   }
 
   return ResultPlan(schema.value_size, std::move(packed), std::move(masks),
@@ -351,6 +363,24 @@ bool ResultPlan::ApplyTwoOps(const ResultPlan &plan,
     }
     Place(ops[0], masks, values[i], destinations[i]);
     Place(ops[1], masks, values[i], destinations[i]);
+  }
+  return true;
+}
+
+template <size_t N>
+bool ResultPlan::ApplyNOps(const ResultPlan &plan,
+                           std::span<const ConstBytes> values,
+                           std::span<const DestinationView> destinations) noexcept {
+  const PackedOp *ops = plan.ops_.data();
+  const std::byte *masks = plan.masks_.data();
+  const size_t count = values.size();
+  for (size_t i = 0; i < count; i++) {
+    if (!plan.Fits(values[i], destinations[i])) {
+      return false;
+    }
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+      (Place(ops[Is], masks, values[i], destinations[i]), ...);
+    }(std::make_index_sequence<N>{});
   }
   return true;
 }

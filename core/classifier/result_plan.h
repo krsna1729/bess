@@ -107,6 +107,9 @@ class ResultPlan {
                                std::span<const DestinationView>) noexcept;
   static bool ApplyTwoOps(const ResultPlan &, std::span<const ConstBytes>,
                           std::span<const DestinationView>) noexcept;
+  template <size_t N>
+  static bool ApplyNOps(const ResultPlan &, std::span<const ConstBytes>,
+                        std::span<const DestinationView>) noexcept;
   static bool ApplyGeneric(const ResultPlan &, std::span<const ConstBytes>,
                            std::span<const DestinationView>) noexcept;
   static ResultBatchFn SelectSingle(const PackedOp &op) noexcept;

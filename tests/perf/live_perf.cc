@@ -686,6 +686,208 @@ std::vector<std::string> MUrrCountControl(Build &b) {
   return MBase(b, {{"md", 1}, {"bp", 1}, {"mt", 1}}, InnerFrame());
 }
 
+
+// -- result-placement matrix (live) ---------------------------------------
+//
+// The 1-vs-2 lookup question, on the real dataplane:
+//   1a INLINE-EM  Source -> ExactMatch(key 4B, M result fields) -> reader -> Sink
+//   1b INLINE-WM  Same with WildcardMatch (masked tuple path)
+//   2a EM+EM      Source -> ExactMatch(key 4B, 1x4B action_id) -> ExactMatch
+//                 (key = action_id, M result fields) -> reader -> Sink
+//   2b WM+EM      Same, with WildcardMatch as the first stage
+// The reader is one MetadataTest hop in every arm, so the only difference is
+// the indirection. M = 1,2,4,8; N = 1024 / 65536 rules; 64-byte packets.
+
+// Source -> Rewrite(64B UDP) -> RandomUpdate(source over `span`) -> rest ->
+// Sink. Same shape as MBase, with the traffic span equal to the rule count so
+// a 64K table is actually exercised.
+std::vector<std::string> MBaseSpan(Build &b, uint64_t span,
+                                   std::vector<std::pair<std::string, int>> rest) {
+  std::string last = Source(b, "src", 64, Ipv4Udp(0x0a000001, 0x0b000001, 40000, 2000, 64));
+  b.Mod("RandomUpdate", "ru",
+        R"({"fields": [{"offset": 26, "size": 4, "min": )" +
+            std::to_string(0x0a000001) + R"(, "max": )" +
+            std::to_string(0x0a000000 + span) + "}]}");
+  b.Conn(last, "ru");
+  last = "ru";
+  for (const auto &[name, gates] : rest) {
+    b.Conn(last, name);
+    last = name;
+    if (gates > 1) {
+      for (int g = 0; g < gates; g++) {
+        b.Mod("Sink", "sink" + std::to_string(g));
+        b.Conn(name, "sink" + std::to_string(g), g);
+      }
+      return {"src"};
+    }
+  }
+  b.Mod("Sink", "sink");
+  b.Conn(last, "sink");
+  return {"src"};
+}
+
+std::string ResultFieldsArg(size_t m) {
+  std::string out = "[";
+  for (size_t i = 0; i < m; i++) {
+    out += std::string(i ? ", " : "") + R"({"attr_name": "res_)" + std::to_string(i) +
+           R"(", "value_offset": )" + std::to_string(4 * i) +
+           R"(, "num_bytes": 4})";
+  }
+  return out + "]";
+}
+
+std::string ReaderArg(size_t m) {
+  std::string out = R"({"read": {)";
+  for (size_t i = 0; i < m; i++) {
+    out += std::string(i ? ", " : "") + R"("res_)" + std::to_string(i) + R"(": 4)";
+  }
+  return out + "}}";
+}
+
+std::string MRecord(size_t base, size_t m) {
+  std::string record;
+  for (size_t j = 0; j < m; j++) {
+    record += Be32(static_cast<uint32_t>(base + j + 1));
+  }
+  return Base64(record);
+}
+
+std::string InlineArg(size_t m, bool wm) {
+  return std::string(R"({"fields": [{"offset": 26, "num_bytes": 4}], "result_fields": )") +
+         ResultFieldsArg(m) + (wm ? R"(, "max_tuples": 1})" : "}");
+}
+
+std::string ProducerArg(bool wm) {
+  return std::string(R"({"fields": [{"offset": 26, "num_bytes": 4}], "result_fields": [{"attr_name": "action_id", "value_offset": 0, "num_bytes": 4}] )") +
+         (wm ? R"(, "max_tuples": 1})" : "}");
+}
+
+std::string ConsumerArg(size_t m) {
+  return std::string(R"({"fields": [{"attr_name": "action_id", "num_bytes": 4}], "result_fields": )") +
+         ResultFieldsArg(m) + "}";
+}
+
+std::string ResultFieldsMixed8Arg() {
+  return R"([{"attr_name": "res_4", "value_offset": 0, "num_bytes": 4},
+             {"attr_name": "res_2", "value_offset": 4, "num_bytes": 2},
+             {"attr_name": "res_1a", "value_offset": 6, "num_bytes": 1},
+             {"attr_name": "res_1b", "value_offset": 7, "num_bytes": 1}])";
+}
+
+std::string ReaderMixed8Arg() {
+  return R"({"read": {"res_4": 4, "res_2": 2, "res_1a": 1, "res_1b": 1}})";
+}
+
+std::string ResultFieldsMixed16Arg() {
+  return R"([{"attr_name": "res_8", "value_offset": 0, "num_bytes": 8},
+             {"attr_name": "res_4", "value_offset": 8, "num_bytes": 4},
+             {"attr_name": "res_2", "value_offset": 12, "num_bytes": 2},
+             {"attr_name": "res_1a", "value_offset": 14, "num_bytes": 1},
+             {"attr_name": "res_1b", "value_offset": 15, "num_bytes": 1}])";
+}
+
+std::string ReaderMixed16Arg() {
+  return R"({"read": {"res_8": 8, "res_4": 4, "res_2": 2, "res_1a": 1, "res_1b": 1}})";
+}
+
+
+void AddFirstStageRules(Build &b, bool wm, const std::string &name, size_t rules,
+                        size_t m, bool inline_layout, size_t num_actions = 0) {
+  const std::string mask = Base64(std::string(4, '\xff'));
+  for (size_t i = 0; i < rules; i++) {
+    const std::string key = Base64(Be32(static_cast<uint32_t>(0x0a000001 + i)));
+    const uint32_t action_id =
+        num_actions > 0 ? static_cast<uint32_t>((i % num_actions) + 1)
+                        : static_cast<uint32_t>(i + 1);
+    const std::string record =
+        inline_layout ? MRecord(i, m) : Base64(Be32(action_id));
+    if (wm) {
+      b.Entry(name + "/rules", "WildcardMatchRuleKey",
+              R"({"values": [{"value_bin": ")" + key + R"("}], "masks": [{"value_bin": ")" +
+                  mask + R"("}]})",
+              "WildcardMatchRuleValue",
+              R"({"priority": 0, "gate": 1, "result": ")" + record + R"("})");
+    } else {
+      b.Entry(name + "/rules", "ExactMatchRuleKey",
+              R"({"fields": [{"value_bin": ")" + key + R"("}]})",
+              "ExactMatchRuleValue",
+              R"({"gate": 1, "result": ")" + record + R"("})");
+    }
+  }
+}
+
+std::vector<std::string> MPlaceInline(Build &b, bool wm, size_t rules, size_t m) {
+  const std::string name = "first";
+  const std::string cls = wm ? "WildcardMatch" : "ExactMatch";
+  const std::string settings = wm ? "WildcardMatchSettings" : "ExactMatchSettings";
+  b.Mod(cls, name, InlineArg(m, wm));
+  b.Setting(name + "/settings", settings, R"({"default_gate": 0})");
+  AddFirstStageRules(b, wm, name, rules, m, true);
+  b.Mod("MetadataTest", "mt", ReaderArg(m));
+  return MBaseSpan(b, rules, {{name, 1}, {"mt", 1}});
+}
+
+std::vector<std::string> MPlaceTwoStage(Build &b, bool wm, size_t rules, size_t m, int pct) {
+  const std::string name = "first";
+  const std::string cls = wm ? "WildcardMatch" : "ExactMatch";
+  const std::string settings = wm ? "WildcardMatchSettings" : "ExactMatchSettings";
+  const size_t num_actions =
+      std::max<size_t>(1, (rules * static_cast<size_t>(pct)) / 100);
+  b.Mod(cls, name, ProducerArg(wm));
+  b.Setting(name + "/settings", settings, R"({"default_gate": 0})");
+  AddFirstStageRules(b, wm, name, rules, m, false, num_actions);
+  b.Mod("ExactMatch", "second", ConsumerArg(m));
+  b.Setting("second/settings", "ExactMatchSettings", R"({"default_gate": 0})");
+  for (size_t i = 0; i < num_actions; i++) {
+    b.Entry("second/rules", "ExactMatchRuleKey",
+            R"({"fields": [{"value_bin": ")" +
+                Base64(Be32(static_cast<uint32_t>(i + 1))) + R"("}]})",
+            "ExactMatchRuleValue",
+            R"({"gate": 1, "result": ")" + MRecord(i, m) + R"("})");
+  }
+  b.Mod("MetadataTest", "mt", ReaderArg(m));
+  return MBaseSpan(b, rules, {{name, 1}, {"second", 1}, {"mt", 1}});
+}
+std::vector<std::string> MPlaceInlineMixed(Build &b, bool wm, size_t rules, bool is_16b) {
+  const std::string name = "first";
+  const std::string cls = wm ? "WildcardMatch" : "ExactMatch";
+  const std::string settings = wm ? "WildcardMatchSettings" : "ExactMatchSettings";
+  const std::string fields_arg = is_16b ? ResultFieldsMixed16Arg() : ResultFieldsMixed8Arg();
+  const std::string reader_arg = is_16b ? ReaderMixed16Arg() : ReaderMixed8Arg();
+  const size_t m = is_16b ? 4 : 2;
+  b.Mod(cls, name, std::string(R"({"fields": [{"offset": 26, "num_bytes": 4}], "result_fields": )") +
+                       fields_arg + (wm ? R"(, "max_tuples": 1})" : "}"));
+  b.Setting(name + "/settings", settings, R"({"default_gate": 0})");
+  AddFirstStageRules(b, wm, name, rules, m, true);
+  b.Mod("MetadataTest", "mt", reader_arg);
+  return MBaseSpan(b, rules, {{name, 1}, {"mt", 1}});
+}
+
+std::vector<std::string> MPlaceTwoStageMixed(Build &b, bool wm, size_t rules, bool is_16b, int pct) {
+  const std::string name = "first";
+  const std::string cls = wm ? "WildcardMatch" : "ExactMatch";
+  const std::string settings = wm ? "WildcardMatchSettings" : "ExactMatchSettings";
+  const std::string fields_arg = is_16b ? ResultFieldsMixed16Arg() : ResultFieldsMixed8Arg();
+  const std::string reader_arg = is_16b ? ReaderMixed16Arg() : ReaderMixed8Arg();
+  const size_t m = is_16b ? 4 : 2;
+  const size_t num_actions = std::max<size_t>(1, (rules * static_cast<size_t>(pct)) / 100);
+  b.Mod(cls, name, ProducerArg(wm));
+  b.Setting(name + "/settings", settings, R"({"default_gate": 0})");
+  AddFirstStageRules(b, wm, name, rules, m, false, num_actions);
+  b.Mod("ExactMatch", "second", std::string(R"({"fields": [{"attr_name": "action_id", "num_bytes": 4}], "result_fields": )") +
+                                    fields_arg + "}");
+  b.Setting("second/settings", "ExactMatchSettings", R"({"default_gate": 0})");
+  for (size_t i = 0; i < num_actions; i++) {
+    b.Entry("second/rules", "ExactMatchRuleKey",
+            R"({"fields": [{"value_bin": ")" +
+                Base64(Be32(static_cast<uint32_t>(i + 1))) + R"("}]})",
+            "ExactMatchRuleValue",
+            R"({"gate": 1, "result": ")" + MRecord(i, m) + R"("})");
+  }
+  b.Mod("MetadataTest", "mt", reader_arg);
+  return MBaseSpan(b, rules, {{name, 1}, {"second", 1}, {"mt", 1}});
+}
+
 std::vector<Test> Catalogue() {
   const auto m = [](const std::string &mclass, const std::string &name, const std::string &arg,
                     int gates) -> Builder {
@@ -694,7 +896,7 @@ std::vector<Test> Catalogue() {
       return MBase(b, {{name, gates}});
     };
   };
-  return {
+  std::vector<Test> tests = {
       {"F.floor", 'F', [](Build &b) { return FFloor(b, 60); }},
       {"F.hop/1", 'F', FHop(1, true)},
       {"F.hop/4", 'F', FHop(4, true)},
@@ -784,6 +986,40 @@ std::vector<Test> Catalogue() {
       {"M.urr_count", 'M', MUrrCount},
       {"M.urr_count.empty", 'M', MUrrCountEmpty},
   };
+  for (size_t m : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}) {
+    for (size_t n : {size_t{1024}, size_t{65536}}) {
+      const std::string suffix = "/m" + std::to_string(m) + "/n" + std::to_string(n);
+      tests.push_back({"M.place/inline-em" + suffix, 'M',
+                       [=](Build &b) { return MPlaceInline(b, false, n, m); }});
+      tests.push_back({"M.place/inline-wm" + suffix, 'M',
+                       [=](Build &b) { return MPlaceInline(b, true, n, m); }});
+      for (int pct : {100, 50, 30, 20, 10, 5}) {
+        const std::string rsuf = suffix + "/r" + std::to_string(pct);
+        tests.push_back({"M.place/em-em" + rsuf, 'M',
+                         [=](Build &b) { return MPlaceTwoStage(b, false, n, m, pct); }});
+        tests.push_back({"M.place/wm-em" + rsuf, 'M',
+                         [=](Build &b) { return MPlaceTwoStage(b, true, n, m, pct); }});
+      }
+    }
+  }
+  for (bool is_16b : {false, true}) {
+    const std::string tag = is_16b ? "/mixed16" : "/mixed8";
+    for (size_t n : {size_t{1024}, size_t{65536}}) {
+      const std::string suffix = tag + "/n" + std::to_string(n);
+      tests.push_back({"M.place/inline-em" + suffix, 'M',
+                       [=](Build &b) { return MPlaceInlineMixed(b, false, n, is_16b); }});
+      tests.push_back({"M.place/inline-wm" + suffix, 'M',
+                       [=](Build &b) { return MPlaceInlineMixed(b, true, n, is_16b); }});
+      for (int pct : {100, 50, 20}) {
+        const std::string rsuf = suffix + "/r" + std::to_string(pct);
+        tests.push_back({"M.place/em-em" + rsuf, 'M',
+                         [=](Build &b) { return MPlaceTwoStageMixed(b, false, n, is_16b, pct); }});
+        tests.push_back({"M.place/wm-em" + rsuf, 'M',
+                         [=](Build &b) { return MPlaceTwoStageMixed(b, true, n, is_16b, pct); }});
+      }
+    }
+  }
+  return tests;
 }
 
 // -- one round: a fresh bessd, every test ------------------------------------------
