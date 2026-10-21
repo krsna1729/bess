@@ -16,6 +16,7 @@
 #include "task.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
+#include "route/l3_packet.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
@@ -39,6 +40,21 @@ using bess::utils::Arp;
 using bess::utils::be16_t;
 using bess::utils::be32_t;
 using bess::utils::Ethernet;
+using bess::utils::Ipv6Address;
+using bess::utils::ParseIpv6Address;
+
+Ipv6Address ParsedIpv6(const char *text) {
+  const auto parsed = ParseIpv6Address(text);
+  EXPECT_TRUE(parsed.has_value()) << text;
+  return parsed.value_or(Ipv6Address{});
+}
+
+bess::route::NdMessage ParsedNd(
+    std::optional<bess::route::NdMessage> message) {
+  EXPECT_TRUE(message.has_value());
+  return message.value_or(
+      bess::route::NdMessage{bess::route::NdType::kNeighborAdvertisement});
+}
 
 class VifTest : public ::testing::Test {
  protected:
@@ -205,6 +221,83 @@ TEST_F(VifTest, LocalArpResponder) {
   be32_t expected_vif_ip;
   bess::utils::ParseIpv4Address("192.168.1.1", &expected_vif_ip);
   EXPECT_EQ(expected_vif_ip, reply->sender_ip_addr);
+
+  bess::PacketFree(pkt);
+}
+
+TEST_F(VifTest, LocalNeighborSolicitationResponder) {
+  VifArg arg;
+  arg.set_default_gate(5);
+
+  auto *iface = arg.add_interfaces();
+  iface->set_id(1);
+  iface->set_vlan(100);
+  iface->set_mac_addr("02:00:00:00:01:01");
+  iface->set_ipv6_addr("fe80::1");
+  iface->set_route_domain(10);
+  iface->set_gate(1);
+
+  Vif *vif = CreateVif(arg);
+  ASSERT_NE(nullptr, vif);
+
+  const auto &builders = ModuleBuilder::all_module_builders();
+  Module *sink =
+      ModuleGraph::CreateModule(builders.find("Sink")->second, "sink_nd", {},
+                                nullptr);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(vif, 1, sink, 0));
+  bess::metadata::default_pipeline.ComputeMetadataOffsets();
+  PlainPacketPool pool(16);
+  bess::PacketHandle pkt = pool.Alloc();
+  ASSERT_NE(nullptr, pkt);
+  PacketRef ref(pkt);
+
+  const Ipv6Address my_ip = ParsedIpv6("fe80::1");
+  const Ipv6Address peer_ip = ParsedIpv6("fe80::2");
+  Ethernet::Address peer_mac;
+  peer_mac.FromString("02:aa:bb:cc:dd:ee");
+  std::array<uint8_t, bess::route::kNdFrameSize> ns{};
+  ASSERT_EQ(bess::route::kNdFrameSize,
+            bess::route::BuildNeighborSolicitation(peer_mac, peer_ip, my_ip,
+                                                   ns));
+
+  // Tag the solicitation for VLAN 100; Vif strips the tag, answers, and sends
+  // the advertisement out its gate.
+  uint8_t raw[128] = {};
+  std::memcpy(raw, ns.data(), 12);
+  raw[12] = 0x81;
+  raw[13] = 0x00;
+  raw[14] = 0x00;
+  raw[15] = 100;
+  std::memcpy(raw + 16, ns.data() + 12, ns.size() - 12);
+  const size_t tagged_len = ns.size() + 4;
+  std::memcpy(ref.append(tagged_len), raw, tagged_len);
+
+  PacketBatch batch;
+  batch.clear();
+  batch.add(ref);
+  Task task(vif, nullptr);
+  Context ctx;
+  ctx.task = &task;
+  vif->ProcessBatch(&ctx, &batch);
+
+  const auto *eth = ref.head_data<const Ethernet *>();
+  const bess::route::NdMessage advertisement = ParsedNd(
+      bess::route::ParseNeighborDiscovery(std::span<const uint8_t>(
+          ref.head_data<const uint8_t *>(), ref.data_len())));
+  EXPECT_EQ(bess::route::NdType::kNeighborAdvertisement, advertisement.type);
+  EXPECT_EQ(my_ip, advertisement.source_ip);
+  EXPECT_EQ(peer_ip, advertisement.destination_ip);
+  EXPECT_EQ(my_ip, advertisement.target_ip);
+  EXPECT_TRUE(advertisement.solicited);
+  EXPECT_TRUE(advertisement.override);
+  Ethernet::Address vif_mac;
+  vif_mac.FromString("02:00:00:00:01:01");
+  EXPECT_EQ(vif_mac, advertisement.source_mac);
+  EXPECT_EQ(peer_mac, eth->dst_addr);
+  EXPECT_EQ(vif_mac, eth->src_addr);
+  ASSERT_TRUE(advertisement.target_ll.has_value());
+  EXPECT_EQ(vif_mac,
+            advertisement.target_ll.value_or(Ethernet::Address{}));
 
   bess::PacketFree(pkt);
 }

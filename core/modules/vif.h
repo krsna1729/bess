@@ -37,6 +37,7 @@ class Vif final : public Module {
     uint16_t vlan = 0;  // 0: untagged
     bess::utils::Ethernet::Address mac_addr{};
     bess::utils::be32_t ip_addr{};
+    bess::utils::Ipv6Address ipv6_addr{};
     uint32_t route_domain = 0;
     gate_idx_t gate = 0;
   };
@@ -65,6 +66,9 @@ class Vif final : public Module {
   using MacIndex = std::map<std::pair<uint16_t, uint64_t>, const Interface *>;
   // Key: (vlan, ip) for ARP responder
   using ArpIndex = std::map<std::pair<uint16_t, uint32_t>, const Interface *>;
+  // Key: (vlan, IPv6 address) for the ND responder
+  using NdIndex =
+      std::map<std::pair<uint16_t, bess::utils::Ipv6Address>, const Interface *>;
 
   // A transaction's edited copy of the interfaces with its indexes, built in
   // Reserve and swapped in by the first publish (no allocation there).
@@ -72,15 +76,18 @@ class Vif final : public Module {
     InterfaceMap interfaces_by_id;
     MacIndex mac_table;
     ArpIndex arp_table;
+    NdIndex nd_table;
   };
 
   // The indexes of `interfaces` (pointing into its nodes).
   static void BuildIndexes(const InterfaceMap &interfaces, MacIndex *mac_table,
-                           ArpIndex *arp_table);
+                           ArpIndex *arp_table, NdIndex *nd_table);
   void RebuildTables();
   const Interface *Lookup(uint16_t vlan,
                           const bess::utils::Ethernet::Address &dmac) const;
   const Interface *LookupByIp(uint16_t vlan, bess::utils::be32_t ip) const;
+  const Interface *LookupByIpv6(uint16_t vlan,
+                                const bess::utils::Ipv6Address &ip) const;
 
   // The transaction's copy (made by its first reservation).
   Staged &BeginTransaction();
@@ -93,6 +100,7 @@ class Vif final : public Module {
   InterfaceMap interfaces_by_id_;
   MacIndex mac_table_;
   ArpIndex arp_table_;
+  NdIndex nd_table_;
   std::unique_ptr<Staged> staged_;
   bool published_staged_ = false;
 
