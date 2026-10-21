@@ -695,8 +695,8 @@ std::vector<std::string> MUrrCountControl(Build &b) {
 //   2a EM+EM      Source -> ExactMatch(key 4B, 1x4B action_id) -> ExactMatch
 //                 (key = action_id, M result fields) -> reader -> Sink
 //   2b WM+EM      Same, with WildcardMatch as the first stage
-// The reader is one MetadataTest hop in every arm, so the only difference is
-// the indirection. M = 1,2,4,8; N = 1024 / 65536 rules; 64-byte packets.
+// The reader is one MetadataTest hop in every arm, reached through gate 0.
+// M = 1..8; N = 1024 / 65536 rules; 64-byte packets.
 
 // Source -> Rewrite(64B UDP) -> RandomUpdate(source over `span`) -> rest ->
 // Sink. Same shape as MBase, with the traffic span equal to the rule count so
@@ -806,12 +806,12 @@ void AddFirstStageRules(Build &b, bool wm, const std::string &name, size_t rules
               R"({"values": [{"value_bin": ")" + key + R"("}], "masks": [{"value_bin": ")" +
                   mask + R"("}]})",
               "WildcardMatchRuleValue",
-              R"({"priority": 0, "gate": 1, "result": ")" + record + R"("})");
+              R"({"priority": 0, "gate": 0, "result": ")" + record + R"("})");
     } else {
       b.Entry(name + "/rules", "ExactMatchRuleKey",
               R"({"fields": [{"value_bin": ")" + key + R"("}]})",
               "ExactMatchRuleValue",
-              R"({"gate": 1, "result": ")" + record + R"("})");
+              R"({"gate": 0, "result": ")" + record + R"("})");
     }
   }
 }
@@ -821,7 +821,7 @@ std::vector<std::string> MPlaceInline(Build &b, bool wm, size_t rules, size_t m)
   const std::string cls = wm ? "WildcardMatch" : "ExactMatch";
   const std::string settings = wm ? "WildcardMatchSettings" : "ExactMatchSettings";
   b.Mod(cls, name, InlineArg(m, wm));
-  b.Setting(name + "/settings", settings, R"({"default_gate": 0})");
+  b.Setting(name + "/settings", settings, R"({"default_gate": 8192})");
   AddFirstStageRules(b, wm, name, rules, m, true);
   b.Mod("MetadataTest", "mt", ReaderArg(m));
   return MBaseSpan(b, rules, {{name, 1}, {"mt", 1}});
@@ -834,16 +834,16 @@ std::vector<std::string> MPlaceTwoStage(Build &b, bool wm, size_t rules, size_t 
   const size_t num_actions =
       std::max<size_t>(1, (rules * static_cast<size_t>(pct)) / 100);
   b.Mod(cls, name, ProducerArg(wm));
-  b.Setting(name + "/settings", settings, R"({"default_gate": 0})");
+  b.Setting(name + "/settings", settings, R"({"default_gate": 8192})");
   AddFirstStageRules(b, wm, name, rules, m, false, num_actions);
   b.Mod("ExactMatch", "second", ConsumerArg(m));
-  b.Setting("second/settings", "ExactMatchSettings", R"({"default_gate": 0})");
+  b.Setting("second/settings", "ExactMatchSettings", R"({"default_gate": 8192})");
   for (size_t i = 0; i < num_actions; i++) {
     b.Entry("second/rules", "ExactMatchRuleKey",
             R"({"fields": [{"value_bin": ")" +
                 Base64(Be32(static_cast<uint32_t>(i + 1))) + R"("}]})",
             "ExactMatchRuleValue",
-            R"({"gate": 1, "result": ")" + MRecord(i, m) + R"("})");
+            R"({"gate": 0, "result": ")" + MRecord(i, m) + R"("})");
   }
   b.Mod("MetadataTest", "mt", ReaderArg(m));
   return MBaseSpan(b, rules, {{name, 1}, {"second", 1}, {"mt", 1}});
@@ -857,7 +857,7 @@ std::vector<std::string> MPlaceInlineMixed(Build &b, bool wm, size_t rules, bool
   const size_t m = is_16b ? 4 : 2;
   b.Mod(cls, name, std::string(R"({"fields": [{"offset": 26, "num_bytes": 4}], "result_fields": )") +
                        fields_arg + (wm ? R"(, "max_tuples": 1})" : "}"));
-  b.Setting(name + "/settings", settings, R"({"default_gate": 0})");
+  b.Setting(name + "/settings", settings, R"({"default_gate": 8192})");
   AddFirstStageRules(b, wm, name, rules, m, true);
   b.Mod("MetadataTest", "mt", reader_arg);
   return MBaseSpan(b, rules, {{name, 1}, {"mt", 1}});
@@ -872,17 +872,17 @@ std::vector<std::string> MPlaceTwoStageMixed(Build &b, bool wm, size_t rules, bo
   const size_t m = is_16b ? 4 : 2;
   const size_t num_actions = std::max<size_t>(1, (rules * static_cast<size_t>(pct)) / 100);
   b.Mod(cls, name, ProducerArg(wm));
-  b.Setting(name + "/settings", settings, R"({"default_gate": 0})");
+  b.Setting(name + "/settings", settings, R"({"default_gate": 8192})");
   AddFirstStageRules(b, wm, name, rules, m, false, num_actions);
   b.Mod("ExactMatch", "second", std::string(R"({"fields": [{"attr_name": "action_id", "num_bytes": 4}], "result_fields": )") +
                                     fields_arg + "}");
-  b.Setting("second/settings", "ExactMatchSettings", R"({"default_gate": 0})");
+  b.Setting("second/settings", "ExactMatchSettings", R"({"default_gate": 8192})");
   for (size_t i = 0; i < num_actions; i++) {
     b.Entry("second/rules", "ExactMatchRuleKey",
             R"({"fields": [{"value_bin": ")" +
                 Base64(Be32(static_cast<uint32_t>(i + 1))) + R"("}]})",
             "ExactMatchRuleValue",
-            R"({"gate": 1, "result": ")" + MRecord(i, m) + R"("})");
+            R"({"gate": 0, "result": ")" + MRecord(i, m) + R"("})");
   }
   b.Mod("MetadataTest", "mt", reader_arg);
   return MBaseSpan(b, rules, {{name, 1}, {"second", 1}, {"mt", 1}});
@@ -1225,8 +1225,27 @@ Sample RunTest(bess::sdk::Client &client, Types &types, const Test &test, const 
       }
       fs::remove(perf_out);
     }
+    if (test.name.starts_with("M.place/")) {
+      Check(client.PauseWorkers(), "pause for placement validation");
+      const double sent = OutPackets(client, {"src"});
+      for (const char *stage : {"first", "second", "mt"}) {
+        if (std::string_view(stage) == "second" &&
+            test.name.find("/inline-") != std::string::npos) {
+          continue;
+        }
+        const double forwarded = OutPackets(client, {stage});
+        if (sent <= 0 || forwarded != sent) {
+          throw std::runtime_error(
+              std::string("placement path incomplete at ") + stage +
+              ": forwarded " + std::to_string(forwarded) +
+              " of " + std::to_string(sent) + " source packets");
+        }
+      }
+    }
   } catch (const std::exception &e) {
     // Recorded, not fatal: a test this build cannot run.
+    out.ns.reset();
+    out.counters.clear();
     std::string what = e.what();
     out.error = "error: " + what.substr(0, std::min<size_t>(160, what.find('\n')));
   }
