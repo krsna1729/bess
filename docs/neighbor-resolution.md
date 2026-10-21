@@ -1,8 +1,9 @@
 # Neighbor resolution
 
-`core/route/neighbor_resolver.h` is the IPv4/Ethernet neighbor resolution
-library (M15, D-175): it solicits with ARP, learns replies, retries with
-backoff, ages resolved neighbors, follows a MAC change, publishes failure and
+`core/route/neighbor_resolver.h` is the IPv4/IPv6 Ethernet neighbor
+resolution library (M15, D-175, D-176): it solicits with ARP or ICMPv6
+Neighbor Solicitation, learns replies/advertisements, retries with backoff,
+ages resolved neighbors, follows a MAC change, publishes failure and
 recovers, and gives the existing neighbor table its events. Packet mechanics
 live beside it (`route/l3_packet.h`); adjacency stays in the Router library.
 This guide states what existed before it, what the library owns, and how the
@@ -17,8 +18,8 @@ one of its interfaces' addresses (keyed by VLAN and address) is rewritten in
 place into the reply -- opcode, Ethernet addresses and the four ARP addresses
 are assigned field by field -- and emitted on that interface's gate. It sent no
 request, learned nothing, kept no timer, rejected no stale reply (it had none
-to reject) and had no IPv6 ND path. ARP replies arriving from the network were
-just demultiplexed like any other frame.
+to reject) and had no IPv6 ND path; IPv6 frames were demultiplexed like any
+other. ARP replies arriving from the network were just demultiplexed too.
 
 **`Router` adjacency** (`core/route/router.h`). A route maps a prefix to a
 `NextHopId`; each id names one immutable 16-byte `NextHop`
@@ -43,12 +44,12 @@ FDB already use it. Neighbor state used no timer.
 ## The library boundary
 
 `NeighborResolver` is a single-writer state machine over
-`(InterfaceId, IPv4 address)`:
+`(InterfaceId, address)`; the address is IPv4 or IPv6 (D-176):
 
 | event | call | effect |
 |---|---|---|
 | create | `Bind(hop, key, now)` | binds a next hop through `NeighborTable`, starts resolution if the neighbor is new |
-| learn | `OnArp(now, ingress, frame)` | a valid reply resolves the neighbor and publishes its new MAC |
+| learn | `OnArp(now, ingress, frame)` / `OnNd(now, ingress, frame)` | a valid reply or advertisement resolves the neighbor and publishes its new MAC |
 | refresh | `OnArp` again, or `Poll` when the aging timer fires | re-arms the lifetime, or starts a fresh solicitation |
 | fail | `Poll` after the last probe | publishes `kUnreachable` |
 | recover | `Poll` after the retry interval | publishes `kIncomplete`, solicits again |
@@ -66,18 +67,19 @@ The state machine is:
 ```
 
 `Poll(now, budget)` returns the solicitations to send and the next-hop updates
-to publish; `OnArp` returns the updates for a reply. The caller owns packet
+to publish; `OnArp`/`OnNd` return the updates for a reply. The caller owns packet
 buffers, gates and the policy for unresolved traffic. That keeps the library
 free of `Module`, gate, worker and protobuf dependencies, as the rest of
 `core/route` is.
 
-Interface identity is explicit: `ConfigureInterface({id, mac, ipv4})` assigns a
-generation (epoch) per interface. Every entry records the epoch it was created
+Interface identity is explicit: `ConfigureInterface({id, mac, ipv4, ipv6})`
+assigns a generation (epoch) per interface. Every entry records the epoch it was created
 under, and a reply is accepted only if the arrival interface, the epoch, the
 reply's sender and target addresses, its Ethernet source/destination and a
 unicast sender MAC all agree with the current identity. A reply in flight when
 an address moves is therefore a stale record, not an update to a newer
-neighbor. A reply never creates an entry: only `Bind` does, so unsolicited
+neighbor. The same key and epoch rules apply to both families, so an IPv4
+reply cannot resolve an IPv6 neighbor or vice versa. A reply never creates an entry: only `Bind` does, so unsolicited
 frames cannot populate the table. `Unbind` leaves a learned neighbor in the
 table (a later bind in the same generation may reuse it), but configuring the
 interface with a new MAC or address, and removing it, walk every neighbor key
@@ -101,11 +103,12 @@ deadline and payload, no capacity spent and no generation advance, so a steady
 reply stream cannot exhaust the wheel. A new node is needed only when an entry
 has no live timer; the wheel's usable capacity falls when a node's generation
 is exhausted (quarantined), so `Schedule` can still refuse. A refusal is
-handled, never ignored: `OnArp` leaves the entry, its timer and the table
-untouched and ignores the reply, `Bind` rolls back, and an entry whose `Poll`
-or `ConfigureInterface` transition cannot be armed is dropped rather than kept
-without a timer (its committed state is incomplete/unreachable, so the hop
-does not forward).
+handled, never ignored: `OnArp`/`OnNd` leave the entry, its timer and the
+table untouched and ignore the frame, `Bind` rolls back, and an entry whose
+`Poll` or `ConfigureInterface` transition cannot be armed is dropped rather
+than kept without a timer (its committed state is incomplete/unreachable, so
+the hop does not forward). `OnNd` stages its table update and output space and
+arms/reschedules the aging timer before committing, exactly as `OnArp` does.
 
 ## Publication and the packet path
 
@@ -135,18 +138,19 @@ committing the interface identity or any neighbor change; `Poll` collects the
 due wheel records, plans every transition (including its next-hop update
 vector) and reserves the output before committing anything, and if a plan's
 allocation is refused it re-arms every due entry at the deadline its record
-carried before rethrowing (the wheel had already spent those nodes). `OnArp`
-stages its update and output space and commits the resolved state only once
-its aging timer is in place, so a timer refusal leaves the entry and its timer
+carried before rethrowing (the wheel had already spent those nodes). `OnArp`/`OnNd`
+stage their update and output space and commit the resolved state only once
+the aging timer is in place, so a timer refusal leaves the entry and its timer
 as they were. A refused call therefore leaves the neighbor table, the
 published adjacency and the timers exactly as they were, and the same call
 retried converges.
 `NeighborResolverFaultTest` fails every allocation point of Poll, Configure and
-Remove in turn and checks that invariant.
+Remove in turn and checks that invariant, and repeats the ND paths so the
+staging is not IPv4-only.
 
-The resolver itself is single-threaded (one control-side writer). ARP frames
-arriving on workers must be handed to that writer; the packet path never calls
-into the resolver. This is the same ownership split as every other control-side
+The resolver itself is single-threaded (one control-side writer). ARP and ND
+frames arriving on workers must be handed to that writer; the packet path
+never calls into the resolver. This is the same ownership split as every other control-side
 table in BESS and is what lets the state machine allocate without locks.
 
 ## What moved out of Vif, and what stayed
@@ -164,8 +168,47 @@ grow timers or a second ARP implementation again.
 
 ## IPv6 ND
 
-Not implemented. The state machine, identity check, publication path and timer
-ownership are address-family neutral; ND is another packet family over the
-same entries (solicitation/advertisement helpers, a hop-limit/multicast MAC
-mapping, and an `InterfaceId`-scoped link-local address) rather than another
-resolver. The key is currently IPv4, as the FIB is.
+IPv6 uses the same entries, table, timers and publication path (D-176); only
+the packet family and the address in the key differ. `OnNd` accepts a
+Neighbor Advertisement and `Poll` emits a Neighbor Solicitation with the
+source link-layer option when the interface has an IPv6 address and a MAC.
+
+An advertisement is accepted only when all of the following hold:
+
+- it is a valid ND frame for the ingress interface: Ethernet/IPv6 framing,
+  version 6, next header ICMPv6, hop limit 255, a correct ICMPv6 checksum
+  over the pseudo-header, an ND type, no malformed option;
+- the destination is this generation's: either the Ethernet destination is
+  the interface's MAC and the IPv6 destination is its current address
+  (solicited), or both are all-nodes (the unsolicited MAC-change form); the
+  source/target link-layer option, if present, equals the Ethernet source,
+  and the sender MAC is unicast, non-zero and not the interface's own;
+- the source address is not multicast or unspecified and is not the loopback
+  address; the target is not multicast or unspecified;
+- source and target are the same address (proxy advertisements are not
+  supported), so the target names the sender actually on the link;
+- the ingress interface and, if the entry already exists, its generation
+  match, and the target has an entry (only `Bind` creates one). Moving the
+  interface's own IPv6 address therefore rejects advertisements still sent to
+  the old address, even on the same MAC.
+
+A solicited advertisement updates the MAC. An unsolicited one updates an
+existing resolved entry only when its override flag is set or the MAC is
+unchanged; otherwise it is ignored, which is RFC 4861's protection against a
+gratuitous advertisement moving traffic. Link-local and global unicast
+addresses are both accepted; there is no scope/zone field, so an application
+that needs a non-link-local scope must use distinct interfaces or addresses.
+
+Solicitations are sent to the target's solicited-node multicast address
+(`ff02::1:ffXX:XXXX`, MAC `33:33:ff:XX:XX:XX`), with the interface's own
+address as source. `Vif` answers a solicitation for its local address in
+place with `AnswerNeighborSolicitationInPlace`, setting S and O for a normal
+solicitation and answering a duplicate-address-detection solicitation (source
+`::`, no source link-layer option) to all-nodes without S/O. That responder is
+still packet mechanics, not resolution: `Vif` does not learn from a
+solicitation and never creates or updates a neighbor entry.
+
+The configuration API adds `ipv6_addr` to a Vif interface, alongside
+`ip_addr`; the readback emits it when set. The Vif `ipv6_addr` does not
+participate in demultiplexing (the interface still matches by VLAN and
+destination MAC) or in metadata.
