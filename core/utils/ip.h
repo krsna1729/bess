@@ -4,10 +4,13 @@
 #ifndef BESS_UTILS_IP_H_
 #define BESS_UTILS_IP_H_
 
-#include <type_traits>
-
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
+#include <type_traits>
 
 #include "endian.h"
 
@@ -21,6 +24,54 @@ bool ParseIpv4Address(const std::string &str, be32_t *addr);
 
 // be32 -> string
 std::string ToIpv4Address(be32_t addr);
+
+// A 128-bit IPv6 address, as network-order bytes. Ordering is memcmp over the
+// bytes (never bit twiddling of a multi-word integer): the same order for
+// IPv4-mapped and native addresses, and no endian assumption. Zero is the
+// unspecified address (::), exactly as a zero IPv4 address is 0.0.0.0.
+struct Ipv6Address {
+  uint8_t bytes[16] = {};
+
+  friend bool operator==(const Ipv6Address &, const Ipv6Address &) = default;
+  friend auto operator<=>(const Ipv6Address &a, const Ipv6Address &b) {
+    const int c = std::memcmp(a.bytes, b.bytes, sizeof(a.bytes));
+    return c < 0 ? std::strong_ordering::less
+                 : c > 0 ? std::strong_ordering::greater
+                         : std::strong_ordering::equal;
+  }
+
+  bool IsUnspecified() const {
+    for (const uint8_t byte : bytes) {
+      if (byte != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+  bool IsMulticast() const { return bytes[0] == 0xff; }
+  bool IsLinkLocal() const {
+    return bytes[0] == 0xfe &&
+           (static_cast<unsigned>(bytes[1]) & 0xc0u) == 0x80u;
+  }
+  bool IsLoopback() const {
+    for (size_t i = 0; i < 15; i++) {
+      if (bytes[i] != 0) {
+        return false;
+      }
+    }
+    return bytes[15] == 1;
+  }
+};
+
+static_assert(sizeof(Ipv6Address) == 16, "an IPv6 address is 16 bytes");
+static_assert(std::is_trivially_copyable_v<Ipv6Address>);
+
+// Strict textual IPv6 parse: eight groups of 1..4 hex digits, with one "::"
+// standing for one or more zero groups. No zone id, no embedded IPv4, no
+// whitespace. Returns nullopt for anything else.
+std::optional<Ipv6Address> ParseIpv6Address(const std::string &str);
+// The canonical compressed lower-case form ("2001:db8::1", "::", "::1").
+std::string ToIpv6Address(const Ipv6Address &addr);
 
 // An IPv4 header definition loosely based on the BSD version.
 struct[[gnu::packed]] Ipv4 {
