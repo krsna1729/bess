@@ -170,7 +170,7 @@ class Router final : public Module {
   std::string next_hop_attr_name_;
   std::string domain_attr_name_;
   // The route domain a packet arrived in, written by the graph's VIF; domain 0
-  // when nothing writes it (D-155).
+  // when nothing writes it (D-155, the attribute's default contract).
   int route_domain_attr_ = -1;
   // What the packet path decides from (D-155): configuration, not a guess
   // about the graph's wiring.

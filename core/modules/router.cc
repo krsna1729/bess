@@ -362,11 +362,15 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // Optional (D-155): the route domain a packet arrived in, which the graph's
   // VIF writes. No writer means domain 0, the default domain -- the same
   // attribute name the VIF uses, so a graph gets the packet's own domain with
-  // no configuration on either side.
+  // no configuration on either side. Declared with the default contract: the
+  // framework resolves it at PreResume and the packet path reads the constant
+  // without touching packet metadata when no provider exists.
+  static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
+      kDefaultRouteDomain{};
   domain_attr_name_ = arg.domain_attr().empty() ? "route_domain" : arg.domain_attr();
-  route_domain_attr_ = AddMetadataAttr(domain_attr_name_,
-                                       sizeof(bess::utils::be32_t),
-                                       bess::metadata::Attribute::AccessMode::kRead);
+  route_domain_attr_ = AddMetadataAttrWithDefault(
+      domain_attr_name_, sizeof(bess::utils::be32_t),
+      bess::metadata::Attribute::AccessMode::kRead, kDefaultRouteDomain);
   if (route_domain_attr_ < 0) {
     auto released = router_->Release();
     CHECK(released) << released.error();
@@ -402,18 +406,22 @@ int Router::OnEvent(bess::Event event) {
   // valid offset means the packet path would read byte 0, which is worth
   // saying once, here, rather than never.
   if (routes_by_destination()) {
-    const bool has_domain =
-        bess::metadata::IsValidOffset(attr_offset(route_domain_attr_));
-    if (has_domain) {
+    const bess::metadata::mt_offset_t domain_offset =
+        attr_offset(route_domain_attr_);
+    if (bess::metadata::IsValidOffset(domain_offset)) {
       LOG(INFO) << "Router '" << name()
                 << "': routing by destination address in the route domain read "
                    "from '"
                 << domain_attr_name_ << "'";
-    } else {
+    } else if (domain_offset == bess::metadata::kMetadataOffsetDefault) {
       LOG(INFO) << "Router '" << name()
                 << "': routing by destination address in domain 0 (nothing "
                    "writes '"
-                << domain_attr_name_ << "')";
+                << domain_attr_name_ << "'; its declared default applies)";
+    } else {
+      LOG(ERROR) << "Router '" << name() << "': the '" << domain_attr_name_
+                 << "' attribute is unreadable; routing by destination "
+                    "address in domain 0";
     }
     return 0;
   }
@@ -575,18 +583,17 @@ namespace {
 // prefix; route/route_domain.h), so no narrowing here -- a domain this router
 // does not hold is looked up as itself and misses instead of aliasing onto
 // another domain's FIB.
-inline route::RouteDomainId DomainOf(bess::metadata::mt_offset_t offset, bool has_domain,
-                                     bess::PacketRef pkt) {
-  return has_domain ? route::RouteDomainId(
-                          get_attr_with_offset<bess::utils::be32_t>(offset, pkt).value())
-                    : route::kDefaultRouteDomainId;
+inline route::RouteDomainId DomainOf(
+    const bess::metadata::ResolvedAttr<bess::utils::be32_t> &domain,
+    bess::PacketRef pkt) {
+  return route::RouteDomainId(domain.Get(pkt).value());
 }
 }  // namespace
 
 void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
   const int cnt = batch->cnt();
-  const bess::metadata::mt_offset_t domain_offset = attr_offset(route_domain_attr_);
-  const bool has_domain = bess::metadata::IsValidOffset(domain_offset);
+  const bess::metadata::ResolvedAttr<bess::utils::be32_t> domain =
+      ResolveAttr<bess::utils::be32_t>(route_domain_attr_);
   gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
     gates[i] = DROP_GATE;
@@ -594,18 +601,18 @@ void Router::RouteByDestination(Context *ctx, bess::PacketBatch *batch) {
   // The lookup is one call for one domain's table (Router::ResolveBatch), so
   // frames are resolved a run at a time: a batch in one domain -- the common
   // case -- is one lookup for the whole burst, and a batch that mixes domains
-  // (policy a controller writes) is resolved in runs, where a run of one is the
-  // scalar path the module used before.
+  // (policy a controller writes) is resolved in runs, where a run of one is
+  // the scalar path the module used before.
   int begin = 0;
   while (begin < cnt) {
-    const route::RouteDomainId domain =
-        DomainOf(domain_offset, has_domain, batch->packet(begin));
+    const route::RouteDomainId current =
+        DomainOf(domain, batch->packet(begin));
     int end = begin + 1;
     while (end < cnt && end - begin < static_cast<int>(bess::PacketBatch::kMaxBurst) &&
-           DomainOf(domain_offset, has_domain, batch->packet(end)) == domain) {
+           DomainOf(domain, batch->packet(end)) == current) {
       end++;
     }
-    ResolveRun(batch, begin, end, domain, gates);
+    ResolveRun(batch, begin, end, current, gates);
     begin = end;
   }
   EmitBatch(ctx, batch, gates);

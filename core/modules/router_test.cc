@@ -582,6 +582,53 @@ TEST_F(RouterTest, AnUnknownModeIsRefused) {
   EXPECT_NE("", h_.CreateError("Router", arg));
 }
 
+// The route domain is declared optional-with-default (D-177): a graph with no
+// VIF/writer routes in domain 0, and the resolved attribute is the declared
+// default, not an unresolved offset. This is the module-level half of the
+// contract; metadata_test.cc covers the framework's report.
+TEST_F(RouterTest, TheDefaultRouteDomainAppliesWithoutAWriter) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 0, 1);
+
+  // No SetMetadata (VIF) is connected: the router is the input.
+  auto out = h_.RunPipeline(rt, 0, {FrameTo("10.1.2.3")}, rt, {0, 1});
+
+  ASSERT_EQ(1u, out[1].size()) << "the domain-0 route names gate 1";
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_EQ(0u, rt->no_route_frames());
+
+  size_t i = 0;
+  bool found = false;
+  for (const auto &attr : rt->all_attrs()) {
+    if (attr.name == "route_domain") {
+      found = true;
+      EXPECT_EQ(bess::metadata::kMetadataOffsetDefault, rt->attr_offset(i));
+      EXPECT_EQ(bess::metadata::Attribute::Contract::kDefault,
+                attr.contract);
+    }
+    i++;
+  }
+  EXPECT_TRUE(found) << "the default domain attribute was not registered";
+}
+
+// A route domain the graph writes replaces the default: the same router reads
+// the packet's domain, not the constant, after the next resume.
+TEST_F(RouterTest, AWriterReplacesTheDefaultRouteDomain) {
+  Router *rt = MakeDestinationRouter(/*domains=*/2);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 1, 1);
+
+  // Domain 1 has the route; domain 0 does not.
+  auto one = RunToDestination(rt, FrameTo("10.1.2.3"), /*domain=*/1);
+  ASSERT_EQ(1u, one[1].size());
+  auto zero = RunToDestination(rt, FrameTo("10.1.2.3"), /*domain=*/0);
+  EXPECT_TRUE(zero[0].empty());
+  EXPECT_TRUE(zero[1].empty());
+}
+
 // A destination the FIB does not cover, and a hop whose neighbor is not
 // resolved: both drop, and both say why.
 TEST_F(RouterTest, AMissAndAnUnresolvedNeighborAreDroppedAndCounted) {
