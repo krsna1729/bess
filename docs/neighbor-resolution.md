@@ -204,12 +204,16 @@ that needs a non-link-local scope must use distinct interfaces or addresses.
 
 Solicitations are sent to the target's solicited-node multicast address
 (`ff02::1:ffXX:XXXX`, MAC `33:33:ff:XX:XX:XX`), with the interface's own
-address as source. `Vif` answers a solicitation for its local address in
-place with `AnswerNeighborSolicitationInPlace`, setting S and O for a normal
-solicitation and answering a duplicate-address-detection solicitation (source
-`::`, no source link-layer option) to all-nodes without S/O. That responder is
-still packet mechanics, not resolution: `Vif` does not learn from a
-solicitation and never creates or updates a neighbor entry.
+address as source. `Vif` answers a solicitation for its local address with
+`AnswerNeighborSolicitation`, setting S for a normal solicitation and
+answering a duplicate-address-detection solicitation (source `::`, no source
+link-layer option, destination the target's solicited-node group) to
+all-nodes with S clear. Every answer carries the target link-layer option:
+RFC 4861 7.2.4 requires it because the solicitation's destination is
+multicast, so a 78-byte DAD solicitation produces an 86-byte answer and
+`Vif` grows the packet into its tailroom. That responder is still packet
+mechanics, not resolution: `Vif` does not learn from a solicitation and never
+creates or updates a neighbor entry.
 
 The configuration API adds `ipv6_addr` to a Vif interface, alongside
 `ip_addr`; the readback emits it when set. The Vif `ipv6_addr` does not

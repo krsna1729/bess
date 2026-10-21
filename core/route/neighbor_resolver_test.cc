@@ -1208,28 +1208,39 @@ TEST(NeighborResolverTest, AnswerNeighborSolicitationHandlesUnicastAndDad) {
   std::array<uint8_t, kNdFrameSize> solicitation{};
   ASSERT_EQ(kNdFrameSize,
             BuildNeighborSolicitation(peer_mac, kPeer6, kMy6, solicitation));
-  const auto original = solicitation;
-  ASSERT_TRUE(AnswerNeighborSolicitationInPlace(solicitation, my_mac, kMy6));
-  NdMessage answer = Nd(ParseNeighborDiscovery(solicitation));
+  std::array<uint8_t, kNdFrameSize> reply{};
+  ASSERT_EQ(kNdFrameSize,
+            AnswerNeighborSolicitation(solicitation, my_mac, kMy6, reply));
+  NdMessage answer = Nd(ParseNeighborDiscovery(reply));
   EXPECT_EQ(NdType::kNeighborAdvertisement, answer.type);
   EXPECT_TRUE(answer.solicited);
   EXPECT_TRUE(answer.override);
   EXPECT_EQ(kMy6, answer.source_ip);
   EXPECT_EQ(kPeer6, answer.destination_ip);
-  EXPECT_EQ(peer_mac,
-            reinterpret_cast<Ethernet *>(solicitation.data())->dst_addr);
+  EXPECT_EQ(peer_mac, reinterpret_cast<Ethernet *>(reply.data())->dst_addr);
   ASSERT_TRUE(answer.target_ll.has_value());
   EXPECT_EQ(my_mac, answer.target_ll.value_or(Ethernet::Address{}));
 
-  // A solicitation for another address is left alone.
-  auto other = original;
-  EXPECT_FALSE(
-      AnswerNeighborSolicitationInPlace(other, my_mac, Ipv6("fe80::99")));
-  EXPECT_EQ(original, other);
+  // A solicitation for another address is not answered and the output stays
+  // untouched.
+  std::array<uint8_t, kNdFrameSize> untouched{};
+  EXPECT_EQ(0u, AnswerNeighborSolicitation(solicitation, my_mac,
+                                           Ipv6("fe80::99"), untouched));
+  const std::array<uint8_t, kNdFrameSize> empty{};
+  EXPECT_EQ(empty, untouched);
+  // An output buffer that cannot hold the 86-byte answer (with its target
+  // link-layer option) is refused rather than truncated.
+  std::array<uint8_t, kEthFrameWithoutOption> too_small{};
+  EXPECT_EQ(0u, AnswerNeighborSolicitation(solicitation, my_mac, kMy6,
+                                           too_small));
+  const std::array<uint8_t, kEthFrameWithoutOption> empty_small{};
+  EXPECT_EQ(empty_small, too_small);
 
   // A duplicate-address-detection solicitation (source ::, no source
-  // link-layer option) is answered to all-nodes without S or O, in the
-  // solicitation's own 78-byte size.
+  // link-layer option) is answered to all-nodes with the Solicited flag
+  // clear. The answer still carries the target link-layer option: RFC 4861
+  // 7.2.4 requires it because the solicitation's destination is multicast,
+  // so the 78-byte solicitation becomes an 86-byte answer.
   std::array<uint8_t, kEthFrameWithoutOption> dad{};
   ASSERT_EQ(kEthFrameWithoutOption,
             internal::WriteIpv6Nd(dad, SolicitedNodeMac(kMy6), peer_mac,
@@ -1244,15 +1255,44 @@ TEST(NeighborResolverTest, AnswerNeighborSolicitationHandlesUnicastAndDad) {
   payload[2] = static_cast<uint8_t>(checksum & 0xffu);
   payload[3] = static_cast<uint8_t>(checksum >> 8u);
 
-  EXPECT_TRUE(AnswerNeighborSolicitationInPlace(dad, my_mac, kMy6));
-  answer = Nd(ParseNeighborDiscovery(dad));
+  reply = {};
+  ASSERT_EQ(kNdFrameSize,
+            AnswerNeighborSolicitation(dad, my_mac, kMy6, reply));
+  answer = Nd(ParseNeighborDiscovery(reply));
   EXPECT_EQ(NdType::kNeighborAdvertisement, answer.type);
   EXPECT_FALSE(answer.solicited);
-  EXPECT_FALSE(answer.override);
+  EXPECT_TRUE(answer.override);  // the target option is present
   EXPECT_EQ(AllNodesAddress(), answer.destination_ip);
   EXPECT_EQ(AllNodesMac(),
-            reinterpret_cast<Ethernet *>(dad.data())->dst_addr);
-  EXPECT_FALSE(answer.target_ll.has_value());
+            reinterpret_cast<Ethernet *>(reply.data())->dst_addr);
+  ASSERT_TRUE(answer.target_ll.has_value());
+  EXPECT_EQ(my_mac, answer.target_ll.value_or(Ethernet::Address{}));
+
+  // RFC 4861 7.1.1: a solicitation from :: must go to the target's
+  // solicited-node multicast address. A unicast (or ::, or another group)
+  // destination is not valid duplicate-address detection and is silently
+  // discarded. Each rejected frame recomputes a valid ICMPv6 checksum over
+  // the new destination, so only the destination guard can be the reason.
+  ASSERT_TRUE(ParseNeighborDiscovery(dad).has_value());
+  for (const Ipv6Address &bad_destination :
+       {kMy6, Ipv6Address{}, AllNodesAddress()}) {
+    auto bad_dad = dad;
+    uint8_t *bad_ip = bad_dad.data() + sizeof(Ethernet);
+    std::memcpy(bad_ip + 24, bad_destination.bytes, 16);
+    uint8_t *bad_payload =
+        bad_dad.data() + sizeof(Ethernet) + kIpv6HeaderSize;
+    bad_payload[2] = 0;
+    bad_payload[3] = 0;
+    const uint16_t bad_checksum = internal::Icmpv6ChecksumSum(
+        Ipv6Address{}, bad_destination,
+        std::span<const uint8_t>(bad_payload, kNdMessageSize));
+    bad_payload[2] = static_cast<uint8_t>(bad_checksum & 0xffu);
+    bad_payload[3] = static_cast<uint8_t>(bad_checksum >> 8u);
+    EXPECT_EQ(0u, internal::Icmpv6ChecksumSum(
+                      Ipv6Address{}, bad_destination,
+                      std::span<const uint8_t>(bad_payload, kNdMessageSize)));
+    EXPECT_FALSE(ParseNeighborDiscovery(bad_dad).has_value());
+  }
 }
 
 TEST(NeighborResolverTest, NdConcurrentPublishAndLookupNeverSeeAHalfUpdate) {

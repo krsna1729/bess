@@ -456,26 +456,46 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
 
     // Answer a Neighbor Solicitation for a local IPv6 address. The ARP path
-    // above is unchanged; this is the same local-responder split for ND.
+    // above is unchanged; this is the same local-responder split for ND. The
+    // answer always carries the target link-layer option (RFC 4861 7.2.4),
+    // so it is kNdFrameSize even for a DAD solicitation that had no option:
+    // the packet grows into its tailroom.
     if (eth->ether_type == be16_t(Ethernet::Type::kIpv6)) {
       uint8_t *bytes = pkt.head_data<uint8_t *>();
-      const std::span<uint8_t> frame(bytes, pkt.head_len());
+      const std::span<const uint8_t> frame(bytes, pkt.head_len());
       const std::optional<bess::route::NdMessage> nd =
           bess::route::ParseNeighborDiscovery(frame);
       if (nd && nd->type == bess::route::NdType::kNeighborSolicitation) {
         const Interface *iface = LookupByIpv6(vlan, nd->target_ip);
+        // The answer is always kNdFrameSize. A linear packet grows into its
+        // tailroom (or shrinks) with both lengths updated; a chained packet's
+        // later segments are not ours to rewrite, so only a first segment of
+        // exactly the answer's size is replaced, leaving every segment length
+        // (and pkt_len) unchanged.
+        const bool linear = pkt.is_linear();
         if (iface != nullptr &&
-            bess::route::AnswerNeighborSolicitationInPlace(
-                frame, iface->mac_addr, iface->ipv6_addr)) {
-          if (write_vif) {
-            _set_attr_with_offset<be32_t>(vif_offset, pkt, be32_t(iface->id));
+            (linear || pkt.head_len() == bess::route::kNdFrameSize)) {
+          const size_t capacity =
+              pkt.head_len() + (linear ? pkt.tailroom() : 0);
+          const std::span<uint8_t> out(bytes, capacity);
+          const size_t answered = bess::route::AnswerNeighborSolicitation(
+              frame, iface->mac_addr, iface->ipv6_addr, out);
+          if (answered != 0) {
+            if (write_vif) {
+              _set_attr_with_offset<be32_t>(vif_offset, pkt,
+                                            be32_t(iface->id));
+            }
+            if (write_domain) {
+              _set_attr_with_offset<be32_t>(domain_offset, pkt,
+                                            be32_t(iface->route_domain));
+            }
+            if (linear) {
+              pkt.set_data_len(static_cast<uint16_t>(answered));
+              pkt.set_total_len(static_cast<uint32_t>(answered));
+            }
+            EmitPacket(ctx, pkt, iface->gate);
+            continue;
           }
-          if (write_domain) {
-            _set_attr_with_offset<be32_t>(domain_offset, pkt,
-                                          be32_t(iface->route_domain));
-          }
-          EmitPacket(ctx, pkt, iface->gate);
-          continue;
         }
       }
     }

@@ -11931,7 +11931,7 @@ design question, not another state machine).
 **Status:** accepted (2026-10-21), experimental API. **Code:**
 `core/route/neighbor_resolver.h` (`OnNd`, IPv6 `Key`/`Interface`),
 `core/route/neighbor_table.h` (family-keyed `NeighborAddress`), `core/route/l3_packet.h`
-(ND parse/build and `AnswerNeighborSolicitationInPlace`), `core/modules/vif.*`,
+(ND parse/build and `AnswerNeighborSolicitation`), `core/modules/vif.*`,
 `protobuf/module_msg.proto` (`VifInterfaceValue.ipv6_addr`),
 `core/route/neighbor_resolver_test.cc`, `core/modules/vif_test.cc`,
 `docs/neighbor-resolution.md`.
@@ -11962,9 +11962,14 @@ had nowhere to go without a second table or a second resolver.
   timer refusal ignores the advertisement rather than keeping a resolved
   neighbor with no timer.
 - **Vif answers, it still does not resolve.** `Vif` calls
-  `AnswerNeighborSolicitationInPlace`: a normal NS is rewritten into a
-  solicited NA with TLL; a DAD NS (source `::`, no SLL) is answered to
-  all-nodes with S=O=0. Vif adds `ipv6_addr` to its interface and its resource
+  `AnswerNeighborSolicitation`: a normal NS becomes a solicited NA, and a DAD
+  NS (source `::`, no SLL) is answered to all-nodes with S clear. Every answer
+  carries the target link-layer option -- RFC 4861 7.2.4 requires it because
+  the solicitation's destination is multicast -- so a 78-byte DAD solicitation
+  produces an 86-byte answer and `Vif` grows the packet within its tailroom;
+  with the option present the O flag is set. Validation also requires a DAD
+  solicitation's destination to be the target's solicited-node group
+  (RFC 4861 7.1.1). Vif adds `ipv6_addr` to its interface and its resource
   readback; the address is not a demux key and is not metadata.
 - **FIB stays IPv4.** IPv6 next hops use the existing `NextHop` shape, so an
   IPv6 FIB can be added without changing adjacency or publication. Until
@@ -11981,11 +11986,13 @@ contents, NA resolving with the interface source MAC, aging and re-solicitation,
 unsolicited/override MAC semantics, retry/failure/recovery, wrong
 interface/target/source, Ethernet destination and unusable MAC rejection,
 malformed IP/ICMP/option/checksum/hop-limit cases including a solicited
-all-nodes advertisement, timestamp/multicast helpers, the unspecified
-interface-address guard,
+all-nodes advertisement, a DAD solicitation with a unicast destination
+rejected and its multicast answer carrying TLL, timestamp/multicast helpers,
+the unspecified interface-address guard,
 concurrent publish/lookup, and the ND variants of the fault-injection tests.
-`modules_vif_test` adds `LocalNeighborSolicitationResponder` and keeps the ARP
-and resource tests unchanged.
+`modules_vif_test` adds `LocalNeighborSolicitationResponder` (normal and DAD
+answers, the latter growing the 78-byte frame to the 86-byte answer) and keeps
+the ARP and resource tests unchanged.
 
 **Not done.** IPv6 FIB/routes; Router Advertisement, redirects, duplicate
 address detection as a resolver state, proxy NDP, and source-address scope

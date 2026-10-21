@@ -482,8 +482,8 @@ class NeighborResolver {
 
   // Feeds one IPv6 Neighbor Discovery frame received on `ingress` to the
   // resolver. Only Neighbor Advertisements are learned from; Neighbor
-  // Solicitations are the local responder's (AnswerNeighborSolicitationInPlace
-  // in l3_packet.h). The advertisement names its neighbor by target address,
+  // Solicitations are the local responder's (AnswerNeighborSolicitation in
+  // l3_packet.h). The advertisement names its neighbor by target address,
   // not by source: a non-proxy advertisement has source == target, which this
   // library requires, and its target link-layer option (or the Ethernet
   // source when the option is absent) is the address to publish. A solicited

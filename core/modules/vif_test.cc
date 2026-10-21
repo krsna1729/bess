@@ -299,6 +299,64 @@ TEST_F(VifTest, LocalNeighborSolicitationResponder) {
   EXPECT_EQ(vif_mac,
             advertisement.target_ll.value_or(Ethernet::Address{}));
 
+  // A duplicate-address-detection solicitation (source ::, no source
+  // link-layer option) is 78 bytes. The answer still carries the target
+  // link-layer option (RFC 4861 7.2.4: the solicitation's destination is
+  // multicast), so Vif grows the packet to the 86-byte ND frame before it
+  // emits it to all-nodes with the Solicited flag clear.
+  constexpr size_t kDadLen = sizeof(Ethernet) +
+                             bess::route::kIpv6HeaderSize +
+                             bess::route::kNdMessageSize;
+  std::array<uint8_t, kDadLen> dad{};
+  ASSERT_EQ(kDadLen, bess::route::internal::WriteIpv6Nd(
+                         dad, bess::route::SolicitedNodeMac(my_ip), peer_mac,
+                         Ipv6Address{},
+                         bess::route::SolicitedNodeAddress(my_ip),
+                         bess::route::kNdMessageSize));
+  uint8_t *dad_payload =
+      dad.data() + sizeof(Ethernet) + bess::route::kIpv6HeaderSize;
+  dad_payload[0] =
+      static_cast<uint8_t>(bess::route::NdType::kNeighborSolicitation);
+  std::memcpy(dad_payload + 8, my_ip.bytes, 16);
+  const uint16_t dad_checksum = bess::route::internal::Icmpv6ChecksumSum(
+      Ipv6Address{}, bess::route::SolicitedNodeAddress(my_ip),
+      std::span<const uint8_t>(dad_payload, bess::route::kNdMessageSize));
+  dad_payload[2] = static_cast<uint8_t>(dad_checksum & 0xffu);
+  dad_payload[3] = static_cast<uint8_t>(dad_checksum >> 8u);
+
+  bess::PacketHandle dad_pkt = pool.Alloc();
+  ASSERT_NE(nullptr, dad_pkt);
+  PacketRef dad_ref(dad_pkt);
+  uint8_t tagged_dad[128] = {};
+  std::memcpy(tagged_dad, dad.data(), 12);
+  tagged_dad[12] = 0x81;
+  tagged_dad[13] = 0x00;
+  tagged_dad[14] = 0x00;
+  tagged_dad[15] = 100;
+  std::memcpy(tagged_dad + 16, dad.data() + 12, dad.size() - 12);
+  std::memcpy(dad_ref.append(dad.size() + 4), tagged_dad, dad.size() + 4);
+
+  PacketBatch dad_batch;
+  dad_batch.clear();
+  dad_batch.add(dad_ref);
+  vif->ProcessBatch(&ctx, &dad_batch);
+
+  EXPECT_EQ(bess::route::kNdFrameSize, dad_ref.data_len());
+  const bess::route::NdMessage dad_answer = ParsedNd(
+      bess::route::ParseNeighborDiscovery(std::span<const uint8_t>(
+          dad_ref.head_data<const uint8_t *>(), dad_ref.data_len())));
+  EXPECT_EQ(bess::route::NdType::kNeighborAdvertisement, dad_answer.type);
+  EXPECT_FALSE(dad_answer.solicited);
+  EXPECT_TRUE(dad_answer.override);
+  EXPECT_EQ(bess::route::AllNodesAddress(), dad_answer.destination_ip);
+  EXPECT_EQ(bess::route::AllNodesMac(),
+            dad_ref.head_data<const Ethernet *>()->dst_addr);
+  EXPECT_EQ(vif_mac, dad_answer.source_mac);
+  EXPECT_EQ(my_ip, dad_answer.target_ip);
+  ASSERT_TRUE(dad_answer.target_ll.has_value());
+  EXPECT_EQ(vif_mac, dad_answer.target_ll.value_or(Ethernet::Address{}));
+
+  bess::PacketFree(dad_pkt);
   bess::PacketFree(pkt);
 }
 

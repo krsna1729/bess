@@ -467,8 +467,10 @@ inline bool VerifyIcmpv6Checksum(const Ipv6Address &source,
 // ICMPv6, hop limit other than 255, a bad ICMPv6 checksum, a multicast or
 // unspecified target, a multicast source, a truncated or malformed option, and
 // a link-layer option that disagrees with the Ethernet source. A source
-// address of :: is allowed only for a solicitation without a source link-layer
-// option (duplicate-address detection).
+// address of :: is allowed only for duplicate-address detection: a solicitation
+// with no source link-layer option whose destination is the target's
+// solicited-node multicast address (RFC 4861 7.1.1). An advertisement sent to a
+// multicast destination must have the Solicited flag clear.
 inline std::optional<NdMessage> ParseNeighborDiscovery(
     std::span<const uint8_t> frame) noexcept {
   constexpr size_t kEth = sizeof(utils::Ethernet);
@@ -553,8 +555,14 @@ inline std::optional<NdMessage> ParseNeighborDiscovery(
     offset += length;
   }
   if (message.type == NdType::kNeighborSolicitation &&
-      message.source_ip.IsUnspecified() && message.source_ll) {
-    return std::nullopt;
+      message.source_ip.IsUnspecified()) {
+    // RFC 4861 7.1.1: a solicitation from :: is duplicate-address detection.
+    // Its destination must be the target's solicited-node multicast address
+    // and it must not carry a source link-layer option.
+    if (message.source_ll ||
+        message.destination_ip != SolicitedNodeAddress(message.target_ip)) {
+      return std::nullopt;
+    }
   }
   return message;
 }
@@ -663,40 +671,36 @@ inline size_t BuildNeighborAdvertisement(
   return size;
 }
 
-// Answers a Neighbor Solicitation for `my_ip` in place, like
-// AnswerArpRequest: the frame becomes the solicited Neighbor Advertisement
-// (S and O set). A duplicate-address-detection solicitation (source ::, which
-// has no source link-layer option) is answered to the all-nodes multicast
-// address; any other goes to the solicitation's unicast source. False and the
-// frame unchanged for anything that is not a solicitation for `my_ip`.
-inline bool AnswerNeighborSolicitationInPlace(
-    std::span<uint8_t> frame, const utils::Ethernet::Address &my_mac,
-    const Ipv6Address &my_ip) noexcept {
+// Answers a Neighbor Solicitation for `my_ip` into `out`, like
+// AnswerArpRequest: the solicitation becomes the solicited Neighbor
+// Advertisement. Every answer carries the Target Link-Layer Address option: a
+// solicitation is addressed to the target's solicited-node multicast address
+// and RFC 4861 7.2.4 requires the option when the solicitation's destination
+// is multicast, duplicate-address detection included. A DAD solicitation
+// (source ::, which has no source link-layer option) is answered to the
+// all-nodes multicast address with the Solicited flag clear; with the option
+// present the Override flag is set. Returns the frame length written (always
+// kNdFrameSize), or 0 and `out` unchanged for anything that is not a
+// solicitation for `my_ip` or when `out` is too small.
+inline size_t AnswerNeighborSolicitation(std::span<const uint8_t> frame,
+                                         const utils::Ethernet::Address &my_mac,
+                                         const Ipv6Address &my_ip,
+                                         std::span<uint8_t> out) noexcept {
   const std::optional<NdMessage> solicitation =
       ParseNeighborDiscovery(frame);
   if (!solicitation || solicitation->type != NdType::kNeighborSolicitation ||
       solicitation->target_ip != my_ip) {
-    return false;
+    return 0;
   }
   const bool unspecified = solicitation->source_ip.IsUnspecified();
   const Ipv6Address destination_ip =
       unspecified ? AllNodesAddress() : solicitation->source_ip;
   const utils::Ethernet::Address destination_mac =
       unspecified ? AllNodesMac() : solicitation->source_mac;
-  // A duplicate-address-detection solicitation has no source link-layer
-  // option and its reply must fit the solicitation's own size (no target
-  // option); a normal answer includes the target link-layer option.
-  const bool include_target_ll = frame.size() >= kNdFrameSize;
-  std::array<uint8_t, kNdFrameSize> reply{};
-  const size_t size = BuildNeighborAdvertisement(
+  return BuildNeighborAdvertisement(
       my_mac, my_ip, my_ip, destination_mac, destination_ip,
-      /*solicited=*/!unspecified, /*override=*/!unspecified, reply,
-      include_target_ll);
-  if (size == 0 || size > frame.size()) {
-    return false;
-  }
-  std::memcpy(frame.data(), reply.data(), size);
-  return true;
+      /*solicited=*/!unspecified, /*override=*/true, out,
+      /*include_target_ll=*/true);
 }
 
 }  // namespace bess::route
