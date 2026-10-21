@@ -58,23 +58,6 @@ RecordArena::Id RecordArena::Allocate() {
   return id;
 }
 
-std::byte *RecordArena::Base(Id id) const noexcept {
-  const uint32_t chunk = id >> kChunkBits;
-  // The reader path touches only the fixed published_ array and the acquired
-  // chunk pointer: chunks_ belongs to the writer. A chunk is published before
-  // any id in it can name a record, and its pointer only becomes non-null
-  // once the bytes exist, so a null pointer is the not-allocated case.
-  if (id == 0 || chunk >= kMaxChunks) {
-    return nullptr;
-  }
-  const std::byte *base = published_[chunk].load(std::memory_order_acquire);
-  if (base == nullptr) {
-    return nullptr;
-  }
-  const uint32_t offset = id & ((1u << kChunkBits) - 1);
-  return const_cast<std::byte *>(base) + static_cast<size_t>(offset) * stride_;
-}
-
 void RecordArena::Free(Id id) noexcept {
   std::byte *slot = Base(id);
   *reinterpret_cast<Id *>(slot) = free_head_;
@@ -88,14 +71,6 @@ MutableBytes RecordArena::Record(Id id) noexcept {
     return {};
   }
   return MutableBytes(base, record_size_);
-}
-
-ConstBytes RecordArena::Lookup(Id id) const noexcept {
-  const std::byte *base = Base(id);
-  if (base == nullptr) {
-    return {};
-  }
-  return ConstBytes(base, record_size_);
 }
 
 void RecordArena::Abort(Id id) noexcept {

@@ -783,3 +783,63 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | LPM lookup and update cost | `route_bench` |
 | the Router's destination path at scale (route count × destination spread), LPM and FIB | `live_perf --tests M.router,M.router/s256,M.router/s64k,M.router/r2560s64k,M.router/r2560,M.router/r10240,M.router/r65536,M.router/r2560s64k-fib` |
 | meters, counters, RCU | `meter_bench`, `stats_bench`, `rcu_bench` |
+
+### Classifier result placement: live comparison
+
+`tests/perf/live_perf.cc` contains `M.place/*` arms for direct EM/WM result
+placement and EM→EM / WM→EM composition. The first table has 1,024 or 65,536
+rules. Uniform records contain 1–8 four-byte fields; `mixed8` and `mixed16`
+use heterogeneous widths. The second table holds 100%, 50%, 30%, 20%, 10%,
+or 5% as many entries (mixed-width arms use 100%, 50%, and 20%).
+
+Hits use the connected gate 0 and misses drop. After each measurement the
+runner pauses workers and checks that every source packet traversed the first
+classifier, the second classifier when present, and the metadata reader.
+A failed check discards the timing and counters instead of reporting a
+successful measurement of an incomplete path.
+
+**Earlier placement figures are invalid.** The original arms sent hits to
+unconnected gate 1 while connecting gate 0. They measured classification and
+result handling followed by a dead end, not the complete pipeline; the second
+lookup and reader were not reached. Do not use those figures or their claimed
+crossover points to choose an architecture.
+
+Use the same corrected runner for both daemon builds, pinned to an isolated
+core with its SMT sibling offline. Save raw rounds with `--save`; compare
+cycles and instructions per packet as well as elapsed time, and retain the
+spread. Alternate build order (`--rounds 2` runs A/B then B/A). WM uses one
+all-ones tuple in these arms: results do not establish the cost of a
+many-tuple wildcard policy. Turbo-off does not guarantee a fixed clock on a
+laptop, so record the platform power profile too.
+
+#### Corrected EM/WM placement comparison
+
+The final implementation uses inline `RecordArena` accessors. This corrected
+`M.place/*` sweep covers N=1,024 and 65,536, uniform widths M=1..8,
+`mixed8` / `mixed16`, and all configured second-table ratios. All 256 placement
+cases passed the path validator. Values below are median `cycles/packet /
+ns/packet` after subtracting `M.base` per run.
+
+| classifier | direct inline | two-stage (R=100%) | direct cost reduction |
+|---|---:|---:|---:|
+| EM | 56.27 / 21.71 | 133.52 / 51.42 | 57.8% |
+| WM | 84.89 / 32.71 | 167.25 / 64.44 | 49.2% |
+
+R=100% gives one second-table entry per action and compares the same 20
+geometries. Across all configured ratios, median two-stage cost was 125.93
+cycles / 48.53 ns for EM→EM and 157.43 cycles / 60.69 ns for WM→EM.
+
+These are the first valid placement comparisons. The earlier claimed
+`up to 27 cycles/packet` reduction and crossover figures are withdrawn:
+their gate mismatch prevented the second classifier and reader from receiving
+the measured traffic, so those results cannot be compared with this sweep.
+Raw rounds are retained locally under `.scratch/recordarena-evidence/`.
+
+A 10-round, 3 s/round repeat at M=4, N=65,536 in the final build:
+
+| classifier | direct inline | two-stage (R=100%) |
+|---|---:|---:|
+| EM | 61.44 / 23.71 | 155.58 / 59.94 |
+| WM | 101.65 / 39.17 | 215.77 / 83.14 |
+
+Raw repeat: `.scratch/recordarena-evidence/repeat10-m4-n65536.json`.
