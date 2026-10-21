@@ -22,6 +22,7 @@
 #include "dataplane/cpu_id.h"
 #include "dataplane/worker_id.h"
 #include "gate.h"
+#include "message.h"
 #include "utils/common.h"
 #include "utils/random.h"
 
@@ -278,8 +279,22 @@ class WorkerPauser {
   explicit WorkerPauser();
   ~WorkerPauser();
 
+  // Runs the resume hooks, sends PreResume to the workers' modules and resumes
+  // the workers this pauser paused. On a hook failure the workers stay paused
+  // and the error is returned: a graph whose required metadata contract has no
+  // provider must not run. Idempotent; the destructor calls it.
+  std::optional<CommandResponse> Resume();
+
  private:
   std::list<bess::dataplane::WorkerId> workers_paused_;
+  // True once Resume() has actually resumed them; the destructor then must
+  // not attach orphans, which asserts no worker is running.
+  bool workers_resumed_ = false;
+  // Orphan attachment happens at most once: an explicit Resume() followed by
+  // the destructor must not attach twice, and a failed Resume() keeps its
+  // error so the destructor still logs it.
+  bool orphans_attached_ = false;
+  std::optional<CommandResponse> resume_error_;
 };
 
 #endif  // BESS_WORKER_H_

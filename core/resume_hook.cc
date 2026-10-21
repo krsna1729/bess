@@ -37,12 +37,17 @@ bool ResumeHookBuilder::RegisterResumeHook(
       .second;
 }
 
-void run_global_resume_hooks(bool run_modules) {
+std::optional<CommandResponse> run_global_resume_hooks(bool run_modules) {
   auto &hooks = global_resume_hooks;
 
   for (auto &hook : hooks) {
     VLOG(1) << "Running global resume hook '" << hook->name() << "'";
-    hook->Run();
+    std::optional<CommandResponse> ret = hook->Run();
+    if (ret) {
+      LOG(ERROR) << "Resume hook '" << hook->name() << "' failed: "
+                 << ret->error().errmsg() << "; workers stay paused";
+      return ret;
+    }
   }
 
   if (run_modules) {
@@ -56,6 +61,7 @@ void run_global_resume_hooks(bool run_modules) {
       }
     }
   }
+  return std::nullopt;
 }
 
 }  // namespace bess

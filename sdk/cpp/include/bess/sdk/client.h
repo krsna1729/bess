@@ -165,15 +165,19 @@ struct PipelineVersion {
   bool operator==(const PipelineVersion &) const = default;
 };
 
-// What Client::Pipeline reads besides the topology (D-129).
+// What Client::Pipeline reads besides the topology (D-129, D-177).
 struct PipelineQuery {
   bool include_resources = false;
   std::vector<std::string> resources;  // with include_resources: only these (empty: all)
+  bool include_metadata = false;       // also fill PipelineSnapshot::metadata
 };
 
 struct PipelineSnapshot {
   pb::Pipeline pipeline;
   PipelineVersion version;
+  // The metadata report as of the last resume/apply, when the query asked for
+  // it; empty otherwise.
+  pb::MetadataReport metadata;
   // Where each worker runs, as the daemon observes it (D-123): the core an
   // automatic worker was given, and whether it shares a physical core with
   // another worker or a control CPU. Empty against a daemon that predates the

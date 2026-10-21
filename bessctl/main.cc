@@ -45,6 +45,9 @@ using bess::sdk::Error;
 constexpr std::string_view kUsage = R"(usage: bessctl [-s HOST:PORT] COMMAND [ARGS]
 
   status                         daemon version, epoch, plugins, ports
+  metadata                       metadata attributes by contract: unread
+                                 writers, readers without a writer,
+                                 unsatisfied required and applied defaults
   schema [CLASS]                 module classes and port drivers, or one class
   get [-o json|yaml]             the active pipeline with its resources'
                                  contents, as a manifest (its version on
@@ -181,6 +184,48 @@ class Cli {
     for (const pb::PortInfo &p : caps->ports()) {
       std::println("port         {} driver {} rx {} tx {}", p.name(), p.driver(), p.rx_queues(),
                    p.tx_queues());
+    }
+    return 0;
+  }
+
+  int Metadata() {
+    auto snap = client_->Pipeline({.include_metadata = true});
+    if (!snap) {
+      return Fail(snap.error());
+    }
+    const pb::MetadataReport &report = snap->metadata;
+    bool any = false;
+    auto print = [&any](std::string_view heading, const auto &list) {
+      if (list.empty()) {
+        return;
+      }
+      any = true;
+      std::println("{}:", heading);
+      for (const auto &d : list) {
+        std::println("  {}/{} ({} bytes, {}, {})", d.module(), d.attribute(),
+                     d.size(), d.mode(), d.contract());
+      }
+    };
+    print("writers without a reader", report.writers_without_reader());
+    print("readers without a writer", report.readers_without_writer());
+    print("required, unsatisfied", report.unsatisfied_required());
+    print("defaults applied", report.defaults_applied());
+    if (!report.conflicts().empty()) {
+      any = true;
+      std::println("conflicting declarations:");
+      for (const auto &c : report.conflicts()) {
+        std::print("  {}: {}", c.attribute(), c.reason());
+        for (const std::string &module : c.modules()) {
+          std::print(" {}", module);
+        }
+        std::println();
+      }
+    }
+    if (!any) {
+      std::println(
+          "metadata: {} attributes registered, {} resolved; all contracts "
+          "satisfied",
+          report.declarations(), report.resolved());
     }
     return 0;
   }
@@ -685,6 +730,9 @@ int bess::ctl::Main(int argc, char **argv) {
   };
   if (command == "status" && rest.empty()) {
     return cli.Status();
+  }
+  if (command == "metadata" && rest.empty()) {
+    return cli.Metadata();
   }
   if (command == "schema" && rest.size() <= 1) {
     return cli.ShowSchema(rest);

@@ -636,6 +636,52 @@ Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ r
   _set_attr_with_offset<bess::utils::be32_t>(action_offset_, pkt, bess::utils::be32_t(action_id));
   ```
 
+### Metadata contracts
+
+The access mode says what a module does with an attribute (`kRead`, `kWrite`,
+`kUpdate`). A contract says what a **reader** may assume when the graph does not
+write it; the two are orthogonal, and a writer's contract is ignored. The
+third and fourth arguments of `AddMetadataAttr` select it, so every existing
+declaration is best-effort:
+
+| Contract | Declaration | A reader with no provider |
+|---|---|---|
+| best-effort (default) | `AddMetadataAttr(name, size, kRead)` | `attr_offset()` is `kMetadataOffsetNoRead`; the module decides (drop, fall back to a packet field, inject on resume). Historical behavior, unchanged. |
+| required | `AddMetadataAttr(name, size, kRead, Attribute::Contract::kRequired)` | Resume fails with `EINVAL` naming the module and attribute. `ApplyPipeline` that resumes workers reports the same refusal; the workers stay paused. |
+| optional with default | `AddMetadataAttrWithDefault(name, size, kRead, bytes)` (or `kDefault` for a zero default) | `attr_offset()` is `kMetadataOffsetDefault`; `ResolveAttr<T>(id).Get(pkt)` returns the declared value and never touches packet metadata. |
+
+A defaulted attribute needs no provider-side change: if a writer appears in a
+later graph revision, the next resume assigns a real offset and the same
+`ResolvedAttr` reads the packet. Resolution happens once per batch, so a
+default costs no per-packet work and the valid-offset path is the load it was:
+
+```cpp
+// In Init:
+static constexpr std::array<uint8_t, 4> kDefaultDomain{};
+domain_attr_ = AddMetadataAttrWithDefault(
+    "route_domain", sizeof(bess::utils::be32_t),
+    bess::metadata::Attribute::AccessMode::kRead, kDefaultDomain);
+
+// In PreResume (or lazily on the first run):
+domain_ = ResolveAttr<bess::utils::be32_t>(domain_attr_);
+
+// In ProcessBatch:
+auto domain = domain_.Get(pkt);
+```
+
+`bess::utils::be32_t` is used above because metadata bytes are copied as the
+writer stored them; `ResolvedAttr<T>::default_value` is assembled from the
+declared bytes with `memcpy`, the same way `get_attr_with_offset<T>` reads a
+packet.
+
+**Validation report.** Every resume/apply with workers paused computes the
+graph's metadata categories. `GetPipeline` returns it with
+`include_metadata: true` as `MetadataReport`, and `bessctl metadata` prints it:
+writers without a reader, readers without a writer, unsatisfied required
+declarations, applied defaults, and declarations of one name that disagree
+about contract or default bytes or have more than one writer scope. A declaration's `size` conflict is already
+refused when the second module is created, so it cannot reach a report.
+
 ---
 
 ## 5. Dynamic Loading Semantics

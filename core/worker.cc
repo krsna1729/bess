@@ -341,19 +341,50 @@ void send_pre_resume(WorkerId wid, std::set<Module *> *sent) {
   }
 }
 
-WorkerPauser::~WorkerPauser() {
-  if (--pauser_depth == 0) {
-    attach_orphans();  // All workers should be paused at this point.
+std::optional<CommandResponse> WorkerPauser::Resume() {
+  if (workers_paused_.empty()) {
+    // Already attempted (success or failure): return the stored failure so the
+    // destructor's call still logs it, rather than masking it with success.
+    return resume_error_;
   }
 
-  if (!workers_paused_.empty()) {
-    bess::run_global_resume_hooks(false);
+  // A nested pauser leaves orphan attachment and resumption to the outermost
+  // one, as before. Attach at most once: an explicit Resume() before the
+  // destructor must not attach again with workers already running.
+  if (pauser_depth == 1 && !orphans_attached_) {
+    attach_orphans();  // All workers should be paused at this point.
+    orphans_attached_ = true;
+  }
+
+  // Take the list first: on failure the workers stay paused, and a second call
+  // (the destructor's) must not run the hooks again.
+  const std::list<WorkerId> paused = std::move(workers_paused_);
+  workers_paused_.clear();
+
+  std::optional<CommandResponse> hooks = bess::run_global_resume_hooks(false);
+  if (hooks) {
+    resume_error_ = hooks;
+    return hooks;  // the hook logged; nothing resumes
   }
 
   std::set<Module *> modules_run;
-  for (WorkerId wid : workers_paused_) {
+  for (WorkerId wid : paused) {
     send_pre_resume(wid, &modules_run);
     resume_worker(wid);
     VLOG(1) << "*** Worker " << wid.value() << " Resumed ***";
+  }
+  workers_resumed_ = true;
+  return std::nullopt;
+}
+
+WorkerPauser::~WorkerPauser() {
+  if (--pauser_depth == 0 && !workers_resumed_ && !orphans_attached_) {
+    attach_orphans();  // All workers should be paused at this point.
+    orphans_attached_ = true;
+  }
+
+  std::optional<CommandResponse> resumed = Resume();
+  if (resumed) {
+    LOG(ERROR) << "Workers left paused: " << resumed->error().errmsg();
   }
 }

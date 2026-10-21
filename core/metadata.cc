@@ -7,8 +7,10 @@
 #include "utils/logging.h"
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <queue>
+#include <utility>
 
 #include "module.h"
 #include "module_graph.h"
@@ -37,22 +39,179 @@ static mt_offset_t ComputeNextOffset(mt_offset_t curr_offset, int8_t size) {
   return overflow > kMetadataTotalSize ? kMetadataOffsetNoSpace : curr_offset;
 }
 
-// Generate warnings for modules that read metadata that never gets set.
-static void CheckOrphanReaders() {
+// Generate warnings for modules that read metadata that never gets set, and
+// fill the report the control plane exposes. The offset assignment has already
+// run: this function only classifies declarations, applies default contracts
+// to readers with no provider, and logs.
+void Pipeline::ApplyContractsAndBuildReport() {
+  using AccessMode = Attribute::AccessMode;
+  using Contract = Attribute::Contract;
+
+  report_ = MetadataReport{};
+
+  // A defaulted reader the graph did not resolve reads its declared value at
+  // no packet-path cost. This is the safe point: workers are paused, offsets
+  // are final for this resume, and no packet memory is touched.
   for (const auto &it : ModuleGraph::GetAllModules()) {
-    const Module *m = it.second.get();
+    Module *m = it.second.get();
     if (!m) {
       break;
     }
-
     size_t i = 0;
     for (const auto &attr : m->all_attrs()) {
-      if (m->attr_offset(i) == kMetadataOffsetNoRead) {
-        LOG(WARNING) << "Metadata attr " << attr.name << "/" << attr.size
-                     << " of module " << m->name() << " has "
-                     << "no upstream module that sets the value!";
+      if ((attr.mode == AccessMode::kRead ||
+           attr.mode == AccessMode::kUpdate) &&
+          m->attr_offset(i) == kMetadataOffsetNoRead &&
+          attr.contract == Contract::kDefault) {
+        m->set_attr_offset(i, kMetadataOffsetDefault);
       }
       i++;
+    }
+  }
+
+  std::map<std::string, std::vector<const Module *>> declarations;
+  // Writers and readers by attribute name: more than one writer of a name a
+  // reader consumes is the duplicate/conflicting-declaration case.
+  std::map<std::string, int> writer_counts;
+  std::map<std::string, bool> has_reader;
+  // A reader in more than one scope component is reachable from more than one
+  // writer scope: the allocator gives those scopes separate offsets and the
+  // reader ends up with one of them, so the graph is ambiguous. Count the
+  // components that claim each (module, attribute) pair.
+  std::map<std::pair<std::string, std::string>, int> component_claims;
+  for (const ScopeComponent &component : scope_components_) {
+    for (const Module *m : component.modules()) {
+      for (const auto &attr : m->all_attrs()) {
+        if (attr.name == component.attr_id() &&
+            (attr.mode == AccessMode::kRead ||
+             attr.mode == AccessMode::kUpdate)) {
+          component_claims[{m->name(), attr.name}]++;
+          break;
+        }
+      }
+    }
+  }
+  std::map<std::string, std::vector<std::string>> multiple_provider_readers;
+  for (const auto &[key, count] : component_claims) {
+    if (count > 1) {
+      multiple_provider_readers[key.second].push_back(key.first);
+    }
+  }
+
+  for (const auto &it : ModuleGraph::GetAllModules()) {
+    Module *m = it.second.get();
+    if (!m) {
+      break;
+    }
+    size_t i = 0;
+    for (const auto &attr : m->all_attrs()) {
+      MetadataDeclaration declaration;
+      declaration.module = m->name();
+      declaration.attribute = attr.name;
+      declaration.size = attr.size;
+      declaration.mode = attr.mode;
+      declaration.contract = attr.contract;
+      declaration.default_value.assign(attr.default_value.begin(),
+                                       attr.default_value.begin() + attr.size);
+      declarations[attr.name].push_back(m);
+
+      const mt_offset_t offset = m->attr_offset(i);
+      report_.declarations++;
+      if (IsValidOffset(offset)) {
+        report_.resolved++;
+      }
+      if (attr.mode == AccessMode::kWrite) {
+        writer_counts[attr.name]++;
+      } else {
+        has_reader[attr.name] = true;
+      }
+      if (attr.mode == AccessMode::kWrite) {
+        if (offset == kMetadataOffsetNoWrite) {
+          report_.writers_without_reader.push_back(declaration);
+          VLOG(1) << "Metadata attr " << attr.name << "/" << attr.size
+                  << " of module " << m->name()
+                  << " has no downstream reader; the write is skipped";
+        }
+      } else if (offset == kMetadataOffsetNoRead) {
+        report_.readers_without_writer.push_back(declaration);
+        if (attr.contract == Contract::kRequired) {
+          report_.unsatisfied_required.push_back(declaration);
+          LOG(ERROR) << "Required metadata attr " << attr.name << "/"
+                     << attr.size << " of module " << m->name()
+                     << " has no upstream module that writes it";
+        } else {
+          LOG(WARNING) << "Metadata attr " << attr.name << "/" << attr.size
+                       << " of module " << m->name()
+                       << " has no upstream module that sets the value!";
+        }
+      } else if (offset == kMetadataOffsetDefault) {
+        report_.defaults_applied.push_back(declaration);
+        VLOG(1) << "Metadata attr " << attr.name << "/" << attr.size
+                << " of module " << m->name()
+                << " has no writer; its declared default applies";
+      }
+      i++;
+    }
+  }
+
+  // Declarations of one name must agree on what a missing writer means. The
+  // registry already refuses a size disagreement when the second module is
+  // created, so only contract/default disagreements can reach here.
+  for (const auto &entry : declarations) {
+    const std::string &name = entry.first;
+    const Attribute *first_reader = nullptr;
+    std::string reason;
+    for (const Module *m : entry.second) {
+      const Attribute *attr = nullptr;
+      for (const auto &candidate : m->all_attrs()) {
+        if (candidate.name == name) {
+          attr = &candidate;
+          break;
+        }
+      }
+      if (attr == nullptr || (attr->mode != AccessMode::kRead &&
+                              attr->mode != AccessMode::kUpdate)) {
+        continue;
+      }
+      if (first_reader == nullptr) {
+        first_reader = attr;
+        continue;
+      }
+      if (first_reader->contract != attr->contract) {
+        reason = "declarations disagree: a reader declares a different contract";
+        break;
+      }
+      if (attr->contract == Contract::kDefault &&
+          std::memcmp(first_reader->default_value.data(),
+                      attr->default_value.data(),
+                      std::min(first_reader->size, attr->size)) != 0) {
+        reason = "declarations disagree: default values differ";
+        break;
+      }
+    }
+    if (reason.empty() &&
+        (writer_counts[name] > 1 && has_reader[name])) {
+      reason =
+          "more than one writer scope declares the attribute for a reader; "
+          "each scope has its own offset";
+    }
+    if (reason.empty()) {
+      const auto providers = multiple_provider_readers.find(name);
+      if (providers != multiple_provider_readers.end()) {
+        reason =
+            "readers are reachable from more than one writer scope; only one "
+            "scope's offset is used";
+      }
+    }
+    if (!reason.empty()) {
+      MetadataConflict conflict;
+      conflict.attribute = name;
+      conflict.reason = reason;
+      for (const Module *m : entry.second) {
+        conflict.modules.push_back(m->name());
+      }
+      report_.conflicts.push_back(std::move(conflict));
+      LOG(WARNING) << "Metadata attr " << name << ": " << reason;
     }
   }
 }
@@ -290,7 +449,11 @@ void Pipeline::FillOffsetArrays() {
       for (const auto &attr : m->all_attrs()) {
         if (get_attr_id(&attr) == id) {
           if (invalid) {
-            if (attr.mode == Attribute::AccessMode::kRead) {
+            // An update reads before it writes, so an upstream gap is a
+            // missing read; its write is skipped either way because the
+            // offset is negative.
+            if (attr.mode == Attribute::AccessMode::kRead ||
+                attr.mode == Attribute::AccessMode::kUpdate) {
               m->set_attr_offset(k, kMetadataOffsetNoRead);
             } else {
               m->set_attr_offset(k, kMetadataOffsetNoWrite);
@@ -453,10 +616,12 @@ int Pipeline::ComputeMetadataOffsets() {
     LogAllScopes();
   }
 
-  CheckOrphanReaders();
+  ApplyContractsAndBuildReport();
+
+  ret = first_unsatisfied_required() != nullptr ? -EINVAL : 0;
 
   CleanupMetadataComputation();
-  return 0;
+  return ret;
 }
 
 int Pipeline::RegisterAttribute(const std::string &attr_name, size_t size) {

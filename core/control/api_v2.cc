@@ -37,6 +37,7 @@
 #include "gate_hooks/track.h"
 #include "framework/plugin_check.h"
 #include "framework/plugin_loader.h"
+#include "metadata.h"
 #include "module.h"
 #include "port.h"
 #include "runtime/runtime_state.h"
@@ -180,6 +181,79 @@ namespace {
 // An absent argument and an empty Any mean the same thing; emit neither.
 bool HasArg(const google::protobuf::Any &arg) {
   return !arg.type_url().empty() || !arg.value().empty();
+}
+
+}  // namespace
+
+namespace {
+
+const char *MetadataModeName(bess::metadata::Attribute::AccessMode mode) {
+  using AccessMode = bess::metadata::Attribute::AccessMode;
+  switch (mode) {
+    case AccessMode::kRead:
+      return "read";
+    case AccessMode::kWrite:
+      return "write";
+    case AccessMode::kUpdate:
+      return "update";
+  }
+  return "unknown";
+}
+
+const char *MetadataContractName(
+    bess::metadata::Attribute::Contract contract) {
+  using Contract = bess::metadata::Attribute::Contract;
+  switch (contract) {
+    case Contract::kBestEffort:
+      return "best_effort";
+    case Contract::kRequired:
+      return "required";
+    case Contract::kDefault:
+      return "default";
+  }
+  return "unknown";
+}
+
+v2::MetadataAttributeReport ToProto(
+    const bess::metadata::MetadataDeclaration &declaration) {
+  v2::MetadataAttributeReport out;
+  out.set_module(declaration.module);
+  out.set_attribute(declaration.attribute);
+  out.set_size(static_cast<uint32_t>(declaration.size));
+  out.set_mode(MetadataModeName(declaration.mode));
+  out.set_contract(MetadataContractName(declaration.contract));
+  return out;
+}
+
+void AddMetadataDeclarations(
+    google::protobuf::RepeatedPtrField<v2::MetadataAttributeReport> *out,
+    const std::vector<bess::metadata::MetadataDeclaration> &declarations) {
+  for (const auto &declaration : declarations) {
+    *out->Add() = ToProto(declaration);
+  }
+}
+
+v2::MetadataReport ToProto(const bess::metadata::MetadataReport &report) {
+  v2::MetadataReport out;
+  out.set_declarations(static_cast<uint32_t>(report.declarations));
+  out.set_resolved(static_cast<uint32_t>(report.resolved));
+  AddMetadataDeclarations(out.mutable_writers_without_reader(),
+                          report.writers_without_reader);
+  AddMetadataDeclarations(out.mutable_readers_without_writer(),
+                          report.readers_without_writer);
+  AddMetadataDeclarations(out.mutable_unsatisfied_required(),
+                          report.unsatisfied_required);
+  AddMetadataDeclarations(out.mutable_defaults_applied(),
+                          report.defaults_applied);
+  for (const auto &conflict : report.conflicts) {
+    v2::MetadataConflictReport *out_conflict = out.add_conflicts();
+    out_conflict->set_attribute(conflict.attribute);
+    out_conflict->set_reason(conflict.reason);
+    for (const std::string &module : conflict.modules) {
+      out_conflict->add_modules(module);
+    }
+  }
+  return out;
 }
 
 }  // namespace
@@ -530,6 +604,7 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *context,
                                            v2::GetPipelineResponse *response) {
   ControlPlane::ResourceQuery query;
   query.include = request->include_resources();
+  query.include_metadata = request->include_metadata();
   query.names.assign(request->resources().begin(), request->resources().end());
   auto read = control_plane_.ReadPipeline(query);
   if (!read) {
@@ -541,6 +616,12 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *context,
   response->set_generation(read->generation);
   response->set_resource_generation(read->resource_generation);
   response->set_daemon_epoch(transactions_.epoch());
+  if (request->include_metadata()) {
+    const auto &metadata = read->value.metadata;
+    if (metadata) {
+      *response->mutable_metadata() = ToProto(*metadata);
+    }
+  }
   for (const WorkerSnapshot &w : read->value.snapshot.workers) {
     v2::WorkerPlacement *out = response->add_workers();
     out->set_wid(w.wid);

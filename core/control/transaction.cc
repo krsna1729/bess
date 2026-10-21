@@ -314,9 +314,27 @@ ControlResult<void> Transaction::Commit() {
 }
 
 ControlResult<void> Transaction::Retire() {
-  if (plan_.retire_ops.empty()) {
+  // The resume hook can refuse the committed graph (a required metadata
+  // contract with no provider). Resume explicitly so the caller sees that,
+  // rather than letting the pauser's destructor log it; on refusal the workers
+  // stay paused.
+  const auto resume = [&]() -> ControlResult<void> {
+    if (!pauser_) {
+      return {};
+    }
+    std::optional<CommandResponse> ret = pauser_->Resume();
     pauser_.reset();
+    if (ret) {
+      ControlError error =
+          Err(ret->error().code(), "%s", ret->error().errmsg().c_str());
+      error.field = "resume";
+      return std::unexpected(std::move(error));
+    }
     return {};
+  };
+
+  if (plan_.retire_ops.empty()) {
+    return resume();
   }
 
   const auto start = std::chrono::steady_clock::now();
@@ -339,12 +357,17 @@ ControlResult<void> Transaction::Retire() {
       break;
     }
   }
-  pauser_.reset();
 
-  if (retired) {
-    timing_.retire_us = MicrosSince(start);
+  ControlResult<void> resumed = resume();
+  if (!retired) {
+    return retired;
   }
-  return retired;
+
+  if (resumed) {
+    timing_.retire_us = MicrosSince(start);
+    return {};
+  }
+  return resumed;
 }
 
 void Transaction::Abort() noexcept {

@@ -744,7 +744,11 @@ ControlResult<void> ControlPlane::ResumeAll() {
     attach_orphans();
   }
 
-  bess::run_global_resume_hooks();
+  std::optional<CommandResponse> hooks = bess::run_global_resume_hooks();
+  if (hooks) {
+    return std::unexpected(
+        ErrorFromLegacy(hooks->error().code(), hooks->error().errmsg()));
+  }
 
   LOG(INFO) << "*** Resuming ***";
   resume_all_workers();
@@ -1853,12 +1857,16 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   if (auto retired = transaction.Retire(); !retired) {
     runtime::runtime().BumpGeneration();
 
+    const char *phase =
+        retired.error().field == "resume" ? "resume" : "retirement";
     ControlError error = Err(retired.error().err,
-                             "pipeline committed, but retirement failed: %s",
+                             "pipeline committed, but %s failed: %s", phase,
                              retired.error().message.c_str());
-    error.code = ControlErrorCode::kResourceFailure;
+    error.code = retired.error().field == "resume"
+                     ? ControlErrorCode::kInvalidArgument
+                     : ControlErrorCode::kResourceFailure;
     error.object = retired.error().object;
-    error.field = "retire";
+    error.field = retired.error().field;
     return std::unexpected(error);
   }
 
@@ -1900,6 +1908,9 @@ ControlResult<ControlPlane::Versioned<ControlPlane::PipelineRead>> ControlPlane:
   read.value.snapshot = SnapshotRuntime(runtime::runtime());
   read.generation = runtime::runtime().generation();
   read.resource_generation = engine.generation();
+  if (query.include_metadata) {
+    read.value.metadata = metadata::default_pipeline.report();
+  }
   if (query.include) {
     auto resources = ReadResources(engine, framework::ResourceBindings::ProcessDefault(),
                                    query.names);

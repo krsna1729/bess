@@ -449,6 +449,7 @@ Result<Resp> Client::PipelineCall(Call &&call, bool retry_busy,
 Result<PipelineSnapshot> Client::Pipeline(const PipelineQuery &query) {
   pb::GetPipelineRequest req;
   req.set_include_resources(query.include_resources);
+  req.set_include_metadata(query.include_metadata);
   for (const std::string &name : query.resources) {
     req.add_resources(name);
   }
@@ -467,6 +468,7 @@ Result<PipelineSnapshot> Client::Pipeline(const PipelineQuery &query) {
   }
   return PipelineSnapshot{.pipeline = r->pipeline(),
                           .version = version,
+                          .metadata = r->metadata(),
                           .workers = {r->workers().begin(), r->workers().end()}};
 }
 

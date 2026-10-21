@@ -278,6 +278,7 @@ bessctl apply pipeline.json [--generation G[/R]@E]
 bessctl get > pipeline.json       # the active pipeline as a manifest
 bessctl get -o yaml > p.yaml      # the same, as YAML (also validate -o yaml)
 bessctl status | resources | metrics | events [--from SEQ] [TYPE...]
+bessctl metadata                 # metadata by contract, from the last resume
 ```
 
 A file is YAML if it ends in `.yaml`/`.yml`, JSON if `.json`, else JSON when it

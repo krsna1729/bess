@@ -14,8 +14,21 @@ CommandResponse SetupMetadata::Init(const bess::pb::EmptyArg &) {
   return CommandSuccess();
 }
 
-void SetupMetadata::Run() {
-  bess::metadata::default_pipeline.ComputeMetadataOffsets();
+std::optional<CommandResponse> SetupMetadata::Run() {
+  const int ret = bess::metadata::default_pipeline.ComputeMetadataOffsets();
+  if (ret == 0) {
+    return std::nullopt;
+  }
+
+  const bess::metadata::MetadataDeclaration *missing =
+      bess::metadata::default_pipeline.first_unsatisfied_required();
+  if (missing != nullptr) {
+    return CommandFailure(EINVAL,
+                          "required metadata attribute '%s' of module '%s' has "
+                          "no provider: no upstream module writes it",
+                          missing->attribute.c_str(), missing->module.c_str());
+  }
+  return CommandFailure(-ret, "metadata offset computation failed");
 }
 
 ADD_RESUME_HOOK(SetupMetadata)

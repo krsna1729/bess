@@ -255,7 +255,34 @@ CheckConstraintResult Module::CheckModuleConstraints() const {
 }
 
 int Module::AddMetadataAttr(const std::string &name, size_t size,
-                            bess::metadata::Attribute::AccessMode mode) {
+                            bess::metadata::Attribute::AccessMode mode,
+                            bess::metadata::Attribute::Contract contract) {
+  static const std::array<uint8_t, bess::metadata::kMetadataAttrMaxSize>
+      kZeroDefault{};
+  return AddMetadataAttrImpl(
+      name, size, mode, contract,
+      contract == bess::metadata::Attribute::Contract::kDefault
+          ? kZeroDefault.data()
+          : nullptr);
+}
+
+int Module::AddMetadataAttrWithDefault(
+    const std::string &name, size_t size,
+    bess::metadata::Attribute::AccessMode mode,
+    std::span<const uint8_t> default_value) {
+  if (default_value.size() != size) {
+    return -EINVAL;
+  }
+  return AddMetadataAttrImpl(
+      name, size, mode, bess::metadata::Attribute::Contract::kDefault,
+      default_value.data());
+}
+
+int Module::AddMetadataAttrImpl(
+    const std::string &name, size_t size,
+    bess::metadata::Attribute::AccessMode mode,
+    bess::metadata::Attribute::Contract contract,
+    const uint8_t *default_value) {
   int ret;
 
   if (attrs_.size() >= bess::metadata::kMaxAttrsPerModule)
@@ -283,6 +310,10 @@ int Module::AddMetadataAttr(const std::string &name, size_t size,
   attr.size = size;
   attr.mode = mode;
   attr.scope_id = -1;
+  attr.contract = contract;
+  if (default_value != nullptr) {
+    std::memcpy(attr.default_value.data(), default_value, size);
+  }
 
   attrs_.push_back(attr);
 

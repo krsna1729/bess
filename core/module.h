@@ -10,6 +10,7 @@
 #include <cstring>
 #include <map>
 #include <numeric>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -300,9 +301,22 @@ class alignas(bess::arch::kCacheLineSize) Module {
   // automatically registered, so only attributes specific to a module
   // 'instance'
   // need this function.
+  // The contract defaults to best-effort, so every existing declaration keeps
+  // its behavior. A Contract::kDefault declaration with no value here means a
+  // zero-filled default; use AddMetadataAttrWithDefault() for any other value.
   // Returns its allocated ID (>= 0), or a negative number for error */
   int AddMetadataAttr(const std::string &name, size_t size,
-                      bess::metadata::Attribute::AccessMode mode);
+                      bess::metadata::Attribute::AccessMode mode,
+                      bess::metadata::Attribute::Contract contract =
+                          bess::metadata::Attribute::Contract::kBestEffort);
+
+  // Declares an optional-with-default read attribute and its value (exactly
+  // `size` bytes). A provider-less reader then resolves to the value at the
+  // next PreResume instead of to an unresolved offset.
+  int AddMetadataAttrWithDefault(
+      const std::string &name, size_t size,
+      bess::metadata::Attribute::AccessMode mode,
+      std::span<const uint8_t> default_value);
 
   CommandResponse RunCommand(const std::string &cmd,
                              const google::protobuf::Any &arg) {
@@ -336,6 +350,26 @@ class alignas(bess::arch::kCacheLineSize) Module {
   bess::metadata::mt_offset_t attr_offset(size_t idx) const {
     DCHECK_LT(idx, bess::metadata::kMaxAttrsPerModule);
     return attr_offsets_[idx];
+  }
+
+  // Resolve an attribute for the packet path once per batch, at PreResume.
+  // For a writer-backed attribute, Get() loads the packet's bytes exactly as
+  // get_attr_with_offset() does. For a defaulted attribute with no provider,
+  // it returns the declared default and never touches packet memory.
+  template <typename T>
+  bess::metadata::ResolvedAttr<T> ResolveAttr(size_t attr_id) const {
+    static_assert(std::is_trivially_copyable_v<T>);
+    DCHECK_LT(attr_id, attrs_.size());
+    const bess::metadata::Attribute &attr = attrs_[attr_id];
+    bess::metadata::ResolvedAttr<T> resolved;
+    resolved.offset = attr_offsets_[attr_id];
+    if (attr.contract == bess::metadata::Attribute::Contract::kDefault) {
+      DCHECK_LE(sizeof(T), attr.size);
+      std::memcpy(&resolved.default_value, attr.default_value.data(),
+                  sizeof(T));
+      resolved.has_default = true;
+    }
+    return resolved;
   }
 
   const bess::metadata::mt_offset_t *all_attr_offsets() const {
@@ -437,6 +471,10 @@ class alignas(bess::arch::kCacheLineSize) Module {
   void DisconnectModulesUpstream(gate_idx_t igate_idx);
   void DestroyAllTasks();
   void DeregisterAllAttributes();
+  int AddMetadataAttrImpl(const std::string &name, size_t size,
+                          bess::metadata::Attribute::AccessMode mode,
+                          bess::metadata::Attribute::Contract contract,
+                          const uint8_t *default_value);
   void AddParentTask(Module *task) { parent_tasks_.push_back(task); }
   void ClearParentTasks() { parent_tasks_.clear(); }
 
@@ -731,6 +769,15 @@ static inline void set_attr_with_offset(bess::metadata::mt_offset_t offset,
   if (bess::metadata::IsValidOffset(offset)) {
     _set_attr_with_offset<T>(offset, pkt, val);
   }
+}
+
+// Read through a ResolvedAttr (Module::ResolveAttr), resolved once per batch.
+// The valid-offset path is the same load as get_attr_with_offset(); a
+// defaulted attribute with no provider returns the declared default without
+// touching the packet.
+template <typename T>
+T bess::metadata::ResolvedAttr<T>::Get(bess::PacketRef pkt) const {
+  return resolved() ? _get_attr_with_offset<T>(offset, pkt) : default_value;
 }
 
 // Deprecated (D-100): each call resolves the attribute's offset again, which

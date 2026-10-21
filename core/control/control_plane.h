@@ -19,6 +19,7 @@
 #include "control/pipeline_validator.h"
 #include "control/transaction.h"
 #include "message.h"
+#include "metadata.h"
 #include "module.h"
 #include "port.h"
 #include "traffic_class.h"
@@ -169,10 +170,14 @@ class ControlPlane {
   struct ResourceQuery {
     bool include = false;
     std::vector<std::string> names;  // with include: only these (empty: all)
+    bool include_metadata = false;   // also snapshot the metadata report
   };
   struct PipelineRead {
     PipelineSnapshot snapshot;
     std::vector<ResourceSpec> resources;  // by name
+    // Copied under this call's mutex when include_metadata is set, so a
+    // concurrent apply/resume cannot change it after the lock is released.
+    std::optional<metadata::MetadataReport> metadata;
   };
   ControlResult<Versioned<PipelineRead>> ReadPipeline(const ResourceQuery& query) const;
   // One resource's contents as one snapshot, for the streamed read: the
