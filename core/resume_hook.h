@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <utility>
 
@@ -41,7 +42,12 @@ class ResumeHook {
 
   bool is_default() const { return is_default_; }
 
-  virtual void Run() = 0;
+  // Runs this hook. A value means the graph cannot be resumed (for example a
+  // required metadata contract has no provider); the caller must not run its
+  // workers, and reports the message. std::nullopt is success: the execution
+  // layer does not construct a CommandResponse, so it keeps no dependency on
+  // the framework's message helpers.
+  virtual std::optional<CommandResponse> Run() = 0;
 
   bool operator<(const ResumeHook &rhs) const {
     return std::tie(priority_, name_) < std::tie(rhs.priority_, rhs.name_);
@@ -102,7 +108,8 @@ class ResumeHookBuilder {
 extern std::set<std::unique_ptr<ResumeHook>, ResumeHook::UniquePtrLess>
     global_resume_hooks;
 
-void run_global_resume_hooks(bool run_modules = true);
+std::optional<CommandResponse> run_global_resume_hooks(
+    bool run_modules = true);
 
 }  // namespace bess
 

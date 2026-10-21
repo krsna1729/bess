@@ -15,7 +15,7 @@ class SetupTaskGraph final : public bess::ResumeHook {
 
   CommandResponse Init(const bess::pb::EmptyArg &);
 
-  void Run() override;
+  std::optional<CommandResponse> Run() override;
 
   static constexpr uint16_t kPriority = 0;
   static const std::string kName;

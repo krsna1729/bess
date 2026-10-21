@@ -252,27 +252,73 @@ class WorkerPlacement(_message.Message):
     on_control_cpu: bool
     def __init__(self, wid: _Optional[int] = ..., core: _Optional[int] = ..., numa_node: _Optional[int] = ..., cross_numa: _Optional[bool] = ..., shares_core: _Optional[bool] = ..., on_control_cpu: _Optional[bool] = ...) -> None: ...
 
+class MetadataAttributeReport(_message.Message):
+    __slots__ = ("module", "attribute", "size", "mode", "contract")
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    ATTRIBUTE_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    MODE_FIELD_NUMBER: _ClassVar[int]
+    CONTRACT_FIELD_NUMBER: _ClassVar[int]
+    module: str
+    attribute: str
+    size: int
+    mode: str
+    contract: str
+    def __init__(self, module: _Optional[str] = ..., attribute: _Optional[str] = ..., size: _Optional[int] = ..., mode: _Optional[str] = ..., contract: _Optional[str] = ...) -> None: ...
+
+class MetadataConflictReport(_message.Message):
+    __slots__ = ("attribute", "reason", "modules")
+    ATTRIBUTE_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    MODULES_FIELD_NUMBER: _ClassVar[int]
+    attribute: str
+    reason: str
+    modules: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, attribute: _Optional[str] = ..., reason: _Optional[str] = ..., modules: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class MetadataReport(_message.Message):
+    __slots__ = ("declarations", "resolved", "writers_without_reader", "readers_without_writer", "unsatisfied_required", "defaults_applied", "conflicts")
+    DECLARATIONS_FIELD_NUMBER: _ClassVar[int]
+    RESOLVED_FIELD_NUMBER: _ClassVar[int]
+    WRITERS_WITHOUT_READER_FIELD_NUMBER: _ClassVar[int]
+    READERS_WITHOUT_WRITER_FIELD_NUMBER: _ClassVar[int]
+    UNSATISFIED_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    DEFAULTS_APPLIED_FIELD_NUMBER: _ClassVar[int]
+    CONFLICTS_FIELD_NUMBER: _ClassVar[int]
+    declarations: int
+    resolved: int
+    writers_without_reader: _containers.RepeatedCompositeFieldContainer[MetadataAttributeReport]
+    readers_without_writer: _containers.RepeatedCompositeFieldContainer[MetadataAttributeReport]
+    unsatisfied_required: _containers.RepeatedCompositeFieldContainer[MetadataAttributeReport]
+    defaults_applied: _containers.RepeatedCompositeFieldContainer[MetadataAttributeReport]
+    conflicts: _containers.RepeatedCompositeFieldContainer[MetadataConflictReport]
+    def __init__(self, declarations: _Optional[int] = ..., resolved: _Optional[int] = ..., writers_without_reader: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., readers_without_writer: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., unsatisfied_required: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., defaults_applied: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., conflicts: _Optional[_Iterable[_Union[MetadataConflictReport, _Mapping]]] = ...) -> None: ...
+
 class GetPipelineRequest(_message.Message):
-    __slots__ = ("include_resources", "resources")
+    __slots__ = ("include_resources", "resources", "include_metadata")
     INCLUDE_RESOURCES_FIELD_NUMBER: _ClassVar[int]
     RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_METADATA_FIELD_NUMBER: _ClassVar[int]
     include_resources: bool
     resources: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, include_resources: _Optional[bool] = ..., resources: _Optional[_Iterable[str]] = ...) -> None: ...
+    include_metadata: bool
+    def __init__(self, include_resources: _Optional[bool] = ..., resources: _Optional[_Iterable[str]] = ..., include_metadata: _Optional[bool] = ...) -> None: ...
 
 class GetPipelineResponse(_message.Message):
-    __slots__ = ("pipeline", "generation", "daemon_epoch", "workers", "resource_generation")
+    __slots__ = ("pipeline", "generation", "daemon_epoch", "workers", "resource_generation", "metadata")
     PIPELINE_FIELD_NUMBER: _ClassVar[int]
     GENERATION_FIELD_NUMBER: _ClassVar[int]
     DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
     WORKERS_FIELD_NUMBER: _ClassVar[int]
     RESOURCE_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    METADATA_FIELD_NUMBER: _ClassVar[int]
     pipeline: Pipeline
     generation: int
     daemon_epoch: int
     workers: _containers.RepeatedCompositeFieldContainer[WorkerPlacement]
     resource_generation: int
-    def __init__(self, pipeline: _Optional[_Union[Pipeline, _Mapping]] = ..., generation: _Optional[int] = ..., daemon_epoch: _Optional[int] = ..., workers: _Optional[_Iterable[_Union[WorkerPlacement, _Mapping]]] = ..., resource_generation: _Optional[int] = ...) -> None: ...
+    metadata: MetadataReport
+    def __init__(self, pipeline: _Optional[_Union[Pipeline, _Mapping]] = ..., generation: _Optional[int] = ..., daemon_epoch: _Optional[int] = ..., workers: _Optional[_Iterable[_Union[WorkerPlacement, _Mapping]]] = ..., resource_generation: _Optional[int] = ..., metadata: _Optional[_Union[MetadataReport, _Mapping]] = ...) -> None: ...
 
 class ReadResourceRequest(_message.Message):
     __slots__ = ("resource", "max_entries")

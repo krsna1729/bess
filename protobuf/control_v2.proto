@@ -197,6 +197,34 @@ message WorkerPlacement {
   bool on_control_cpu = 6;  // a CPU held for control threads
 }
 
+// The metadata graph as the last resume/apply resolved it (D-177). A
+// declaration is one module's attribute, named as the module registered it.
+message MetadataAttributeReport {
+  string module = 1;
+  string attribute = 2;
+  uint32 size = 3;
+  string mode = 4;      // "read", "write" or "update"
+  string contract = 5;  // "best_effort", "required" or "default"
+}
+message MetadataConflictReport {
+  string attribute = 1;
+  string reason = 2;
+  repeated string modules = 3;  // every module that declares the name
+}
+// A read-only report, computed while workers were paused. It is the snapshot
+// of the last metadata resolution, not a new walk of the graph: an apply that
+// has not resumed yet does not change it.
+message MetadataReport {
+  // Every declaration and how many resolved to a usable packet offset.
+  uint32 declarations = 6;
+  uint32 resolved = 7;
+  repeated MetadataAttributeReport writers_without_reader = 1;
+  repeated MetadataAttributeReport readers_without_writer = 2;
+  repeated MetadataAttributeReport unsatisfied_required = 3;
+  repeated MetadataAttributeReport defaults_applied = 4;
+  repeated MetadataConflictReport conflicts = 5;
+}
+
 // With include_resources, the pipeline lists its resources' contents too
 // (every resource, or those named in `resources`), so a manifest read back
 // and applied again changes nothing. A response above the message limit is
@@ -205,6 +233,7 @@ message WorkerPlacement {
 message GetPipelineRequest {
   bool include_resources = 1;
   repeated string resources = 2;  // with include_resources: only these (empty: all)
+  bool include_metadata = 3;      // also return the last metadata report
 }
 message GetPipelineResponse {
   // The active runtime as desired state; every worker with the core it runs
@@ -216,6 +245,9 @@ message GetPipelineResponse {
   // The dataplane transaction generation (ApplyTransaction's) the resource
   // contents were read at.
   uint64 resource_generation = 5;
+  // Present with include_metadata; the categories of the last metadata
+  // resolution.
+  MetadataReport metadata = 6;
 }
 
 // One resource's committed entries, in bounded pages, as one server-streamed

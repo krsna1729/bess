@@ -5,6 +5,7 @@
 #ifndef BESS_METADATA_H_
 #define BESS_METADATA_H_
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -15,6 +16,10 @@
 #include "snbuf_layout.h"
 
 class Module;
+
+namespace bess {
+class PacketRef;
+}
 
 namespace bess {
 namespace metadata {
@@ -47,17 +52,117 @@ static const mt_offset_t kMetadataOffsetNoRead = -2;
 // Out of space in packet buffers for the attribute.
 static const mt_offset_t kMetadataOffsetNoSpace = -3;
 
+// The attribute has no writer, and its readers declared a default (Contract::
+// kDefault). The bytes in the packet are never read: packet access goes through
+// Module::ResolveAttr()/ResolvedAttr<T>::Get(), which returns the declared
+// default. Like the other negative values, IsValidOffset() is false.
+static const mt_offset_t kMetadataOffsetDefault = -4;
+
 static inline int IsValidOffset(mt_offset_t offset) {
   return (offset >= 0);
 }
 
 struct Attribute {
-  Attribute() : name(), size(), mode(), scope_id() {}
+  // What a reader may assume about an attribute that the graph does not write.
+  // Orthogonal to AccessMode: the contract is a statement by a reader, and a
+  // writer's contract is ignored (it is the provider, not the consumer).
+  enum class Contract {
+    // Unresolved is allowed; a reader sees kMetadataOffsetNoRead and decides
+    // what to do (the historical behavior).
+    kBestEffort = 0,
+
+    // Resume fails, naming this module and attribute, unless some upstream
+    // module writes the attribute on every path that reaches the reader.
+    kRequired,
+
+    // A provider-less reader resolves to kMetadataOffsetDefault and reads
+    // `default_value` through ResolvedAttr<T>::Get(), at no packet-path cost:
+    // the packet's metadata bytes are not touched. A provider that appears in
+    // a later graph replaces the default at the next resume.
+    kDefault,
+  };
+
+  Attribute()
+      : name(),
+        size(),
+        mode(),
+        scope_id(),
+        contract(Contract::kBestEffort),
+        default_value() {}
 
   std::string name;
   size_t size;  // in bytes
   enum class AccessMode { kRead = 0, kWrite, kUpdate } mode;
   mutable int scope_id;
+  Contract contract;
+  // Valid only when contract == Contract::kDefault; the first `size` bytes.
+  std::array<uint8_t, kMetadataAttrMaxSize> default_value;
+};
+
+// A read side resolved at PreResume: either a packet-metadata offset, or the
+// attribute's declared default when the graph has no provider. Resolve it once
+// per batch (Module::ResolveAttr<T>) and call Get() per packet; the common
+// valid-offset path is the same load it was before, and the default path does
+// not touch packet memory.
+template <typename T>
+struct ResolvedAttr {
+  mt_offset_t offset = kMetadataOffsetNoRead;
+  T default_value{};
+  bool has_default = false;
+
+  bool resolved() const { return IsValidOffset(offset); }
+
+  // Defined in module.h, where packet access lives. The valid-offset path is
+  // get_attr_with_offset<T>(); the default path returns default_value without
+  // touching the packet.
+  T Get(bess::PacketRef pkt) const;
+};
+
+// What the last metadata computation saw, by category. Built only while
+// workers are paused (resume/apply); Report() is a read-only accessor, so
+// GetPipeline can return it without walking the graph again.
+struct MetadataDeclaration {
+  std::string module;
+  std::string attribute;
+  size_t size = 0;
+  Attribute::AccessMode mode = Attribute::AccessMode::kRead;
+  Attribute::Contract contract = Attribute::Contract::kBestEffort;
+  std::vector<uint8_t> default_value;  // `size` bytes for Contract::kDefault
+};
+
+struct MetadataConflict {
+  std::string attribute;
+  std::string reason;
+  std::vector<std::string> modules;
+};
+
+struct MetadataReport {
+  // Every attribute declaration the graph has, and how many of them resolved
+  // to a usable packet offset. The control surface prints these when no
+  // category below has an entry (a clean graph).
+  size_t declarations = 0;
+  size_t resolved = 0;
+
+  // A writer whose value nothing downstream reads: the write is skipped
+  // (kMetadataOffsetNoWrite).
+  std::vector<MetadataDeclaration> writers_without_reader;
+
+  // A read/update declaration with no upstream writer on every path. Includes
+  // required declarations; see unsatisfied_required for the ones that failed.
+  std::vector<MetadataDeclaration> readers_without_writer;
+
+  // Required declarations whose reader got no provider; resume fails for
+  // these.
+  std::vector<MetadataDeclaration> unsatisfied_required;
+
+  // Default declarations that resolved to kMetadataOffsetDefault.
+  std::vector<MetadataDeclaration> defaults_applied;
+
+  // Declarations of one name that disagree (contract or default bytes), or a
+  // reader's attribute declared by more than one writer scope.
+  // RegisterAttribute already refuses a size disagreement when a module is
+  // created, so that class cannot reach a computed report.
+  std::vector<MetadataConflict> conflicts;
 };
 
 typedef std::string attr_id_t;
@@ -126,7 +231,21 @@ class Pipeline {
         registered_attrs_() {}
 
   // Main entry point for calculating metadata offsets.
+  // Returns 0 on success, -EINVAL if a required contract has no provider.
   int ComputeMetadataOffsets();
+
+  // The categories of the last ComputeMetadataOffsets() call. Read-only: it
+  // does not walk the graph or touch offsets, so the control plane can expose
+  // it while workers run.
+  const MetadataReport &report() const { return report_; }
+
+  // The first unsatisfied required declaration, or nullptr. ComputeMetadata
+  // Offsets() returns -EINVAL exactly when this is non-null.
+  const MetadataDeclaration *first_unsatisfied_required() const {
+    return report_.unsatisfied_required.empty()
+               ? nullptr
+               : &report_.unsatisfied_required.front();
+  }
 
   // Registers attr and returns 0 if no attribute named @attr_name with size
   // other than @size has already been registered for this pipeline.
@@ -171,6 +290,10 @@ class Pipeline {
   void AssignOffsets();
   void ComputeScopeDegrees();
 
+  // Applies default contracts to readers the graph did not resolve, then
+  // fills report_ from the assigned offsets and declarations.
+  void ApplyContractsAndBuildReport();
+
   std::vector<ScopeComponent> scope_components_;
 
   // Maps modules to the
@@ -184,6 +307,9 @@ class Pipeline {
   // attribute is deregistered once it reaches back to 0.
   // Those modules should agree on the same size(=size_t).
   std::map<std::string, std::tuple<size_t, int> > registered_attrs_;
+
+  // Last computed report; empty until ComputeMetadataOffsets() runs.
+  MetadataReport report_;
 };
 
 extern bess::metadata::Pipeline default_pipeline;

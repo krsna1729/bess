@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -1364,6 +1365,133 @@ class PreResumeCounter final : public Module {
   static inline std::atomic<int> events = 0;
 };
 ADD_MODULE(PreResumeCounter, "pre_resume_counter", "test: counts PreResume events")
+
+// Declares one attribute of each contract, for the metadata report/resume
+// tests. Nothing writes any of them, so the required one refuses the resume.
+class ContractReader final : public Module {
+ public:
+  CommandResponse Init(const bess::pb::EmptyArg &) {
+    using bess::metadata::Attribute;
+    static constexpr std::array<uint8_t, 4> kDefault{0, 0, 0, 7};
+    if (AddMetadataAttr("required_attr", 4, Attribute::AccessMode::kRead,
+                        Attribute::Contract::kRequired) < 0) {
+      return CommandFailure(EINVAL, "required_attr declaration failed");
+    }
+    if (AddMetadataAttrWithDefault("default_attr", 4,
+                                   Attribute::AccessMode::kRead,
+                                   kDefault) < 0) {
+      return CommandFailure(EINVAL, "default_attr declaration failed");
+    }
+    if (AddMetadataAttr("optional_attr", 4,
+                        Attribute::AccessMode::kRead) < 0) {
+      return CommandFailure(EINVAL, "optional_attr declaration failed");
+    }
+    return CommandSuccess();
+  }
+};
+ADD_MODULE(ContractReader, "contract_reader", "test: declares metadata contracts")
+
+// A required contract with no provider refuses ResumeAll with a message that
+// names the module and attribute; GetPipeline's include_metadata returns the
+// same categories as a read-only report.
+TEST_F(ApiV2ServiceTest, MetadataContractsRefuseResumeAndAppearInTheReport) {
+  v2::Pipeline p;
+  auto *m = p.add_modules();
+  m->set_name("c");
+  m->set_mclass("ContractReader");
+  ASSERT_TRUE(m->mutable_arg()->PackFrom(bess::pb::EmptyArg()));
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = p;
+    req.set_daemon_epoch(Epoch());
+    v2::ApplyPipelineResponse resp;
+    const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+
+  auto resumed = control_plane_->ResumeAll();
+  ASSERT_FALSE(resumed) << "a required contract with no writer must refuse";
+  EXPECT_EQ(EINVAL, resumed.error().err);
+  EXPECT_NE(std::string::npos, resumed.error().message.find("required_attr"));
+  EXPECT_NE(std::string::npos, resumed.error().message.find("module 'c'"));
+
+  grpc::ClientContext ctx;
+  v2::GetPipelineRequest req;
+  req.set_include_metadata(true);
+  v2::GetPipelineResponse resp;
+  ASSERT_TRUE(stub_->GetPipeline(&ctx, req, &resp).ok());
+  const v2::MetadataReport &report = resp.metadata();
+
+  ASSERT_EQ(1, report.unsatisfied_required_size());
+  EXPECT_EQ("c", report.unsatisfied_required(0).module());
+  EXPECT_EQ("required_attr", report.unsatisfied_required(0).attribute());
+  EXPECT_EQ("required", report.unsatisfied_required(0).contract());
+  EXPECT_EQ("read", report.unsatisfied_required(0).mode());
+
+  ASSERT_EQ(1, report.defaults_applied_size());
+  EXPECT_EQ("default_attr", report.defaults_applied(0).attribute());
+  EXPECT_EQ("default", report.defaults_applied(0).contract());
+
+  bool optional_listed = false;
+  for (const auto &reader : report.readers_without_writer()) {
+    if (reader.attribute() == "optional_attr") {
+      optional_listed = true;
+      EXPECT_EQ("best_effort", reader.contract());
+    }
+  }
+  EXPECT_TRUE(optional_listed);
+  EXPECT_TRUE(report.writers_without_reader().empty());
+  EXPECT_TRUE(report.conflicts().empty());
+  EXPECT_EQ(3u, report.declarations()) << "one declaration of each contract";
+  EXPECT_EQ(0u, report.resolved()) << "none of them has a writer";
+}
+
+// A running graph replaced by one that commits a required contract with no
+// provider: the commit cannot be rolled back, but the apply reports the
+// refused resume (field "resume") and leaves the workers paused. This also
+// exercises WorkerPauser's destructor fallback after the explicit Resume
+// failed.
+TEST_F(ApiV2ServiceTest, ACommittedApplyWhoseResumeFailsLeavesWorkersPaused) {
+  {
+    grpc::ClientContext ctx;
+    v2::ApplyPipelineRequest req;
+    *req.mutable_pipeline() = SamplePipeline();
+    req.set_daemon_epoch(Epoch());
+    v2::ApplyPipelineResponse resp;
+    const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+  }
+  ASSERT_TRUE(control_plane_->ResumeAll());
+  ASSERT_TRUE(is_worker_running(bess::dataplane::WorkerId(0)));
+
+  v2::Pipeline desired = SamplePipeline();
+  auto *c = desired.add_modules();
+  c->set_name("c");
+  c->set_mclass("ContractReader");
+  ASSERT_TRUE(c->mutable_arg()->PackFrom(bess::pb::EmptyArg()));
+  auto *conn = desired.add_connections();
+  conn->set_upstream("sink");
+  conn->set_downstream("c");
+
+  grpc::ClientContext ctx;
+  v2::ApplyPipelineRequest req;
+  *req.mutable_pipeline() = desired;
+  req.set_daemon_epoch(Epoch());
+  v2::ApplyPipelineResponse resp;
+  const grpc::Status status = stub_->ApplyPipeline(&ctx, req, &resp);
+  ASSERT_EQ(grpc::StatusCode::INVALID_ARGUMENT, status.error_code())
+      << status.error_message();
+  const v2::ErrorDetail detail = DetailOf(ctx);
+  EXPECT_EQ(v2::ErrorDetail::INVALID_ARGUMENT, detail.code());
+  EXPECT_EQ("resume", detail.field());
+  EXPECT_NE(std::string::npos,
+            status.error_message().find("pipeline committed, but resume failed"));
+  EXPECT_NE(std::string::npos, status.error_message().find("required_attr"));
+  EXPECT_FALSE(is_worker_running(bess::dataplane::WorkerId(0)))
+      << "a refused resume must not run the workers";
+}
+
 
 // A worker resumed alone (the legacy per-worker resume) first sends PreResume
 // to the modules it runs, so they rebind to what changed while it was paused.
