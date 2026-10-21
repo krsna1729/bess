@@ -906,6 +906,7 @@ allocation_fault_tests = [
   'nat/nat_test.cc',
   'offload/flow_rule_owner_test.cc',
   'route/l3_test.cc',
+  'route/neighbor_resolver_test.cc',
   'route/router_transaction_test.cc',
 ]
 

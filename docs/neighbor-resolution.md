@@ -119,6 +119,19 @@ MAC, egress or state; the replaced object is retired after a grace period. The
 `ConcurrentPublishAndLookupNeverSeeAHalfUpdate` and
 `ATransactionPublishesAllAdjacencyOrNone` tests pin both paths.
 
+Allocation failure is staged away from the dataplane. `ConfigureInterface` and
+`RemoveInterface` build every key's update and reserve the output before
+committing the interface identity or any neighbor change; `Poll` collects the
+due wheel records, plans every transition (including its next-hop update
+vector) and reserves the output before committing anything, and if a plan's
+allocation is refused it re-arms every due entry at the deadline its record
+carried before rethrowing (the wheel had already spent those nodes). `OnArp`
+stages its update and output space before cancelling the reply's timer. A
+refused call therefore leaves the neighbor table, the published adjacency and
+the timers exactly as they were, and the same call retried converges.
+`NeighborResolverFaultTest` fails every allocation point of Poll, Configure and
+Remove in turn and checks that invariant.
+
 The resolver itself is single-threaded (one control-side writer). ARP frames
 arriving on workers must be handed to that writer; the packet path never calls
 into the resolver. This is the same ownership split as every other control-side

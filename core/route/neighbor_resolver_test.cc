@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <thread>
@@ -27,6 +28,7 @@
 #include "route/next_hop_id.h"
 #include "route/router.h"
 #include "runtime/runtime_state.h"
+#include "testing/allocation_faults.h"
 #include "utils/arp.h"
 #include "utils/ether.h"
 
@@ -581,6 +583,260 @@ TEST(NeighborResolverTest, CapacityCountsNeighborsWhoseTimerIsGone) {
   ASSERT_TRUE(resolver->Bind(NextHopId(1), key_b, 10).has_value());
   EXPECT_EQ(1u, resolver->size());
   EXPECT_TRUE(resolver->Find(key_b).has_value());
+}
+
+// -- allocation failure --------------------------------------------------------
+
+using bess::fault_injection::AllocationFaults;
+using bess::fault_injection::ForEachFailurePoint;
+
+// A resolver with one learned neighbor: interface 1 at the old MAC, hop 1
+// bound to 10.0.0.2, resolved to 02:00:00:00:00:aa, aging armed for tick 110.
+// Every failure point needs this state, so each iteration builds it afresh.
+std::unique_ptr<NeighborResolver> ResolvedWithOldMac(
+    NeighborResolver::Key *key) {
+  auto resolver = MakeResolver();
+  if (!resolver) {
+    return nullptr;
+  }
+  if (!resolver
+           ->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01", kMyIp), 0)
+           .has_value()) {
+    ADD_FAILURE() << "configure";
+    return nullptr;
+  }
+  *key = Key(kIface1, kPeer1);
+  if (!resolver->Bind(NextHopId(1), *key, 0).has_value()) {
+    ADD_FAILURE() << "bind";
+    return nullptr;
+  }
+  NeighborResolver::Progress progress = resolver->Poll(10, 16);
+  if (progress.solicitations.size() != 1) {
+    ADD_FAILURE() << "solicitation";
+    return nullptr;
+  }
+  progress = resolver->OnArp(10, kIface1,
+                             ReplyTo(progress.solicitations[0].frame,
+                                     Mac("02:00:00:00:00:aa")));
+  if (progress.updates.size() != 1) {
+    ADD_FAILURE() << "reply";
+    return nullptr;
+  }
+  return resolver;
+}
+
+// The same, for two neighbors so both are due in one Poll: both resolved at
+// tick 10, both aging at 110. Used to prove a refused allocation does not
+// strand the other due entries or discard their transitions.
+std::unique_ptr<NeighborResolver> ResolvedPair(NeighborResolver::Key *a,
+                                               NeighborResolver::Key *b) {
+  auto resolver = MakeResolver();
+  if (!resolver) {
+    return nullptr;
+  }
+  if (!resolver
+           ->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01", kMyIp), 0)
+           .has_value()) {
+    ADD_FAILURE() << "configure";
+    return nullptr;
+  }
+  *a = Key(kIface1, kPeer1);
+  *b = Key(kIface1, kPeer2);
+  if (!resolver->Bind(NextHopId(1), *a, 0).has_value() ||
+      !resolver->Bind(NextHopId(2), *b, 0).has_value()) {
+    ADD_FAILURE() << "bind";
+    return nullptr;
+  }
+  NeighborResolver::Progress progress = resolver->Poll(10, 16);
+  if (progress.solicitations.size() != 2) {
+    ADD_FAILURE() << "solicitations";
+    return nullptr;
+  }
+  for (const auto &solicitation : progress.solicitations) {
+    const uint32_t target =
+        ParseArp(solicitation.frame).value_or(ArpMessage{}).target_ip.value();
+    const auto reply = ReplyTo(
+        solicitation.frame,
+        Mac(target == kPeer1 ? "02:00:00:00:00:aa" : "02:00:00:00:00:bb"));
+    if (resolver->OnArp(10, kIface1, reply).updates.size() != 1) {
+      ADD_FAILURE() << "reply";
+      return nullptr;
+    }
+  }
+  return resolver;
+}
+
+// A refused allocation while Poll commits an aging transition must not lose
+// the timer or change the table: every due entry is re-armed at its own
+// deadline, and the retry produces the same update and solicitation.
+TEST(NeighborResolverFaultTest, PollAllocationFailureLosesNoTimerOrUpdate) {
+  const size_t points = ForEachFailurePoint([&](size_t fail_at) {
+    NeighborResolver::Key key_a;
+    NeighborResolver::Key key_b;
+    auto resolver = ResolvedPair(&key_a, &key_b);
+    if (!resolver) {
+      return;
+    }
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_a).state);
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_b).state);
+    EXPECT_EQ(2u, resolver->armed());
+    bool threw = false;
+    bool injected = false;
+    NeighborResolver::Progress progress;
+    {
+      AllocationFaults faults(fail_at);
+      try {
+        progress = resolver->Poll(110, 16);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+    }
+    if (!injected) {
+      EXPECT_FALSE(threw);
+      EXPECT_EQ(2u, progress.updates.size());
+      EXPECT_EQ(2u, progress.solicitations.size());
+      EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key_a).state);
+      EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key_b).state);
+      return;
+    }
+    EXPECT_TRUE(threw);
+    // Nothing committed, and both aging timers are still live (re-armed at
+    // 110 after the wheel spent their nodes during planning).
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_a).state);
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_b).state);
+    EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key_a).mac);
+    EXPECT_EQ(Mac("02:00:00:00:00:bb"), State(*resolver, key_b).mac);
+    EXPECT_EQ(2u, resolver->armed());
+
+    // The retry converges to the transitions the refused poll was making,
+    // for both entries, so no other due work was lost either.
+    progress = resolver->Poll(110, 16);
+    EXPECT_EQ(2u, progress.updates.size());
+    EXPECT_EQ(2u, progress.solicitations.size());
+    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key_a).state);
+    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key_b).state);
+    EXPECT_EQ(2u, resolver->armed());
+  });
+  EXPECT_GT(points, 0u);
+}
+
+// A refused allocation while ConfigureInterface stages an identity change
+// leaves the old interface generation, the learned neighbor, its binding's
+// source MAC and its timer untouched; retrying the same call converges.
+TEST(NeighborResolverFaultTest, ConfigureAllocationFailureLeavesIdentityWhole) {
+  const NeighborResolver::Interface moved = Iface(kIface1, "02:00:00:00:00:09", kMyIp);
+  const size_t points = ForEachFailurePoint([&](size_t fail_at) {
+    NeighborResolver::Key key;
+    auto resolver = ResolvedWithOldMac(&key);
+    if (!resolver) {
+      return;
+    }
+    const auto binding = resolver->table().BindingOf(NextHopId(1));
+    if (!binding) {
+      ADD_FAILURE() << "binding";
+      return;
+    }
+    EXPECT_EQ(1u, resolver->interface_epoch(kIface1));
+    bool threw = false;
+    bool injected = false;
+    std::expected<NeighborResolver::Progress, std::string> progress;
+    {
+      AllocationFaults faults(fail_at);
+      try {
+        progress = resolver->ConfigureInterface(moved, 20);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+    }
+    if (!injected) {
+      EXPECT_FALSE(threw);
+      ASSERT_TRUE(progress.has_value());
+      EXPECT_EQ(2u, resolver->interface_epoch(kIface1));
+      EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+      EXPECT_EQ(1u, progress.value().updates.size());
+      EXPECT_EQ(Mac("02:00:00:00:00:09"),
+                progress.value().updates[0].second.src_mac);
+      return;
+    }
+    EXPECT_TRUE(threw);
+    // The failed call changed neither the interface nor the neighbor.
+    EXPECT_EQ(1u, resolver->interface_epoch(kIface1));
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+    EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+    const auto unchanged = resolver->table().BindingOf(NextHopId(1));
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(binding->src_mac, unchanged->src_mac);
+    EXPECT_EQ(1u, resolver->armed());
+
+    // Retrying the same change (the old identity is still current) commits.
+    auto retried = resolver->ConfigureInterface(moved, 20);
+    ASSERT_TRUE(retried.has_value());
+    EXPECT_EQ(2u, resolver->interface_epoch(kIface1));
+    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+    EXPECT_EQ(1u, retried->updates.size());
+    EXPECT_EQ(Mac("02:00:00:00:00:09"),
+              retried->updates[0].second.src_mac);
+    const auto rebound = resolver->table().BindingOf(NextHopId(1));
+    ASSERT_TRUE(rebound.has_value());
+    EXPECT_EQ(Mac("02:00:00:00:00:09"), rebound->src_mac);
+  });
+  EXPECT_GT(points, 0u);
+}
+
+// RemoveInterface stages every update before erasing the interface or
+// touching a neighbor; a refusal leaves all of it in place and the retry
+// converges to unreachable.
+TEST(NeighborResolverFaultTest, RemoveAllocationFailureLeavesInterfaceWhole) {
+  const size_t points = ForEachFailurePoint([&](size_t fail_at) {
+    NeighborResolver::Key key;
+    auto resolver = ResolvedWithOldMac(&key);
+    if (!resolver) {
+      return;
+    }
+    const auto binding = resolver->table().BindingOf(NextHopId(1));
+    if (!binding) {
+      ADD_FAILURE() << "binding";
+      return;
+    }
+    EXPECT_EQ(1u, resolver->interface_epoch(kIface1));
+    bool threw = false;
+    bool injected = false;
+    NeighborResolver::Progress progress;
+    {
+      AllocationFaults faults(fail_at);
+      try {
+        progress = resolver->RemoveInterface(kIface1);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+      injected = faults.injected();
+    }
+    if (!injected) {
+      EXPECT_FALSE(threw);
+      EXPECT_EQ(0u, resolver->interface_epoch(kIface1));
+      EXPECT_EQ(1u, progress.updates.size());
+      EXPECT_EQ(NeighborState::kUnreachable, State(*resolver, key).state);
+      EXPECT_EQ(0u, resolver->armed());
+      return;
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(1u, resolver->interface_epoch(kIface1));
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+    EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+    const auto unchanged = resolver->table().BindingOf(NextHopId(1));
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(binding->src_mac, unchanged->src_mac);
+    EXPECT_EQ(1u, resolver->armed());
+
+    progress = resolver->RemoveInterface(kIface1);
+    EXPECT_EQ(0u, resolver->interface_epoch(kIface1));
+    EXPECT_EQ(1u, progress.updates.size());
+    EXPECT_EQ(NeighborState::kUnreachable, State(*resolver, key).state);
+    EXPECT_EQ(0u, resolver->armed());
+  });
+  EXPECT_GT(points, 0u);
 }
 
 // -- publication ---------------------------------------------------------------

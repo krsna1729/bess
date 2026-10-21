@@ -190,29 +190,72 @@ class NeighborResolver {
     if (epoch == 0) {
       epoch = 1;  // wrapped: no entry can still name the old generation
     }
-    interfaces_[iface.id] = StoredInterface{iface.mac, iface.ipv4, epoch};
-    return ResetInterfaceEntries(iface.id, now);
+
+    // Stage every neighbor key on the interface -- bound or not, so retained
+    // learning is invalidated -- before committing the identity or touching
+    // a table, timer or resolver entry. A refused allocation leaves the old
+    // identity in place, so the same call retried converges.
+    Progress out = NewProgress();
+    const std::vector<Key> keys = neighbors_.KeysForInterface(iface.id);
+    std::vector<NeighborTable::Prepared> prepared;
+    prepared.reserve(keys.size());
+    size_t update_count = 0;
+    for (const Key &key : keys) {
+      prepared.push_back(neighbors_.Prepare(key, NeighborState::kIncomplete,
+                                           utils::Ethernet::Address{},
+                                           iface.mac));
+      update_count += prepared.back().updates.size();
+    }
+    out.updates.reserve(update_count);
+
+    // Commit. insert_or_assign may allocate only for an interface id not seen
+    // before, and only before any neighbor is committed; if it throws, nothing
+    // else has changed and the same call retried converges.
+    interfaces_.insert_or_assign(
+        iface.id, StoredInterface{iface.mac, iface.ipv4, epoch});
+    for (NeighborTable::Prepared &update : prepared) {
+      neighbors_.Commit(update);
+      AppendUpdates(std::move(update.updates), out);
+      auto entry = entries_.find(update.key);
+      if (entry != entries_.end()) {
+        Disarm(entry->second);
+        entry->second.epoch = epoch;
+        entry->second.state = NeighborState::kIncomplete;
+        entry->second.probes = 0;
+        Arm(update.key, entry->second, now, timing_.first_probe);
+      }
+    }
+    return out;
   }
 
   // Removes the interface: every neighbor on it becomes unreachable and its
   // binding stays in the neighbor table (the next hops remain readable), but
   // the resolver forgets its state and timers. A later ConfigureInterface
-  // does not revive those neighbors; Bind them again.
+  // does not revive those neighbors; Bind them again. All updates are staged
+  // before the interface or any neighbor changes; a refused allocation
+  // leaves the interface and every entry as they were.
   Progress RemoveInterface(dataplane::InterfaceId id) {
-    interfaces_.erase(id);
     Progress out = NewProgress();
     const std::vector<Key> keys = neighbors_.KeysForInterface(id);
+    std::vector<NeighborTable::Prepared> prepared;
+    prepared.reserve(keys.size());
+    size_t update_count = 0;
     for (const Key &key : keys) {
-      // Allocations before the table or the resolver changes.
-      out.updates.reserve(out.updates.size() + neighbors_.BindingCount(key));
-      NeighborTable::Updates updates = neighbors_.Update(
-          key, NeighborState::kUnreachable, utils::Ethernet::Address{});
-      auto entry = entries_.find(key);
+      prepared.push_back(neighbors_.Prepare(
+          key, NeighborState::kUnreachable, utils::Ethernet::Address{}));
+      update_count += prepared.back().updates.size();
+    }
+    out.updates.reserve(update_count);
+
+    interfaces_.erase(id);
+    for (NeighborTable::Prepared &update : prepared) {
+      neighbors_.Commit(update);
+      auto entry = entries_.find(update.key);
       if (entry != entries_.end()) {
         Disarm(entry->second);
         entries_.erase(entry);
       }
-      AppendUpdates(std::move(updates), out);
+      AppendUpdates(std::move(update.updates), out);
     }
     return out;
   }
@@ -409,21 +452,89 @@ class NeighborResolver {
   // the solicitations and transitions that are due. Call it between batches
   // on the resolver's thread, with the scheduler's cached time and a bounded
   // budget, as ExpiryWheel::Poll does.
+  //
+  // Two phases. The wheel spends the due nodes while collecting them; every
+  // allocation the transitions need (their next-hop update vectors and the
+  // output space) happens in the planning phase, before any table, timer or
+  // resolver state changes. Only when all of that succeeded are the plans
+  // committed, which allocates nothing. If planning throws, every due entry
+  // is re-armed at the deadline it was collected for, so no timer is lost and
+  // no update is partially applied; the retry (the next Poll) sees the same
+  // work.
   Progress Poll(uint64_t now, size_t budget) {
-    Progress out = NewProgress();
+    Progress out = NewProgress();  // before consuming, so its space is staged
     due_.clear();
     wheel_->Poll(now, budget, [this](const TimerPayload &payload) noexcept {
       if (due_.size() < due_.capacity()) {
         due_.push_back(payload);
       }
     });
-    for (const TimerPayload &payload : due_) {
-      auto entry = entries_.find(payload.key);
-      if (entry == entries_.end() || entry->second.serial != payload.serial) {
-        continue;  // a record that outlived its entry
+    std::vector<Plan> plans;
+    try {
+      plans.reserve(due_.size());
+      size_t update_count = 0;
+      for (const TimerPayload &payload : due_) {
+        auto entry = entries_.find(payload.key);
+        if (entry == entries_.end() ||
+            entry->second.serial != payload.serial) {
+          continue;  // a record that outlived its entry
+        }
+        plans.emplace_back();
+        Plan &plan = plans.back();
+        plan.key = payload.key;
+        auto iface = interfaces_.find(payload.key.interface);
+        if (iface == interfaces_.end() ||
+            iface->second.epoch != entry->second.epoch) {
+          // The interface left or moved after the timer was armed: the entry
+          // goes, the table's newer state is not ours to change.
+          plan.remove = true;
+          continue;
+        }
+        PlanDue(plan, entry->second, now);
+        update_count += plan.prepared.updates.size();
       }
+      out.updates.reserve(update_count);
+    } catch (...) {
+      RecoverDue();
+      throw;
+    }
+
+    // Commit: no allocation, and nothing above changed yet.
+    for (Plan &plan : plans) {
+      auto entry = entries_.find(plan.key);
+      if (entry == entries_.end()) {
+        continue;
+      }
+      if (plan.remove) {
+        Disarm(entry->second);
+        entries_.erase(entry);
+        continue;
+      }
+      // The wheel already spent the timer this plan was collected for.
       entry->second.timer = dataplane::kNoExpiry;
-      Fire(payload.key, entry->second, now, out);
+      if (plan.prepared.changed) {
+        neighbors_.Commit(plan.prepared);
+      }
+      entry->second.state = plan.state;
+      entry->second.probes = plan.probes;
+      AppendUpdates(std::move(plan.prepared.updates), out);
+      if (plan.solicit) {
+        auto iface = interfaces_.find(plan.key.interface);
+        if (iface != interfaces_.end() && iface->second.ipv4 != 0 &&
+            !iface->second.mac.IsZero()) {
+          Solicitation solicitation;
+          solicitation.egress = plan.key.interface;
+          const size_t wrote = BuildArpRequest(
+              iface->second.mac, utils::be32_t(iface->second.ipv4),
+              utils::be32_t(plan.key.ipv4), solicitation.frame);
+          if (wrote == kArpFrameSize) {
+            out.solicitations.push_back(solicitation);
+          }
+        }
+      }
+      if (plan.arm) {
+        ArmAt(plan.key, entry->second, plan.deadline);
+      }
     }
     return out;
   }
@@ -446,10 +557,14 @@ class NeighborResolver {
 
  private:
   // The ExpiryWheel payload. The serial names one arming of one entry: a due
-  // record is acted on only if the entry still carries it.
+  // record is acted on only if the entry still carries it. The deadline lets
+  // Poll re-arm every due entry at its own deadline when a later allocation
+  // in the same poll is refused: the wheel spent the node, but the work is
+  // not lost.
   struct TimerPayload {
     Key key;
     uint32_t serial;
+    uint64_t deadline;
   };
 
   struct Entry {
@@ -511,7 +626,7 @@ class NeighborResolver {
     }
     entry.serial++;
     const dataplane::ExpiryHandle handle =
-        wheel_->Schedule(deadline, TimerPayload{key, entry.serial});
+        wheel_->Schedule(deadline, TimerPayload{key, entry.serial, deadline});
     if (handle == dataplane::kNoExpiry) {
       entry.serial--;
       return false;
@@ -527,15 +642,69 @@ class NeighborResolver {
                  dataplane::ExpiryWheel<TimerPayload>::After(now, delay));
   }
 
-  // Records `state` for `key` after reserving the output space first: every
-  // allocation this needs happens before the table or the resolver changes,
-  // so a refused allocation leaves both as they were and the caller can
-  // retry. The returned updates fit in `out` without allocating.
-  NeighborTable::Updates StageUpdate(const Key &key, NeighborState state,
-                                     const utils::Ethernet::Address &mac,
-                                     Progress &out) {
-    out.updates.reserve(out.updates.size() + neighbors_.BindingCount(key));
-    return neighbors_.Update(key, state, mac);
+  // One due timer's planned transition. Planning allocates (the table update
+  // vector); committing changes the table, the entry and the wheel and does
+  // not.
+  struct Plan {
+    Key key{};
+    bool remove = false;
+    NeighborState state = NeighborState::kIncomplete;
+    uint32_t probes = 0;
+    bool solicit = false;
+    bool arm = false;
+    uint64_t deadline = 0;
+    NeighborTable::Prepared prepared;
+  };
+
+  // What firing `entry`'s timer means, without changing anything. A resolved
+  // or unreachable neighbor is solicited again from kIncomplete; an attempt
+  // that has sent max_probes fails into kUnreachable; otherwise the next
+  // solicitation is fired. The plan's table transition is prepared here.
+  void PlanDue(Plan &plan, const Entry &entry, uint64_t now) {
+    NeighborState state = entry.state;
+    uint32_t probes = entry.probes;
+    if (state == NeighborState::kResolved ||
+        state == NeighborState::kUnreachable) {
+      // Aging or the retry of a failed attempt: solicit again. A resolved
+      // neighbor loses its MAC until a reply arrives (NeighborTable::Make
+      // clears it for an incomplete state).
+      state = NeighborState::kIncomplete;
+      probes = 0;
+    }
+    if (probes >= timing_.max_probes) {
+      state = NeighborState::kUnreachable;
+      probes = 0;
+      plan.arm = timing_.unreachable_retry != 0;
+      plan.deadline = dataplane::ExpiryWheel<TimerPayload>::After(
+          now, timing_.unreachable_retry);
+    } else {
+      probes++;
+      plan.solicit = true;
+      plan.arm = true;
+      plan.deadline = dataplane::ExpiryWheel<TimerPayload>::After(
+          now, RetryDelay(probes));
+    }
+    plan.state = state;
+    plan.probes = probes;
+    if (state != entry.state) {
+      plan.prepared =
+          neighbors_.Prepare(plan.key, state, utils::Ethernet::Address{});
+    }
+  }
+
+  // The wheel already spent these nodes, but planning refused an allocation:
+  // re-arm every still-current entry at the deadline its record carried, so
+  // nothing is lost and the next Poll retries the work.
+  void RecoverDue() noexcept {
+    for (const TimerPayload &payload : due_) {
+      auto entry = entries_.find(payload.key);
+      if (entry == entries_.end() ||
+          entry->second.serial != payload.serial) {
+        continue;
+      }
+      entry->second.timer = dataplane::kNoExpiry;
+      ArmAt(payload.key, entry->second, payload.deadline);
+    }
   }
 
   void Disarm(Entry &entry) {
@@ -558,88 +727,6 @@ class NeighborResolver {
       Disarm(stale->second);
       entries_.erase(stale);
     }
-  }
-
-  // A due timer for `key`'s entry.
-  void Fire(const Key &key, Entry &entry, uint64_t now, Progress &out) {
-    auto iface = interfaces_.find(key.interface);
-    if (iface == interfaces_.end() || iface->second.epoch != entry.epoch) {
-      // The interface left or moved after the timer was armed: drop the
-      // resolver's entry; the table's newer state is not ours to change.
-      Disarm(entry);
-      entries_.erase(key);
-      return;
-    }
-    if (entry.state == NeighborState::kResolved ||
-        entry.state == NeighborState::kUnreachable) {
-      // Aging or the retry of a failed attempt: solicit again. A resolved
-      // neighbor loses its MAC until a reply arrives (NeighborTable::Make
-      // clears it for an incomplete state).
-      NeighborTable::Updates updates = StageUpdate(
-          key, NeighborState::kIncomplete, utils::Ethernet::Address{}, out);
-      entry.state = NeighborState::kIncomplete;
-      entry.probes = 0;
-      AppendUpdates(std::move(updates), out);
-    }
-
-    if (entry.probes >= timing_.max_probes) {
-      // The attempt is over: publish failure and wait for the retry interval.
-      NeighborTable::Updates updates = StageUpdate(
-          key, NeighborState::kUnreachable, utils::Ethernet::Address{}, out);
-      entry.state = NeighborState::kUnreachable;
-      entry.probes = 0;
-      AppendUpdates(std::move(updates), out);
-      if (timing_.unreachable_retry != 0) {
-        Arm(key, entry, now, timing_.unreachable_retry);
-      }
-      return;
-    }
-
-    entry.probes++;
-    if (iface->second.ipv4 != 0 && !iface->second.mac.IsZero()) {
-      Solicitation solicitation;
-      solicitation.egress = key.interface;
-      const size_t wrote =
-          BuildArpRequest(iface->second.mac, utils::be32_t(iface->second.ipv4),
-                          utils::be32_t(key.ipv4), solicitation.frame);
-      if (wrote == kArpFrameSize) {
-        out.solicitations.push_back(solicitation);
-      }
-    }
-    // Without a usable source identity the attempt still advances, so a
-    // configured-away interface fails cleanly instead of spinning.
-    Arm(key, entry, now, RetryDelay(entry.probes));
-  }
-
-  // Re-arms every neighbor on `id` from the interface's new identity. It
-  // walks the neighbor table, not only the resolver's entries, so learning
-  // retained for neighbors that currently have no bound next hop is
-  // invalidated too: a later Bind must not reuse a MAC learned under the old
-  // interface generation.
-  Progress ResetInterfaceEntries(dataplane::InterfaceId id, uint64_t now) {
-    Progress out = NewProgress();
-    const auto iface = interfaces_.find(id);
-    const std::vector<Key> keys = neighbors_.KeysForInterface(id);
-    for (const Key &key : keys) {
-      // Reserve the output before the fallible table update; the table
-      // update itself builds all of its objects before changing anything.
-      out.updates.reserve(out.updates.size() + neighbors_.BindingCount(key));
-      NeighborTable::Updates updates = neighbors_.Reconfigure(
-          key, iface->second.mac, NeighborState::kIncomplete,
-          utils::Ethernet::Address{});
-      auto entry = entries_.find(key);
-      if (entry != entries_.end()) {
-        Disarm(entry->second);
-        entry->second.epoch = iface->second.epoch;
-        entry->second.state = NeighborState::kIncomplete;
-        entry->second.probes = 0;
-      }
-      AppendUpdates(std::move(updates), out);
-      if (entry != entries_.end()) {
-        Arm(key, entry->second, now, timing_.first_probe);
-      }
-    }
-    return out;
   }
 
   std::unique_ptr<dataplane::ExpiryWheel<TimerPayload>> wheel_;

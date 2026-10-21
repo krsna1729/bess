@@ -11890,7 +11890,7 @@ or interface identity. Neighbor state had no timers.
   are address-family neutral; ND enters as another packet family over the same
   entries when an IPv6 FIB exists.
 
-**Tests.** `core/route/neighbor_resolver_test.cc` (13/13): backoff/retry/
+**Tests.** `core/route/neighbor_resolver_test.cc` (16/16): backoff/retry/
 failure/recovery sequence with frame contents; aging and repeated-reply
 refresh; MAC change republishing every bound hop with no route write and an
 interface MAC change moving the bindings' source MAC; wrong-interface,
@@ -11901,7 +11901,10 @@ and a capacity-one rebind that releases its old entry; rebind and stale-timer
 safety; all-or-nothing (referential-order) transactional publication with a
 rejected transaction leaving both hops unchanged; two concurrent RCU readers
 resolving while a writer alternates published MACs; and the in-place responder
-used by Vif. `modules_vif_test` 8/8 (including `VifTest.LocalArpResponder`) and
+used by Vif. Three `NeighborResolverFaultTest` cases fail every allocation
+point of `Poll`, `ConfigureInterface` and `RemoveInterface` in turn: no timer
+is lost, no table or interface change is left uncommitted, and the retry
+converges. `modules_vif_test` 8/8 (including `VifTest.LocalArpResponder`) and
 `route_l3_test` 8/8 pass. The full fast-build suite (`meson test
 --no-rebuild`, 213 tests) passes except `live_conformance`'s Go half when no
 Go toolchain is on `PATH`; rerun with `MISE_GO_VERSION=1.27.2 mise exec --`,
