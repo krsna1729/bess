@@ -180,7 +180,10 @@ An advertisement is accepted only when all of the following hold:
   over the pseudo-header, an ND type, no malformed option;
 - the destination is this generation's: either the Ethernet destination is
   the interface's MAC and the IPv6 destination is its current address
-  (solicited), or both are all-nodes (the unsolicited MAC-change form); the
+  (solicited), or both are all-nodes (the unsolicited MAC-change form); a
+  multicast destination requires the Solicited flag to be clear (RFC 4861
+  7.1.1), and an interface with no IPv6 address (`::`) never matches a
+  unicast destination; the
   source/target link-layer option, if present, equals the Ethernet source,
   and the sender MAC is unicast, non-zero and not the interface's own;
 - the source address is not multicast or unspecified and is not the loopback

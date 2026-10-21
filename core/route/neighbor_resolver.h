@@ -508,7 +508,8 @@ class NeighborResolver {
     // an unsolicited one (RFC 4861's MAC-change notification) goes to
     // all-nodes. Anything else -- an old own address, another group, another
     // interface's MAC -- is not this generation's neighbor.
-    const bool to_us = eth.dst_addr == iface->second.mac &&
+    const bool to_us = !iface->second.ipv6.IsUnspecified() &&
+                       eth.dst_addr == iface->second.mac &&
                        advertisement->destination_ip == iface->second.ipv6;
     const bool to_all_nodes =
         eth.dst_addr == AllNodesMac() &&

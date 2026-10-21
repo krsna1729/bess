@@ -11980,7 +11980,9 @@ commit by the frame/parse and all-nodes tests.
 contents, NA resolving with the interface source MAC, aging and re-solicitation,
 unsolicited/override MAC semantics, retry/failure/recovery, wrong
 interface/target/source, Ethernet destination and unusable MAC rejection,
-malformed IP/ICMP/option/checksum/hop-limit cases, timestamp/multicast helpers,
+malformed IP/ICMP/option/checksum/hop-limit cases including a solicited
+all-nodes advertisement, timestamp/multicast helpers, the unspecified
+interface-address guard,
 concurrent publish/lookup, and the ND variants of the fault-injection tests.
 `modules_vif_test` adds `LocalNeighborSolicitationResponder` and keeps the ARP
 and resource tests unchanged.

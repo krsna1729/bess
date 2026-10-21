@@ -518,6 +518,11 @@ inline std::optional<NdMessage> ParseNeighborDiscovery(
     if (message.source_ip.IsUnspecified()) {
       return std::nullopt;
     }
+    // RFC 4861 7.1.1: an advertisement sent to a multicast destination must
+    // have the Solicited flag clear; otherwise it is silently discarded.
+    if (message.destination_ip.IsMulticast() && message.solicited) {
+      return std::nullopt;
+    }
   }
   size_t offset = kNdMessageSize;
   while (offset < payload.size()) {

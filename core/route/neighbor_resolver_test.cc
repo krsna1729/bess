@@ -996,6 +996,17 @@ TEST(NeighborResolverTest, NdAdvertisementsFollowMacAndOverrideSemantics) {
                   .empty());
   EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
 
+  // An all-nodes advertisement with Solicited set is invalid and changes
+  // nothing.
+  EXPECT_TRUE(resolver
+                  ->OnNd(20, kIface1,
+                         Advertisement(kPeer6, Mac("02:00:00:00:00:bb"),
+                                       /*solicited=*/true, /*override=*/true,
+                                       bess::route::AllNodesAddress(),
+                                       bess::route::AllNodesMac()))
+                  .empty());
+  EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+
   // A solicited (or overriding) one can, including the RFC 4861 unsolicited
   // form sent to all-nodes.
   auto progress = resolver->OnNd(
@@ -1107,6 +1118,28 @@ TEST(NeighborResolverTest, NdIdentityRejectsWrongInterfaceTargetAndSource) {
   EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
 }
 
+TEST(NeighborResolverTest, NdAdvertisementToUnspecifiedAddressIsIgnored) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver
+                  ->ConfigureInterface(
+                      Iface6(kIface1, "02:00:00:00:00:01", "::"), 0)
+                  .has_value());
+  const NeighborResolver::Key key(kIface1, kPeer6);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  // No address means no solicitation...
+  EXPECT_TRUE(resolver->Poll(10, 16).solicitations.empty());
+  // ...and a destination of :: is not this interface's address.
+  EXPECT_TRUE(resolver
+                  ->OnNd(10, kIface1,
+                         Advertisement(kPeer6, Mac("02:00:00:00:00:aa"),
+                                       /*solicited=*/true, /*override=*/true,
+                                       Ipv6Address{},
+                                       Mac("02:00:00:00:00:01")))
+                  .empty());
+  EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+}
+
 TEST(NeighborResolverTest, NdParsingRejectsMalformedAndBadChecksums) {
   Ipv6Address target = kPeer6;
   std::array<uint8_t, kNdFrameSize> frame{};
@@ -1148,6 +1181,14 @@ TEST(NeighborResolverTest, NdParsingRejectsMalformedAndBadChecksums) {
   bad = frame;
   std::memset(bad.data() + 14 + 40 + 26, 0xee, 6);
   EXPECT_FALSE(ParseNeighborDiscovery(bad).has_value());
+  // An advertisement to a multicast destination must not set Solicited.
+  std::array<uint8_t, kNdFrameSize> multicast_na{};
+  ASSERT_EQ(kNdFrameSize,
+            BuildNeighborAdvertisement(Mac("02:00:00:00:00:aa"), kPeer6, kPeer6,
+                                       AllNodesMac(), AllNodesAddress(),
+                                       /*solicited=*/true, /*override=*/true,
+                                       multicast_na));
+  EXPECT_FALSE(ParseNeighborDiscovery(multicast_na).has_value());
   EXPECT_FALSE(ParseNeighborDiscovery(
                    std::span<const uint8_t>(frame.data(), frame.size() - 1))
                    .has_value());
