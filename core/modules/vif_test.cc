@@ -391,10 +391,12 @@ TEST(VifResourceTest, InterfacesReadBackCanonically) {
   ASSERT_EQ("", h.UpsertResource(interfaces, bare_key, bare));
   VifInterfaceValue upper = IfaceValue();
   upper.set_mac_addr("02:AA:BB:CC:DD:EE");
+  upper.set_ipv6_addr("2001:0DB8:0000:0000:0000:0000:0000:0001");
   const VifInterfaceKey upper_key = IfaceKey(2);
   ASSERT_EQ("", h.UpsertResource(interfaces, upper_key, upper));
   VifInterfaceValue lower = upper;
   lower.set_mac_addr("02:aa:bb:cc:dd:ee");
+  lower.set_ipv6_addr("2001:db8::1");
   EXPECT_EQ("", h.ReadBackDiffers(interfaces, {{&bare_key, &bare}, {&upper_key, &lower}}));
 }
 
@@ -412,6 +414,12 @@ TEST(VifResourceTest, InterfacesRefuseBadKeysAndValues) {
   EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(1), bad));
   bad = IfaceValue();
   bad.set_ip_addr("10.0.0");
+  EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(1), bad));
+  bad = IfaceValue();
+  bad.set_ipv6_addr("2001:db8::1::2");
+  EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(1), bad));
+  bad = IfaceValue();
+  bad.set_ipv6_addr("fe80::1%eth0");
   EXPECT_NE("", h.UpsertResource(interfaces, IfaceKey(1), bad));
   bad = IfaceValue();
   bad.set_gate(DROP_GATE + 1);
