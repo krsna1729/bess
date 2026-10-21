@@ -29,7 +29,7 @@
 
 #include "dataplane/interface_id.h"
 #include "rcu/rcu_domain.h"
-#include "route/connected_route.h"
+#include "route/connected_routes.h"
 #include "route/forward.h"
 #include "route/neighbor_table.h"
 #include "route/router.h"
@@ -182,24 +182,37 @@ class RouterApp {
       return "route";
     }
     route_writes_ = 3;
-    // The connected routes (D-164): each interface's own subnet is reachable on
-    // it, with the hop the library makes -- the interface, no neighbor resolved
-    // yet, so a frame to the subnet itself is unresolved and dropped. A host on
-    // a subnet needs its own /32 route and hop: LearnNeighbor updates the hops
-    // bound to a neighbor (NeighborTable::Bind), and these are bound to
-    // nothing -- binding one to a host would point the whole subnet at that
-    // host's MAC. Hops 1..3 above are the gateways, so these start at 4.
-    uint32_t connected_hop = 4;
+    // The routes the interfaces' own addresses imply (D-164, D-178), derived
+    // by the library so this application and a controller cannot disagree
+    // about the arithmetic: each address's subnet is a connected route (the
+    // hop names the interface, no neighbor resolved, so a frame to the subnet
+    // itself is unresolved and dropped), and the address itself is a local
+    // route (delivery, never forwarded). A host on a subnet needs its own /32
+    // route and hop: LearnNeighbor updates the hops bound to a neighbor
+    // (NeighborTable::Bind), and these are bound to nothing -- binding one to
+    // a host would point the whole subnet at that host's MAC. Hops 1..3 above
+    // are the gateways, so these start at 4.
+    std::vector<bess::route::InterfaceAddress> addresses;
+    addresses.reserve(interfaces_.size());
     for (const Interface &iface : interfaces_) {
-      const auto connected =
-          bess::route::ConnectedRouteFor(iface.address, iface.length, iface.id);
-      if (!connected) {
-        return "connected route";
-      }
-      const NextHopId hop_id{connected_hop++};
-      if (!router_->SetNextHop(hop_id, connected->hop) ||
-          !router_->SetRoute(iface.vrf, connected->prefix, hop_id)) {
-        return "connected route";
+      addresses.push_back(bess::route::InterfaceAddress{
+          .interface = iface.id,
+          .domain = iface.vrf,
+          .address = iface.address,
+          .length = iface.length,
+      });
+    }
+    const auto derived = bess::route::DerivedRoutes::Derive(addresses);
+    if (!derived) {
+      return std::string("derived routes: ") +
+             bess::route::DerivationErrorName(derived.error());
+    }
+    uint32_t derived_hop = 4;
+    for (const bess::route::DerivedRoute &entry : derived->entries()) {
+      const NextHopId hop_id{derived_hop++};
+      if (!router_->SetNextHop(hop_id, entry.hop()) ||
+          !router_->SetRoute(entry.domain, entry.prefix, hop_id)) {
+        return "derived route";
       }
       route_writes_++;
     }

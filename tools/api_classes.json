@@ -100,6 +100,7 @@
     "rcu/rcu_domain.h": "experimental",
     "rcu/rcu_ptr.h": "experimental",
     "route/connected_route.h": "experimental",
+    "route/connected_routes.h": "experimental",
     "route/forward.h": "experimental",
     "route/l3_packet.h": "experimental",
     "route/neighbor_table.h": "experimental",

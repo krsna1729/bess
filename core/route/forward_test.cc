@@ -95,10 +95,10 @@ class ForwardChainTest : public bess::testing::RouteBackendTest {};
 TEST_P(ForwardChainTest, EgressIsReadBeforeTheNeighborState) {
   auto router = MakeRouter();
   // A hop that names no egress interface and whose neighbor is not resolved:
-  // the blackhole shape (D-160) as a controller writes it, and the shape of a
-  // local /32, whose neighbor nothing ever resolves. Its frames must not be
-  // reported as merely unresolved -- a graph punts those (D-162) -- and its
-  // neighbor state must not decide anything at all.
+  // the blackhole shape (D-160) as a controller writes it. Its frames must not
+  // be reported as merely unresolved -- a graph punts those (D-162) -- and its
+  // neighbor state must not decide anything at all. A local route is a
+  // different kind (D-178) and is tested in connected_routes_test.cc.
   NextHop hop = BlackholeNextHop();
   hop.neighbor = NeighborState::kIncomplete;
   RouteThrough(*router, NextHopId(1), hop, Ip(192, 0, 2, 0), 24);

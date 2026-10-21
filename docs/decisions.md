@@ -12001,6 +12001,9 @@ received ARP/ND frames to the control-side writer.
 
 **Revisit when:** an IPv6 FIB or a resolver module is added, or an application
 needs scoped link-local addresses on more than one interface.
+
+---
+
 ## D-177 A metadata reader declares its contract: best-effort, required, or optional with a default
 
 **Status:** accepted (2026-10-21; the plan's item: "required vs optional-with-default vs best-effort, plus a graph validation report").
@@ -12079,3 +12082,86 @@ mutex. The existing metadata graph tests, Router tests, and the full functional 
 `core/resume_hooks/{metadata,task_graph}.{h,cc}`, `core/worker.{h,cc}`, `core/control/{api_v2.cc,control_plane.cc,
 transaction.cc}`, `core/modules/router.{h,cc}`, `protobuf/control_v2.proto`, the C++ SDK and `bessctl/main.cc`,
 `docs/plugin-api.md`, and the SDK's generated control_v2 code.
+
+---
+
+## D-178 Connected and local route derivation, and local delivery as its own hop kind
+
+**Status:** accepted (2026-10-21; the roadmap item: "connected and local route derivation plus local
+delivery/punt semantics; the controller owns installation").
+
+**Context.** An interface's address has two meanings in a router. Its subnet is reachable on that interface
+(the *connected* route), and the address itself is the node's (a *local* route). D-164 put the first in the
+route library (`ConnectedRouteFor`) and the reference appliance installed one per interface; nothing owned the
+second. A local `/32` was written as `BlackholeNextHop()` (D-160) -- a route to a hop with no egress -- so a
+packet to the node's own address was indistinguishable from a deliberate blackhole: both were `kNoEgress`, and
+a graph could not send the first to a stack or control path while dropping the second. The derivation itself
+was also each caller's: the appliance masked the address by hand and the off-link-gateway correctness was the
+application's to get right, with no library surface for add/remove/change, duplicates, overlapping prefixes or
+two interfaces claiming one subnet. The Router's control path already had what installation needs -- the
+`routes` and `next_hops` resources in a transaction engine, all-or-nothing and retryable (D-021, D-023) -- but
+no derived route was published through it.
+
+**Decision.**
+
+- **One derivation library** (`route/connected_routes.h/.cc`). Given `InterfaceAddress{interface, domain,
+  address, length, flags}`, `DerivedRoutes::Derive` returns the connected route (`ConnectedRouteFor`'s subnet,
+  hop on the interface with no neighbor resolved) and the local route (the address as a `/32`, local hop), or
+  either half by flag. Entries are sorted by `(domain, prefix address, prefix length, kind)`; the route key is
+  `(domain, prefix)` and is unique. Identical inputs collapse. A `/32` address derives only the local route:
+  its connected subnet and its host route are the same key, and "this is my address" is the honest meaning.
+  Two interfaces deriving the same key in one domain is refused (`kConflictingRoute`) rather than resolved by
+  picking one; overlapping but different prefixes are both derived, and the FIB's longest-prefix match decides.
+- **Installation is the controller's, through the engine.** `InstallationOps(router, entries, hop_ids)` builds
+  the next-hop and route upserts for one transaction; `StaleRouteKeys` and `EraseOps` name and erase what an
+  address move or removal leaves behind. The library writes no table and assigns no ids: the controller owns
+  the id namespace and applies the transaction. A refused transaction leaves no partial derived state and the
+  same derivation can be retried; a duplicate application is idempotent.
+- **A local route is a distinct hop kind, not a blackhole.** `NextHop` gains `kind` (`kForward` default,
+  `kLocal`) in the byte its two neighbours left as padding, so it stays 16 bytes (D-060).
+  `LocalNextHop()` is kind local, no egress, no addresses. The shared forwarding chain
+  (`route/forward.h`) reports `kLocalDelivery` before it reads the egress or the neighbor -- delivery is not a
+  forward and not a drop -- and the Router module sends it to `punt_local_gate` (default `DROP_GATE`) and
+  counts it as `local`. `BlackholeNextHop()` keeps its meaning: an intentional drop. Both remain "a route
+  exists", both stay apart from `kNoRoute`, and the local counter says which one it was.
+- **The wire carries the kind.** `RouterNextHopValue` gains `RouterNextHopKind kind = 5` (unset = forward, so
+  every existing value keeps its meaning). A local hop's canonical form is kind `LOCAL` alone -- no egress, no
+  neighbor, no MACs -- and the codec refuses a local hop that also names an egress or an adjacency. Read-back
+  is that same form, so a controller's desired state applies as a no-op (D-129).
+- **The id mode does not punt.** Destination mode has the punt gates (D-162) and the local gate is one of
+  them. `ROUTE_MODE_NEXT_HOP_ID` forwards what the attribute names and drops everything else; a local hop
+  reached that way is not forwarded and is counted `local`.
+
+**Why.** The local delivery path is policy a graph must name, not a kernel the dataplane can assume: BESS has
+no stack to deliver to. Making it a hop kind keeps one FIB, one route set and one lookup; a second local table
+would be a second forwarding decision to keep consistent with the first. It costs no bytes: the `InterfaceId`
++ `NeighborState` pair left one padding byte, and `NextHop` is still the 16-byte object the hot path expects.
+Derivation belongs in the library for the same reason D-164 put the masking there: two controllers must not
+disagree about host bits, `/32`, or which interface owns a prefix, and a conflict must be reported before it
+becomes a silently blackholed subnet. Building operations rather than applying them keeps the library free of
+the transaction engine and the module lifecycle: the controller already holds the control-plane lock and the
+id namespace, and the engine already provides all-or-nothing publication and retry.
+
+**Consequences.** D-160's sentence that a local `/32` "uses the blackhole hop" is superseded: a local route now
+has its own hop kind and verdict, while a blackhole route keeps dropping. The reference appliance derives its
+routes with the library (one connected + one local route per interface instead of one connected route), and its
+own `Process` returns `kLocalDelivery` for the node's address. Adding local routes raises its route count and
+`route_writes`, which its self-test compares before and after a neighbor move, not against a fixed number.
+`Vif`'s interface address stays an ARP/ND responder address without a prefix length; it is a graph
+demultiplexer, not the route controller, and an address that should derive routes should be configured where
+the controller that owns the router's table can see its length. IPv6 has no FIB yet (D-176), so the derivation
+is IPv4-only, like the rest of the route library.
+
+**Evidence.** `route_connected_routes_test` 26/26 on both backends (`rte_lpm`, `rte_fib`): /24, /31,
+/32 and /0 derivation, flags, multiple addresses with overlapping prefixes and duplicates, input-order
+independence, cross-interface conflict, one-transaction installation, refused-transaction atomicity and retry,
+duplicate-install idempotence, address add/remove/change with stable keys, plan validation, mask decoding, and
+local vs connected vs routed vs miss through `ResolveFrame`/`ResolveFrames`. `modules_router_test` 35/35,
+including the new local-delivery gate, the id mode's non-forwarding of a local hop, and the canonical
+read-back/refusal rules; `route_forward_test` 14/14, `route_route_test` 45/45,
+`route_router_transaction_test` 34/34, `route_neighbor_resolver_test` 28/28 and `modules_vif_test` 9/9 are
+unchanged. The full suite (`meson test -C build/fast`) and `tools/check_includes.py` are the gate.
+
+**Revisit when:** an IPv6 FIB lands (a second derivation family), a controller needs to derive non-connected
+routes (recursion, preferences), or an interface address model with a prefix length arrives in `Vif` so the
+configuration can be the source of truth rather than a separate controller input.

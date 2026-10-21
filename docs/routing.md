@@ -67,6 +67,7 @@ route exists and chose that hop (D-160).
 | `route/neighbor_resolver.h` | the IPv4/IPv6 neighbor state machine: ARP or ND solicitation, retries/backoff, aging, MAC change, failure/recovery, interface identity; returns frames and neighbor updates (`docs/neighbor-resolution.md`) |
 | `route/l3_packet.h` | packet mechanics: `DecrementTtl`, `FlowHash`, MTU, ICMPv4 errors, ARP and IPv6 ND build/parse |
 | `route/forward.h` | the IPv4 forwarding chain both callers share (D-157): `ResolveFrame` (read) and `WriteForwarded` (write) |
+| `route/connected_routes.h` | the routes an interface address implies (D-178): `DerivedRoutes::Derive` for connected + local, deterministic order and stable keys, `InstallationOps`/`EraseOps` for the controller's transaction |
 | `route/lpm_resource.h` | one `LpmRouteTable` as a transaction resource (D-111): prefix → an opaque value whose meaning is the module's |
 | `conntrack/packet_parse.h` | the checked parse the chain starts from |
 
@@ -105,6 +106,25 @@ whose neighbor stays unresolved -- the hop names the interface, not a neighbor, 
 frame to the subnet itself is unresolved. Reaching a host on that subnet is a /32 route and hop the application
 writes when resolution learns the host (`NeighborTable::Bind` is what makes a learned neighbor update a hop).
 
+An interface address also implies a **local route** (D-178): the address itself is this node's, so a packet to
+it is delivered here and never forwarded. `route::DerivedRoutes::Derive(interfaces)` returns both routes per
+address -- the connected subnet and the local `/32` -- in a deterministic order with a stable key
+`(domain, prefix)`, collapsing duplicate inputs. A `/32` address derives only the local route: the connected
+subnet and the address's own host route would be the same key, and the local meaning is the honest one. Two
+interfaces deriving the same key in one domain is refused as a conflict; overlapping (but different) prefixes
+are both derived and the FIB's longest-prefix match decides. `InstallationOps(router, entries, hop_ids)` builds
+the next-hop and route upserts for one transaction, and `StaleRouteKeys(previous, next)` plus `EraseOps` name
+what an address move or removal leaves behind. The library never writes a table: the controller assigns the ids
+and applies the transaction, so a refused transaction leaves no partial derived state and the same derivation
+can be retried.
+
+A local hop (`route::LocalNextHop()`) has kind `kLocal`, no egress interface and no addresses. The forwarding
+chain reports `kLocalDelivery` for it before it consults either the egress or the neighbor; a caller decides
+where a local packet goes. The Router module's destination mode sends it to `punt_local_gate` (default: drop)
+and counts it as `local`, apart from a miss, an unresolved neighbor and a blackhole. That is the local
+delivery path in a dataplane graph: there is no kernel stack to hand the packet to, so the graph names the slow
+path. A local hop behind a `next_hop_id` is not forwarded either; the id mode has no punt gates (D-162).
+
 The two recipes meet in one module. Which one runs is **configuration**, not a per-packet test: the `mode` arg
 (`ROUTE_MODE_NEXT_HOP_ID`, the default, or `ROUTE_MODE_DESTINATION`, D-155). A module decides; it does not
 change what it decides from because a graph's wiring changed underneath it. In destination mode the
@@ -114,15 +134,17 @@ change what it decides from because a graph's wiring changed underneath it. In d
 
 The module owns: the mode, the gate map (`modules/router_gate_map.h` — a hop's egress interface to an output
 gate), the counters (one per outcome of the chain: not IPv4, malformed, non-initial fragment, no route,
-unresolved neighbor, TTL expired, a hop that forwards nowhere (D-160), header-write failure), and the copy a
-shared payload needs before its header is written.
+unresolved neighbor, TTL expired, a hop that forwards nowhere (D-160), a local address (D-178), header-write
+failure), and the copy a shared payload needs before its header is written.
 
 The application owns everything that is policy: which domain a packet is in (an interface, a VIF, a port), where
 the TTL is decremented (`UpdateTTL` in the graph, or the chain when the module routes by destination), and
 ICMP/uRPF (not the Router's business). A packet whose destination has no route and a packet whose neighbor is
 unresolved are distinct, counted outcomes; the module drops both by default, and it can send either to a gate
 instead (`punt_miss_gate`, `punt_unresolved_gate`, D-162) -- the frame is counted either way, so the counters
-stay the record of what happened.
+stay the record of what happened. A packet to a local route is a third outcome: it is delivered, not dropped,
+and `punt_local_gate` says where the graph's local path is (D-178); dropping is the default because a graph
+that names no local path has nowhere to deliver, and the `local` counter still records the traffic.
 
 ## Domains are cheap: `max_domains` is a bound
 
@@ -152,6 +174,7 @@ than to grow a second prefix table.
 - `docs/dataplane-tables.md` — the tables themselves, their capacities and their update costs.
 - `docs/decisions.md` — D-046 (domains), D-111 (the LPM resource), D-132 (the FIB backends), D-153 (address
   writes), D-155 (routing by destination), D-156 (groups), D-157 (the shared chain), D-158 (lazy domains),
-  D-160 (a hop that forwards nowhere), D-175 (IPv4 neighbor resolution), D-176 (IPv6 ND on the same resolver).
+  D-160 (a hop that forwards nowhere), D-175 (IPv4 neighbor resolution), D-176 (IPv6 ND on the same resolver),
+  D-178 (connected/local route derivation and local delivery).
 - `examples/appliances/router/router_app.h` — R1, the reference application, and `examples/static_router` for
   the same code as a program without `bessd`.

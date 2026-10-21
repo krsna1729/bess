@@ -315,16 +315,30 @@ enum RouterNeighborState {
 }
 
 /**
+ * What a Router next hop does with a packet (D-178): forward it out the egress
+ * gate, or deliver it to this node (a local route). Unset means forward, which
+ * keeps every value written before local delivery existed meaning the same.
+ */
+enum RouterNextHopKind {
+  ROUTER_NEXT_HOP_KIND_UNSPECIFIED = 0;
+  ROUTER_NEXT_HOP_KIND_FORWARD = 1;
+  ROUTER_NEXT_HOP_KIND_LOCAL = 2;
+}
+
+/**
  * A Router next hop ("<module>/next_hops"). An unset neighbor means resolved
  * and an absent MAC the zero address; the resource reads back (D-129) with
  * the neighbor always set and a zero MAC absent, so desired state that sends
- * that form applies as a no-op.
+ * that form applies as a no-op. A local hop takes kind LOCAL, no egress
+ * (DROP_GATE) and no MACs; it delivers to this node instead of forwarding
+ * (D-178).
  */
 message RouterNextHopValue {
   uint32 egress_gate = 1;
   RouterNeighborState neighbor = 2;
   bytes dst_mac = 3;
   bytes src_mac = 4;
+  RouterNextHopKind kind = 5;
 }
 
 /**
@@ -1453,6 +1467,7 @@ message RouterArg {
   FlowHashFields flow_hash = 10; /// Which fields a route that names a next-hop group hashes to pick its member (default: the whole flow, D-163).
   string next_hop_attr = 11; /// The metadata attribute next-hop mode reads the next-hop id from (default "next_hop_id").
   string domain_attr = 12; /// The metadata attribute destination mode reads the route domain from (default "route_domain").
+  uint64 punt_local_gate = 13; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. The frame is counted either way (D-178).
 }
 
 /**
