@@ -1236,6 +1236,9 @@ TEST(NeighborResolverTest, NdIdentityRejectsWrongInterfaceTargetAndSource) {
   EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
 }
 
+// An interface with no IPv6 address has nothing to solicit from: a binding of
+// an IPv6 neighbor on it is refused, and an advertisement to :: -- not this
+// interface's address -- creates nothing.
 TEST(NeighborResolverTest, NdAdvertisementToUnspecifiedAddressIsIgnored) {
   auto resolver = MakeResolver();
   ASSERT_NE(nullptr, resolver);
@@ -1244,10 +1247,9 @@ TEST(NeighborResolverTest, NdAdvertisementToUnspecifiedAddressIsIgnored) {
                       Iface6(kIface1, "02:00:00:00:00:01", "::"), 0)
                   .has_value());
   const NeighborResolver::Key key(kIface1, kPeer6);
-  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
-  // No address means no solicitation...
+  EXPECT_FALSE(resolver->CheckBind(key).has_value());
+  EXPECT_FALSE(resolver->Bind(NextHopId(1), key, 0).has_value());
   EXPECT_TRUE(resolver->Poll(10, 16).solicitations.empty());
-  // ...and a destination of :: is not this interface's address.
   EXPECT_TRUE(resolver
                   ->OnNd(10, kIface1,
                          Advertisement(kPeer6, Mac("02:00:00:00:00:aa"),
@@ -1255,7 +1257,7 @@ TEST(NeighborResolverTest, NdAdvertisementToUnspecifiedAddressIsIgnored) {
                                        Ipv6Address{},
                                        Mac("02:00:00:00:00:01")))
                   .empty());
-  EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+  EXPECT_FALSE(resolver->Find(key).has_value());
 }
 
 TEST(NeighborResolverTest, NdParsingRejectsMalformedAndBadChecksums) {

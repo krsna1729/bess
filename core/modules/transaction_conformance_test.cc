@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <any>
 #include <atomic>
 #include <cstddef>
@@ -164,6 +165,11 @@ std::vector<ModuleCase> ParityCases() {
     arg->set_max_ipv4_routes(64);
     arg->set_max_next_hops(16);
     arg->set_max_groups(8);
+    // An interface, so the neighbors table takes a binding.
+    auto *interface = arg->add_interfaces();
+    interface->set_egress_gate(1);
+    interface->set_mac_addr("02:00:00:00:00:01");
+    interface->add_addresses("192.0.2.1/24");
     c.arg = arg;
 
     auto hop_key = Msg<pb::RouterNextHopIdKey>();
@@ -171,6 +177,13 @@ std::vector<ModuleCase> ParityCases() {
     auto hop = Msg<pb::RouterNextHopValue>();
     hop->set_egress_gate(2);  // an unset neighbor is the canonical read-back state
     c.samples.push_back({"next_hops", hop_key, hop});
+
+    auto bound_key = Msg<pb::RouterNextHopIdKey>();
+    bound_key->set_id(2);
+    auto binding = Msg<pb::RouterNeighborBinding>();
+    binding->set_interface_id(2);
+    binding->set_ipv4("192.0.2.2");
+    c.samples.push_back({"neighbors", bound_key, binding});
 
     auto group_key = Msg<pb::RouterGroupIdKey>();
     group_key->set_id(1);
@@ -239,6 +252,8 @@ void CountPublishAllocations(bool entering) {
 TEST(ResourceParityTest, DeclaredTablesAreLiveTypedAndReleased) {
   ModuleHarness harness;
   TransactionEngine &engine = runtime::runtime().transactions();
+  // A resolving Router needs the maintenance loop; stand in for its interval.
+  runtime::runtime().ticks().set_interval(std::chrono::milliseconds(1));
 
   for (const ModuleCase &c : ParityCases()) {
     SCOPED_TRACE(c.mclass);

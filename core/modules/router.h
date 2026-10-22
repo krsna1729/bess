@@ -70,13 +70,15 @@
 // guess. docs/routing.md is the guide: the library's pieces, the two recipes
 // and what a graph decides.
 //
-// Neighbor resolution (D-179). With `interfaces` and `neighbor_bindings`
-// (both fixed at Init), the module owns those next hops' adjacencies: a
+// Neighbor resolution (D-179). With `interfaces` (fixed at Init), the module
+// owns the adjacencies of the next hops bound in `<module>/neighbors`: a
 // route::NeighborResolver solicits (ARP, ND) from a task, learns from ARP
 // replies and Neighbor Advertisements read with the ingress interface
 // attribute (default `vif_id`), ages and fails neighbors, and publishes each
-// change as a next-hop update through the engine on the maintenance tick.
-// Timings are configured in milliseconds and converted to ticks at Init.
+// change as an update of the bound hop through the engine on the
+// maintenance tick. Bindings come and go at runtime; the tick takes each up
+// (TakeNeighborBindingChanges). Timings are configured in milliseconds and
+// converted to ticks at Init.
 // ARP requests and Neighbor Solicitations are answered elsewhere: they go to
 // punt_neighbor_gate (by default the local punt gate), or are dropped, and
 // are counted. An ARP request (a gratuitous one included) is also copied to
@@ -97,20 +99,22 @@
 // forwarding it with the addresses it arrived with would put it on the wire as
 // someone else's.
 //
-// Control path: `<module>/next_hops`, `<module>/groups` (sized by
-// `max_groups`; a route names a next hop or a group) and `<module>/routes`
-// are resources, so one transaction can create a session's next hop, the
-// route to it and the rule whose result names the hop. An enrolled
-// router has one writer, the engine: the direct setters refuse with kEnrolled,
-// and the engine's ledger replaces the router's own reference counts. New
-// routes are placed during prepare with the value their addresses already
-// resolve to, so rte_lpm capacity is settled before anything is visible.
+// Control path: `<module>/next_hops`, `<module>/neighbors`, `<module>/groups`
+// (sized by `max_groups`; a route names a next hop or a group) and
+// `<module>/routes` are resources, so one transaction can create a next hop
+// (static or bound to a neighbor), the route to it and the rule whose result
+// names the hop. An enrolled router has one writer, the engine: the direct
+// setters refuse with kEnrolled, and the engine's ledger replaces the
+// router's own reference counts. New routes are placed during prepare with
+// the value their addresses already resolve to, so rte_lpm capacity is
+// settled before anything is visible.
 class Router final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
 
   static const Commands cmds;
   // "<module>/next_hops" (RouterNextHopIdKey -> RouterNextHopValue),
+  // "<module>/neighbors" (RouterNextHopIdKey -> RouterNeighborBinding),
   // "<module>/groups" (RouterGroupIdKey -> RouterGroupValue, with
   // `max_groups`) and "<module>/routes" (RouterRouteKey -> RouterRouteValue),
   // D-129.
@@ -252,6 +256,8 @@ class Router final : public Module {
   // Publishes at most kMaxNeighborUpdatesPerTick pending neighbor changes in
   // one transaction; the rest wait for the next tick.
   void PublishNeighborUpdates(uint64_t now);
+  // Starts or stops resolving the bindings published since the last tick.
+  void ApplyNeighborBindingChanges(uint64_t now);
   void ResolverTick(bess::framework::TickContext &ctx);
   void QueueNeighborUpdates(
       std::span<const std::pair<bess::route::NextHopId,
@@ -282,6 +288,7 @@ class Router final : public Module {
   std::unique_ptr<bess::route::Router> router_;
   // After router_, which owns the resources they bind (D-044).
   bess::framework::ResourceBinding next_hops_binding_;
+  bess::framework::ResourceBinding neighbors_binding_;
   bess::framework::ResourceBinding groups_binding_;
   bess::framework::ResourceBinding routes_binding_;
   std::unique_ptr<bess::route::NeighborResolver> neighbor_resolver_;

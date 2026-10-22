@@ -1454,7 +1454,8 @@ TEST_F(SessionPacketPathTest, DeclaredTablesMatchTheBoundCodecs) {
     EXPECT_FALSE(declared->requires_paused_workers) << t.resource;
     EXPECT_FALSE(codec->requires_paused_workers()) << t.resource;
   }
-  EXPECT_EQ(3u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size());
+  EXPECT_EQ(4u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size())
+      << "next_hops, neighbors, groups and routes";
 }
 
 // The configured names are the contract, not the registration: the graph

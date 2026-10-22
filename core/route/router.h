@@ -11,11 +11,12 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,7 @@
 #include "dataplane/slot_table.h"
 #include "packet.h"
 #include "packet_mutation.h"
+#include "route/neighbor_key.h"
 #include "route/next_hop_id.h"
 #include "route/route_domain.h"
 #include "route/route_table.h"
@@ -82,9 +84,29 @@ struct NextHop {
   utils::Ethernet::Address dst_mac{};
   utils::Ethernet::Address src_mac{};
 };
-// A transaction value accepted only by Router's internal neighbor publisher.
+// A neighbor's update to the next hop bound to it ("<router>/neighbors"): the
+// state and addresses a resolver learned. Accepted only for a bound id, by
+// the neighbors resource; the hop keeps its binding's interface as egress.
 struct NeighborManagedNextHop {
   NextHop value;
+};
+
+// One change to the neighbor bindings, in the order transactions published
+// them: `neighbor` is the key `id` is now bound to, or empty for an unbind.
+// The owner reads them (TakeNeighborBindingChanges) to start or stop
+// resolving; the next hop itself was already published, incomplete.
+struct NeighborBindingChange {
+  NextHopId id;
+  std::optional<NeighborKey> neighbor;
+};
+
+// What the owner of neighbor resolution accepts as bindings: how many next
+// hops may be bound at once, and a check of each neighbor key (its interface
+// exists, the router has an address of its family there, it is not one of
+// the router's own) before a transaction may bind it.
+struct NeighborBindingPolicy {
+  size_t capacity = 0;
+  std::function<std::expected<void, std::string>(const NeighborKey &)> validate;
 };
 
 // Every resolved packet loads one; at 16 bytes four fill a cache line and none
@@ -237,14 +259,28 @@ struct NextHopGroup {
 // id is invalid. A route may name a group, a group references its members,
 // and the direct group setters refuse (kEnrolled).
 //
-// Transactions (G1.2b, D-023): Enroll() registers the next hops, the groups
-// and the routes as three resources of a TransactionEngine, so that one
-// transaction can change them together with other modules' tables (a rule,
-// the action it names, the route that action forwards to). The routes
-// resource holds every domain's routes under one resource; the key carries
-// the domain (RouteKey). An enrolled router has one writer, the engine: the
-// direct setters above refuse (kEnrolled), and the engine's reference ledger
-// replaces the router's own counts.
+// Transactions (G1.2b, D-023): Enroll() registers the next hops, the neighbor
+// bindings, the groups and the routes as four resources of a
+// TransactionEngine, so that one transaction can change them together with
+// other modules' tables (a rule, the action it names, the route that action
+// forwards to). The routes resource holds every domain's routes under one
+// resource; the key carries the domain (RouteKey). An enrolled router has one
+// writer, the engine: the direct setters above refuse (kEnrolled), and the
+// engine's reference ledger replaces the router's own counts.
+//
+// Neighbor bindings (D-179): "<name>/neighbors" (key EncodeKey(NextHopId),
+// value NeighborKey) binds a next-hop id to a neighbor that a resolver owns.
+// Binding publishes the id's next hop -- egress the neighbor's interface,
+// incomplete -- in the same slot table the static next hops use, so routes
+// and groups name it like any next hop; its later states arrive as
+// NeighborManagedNextHop upserts on the same key. An id is either static
+// ("<name>/next_hops") or bound, never both: each resource refuses the
+// other's ids. A route or group that names a bound id references
+// "<name>/neighbors", so the engine refuses to unbind it while it is named.
+// Which resource a new value references is decided from the bindings as the
+// transaction has them so far: list a binding before the routes that name it
+// (desired-state convergence orders upserts by rank, which does). Without a
+// NeighborBindingPolicy the resource exists and binds nothing.
 class Router {
  public:
   // The address families a router serves and how each domain's table of each
@@ -289,16 +325,17 @@ class Router {
 
   // Adds next hop `id`, or replaces it (a neighbor update).
   std::expected<void, RouteError> SetNextHop(NextHopId id, const NextHop &hop);
-  // Marks an existing next hop as NeighborResolver-owned before Enroll().
-  // The ordinary next_hops resource then refuses writes and erases of its id.
-  std::expected<void, RouteError> MarkNeighborManagedNextHop(NextHopId id);
-  // Whether `id` is NeighborResolver-owned. The set is fixed once enrolled
-  // (marking refuses kEnrolled), so this reads it without the lock.
-  bool IsNeighborManagedNextHop(NextHopId id) const {
-    return std::find(neighbor_managed_next_hops_.begin(),
-                     neighbor_managed_next_hops_.end(),
-                     id) != neighbor_managed_next_hops_.end();
-  }
+  // Neighbor bindings (see the class comment). Set before Enroll(): the
+  // policy every binding must pass; without it no binding is accepted.
+  std::expected<void, RouteError> SetNeighborBindingPolicy(
+      NeighborBindingPolicy policy);
+  // Whether `id` is bound to a neighbor (control side, committed state).
+  bool IsNeighborBound(NextHopId id) const;
+  // Every binding, in id order (control side, committed state).
+  void ForEachNeighborBinding(
+      const std::function<void(NextHopId, const NeighborKey &)> &fn) const;
+  // The binding changes published since the last call, oldest first.
+  std::vector<NeighborBindingChange> TakeNeighborBindingChanges();
   std::expected<void, RouteError> RemoveNextHop(NextHopId id);
 
   // Drops retiring next hops and groups whose grace period has completed, and
@@ -434,10 +471,12 @@ class Router {
   // -- transactions (D-023) ---------------------------------------------------
 
   // Registers "<name>/next_hops" (key: EncodeKey(NextHopId), value: NextHop),
-  // "<name>/groups" (key: EncodeKey(NextHopGroupId), value: NextHopGroup;
-  // each group references its distinct members), and
-  // "<name>/routes" (key: RouteKey(domain, prefix), value: NextHopId or
-  // NextHopGroupId; each route references what it names) with `engine`, which
+  // "<name>/neighbors" (key: EncodeKey(NextHopId), value: NeighborKey or
+  // NeighborManagedNextHop; see the class comment), "<name>/groups" (key:
+  // EncodeKey(NextHopGroupId), value: NextHopGroup; each group references its
+  // distinct members), and "<name>/routes" (key: RouteKey(domain, prefix),
+  // value: NextHopId or NextHopGroupId; each route references what it names)
+  // with `engine`, which
   // must outlive the router or its enrollment. Refused once any route or group
   // exists or a removed next hop or group is still retiring (the ledger must
   // start from what it can see). Freezes the set of domains. Destroying an
@@ -445,7 +484,7 @@ class Router {
   std::expected<void, std::string> Enroll(dataplane::ResourceRegistry &engine);
   bool enrolled() const noexcept { return engine_ != nullptr; }
 
-  // Releases both resources for teardown, tolerating a referrer that is still
+  // Releases the resources for teardown, tolerating a referrer that is still
   // registered and live keys (the graph is being disconnected around the
   // router): the owning module calls this from DeInit(), because the order
   // modules are destroyed in must not decide whether a pipeline can be torn
@@ -453,12 +492,16 @@ class Router {
   std::expected<void, std::string> Release();
 
   const std::string &next_hops_resource() const { return next_hops_name_; }
+  const std::string &neighbors_resource() const { return neighbors_name_; }
   const std::string &routes_resource() const { return routes_name_; }
   const std::string &groups_resource() const { return groups_name_; }
   // The registered resources while enrolled (null otherwise), so the owning
   // module can attach the RPC's typed codecs to them (D-025).
   dataplane::Resource *next_hops_resource_object() const noexcept {
     return next_hops_res_.get();
+  }
+  dataplane::Resource *neighbors_resource_object() const noexcept {
+    return neighbors_res_.get();
   }
   dataplane::Resource *routes_resource_object() const noexcept {
     return routes_res_.get();
@@ -498,12 +541,20 @@ class Router {
     return dataplane::Op::Upsert(next_hops_name_, dataplane::EncodeKey(id),
                                  std::any(hop));
   }
-  // Privileged transaction update for a next hop previously marked as
-  // NeighborResolver-owned. Static next_hops resource writes are rejected.
+  // Binds next hop `id` to `neighbor`, or unbinds it ("<name>/neighbors").
+  dataplane::Op BindNeighborOp(NextHopId id, const NeighborKey &neighbor) const {
+    return dataplane::Op::Upsert(neighbors_name_, dataplane::EncodeKey(id),
+                                 std::any(neighbor));
+  }
+  dataplane::Op UnbindNeighborOp(NextHopId id) const {
+    return dataplane::Op::Erase(neighbors_name_, dataplane::EncodeKey(id));
+  }
+  // A resolver's update to the next hop bound at `id`: its state and
+  // addresses (the egress stays the binding's interface).
   dataplane::Op SetNeighborManagedNextHopOp(NextHopId id,
                                             const NextHop &hop) const {
     return dataplane::Op::Upsert(
-        next_hops_name_, dataplane::EncodeKey(id),
+        neighbors_name_, dataplane::EncodeKey(id),
         std::any(NeighborManagedNextHop{hop}));
   }
   dataplane::Op RemoveNextHopOp(NextHopId id) const {
@@ -741,7 +792,15 @@ class Router {
 
   class RouteResource;
   class NextHopResource;
+  class NeighborResource;
   class GroupResource;
+
+  // The resource a value naming next hop `id` references: "<name>/neighbors"
+  // for a bound id, else "<name>/next_hops". `in_transaction` reads the
+  // bindings as the transaction in progress has them so far (a new value);
+  // otherwise the committed ones (a stored value). Engine-serialized.
+  dataplane::Reference HopReference(NextHopId id, bool in_transaction) const;
+  bool BoundInTransaction(NextHopId id) const;
 
   // The domain's IPv4 / IPv6 FIB, or null for a domain that does not exist
   // or a family the router does not serve.
@@ -894,13 +953,29 @@ class Router {
 
   // Set by Enroll(); the resources exist while enrolled.
   const std::string next_hops_name_;
+  const std::string neighbors_name_;
   const std::string routes_name_;
   const std::string groups_name_;
   dataplane::ResourceRegistry *engine_ = nullptr;
   std::unique_ptr<dataplane::Resource> next_hops_res_;
+  std::unique_ptr<dataplane::Resource> neighbors_res_;
   std::unique_ptr<dataplane::Resource> groups_res_;  // holds nothing without max_groups
   std::unique_ptr<dataplane::Resource> routes_res_;
-  std::vector<NextHopId> neighbor_managed_next_hops_;
+
+  // Neighbor bindings (D-179), written by the engine's serialized
+  // transactions and read by the control side under the same serialization.
+  // Index = next-hop id, sized at construction, so publishing a binding never
+  // allocates.
+  std::vector<std::optional<NeighborKey>> bindings_;
+  size_t bound_count_ = 0;
+  NeighborBindingPolicy neighbor_policy_;
+  // The transaction in progress: the ids it binds (with their keys) or unbinds
+  // (empty), and the static ids it upserts. Cleared when it ends.
+  std::map<NextHopId, std::optional<NeighborKey>> staged_bindings_;
+  std::set<NextHopId> staged_static_;
+  // Published changes the owner has not taken yet; room for every staged one
+  // is reserved before anything publishes.
+  std::vector<NeighborBindingChange> binding_changes_;
 };
 
 }  // namespace bess::route

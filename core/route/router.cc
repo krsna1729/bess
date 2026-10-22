@@ -99,8 +99,10 @@ Router::Router(const std::string &name, const Config &config,
       group_references_(max_groups + 1, 0),
       member_references_(max_next_hops + 1, 0),
       next_hops_name_(name + "/next_hops"),
+      neighbors_name_(name + "/neighbors"),
       routes_name_(name + "/routes"),
-      groups_name_(name + "/groups") {
+      groups_name_(name + "/groups"),
+      bindings_(max_next_hops + 1) {
   // Before any reader can exist: nothing to retire.
   domains_.Publish(SlotOf(kDefaultRouteDomainId), std::move(default_domain));
 }
@@ -110,10 +112,11 @@ Router::Router(const std::string &name, const Config &config,
 // no reader can use it.
 Router::~Router() {
   if (engine_ != nullptr) {
-    // Routes reference groups and next hops, groups reference next hops: they
-    // leave together with their contents; with readers gone, pending removals
-    // complete in the call.
-    std::vector<std::string> names = {routes_name_, groups_name_, next_hops_name_};
+    // Routes reference groups, bindings and next hops, groups reference
+    // bindings and next hops: they leave together with their contents; with
+    // readers gone, pending removals complete in the call.
+    std::vector<std::string> names = {routes_name_, groups_name_, neighbors_name_,
+                                      next_hops_name_};
     auto unregistered = engine_->Unregister(names);
     CHECK(unregistered) << unregistered.error();
   }
@@ -162,7 +165,8 @@ class Router::RouteResource final : public dataplane::Resource {
  public:
   explicit RouteResource(Router &router)
       : Resource(router.routes_name_,
-                 std::vector<std::string>{router.next_hops_name_, router.groups_name_}),
+                 std::vector<std::string>{router.next_hops_name_, router.neighbors_name_,
+                                          router.groups_name_}),
         router_(router) {}
 
   size_t LiveCount() const override { return router_.CountRoutes(); }
@@ -272,7 +276,7 @@ class Router::RouteResource final : public dataplane::Resource {
     }
     // Everything that can throw first; placing the prefix is the last step.
     auto upsert = std::make_unique<UpsertOp>(*table, prefix, value);
-    Reservation reservation{nullptr, References(value)};
+    Reservation reservation{nullptr, References(value, /*in_transaction=*/true)};
     reservation.existed = previous.has_value();
     if (previous) {
       reservation.previous_references = References(*previous);
@@ -396,7 +400,7 @@ class Router::RouteResource final : public dataplane::Resource {
     auto commit = std::make_unique<Commit6Op>(staged);
     Reservation reservation{nullptr,
                             erase ? std::vector<dataplane::Reference>{}
-                                  : References(value)};
+                                  : References(value, /*in_transaction=*/true)};
     reservation.existed = previous.has_value();
     if (previous) {
       reservation.previous_references = References(*previous);
@@ -442,12 +446,16 @@ class Router::RouteResource final : public dataplane::Resource {
     return table->Find(id.prefix);
   }
 
-  std::vector<dataplane::Reference> References(uint32_t value) const {
+  // What a route value references: its group, or its next hop in the
+  // resource that holds it (HopReference). A stored value is read against the
+  // committed bindings; a value being written against the transaction's.
+  std::vector<dataplane::Reference> References(uint32_t value,
+                                               bool in_transaction = false) const {
     if (value > router_.max_next_hops_) {
       return {{router_.groups_name_,
                dataplane::EncodeKey(NextHopGroupId(value - router_.max_next_hops_))}};
     }
-    return {{router_.next_hops_name_, dataplane::EncodeKey(NextHopId(value))}};
+    return {router_.HopReference(NextHopId(value), in_transaction)};
   }
 
   class UpsertOp final : public dataplane::StagedOp {
@@ -518,8 +526,10 @@ class Router::RouteResource final : public dataplane::Resource {
 };
 
 
-// Next hops with a NeighborResolver binding are owned by that state machine.
-// External resource writes cannot replace a learned adjacency or erase its id.
+// "<router>/next_hops": the static next hops. A bound id ("<router>/neighbors")
+// shares the slot table but is not this resource's: it is absent here, and a
+// write or an erase of it is refused. The ids this transaction upserts are
+// recorded, so the neighbors resource can refuse to bind them.
 class Router::NextHopResource final
     : public dataplane::SlotResource<NextHopId, NextHop> {
  public:
@@ -528,60 +538,260 @@ class Router::NextHopResource final
   explicit NextHopResource(Router &router)
       : Base(router.next_hops_name_, router.next_hops_), router_(router) {}
 
+  size_t LiveCount() const override {
+    return Base::LiveCount() - router_.bound_count_;
+  }
+
+  bool Contains(const dataplane::ResourceKey &key) const override {
+    NextHopId id;
+    return dataplane::DecodeKey(key, &id) && !router_.IsNeighborBound(id) &&
+           Base::Contains(key);
+  }
+
   std::expected<Reservation, std::string> Reserve(
       const dataplane::Op &op) override {
     NextHopId id;
     if (dataplane::DecodeKey(op.key, &id) &&
-        router_.IsNeighborManagedNextHop(id)) {
-      if (op.kind != dataplane::OpKind::kUpsert) {
-        return std::unexpected(
-            "next hop is owned by the Router NeighborResolver");
-      }
-      const auto *managed =
-          std::any_cast<NeighborManagedNextHop>(&op.value);
-      if (managed == nullptr) {
-        return std::unexpected(
-            "next hop is owned by the Router NeighborResolver");
-      }
-      dataplane::Op authorized = op;
-      authorized.value = managed->value;
-      return Base::Reserve(authorized);
+        (router_.IsNeighborBound(id) || router_.BoundInTransaction(id))) {
+      return std::unexpected("next hop " + std::to_string(id.value()) +
+                             " is bound to a neighbor (" + router_.neighbors_name_ +
+                             ")");
     }
-    return Base::Reserve(op);
+    auto reserved = Base::Reserve(op);
+    if (reserved && op.kind == dataplane::OpKind::kUpsert) {
+      router_.staged_static_.insert(id);
+    }
+    return reserved;
   }
+
+  void EndTransaction() noexcept override { router_.staged_static_.clear(); }
 
  private:
   Router &router_;
 };
 
+// "<router>/neighbors" (D-179): next-hop id -> NeighborKey, the hops a
+// resolver owns. Binding publishes the id's next hop in the shared slot table
+// -- egress the neighbor's interface, incomplete -- and records the change for
+// the owner (TakeNeighborBindingChanges); a NeighborManagedNextHop upsert on a
+// bound id publishes the resolver's newer state; an erase unbinds, keeping
+// the hop readable until the removal cascade, like a SlotResource erase. Its
+// erase is deferred, so routes and groups may reference it, and the engine
+// refuses an unbind while any does. Capacity is the policy's: bound ids,
+// counted across the transaction.
+class Router::NeighborResource final : public dataplane::Resource {
+ public:
+  explicit NeighborResource(Router &router)
+      : Resource(router.neighbors_name_), router_(router) {}
+
+  size_t LiveCount() const override { return router_.bound_count_; }
+
+  std::optional<uint64_t> Capacity() const override {
+    if (!router_.neighbor_policy_.validate) {
+      return std::nullopt;
+    }
+    return router_.neighbor_policy_.capacity;
+  }
+
+  bool Contains(const dataplane::ResourceKey &key) const override {
+    NextHopId id;
+    return dataplane::DecodeKey(key, &id) && router_.IsNeighborBound(id);
+  }
+
+  bool DefersErase() const override { return true; }
+
+  std::expected<Reservation, std::string> Reserve(
+      const dataplane::Op &op) override {
+    NextHopId id;
+    if (!dataplane::DecodeKey(op.key, &id) || !router_.ValidId(id)) {
+      return std::unexpected("invalid id");
+    }
+    const std::string named = "next hop " + std::to_string(id.value());
+    const std::optional<NeighborKey> &current = router_.bindings_[id.value()];
+    if (op.kind == dataplane::OpKind::kErase) {
+      if (!current) {
+        return std::unexpected("not found");
+      }
+      StageChange(id, std::nullopt);
+      Reservation erase{std::make_unique<UnbindOp>(router_, id), {},
+                        Footprint{.removals = 1}};
+      erase.existed = true;
+      return erase;
+    }
+    if (const auto *update = std::any_cast<NeighborManagedNextHop>(&op.value)) {
+      if (!current || router_.staged_bindings_.contains(id)) {
+        return std::unexpected(named + " is not bound to a neighbor");
+      }
+      NextHop hop = update->value;
+      hop.egress = current->interface;
+      hop.kind = NextHopKind::kForward;
+      Reservation reservation{
+          std::make_unique<PublishOp>(router_, id, std::make_unique<const NextHop>(hop),
+                                      std::nullopt),
+          {},
+          Footprint{.retires = 1}};
+      reservation.existed = true;
+      return reservation;
+    }
+    const auto *neighbor = std::any_cast<NeighborKey>(&op.value);
+    if (neighbor == nullptr) {
+      return std::unexpected(
+          "wrong value type (want NeighborKey or NeighborManagedNextHop)");
+    }
+    if (!router_.neighbor_policy_.validate) {
+      return std::unexpected("neighbor resolution is not configured");
+    }
+    if (auto valid = router_.neighbor_policy_.validate(*neighbor); !valid) {
+      return std::unexpected(valid.error());
+    }
+    if (current && *current == *neighbor) {
+      Reservation same{std::make_unique<NoOp>(), {}, {}};
+      same.existed = true;
+      return same;
+    }
+    if (!current) {
+      if (router_.next_hops_.Contains(id) || router_.staged_static_.contains(id)) {
+        return std::unexpected(named + " is a static next hop (" +
+                               router_.next_hops_name_ + ")");
+      }
+      if (!router_.next_hops_.CanPublish(id)) {
+        return std::unexpected(named + " is still retiring");
+      }
+      // Bound after the transaction: the committed bindings, plus what it
+      // has bound and minus what it has unbound so far, plus this one.
+      size_t bound = router_.bound_count_ + 1;
+      for (const auto &[staged, key] : router_.staged_bindings_) {
+        if (key && !router_.bindings_[staged.value()]) {
+          bound++;
+        } else if (!key) {
+          bound--;
+        }
+      }
+      if (bound > router_.neighbor_policy_.capacity) {
+        return std::unexpected("neighbor capacity (" +
+                               std::to_string(router_.neighbor_policy_.capacity) +
+                               " bindings) exhausted");
+      }
+    }
+    NextHop hop;
+    hop.egress = neighbor->interface;
+    hop.neighbor = NeighborState::kIncomplete;
+    auto object = std::make_unique<const NextHop>(hop);
+    StageChange(id, *neighbor);
+    Reservation reservation{
+        std::make_unique<PublishOp>(router_, id, std::move(object), *neighbor),
+        {},
+        Footprint{.retires = current ? 1u : 0u}};
+    reservation.existed = current.has_value();
+    return reservation;
+  }
+
+  void EndTransaction() noexcept override { router_.staged_bindings_.clear(); }
+
+ private:
+  // Records the transaction's change to `id`'s binding, with room for it in
+  // the change log, before anything can publish.
+  void StageChange(NextHopId id, std::optional<NeighborKey> neighbor) {
+    router_.staged_bindings_[id] = neighbor;
+    router_.binding_changes_.reserve(router_.binding_changes_.size() +
+                                     router_.staged_bindings_.size());
+  }
+
+  class NoOp final : public dataplane::StagedOp {
+   public:
+    void Publish(dataplane::Retirer &) noexcept override {}
+  };
+
+  // Publishes a bound id's next hop; with `binding`, also (re)binds the id.
+  class PublishOp final : public dataplane::StagedOp {
+   public:
+    PublishOp(Router &router, NextHopId id, std::unique_ptr<const NextHop> hop,
+              std::optional<NeighborKey> binding)
+        : router_(router), id_(id), hop_(std::move(hop)), binding_(binding) {}
+    void Publish(dataplane::Retirer &retirer) noexcept override {
+      retirer.Retire(router_.next_hops_.Publish(id_, std::move(hop_)));
+      if (binding_) {
+        std::optional<NeighborKey> &slot = router_.bindings_[id_.value()];
+        if (!slot) {
+          router_.bound_count_++;
+        }
+        slot = *binding_;
+        router_.binding_changes_.push_back({id_, *binding_});  // room reserved
+      }
+    }
+
+   private:
+    Router &router_;
+    NextHopId id_;
+    std::unique_ptr<const NextHop> hop_;
+    std::optional<NeighborKey> binding_;
+  };
+
+  class UnbindOp final : public dataplane::StagedOp {
+   public:
+    UnbindOp(Router &router, NextHopId id) : router_(router), id_(id) {}
+    void Publish(dataplane::Retirer &retirer) noexcept override {
+      router_.next_hops_.Retire(id_);  // absent now, readable until the cascade
+      retirer.RemoveLater([&table = router_.next_hops_, id = id_](dataplane::Retirer &later) {
+        later.Retire(table.Unpublish(id));
+      });
+      router_.bindings_[id_.value()].reset();
+      router_.bound_count_--;
+      router_.binding_changes_.push_back({id_, std::nullopt});  // room reserved
+    }
+
+   private:
+    Router &router_;
+    NextHopId id_;
+  };
+
+  Router &router_;
+};
+
+namespace {
+
+// A group's references: each distinct member once (a repeated member, a
+// weight, is one reference), in the resource that holds it.
+template <typename HopReferenceFn>
+std::vector<dataplane::Reference> MemberReferences(const NextHopGroup &group,
+                                                   HopReferenceFn &&reference) {
+  std::vector<NextHopId> members(group.members.begin(),
+                                 group.members.begin() + std::min<size_t>(group.size, NextHopGroup::kMaxMembers));
+  std::sort(members.begin(), members.end());
+  members.erase(std::unique(members.begin(), members.end()), members.end());
+  std::vector<dataplane::Reference> refs;
+  refs.reserve(members.size());
+  for (const NextHopId m : members) {
+    refs.push_back(reference(m));
+  }
+  return refs;
+}
+
+}  // namespace
+
 // "<router>/groups": a SlotResource of immutable groups, each referencing its
-// distinct members (a repeated member, a weight, is one reference), so a group
+// distinct members (a repeated member, a weight, is one reference) -- in
+// "<router>/next_hops", or "<router>/neighbors" for a bound one -- so a group
 // cannot name a next hop that does not exist and a member cannot be removed
 // while a group names it. Reserve also checks the id and the member count,
-// before the base reads the members.
+// before the base reads the members, and reports a replaced group's
+// references as they were committed.
 class Router::GroupResource final
     : public dataplane::SlotResource<NextHopGroupId, NextHopGroup> {
  public:
   explicit GroupResource(Router &router)
       : SlotResource(router.groups_name_, router.groups_,
-                     [hops = router.next_hops_name_](const NextHopGroup &group) {
-                       std::vector<NextHopId> members(group.members.begin(),
-                                                      group.members.begin() + group.size);
-                       std::sort(members.begin(), members.end());
-                       members.erase(std::unique(members.begin(), members.end()), members.end());
-                       std::vector<dataplane::Reference> refs;
-                       refs.reserve(members.size());
-                       for (const NextHopId m : members) {
-                         refs.push_back({hops, dataplane::EncodeKey(m)});
-                       }
-                       return refs;
+                     [&router](const NextHopGroup &group) {
+                       return MemberReferences(group, [&router](NextHopId m) {
+                         return router.HopReference(m, /*in_transaction=*/true);
+                       });
                      },
-                     {router.next_hops_name_}),
+                     {router.next_hops_name_, router.neighbors_name_}),
         router_(router) {}
 
   std::expected<Reservation, std::string> Reserve(const dataplane::Op &op) override {
+    NextHopGroupId id;
     if (op.kind == dataplane::OpKind::kUpsert) {
-      NextHopGroupId id;
       if (!dataplane::DecodeKey(op.key, &id) || !router_.ValidGroupId(id)) {
         return std::unexpected(RouteErrorName(RouteError::kInvalidId));
       }
@@ -594,12 +804,65 @@ class Router::GroupResource final
                                " members");
       }
     }
-    return SlotResource::Reserve(op);
+    auto reserved = SlotResource::Reserve(op);
+    if (reserved && reserved->existed && dataplane::DecodeKey(op.key, &id)) {
+      if (const NextHopGroup *previous = router_.groups_.Current(id)) {
+        reserved->previous_references =
+            MemberReferences(*previous, [this](NextHopId m) {
+              return router_.HopReference(m, /*in_transaction=*/false);
+            });
+      }
+    }
+    return reserved;
   }
 
  private:
   Router &router_;
 };
+
+dataplane::Reference Router::HopReference(NextHopId id, bool in_transaction) const {
+  const bool bound = in_transaction ? BoundInTransaction(id) : IsNeighborBound(id);
+  return {bound ? neighbors_name_ : next_hops_name_, dataplane::EncodeKey(id)};
+}
+
+bool Router::BoundInTransaction(NextHopId id) const {
+  if (!ValidId(id)) {
+    return false;
+  }
+  if (const auto staged = staged_bindings_.find(id); staged != staged_bindings_.end()) {
+    return staged->second.has_value();
+  }
+  return bindings_[id.value()].has_value();
+}
+
+bool Router::IsNeighborBound(NextHopId id) const {
+  return ValidId(id) && bindings_[id.value()].has_value();
+}
+
+void Router::ForEachNeighborBinding(
+    const std::function<void(NextHopId, const NeighborKey &)> &fn) const {
+  for (size_t i = 1; i < bindings_.size(); i++) {
+    if (bindings_[i]) {
+      fn(NextHopId(static_cast<uint32_t>(i)), *bindings_[i]);
+    }
+  }
+}
+
+std::vector<NeighborBindingChange> Router::TakeNeighborBindingChanges() {
+  std::vector<NeighborBindingChange> out;
+  out.swap(binding_changes_);
+  return out;
+}
+
+std::expected<void, RouteError> Router::SetNeighborBindingPolicy(
+    NeighborBindingPolicy policy) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr) {
+    return std::unexpected(RouteError::kEnrolled);
+  }
+  neighbor_policy_ = std::move(policy);
+  return {};
+}
 
 std::expected<void, std::string> Router::Enroll(
     dataplane::ResourceRegistry &engine) {
@@ -617,27 +880,35 @@ std::expected<void, std::string> Router::Enroll(
     return std::unexpected("enroll before adding next-hop groups");
   }
   auto hops = std::make_unique<NextHopResource>(*this);
-  // The groups resource is registered whether or not max_groups is set: the
+  // The neighbors resource is registered whether or not a binding policy is
+  // set, and so is the groups resource whether or not max_groups is: the
   // control plane refuses a class that registers fewer tables than it
   // declares (CheckDeclaredResources), and the Router module declares all
-  // three (D-156). Without max_groups it holds nothing and every id is
-  // invalid.
+  // four (D-156, D-179). Without its policy or bound it holds nothing.
+  auto neighbors = std::make_unique<NeighborResource>(*this);
   auto groups = std::make_unique<GroupResource>(*this);
   auto routes = std::make_unique<RouteResource>(*this);
   if (auto r = engine.Register(hops.get()); !r) {
     return r;
   }
+  if (auto r = engine.Register(neighbors.get()); !r) {
+    CHECK(engine.Unregister(next_hops_name_));
+    return r;
+  }
   if (auto r = engine.Register(groups.get()); !r) {
+    CHECK(engine.Unregister(neighbors_name_));
     CHECK(engine.Unregister(next_hops_name_));
     return r;
   }
   if (auto r = engine.Register(routes.get()); !r) {
     CHECK(engine.Unregister(groups_name_));
+    CHECK(engine.Unregister(neighbors_name_));
     CHECK(engine.Unregister(next_hops_name_));
     return r;
   }
   engine_ = &engine;
   next_hops_res_ = std::move(hops);
+  neighbors_res_ = std::move(neighbors);
   groups_res_ = std::move(groups);
   routes_res_ = std::move(routes);
   return {};
@@ -648,13 +919,15 @@ std::expected<void, std::string> Router::Release() {
   if (engine_ == nullptr) {
     return {};  // not enrolled, or already released
   }
-  std::vector<std::string> names = {routes_name_, groups_name_, next_hops_name_};
+  std::vector<std::string> names = {routes_name_, groups_name_, neighbors_name_,
+                                    next_hops_name_};
   auto released = engine_->ReleaseForTeardown(names);
   if (!released) {
     return released;
   }
   engine_ = nullptr;
   next_hops_res_.reset();
+  neighbors_res_.reset();
   groups_res_.reset();
   routes_res_.reset();
   return {};
@@ -737,26 +1010,6 @@ std::expected<void, RouteError> Router::SetNextHop(NextHopId id,
   }
   return {};
 }
-std::expected<void, RouteError> Router::MarkNeighborManagedNextHop(
-    NextHopId id) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (engine_ != nullptr) {
-    return std::unexpected(RouteError::kEnrolled);
-  }
-  if (!ValidId(id)) {
-    return std::unexpected(RouteError::kInvalidId);
-  }
-  if (!next_hops_.Contains(id)) {
-    return std::unexpected(RouteError::kUnknownNextHop);
-  }
-  if (std::find(neighbor_managed_next_hops_.begin(),
-                neighbor_managed_next_hops_.end(), id) ==
-      neighbor_managed_next_hops_.end()) {
-    neighbor_managed_next_hops_.push_back(id);
-  }
-  return {};
-}
-
 std::expected<void, RouteError> Router::RemoveNextHop(NextHopId id) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {
@@ -1296,7 +1549,7 @@ size_t Router::RouteReferences(NextHopId id) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {
     // Groups reference next hops too: count the routes' references only.
-    const dataplane::Reference wanted{next_hops_name_, dataplane::EncodeKey(id)};
+    const dataplane::Reference wanted = HopReference(id, /*in_transaction=*/false);
     size_t n = 0;
     routes_res_->VisitReferences([&](const dataplane::Reference &ref) { n += ref == wanted; });
     return n;

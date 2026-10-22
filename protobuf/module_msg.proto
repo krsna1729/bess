@@ -394,15 +394,19 @@ message RouterInterface {
 }
 
 /**
- * Bind one Router next hop to a neighbor on one of the router's interfaces.
- * The binding owns its next-hop id; configure routes to it, not a static MAC.
- * Exactly one of ipv4 or ipv6 is set.
+ * A Router neighbor binding ("<module>/neighbors", keyed by
+ * RouterNextHopIdKey, D-179): the next-hop id the key names is bound to a
+ * neighbor on one of the router's interfaces, and the router resolves its
+ * MAC (ARP for IPv4, Neighbor Discovery for IPv6). Binding publishes the hop,
+ * incomplete, at once; routes and groups name it like any next hop, and an
+ * unbind is refused while any does. An id is bound or static
+ * ("<module>/next_hops"), never both. Exactly one of ipv4 or ipv6 is set.
+ * Reads back in exactly this form, addresses in canonical text (D-129).
  */
 message RouterNeighborBinding {
-  uint32 next_hop_id = 1; /// The next-hop id routes name; nonzero and unique.
-  uint32 interface_id = 2; /// The RouterInterface the neighbor is on.
-  string ipv4 = 3; /// Neighbor IPv4 address (resolved with ARP).
-  string ipv6 = 4; /// Neighbor IPv6 address (resolved with Neighbor Discovery).
+  uint32 interface_id = 1; /// The RouterInterface the neighbor is on.
+  string ipv4 = 2; /// Neighbor IPv4 address (resolved with ARP).
+  string ipv6 = 3; /// Neighbor IPv6 address (resolved with Neighbor Discovery).
 }
 
 
@@ -1496,8 +1500,8 @@ enum FlowHashFields {
  * The Router module forwards a packet to the egress its next-hop id (from
  * packet metadata) names, or -- in ROUTE_MODE_DESTINATION -- routes it by its
  * destination address in the route domain it carries (D-155). Routes, next
- * hops and next-hop groups are the resources D-023 describes, changed
- * together or not at all.
+ * hops, neighbor bindings and next-hop groups are the resources D-023
+ * describes, changed together or not at all.
  *
  * Address families (D-179). A family is enabled exactly when its route
  * capacity is set: IPv4 with max_ipv4_routes, IPv6 with max_ipv6_routes, at
@@ -1505,6 +1509,10 @@ enum FlowHashFields {
  * are dropped and counted (family_disabled), its routes, interface addresses
  * and neighbor bindings are refused, and its neighbor protocol (ARP, or
  * Neighbor Discovery) is not processed.
+ *
+ * Neighbor resolution (D-179). With `interfaces`, the router resolves the
+ * next hops bound in its "<module>/neighbors" resource (RouterNeighborBinding)
+ * and publishes their state.
  *
  * __Input Gates__: 1
  * __Output Gates__: many (the next hop's egress)
@@ -1527,10 +1535,10 @@ message RouterArg {
   uint64 punt_local_gate = 15; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. So do link-local or multicast IPv6 frames in destination mode, which are never forwarded, and, unless punt_neighbor_gate names another gate, the ARP requests and Neighbor Solicitations a resolving router receives. The frame is counted either way (D-178, D-179).
   uint64 punt_neighbor_gate = 26; /// Where the ARP requests and Neighbor Solicitations a resolving router receives go, in either mode: an output gate (the responder that answers for the interfaces' addresses), DROP_GATE (8192) to drop them, or 0 (the default) to follow punt_local_gate. Counted either way (D-179).
   string ingress_interface_attr = 16; /// The metadata attribute naming the RouterInterface a frame arrived on, read for ARP and Neighbor Discovery input (default "vif_id", what Vif writes).
-  repeated RouterInterface interfaces = 17; /// The router's own interfaces that neighbor resolution solicits from. Fixed at Init.
-  repeated RouterNeighborBinding neighbor_bindings = 18; /// Resolver-owned next-hop ids; configure routes to these, not static MACs. Fixed at Init.
-  uint64 max_neighbors = 19; /// Neighbor resolver capacity (default 1024).
-  optional uint64 neighbor_first_probe_ms = 20; /// Delay from Init to a neighbor's first solicitation (absent: 1000; 0: on the first maintenance tick).
+  repeated RouterInterface interfaces = 17; /// The router's own interfaces that neighbor resolution solicits from; setting any enables neighbor resolution and the "<module>/neighbors" resource. Fixed at Init.
+  reserved 18;
+  uint64 max_neighbors = 19; /// Most bound next hops in "<module>/neighbors", and so most neighbors resolved (default 1024 or max_next_hops, whichever is smaller; above max_next_hops is refused).
+  optional uint64 neighbor_first_probe_ms = 20; /// Delay from a binding to its neighbor's first solicitation, counted from the maintenance tick that takes the binding up (absent: 1000; 0: on that tick).
   optional uint64 neighbor_probe_interval_ms = 21; /// First retry delay of an attempt; later retries double it (absent: 1000; 0 is refused).
   optional uint64 neighbor_max_probe_interval_ms = 22; /// Retry backoff ceiling (absent: 8000; 0 or below the probe interval is refused).
   optional uint64 neighbor_max_probes = 23; /// Solicitations per resolution attempt (absent: 3; 0 is refused).

@@ -344,12 +344,12 @@ class NeighborResolver {
     return out;
   }
 
-  // Binds next hop `hop` to neighbor `key` and starts resolving it. Returns
-  // the next hop as it should be published now (the neighbor's current state
-  // if it is already known, incomplete otherwise). Rebinding a hop moves it;
-  // it does not restart an existing neighbor's resolution.
-  std::expected<NextHop, std::string> Bind(NextHopId hop, Key key,
-                                            uint64_t now) {
+  // Whether `key` can be bound: its interface is configured and holds an
+  // address of the neighbor's family to solicit from, and the address is a
+  // usable unicast neighbor that is not one of the interface's own. Bind
+  // refuses exactly what this refuses (and, beyond it, only a full table or
+  // timer wheel), so an owner can check a binding before committing to it.
+  std::expected<void, std::string> CheckBind(Key key) const {
     auto iface = interfaces_.find(key.interface);
     if (iface == interfaces_.end()) {
       return std::unexpected("unknown interface");
@@ -367,6 +367,24 @@ class NeighborResolver {
     if (Owns(iface->second, key.address)) {
       return std::unexpected("an interface cannot be its own neighbor");
     }
+    if (SourceFor(iface->second, key.address) == nullptr) {
+      return std::unexpected(key.address.is_ipv4()
+                                 ? "the interface has no IPv4 address to solicit from"
+                                 : "the interface has no IPv6 address to solicit from");
+    }
+    return {};
+  }
+
+  // Binds next hop `hop` to neighbor `key` and starts resolving it. Returns
+  // the next hop as it should be published now (the neighbor's current state
+  // if it is already known, incomplete otherwise). Rebinding a hop moves it;
+  // it does not restart an existing neighbor's resolution.
+  std::expected<NextHop, std::string> Bind(NextHopId hop, Key key,
+                                            uint64_t now) {
+    if (auto valid = CheckBind(key); !valid) {
+      return std::unexpected(valid.error());
+    }
+    auto iface = interfaces_.find(key.interface);
     const bool key_exists = entries_.contains(key);
     const std::optional<NeighborTable::Bound> previous =
         neighbors_.BindingOf(hop);

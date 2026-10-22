@@ -1676,10 +1676,14 @@ TEST_F(ApplyPipelineTest, ListedResourcesConvergeAndUnlistedOnesStay) {
   EXPECT_EQ(3u, DefaultGate(*control_plane_));
 }
 
-// A Router whose neighbor resolver owns next hop 1 (RouterArg.neighbor_bindings)
-// and whose manifest lists `static_ids` in rt/next_hops, plus a route to the
-// resolver-owned hop in rt/routes.
-PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids) {
+// A resolving Router whose manifest lists `static_ids` in rt/next_hops,
+// `bound_ids` in rt/neighbors (192.0.2.<id + 1> on interface 2) and, with
+// `route`, a route to bound hop 1. The neighbors are listed after the routes
+// on purpose: the apply orders operations by what references what, not by the
+// manifest's order.
+PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids,
+                                     const std::vector<uint32_t> &bound_ids = {1},
+                                     bool route = true) {
   bess::pb::RouterArg arg;
   arg.set_max_ipv4_routes(16);
   auto *interface = arg.add_interfaces();
@@ -1687,10 +1691,6 @@ PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids) {
   interface->set_egress_gate(1);
   interface->set_mac_addr("02:00:00:00:00:01");
   interface->add_addresses("192.0.2.1/24");
-  auto *binding = arg.add_neighbor_bindings();
-  binding->set_next_hop_id(1);
-  binding->set_interface_id(2);
-  binding->set_ipv4("192.0.2.2");
   PipelineSpec spec;
   spec.modules.push_back({"rt", "Router", Packed(arg)});
   bess::control::ResourceSpec hops{"rt/next_hops", {}};
@@ -1704,31 +1704,48 @@ PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids) {
     hops.entries.push_back({Packed(key), Packed(value)});
   }
   spec.resources.push_back(std::move(hops));
-  bess::pb::RouterRouteKey route;
-  route.set_ipv4("198.51.100.0");
-  route.set_prefix_length(24);
-  bess::pb::RouterRouteValue to_resolver_hop;
-  to_resolver_hop.set_next_hop_id(1);
-  spec.resources.push_back({"rt/routes", {{Packed(route), Packed(to_resolver_hop)}}});
+  bess::control::ResourceSpec routes{"rt/routes", {}};
+  if (route) {
+    bess::pb::RouterRouteKey key;
+    key.set_ipv4("198.51.100.0");
+    key.set_prefix_length(24);
+    bess::pb::RouterRouteValue to_bound_hop;
+    to_bound_hop.set_next_hop_id(1);
+    routes.entries.push_back({Packed(key), Packed(to_bound_hop)});
+  }
+  spec.resources.push_back(std::move(routes));
+  bess::control::ResourceSpec neighbors{"rt/neighbors", {}};
+  for (uint32_t id : bound_ids) {
+    bess::pb::RouterNextHopIdKey key;
+    key.set_id(id);
+    bess::pb::RouterNeighborBinding value;
+    value.set_interface_id(2);
+    value.set_ipv4("192.0.2." + std::to_string(id + 1));
+    neighbors.entries.push_back({Packed(key), Packed(value)});
+  }
+  spec.resources.push_back(std::move(neighbors));
   return spec;
 }
 
-// Resolver-owned next hops are the module's configuration, not entries the
-// resource list owns (D-179): a list of only the static ids converges without
-// erasing (or being refused for) the bound one, and a list that names a
-// resolver-owned id is refused and changes nothing.
-TEST_F(ApplyPipelineTest, ResolverOwnedNextHopsAreOutsideDesiredStateConvergence) {
+// Neighbor bindings are desired state of their own (D-179): a manifest lists
+// them in rt/neighbors and the routes that name them in rt/routes, in any
+// order. The bound hops are not rt/next_hops entries, so a static list
+// neither erases nor reports them, and one that names a bound id is refused.
+// A binding a route still names cannot be dropped; dropped together with the
+// route, it goes.
+TEST_F(ApplyPipelineTest, NeighborBindingsConvergeAsTheirOwnResource) {
   // Neighbor resolution runs on the maintenance loop; stand in for its interval.
   bess::runtime::runtime().ticks().set_interval(std::chrono::milliseconds(1));
   auto applied = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2, 3}), {});
   ASSERT_TRUE(applied) << applied.error().message;
-  EXPECT_EQ(3u, applied->resource_ops) << "hops 2 and 3, and the route to hop 1";
+  EXPECT_EQ(4u, applied->resource_ops)
+      << "hops 2 and 3, the binding of hop 1, and the route to it";
 
   auto again = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2, 3}), {});
   ASSERT_TRUE(again) << again.error().message;
-  EXPECT_EQ(0u, again->resource_ops) << "the bound hop is not an unlisted entry";
+  EXPECT_EQ(0u, again->resource_ops) << "everything reads back as listed";
 
-  // Hop 3 goes; hop 1 stays, as the route that names it shows.
+  // Hop 3 goes; bound hop 1 stays, as the route that names it shows.
   auto shrunk = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2}), {});
   ASSERT_TRUE(shrunk) << shrunk.error().message;
   EXPECT_EQ(1u, shrunk->resource_ops);
@@ -1742,12 +1759,35 @@ TEST_F(ApplyPipelineTest, ResolverOwnedNextHopsAreOutsideDesiredStateConvergence
   ASSERT_TRUE(routes);
   EXPECT_EQ(1u, routes->entries.size()) << "the route to hop 1 still stands";
 
-  // Naming the resolver-owned id is refused, and the apply changes nothing.
-  auto owned = control_plane_->ApplyPipeline(ResolvingRouterPipeline({1, 2, 3}), {});
+  // Naming the bound id as a static hop is refused, and the apply changes
+  // nothing.
+  auto owned = control_plane_->ApplyPipeline(ResolvingRouterPipeline({1, 2}), {});
   EXPECT_FALSE(owned);
   hops = ReadResource(*control_plane_, "rt/next_hops");
   ASSERT_TRUE(hops);
   EXPECT_EQ(1u, hops->entries.size());
+
+  // A second binding comes at runtime; dropping hop 1's binding while the
+  // route names it is refused.
+  auto grown = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2}, {1, 4}), {});
+  ASSERT_TRUE(grown) << grown.error().message;
+  EXPECT_EQ(1u, grown->resource_ops);
+  auto referenced = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2}, {4}), {});
+  EXPECT_FALSE(referenced) << "the route still names hop 1";
+  auto neighbors = ReadResource(*control_plane_, "rt/neighbors");
+  ASSERT_TRUE(neighbors);
+  EXPECT_EQ(2u, neighbors->entries.size());
+
+  // The binding and the route that names it go together.
+  auto dropped =
+      control_plane_->ApplyPipeline(ResolvingRouterPipeline({2}, {4}, /*route=*/false), {});
+  ASSERT_TRUE(dropped) << dropped.error().message;
+  EXPECT_EQ(2u, dropped->resource_ops);
+  neighbors = ReadResource(*control_plane_, "rt/neighbors");
+  ASSERT_TRUE(neighbors);
+  ASSERT_EQ(1u, neighbors->entries.size());
+  ASSERT_TRUE(neighbors->entries[0].key.UnpackTo(&listed));
+  EXPECT_EQ(4u, listed.id());
 }
 
 // A listed resource of a module the apply creates is reported, unchecked,

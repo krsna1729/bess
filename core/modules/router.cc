@@ -10,7 +10,6 @@
 #include <cstring>
 #include <expected>
 #include <new>
-#include <unordered_set>
 #include <memory>
 #include <span>
 #include <string>
@@ -48,6 +47,8 @@ const Commands Router::cmds = {};
 const ResourceTables Router::resource_tables = {
     ResourceTable::Map<bess::pb::RouterNextHopIdKey,
                        bess::pb::RouterNextHopValue>("next_hops"),
+    ResourceTable::Map<bess::pb::RouterNextHopIdKey,
+                       bess::pb::RouterNeighborBinding>("neighbors"),
     ResourceTable::Map<bess::pb::RouterGroupIdKey, bess::pb::RouterGroupValue>(
         "groups"),
     ResourceTable::Map<bess::pb::RouterRouteKey, bess::pb::RouterRouteValue>(
@@ -178,6 +179,43 @@ InterfaceAddressFromPb(const std::string &text) {
   }
   out.prefix_length = static_cast<uint8_t>(length);
   return out;
+}
+
+// A RouterNeighborBinding as the library's key: the interface (16 bits, as
+// InterfaceOf maps gates) and exactly one address.
+std::expected<route::NeighborKey, std::string> NeighborKeyFromPb(
+    const bess::pb::RouterNeighborBinding &value) {
+  if (value.interface_id() == 0 || value.interface_id() > 0xffffu) {
+    return std::unexpected("invalid interface id " +
+                           std::to_string(value.interface_id()));
+  }
+  const dataplane::InterfaceId interface(static_cast<uint16_t>(value.interface_id()));
+  if (value.ipv4().empty() == value.ipv6().empty()) {
+    return std::unexpected("a neighbor binding sets exactly one of ipv4 or ipv6");
+  }
+  if (!value.ipv4().empty()) {
+    bess::utils::be32_t address;
+    if (!bess::utils::ParseIpv4Address(value.ipv4(), &address)) {
+      return std::unexpected("invalid neighbor IPv4 address '" + value.ipv4() + "'");
+    }
+    return route::NeighborKey(interface, address.value());
+  }
+  const auto address = bess::utils::ParseIpv6Address(value.ipv6());
+  if (!address) {
+    return std::unexpected("invalid neighbor IPv6 address '" + value.ipv6() + "'");
+  }
+  return route::NeighborKey(interface, *address);
+}
+
+bess::pb::RouterNeighborBinding NeighborKeyToPb(const route::NeighborKey &key) {
+  bess::pb::RouterNeighborBinding value;
+  value.set_interface_id(key.interface.value());
+  if (key.address.is_ipv4()) {
+    value.set_ipv4(bess::utils::ToIpv4Address(bess::utils::be32_t(key.address.ipv4())));
+  } else {
+    value.set_ipv6(bess::utils::ToIpv6Address(key.address.ipv6()));
+  }
+  return value;
 }
 
 }  // namespace
@@ -327,18 +365,16 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // while a router configured for many network instances pays only for the ones
   // that hold routes. A failure to create one surfaces at the route write, as a
   // refused transaction.
-  if (arg.interfaces_size() != 0 || arg.neighbor_bindings_size() != 0) {
+  if (arg.interfaces_size() != 0) {
+    // A binding is a next hop, so there are never more than max_next_hops:
+    // the default is 1024 or that, whichever is smaller.
+    if (arg.max_neighbors() > max_next_hops) {
+      return CommandFailure(EINVAL,
+                            "max_neighbors is out of range (at most max_next_hops)");
+    }
     const size_t resolver_capacity =
-        arg.max_neighbors() == 0 ? 1024 : static_cast<size_t>(arg.max_neighbors());
-    if (static_cast<uint64_t>(resolver_capacity) !=
-        (arg.max_neighbors() == 0 ? 1024u : arg.max_neighbors())) {
-      return CommandFailure(EINVAL,
-                            "neighbor resolver capacity is out of range");
-    }
-    if (arg.interfaces_size() == 0 || arg.neighbor_bindings_size() == 0) {
-      return CommandFailure(EINVAL,
-                            "neighbor resolution requires interfaces and bindings");
-    }
+        arg.max_neighbors() == 0 ? std::min<size_t>(1024, max_next_hops)
+                                 : static_cast<size_t>(arg.max_neighbors());
     // The resolver runs on the maintenance loop's ticks; with the loop off
     // (--maintenance_interval_us=0) no neighbor would ever be solicited and
     // every bound hop would stay unresolved, so refuse rather than blackhole.
@@ -410,7 +446,6 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     if (max_probes == 0 || max_probes > std::numeric_limits<uint32_t>::max()) {
       return CommandFailure(EINVAL, "neighbor_max_probes is out of range");
     }
-    std::unordered_set<uint32_t> bound_next_hops;
     route::NeighborResolver::Config resolver_config;
     resolver_config.capacity = resolver_capacity;
     resolver_config.timing = {
@@ -424,15 +459,15 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
         .unreachable_retry = unreachable_retry,
     };
     // The resolver's clock is the maintenance tick count, which runs from
-    // daemon start: start it now, so first_probe counts from Init.
+    // daemon start: start it at the current tick.
     const uint64_t now = init_context().ticks().current_tick();
     auto resolver = route::NeighborResolver::Create(resolver_config, now);
     if (!resolver) {
       return CommandFailure(EINVAL, "%s", resolver.error().c_str());
     }
     neighbor_resolver_ = std::move(*resolver);
-    // Interface id -> whether it has a local IPv4 / IPv6 address.
-    std::unordered_map<uint32_t, std::pair<bool, bool>> interface_families;
+    // The interfaces are configuration, fixed here; the bindings are the
+    // "<module>/neighbors" resource, which the policy below admits.
     for (const auto &entry : arg.interfaces()) {
       if (!bess::IsValidGateValue(entry.egress_gate())) {
         return CommandFailure(EINVAL, "interface egress_gate %u is invalid",
@@ -456,8 +491,6 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       }
       route::NeighborResolver::Interface interface{dataplane::InterfaceId(id), mac,
                                                    {}};
-      bool has_ipv4 = false;
-      bool has_ipv6 = false;
       for (const std::string &text : entry.addresses()) {
         auto address = InterfaceAddressFromPb(text);
         if (!address) {
@@ -471,8 +504,6 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                                 "router does not enable (set max_%s_routes)",
                                 id, text.c_str(), v4 ? "ipv4" : "ipv6");
         }
-        has_ipv4 = has_ipv4 || v4;
-        has_ipv6 = has_ipv6 || !v4;
         interface.addresses.push_back(*address);
       }
       if (interface.addresses.empty()) {
@@ -485,74 +516,29 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                               configured.error().c_str());
       }
       resolver_gates_.emplace(id, static_cast<gate_idx_t>(entry.egress_gate()));
-      interface_families.emplace(id, std::make_pair(has_ipv4, has_ipv6));
     }
-    for (const auto &binding : arg.neighbor_bindings()) {
-      const auto families = interface_families.find(binding.interface_id());
-      if (families == interface_families.end()) {
-        return CommandFailure(EINVAL,
-                              "neighbor binding names unknown interface %u",
-                              binding.interface_id());
+    // A binding must be one the resolver would take (its interface, an
+    // address of its family there, not one of the interface's own): checked
+    // when a transaction reserves it, so the tick that takes it up cannot be
+    // refused. The capacity is max_neighbors bindings, so the resolver's own
+    // table, sized the same, never fills.
+    bess::route::NeighborBindingPolicy policy;
+    policy.capacity = resolver_capacity;
+    policy.validate = [this](const route::NeighborKey &key)
+        -> std::expected<void, std::string> {
+      if (key.address.is_ipv4() ? !router_->has_ipv4() : !router_->has_ipv6()) {
+        return std::unexpected(key.address.is_ipv4()
+                                   ? "an IPv4 neighbor on a router without IPv4"
+                                   : "an IPv6 neighbor on a router without IPv6");
       }
-      if (binding.next_hop_id() == 0 ||
-          (binding.ipv4().empty() == binding.ipv6().empty())) {
-        return CommandFailure(EINVAL, "invalid neighbor binding");
+      if (neighbor_resolver_ == nullptr) {
+        return std::unexpected("neighbor resolution is shut down");
       }
-      route::NeighborResolver::Key key;
-      if (!binding.ipv4().empty()) {
-        if (!router_->has_ipv4()) {
-          return CommandFailure(EINVAL,
-                                "IPv4 neighbor binding on a router without IPv4");
-        }
-        if (!families->second.first) {
-          return CommandFailure(EINVAL,
-                                "IPv4 neighbor binding requires local IPv4");
-        }
-        bess::utils::be32_t peer;
-        if (!bess::utils::ParseIpv4Address(binding.ipv4(), &peer)) {
-          return CommandFailure(EINVAL, "invalid neighbor IPv4 address '%s'",
-                                binding.ipv4().c_str());
-        }
-        key = route::NeighborResolver::Key(
-            dataplane::InterfaceId(binding.interface_id()), peer.value());
-      } else {
-        if (!router_->has_ipv6()) {
-          return CommandFailure(EINVAL,
-                                "IPv6 neighbor binding on a router without IPv6");
-        }
-        if (!families->second.second) {
-          return CommandFailure(EINVAL,
-                                "IPv6 neighbor binding requires local IPv6");
-        }
-        auto peer = bess::utils::ParseIpv6Address(binding.ipv6());
-        if (!peer) {
-          return CommandFailure(EINVAL, "invalid neighbor IPv6 address '%s'",
-                                binding.ipv6().c_str());
-        }
-        key = route::NeighborResolver::Key(
-            dataplane::InterfaceId(binding.interface_id()), *peer);
-      }
-      if (!bound_next_hops.insert(binding.next_hop_id()).second) {
-        return CommandFailure(EINVAL, "duplicate neighbor binding next hop %u",
-                              binding.next_hop_id());
-      }
-      auto hop = neighbor_resolver_->Bind(
-          route::NextHopId(binding.next_hop_id()), key, now);
-      if (!hop) {
-        return CommandFailure(EINVAL, "%s", hop.error().c_str());
-      }
-      if (auto set = router_->SetNextHop(route::NextHopId(binding.next_hop_id()),
-                                         *hop);
-          !set) {
-        return CommandFailure(route::RouteErrno(set.error()), "%s",
-                              route::RouteErrorName(set.error()));
-      }
-      if (auto managed = router_->MarkNeighborManagedNextHop(
-              route::NextHopId(binding.next_hop_id()));
-          !managed) {
-        return CommandFailure(route::RouteErrno(managed.error()), "%s",
-                              route::RouteErrorName(managed.error()));
-      }
+      return neighbor_resolver_->CheckBind(key);
+    };
+    if (auto set = router_->SetNeighborBindingPolicy(std::move(policy)); !set) {
+      return CommandFailure(route::RouteErrno(set.error()), "%s",
+                            route::RouteErrorName(set.error()));
     }
     ingress_interface_attr_name_ = arg.ingress_interface_attr().empty()
                                        ? "vif_id"
@@ -561,6 +547,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
     next_hops_binding_.Reset();
+    neighbors_binding_.Reset();
     groups_binding_.Reset();
     routes_binding_.Reset();
     router_.reset();
@@ -624,21 +611,46 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
             }
             return std::any(hop);
           },
-          // The read-back is desired state (D-129). A resolver-owned next hop
-          // is the module's configuration (RouterArg.neighbor_bindings) and
-          // learned adjacency, not an entry a resource list owns (D-179): it
-          // is not enumerated, so desired-state convergence neither erases
-          // it for being unlisted nor reports it, while a list that names it
-          // is an upsert the resource refuses.
+          // The read-back is desired state (D-129): the static next hops. A
+          // bound one is "<module>/neighbors"' entry (its key and its
+          // binding read back there), and its state is learned, not desired
+          // (D-179), so it is not listed here: a list of static hops neither
+          // erases nor reports it, and one that names it is refused.
           [this](const auto &visit) {
             router_->ForEachNextHop(
                 [this, &visit](route::NextHopId id, const route::NextHop &hop) {
-                  if (router_->IsNeighborManagedNextHop(id)) {
+                  if (router_->IsNeighborBound(id)) {
                     return;
                   }
                   bess::pb::RouterNextHopIdKey key;
                   key.set_id(id.value());
                   visit(key, NextHopToPb(hop));
+                });
+          }));
+  neighbors_binding_ = init_context().codecs().Bind(
+      *router_->neighbors_resource_object(),
+      std::make_shared<bess::framework::TypedCodec<bess::pb::RouterNextHopIdKey,
+                                             bess::pb::RouterNeighborBinding>>(
+          [](const bess::pb::RouterNextHopIdKey &key)
+              -> std::expected<dataplane::ResourceKey, std::string> {
+            if (key.id() == 0) {
+              return std::unexpected("next hop id 0 is invalid");
+            }
+            return dataplane::EncodeKey(route::NextHopId(key.id()));
+          },
+          [](const bess::pb::RouterNeighborBinding &value)
+              -> std::expected<std::any, std::string> {
+            return NeighborKeyFromPb(value).transform(
+                [](const route::NeighborKey &key) { return std::any(key); });
+          },
+          // The bindings, as written (D-129): the state the router learned
+          // for each is the get_neighbors command's, not desired state.
+          [this](const auto &visit) {
+            router_->ForEachNeighborBinding(
+                [&visit](route::NextHopId id, const route::NeighborKey &neighbor) {
+                  bess::pb::RouterNextHopIdKey key;
+                  key.set_id(id.value());
+                  visit(key, NeighborKeyToPb(neighbor));
                 });
           }));
   groups_binding_ = init_context().codecs().Bind(
@@ -801,6 +813,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       auto released = router_->Release();
       CHECK(released) << released.error();
       next_hops_binding_.Reset();
+      neighbors_binding_.Reset();
       groups_binding_.Reset();
       routes_binding_.Reset();
       router_.reset();
@@ -823,6 +836,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       auto released = router_->Release();
       CHECK(released) << released.error();
       next_hops_binding_.Reset();
+      neighbors_binding_.Reset();
       groups_binding_.Reset();
       routes_binding_.Reset();
       router_.reset();
@@ -908,6 +922,7 @@ void Router::DeInit() {
   auto released = router_->Release();
   CHECK(released) << released.error();
   next_hops_binding_.Reset();
+  neighbors_binding_.Reset();
   groups_binding_.Reset();
   routes_binding_.Reset();
   router_.reset();
@@ -1138,11 +1153,39 @@ void Router::PublishNeighborUpdates(uint64_t now) {
                << "); retrying";
 }
 
+// Takes up the bindings transactions published since the last tick (D-179):
+// a bound id starts resolving from now, its hop published as the resolver
+// has it (already resolved, if another binding knows the neighbor); an
+// unbound one stops, and any of its updates still pending are dropped, since
+// its key is gone. The policy checked each binding when it was reserved, so
+// Bind refuses only for a full timer wheel or table, which max_neighbors
+// sizes; such a binding stays incomplete and is logged.
+void Router::ApplyNeighborBindingChanges(uint64_t now) {
+  for (const route::NeighborBindingChange &change :
+       router_->TakeNeighborBindingChanges()) {
+    std::erase_if(pending_neighbor_updates_,
+                  [&change](const auto &pending) { return pending.first == change.id; });
+    if (!change.neighbor) {
+      neighbor_resolver_->Unbind(change.id);
+      continue;
+    }
+    auto hop = neighbor_resolver_->Bind(change.id, *change.neighbor, now);
+    if (!hop) {
+      LOG(ERROR) << "Router '" << name() << "': next hop " << change.id.value()
+                 << " stays unresolved: " << hop.error();
+      continue;
+    }
+    const std::pair<route::NextHopId, route::NextHop> update{change.id, *hop};
+    QueueNeighborUpdates(std::span(&update, 1));
+  }
+}
+
 void Router::ResolverTick(bess::framework::TickContext &ctx) {
   if (neighbor_resolver_ == nullptr) {
     return;
   }
   const uint64_t now = ctx.tick();
+  ApplyNeighborBindingChanges(now);
   constexpr unsigned kResolverWorkBudget = 64;
   for (unsigned n = 0; n < kResolverWorkBudget && !ctx.Expired(); n++) {
     NeighborFrame queued{};
