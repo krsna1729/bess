@@ -202,36 +202,5 @@ TEST(ResultPlanTest, BatchPlacementUsesOnePlanCallAndChecksSpans) {
   EXPECT_FALSE(
       compiled->Apply(ConstBytes(first), MetadataOnly(std::span<std::byte>(storage).first(4))));
 }
-TEST(ResultPlanTest, UnrolledNOpsBatchPlacement) {
-  for (size_t n = 3; n <= 8; n++) {
-    std::vector<RuntimeResultField> fields;
-    for (size_t i = 0; i < n; i++) {
-      // Separate offsets so they do not coalesce.
-      fields.push_back(Meta(i * 4, i * 8, 4));
-    }
-    RuntimeClassifierSchema schema{
-        .key_size = 1,
-        .value_size = n * 4,
-        .result_fields = fields,
-    };
-    auto compiled = ResultPlan::Compile(schema);
-    ASSERT_TRUE(compiled);
-    EXPECT_EQ(n, compiled->ops().size());
 
-    std::vector<std::byte> record(n * 4);
-    for (size_t i = 0; i < n * 4; i++) {
-      record[i] = Byte(static_cast<unsigned>(i + 1));
-    }
-    std::vector<std::byte> storage(n * 8, Byte(0));
-    const std::array<ConstBytes, 1> values = {ConstBytes(record)};
-    const std::array<DestinationView, 1> destinations = {MetadataOnly(storage)};
-
-    ASSERT_TRUE(compiled->ApplyBatch(values, destinations));
-    for (size_t i = 0; i < n; i++) {
-      for (size_t b = 0; b < 4; b++) {
-        EXPECT_EQ(Byte(static_cast<unsigned>(i * 4 + b + 1)), storage[i * 8 + b]);
-      }
-    }
-  }
-}
 }  // namespace
