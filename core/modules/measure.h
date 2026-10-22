@@ -36,6 +36,9 @@ class Measure final : public Module {
   CommandResponse CommandClear(const bess::pb::EmptyArg &arg);
 
   static const Commands cmds;
+  // Every worker updates one sampler (RNG, last RTT, histograms) under lock_.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
  private:
   static const uint64_t kDefaultNsPerBucket = 100;

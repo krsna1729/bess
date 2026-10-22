@@ -25,6 +25,9 @@ class RandomSplit final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // rng_ is written without synchronization (a tolerated race: any value is correct).
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::RandomSplitArg &arg);
   void DeInit() override;

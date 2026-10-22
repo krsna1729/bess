@@ -12,6 +12,10 @@ class IPSwap final : public Module {
  public:
   IPSwap() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
+  // Swaps header fields in place; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 };
 

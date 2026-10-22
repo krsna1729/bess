@@ -26,6 +26,20 @@ std::unique_ptr<ConnTrack::Ct> ConnTrack::MakeTable() const {
   return made ? std::move(*made) : nullptr;
 }
 
+ModuleCapabilities ConnTrack::Capabilities(const bess::pb::ConnTrackArg &arg) {
+  using State = ModuleCapabilities::State;
+  using Affinity = ModuleCapabilities::FlowAffinity;
+  switch (arg.mode()) {
+    case bess::pb::ConnTrackArg::SHARED:
+      return {State::kShared, Affinity::kNone};
+    case bess::pb::ConnTrackArg::PER_WORKER:
+      return {State::kPerWorker,
+              arg.fallback_shared() ? Affinity::kPreferred : Affinity::kRequired};
+    default:
+      return {State::kSingleWorker, Affinity::kNone};
+  }
+}
+
 CommandResponse ConnTrack::Init(const bess::pb::ConnTrackArg &arg) {
   table_full_ = bess::stats::EventThrottle(init_context().events(), "bess.table_full", name());
   mode_ = arg.mode();

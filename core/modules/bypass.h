@@ -14,6 +14,9 @@ class Bypass final : public Module {
  public:
   static const gate_idx_t kNumIGates = MAX_GATES;
   static const gate_idx_t kNumOGates = MAX_GATES;
+  // Stateless: burns configured cycles and forwards.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Bypass() { max_allowed_workers_ = Worker::kMaxWorkers; }
 

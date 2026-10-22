@@ -18,6 +18,9 @@ class RandomUpdate final : public Module {
  public:
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // rng_ is written without synchronization (a tolerated race: any value is correct).
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   RandomUpdate() : Module(), num_vars_(), vars_(), rng_() {
     max_allowed_workers_ = Worker::kMaxWorkers;

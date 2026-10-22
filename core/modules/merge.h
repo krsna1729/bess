@@ -14,6 +14,9 @@ class Merge final : public Module {
   CommandResponse Init(const bess::pb::MergeArg &) { return CommandSuccess(); }
 
   static const gate_idx_t kNumIGates = MAX_GATES;
+  // Passes batches through; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 };

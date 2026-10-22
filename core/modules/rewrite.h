@@ -18,6 +18,9 @@ class Rewrite final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // next_turn_ is written without synchronization (a tolerated race: any value is correct).
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Rewrite()
       : Module(),

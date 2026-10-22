@@ -83,6 +83,9 @@ class Router final : public Module {
   // `max_groups`) and "<module>/routes" (RouterRouteKey -> RouterRouteValue),
   // D-129.
   static const ResourceTables resource_tables;
+  // The packet path only reads the RCU-published FIB and next hops.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Router() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 

@@ -30,7 +30,8 @@ const Commands Firewall::cmds = {};
 
 const ResourceTables Firewall::resource_tables = {
     ResourceTable::Map<bess::pb::FirewallRuleKey, bess::pb::FirewallRuleValue>(
-        "rules", /*requires_paused_workers=*/false)};
+        "rules", /*requires_paused_workers=*/false)
+        .Rebuilds()};
 
 namespace {
 

@@ -17,6 +17,9 @@ class Update final : public Module {
  public:
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Writes configured values into packets; the field list is only read.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Update() : Module(), num_fields_(), fields_() {
     max_allowed_workers_ = Worker::kMaxWorkers;

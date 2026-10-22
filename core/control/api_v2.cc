@@ -256,6 +256,45 @@ v2::MetadataReport ToProto(const bess::metadata::MetadataReport &report) {
   return out;
 }
 
+// A module's capabilities (D-180): what its class declares for its argument,
+// and how its resources change, from the class's resource tables. A module
+// resource provides referential consistency (D-050); scope snapshots are
+// ScopeResource's, which no module table is.
+static_assert(static_cast<int>(ModuleCapabilities::State::kShared) ==
+              v2::ModuleCapabilities::STATE_SHARED);
+static_assert(static_cast<int>(ModuleCapabilities::State::kPerWorker) ==
+              v2::ModuleCapabilities::STATE_PER_WORKER);
+static_assert(static_cast<int>(ModuleCapabilities::State::kSingleWorker) ==
+              v2::ModuleCapabilities::STATE_SINGLE_WORKER);
+static_assert(static_cast<int>(ModuleCapabilities::State::kNone) ==
+              v2::ModuleCapabilities::STATE_NONE);
+static_assert(static_cast<int>(ModuleCapabilities::FlowAffinity::kRequired) ==
+              v2::ModuleCapabilities::FLOW_AFFINITY_REQUIRED);
+static_assert(static_cast<int>(ModuleCapabilities::FlowAffinity::kPreferred) ==
+              v2::ModuleCapabilities::FLOW_AFFINITY_PREFERRED);
+static_assert(static_cast<int>(ModuleCapabilities::FlowAffinity::kNone) ==
+              v2::ModuleCapabilities::FLOW_AFFINITY_NONE);
+v2::ModuleCapabilities ToProto(const ModuleCapabilities &declared,
+                               const ResourceTables &tables) {
+  v2::ModuleCapabilities out;
+  out.set_state(static_cast<v2::ModuleCapabilities::State>(declared.state));
+  out.set_flow_affinity(
+      static_cast<v2::ModuleCapabilities::FlowAffinity>(declared.flow_affinity));
+  v2::ModuleCapabilities::Updates updates = v2::ModuleCapabilities::UPDATES_NONE;
+  for (const ResourceTable &t : tables) {
+    v2::ModuleCapabilities::Updates table = t.requires_paused_workers
+                                                ? v2::ModuleCapabilities::UPDATES_PAUSED_WORKERS
+                                            : t.rebuilds ? v2::ModuleCapabilities::UPDATES_REBUILD
+                                                         : v2::ModuleCapabilities::UPDATES_LIVE;
+    updates = std::max(updates, table);  // the most disruptive table's
+  }
+  out.set_updates(updates);
+  if (!tables.empty()) {
+    out.set_consistency(v2::ApplyTransactionRequest::CONSISTENCY_REFERENTIAL);
+  }
+  return out;
+}
+
 }  // namespace
 
 v2::Pipeline ToProto(const PipelineSpec &spec) {
@@ -761,6 +800,10 @@ grpc::Status ControlV2Service::ValidatePipeline(
     return ToStatus(validated.error(), context);
   }
   *response->mutable_normalized() = ToProto(validated->spec);
+  auto *capabilities = response->mutable_capabilities();
+  for (const auto &[name, report] : validated->capabilities) {
+    (*capabilities)[name] = ToProto(report.declared, report.tables);
+  }
   return grpc::Status::OK;
 }
 
@@ -1324,6 +1367,7 @@ grpc::Status ControlV2Service::GetSchema(grpc::ServerContext *, const v2::GetSch
       r->set_key_type(t->key_type);
       r->set_value_type(t->value_type);
       r->set_requires_paused_workers(t->requires_paused_workers);
+      r->set_rebuilds(t->rebuilds);
       types.insert(t->key_type);
       types.insert(t->value_type);
     }

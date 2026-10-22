@@ -19,6 +19,9 @@ class Replicate final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // The packet path only reads the configured gates.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Replicate() : Module(), gates_(), ngates_() {
     max_allowed_workers_ = Worker::kMaxWorkers;

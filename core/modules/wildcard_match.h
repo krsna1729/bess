@@ -55,6 +55,9 @@ class WildcardMatch final : public Module {
   // "<module>/settings" (WildcardMatchSettings), D-129. Neither requires
   // paused workers: rules change in place, the default gate is published.
   static const ResourceTables resource_tables;
+  // The packet path reads the published generation and the rule table only.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   // Module-level limits. The classifier library supports arbitrary widths and
   // tuple counts; these bounds are WildcardMatch's own wire compatibility.

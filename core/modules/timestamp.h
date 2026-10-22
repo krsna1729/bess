@@ -12,6 +12,9 @@ class Timestamp final : public Module {
  public:
   using MarkerType = uint32_t;
   static const MarkerType kMarker = 0x54C5BE55;
+  // Stamps the current time into each packet; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Timestamp() : Module(), offset_(), attr_id_(-1) { max_allowed_workers_ = Worker::kMaxWorkers; }
 

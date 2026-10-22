@@ -53,6 +53,10 @@ class PacketStore final : public Module {
   static const gate_idx_t kNumOGates = 2;  // 0: released, 1: evicted
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Every feeding worker enqueues to one MPSC ingress ring; the owner task
+  // alone changes the store.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   struct StoredPacket {
     bess::PacketRef pkt;

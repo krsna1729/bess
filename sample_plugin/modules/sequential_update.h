@@ -17,6 +17,9 @@ class SequentialUpdate final : public Module {
 public:
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Capabilities: the packet path advances each field's sequence, on one worker.
+  static constexpr ModuleCapabilities kCapabilities{
+      ModuleCapabilities::State::kSingleWorker, ModuleCapabilities::FlowAffinity::kNone};
 
   SequentialUpdate() : Module(), num_vars_(), vars_() {}
 

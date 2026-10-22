@@ -15,6 +15,9 @@ class L4Checksum final : public Module {
   /* Gates: (0) Default, (1) Drop */
   static const gate_idx_t kNumOGates = 2;
   static const gate_idx_t kNumIGates = MAX_GATES;
+  // Rewrites or checks each packet's checksum; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
   CommandResponse Init(const bess::pb::L4ChecksumArg &arg);
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 

@@ -26,6 +26,9 @@ class Firewall final : public Module {
  public:
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // The packet path only reads the published policy.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   // What a rule carries in the table. The library returns the action
   // untouched, so the module names its own: kDrop drops the packet, kPass

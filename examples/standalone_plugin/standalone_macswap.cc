@@ -12,6 +12,9 @@
 class StandaloneMacSwap final : public Module {
  public:
   static const Commands cmds;
+  // Capabilities: the packet path changes packets only, no module state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) { return CommandSuccess(); }
 

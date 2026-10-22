@@ -21,6 +21,9 @@ class BPF final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // The packet path only reads the compiled filter list.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   BPF() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 

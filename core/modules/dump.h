@@ -21,6 +21,9 @@ class Dump final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // The packet path advances next_ns_, the next dump time (one worker by default).
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
  private:
   // The init argument's interval, validated before anything is installed.

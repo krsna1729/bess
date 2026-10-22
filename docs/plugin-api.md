@@ -221,7 +221,35 @@ a client can do to it is an **action**.
   ```
 
   `GetSchema` lists them; transactions (`ApplyTransaction`) and desired state
-  (`Pipeline.resources`, below) change them.
+  (`Pipeline.resources`, below) change them. A table whose change rebuilds
+  its structure and swaps it in - so a change costs in proportion to the
+  table, not to the change - says so with `.Rebuilds()`
+  (`ResourceTable::Map<my::RuleKey, my::RuleValue>("rules").Rebuilds()`);
+  `GetSchema` reports it (`rebuilds`) and `ValidatePipeline` counts it in the
+  module's `updates` (D-180).
+- **Capabilities (D-180).** A class says who owns the state its packet path
+  changes and whether one flow's packets must reach one worker, so a
+  controller can place it before it exists (`ValidatePipeline` answers it
+  for every module, with how its tables change and their consistency).
+  Statistics are not state; configuration the control plane writes is the
+  resource tables' business:
+
+  ```cpp
+  // Each worker keeps its own flow table; a flow must stay on one worker.
+  static constexpr ModuleCapabilities kCapabilities{
+      ModuleCapabilities::State::kPerWorker, ModuleCapabilities::FlowAffinity::kRequired};
+  ```
+
+  When the init argument decides (ConnTrack's `mode`), declare
+  `static ModuleCapabilities Capabilities(const MyArg &arg);` instead. The
+  states are `kNone` (the packet path changes nothing), `kSingleWorker` (one
+  worker owns it: the class's worker limit is 1), `kPerWorker` and `kShared`
+  (several workers own or share it: the limit is above 1); affinity is
+  `kNone`, `kPreferred` (correct anywhere, cheaper when a flow stays) or
+  `kRequired`, and only per-worker state needs either. A class that declares
+  nothing reports both unspecified; every built-in class declares, and
+  `ModuleCapabilitiesTest` checks a created module's worker limit against its
+  declaration.
 - **Stating a bound (D-149).** `GetResourceStatus` reports each resource's
   live entries and, when the resource states one, its capacity, so a
   controller sees the ceiling it can plan against before it writes. The

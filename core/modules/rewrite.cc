@@ -17,7 +17,7 @@
 const Commands Rewrite::cmds = {};
 
 const ResourceTables Rewrite::resource_tables = {
-    ResourceTable::Singleton<bess::pb::RewriteArg>("templates", true)};
+    ResourceTable::Singleton<bess::pb::RewriteArg>("templates", true).Rebuilds()};
 
 CommandResponse Rewrite::Init(const bess::pb::RewriteArg &arg) {
   // The init argument's templates; a refused one refuses the creation.

@@ -15,6 +15,9 @@ class VLANPush final : public Module {
  public:
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Inserts the configured tag; the tag is only read by the packet path.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   VLANPush() : Module(), vlan_tag_(), qinq_tag_() {
     max_allowed_workers_ = Worker::kMaxWorkers;

@@ -41,6 +41,13 @@ const Commands NAT::cmds = {
      Command::THREAD_SAFE, "NATUsageResponse"},
 };
 
+ModuleCapabilities NAT::Capabilities(const bess::pb::NATArg &arg) {
+  if (arg.shared()) {
+    return {ModuleCapabilities::State::kShared, ModuleCapabilities::FlowAffinity::kNone};
+  }
+  return {ModuleCapabilities::State::kSingleWorker, ModuleCapabilities::FlowAffinity::kNone};
+}
+
 CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
   table_full_ = bess::stats::EventThrottle(init_context().events(), "bess.table_full", name());
   ports_exhausted_ =

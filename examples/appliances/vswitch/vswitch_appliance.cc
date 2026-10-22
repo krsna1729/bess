@@ -50,6 +50,9 @@ class VswitchAppliance final : public Module {
   static const gate_idx_t kNumIGates = VswitchApp::kTenants;
   static const gate_idx_t kNumOGates = 2;
   static const Commands cmds;
+  // The packet path fills decision caches and cold-flow counts: one worker.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   VswitchAppliance() : Module() { max_allowed_workers_ = 1; }  // one worker's caches
 

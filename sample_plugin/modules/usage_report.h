@@ -56,6 +56,10 @@ class UsageReport final : public Module {
  public:
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Capabilities: each worker meters into its own counter plane and compares it
+  // against the quota; a key on one worker gets an exact report, not the sweep's.
+  static constexpr ModuleCapabilities kCapabilities{
+      ModuleCapabilities::State::kPerWorker, ModuleCapabilities::FlowAffinity::kPreferred};
 
   UsageReport() = default;
 

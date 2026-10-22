@@ -39,6 +39,11 @@ class ConnTrack final : public Module {
 
   ConnTrack() : Module() { max_allowed_workers_ = 1; }
 
+  // OWNED: one worker owns the table. SHARED: every worker changes one
+  // table, any distribution. PER_WORKER: each worker owns its table, so a
+  // connection's packets must reach one worker -- required when unverified
+  // inputs fail closed, preferred when they fall back to one shared table.
+  static ModuleCapabilities Capabilities(const bess::pb::ConnTrackArg &arg);
   CommandResponse Init(const bess::pb::ConnTrackArg &arg);
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
   int OnEvent(bess::Event event) override;

@@ -19,6 +19,9 @@ class QueueInc final : public Module {
   static const Commands cmds;
   // "settings" (QueueIncSettings): burst, applied live (D-129).
   static const ResourceTables resource_tables;
+  // The packet path only receives from the port's queue and counts.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   QueueInc() : Module(), port_(), qid_(), prefetch_(), burst_() {}
 
