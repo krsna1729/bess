@@ -12329,7 +12329,8 @@ or the metadata pass gains per-path offsets.
 
 **Status:** accepted (2026-10-22). **Code:** `core/route/route_table.{h,cc}` (`Ipv6RouteTable`,
 `Ipv6Prefix`), `core/route/router.cc` (`RouteResource` IPv6 staging), `core/route/neighbor_resolver.h`
-(aging), `core/modules/router.{h,cc}`, `protobuf/module_msg.proto` (`RouterArg` 13, 14, 22, 23),
+(aging), `core/framework/module_tick.h` (`TickHub::interval`, `current_tick`), `core/modules/router.{h,cc}`,
+`protobuf/module_msg.proto` (`RouterInterface`, `RouterNeighborBinding`, `RouterArg` 13-23),
 `docs/routing.md`, `docs/neighbor-resolution.md`.
 
 **Context.** D-176 and D-178 left IPv6 routing for "when an IPv6 FIB lands", and the Router module sent no
@@ -12367,23 +12368,51 @@ hops a `RouterArg.neighbor_bindings` entry names.
   mode declares `domain_attr`. A declared read is a requirement on every path into the module, so a
   destination-mode Router fed by a path with no next-hop writer no longer invalidates that attribute's scope
   for the next-hop readers sharing the graph.
-- *Explicit zero is a value.* `neighbor_reachable_lifetime` and `neighbor_unreachable_retry` are `optional`.
-  An unset field takes the default, and an explicit 0 is the library's "never age" / "never retry".
+- *Timings are time, and zero has one meaning per field.* The `neighbor_*_ms` fields are milliseconds, all
+  `optional`, converted at Init to ticks from the maintenance loop's interval (`TickHub::interval`, set by the
+  loop) and counted from the tick current at Init. An unset field takes the default; an explicit 0 is "never"
+  for the reachable lifetime and the unreachable retry, "at once" for the first probe, and refused for the
+  probe interval, its ceiling and the probe count. Init refuses a resolver when the loop is disabled, since no
+  neighbor would ever be solicited. The unreachable retry defaults to the backoff ceiling (8 s), so a failed
+  neighbor keeps being probed at that rate.
+- *Interfaces are the router's own, and next-hop mode writes the IPv6 hop limit.* `RouterArg.interfaces`
+  (`RouterInterface`: id, egress gate, `mac_addr` text, addresses) names what a later interface-address
+  feature would also use; `ingress_interface_attr` defaults to `vif_id`, what Vif writes. An interface `id`
+  of 0 is derived as `egress_gate + 1`. Next-hop mode decrements the IPv6 hop limit as destination mode does,
+  so the two modes agree on every hop-count boundary (D-153).
 
-**Consequences.** D-153's "the Router sends no ARP/ND" no longer holds for a Router with resolver
+**Consequences.** D-153's "the Router sends no ARP/ND" no longer holds for a Router with configured
 interfaces. The D-176/D-178 "IPv6 FIB lands" trigger has fired for routing (route derivation stays IPv4-only).
 D-065's note that IPv6 is not built is superseded for the Router module. Neighbor changes advance the
 engine generation, so a controller that writes with `expected_generation` can see a conflict after a neighbor
 change and must re-read. A read-back of `<router>/next_hops` omits bound hops; their state is learned, not
-desired. Reaching the engine makes `core/modules/router.cc` the one module that includes
-`runtime/runtime_state.h`: `tools/check_includes.py` exempts that file by name from D-042's rule, because the
-alternative, putting transaction application on `ModuleInitContext` or `ResourceRegistry`, is the plugin-API
-widening D-074 refuses.
+desired, so a `<router>/routes` read-back may name a next-hop id the next-hop read-back leaves out. That is
+expected until a neighbor view exists. Reaching the engine makes `core/modules/router.cc` the one module that
+includes `runtime/runtime_state.h`: `tools/check_includes.py` exempts that file by name from D-042's rule,
+because the alternative, putting transaction application on `ModuleInitContext` or `ResourceRegistry`, is the
+plugin-API widening D-074 refuses.
+
+What an existing Router user (no interfaces configured) sees:
+- GetDesc reads `not ip:` where it read `not ipv4:`, and the accessor `not_ipv4_frames` is `not_ip_frames`.
+- In destination mode, IPv6 frames, once dropped as non-IPv4, are routed through the domain's IPv6 table, and
+  go to `punt_miss_gate` (or are dropped and counted) when it has no route.
+- Link-local and multicast IPv6 goes to `punt_local_gate` when one is configured.
+- In next-hop mode, an IPv6 frame's hop limit is decremented, and one arriving with 0 or 1 is dropped and
+  counted as TTL expired.
+- Each mode declares only its own metadata attribute: next-hop mode no longer declares `domain_attr`, and
+  destination mode no longer declares `next_hop_attr`.
+
+Limits, additive later: interfaces and bindings are fixed at Init (no runtime neighbor resource); route
+gateways are not resolved on demand; neighbor state is not inspectable (no neighbors view); ARP requests and
+Neighbor Solicitations share `punt_local_gate` (no separate neighbor punt gate); gratuitous ARP is not learned;
+one address per family per interface.
 
 **Evidence.** `route_route_test` (`Ipv6RouteTableTest.*`), `route_router_transaction_test` (IPv6
 atomicity, abort, `max_routes` bound, and allocation-free publication), `route_neighbor_resolver_test`
 (aging, reconfirmation, poll fault steps), `modules_router_test` (IPv6 local and link-scope gates, request
-punting, input drops, explicit-zero aging, the 64-per-tick publication cap, and mode-specific attributes) and
+punting, input drops, explicit-zero aging, the 64-per-tick publication cap, mode-specific attributes,
+millisecond timings from Init, refusal without the maintenance loop, meaningless zeros refused, derived
+interface ids, and the next-hop-mode IPv6 hop limit) and
 `control_apply_pipeline_test` (`ResolverOwnedNextHopsAreOutsideDesiredStateConvergence`). The full suite
 (`meson test -C build/fast --no-suite live`) is the gate.
 

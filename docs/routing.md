@@ -73,18 +73,18 @@ route exists and chose that hop (D-160).
 
 ## Two recipes
 
-**Recipe A — policy forwarding (sessions).** A classifier (or a PDR/selector) picks the next hop, writes it as
+**Recipe A — policy forwarding (per-flow next hops).** A classifier picks the next hop, writes it as
 `next_hop_id` metadata, and the Router resolves it and leaves on that hop's egress gate:
 
 ```
 ports/vifs -> classifier (next_hop_id) -> Router -> ports
 ```
 
-The Router decrements IPv4 TTL and fixes its checksum before the L2 rewrite.
-It does not decrement an IPv6 hop limit in next-hop mode. No FIB routes are
-needed: the classifier selects a hop, and the Router resolves it to an egress
-gate. The UPF uses this mode for inner session forwarding; its default PDR
-fields are IPv4.
+The Router decrements the IPv4 TTL and fixes its checksum, or decrements the
+IPv6 hop limit, before the L2 rewrite, exactly as destination mode does (D-153,
+D-179); a frame arriving with a hop count of 0 or 1 is dropped and counted as
+TTL expired. No FIB routes are needed: the classifier selects a hop, and the
+Router resolves it to an egress gate.
 
 **Recipe B — a routed network.** Ports and VIFs feed the Router, which looks each packet's own destination up
 in its route domain and forwards it:
@@ -105,15 +105,17 @@ configured with `RouterRouteKey.ipv6` and an `Ipv6Prefix`; they share the
 same route domain and next-hop resources. The Router does not synthesize
 connected IPv6 routes.
 
-`RouterArg.domain_attr` defaults to `route_domain`; a second Router can read
-`transport_route_domain` for an outer transport FIB. The Router resource key
-keeps the IPv4 spelling (`ipv4`, `prefix_length`, `domain`) and adds the
-mutually exclusive `ipv6` field. Resolver interface metadata defaults to
-`neighbor_interface_id`, independent of the route domain. A configured
-`RouterNeighborBinding` owns its next-hop id: create routes to it, and do not
-write a static `RouterNextHopValue` for that id. The resolver interface id is
-the Router's logical `InterfaceId` (currently gate + 1), not a queue or UPF
-endpoint id; the deployment graph must tag resolver input with that interface id.
+`RouterArg.domain_attr` defaults to `route_domain`; several Routers can read
+different domain attributes, e.g. an overlay and an underlay FIB. A
+`RouterRouteKey` sets exactly one of `ipv4` or `ipv6` (with `prefix_length`
+and `domain`), so an IPv6 route is written as `{ipv6: "2001:db8::",
+prefix_length: 32}`. The ingress interface attribute (`ingress_interface_attr`,
+default `vif_id`, what Vif writes) is independent of the route domain. A
+configured `RouterNeighborBinding` owns its next-hop id: create routes to it,
+and do not write a static `RouterNextHopValue` for that id. The interface id is
+the Router's logical `InterfaceId` (`egress_gate + 1`), not a queue id or any
+other ingress tag; the graph must tag ARP/ND input with that id.
+docs/neighbor-resolution.md has a complete configuration example.
 
 An interface address also implies a **local route** (D-178): the address itself is this node's, so a packet to
 it is delivered here and never forwarded. `route::DerivedRoutes::Derive(interfaces)` returns both routes per

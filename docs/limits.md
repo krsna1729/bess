@@ -109,6 +109,9 @@ Columns:
 | Dump | sampling interval | 1 s | `DEFAULT_INTERVAL_NS` (`dump.cc`) | `interval` | — |
 | Router | default route domain | 0 | `kDefaultRouteDomainId` (`route/route_domain.h`) | the route key's `domain` | — |
 | Router | neighbor next-hop updates published per tick | 64 | `Router::kMaxNeighborUpdatesPerTick` (`modules/router.h`) | No | the rest stay pending for the next tick (D-179) |
+| Router | neighbor interfaces and bindings | fixed at Init | `RouterArg.interfaces`, `neighbor_bindings` | No (recreate the Router) | no runtime change; route gateways are not resolved on demand, so every neighbor needs a binding (D-179) |
+| Router | neighbor state visibility | counts only | `Router::GetDesc` | No | bound hops are hidden from `<router>/next_hops`; no neighbors view yet (D-179) |
+| Router | addresses per interface | one IPv4, one IPv6, no prefix length | `RouterInterface` | No | — |
 
 ## Other fixed constants
 
