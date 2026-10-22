@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -123,6 +124,12 @@ class FirewallTable {
   // names no family - rather than widening the constraint.
   static std::expected<std::unique_ptr<const FirewallTable>, std::string>
   Build(std::vector<FirewallRule> rules);
+
+  // Why Build would refuse `rule`, without naming it (the caller knows which
+  // rule it is), or nullopt when the table can express it. Build refuses a
+  // list exactly when it refuses one of its rules, so a caller that checks
+  // each rule as it arrives knows the list will build.
+  static std::optional<std::string> Refusal(const FirewallRule &rule);
 
   // Classifies `n` (<= 64) keys: sets bit i of the returned mask for each key a
   // rule matched, writes that rule's action into matches[i].action (and, with

@@ -599,6 +599,7 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
       w.touched.push_back(reg);  // cannot throw: reserved above
       reg->touched = true;
     }
+    reg->last_op = static_cast<uint32_t>(i);
     auto reserved = reg->resource->Reserve(op);
     if (!reserved) {
       return Reject(n, i, std::move(reserved.error()));
@@ -737,6 +738,14 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
       return Reject(n, d.added_by,
                     "references missing " +
                         Describe(d.target->resource->name(), d.key));
+    }
+  }
+
+  // -- prepare: one build per resource for the whole transaction -----------
+  // After every check, so a refused or busy transaction builds nothing.
+  for (Registration *r : w.touched) {
+    if (auto prepared = r->resource->Prepare(); !prepared) {
+      return Reject(n, r->last_op, std::move(prepared.error()));
     }
   }
 

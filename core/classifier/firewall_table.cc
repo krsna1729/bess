@@ -192,7 +192,14 @@ bool FirewallTable::Matches(const FirewallRule &rule, const FirewallKey &key,
 // 1-based, the way the messages count rules and the way a Match's rule_id does.
 std::optional<std::string> CheckRule(const FirewallRule &rule,
                                      uint32_t index) {
-  const std::string where = "rule " + std::to_string(index) + ": ";
+  std::optional<std::string> refused = FirewallTable::Refusal(rule);
+  if (refused.has_value()) {
+    return "rule " + std::to_string(index) + ": " + *refused;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> FirewallTable::Refusal(const FirewallRule &rule) {
   switch (rule.family) {
     case FirewallFamily::kIpv4:
     case FirewallFamily::kIpv6:
@@ -201,29 +208,27 @@ std::optional<std::string> CheckRule(const FirewallRule &rule,
       // A rule with no family cannot carry a prefix: there would be no width
       // to read the length against.
       if (rule.src_len != 0 || rule.dst_len != 0) {
-        return where +
-               "a rule that names no family cannot carry a prefix";
+        return "a rule that names no family cannot carry a prefix";
       }
       break;
   }
   const uint8_t bits = FamilyBits(rule.family);
   if (rule.src_len > bits) {
-    return where + "source prefix length " + std::to_string(rule.src_len) +
+    return "source prefix length " + std::to_string(rule.src_len) +
            " is beyond " + std::to_string(bits);
   }
   if (rule.dst_len > bits) {
-    return where + "destination prefix length " + std::to_string(rule.dst_len) +
+    return "destination prefix length " + std::to_string(rule.dst_len) +
            " is beyond " + std::to_string(bits);
   }
   if (rule.src_port_low > rule.src_port_high) {
-    return where + "source port range " + std::to_string(rule.src_port_low) +
-           "-" + std::to_string(rule.src_port_high) +
+    return "source port range " + std::to_string(rule.src_port_low) + "-" +
+           std::to_string(rule.src_port_high) +
            " has its low bound above its high";
   }
   if (rule.dst_port_low > rule.dst_port_high) {
-    return where + "destination port range " +
-           std::to_string(rule.dst_port_low) + "-" +
-           std::to_string(rule.dst_port_high) +
+    return "destination port range " + std::to_string(rule.dst_port_low) +
+           "-" + std::to_string(rule.dst_port_high) +
            " has its low bound above its high";
   }
   return std::nullopt;

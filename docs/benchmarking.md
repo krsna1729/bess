@@ -147,6 +147,14 @@ by 1.26x - and the index's advantage grows to 72x at 1,000. Building the table
 (what an apply costs) is about 50 µs at 1K rules and about 1 ms at 10K
 (`BM_FirewallBuild`; 44-58 µs and 0.82-1.07 ms across runs).
 
+What a controller pays is `modules_firewall_update_bench`
+(`core/modules/firewall_update_bench.cc`, D-179): one transaction through the
+module's `<name>/rules` resource, `BM_RuleTransaction/<rules>/<ops>`, with the
+operations decoded beforehand so only the apply is timed. It reports µs per
+transaction and `busy`, the retries the engine asked for. The cost should
+follow `rules` (one build per transaction) and barely move with `ops`; the
+D-179 table is the reference.
+
 ## Flow-state tables
 
 `flow_bench` (`core/flow/flow_bench.cc`, D-052) covers `WorkerFlowTable` and

@@ -219,6 +219,81 @@ TEST_F(TransactionEngineTest, PublishesUpsertsReferentsFirstAndErasesReferrersFi
   EXPECT_EQ(log, (std::vector<std::string>{"+b", "-c", "-b", "-a"}));
 }
 
+// A resource that builds once per transaction (Resource::Prepare): it counts
+// what it was asked to do, and can be told to refuse the build.
+class Batcher final : public Resource {
+ public:
+  explicit Batcher(std::string name) : Resource(std::move(name)) {}
+  size_t LiveCount() const override { return 0; }
+  bool Contains(const ResourceKey &) const override { return false; }
+
+  std::expected<Reservation, std::string> Reserve(const Op &) override {
+    struct Staged final : StagedOp {
+      Batcher *b;
+      explicit Staged(Batcher *batcher) : b(batcher) {}
+      void Publish(Retirer &) noexcept override { b->published++; }
+      void Abort() noexcept override { b->aborted++; }
+    };
+    reserved++;
+    return Reservation{std::make_unique<Staged>(this), {}};
+  }
+  std::expected<void, std::string> Prepare() override {
+    prepares++;
+    reserved_at_prepare = reserved;
+    if (refuse) {
+      return std::unexpected("cannot build");
+    }
+    return {};
+  }
+  void EndTransaction() noexcept override { reserved = 0; }
+
+  bool refuse = false;
+  int reserved = 0;
+  int prepares = 0;
+  int reserved_at_prepare = 0;
+  int published = 0;
+  int aborted = 0;
+};
+
+// Prepare runs once per touched resource, after every operation of the
+// transaction was reserved, and never for a resource the transaction does not
+// touch. Its refusal names the resource's last operation and leaves nothing
+// visible.
+TEST_F(TransactionEngineTest, PrepareBuildsOnceAfterEveryReservation) {
+  Batcher batch("batch");
+  Batcher idle("idle");
+  TransactionEngine engine(domain_);
+  ASSERT_TRUE(engine.Register(&batch) && engine.Register(&idle));
+
+  std::vector<Op> ops = {Op::Upsert("batch", "a", std::any(1)),
+                         Op::Upsert("batch", "b", std::any(1)),
+                         Op::Erase("batch", "c"),
+                         Op::Upsert("batch", "d", std::any(1))};
+  ASSERT_EQ(engine.Apply(ops).outcome, Outcome::kApplied);
+  EXPECT_EQ(batch.prepares, 1);
+  EXPECT_EQ(batch.reserved_at_prepare, 4);
+  EXPECT_EQ(batch.published, 4);
+  EXPECT_EQ(idle.prepares, 0);
+
+  batch.refuse = true;
+  ops = {Op::Upsert("batch", "a", std::any(1)),
+         Op::Upsert("idle", "x", std::any(1)),
+         Op::Upsert("batch", "b", std::any(1)),
+         Op::Upsert("idle", "y", std::any(1))};
+  auto r = engine.Apply(ops);
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_EQ(r.ops[0].status, OpStatus::kNotApplied);
+  EXPECT_EQ(r.ops[1].status, OpStatus::kNotApplied);
+  EXPECT_EQ(r.ops[2].status, OpStatus::kFailed) << "batch's last operation";
+  EXPECT_EQ(r.ops[2].error, "cannot build");
+  EXPECT_EQ(r.ops[3].status, OpStatus::kNotApplied);
+  EXPECT_EQ(batch.prepares, 2);
+  EXPECT_EQ(batch.published, 4) << "a refused build publishes nothing";
+  EXPECT_EQ(idle.published, 0);
+  EXPECT_EQ(batch.aborted, 2);
+  EXPECT_EQ(idle.aborted, 2);
+}
+
 TEST_F(TransactionEngineTest, MissingReferentRejectsAndNothingIsVisible) {
   auto r = Apply({Met(7, 1000), Rule(10, 5)});  // action 5 does not exist
   ASSERT_EQ(r.outcome, Outcome::kRejected);

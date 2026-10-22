@@ -166,7 +166,7 @@ file is the reasoning.
 | D-144 | The gate byte counter is gone: `TrackArg.bits` was its only switch and every hook was installed with the default arg, so `bess_gate_bytes_total` could never appear; the feature went with it, while the field number and name stay reserved so no client can silently write the old one | accepted; reserved-number policy superseded by D-173 |
 | D-145 | The Go SDK ships as a nested module under module-prefixed tags (`sdk/go/vX.Y.Z`), consumed by pinning a tag or a commit; unpinned queries resolve through the repository's default branch, which is `develop`, while `master` stays the archival upstream mirror and no branch is renamed; `go.work` is a machine-local development shortcut, never how a consumer builds | accepted |
 | D-146 | C++, Python and Go are all first-class control_v2 SDKs, and the Python one is rebuilt clean-room: a fresh client taking `pybess.sdk`'s place - the same transaction discipline (one request id per logical transaction, recovery through `GetTransaction`, the daemon epoch, typed resources and typed outcomes) over the same wire, with no legacy service and no place in the runtime package (D-135). It amends D-104's count of two supported SDKs | accepted |
-| D-147 | The firewall table: a masked 5-tuple policy where a port range costs no tuple (the ports are checked after the group's masked key, so a range adds no group, no mask and no entry - what WildcardMatch cannot do without spending 2n-2 prefixes per field of its budget, D-102), IPv4 and IPv6 in one table (the family is part of a group's identity, so a v4 rule never sees a v6 packet and a rule with no prefix sees both), the first match in rule order wins, and a packet the table cannot judge is dropped rather than passed by a catch-all; the module publishes the whole policy as one `<name>/rules` singleton (D-129). Amended 2026-10-18: the same policy can be **scanned** (`FirewallScan`) rather than indexed, sharing the index's predicate, validation and normalization so the two cannot drift | accepted |
+| D-147 | The firewall table: a masked 5-tuple policy where a port range costs no tuple (the ports are checked after the group's masked key, so a range adds no group, no mask and no entry - what WildcardMatch cannot do without spending 2n-2 prefixes per field of its budget, D-102), IPv4 and IPv6 in one table (the family is part of a group's identity, so a v4 rule never sees a v6 packet and a rule with no prefix sees both), the first match in rule order wins, and a packet the table cannot judge is dropped rather than passed by a catch-all; the module publishes the whole policy as one `<name>/rules` singleton (D-129). Amended 2026-10-18: the same policy can be **scanned** (`FirewallScan`) rather than indexed, sharing the index's predicate, validation and normalization so the two cannot drift | accepted; the module's singleton superseded by D-179 |
 | D-148 | The desired-state clear is bounded in the daemon, not in the client: a listed resource owns its contents, so an empty list clears a map, and today that is one transaction with one op per entry - refused whole by the engine's retire budget (`retire_high_water()/2`, "split it"). `TransactionEngine::ApplyBatched` applies what fits and halves on the budget refusal, and `ApplyResourcesLocked` calls it; convergence rather than atomicity, and the busy retry moves inside it because a caller looping over the whole request would re-apply batches that already applied, an erase of an already-erased key being refused ("not found"), not ignored | accepted |
 
 
@@ -10448,7 +10448,8 @@ layout change: cut `sdk/go/v0.1.0` on a green commit, then repin the consumers f
 
 ## D-147 The firewall table: a port range costs no tuple
 
-**Status:** accepted (2026-10-18).
+**Status:** accepted (2026-10-18); the module's `<name>/rules` singleton is superseded by D-179 (one keyed,
+priority-ordered entry per rule).
 **Code:** `core/classifier/firewall_table.{h,cc}`, `core/modules/firewall.{h,cc}`,
 `core/arch/masked_addr.h`, `protobuf/module_msg.proto` (`FirewallArg`),
 `core/classifier/firewall_table_test.cc`, `core/modules/firewall_test.cc`,
@@ -12169,3 +12170,84 @@ unchanged. The full suite (`meson test -C build/fast`) and `tools/check_includes
 **Revisit when:** an IPv6 FIB lands (a second derivation family), a controller needs to derive non-connected
 routes (recursion, preferences), or an interface address model with a prefix length arrives in `Vif` so the
 configuration can be the source of truth rather than a separate controller input.
+
+## D-179 Firewall rules are keyed and priority-ordered; a transaction rebuilds the policy once
+
+**Status:** accepted (2026-10-22). Supersedes D-147's `<name>/rules` singleton; the table itself (D-147) is
+unchanged.
+**Code:** `core/modules/firewall.{h,cc}` (`Firewall::RulesResource`), `core/dataplane/resource.h`
+(`Resource::Prepare`), `core/dataplane/transaction_engine.{h,cc}`, `protobuf/module_msg.proto`
+(`FirewallRuleKey`, `FirewallRuleValue`), `core/modules/firewall_test.cc`,
+`core/dataplane/transaction_engine_test.cc`, `core/modules/transaction_conformance_test.cc`,
+`core/modules/firewall_update_bench.cc`.
+
+**Context.** The Firewall published its whole policy as one singleton (D-129): a controller that changed one
+rule sent every rule again, two controllers could not own separate rules, and a rule had no name to change it
+by - only its place in a list, which every insert above it moves. WildcardMatch and ExactMatch already expose
+one keyed entry per rule. The Firewall's table has no incremental update (D-147): every change rebuilds it, so
+a keyed resource that rebuilt per operation would cost k rebuilds for k operations. And the engine publishes a
+transaction's upserts before its erases (D-021), so per-operation replacement tables would publish in that
+order, not the request's: the last table published could be one that misses a later operation.
+
+**Decision.**
+
+- **`<name>/rules` is a map**: key `FirewallRuleKey{id}`, value `FirewallRuleValue{priority, rule}`. The policy
+  order is priority, highest first, then id, lowest first; the first rule that matches wins, as before. An id
+  is stable: changing a rule's priority moves it and keeps its id. The init argument's list becomes ids
+  1..n at priority 0, so its given order is still the policy order, and it reads back as given.
+- **The codec checks each rule** (`FirewallTable::Refusal`, the same checks `Build` makes), so a rule the
+  table cannot express is refused by name when it arrives, not when the table is built. A value without its
+  rule is refused too: it would decode as the empty rule (match everything, pass) and read back as a present
+  one; a catch-all is written `"rule": {}`.
+- **One build per transaction: `Resource::Prepare()`.** A new engine hook, called once per touched resource
+  after every operation was reserved and every reference checked, before anything publishes. The default
+  does nothing. A refusal is reported against the resource's last operation and aborts every reservation,
+  as a `Reserve` refusal does. The Firewall's `Reserve` records the operation (an upsert's map node is
+  allocated there); `Prepare` merges the committed rules with the changes in id order and builds the table
+  once; the first of its operations to publish (an upsert when there is one) swaps it in - one RCU exchange,
+  one retire, footprint declared by the first operation reserved, the retirer counting the whole
+  transaction - and moves the nodes into the committed map without allocating. The other operations'
+  publishes find nothing left to do.
+- **Workers are not paused** and the consistency stays referential: a transaction is one RCU swap, so a packet
+  sees the old policy or the new one, but the resource does not yet claim scope snapshot.
+- **No incremental backend.** The measured cost is the rebuild itself (below); a backend that inserts into
+  the built table waits for a load that needs it.
+
+**Why.** Stable ids are what a controller reconciles against (D-129): desired state names an entry, and a
+rule that moves when another is inserted cannot be named. Priority plus id gives a total order without
+renumbering. One build per transaction is the cheapest correct publication for a structure that only
+rebuilds: it costs the same for one operation as for a thousand, and the one swap makes a multi-rule change
+atomic for the packet path. The hook is generic - any resource whose structure rebuilds rather than updates
+can use it - and it changes nothing for a resource that does not override it.
+
+**Evidence.** `modules_firewall_update_bench` (`BM_RuleTransaction/<rules>/<ops>`: one transaction that
+changes `ops` rules of a `rules`-rule policy, ops pre-decoded; `build/fast`, `-O2 -march=x86-64-v3` with
+`_GLIBCXX_ASSERTIONS`; CPU 4 isolated, turbo off; median of 5):
+
+| rules | 1 op | 64 ops | 1,000 ops |
+|---|---|---|---|
+| 1,000 | 172 µs | 234 µs | 1.23 ms |
+| 10,000 | 2.14 ms | 2.22 ms | 3.73 ms |
+| 50,000 | 13.1 ms | 14.1 ms | 15.6 ms |
+
+The cost scales with the policy, not with the operations: each operation adds 1-2.5 µs (the decoded value's
+copy, its map node and its lookups, growing with the policy). Under the same conditions
+`BM_FirewallBuild/10000` - the table build alone, over that bench's own rule mix - takes 1.85 ms, so most of
+a one-rule change at 10,000 rules is the build. Tests:
+`TransactionEngineTest.PrepareBuildsOnceAfterEveryReservation` (one prepare after four reserves, none for an
+untouched resource, a refusal marks its last operation failed and publishes nothing);
+`FirewallTest.PriorityOrdersTheRulesAndTheIdBreaksTies`, `ATransactionChangesThePolicyWholeOrNotAtAll` and
+`AnActionIdTravelsWithTheRule`; `FirewallTest.PublishingAChangeAllocatesNothing` (an insert, a replace and
+an erase, alone and in one transaction, publish with no allocation); and
+`ResourceParityTest.DeclaredTablesAreLiveTypedAndReleased` now asserts that publishing every module's
+sample, and its erase, allocates nothing (an allocation added to the Firewall's publish fails it).
+
+**Consequences.** A controller that wrote the singleton writes entries instead; a desired-state list of
+entries replaces the old whole-policy value. `action_attr` is an init argument only. The resource reports no
+capacity: the table has no fixed size. A single-rule change at 50,000 rules costs 13 ms of control-plane
+time, about 76 changes a second if they come one per transaction; batching them costs little more than one.
+
+**Revisit when:** a deployment needs more than about a hundred single-rule transactions a second on a policy
+of 10,000 rules or more (then an incremental backend, measured against this bench), a policy grows past
+50,000 rules (or shard it by domain or direction, D-147), or a controller needs scope-snapshot consistency
+across the Firewall and another resource.

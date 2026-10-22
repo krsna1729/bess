@@ -192,11 +192,13 @@ std::vector<ModuleCase> ParityCases() {
     c.mclass = "Firewall";
     c.arg = Msg<pb::FirewallArg>();
 
-    auto policy = Msg<pb::FirewallArg>();
-    auto *rule = policy->add_rules();
-    rule->set_src_ip("10.0.0.0/8");
-    rule->set_drop(true);
-    c.samples.push_back({"rules", nullptr, policy});
+    auto key = Msg<pb::FirewallRuleKey>();
+    key->set_id(1);
+    auto value = Msg<pb::FirewallRuleValue>();
+    value->set_priority(5);
+    value->mutable_rule()->set_src_ip("10.0.0.0/8");
+    value->mutable_rule()->set_drop(true);
+    c.samples.push_back({"rules", key, value});
     cases.push_back(std::move(c));
   }
 
@@ -218,6 +220,20 @@ std::set<std::string> RegisteredNames(TransactionEngine &engine,
     }
   }
   return names;
+}
+
+// Opens an allocation window when the engine starts publishing, so that what
+// Publish() (and only Publish()) allocates is seen.
+std::optional<fault_injection::AllocationFaults> g_publish_window;
+std::atomic<uint64_t> g_publish_allocations{0};
+
+void CountPublishAllocations(bool entering) {
+  if (entering) {
+    g_publish_window.emplace();
+  } else if (g_publish_window) {
+    g_publish_allocations += g_publish_window->allocations();
+    g_publish_window.reset();
+  }
 }
 
 TEST(ResourceParityTest, DeclaredTablesAreLiveTypedAndReleased) {
@@ -263,7 +279,11 @@ TEST(ResourceParityTest, DeclaredTablesAreLiveTypedAndReleased) {
           << "a mismatched key/value type was accepted";
     }
 
-    // A well-formed entry of each declared type is accepted and reads back.
+    // A well-formed entry of each declared type is accepted and reads back,
+    // and publishing it or its erase allocates nothing (the engine reserved
+    // what publication needs).
+    g_publish_allocations = 0;
+    dataplane::internal::g_publish_window_hook = CountPublishAllocations;
     for (const Sample &sample : c.samples) {
       SCOPED_TRACE(sample.table);
       const std::string name = ResourceName(m->name(), sample.table);
@@ -285,6 +305,9 @@ TEST(ResourceParityTest, DeclaredTablesAreLiveTypedAndReleased) {
       EXPECT_EQ("", harness.EraseResource(ResourceName(m->name(), it->table),
                                           *it->key));
     }
+    dataplane::internal::g_publish_window_hook = nullptr;
+    EXPECT_EQ(g_publish_allocations.load(), 0u)
+        << "publishing a sample, or its erase, allocated";
     while (engine.ReclaimRetired() != 0) {
     }
     for (const ResourceTable &table : declared) {
@@ -331,20 +354,6 @@ struct SettingsState {
 struct StagedSettings {
   uint64_t gate;
 };
-
-// Opens an allocation window when the engine starts publishing, so that what
-// Publish() (and only Publish()) allocates is seen.
-std::optional<fault_injection::AllocationFaults> g_publish_window;
-std::atomic<uint64_t> g_publish_allocations{0};
-
-void CountPublishAllocations(bool entering) {
-  if (entering) {
-    g_publish_window.emplace();
-  } else if (g_publish_window) {
-    g_publish_allocations += g_publish_window->allocations();
-    g_publish_window.reset();
-  }
-}
 
 class PublishConformanceTest : public ::testing::Test {
  protected:

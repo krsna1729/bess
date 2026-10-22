@@ -217,6 +217,15 @@ One change rebuilds the whole table (mode G): about 50 µs at 1K rules and about
 (one table per direction, or per UE group) or an incremental path that does not
 exist yet.
 
+**The module's rules are keyed (D-179).** `<name>/rules` is a map: key
+`FirewallRuleKey{id}`, value `FirewallRuleValue{priority, rule}`, ordered by
+priority (highest first), then id (lowest first). An id is stable, so a
+controller changes or removes one rule by name. A transaction builds the table
+once however many rules it changes (`Resource::Prepare`) and swaps it in with
+one RCU exchange: through the module, one rule changed costs 0.17 ms at 1K
+rules, 2.1 ms at 10K and 13 ms at 50K, and 1,000 changed together cost 1.2,
+3.7 and 15.6 ms (`modules_firewall_update_bench`).
+
 Packet path: the module (`modules/firewall.h`) extracts the key - IPv4 by
 offset, IPv6 through its extension chain (bounded at four headers) to the
 transport header - and a packet the table cannot judge (a non-IP frame, a
@@ -457,6 +466,10 @@ reference to something missing.
   record that loses to every rule and alone reads as a miss; the table's
   lookup filters it, so the packet path is unchanged. The result 0xFFFF is
   reserved for it. D-024.
+- **Firewall** registers its rules as `<module>/rules` (key: the rule id;
+  value: `{priority, rule}`) and rebuilds its table once per transaction in
+  `Prepare()`; the first of its operations to publish swaps the policy in
+  whole, so the workers are never paused. D-147, D-179.
 - **Router** (opt-in, `Router::Enroll(engine)`): next hops as
   `<router>/next_hops`, groups as `<router>/groups` (a member list, D-156),
   routes as `<router>/routes` (each route references the next hop or the
@@ -522,6 +535,15 @@ reference to something missing.
 - **Declare each operation's footprint** in `Reserve()` (`Footprint{retires,
   removals, callbacks}`); the adapters do. Exceeding it is fatal: the
   engine reserved exactly that, so publication never allocates.
+- **A resource that rebuilds builds once per transaction.** `Reserve()`
+  validates and records each operation; `Prepare()`, called once per touched
+  resource after every operation was reserved and checked, builds the one
+  replacement they make together, and may fail (the transaction is refused
+  against that resource's last operation). Every operation's staged work then
+  publishes the same replacement, the first one swapping it in. A resource
+  that builds per operation would rebuild k times for k operations, and
+  per-operation replacements would publish in the engine's order (upserts
+  before erases), not the request's. D-179.
 - **Cost:** a session of two meters, two actions and two rules, created
   and then removed, takes about 4.4 µs in process (226K sessions/s on a
   P-core, 216K with an idle reader online; 167K and 152K on an E-core).

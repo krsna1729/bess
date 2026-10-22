@@ -432,13 +432,15 @@ message ACLArg {
 }
 
 /**
- * A firewall: an ordered policy over the 5-tuple, with port ranges.
+ * A firewall: a priority-ordered policy over the 5-tuple, with port ranges.
  *
- * The first matching rule wins (the list order is the policy order), a
- * matching rule that does not drop forwards, and a packet no rule matches is
- * dropped. Port ranges are first-class: a range is two bounds, not a set of
- * masks, so a wide range costs the table nothing (see
- * core/classifier/firewall_table.h).
+ * The policy is the "<name>/rules" resource (FirewallRuleKey ->
+ * FirewallRuleValue, D-179): each rule has a stable id, and the rules are
+ * checked by priority, highest first, equal priorities by id, lowest first.
+ * The first matching rule wins, a matching rule that does not drop forwards,
+ * and a packet no rule matches is dropped. Port ranges are first-class: a
+ * range is two bounds, not a set of masks, so a wide range costs the table
+ * nothing (see core/classifier/firewall_table.h).
  *
  * __Input Gates__: 1
  * __Output Gates__: 1 (the incoming gate)
@@ -455,8 +457,26 @@ message FirewallArg {
     bool drop = 8;             /// Drop matching packets instead of forwarding.
     optional uint32 action_id = 9; /// The action id a matching packet carries, 0 for none. The packet path writes it into the packet's "action_id" metadata attribute for whatever module downstream reads it (D-141). A rule that drops cannot name one.
   }
-  repeated Rule rules = 1; /// The policy, in order.
+  repeated Rule rules = 1; /// The initial policy, in order: rule i becomes "<name>/rules" id i + 1 at priority 0.
   string action_attr = 2; /// The metadata attribute a matching rule's action id is written to (default "action_id"). The reader must be configured with the same name; with no reader the packets carry no action id (PreResume reports it once).
+}
+
+/**
+ * A Firewall rule's key in "<name>/rules": an id the controller chooses. It
+ * names the rule across updates; it does not order it (D-179).
+ */
+message FirewallRuleKey {
+  uint32 id = 1;
+}
+
+/**
+ * A Firewall rule's value in "<name>/rules": where it stands and what it
+ * matches. Higher priority is checked first; equal priorities go by id,
+ * lowest first (D-179).
+ */
+message FirewallRuleValue {
+  int64 priority = 1;
+  FirewallArg.Rule rule = 2;  // required; a catch-all is the empty rule {}
 }
 
 /**
