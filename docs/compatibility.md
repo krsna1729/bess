@@ -80,14 +80,26 @@ running daemon in the test suite.
   `bessctl/conf/samples/vrf_routing.yaml` (one Router, one FIB per route
   domain, a Vif writing the domain) is the VRF shape the two IPLookups in
   that sample used to have.
-- **`RouterArg` sizes each address family on its own** (D-180).
-  `max_routes` and `max_tbl8s` are removed: `max_ipv4_routes`/`max_ipv4_tbl8s`
-  and `max_ipv6_routes`/`max_ipv6_tbl8s` replace them, a family is enabled
-  exactly when its route capacity is set, and a Router with neither is
-  refused. The remaining `RouterArg` fields are renumbered, so a binary
-  `RouterArg` must be re-encoded; text and YAML that name fields only need the
-  capacity rename. An IPv4 Router that relied on the old default writes
+- **`RouterArg` sizes each address family on its own, in destination mode
+  only** (D-180). `max_routes` and `max_tbl8s` are removed:
+  `max_ipv4_routes`/`max_ipv4_tbl8s` and `max_ipv6_routes`/`max_ipv6_tbl8s`
+  replace them. In `ROUTE_MODE_DESTINATION` a family is enabled exactly when
+  its route capacity is set, and a Router with neither is refused. In
+  `ROUTE_MODE_NEXT_HOP_ID` (the default) the Router has no FIB: it forwards
+  IPv4 and IPv6, refuses the four capacity fields and a non-default
+  `backend`, and refuses every route write, so a next-hop-id configuration
+  drops its capacity fields and its routes (an empty `RouterArg` is valid).
+  All `RouterArg` fields are renumbered (1-25, no reserved slots) and
+  `RouterInterface` keeps 1-4, so a binary `RouterArg` must be re-encoded;
+  text and YAML that name fields only need the capacity rename. An IPv4
+  destination-mode Router that relied on the old default writes
   `max_ipv4_routes: 4096`.
+- **Transactions reserve in resource rank order** (D-180). The engine calls
+  `Resource::Reserve` for every operation on a referenced resource before the
+  operations on the resources that reference it, and in request order within
+  a resource; results are still reported in request order. A `Reserve` that
+  reads another resource's staged state therefore sees every operation on
+  lower-rank resources, wherever the request lists them.
 
 ## What a build is made of
 

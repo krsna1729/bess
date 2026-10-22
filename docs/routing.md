@@ -121,8 +121,20 @@ IPv4-only, IPv6-only and dual-stack configuration examples.
 
 ## Address families and sizing
 
-`RouterArg` enables each family on its own: a family is on exactly when its
-route capacity is set.
+The family rules depend on the mode (D-180).
+
+**Next-hop-id mode (`ROUTE_MODE_NEXT_HOP_ID`, the default).** The packet's
+next-hop id is the decision, so the Router has no FIB: it allocates none in
+any family, takes no family setting, and forwards IPv4 and IPv6 alike,
+decrementing each packet's TTL or hop limit by the packet's own family. Init
+refuses the four FIB sizing fields below and a non-default `backend` ("a
+ROUTE_MODE_NEXT_HOP_ID router has no FIB"); every `<router>/routes` write is
+refused with an error that names the mode. Interface addresses and neighbor
+bindings of either family are accepted. An empty `RouterArg` is a valid
+next-hop-id Router.
+
+**Destination mode (`ROUTE_MODE_DESTINATION`).** `RouterArg` enables each
+family on its own: a family is on exactly when its route capacity is set.
 
 | field | meaning | default |
 |---|---|---|
@@ -131,15 +143,19 @@ route capacity is set.
 | `max_ipv6_routes` | IPv6 routes per domain; setting it enables IPv6 | unset: IPv6 off |
 | `max_ipv6_tbl8s` | IPv6 (rte_fib6) tbl8 groups per domain; a route reserves one per byte between its length and its covering route's, counted from /24 | 8192 |
 
-Init refuses: no family enabled ("set max_ipv4_routes, max_ipv6_routes or
-both"); an explicit 0 for any of the four; a `max_*_tbl8s` whose family's
-route capacity is unset; a capacity past 32 bits; a non-default `backend`
-(which selects the IPv4 table) without IPv4; and an interface address of a
-disabled family. A disabled family has no FIB in any domain and costs
-nothing. In both modes its frames are dropped and counted as
-`family_disabled_frames` (GetDesc: `family disabled`), its routes and
-neighbor bindings are refused, and its neighbor protocol (ARP or ND) is not
-read.
+Init refuses: no family enabled ("ROUTE_MODE_DESTINATION needs
+max_ipv4_routes, max_ipv6_routes or both"); an explicit 0 for any of the
+four; a `max_*_tbl8s` whose family's route capacity is unset; a capacity past
+32 bits; a non-default `backend` (which selects the IPv4 table) without IPv4;
+and an interface address of a disabled family. A disabled family has no FIB in
+any domain and costs nothing. Its frames are dropped and counted as
+`family_disabled_frames` (GetDesc: `family disabled`), and its routes and
+neighbor bindings are refused.
+
+In both modes the neighbor protocols the Router reads are those of its
+configured interface addresses: ARP when an interface has an IPv4 address,
+Neighbor Discovery when one has an IPv6 address. Frames of a protocol no
+interface address calls for are not diverted to the resolver.
 
 **IPv6 on rte_fib6, two instances per domain.** rte_fib6's trie cannot change
 a rule in place without possibly allocating: rewriting a rule takes a
@@ -151,7 +167,9 @@ which readers use through RCU and nobody edits, and a `spare` that a
 transaction edits (every allocation and capacity check happens there).
 Commit is one pointer exchange; the old live becomes the spare after a grace
 period and replays the prefixes it lags by. An aborted transaction changes
-nothing, and publication allocates nothing.
+nothing, and publication allocates nothing. A spare that was built and never
+published needs no grace period: an aborted transaction leaves it editable,
+and the next one replays it rather than building a new instance.
 
 Memory per IPv6 domain follows from that. One instance is the 2^24-entry
 tbl24 plus `max_ipv6_tbl8s` × 256 entries plus the rib's 2 × `max_ipv6_routes`

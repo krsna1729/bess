@@ -81,10 +81,12 @@ unicast sender MAC all agree with the current identity. A reply in flight when
 an address moves is therefore a stale record, not an update to a newer
 neighbor. The same key and epoch rules apply to both families, so an IPv4
 reply cannot resolve an IPv6 neighbor or vice versa. A reply never creates an entry: only `Bind` does, so unsolicited
-frames cannot populate the table. `Unbind` leaves a learned neighbor in the
-table (a later bind in the same generation may reuse it), but configuring the
+frames cannot populate the table. The last `Unbind` of a neighbor forgets it
+(`NeighborTable::Forget`): its entry, timer and learned MAC go, so the table
+holds only bound neighbors however many addresses churn through it, and a
+later `Bind` of the same address starts incomplete and solicits. Configuring the
 interface with a new MAC or address, and removing it, walk every neighbor key
-on that interface -- bound or not -- and invalidate that learning, so a rebind
+on that interface and invalidate its learning, so a rebind
 cannot resurrect a MAC learned under an old interface identity. A rebind also
 moves the bindings' captured source MAC, so the republished next hops send
 from the interface's current MAC. `Bind` enforces the neighbor-entry bound
@@ -112,6 +114,15 @@ Either way the frame needs an Ethernet source equal to the ARP sender, a
 usable unicast sender MAC that is not the interface's own, an Ethernet
 destination that is the interface's MAC or broadcast, and the generation the
 entry was bound under; a sender no `Bind` named is ignored.
+
+These checks tie a frame to a bound neighbor's address, not to whoever owns
+that address. ARP is unauthenticated, so any sender on the link can announce a
+bound neighbor's address with its own MAC and redirect that neighbor's
+traffic at once; reconfirmation follows on the next `Poll`, but the merge has
+already been published. This is RFC 826 behaviour, not spoof prevention. On a
+link where untrusted hosts share the segment, protect it with link-layer
+controls (port security, dynamic ARP inspection) or use static next hops
+(`<router>/next_hops`) for those peers.
 
 An interface can hold several addresses of a family. A solicitation leaves
 from the address whose prefix holds the neighbor, and from the first address
@@ -204,9 +215,12 @@ table in BESS and is what lets the state machine allocate without locks.
 `InterfaceId`, which is `egress_gate + 1`; leave it 0 to derive it, and any
 other value must equal it. `mac_addr` is text, `"aa:bb:cc:dd:ee:ff"`, as in
 Vif, and must be nonzero. `addresses` is a list of the interface's own
-addresses in CIDR form (`"192.0.2.1/24"`, `"2001:db8::1/64"`): any number of
-either enabled family, at least one. Init refuses an address of a family the
-router does not enable, a malformed address, and an interface without one.
+addresses in CIDR form (`"192.0.2.1/24"`, `"2001:db8::1/64"`): any number, at
+least one. In destination mode they must be of an enabled family; a
+next-hop-id Router has no FIB families and takes addresses of either family.
+Init refuses such a family mismatch, a malformed address, and an interface
+without one. The Router reads ARP when some interface has an IPv4 address and
+Neighbor Discovery when some interface has an IPv6 address, in either mode.
 The interfaces are fixed at Init; setting any enables neighbor resolution and
 the `<router>/neighbors` resource.
 
@@ -221,9 +235,10 @@ other resource:
   as an incomplete next hop. The resolver takes the binding up on the next
   maintenance tick, and `neighbor_first_probe_ms` counts from that tick.
 - **Validated before it is staged.** A binding must name a configured
-  interface, an address of a family the router enables and the interface has
-  an address of, and not one of the interface's own addresses
-  (`NeighborResolver::CheckBind`). A refused binding refuses the transaction.
+  interface, an address of a family the interface has an address of (in
+  destination mode, also a family the router enables), and not one of the
+  interface's own addresses (`NeighborResolver::CheckBind`). A refused
+  binding refuses the transaction.
 - **Static and bound ids are disjoint.** An id is in `<router>/next_hops` or
   in `<router>/neighbors`, never both; a transaction that would make it both
   is refused.
@@ -233,10 +248,16 @@ other resource:
   earlier transaction.
 - **Abort leaves nothing.** An aborted transaction leaves no binding, hop or
   pending resolver change behind.
-- **Apply order.** Desired-state apply upserts resources by ascending rank
-  and erases by descending rank, so a manifest may list `<router>/neighbors`
-  after the routes that name its ids: bindings are upserted before routes
-  and erased after them.
+- **Order does not matter.** The transaction engine reserves operations in
+  ascending resource rank (bindings and next hops before the groups and
+  routes that name them), so a route or group may be listed before the
+  binding it names in the same transaction. Desired-state apply also upserts
+  by ascending rank and erases by descending rank.
+- **The final binding wins.** The maintenance tick coalesces the binding
+  changes committed since the last tick per id, releases removed or replaced
+  bindings first, then installs the new ones: an unbind and a bind in one
+  transaction at `max_neighbors` resolve the new neighbor, and several
+  transactions on one id before a tick install only the last binding.
 - **Capacity.** `max_neighbors` bounds the bindings (and so the neighbors
   resolved). It defaults to 1024 or `max_next_hops`, whichever is smaller;
   a value above `max_next_hops` is refused. A binding past it refuses the
@@ -285,11 +306,21 @@ it runs while workers run.
 
 ### Examples
 
-A family is enabled exactly when its route capacity (`max_ipv4_routes`,
-`max_ipv6_routes`) is set; at least one must be. Interface addresses and
-bindings must be of an enabled family. The three Router configurations
-below differ only in that; the graph around them is the one in the dual-stack
-example.
+In destination mode a family is enabled exactly when its route capacity
+(`max_ipv4_routes`, `max_ipv6_routes`) is set; at least one must be, and
+interface addresses and bindings must be of an enabled family. The three
+destination-mode configurations below differ only in that; the graph around
+them is the one in the dual-stack example. A next-hop-id Router (the default
+mode) has no FIB and no family setting: it takes neither capacity, nor
+routes, and resolves neighbors of whichever families its interfaces hold:
+
+```yaml
+  - name: rt
+    mclass: Router
+    arg:
+      interfaces:
+        - {egress_gate: 0, mac_addr: "02:00:00:00:00:01", addresses: ["192.0.2.1/24", "2001:db8:1::1/64"]}
+```
 
 IPv4 only (`rte_lpm`, 256 tbl8 groups per domain by default):
 
