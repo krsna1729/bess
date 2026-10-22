@@ -251,9 +251,10 @@ resume_hook_compile_deps = low_level_compile_deps + [
 ]
 utility_compile_deps = low_level_compile_deps + [pcap_dep]
 
-# Decision D-095: route, its dataplane core and RCU domain, and the EAL and
-# utility archives they link against are installed (experimental, no ABI
-# promise) with bess-dev-static.pc, so a program can use the router without
+# Decision D-095: route, the shared flow index and the classifier backend it
+# uses, their dataplane core and RCU domain, and the EAL and utility archives
+# they link against are installed (experimental, no ABI promise) with
+# bess-dev-static.pc, so a program or a plugin's unit test can use them without
 # bessd. Plugins never link them: bessd provides those symbols.
 bess_archive_dir = get_option('libdir') / 'bess'
 bess_utils = static_library(
@@ -296,6 +297,8 @@ bess_classifier = static_library(
   include_directories: core_include,
   dependencies: low_level_compile_deps,
   link_with: [bess_dataplane_core, bess_eal, bess_rcu],
+  install: true,
+  install_dir: bess_archive_dir,
 )
 bess_flow = static_library(
   'bess_flow',
@@ -303,6 +306,8 @@ bess_flow = static_library(
   include_directories: core_include,
   dependencies: low_level_compile_deps,
   link_with: [bess_classifier, bess_dataplane_core, bess_rcu],
+  install: true,
+  install_dir: bess_archive_dir,
 )
 bess_meter = static_library(
   'bess_meter',
@@ -332,10 +337,10 @@ bess_route = static_library(
 pkg.generate(
   name: 'bess-dev-static',
   filebase: 'bess-dev-static',
-  description: 'BESS route, dataplane and RCU archives for programs without bessd (experimental)',
+  description: 'BESS route, flow index, classifier, dataplane and RCU archives for programs without bessd (experimental)',
   version: meson.project_version(),
-  libraries: ['-L${libdir}/bess', '-lbess_route', '-lbess_dataplane_core', '-lbess_eal',
-              '-lbess_rcu', '-lbess_utils'],
+  libraries: ['-L${libdir}/bess', '-lbess_route', '-lbess_flow', '-lbess_classifier',
+              '-lbess_dataplane_core', '-lbess_eal', '-lbess_rcu', '-lbess_utils'],
   requires: ['bess-dev', 'gflags'],
   requires_private: ['libpcap'],
   # A plugin must not link these: it would carry a second EAL and RCU state
