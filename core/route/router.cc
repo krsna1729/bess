@@ -43,7 +43,7 @@ std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
   if (!routes) {
     return std::unexpected(routes.error());
   }
-  auto routes6 = Ipv6RouteTable::Create(domain);
+  auto routes6 = Ipv6RouteTable::Create(domain, config.max_routes);
   if (!routes6) {
     return std::unexpected(routes6.error());
   }
@@ -118,6 +118,17 @@ Router::~Router() {
 // defer queue holds every freed group; RouteTableTest pins both. Placed
 // prefixes are "pending" to Contains()/ReferencesOf() until the transaction
 // ends.
+//
+// IPv6 routes (Ipv6RouteTable) are immutable tries, so nothing is placed: the
+// first IPv6 operation of a transaction on a domain begins that table's
+// Stage, and it and every later IPv6 operation on the same table edit the
+// stage in Reserve(), where all allocation and the max_routes bound are
+// settled. The first of them to publish commits the stage -- one pointer
+// exchange, the replaced trie to the Retirer -- and the rest find it done.
+// That publishes the transaction's IPv6 upserts and erases on a table
+// together, during the route rank's upserts: earlier than an erase would
+// otherwise publish, which is safe because nothing references a route. An
+// aborted transaction discards its stages, so the tables never changed.
 class Router::RouteResource final : public dataplane::Resource {
  public:
   explicit RouteResource(Router &router)
@@ -129,7 +140,7 @@ class Router::RouteResource final : public dataplane::Resource {
 
   bool Contains(const dataplane::ResourceKey &key) const override {
     if (const auto id = Decode6(key)) {
-      return Find6(key, *id).has_value();
+      return Find6(*id).has_value();
     }
     const auto id = Decode(key);
     return id && Find(*id).has_value();
@@ -138,7 +149,7 @@ class Router::RouteResource final : public dataplane::Resource {
   std::vector<dataplane::Reference> ReferencesOf(
       const dataplane::ResourceKey &key) const override {
     if (const auto id = Decode6(key)) {
-      const auto value = Find6(key, *id);
+      const auto value = Find6(*id);
       return value ? References(*value) : std::vector<dataplane::Reference>{};
     }
     const auto id = Decode(key);
@@ -242,7 +253,7 @@ class Router::RouteResource final : public dataplane::Resource {
   }
   void EndTransaction() noexcept override {
     pending_.clear();
-    pending6_.clear();
+    stages6_.clear();
   }
 
  private:
@@ -267,30 +278,30 @@ class Router::RouteResource final : public dataplane::Resource {
     return Ipv6Id{RouteDomainId(domain), *prefix};
   }
 
-  std::optional<uint32_t> Find6(const dataplane::ResourceKey &key,
-                                const Ipv6Id &id) const {
-    if (pending6_.contains(key)) {
-      return std::nullopt;
-    }
+  // The committed route: the engine refuses a second operation on one key in
+  // a transaction, so a staged edit never needs to be seen here.
+  std::optional<uint32_t> Find6(const Ipv6Id &id) const {
     const Ipv6RouteTable *table = router_.Table6Of(id.domain);
     return table == nullptr ? std::nullopt : table->Find(id.prefix);
   }
 
+  // One table's next version within a transaction (see the class comment).
+  struct Stage6 {
+    Ipv6RouteTable &table;
+    std::unique_ptr<Ipv6RouteTable::Stage> stage;
+    bool committed = false;
+  };
+
   std::expected<Reservation, std::string> Reserve6(
       const dataplane::Op &op, const Ipv6Id &id) {
-    Ipv6RouteTable *table = router_.Table6Of(id.domain);
-    const auto previous = Find6(op.key, id);
-    if (op.kind == dataplane::OpKind::kErase) {
+    const auto previous = Find6(id);
+    const bool erase = op.kind == dataplane::OpKind::kErase;
+    uint32_t value = 0;
+    if (erase) {
       if (!previous) {
         return std::unexpected("not found");
       }
-      Reservation erase{std::make_unique<Erase6Op>(*table, id.prefix), {}};
-      erase.existed = true;
-      erase.previous_references = References(*previous);
-      return erase;
-    }
-    uint32_t value;
-    if (const auto *hop = std::any_cast<NextHopId>(&op.value)) {
+    } else if (const auto *hop = std::any_cast<NextHopId>(&op.value)) {
       if (!router_.ValidId(*hop)) {
         return std::unexpected(RouteErrorName(RouteError::kInvalidId));
       }
@@ -303,7 +314,10 @@ class Router::RouteResource final : public dataplane::Resource {
     } else {
       return std::unexpected("wrong value type (want NextHopId or NextHopGroupId)");
     }
+    Ipv6RouteTable *table = router_.Table6Of(id.domain);
     if (table == nullptr) {
+      // As for IPv4 (D-158): the first route written into a domain creates it.
+      // An erase never gets here (a missing domain holds nothing to erase).
       std::lock_guard<std::mutex> lock(router_.mutex_);
       if (auto created =
               router_.CreateDomainLocked(id.domain, router_.domain_config_);
@@ -311,22 +325,40 @@ class Router::RouteResource final : public dataplane::Resource {
         return std::unexpected(RouteErrorName(created.error()));
       }
       table = router_.Table6Of(id.domain);
+      if (table == nullptr) {  // just created, within the bound: unreachable
+        return std::unexpected(RouteErrorName(RouteError::kUnknownDomain));
+      }
     }
-    auto upsert = std::make_unique<Upsert6Op>(*table, id.prefix, value);
-    Reservation reservation{nullptr, References(value)};
+    auto it = stages6_.find(table);
+    const bool begins = it == stages6_.end();
+    if (begins) {
+      auto stage = table->BeginStage();
+      if (!stage) {
+        return std::unexpected(RouteErrorName(stage.error()));
+      }
+      it = stages6_
+               .emplace(table, std::make_unique<Stage6>(
+                                   Stage6{*table, std::move(*stage)}))
+               .first;
+    }
+    Stage6 &staged = *it->second;
+    auto commit = std::make_unique<Commit6Op>(staged);
+    Reservation reservation{nullptr,
+                            erase ? std::vector<dataplane::Reference>{}
+                                  : References(value)};
     reservation.existed = previous.has_value();
     if (previous) {
       reservation.previous_references = References(*previous);
-    } else if (id.prefix.length() != 0) {
-      pending6_.insert(op.key);
-      const uint32_t placeholder = table->CoveringValue(id.prefix).value_or(0);
-      if (auto placed = table->Upsert(id.prefix, placeholder); !placed) {
-        pending6_.erase(op.key);
-        return std::unexpected(RouteErrorName(placed.error()));
-      }
-      upsert->MarkPlaced();
     }
-    reservation.staged = std::move(upsert);
+    // The stage's commit retires the replaced trie once per table.
+    reservation.footprint.retires = begins ? 1 : 0;
+    // The edit is last: everything above that can fail has.
+    const auto edited = erase ? staged.stage->Erase(id.prefix)
+                              : staged.stage->Upsert(id.prefix, value);
+    if (!edited) {
+      return std::unexpected(RouteErrorName(edited.error()));
+    }
+    reservation.staged = std::move(commit);
     return reservation;
   }
 
@@ -403,46 +435,28 @@ class Router::RouteResource final : public dataplane::Resource {
     LpmRouteTable &table_;
     Ipv4Prefix prefix_;
   };
-  class Upsert6Op final : public dataplane::StagedOp {
+  // Every IPv6 operation on a table publishes its transaction's stage; the
+  // first does it, the rest find it committed. Nothing allocates: the stage
+  // was built in Reserve(), and Commit() is a pointer exchange and a swap.
+  // Abort() has nothing to undo, since the table was never touched.
+  class Commit6Op final : public dataplane::StagedOp {
    public:
-    Upsert6Op(Ipv6RouteTable &table, Ipv6Prefix prefix, uint32_t value)
-        : table_(table), prefix_(prefix), value_(value) {}
-    void MarkPlaced() noexcept { placed_ = true; }
-    void Publish(dataplane::Retirer &) noexcept override {
-      auto set = table_.Upsert(prefix_, value_);
-      CHECK(set) << RouteErrorName(set.error());
-    }
-    void Abort() noexcept override {
-      if (placed_) {
-        auto erased = table_.Erase(prefix_);
-        CHECK(erased) << RouteErrorName(erased.error());
+    explicit Commit6Op(Stage6 &stage) : stage_(stage) {}
+    void Publish(dataplane::Retirer &retirer) noexcept override {
+      if (stage_.committed) {
+        return;
       }
+      stage_.committed = true;
+      retirer.Retire(stage_.table.Commit(*stage_.stage));
     }
 
    private:
-    Ipv6RouteTable &table_;
-    Ipv6Prefix prefix_;
-    uint32_t value_;
-    bool placed_ = false;
-  };
-
-  class Erase6Op final : public dataplane::StagedOp {
-   public:
-    Erase6Op(Ipv6RouteTable &table, Ipv6Prefix prefix)
-        : table_(table), prefix_(prefix) {}
-    void Publish(dataplane::Retirer &) noexcept override {
-      auto erased = table_.Erase(prefix_);
-      CHECK(erased) << RouteErrorName(erased.error());
-    }
-
-   private:
-    Ipv6RouteTable &table_;
-    Ipv6Prefix prefix_;
+    Stage6 &stage_;
   };
 
   Router &router_;
   std::set<::bess::route::RouteKey> pending_;
-  std::set<dataplane::ResourceKey> pending6_;
+  std::map<const Ipv6RouteTable *, std::unique_ptr<Stage6>> stages6_;
 };
 
 
@@ -460,9 +474,7 @@ class Router::NextHopResource final
       const dataplane::Op &op) override {
     NextHopId id;
     if (dataplane::DecodeKey(op.key, &id) &&
-        std::find(router_.neighbor_managed_next_hops_.begin(),
-                  router_.neighbor_managed_next_hops_.end(), id) !=
-            router_.neighbor_managed_next_hops_.end()) {
+        router_.IsNeighborManagedNextHop(id)) {
       if (op.kind != dataplane::OpKind::kUpsert) {
         return std::unexpected(
             "next hop is owned by the Router NeighborResolver");
@@ -736,7 +748,7 @@ std::expected<void, RouteError> Router::CreateDomainLocked(
   if (!table) {
     return std::unexpected(table.error());
   }
-  auto table6 = Ipv6RouteTable::Create(rcu_);
+  auto table6 = Ipv6RouteTable::Create(rcu_, config.max_routes);
   if (!table6) {
     return std::unexpected(table6.error());
   }

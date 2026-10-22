@@ -360,19 +360,6 @@ std::expected<void, std::string> ResourceRegistry::ReleaseForTeardown(
     std::span<const std::string> names) {
   return engine_.ReleaseForTeardown(names);
 }
-std::expected<void, std::string> ResourceRegistry::Apply(
-    std::span<const Op> ops) {
-  TransactionEngine::Result result = engine_.Apply(ops);
-  if (result.outcome == TransactionEngine::Outcome::kApplied) {
-    return {};
-  }
-  for (const TransactionEngine::OpResult &op : result.ops) {
-    if (!op.error.empty()) {
-      return std::unexpected(op.error);
-    }
-  }
-  return std::unexpected("transaction was not applied");
-}
 size_t ResourceRegistry::ReferenceCount(const std::string &resource,
                                         const ResourceKey &key) const {
   return engine_.ReferenceCount(resource, key);

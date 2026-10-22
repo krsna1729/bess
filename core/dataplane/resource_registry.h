@@ -32,9 +32,6 @@ class ResourceRegistry {
   std::expected<void, std::string> Unregister(const std::string &name);
   std::expected<void, std::string> Unregister(std::span<const std::string> names);
   std::expected<void, std::string> ReleaseForTeardown(std::span<const std::string> names);
-  // Applies a small module-owned transaction from a control-plane callback
-  // (for example, a periodic module tick). Never call from a worker.
-  std::expected<void, std::string> Apply(std::span<const Op> ops);
 
   // References to `key` of `resource` held by other resources' values.
   size_t ReferenceCount(const std::string &resource, const ResourceKey &key) const;

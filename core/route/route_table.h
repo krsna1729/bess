@@ -99,7 +99,9 @@ class Ipv4Prefix {
   uint8_t length_;
 };
 
-// A validated IPv6 prefix, stored as network-order bytes.
+// A validated IPv6 prefix, stored as network-order bytes. Like Ipv4Prefix,
+// only Make() builds one, so every prefix a table sees has length <= 128 and
+// no host bits set.
 class Ipv6Prefix {
  public:
   static std::expected<Ipv6Prefix, RouteError> Make(
@@ -109,20 +111,32 @@ class Ipv6Prefix {
   uint8_t length() const noexcept { return length_; }
   friend auto operator<=>(const Ipv6Prefix &, const Ipv6Prefix &) = default;
 
-  friend class Ipv6RouteTable;
+ private:
   Ipv6Prefix(utils::Ipv6Address addr, uint8_t length)
       : addr_(addr), length_(length) {}
+
   utils::Ipv6Address addr_;
   uint8_t length_;
 };
 
-// Immutable binary-trie snapshots: control writes rebuild and publish the
-// complete trie through RCU; packet lookup follows at most 128 branches.
+// One route domain's IPv6 routes: immutable binary-trie snapshots published
+// through RCU; packet lookup follows at most 128 branches. `max_routes` bounds
+// the prefixes, the same bound LpmRouteTable::Config::max_routes puts on the
+// domain's IPv4 rules; a new prefix past it is kTableFull.
+//
+// Two ways to write. Upsert()/Erase() build and publish a new snapshot per
+// call (the direct API). A Stage is the transactional path: BeginStage()
+// copies the rule set and builds a compact trie off to the side, the Stage's
+// own Upsert()/Erase() edit that copy in place (O(prefix length) each, all
+// fallible work), and Commit() makes it the table with one pointer store and a
+// swap -- no allocation -- returning the replaced trie for the caller to retire
+// after a grace period. Readers see the old table or the whole new one.
 class Ipv6RouteTable {
  public:
   struct View;
+  class Stage;
   static std::expected<std::unique_ptr<Ipv6RouteTable>, RouteError> Create(
-      rcu::RcuDomain &domain);
+      rcu::RcuDomain &domain, uint32_t max_routes);
   ~Ipv6RouteTable();
   Ipv6RouteTable(const Ipv6RouteTable &) = delete;
   Ipv6RouteTable &operator=(const Ipv6RouteTable &) = delete;
@@ -131,7 +145,7 @@ class Ipv6RouteTable {
   std::expected<void, RouteError> Erase(Ipv6Prefix prefix);
   std::optional<uint32_t> Find(Ipv6Prefix prefix) const;
   size_t size() const;
-  std::optional<uint32_t> CoveringValue(Ipv6Prefix prefix) const;
+  uint32_t max_routes() const noexcept { return max_routes_; }
   template <typename Fn>
   void ForEach(Fn &&fn) const {
     std::lock_guard<std::mutex> lock(writer_mutex_);
@@ -150,13 +164,53 @@ class Ipv6RouteTable {
     bool has_value = false;
   };
   struct Snapshot { std::vector<Node> nodes; };
+
+ public:
+  // The replaced trie Commit() returns: the caller retires it after a grace
+  // period (Retirer::Retire, RcuDomain::Retire).
+  using Retired = std::unique_ptr<const Snapshot>;
+
+  // The table's next version, built off to the side. All allocation happens
+  // here and in the Stage's own edits; nothing is visible until Commit().
+  std::expected<std::unique_ptr<Stage>, RouteError> BeginStage() const;
+  // Makes `stage` the table. Does not allocate and cannot fail; the stage is
+  // spent afterwards. Only one writer may commit at a time (the caller's lock).
+  Retired Commit(Stage &stage) noexcept;
+
+ private:
   static std::expected<std::unique_ptr<Snapshot>, RouteError> BuildSnapshot(
       const Rules &rules);
-  explicit Ipv6RouteTable(rcu::RcuDomain &domain) : domain_(domain), live_(domain) {}
+  static void InsertNode(Snapshot &snapshot, Ipv6Prefix prefix, uint32_t value);
+  static void EraseNode(Snapshot &snapshot, Ipv6Prefix prefix) noexcept;
+  std::expected<std::unique_ptr<Stage>, RouteError> BeginStageLocked() const;
+  Ipv6RouteTable(rcu::RcuDomain &domain, uint32_t max_routes)
+      : domain_(domain), live_(domain), max_routes_(max_routes) {}
   rcu::RcuDomain &domain_;
   rcu::RcuPtr<Snapshot> live_;
+  const uint32_t max_routes_;
   mutable std::mutex writer_mutex_;
   Rules rules_;
+};
+
+class Ipv6RouteTable::Stage {
+ public:
+  // kValueOutOfRange for a value past LpmRouteTable::kMaxValue; kTableFull for
+  // a new prefix past max_routes.
+  std::expected<void, RouteError> Upsert(Ipv6Prefix prefix, uint32_t value);
+  // kNotFound for a prefix the stage does not hold.
+  std::expected<void, RouteError> Erase(Ipv6Prefix prefix);
+  std::optional<uint32_t> Find(Ipv6Prefix prefix) const;
+
+ private:
+  friend class Ipv6RouteTable;
+  Stage(uint32_t max_routes, Rules rules, std::unique_ptr<Snapshot> snapshot)
+      : max_routes_(max_routes),
+        rules_(std::move(rules)),
+        snapshot_(std::move(snapshot)) {}
+
+  uint32_t max_routes_;
+  Rules rules_;
+  std::unique_ptr<Snapshot> snapshot_;
 };
 
 struct Ipv6RouteTable::View {

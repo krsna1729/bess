@@ -259,8 +259,15 @@ class Router {
   // Adds next hop `id`, or replaces it (a neighbor update).
   std::expected<void, RouteError> SetNextHop(NextHopId id, const NextHop &hop);
   // Marks an existing next hop as NeighborResolver-owned before Enroll().
-  // The ordinary next_hops resource then refuses writes to its id.
+  // The ordinary next_hops resource then refuses writes and erases of its id.
   std::expected<void, RouteError> MarkNeighborManagedNextHop(NextHopId id);
+  // Whether `id` is NeighborResolver-owned. The set is fixed once enrolled
+  // (marking refuses kEnrolled), so this reads it without the lock.
+  bool IsNeighborManagedNextHop(NextHopId id) const {
+    return std::find(neighbor_managed_next_hops_.begin(),
+                     neighbor_managed_next_hops_.end(),
+                     id) != neighbor_managed_next_hops_.end();
+  }
   std::expected<void, RouteError> RemoveNextHop(NextHopId id);
 
   // Drops retiring next hops and groups whose grace period has completed, and

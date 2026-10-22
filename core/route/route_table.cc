@@ -88,27 +88,62 @@ Ipv6RouteTable::BuildSnapshot(const Rules &rules) {
   snapshot->nodes.reserve(node_capacity);
   snapshot->nodes.emplace_back();
   for (const auto &[prefix, value] : rules) {
-    size_t node_index = 0;
-    for (size_t bit = 0; bit < prefix.length(); bit++) {
-      const size_t branch =
-          (prefix.addr().bytes[bit / 8] >> (7 - bit % 8)) & 1u;
-      size_t child = snapshot->nodes[node_index].child[branch];
-      if (child == kNoNode) {
-        child = snapshot->nodes.size();
-        snapshot->nodes[node_index].child[branch] = child;
-        snapshot->nodes.emplace_back();
-      }
-      node_index = child;
-    }
-    snapshot->nodes[node_index].value = value;
-    snapshot->nodes[node_index].has_value = true;
+    InsertNode(*snapshot, prefix, value);
   }
   return snapshot;
 }
 
+// Walks `prefix`'s bits from the root, adding the nodes it lacks, and stores
+// the value at its end. Allocates (vector growth) only in a Stage or a build.
+void Ipv6RouteTable::InsertNode(Snapshot &snapshot, Ipv6Prefix prefix,
+                                uint32_t value) {
+  size_t node_index = 0;
+  for (size_t bit = 0; bit < prefix.length(); bit++) {
+    const size_t branch = (prefix.addr().bytes[bit / 8] >> (7 - bit % 8)) & 1u;
+    size_t child = snapshot.nodes[node_index].child[branch];
+    if (child == kNoNode) {
+      child = snapshot.nodes.size();
+      snapshot.nodes.emplace_back();
+      snapshot.nodes[node_index].child[branch] = child;
+    }
+    node_index = child;
+  }
+  snapshot.nodes[node_index].value = value;
+  snapshot.nodes[node_index].has_value = true;
+}
+
+// Clears `prefix`'s value and unlinks the chain of nodes that then lead to
+// nothing. The unlinked nodes stay in the vector until the next BeginStage
+// rebuilds the trie compactly; no lookup can reach them.
+void Ipv6RouteTable::EraseNode(Snapshot &snapshot, Ipv6Prefix prefix) noexcept {
+  std::array<size_t, 129> path;
+  size_t node_index = 0;
+  path[0] = 0;
+  for (size_t bit = 0; bit < prefix.length(); bit++) {
+    const size_t branch = (prefix.addr().bytes[bit / 8] >> (7 - bit % 8)) & 1u;
+    node_index = snapshot.nodes[node_index].child[branch];
+    if (node_index == kNoNode) {
+      return;
+    }
+    path[bit + 1] = node_index;
+  }
+  snapshot.nodes[node_index].has_value = false;
+  snapshot.nodes[node_index].value = 0;
+  for (size_t depth = prefix.length(); depth > 0; depth--) {
+    const Node &node = snapshot.nodes[path[depth]];
+    if (node.has_value || node.child[0] != kNoNode || node.child[1] != kNoNode) {
+      return;
+    }
+    const size_t bit = depth - 1;
+    const size_t branch = (prefix.addr().bytes[bit / 8] >> (7 - bit % 8)) & 1u;
+    snapshot.nodes[path[depth - 1]].child[branch] = kNoNode;
+  }
+}
+
 std::expected<std::unique_ptr<Ipv6RouteTable>, RouteError>
-Ipv6RouteTable::Create(rcu::RcuDomain &domain) {
-  auto table = std::unique_ptr<Ipv6RouteTable>(new Ipv6RouteTable(domain));
+Ipv6RouteTable::Create(rcu::RcuDomain &domain, uint32_t max_routes) {
+  auto table =
+      std::unique_ptr<Ipv6RouteTable>(new Ipv6RouteTable(domain, max_routes));
   auto snapshot = BuildSnapshot(table->rules_);
   if (!snapshot) {
     return std::unexpected(snapshot.error());
@@ -119,39 +154,95 @@ Ipv6RouteTable::Create(rcu::RcuDomain &domain) {
 
 Ipv6RouteTable::~Ipv6RouteTable() { live_.ResetQuiesced(); }
 
-std::expected<void, RouteError> Ipv6RouteTable::Upsert(Ipv6Prefix prefix,
-                                                       uint32_t value) {
-  if (value > LpmRouteTable::kMaxValue) {
-    return std::unexpected(RouteError::kValueOutOfRange);
-  }
-  std::lock_guard<std::mutex> lock(writer_mutex_);
-  Rules next = rules_;
-  next.insert_or_assign(prefix, value);
-  auto snapshot = BuildSnapshot(next);
+std::expected<std::unique_ptr<Ipv6RouteTable::Stage>, RouteError>
+Ipv6RouteTable::BeginStageLocked() const {
+  // Rebuilt from the rules rather than copied from the live trie, so nodes an
+  // earlier stage unlinked do not accumulate.
+  auto snapshot = BuildSnapshot(rules_);
   if (!snapshot) {
     return std::unexpected(snapshot.error());
   }
-  live_.Publish(std::move(*snapshot));
+  return std::unique_ptr<Stage>(
+      new Stage(max_routes_, rules_, std::move(*snapshot)));
+}
+
+std::expected<std::unique_ptr<Ipv6RouteTable::Stage>, RouteError>
+Ipv6RouteTable::BeginStage() const {
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  return BeginStageLocked();
+}
+
+Ipv6RouteTable::Retired Ipv6RouteTable::Commit(Stage &stage) noexcept {
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  Retired old = live_.Exchange(std::move(stage.snapshot_));
+  rules_.swap(stage.rules_);
+  return old;
+}
+
+std::expected<void, RouteError> Ipv6RouteTable::Stage::Upsert(Ipv6Prefix prefix,
+                                                              uint32_t value) {
+  if (value > LpmRouteTable::kMaxValue) {
+    return std::unexpected(RouteError::kValueOutOfRange);
+  }
+  const auto it = rules_.find(prefix);
+  if (it != rules_.end()) {
+    it->second = value;
+  } else {
+    if (rules_.size() >= max_routes_) {
+      return std::unexpected(RouteError::kTableFull);
+    }
+    rules_.emplace(prefix, value);
+  }
+  // The trie may grow (and throw) after the rule went in: the stage is then
+  // inconsistent, but a failed Reserve() discards it whole.
+  InsertNode(*snapshot_, prefix, value);
+  return {};
+}
+
+std::expected<void, RouteError> Ipv6RouteTable::Stage::Erase(Ipv6Prefix prefix) {
+  if (rules_.erase(prefix) == 0) {
+    return std::unexpected(RouteError::kNotFound);
+  }
+  EraseNode(*snapshot_, prefix);
+  return {};
+}
+
+std::optional<uint32_t> Ipv6RouteTable::Stage::Find(Ipv6Prefix prefix) const {
+  const auto it = rules_.find(prefix);
+  return it == rules_.end() ? std::nullopt : std::optional<uint32_t>(it->second);
+}
+
+std::expected<void, RouteError> Ipv6RouteTable::Upsert(Ipv6Prefix prefix,
+                                                       uint32_t value) {
+  std::lock_guard<std::mutex> lock(writer_mutex_);
+  auto stage = BeginStageLocked();
+  if (!stage) {
+    return std::unexpected(stage.error());
+  }
+  if (auto set = (*stage)->Upsert(prefix, value); !set) {
+    return set;
+  }
+  live_.Publish(std::move((*stage)->snapshot_));
+  rules_.swap((*stage)->rules_);
   domain_.ReclaimReady();
-  rules_.swap(next);
   return {};
 }
 
 std::expected<void, RouteError> Ipv6RouteTable::Erase(Ipv6Prefix prefix) {
   std::lock_guard<std::mutex> lock(writer_mutex_);
-  auto it = rules_.find(prefix);
-  if (it == rules_.end()) {
+  if (!rules_.contains(prefix)) {
     return std::unexpected(RouteError::kNotFound);
   }
-  Rules next = rules_;
-  next.erase(prefix);
-  auto snapshot = BuildSnapshot(next);
-  if (!snapshot) {
-    return std::unexpected(snapshot.error());
+  auto stage = BeginStageLocked();
+  if (!stage) {
+    return std::unexpected(stage.error());
   }
-  live_.Publish(std::move(*snapshot));
+  if (auto erased = (*stage)->Erase(prefix); !erased) {
+    return erased;
+  }
+  live_.Publish(std::move((*stage)->snapshot_));
+  rules_.swap((*stage)->rules_);
   domain_.ReclaimReady();
-  rules_.swap(next);
   return {};
 }
 
@@ -159,24 +250,6 @@ std::optional<uint32_t> Ipv6RouteTable::Find(Ipv6Prefix prefix) const {
   std::lock_guard<std::mutex> lock(writer_mutex_);
   const auto it = rules_.find(prefix);
   return it == rules_.end() ? std::nullopt : std::optional<uint32_t>(it->second);
-}
-
-std::optional<uint32_t> Ipv6RouteTable::CoveringValue(
-    Ipv6Prefix prefix) const {
-  std::lock_guard<std::mutex> lock(writer_mutex_);
-  utils::Ipv6Address network = prefix.addr();
-  for (int length = static_cast<int>(prefix.length()) - 1; length >= 0;
-       length--) {
-    const size_t bit = static_cast<size_t>(length);
-    network.bytes[bit / 8] &=
-        static_cast<uint8_t>(~(uint8_t{1} << (7 - bit % 8)));
-    const auto it =
-        rules_.find(Ipv6Prefix(network, static_cast<uint8_t>(length)));
-    if (it != rules_.end()) {
-      return it->second;
-    }
-  }
-  return std::nullopt;
 }
 
 size_t Ipv6RouteTable::size() const {

@@ -1316,34 +1316,81 @@ BESS_INSTANTIATE_ROUTE_BACKENDS(RouteTableTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouterTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouterGroupTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouteOracleTest);
+bess::utils::Ipv6Address V6(const char *text) {
+  return bess::utils::ParseIpv6Address(text).value();
+}
+
+Ipv6Prefix P6(const char *text, uint8_t length) {
+  return Ipv6Prefix::Make(V6(text), length).value();
+}
+
 TEST(Ipv6RouteTableTest, ValidatesAndPerformsLongestPrefixLookup) {
-  auto created = Ipv6RouteTable::Create(bess::runtime::runtime().rcu());
+  auto created = Ipv6RouteTable::Create(bess::runtime::runtime().rcu(), 16);
   ASSERT_TRUE(created);
   auto &table = **created;
-  const auto address = [](const char *text) {
-    return bess::utils::ParseIpv6Address(text).value();
-  };
-  auto prefix = [](const char *text, uint8_t length) {
-    return Ipv6Prefix::Make(bess::utils::ParseIpv6Address(text).value(), length);
-  };
   EXPECT_EQ(RouteError::kInvalidPrefixLength,
             Ipv6Prefix::Make({}, 129).error());
   EXPECT_EQ(RouteError::kHostBitsSet,
-            prefix("2001:db8::1", 64).error());
-  ASSERT_TRUE(table.Upsert(*prefix("::", 0), 1));
-  ASSERT_TRUE(table.Upsert(*prefix("2001:db8::", 32), 2));
-  ASSERT_TRUE(table.Upsert(*prefix("2001:db8:1::", 48), 3));
+            Ipv6Prefix::Make(V6("2001:db8::1"), 64).error());
+  ASSERT_TRUE(table.Upsert(P6("::", 0), 1));
+  ASSERT_TRUE(table.Upsert(P6("2001:db8::", 32), 2));
+  ASSERT_TRUE(table.Upsert(P6("2001:db8:1::", 48), 3));
   auto view = table.Read();
-  EXPECT_EQ(3, view.Lookup(address("2001:db8:1::1234")));
-  EXPECT_EQ(2, view.Lookup(address("2001:db8:2::1234")));
-  EXPECT_EQ(1, view.Lookup(address("2001:db9::1")));
-  EXPECT_EQ(2, table.CoveringValue(*prefix("2001:db8:1::", 48)));
+  EXPECT_EQ(3, view.Lookup(V6("2001:db8:1::1234")));
+  EXPECT_EQ(2, view.Lookup(V6("2001:db8:2::1234")));
+  EXPECT_EQ(1, view.Lookup(V6("2001:db9::1")));
   size_t enumerated = 0;
   table.ForEach([&](Ipv6Prefix, uint32_t) { enumerated++; });
   EXPECT_EQ(3u, enumerated);
-  ASSERT_TRUE(table.Erase(*prefix("2001:db8:1::", 48)));
-  EXPECT_EQ(2, table.Read().Lookup(address("2001:db8:1::1234")));
+  ASSERT_TRUE(table.Erase(P6("2001:db8:1::", 48)));
+  EXPECT_EQ(2, table.Read().Lookup(V6("2001:db8:1::1234")));
   EXPECT_EQ(2u, table.size());
+}
+
+// max_routes bounds the prefixes a domain's IPv6 table holds, as it bounds
+// the IPv4 rules: a new prefix past it is refused, a replaced one is not.
+TEST(Ipv6RouteTableTest, MaxRoutesBoundsNewPrefixes) {
+  auto created = Ipv6RouteTable::Create(bess::runtime::runtime().rcu(), 2);
+  ASSERT_TRUE(created);
+  auto &table = **created;
+  ASSERT_TRUE(table.Upsert(P6("2001:db8::", 32), 1));
+  ASSERT_TRUE(table.Upsert(P6("2001:db9::", 32), 2));
+  const auto full = table.Upsert(P6("2001:dba::", 32), 3);
+  ASSERT_FALSE(full);
+  EXPECT_EQ(RouteError::kTableFull, full.error());
+  EXPECT_EQ(2u, table.size());
+  EXPECT_FALSE(table.Read().Lookup(V6("2001:dba::1")).has_value());
+  EXPECT_TRUE(table.Upsert(P6("2001:db8::", 32), 4)) << "a replacement fits";
+  EXPECT_EQ(4, table.Read().Lookup(V6("2001:db8::1")));
+}
+
+// A Stage composes several edits off to the side; readers see none of them
+// until Commit(), then all of them. Erased prefixes stop matching.
+TEST(Ipv6RouteTableTest, AStageIsInvisibleUntilCommitted) {
+  auto created = Ipv6RouteTable::Create(bess::runtime::runtime().rcu(), 16);
+  ASSERT_TRUE(created);
+  auto &table = **created;
+  ASSERT_TRUE(table.Upsert(P6("2001:db8::", 32), 1));
+  ASSERT_TRUE(table.Upsert(P6("2001:db8:1::", 48), 2));
+
+  auto stage = table.BeginStage();
+  ASSERT_TRUE(stage);
+  ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:2::", 48), 3));
+  ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:3::", 48), 4));
+  ASSERT_TRUE((*stage)->Erase(P6("2001:db8:1::", 48)));
+  EXPECT_EQ(RouteError::kNotFound, (*stage)->Erase(P6("2001:db9::", 32)).error());
+  EXPECT_EQ(2, table.Read().Lookup(V6("2001:db8:1::1")));
+  EXPECT_EQ(1, table.Read().Lookup(V6("2001:db8:2::1")));
+  EXPECT_EQ(2u, table.size());
+
+  Ipv6RouteTable::Retired old = table.Commit(**stage);
+  EXPECT_NE(nullptr, old);
+  EXPECT_EQ(1, table.Read().Lookup(V6("2001:db8:1::1")));
+  EXPECT_EQ(3, table.Read().Lookup(V6("2001:db8:2::1")));
+  EXPECT_EQ(4, table.Read().Lookup(V6("2001:db8:3::1")));
+  EXPECT_EQ(3u, table.size());
+  EXPECT_EQ(std::optional<uint32_t>(3), table.Find(P6("2001:db8:2::", 48)));
+  EXPECT_FALSE(table.Find(P6("2001:db8:1::", 48)).has_value());
 }
 
 }  // namespace
