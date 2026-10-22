@@ -635,6 +635,11 @@ Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ r
   ```cpp
   _set_attr_with_offset<bess::utils::be32_t>(action_offset_, pkt, bess::utils::be32_t(action_id));
   ```
+- A module declares a name once. The one exception is a module that reads an
+  attribute and writes it too (a classifier that keys on `route_domain` and sets
+  it in its result): a `kRead` and a `kWrite` of the same name and size become
+  one `kUpdate` attribute with one index, keeping the reader's contract and
+  default. Any other repeat, or a size mismatch, is `-EEXIST`.
 
 ### Metadata contracts
 
