@@ -44,8 +44,8 @@ modules:
   - name: rt
     mclass: Router
     arg:
-      max_routes: "64"
-      max_tbl8s: "16"
+      max_ipv4_routes: "64"
+      max_ipv4_tbl8s: "16"
       max_next_hops: "64"
   - name: sink0
     mclass: Sink

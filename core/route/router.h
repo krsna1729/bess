@@ -151,16 +151,24 @@ struct NextHopGroup {
   }
 };
 
-// Route domains plus next hops (K7, K7.1, M6):
+// Route domains plus next hops (K7, K7.1, M6), dual-stack:
 //
-//   (domain, IPv4 dst) --LPM--> NextHopId --SlotTable--> NextHop
+//   (domain, IPv4 dst) --rte_lpm/rte_fib--> NextHopId --SlotTable--> NextHop
+//   (domain, IPv6 dst) --rte_fib6-------/
 //
 // One Router owns both halves: the per-domain FIBs and the next hops every
 // domain's routes share. Many routes share a next hop, so a neighbor change
 // (a new MAC, an unresolved neighbor) publishes one next-hop object (a
 // SlotTable pointer store, O(1)) and never touches a FIB; a route change is
-// one in-place rte_lpm update and never copies next hops. A next hop is named
-// by routes in any domain, and the reference counts below span all of them.
+// one FIB update and never copies next hops. A next hop is named by routes of
+// either family in any domain, and the reference counts below span all of
+// them. Each family is optional and sized on its own (Config): a router
+// without one has no FIB of it in any domain.
+//
+// An IPv4 route change is applied in place to the domain's rte_lpm/rte_fib;
+// an IPv6 one is applied to the domain's Ipv6RouteTable spare and published
+// by a pointer exchange (route_table.h), so even a sequence of IPv6 changes
+// in one transaction reaches readers at once.
 //
 // Domains. A Router is created with `max_domains` (default 1: just the
 // default domain 0, with the cost and behaviour of a router that has no
@@ -239,15 +247,38 @@ struct NextHopGroup {
 // replaces the router's own counts.
 class Router {
  public:
-  using Config = LpmRouteTable::Config;
+  // The address families a router serves and how each domain's table of each
+  // is sized: a family is enabled iff its config is set, and every domain
+  // (the default one, CreateDomain's, and those a transaction creates) has a
+  // table for exactly the enabled families. A disabled family has no FIB
+  // anywhere: its route writes are refused (kFamilyDisabled) and its lookups
+  // miss. `ipv6->max_value` is the router's own (max_next_hops + max_groups,
+  // the largest route value), whatever the caller sets, so the IPv6 entry
+  // size follows from the router's capacity.
+  struct Config {
+    std::optional<LpmRouteTable::Config> ipv4;
+    std::optional<Ipv6RouteTable::Config> ipv6;
+  };
 
-  // `config` sizes the default domain's FIB; CreateDomain() takes the others'.
+  // `config` sizes the default domain's FIBs and those created on demand;
+  // CreateDomain() takes the others'. kFamilyDisabled for neither family.
   // `max_domains` (1..kMaxRouteDomains) bounds the domain ids: 0..max_domains-1.
   // `max_groups` bounds the next-hop group ids: 1..max_groups (0: none);
   // max_next_hops + max_groups must fit a route value (24 bits).
   static std::expected<std::unique_ptr<Router>, RouteError> Create(
       std::string name, const Config &config, size_t max_next_hops,
       rcu::RcuDomain &domain, size_t max_domains = 1, size_t max_groups = 0);
+
+  bool has_ipv4() const noexcept { return domain_config_.ipv4.has_value(); }
+  bool has_ipv6() const noexcept { return domain_config_.ipv6.has_value(); }
+
+  // The FIBs that exist across all domains, per family (an IPv6 table counts
+  // once, however many rte_fib6 instances it holds).
+  struct FibCounts {
+    size_t ipv4 = 0;
+    size_t ipv6 = 0;
+  };
+  FibCounts fib_counts() const;
 
   ~Router();
 
@@ -310,8 +341,10 @@ class Router {
   // network instances pays for the ones that hold routes. A domain created on
   // demand is sized like the default one.
   //
-  // Adds domain `domain` (0 < domain < max_domains) with its own FIB sized by
-  // `config`. kInvalidId beyond max_domains, kDomainExists, kEnrolled.
+  // Adds domain `domain` (0 < domain < max_domains) with its own FIBs sized by
+  // `config`, which must enable exactly the router's families
+  // (kFamilyDisabled otherwise). kInvalidId beyond max_domains,
+  // kDomainExists, kEnrolled.
   std::expected<void, RouteError> CreateDomain(RouteDomainId domain,
                                                const Config &config);
   // Removes an empty domain other than the default; its FIB is freed after a
@@ -321,7 +354,7 @@ class Router {
   std::expected<void, RouteError> RemoveDomain(RouteDomainId domain);
 
   bool HasDomain(RouteDomainId domain) const noexcept {
-    return TableOf(domain) != nullptr;
+    return domains_.Lookup(SlotOf(domain)) != nullptr;
   }
   size_t domain_count() const;
   size_t max_domains() const noexcept { return max_domains_; }
@@ -329,8 +362,9 @@ class Router {
   // -- routes -----------------------------------------------------------------
 
   // Adds or re-points a route in `domain`; /0 is the domain's default route.
-  // Ordinary live update (see above). kUnknownDomain for a domain that does
-  // not exist; the overloads without a domain act on the default domain.
+  // Ordinary live update (see above). kFamilyDisabled for a family the router
+  // does not serve, kUnknownDomain for a domain that does not exist; the
+  // overloads without a domain act on the default domain.
   std::expected<void, RouteError> SetRoute(RouteDomainId domain,
                                            Ipv4Prefix prefix, NextHopId hop);
   std::expected<void, RouteError> RemoveRoute(RouteDomainId domain,
@@ -352,13 +386,14 @@ class Router {
     return RemoveRoute(kDefaultRouteDomainId, prefix);
   }
 
-  // Replaces every route of `domain` with `routes` (a prefix named twice takes
-  // its last entry), published as one pointer store. All validation happens
-  // before anything is visible: every next hop must exist (kInvalidId,
-  // kUnknownNextHop) and the FIB built off to the side must hold the whole set
-  // (kTableFull for rules or tbl8 groups). On any error the previous set
-  // stays published and the next-hop reference counts are unchanged. An empty
-  // set empties the domain. kEnrolled when written through transactions.
+  // Replaces every IPv4 route of `domain` with `routes` (a prefix named twice
+  // takes its last entry), published as one pointer store. All validation
+  // happens before anything is visible: every next hop must exist
+  // (kInvalidId, kUnknownNextHop) and the FIB built off to the side must hold
+  // the whole set (kTableFull for rules or tbl8 groups). On any error the
+  // previous set stays published and the next-hop reference counts are
+  // unchanged. An empty set empties the domain. kEnrolled when written
+  // through transactions; kFamilyDisabled without IPv4.
   std::expected<void, RouteError> ReplaceRouteSetAtomic(
       RouteDomainId domain, const RouteSet &routes);
 
@@ -527,10 +562,12 @@ class Router {
   // -- reader -----------------------------------------------------------------
 
   static constexpr size_t kMaxBatch = LpmRouteTable::kMaxBatch;
+  static_assert(Ipv6RouteTable::kMaxBatch == kMaxBatch);
 
   // Resolves each destination (host order) in `domain` to its next hop.
   // Returns a mask with bit i set where `hops[i]` was written; other positions
-  // untouched. A domain that does not exist resolves nothing (mask 0).
+  // untouched. A domain that does not exist, or a router without IPv4,
+  // resolves nothing (mask 0).
   uint64_t ResolveBatch(RouteDomainId domain, std::span<const uint32_t> dst,
                         std::span<const NextHop *> hops) const noexcept {
     const LpmRouteTable *routes = TableOf(domain);
@@ -542,6 +579,9 @@ class Router {
   // The default domain.
   uint64_t ResolveBatch(std::span<const uint32_t> dst,
                         std::span<const NextHop *> hops) const noexcept {
+    if (unlikely(default_routes_ == nullptr)) {
+      return 0;
+    }
     return ResolveBatchIn<false>(*default_routes_, dst, {}, hops);
   }
   // With each packet's flow hash, which picks the member of a group route.
@@ -555,22 +595,50 @@ class Router {
     }
     return ResolveBatchIn<true>(*routes, dst, flow_hashes, hops);
   }
+  // The IPv6 batch: one rte_fib6_lookup_bulk for the batch, then as above.
+  // A domain that does not exist, or a router without IPv6, resolves nothing.
+  uint64_t ResolveBatch6(RouteDomainId domain,
+                         std::span<const utils::Ipv6Address> dst,
+                         std::span<const uint32_t> flow_hashes,
+                         std::span<const NextHop *> hops) const noexcept {
+    promise(flow_hashes.size() == dst.size() && dst.size() == hops.size() &&
+            dst.size() <= kMaxBatch);
+    const Ipv6RouteTable *routes = Table6Of(domain);
+    if (unlikely(routes == nullptr)) {
+      return 0;
+    }
+    uint32_t ids[kMaxBatch];
+    const uint64_t mask =
+        routes->Read().LookupBatch(dst, std::span(ids, dst.size()));
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return HopsOf<true>(mask, ids, flow_hashes, hops);
+  }
 
-  // The next hop `dst` resolves to in `domain`, or nullptr for a miss or an
-  // unknown domain. Valid until the calling worker's next quiescent state.
-  // `flow_hash` picks the member of a group route.
+  // The next hop `dst` resolves to in `domain`, or nullptr for a miss, an
+  // unknown domain or a family the router does not serve. Valid until the
+  // calling worker's next quiescent state. `flow_hash` picks the member of a
+  // group route.
   const NextHop *Resolve(RouteDomainId domain, const utils::Ipv6Address &dst,
-                         uint32_t flow_hash = 0) const noexcept;
+                         uint32_t flow_hash = 0) const noexcept {
+    const Ipv6RouteTable *routes = Table6Of(domain);
+    if (unlikely(routes == nullptr)) {
+      return nullptr;
+    }
+    return HopOf(routes->Read().LookupOrMiss(dst), flow_hash);
+  }
   const NextHop *Resolve(RouteDomainId domain, uint32_t dst,
                          uint32_t flow_hash = 0) const noexcept {
     const LpmRouteTable *routes = TableOf(domain);
     if (unlikely(routes == nullptr)) {
       return nullptr;
     }
-    return ResolveIn(*routes, dst, flow_hash);
+    return HopOf(routes->Read().LookupOrMiss(dst), flow_hash);
   }
   const NextHop *Resolve(uint32_t dst) const noexcept {
-    return ResolveIn(*default_routes_, dst, 0);
+    if (unlikely(default_routes_ == nullptr)) {
+      return nullptr;
+    }
+    return HopOf(default_routes_->Read().LookupOrMiss(dst), 0);
   }
 
   // Only the route lookup: the next-hop id `dst` matches in `domain`, or
@@ -633,17 +701,22 @@ class Router {
   }
 
  private:
-  // A domain's FIB. Immutable once published, like every SlotTable object:
-  // the FIB inside synchronizes itself (rte_lpm or rte_fib in-place updates,
-  // the RcuPtr generation ReplaceAll publishes), so it is reached through a
-  // const Domain.
+  // A domain's FIBs, one per enabled family (null for a disabled one).
+  // Immutable once published, like every SlotTable object: each FIB
+  // synchronizes itself (rte_lpm or rte_fib in-place updates, the RcuPtr
+  // generations ReplaceAll and the IPv6 table publish), so it is reached
+  // through a const Domain.
   class Domain {
    public:
     Domain(std::unique_ptr<LpmRouteTable> table,
            std::unique_ptr<Ipv6RouteTable> table6)
         : table_(std::move(table)), table6_(std::move(table6)) {}
-    LpmRouteTable &table() const noexcept { return *table_; }
-    Ipv6RouteTable &table6() const noexcept { return *table6_; }
+    LpmRouteTable *table() const noexcept { return table_.get(); }
+    Ipv6RouteTable *table6() const noexcept { return table6_.get(); }
+    // Routes in both tables.
+    size_t size() const {
+      return (table_ ? table_->size() : 0) + (table6_ ? table6_->size() : 0);
+    }
 
    private:
     std::unique_ptr<LpmRouteTable> table_;
@@ -659,22 +732,26 @@ class Router {
   }
 
   Router(const std::string &name, const Config &config,
-         std::unique_ptr<LpmRouteTable> default_routes,
-         std::unique_ptr<Ipv6RouteTable> default_routes6,
-         size_t max_next_hops, size_t max_domains, size_t max_groups,
-         rcu::RcuDomain &rcu);
+         std::unique_ptr<const Domain> default_domain, size_t max_next_hops,
+         size_t max_domains, size_t max_groups, rcu::RcuDomain &rcu);
+
+  // A domain's FIBs for the router's families, named after `name`.
+  static std::expected<std::unique_ptr<const Domain>, RouteError> MakeDomain(
+      const std::string &name, const Config &config, rcu::RcuDomain &rcu);
 
   class RouteResource;
   class NextHopResource;
   class GroupResource;
 
+  // The domain's IPv4 / IPv6 FIB, or null for a domain that does not exist
+  // or a family the router does not serve.
   LpmRouteTable *TableOf(RouteDomainId domain) const noexcept {
     const Domain *d = domains_.Lookup(SlotOf(domain));
-    return d != nullptr ? &d->table() : nullptr;
+    return d != nullptr ? d->table() : nullptr;
   }
   Ipv6RouteTable *Table6Of(RouteDomainId domain) const noexcept {
     const Domain *d = domains_.Lookup(SlotOf(domain));
-    return d != nullptr ? &d->table6() : nullptr;
+    return d != nullptr ? d->table6() : nullptr;
   }
 
   // Control-side walk over the existing domains, in id order. The caller holds
@@ -684,7 +761,7 @@ class Router {
   template <typename Fn>
   void ForEachDomain(Fn &&fn) const {
     for (const RouteDomainId id : domain_ids_) {
-      fn(id, *TableOf(id));
+      fn(id, *domains_.Lookup(SlotOf(id)));
     }
   }
   size_t CountRoutes() const;
@@ -717,9 +794,10 @@ class Router {
     return next_hops_.Lookup(NextHopId(MemberOf(value, flow_hash)));
   }
 
-  const NextHop *ResolveIn(const LpmRouteTable &routes, uint32_t dst,
-                           uint32_t flow_hash) const noexcept {
-    const uint32_t id = routes.Read().LookupOrMiss(dst);
+  // The next hop a looked-up route value names (a next hop or a group
+  // member), or nullptr for a miss. The acquire fence pairs with the release
+  // a route write puts after its next hop.
+  const NextHop *HopOf(uint32_t id, uint32_t flow_hash) const noexcept {
     std::atomic_thread_fence(std::memory_order_acquire);
     const NextHop *hop = next_hops_.Lookup(NextHopId(id));
     if (unlikely(hop == nullptr)) {
@@ -737,8 +815,18 @@ class Router {
                           std::span<const NextHop *> hops) const noexcept {
     promise(dst.size() == hops.size() && dst.size() <= kMaxBatch);
     uint32_t ids[kMaxBatch];
-    uint64_t mask = routes.Read().LookupBatch(dst, std::span(ids, dst.size()));
+    const uint64_t mask =
+        routes.Read().LookupBatch(dst, std::span(ids, dst.size()));
     std::atomic_thread_fence(std::memory_order_acquire);
+    return HopsOf<kHashed>(mask, ids, flow_hashes, hops);
+  }
+
+  // The hops for the looked-up values in `mask`, after the caller's acquire
+  // fence; clears the bits that name nothing.
+  template <bool kHashed>
+  uint64_t HopsOf(uint64_t mask, const uint32_t *ids,
+                  std::span<const uint32_t> flow_hashes,
+                  std::span<const NextHop *> hops) const noexcept {
     for (uint64_t m = mask; m != 0; m &= m - 1) {
       const size_t i = static_cast<size_t>(__builtin_ctzll(m));
       const NextHop *hop = next_hops_.Lookup(NextHopId(ids[i]));
@@ -763,15 +851,15 @@ class Router {
   rcu::RcuDomain &rcu_;
   const size_t max_domains_;
   const uint32_t max_next_hops_;  // route values above it name groups
-  // What a domain created on demand is sized with: the default domain's
-  // config (D-158).
+  // The families and what a domain created on demand is sized with: the
+  // default domain's config (D-158), `ipv6->max_value` set by Create().
   const Config domain_config_;
   // Slot = domain id + 1. Read lock-free by workers and the engine; written
   // under mutex_ -- by CreateDomain, and by the route resource for a domain a
   // transaction first writes into (D-158).
   dataplane::SlotTable<DomainSlot, Domain> domains_;
-  // Domain 0's FIB: it is never removed, so the default-domain readers skip
-  // the slot lookup.
+  // Domain 0's IPv4 FIB (null without IPv4): it is never removed, so the
+  // default-domain readers skip the slot lookup.
   LpmRouteTable *const default_routes_;
   std::vector<RouteDomainId> domain_ids_;  // existing domains, ascending
   // One immutable NextHop per id, changed one at a time (mode C): a neighbor

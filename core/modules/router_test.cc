@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <span>
 #include <string>
@@ -117,6 +118,17 @@ std::string MacString(const std::array<uint8_t, 6> &mac) {
   return Ethernet::Address(mac.data()).ToString();
 }
 
+// A router argument with both address families enabled and small FIBs
+// (D-179): RouterArg enables a family only when its route capacity is set.
+bess::pb::RouterArg DualStackArg() {
+  bess::pb::RouterArg arg;
+  arg.set_max_ipv4_routes(64);
+  arg.set_max_ipv4_tbl8s(16);
+  arg.set_max_ipv6_routes(64);
+  arg.set_max_ipv6_tbl8s(64);
+  return arg;
+}
+
 class RouterTest : public ::testing::Test {
  protected:
   // The tests stand in for the maintenance loop: one tick is 1 ms, so the
@@ -132,7 +144,7 @@ class RouterTest : public ::testing::Test {
   // leaves the field out, which reads back as the zero address, D-129).
   Router *MakeRouter(uint64_t egress_gate, const char *dst_mac, const char *src_mac,
                      bess::pb::RouterNeighborState neighbor) {
-    Router *rt = dynamic_cast<Router *>(h_.Create("Router", bess::pb::RouterArg(), "rt"));
+    Router *rt = dynamic_cast<Router *>(h_.Create("Router", DualStackArg(), "rt"));
     if (rt == nullptr) {
       return nullptr;
     }
@@ -183,7 +195,7 @@ class RouterTest : public ::testing::Test {
   // not a guess about the graph's wiring. `groups` sets max_groups (D-156).
   Router *MakeDestinationRouter(uint64_t domains = 1, uint64_t groups = 0,
                                 const std::string &domain_attr = "") {
-    bess::pb::RouterArg arg;
+    bess::pb::RouterArg arg = DualStackArg();
     arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
     arg.set_max_domains(domains);
     if (!domain_attr.empty()) {
@@ -198,7 +210,7 @@ class RouterTest : public ::testing::Test {
   // A destination-mode router that punts what it cannot forward (D-162): a miss
   // to `miss_gate`, an unresolved neighbor to `unresolved_gate`.
   Router *MakePuntingRouter(uint64_t miss_gate, uint64_t unresolved_gate) {
-    bess::pb::RouterArg arg;
+    bess::pb::RouterArg arg = DualStackArg();
     arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
     arg.set_punt_miss_gate(miss_gate);
     arg.set_punt_unresolved_gate(unresolved_gate);
@@ -324,7 +336,7 @@ class RouterTest : public ::testing::Test {
 TEST_F(RouterTest, ArpReplyPublishesResolverNextHop) {
   constexpr char kLocalMac[] = "02:00:00:00:00:01";
   constexpr char kPeerMac[] = "02:00:00:00:00:02";
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
@@ -417,7 +429,7 @@ TEST_F(RouterTest, ArpReplyPublishesResolverNextHop) {
 // gates. The task module must flush its own per-gate batches: left in the
 // shared Context, the next module would read them against its own gates.
 TEST_F(RouterTest, SolicitationsOnTwoInterfacesLeaveThroughBothGates) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   for (uint32_t id = 1; id <= 2; id++) {
     auto *interface = arg.add_interfaces();
     interface->set_id(id);
@@ -444,7 +456,7 @@ TEST_F(RouterTest, SolicitationsOnTwoInterfacesLeaveThroughBothGates) {
 }
 TEST_F(RouterTest, NeighborResolverCapacityIsBounded) {
   constexpr char kLocalMac[] = "02:00:00:00:00:01";
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_max_neighbors(1);
   auto *interface = arg.add_interfaces();
   interface->set_id(2);
@@ -470,7 +482,7 @@ TEST_F(RouterTest, NdAdvertisementPublishesResolverNextHop) {
   const auto peer_mac = Mac(kPeerMac);
   const auto local_ip = bess::utils::ParseIpv6Address("fe80::1").value();
   const auto peer_ip = bess::utils::ParseIpv6Address("fe80::2").value();
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
@@ -778,9 +790,7 @@ TEST_F(RouterTest, DestinationRoutingForwardsOnTheFibsGateAndDecrementsTtl) {
 // next-hop id and the route domain from the names a graph gives it, so a
 // classifier that writes its own names needs no adapter module.
 TEST_F(RouterTest, TheSelectorAttributesAreConfiguration) {
-  bess::pb::RouterArg arg;
-  arg.set_max_routes(64);
-  arg.set_max_tbl8s(16);
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_max_next_hops(64);
   arg.set_next_hop_attr("nh_id");
   arg.set_domain_attr("vrf");
@@ -845,7 +855,7 @@ TEST_F(RouterTest, TheMetadataIdIsIgnoredInDestinationMode) {
 // The default mode keeps failing closed: with no writer the module drops every
 // packet and does not consult the FIB it holds (D-155).
 TEST_F(RouterTest, TheIdModeStillFailsClosedWithoutAWriter) {
-  Router *rt = dynamic_cast<Router *>(h_.Create("Router", bess::pb::RouterArg(), "rt"));
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", DualStackArg(), "rt"));
   ASSERT_NE(nullptr, rt);
   EXPECT_FALSE(rt->routes_by_destination());
   MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
@@ -859,7 +869,7 @@ TEST_F(RouterTest, TheIdModeStillFailsClosedWithoutAWriter) {
 }
 
 TEST_F(RouterTest, AnUnknownModeIsRefused) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_mode(static_cast<bess::pb::RouteMode>(7));
   EXPECT_NE("", h_.CreateError("Router", arg));
 }
@@ -986,7 +996,7 @@ TEST_F(RouterTest, ABlackholeHopIsNotAnUnresolvedNeighbor) {
 // with them forwards what the attribute names and drops everything else, so
 // its desc must not advertise a punt a reader would look for.
 TEST_F(RouterTest, ANextHopIdRouterDoesNotAdvertisePuntGates) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_punt_miss_gate(2);
   arg.set_punt_unresolved_gate(3);
   Router *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
@@ -1035,7 +1045,7 @@ TEST_F(RouterTest, AMissAndAnUnresolvedNeighborPuntToTheirGates) {
 // neighbor or a blackhole. Another host on the same subnet is still the
 // connected route, and a destination outside it is still a miss.
 TEST_F(RouterTest, ALocalAddressIsDeliveredToItsOwnGate) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
   arg.set_punt_miss_gate(2);
   arg.set_punt_unresolved_gate(3);
@@ -1079,7 +1089,7 @@ TEST_F(RouterTest, ALocalAddressIsDeliveredToItsOwnGate) {
 // The id mode has no punt gates (D-162): a next-hop id naming a local hop is
 // not forwarded, and it is counted as local rather than as a miss.
 TEST_F(RouterTest, ALocalHopInTheIdModeIsNotForwarded) {
-  Router *rt = dynamic_cast<Router *>(h_.Create("Router", bess::pb::RouterArg(), "rt"));
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", DualStackArg(), "rt"));
   ASSERT_NE(nullptr, rt);
   MakeLocalHop(rt, 1);
 
@@ -1118,7 +1128,7 @@ TEST_F(RouterTest, ALocalHopIsCanonicalAndRejectsAnEgressOrAddresses) {
 // A punt gate that is not a gate this graph can have is refused at Init, like
 // an unknown mode (D-162).
 TEST_F(RouterTest, AnInvalidPuntGateIsRefused) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
   arg.set_punt_miss_gate(70000);  // beyond MAX_GATES and not DROP_GATE
   EXPECT_NE("", h_.CreateError("Router", arg));
@@ -1319,7 +1329,7 @@ TEST_F(RouterTest, AGroupRoutePicksOneMemberPerFlow) {
 // same member -- what a graph wants when a subscriber's traffic must not be
 // spread -- while the default spreads the flows.
 TEST_F(RouterTest, L3OnlyHashingPinsEveryFlowToOneDestinationToOneMember) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
   arg.set_max_groups(1);
   arg.set_flow_hash(bess::pb::FLOW_HASH_L3);
@@ -1539,7 +1549,7 @@ TEST_F(RouterTest, Ipv6NoRouteAndMalformedFramesFailClosed) {
 // A local IPv6 route (D-178) delivers to the local gate and counts as local,
 // as an IPv4 one does; it is neither forwarded nor a blackhole.
 TEST_F(RouterTest, AnIpv6LocalRouteIsDeliveredToTheLocalGate) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
   arg.set_punt_local_gate(2);
   Router *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
@@ -1566,7 +1576,7 @@ TEST_F(RouterTest, AnIpv6LocalRouteIsDeliveredToTheLocalGate) {
 // link-local or multicast destination, or a link-local source, takes the
 // local punt gate -- even with a default route that would forward it.
 TEST_F(RouterTest, LinkScopedIpv6IsPuntedNotForwarded) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
   arg.set_punt_local_gate(2);
   Router *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
@@ -1605,10 +1615,151 @@ TEST_F(RouterTest, LinkScopedIpv6WithoutALocalGateIsDroppedAndCounted) {
   EXPECT_NE(std::string::npos, rt->GetDesc().find("link scope: 1")) << rt->GetDesc();
 }
 
+// -- address families (D-179) -------------------------------------------------
+
+// A destination-mode router with only the families whose route capacity is
+// set: IPv4 when `ipv4`, IPv6 when `ipv6`.
+bess::pb::RouterArg FamilyArg(bool ipv4, bool ipv6) {
+  bess::pb::RouterArg arg;
+  arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
+  if (ipv4) {
+    arg.set_max_ipv4_routes(16);
+  }
+  if (ipv6) {
+    arg.set_max_ipv6_routes(16);
+    arg.set_max_ipv6_tbl8s(32);
+  }
+  return arg;
+}
+
+bess::pb::RouterRouteKey RouteKey(const char *ipv4, const char *ipv6, uint32_t length) {
+  bess::pb::RouterRouteKey key;
+  if (ipv4 != nullptr) {
+    key.set_ipv4(ipv4);
+  } else {
+    key.set_ipv6(ipv6);
+  }
+  key.set_prefix_length(length);
+  return key;
+}
+
+// IPv4 only: IPv4 is routed; an IPv6 frame is dropped and counted as family
+// disabled, an IPv6 route is refused, and no IPv6 FIB exists in any domain.
+TEST_F(RouterTest, AnIpv4OnlyRouterDropsAndCountsIpv6) {
+  bess::pb::RouterArg arg = FamilyArg(true, false);
+  arg.set_max_domains(2);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  EXPECT_TRUE(rt->router()->has_ipv4());
+  EXPECT_FALSE(rt->router()->has_ipv6());
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "198.51.100.0", 24, 0, 1);
+  MakeRoute(rt, "198.51.100.0", 24, 1, 1);
+  bess::pb::RouterRouteValue value;
+  value.set_next_hop_id(1);
+  EXPECT_NE("", h_.UpsertResource("rt/routes", RouteKey(nullptr, "2001:db8::", 32), value));
+
+  EXPECT_EQ(1u, RunToDestination(rt, FrameTo("198.51.100.9"))[1].size());
+  auto out6 = RunToDestination(rt, Frame6To("2001:db8:1::9"));
+  EXPECT_TRUE(out6[0].empty());
+  EXPECT_TRUE(out6[1].empty());
+  EXPECT_EQ(1u, rt->family_disabled_frames());
+  EXPECT_EQ(0u, rt->not_ip_frames());
+  EXPECT_EQ(0u, rt->router()->fib_counts().ipv6);
+  EXPECT_EQ(2u, rt->router()->fib_counts().ipv4);
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("family disabled: 1")) << rt->GetDesc();
+}
+
+// IPv6 only: the mirror image, and no IPv4 table (rte_lpm's 64 MiB tbl24) is
+// built for any domain.
+TEST_F(RouterTest, AnIpv6OnlyRouterDropsAndCountsIpv4) {
+  bess::pb::RouterArg arg = FamilyArg(false, true);
+  arg.set_max_domains(2);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  EXPECT_FALSE(rt->router()->has_ipv4());
+  EXPECT_TRUE(rt->router()->has_ipv6());
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute6(rt, "2001:db8:1::", 64, 0, 1);
+  MakeRoute6(rt, "2001:db8:1::", 64, 1, 1);
+  bess::pb::RouterRouteValue value;
+  value.set_next_hop_id(1);
+  EXPECT_NE("", h_.UpsertResource("rt/routes", RouteKey("198.51.100.0", nullptr, 24), value));
+
+  auto out6 = RunToDestination(rt, Frame6To("2001:db8:1::9"));
+  ASSERT_EQ(1u, out6[1].size());
+  EXPECT_EQ(63, HopLimitOf(out6[1][0]));
+  auto out4 = RunToDestination(rt, FrameTo("198.51.100.9"));
+  EXPECT_TRUE(out4[0].empty());
+  EXPECT_TRUE(out4[1].empty());
+  EXPECT_EQ(1u, rt->family_disabled_frames());
+  EXPECT_EQ(0u, rt->router()->fib_counts().ipv4);
+  EXPECT_EQ(2u, rt->router()->fib_counts().ipv6);
+}
+
+// Dual stack: both families route through one domain's two FIBs, and a burst
+// that mixes them keeps each frame's outcome.
+TEST_F(RouterTest, ADualStackRouterRoutesAMixedBurst) {
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", FamilyArg(true, true), "rt"));
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "198.51.100.0", 24, 0, 1);
+  MakeRoute6(rt, "2001:db8:1::", 64, 0, 1);
+  Module *vif = MakeDomainWriter(0);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(vif, 0, rt, 0, true));
+  auto out = h_.RunPipeline(vif, 0,
+                            {FrameTo("198.51.100.9"), Frame6To("2001:db8:1::9"),
+                             FrameTo("203.0.113.9"), Frame6To("2001:db8:2::9")},
+                            rt, {0, 1});
+  ASSERT_EQ(2u, out[1].size());
+  EXPECT_EQ(63, TtlOf(out[1][0]));
+  EXPECT_EQ(63, HopLimitOf(out[1][1]));
+  EXPECT_EQ(2u, rt->no_route_frames());
+  EXPECT_EQ(0u, rt->family_disabled_frames());
+  EXPECT_EQ(1u, rt->router()->fib_counts().ipv4);
+  EXPECT_EQ(1u, rt->router()->fib_counts().ipv6);
+}
+
+// The next-hop mode applies the same rule: a frame of a disabled family is
+// not forwarded on a hop the metadata names, and is counted.
+TEST_F(RouterTest, TheIdModeDropsADisabledFamily) {
+  bess::pb::RouterArg arg = FamilyArg(true, false);
+  arg.clear_mode();
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  EXPECT_EQ(1u, Run(rt, Frame())[1].size());
+  EXPECT_TRUE(Run(rt, Frame6To("2001:db8:1::9"))[1].empty());
+  EXPECT_EQ(1u, rt->family_disabled_frames());
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("1 family disabled")) << rt->GetDesc();
+}
+
+// Sizing is per family: a family is on when its route capacity is set, zero
+// is not a way to say "off", a tbl8 budget alone enables nothing, and a
+// router with neither family is refused.
+TEST_F(RouterTest, FamilySizingIsValidated) {
+  EXPECT_NE("", h_.CreateError("Router", bess::pb::RouterArg())) << "no family";
+  bess::pb::RouterArg arg;
+  arg.set_max_ipv4_routes(0);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "explicit zero";
+  arg = FamilyArg(true, false);
+  arg.set_max_ipv4_tbl8s(0);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "zero groups";
+  arg = FamilyArg(true, false);
+  arg.set_max_ipv6_tbl8s(64);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "IPv6 groups without IPv6 routes";
+  arg = FamilyArg(false, true);
+  arg.set_backend(bess::pb::ROUTE_BACKEND_FIB);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "an IPv4 backend without IPv4";
+  arg = FamilyArg(false, true);
+  arg.set_max_ipv6_routes(uint64_t{1} << 32);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "beyond 32 bits";
+}
+
 // A resolver router configured for IPv4 and IPv6 on interface 2 (gate 1),
 // with next hops 1..`bindings` bound to 192.0.2.2, and `punt_local_gate`.
 bess::pb::RouterArg ResolverArg(uint64_t punt_local_gate, uint32_t bindings = 1) {
-  bess::pb::RouterArg arg;
+  bess::pb::RouterArg arg = DualStackArg();
   auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
@@ -1835,6 +1986,23 @@ TEST_F(RouterTest, AnInterfaceIdIsDerivedOrMustMatchItsGate) {
   EXPECT_NE("", h_.CreateError("Router", arg));
   arg.mutable_interfaces(0)->set_mac_addr("00:00:00:00:00:00");
   EXPECT_NE("", h_.CreateError("Router", arg));
+}
+
+// A disabled family's interface addresses and neighbor bindings are refused
+// at Init: the router could never use them.
+TEST_F(RouterTest, ADisabledFamilysAddressesAreRefused) {
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.clear_max_ipv6_routes();
+  arg.clear_max_ipv6_tbl8s();
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "IPv6 interface address";
+  arg.mutable_interfaces(0)->clear_ipv6();
+  EXPECT_NE(nullptr, h_.Create("Router", arg, "v4only"));
+
+  arg = ResolverArg(0);
+  arg.clear_max_ipv4_routes();
+  arg.clear_max_ipv4_tbl8s();
+  arg.mutable_interfaces(0)->clear_ipv4();
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "IPv4 neighbor binding";
 }
 
 }  // namespace

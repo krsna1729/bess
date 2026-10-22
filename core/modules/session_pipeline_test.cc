@@ -146,8 +146,8 @@ ExactMatch *CreateExactMatch(const std::string &name,
 Router *CreateRouterModule(const std::string &name,
                            const std::string &next_hop_attr = "") {
   bess::pb::RouterArg arg;
-  arg.set_max_routes(64);
-  arg.set_max_tbl8s(16);
+  arg.set_max_ipv4_routes(64);
+  arg.set_max_ipv4_tbl8s(16);
   arg.set_max_next_hops(64);
   if (!next_hop_attr.empty()) {
     arg.set_next_hop_attr(next_hop_attr);
@@ -959,7 +959,7 @@ TEST_F(SessionPipelineTest, ModuleCapacitiesRejectNarrowing) {
   meter.set_capacity(~uint64_t{0});
   rejected("Meter", meter);
   bess::pb::RouterArg router;
-  router.set_max_routes(uint64_t{1} << 32);
+  router.set_max_ipv4_routes(uint64_t{1} << 32);
   rejected("Router", router);
 }
 TEST_F(SessionPipelineTest, CodecsRejectMismatchedFieldsAndUnknownEnums) {

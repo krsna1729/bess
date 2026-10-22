@@ -306,7 +306,7 @@ TEST(NeighborResolverTest, ARepeatedReplyRefreshesAgingWithoutRepublishing) {
 }
 
 TEST(NeighborResolverTest, AMacChangeRepublishesEveryBoundNextHopAndNoRoute) {
-  LpmRouteTable::Config config;
+  const Router::Config config{.ipv4 = LpmRouteTable::Config{}};
   auto made = Router::Create("neighbor_mac_change", config, 8,
                              bess::runtime::runtime().rcu());
   ASSERT_TRUE(made.has_value());
@@ -1403,7 +1403,7 @@ TEST(NeighborResolverTest, AnswerNeighborSolicitationHandlesUnicastAndDad) {
 
 TEST(NeighborResolverTest, NdConcurrentPublishAndLookupNeverSeeAHalfUpdate) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
-  LpmRouteTable::Config config;
+  const Router::Config config{.ipv4 = LpmRouteTable::Config{}};
   auto made = Router::Create("neighbor_nd_concurrent", config, 4, domain);
   ASSERT_TRUE(made.has_value());
   Router &router = **made;
@@ -1676,7 +1676,7 @@ TEST(NeighborResolverFaultTest, NdRemoveAllocationFailureKeepsInterface) {
 
 TEST(NeighborResolverTest, ATransactionPublishesAllAdjacencyOrNone) {
   TransactionEngine engine{bess::runtime::runtime().rcu()};
-  LpmRouteTable::Config config;
+  const Router::Config config{.ipv4 = LpmRouteTable::Config{}};
   auto made = Router::Create("neighbor_txn", config, 8,
                              bess::runtime::runtime().rcu());
   ASSERT_TRUE(made.has_value());
@@ -1739,7 +1739,7 @@ TEST(NeighborResolverTest, ATransactionPublishesAllAdjacencyOrNone) {
 // of the two destination MACs, never a mixture or an unresolved state.
 TEST(NeighborResolverTest, ConcurrentPublishAndLookupNeverSeeAHalfUpdate) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
-  LpmRouteTable::Config config;
+  const Router::Config config{.ipv4 = LpmRouteTable::Config{}};
   auto made = Router::Create("neighbor_concurrent", config, 4, domain);
   ASSERT_TRUE(made.has_value());
   Router &router = **made;

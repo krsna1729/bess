@@ -82,6 +82,10 @@ Columns:
 | Bridge | domains; interface ids | 65,535; 65,535 | `MacTable::kMaxDomains`, `kMaxValue` | `max_domains` up to the bound | refused |
 | Meter | meters | default 1,024 | `MeterArg.capacity` | yes (up to the id width) | EINVAL |
 | Meter | meter ids per packet (levels) | 8 | `kMetadataAttrMaxSize / 4` | `MeterArg.levels` 1–8 | EINVAL |
+| Router | address families | IPv4, IPv6 or both; at least one | `RouterArg.max_ipv4_routes`, `max_ipv6_routes` (D-179) | a family is enabled by setting its route capacity | EINVAL "no address family is enabled"; an explicit 0 is refused |
+| Router | IPv4 routes; tbl8 groups per domain | 4G − 1; default 256 | `RouterArg.max_ipv4_routes`, `max_ipv4_tbl8s`, `Router::kDefaultIpv4Tbl8s` (`modules/router.h`) | yes | EINVAL "ipv4 capacity exceeds backend limits"; a full table refuses the route write (`kTableFull`) |
+| Router | IPv6 routes; tbl8 groups per domain | 1G − 1 (rte_fib6's rule pool is 2 × routes); default 8,192 | `RouterArg.max_ipv6_routes`, `max_ipv6_tbl8s`, `Router::kDefaultIpv6Tbl8s` (`modules/router.h`) | yes | a full table refuses the route write (`kTableFull`); the transaction changes nothing |
+| Router | IPv6 FIB entry width | 2 B while the largest value (`max_next_hops + max_groups`) and the tbl8 count are at most 32,767, else 4 B | `kMaxTwoByteValue` (`route/route_table.cc`) | follows from the capacities | — (each IPv6 table instance is 2^24 entries, 32 MiB at 2 B, 64 MiB at 4 B, plus its tbl8 groups; a written table keeps two instances) |
 | Router | next hops | 16M − 1 | `LpmRouteTable::kMaxValue` | `max_next_hops` up to the bound | EINVAL "router capacity exceeds backend limits" |
 | Router | next-hop groups | 16M − 1 − `max_next_hops` | `LpmRouteTable::kMaxValue` (shares the bound with `max_next_hops`) | `max_groups` up to the bound; 0 (the default) registers the empty resource | EINVAL "router capacity exceeds backend limits" |
 | Router | route domains | 16M | `route::kMaxRouteDomains` | `max_domains` up to the bound | EINVAL |

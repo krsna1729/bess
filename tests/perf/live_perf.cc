@@ -465,7 +465,7 @@ std::vector<std::string> MSession(Build &b) {
         R"({"attr_name": "next_hop_id", "value_offset": 4, "num_bytes": 4,)"
         R"( "reference": "rt/next_hops", "reference_key": "BE32"}]})");
   b.Mod("Meter", "mt", R"({"capacity": 64})");
-  b.Mod("Router", "rt", R"({"max_routes": 64, "max_tbl8s": 16, "max_next_hops": 64})");
+  b.Mod("Router", "rt", R"({"max_ipv4_routes": 64, "max_ipv4_tbl8s": 16, "max_next_hops": 64})");
   b.Entry("mt/meters", "MeterIdKey", R"({"id": 1})", "MeterPolicyValue",
           R"({"tr_tcm": {"committed_rate": "1000000000000", "committed_burst": "1000000000",)"
           R"( "peak_rate": "1000000000000", "peak_burst": "1000000000"}})");
@@ -488,7 +488,7 @@ std::vector<std::string> MSession(Build &b) {
 Builder MRouter(const std::string &backend) {
   return [backend](Build &b) {
     b.Mod("Router", "rt",
-          R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": 512, "max_next_hops": 2, "backend": ")" +
+          R"({"mode": "ROUTE_MODE_DESTINATION", "max_ipv4_routes": 512, "max_next_hops": 2, "backend": ")" +
               backend + R"("})");
     b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 1})", "RouterNextHopValue",
             R"({"egress_gate": 1, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})");
@@ -516,7 +516,7 @@ Builder MRouterScale(int routes, uint64_t dest_span,
                      const std::string &backend = "ROUTE_BACKEND_LPM") {
   return [routes, dest_span, backend](Build &b) {
     b.Mod("Router", "rt",
-          R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": )" +
+          R"({"mode": "ROUTE_MODE_DESTINATION", "max_ipv4_routes": )" +
               std::to_string(routes + routes / 4) + R"(, "max_next_hops": 2, "backend": ")" +
               backend + R"("})");
     b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 1})", "RouterNextHopValue",

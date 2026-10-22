@@ -356,7 +356,7 @@ std::vector<ModuleSample> EveryResourceSample() {
                                           "peak_rate": 1, "peak_burst": 100}})"}}}}},
       // A next hop's canonical form omits defaults: no neighbor when resolved.
       {"rt", "Router",
-       R"({"max_routes": 64, "max_tbl8s": 16, "max_next_hops": 64, "max_groups": 8})", false,
+       R"({"max_ipv4_routes": 64, "max_ipv4_tbl8s": 16, "max_next_hops": 64, "max_groups": 8})", false,
        {{"next_hops",
          {{R"({"id": 1})",
            R"({"egress_gate": 7, "dst_mac": "AgAAAAAB", "src_mac": "AgAAAAAC"})"}}},

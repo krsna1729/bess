@@ -161,7 +161,7 @@ std::vector<ModuleCase> ParityCases() {
     ModuleCase c;
     c.mclass = "Router";
     auto arg = Msg<pb::RouterArg>();
-    arg->set_max_routes(64);
+    arg->set_max_ipv4_routes(64);
     arg->set_max_next_hops(16);
     arg->set_max_groups(8);
     c.arg = arg;

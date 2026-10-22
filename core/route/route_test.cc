@@ -599,7 +599,7 @@ std::unique_ptr<Router> MakeRouter(size_t next_hops = 64) {
   LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = 4096;
   config.tbl8_groups = 256;
-  auto router = Router::Create("router_test", config, next_hops,
+  auto router = Router::Create("router_test", Router::Config{.ipv4 = config}, next_hops,
                                bess::runtime::runtime().rcu());
   EXPECT_TRUE(router.has_value()) << RouteErrorName(router.error());
   return std::move(router).value();
@@ -791,7 +791,7 @@ std::unique_ptr<Router> MakeGroupRouter(size_t next_hops = 16, size_t groups = 4
   LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = 1024;
   config.tbl8_groups = 64;
-  auto router = Router::Create("router_groups", config, next_hops,
+  auto router = Router::Create("router_groups", Router::Config{.ipv4 = config}, next_hops,
                                bess::runtime::runtime().rcu(), 1, groups);
   EXPECT_TRUE(router.has_value()) << RouteErrorName(router.error());
   return std::move(router).value();
@@ -939,7 +939,7 @@ TEST_P(RouterGroupTest, InvalidGroupsAreRefused) {
   // A router without groups refuses them; route values must fit 24 bits.
   auto plain = MakeRouter(8);
   EXPECT_EQ(RouteError::kInvalidId, plain->SetNextHopGroup(NextHopGroupId(1), one).error());
-  const LpmRouteTable::Config config = bess::testing::TestRouteConfig();
+  const Router::Config config{.ipv4 = bess::testing::TestRouteConfig()};
   EXPECT_EQ(RouteError::kValueOutOfRange,
             Router::Create("too_wide", config, LpmRouteTable::kMaxValue - 1,
                            bess::runtime::runtime().rcu(), 1, 2)
@@ -1316,6 +1316,9 @@ BESS_INSTANTIATE_ROUTE_BACKENDS(RouteTableTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouterTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouterGroupTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouteOracleTest);
+
+// -- Ipv6RouteTable (rte_fib6) -------------------------------------------------
+
 bess::utils::Ipv6Address V6(const char *text) {
   return bess::utils::ParseIpv6Address(text).value();
 }
@@ -1324,73 +1327,422 @@ Ipv6Prefix P6(const char *text, uint8_t length) {
   return Ipv6Prefix::Make(V6(text), length).value();
 }
 
-TEST(Ipv6RouteTableTest, ValidatesAndPerformsLongestPrefixLookup) {
-  auto created = Ipv6RouteTable::Create(bess::runtime::runtime().rcu(), 16);
-  ASSERT_TRUE(created);
-  auto &table = **created;
-  EXPECT_EQ(RouteError::kInvalidPrefixLength,
-            Ipv6Prefix::Make({}, 129).error());
-  EXPECT_EQ(RouteError::kHostBitsSet,
-            Ipv6Prefix::Make(V6("2001:db8::1"), 64).error());
-  ASSERT_TRUE(table.Upsert(P6("::", 0), 1));
-  ASSERT_TRUE(table.Upsert(P6("2001:db8::", 32), 2));
-  ASSERT_TRUE(table.Upsert(P6("2001:db8:1::", 48), 3));
-  auto view = table.Read();
-  EXPECT_EQ(3, view.Lookup(V6("2001:db8:1::1234")));
-  EXPECT_EQ(2, view.Lookup(V6("2001:db8:2::1234")));
-  EXPECT_EQ(1, view.Lookup(V6("2001:db9::1")));
-  size_t enumerated = 0;
-  table.ForEach([&](Ipv6Prefix, uint32_t) { enumerated++; });
-  EXPECT_EQ(3u, enumerated);
-  ASSERT_TRUE(table.Erase(P6("2001:db8:1::", 48)));
-  EXPECT_EQ(2, table.Read().Lookup(V6("2001:db8:1::1234")));
-  EXPECT_EQ(2u, table.size());
+// 2-byte entries: one instance is 32 MiB of tbl24 plus `tbl8` x 512 bytes.
+Ipv6RouteTable::Config Cfg6(uint32_t routes = 64, uint32_t tbl8 = 64) {
+  Ipv6RouteTable::Config config;
+  config.max_routes = routes;
+  config.tbl8_groups = tbl8;
+  config.max_value = 1000;
+  return config;
 }
 
-// max_routes bounds the prefixes a domain's IPv6 table holds, as it bounds
-// the IPv4 rules: a new prefix past it is refused, a replaced one is not.
+std::unique_ptr<Ipv6RouteTable> MakeTable6(const Ipv6RouteTable::Config &config = Cfg6()) {
+  auto table = Ipv6RouteTable::Create("v6_test", config, bess::runtime::runtime().rcu());
+  EXPECT_TRUE(table.has_value()) << RouteErrorName(table.error());
+  return std::move(table).value();
+}
+
+// An independent longest-prefix match over a rule list.
+std::optional<uint32_t> ReferenceLookup6(
+    const std::map<Ipv6Prefix, uint32_t> &rules, const bess::utils::Ipv6Address &addr) {
+  std::optional<uint32_t> best;
+  int best_length = -1;
+  for (const auto &[prefix, value] : rules) {
+    bool match = true;
+    for (size_t bit = 0; bit < prefix.length() && match; bit++) {
+      const uint8_t mask = uint8_t(0x80u >> (bit % 8));
+      match = (addr.bytes[bit / 8] & mask) == (prefix.addr().bytes[bit / 8] & mask);
+    }
+    if (match && prefix.length() > best_length) {
+      best = value;
+      best_length = prefix.length();
+    }
+  }
+  return best;
+}
+
+bess::utils::Ipv6Address MaskTo(bess::utils::Ipv6Address addr, uint8_t length) {
+  for (size_t bit = length; bit < 128; bit++) {
+    addr.bytes[bit / 8] &= uint8_t(~(0x80u >> (bit % 8)));
+  }
+  return addr;
+}
+
+// The table agrees with the reference on `addrs`, through the scalar lookup
+// and through one bulk lookup.
+void ExpectAgrees6(const Ipv6RouteTable &table, const std::map<Ipv6Prefix, uint32_t> &rules,
+                   std::span<const bess::utils::Ipv6Address> addrs) {
+  const auto view = table.Read();
+  std::array<uint32_t, Ipv6RouteTable::kMaxBatch> values{};
+  const uint64_t mask = view.LookupBatch(addrs, std::span(values.data(), addrs.size()));
+  for (size_t i = 0; i < addrs.size(); i++) {
+    const auto want = ReferenceLookup6(rules, addrs[i]);
+    EXPECT_EQ(want, view.Lookup(addrs[i])) << bess::utils::ToIpv6Address(addrs[i]);
+    EXPECT_EQ(want.value_or(LpmRouteTable::kNoDefault), view.LookupOrMiss(addrs[i]));
+    EXPECT_EQ(want.has_value(), (mask >> i & 1) != 0) << bess::utils::ToIpv6Address(addrs[i]);
+    if (want) {
+      EXPECT_EQ(*want, values[i]) << bess::utils::ToIpv6Address(addrs[i]);
+    }
+  }
+}
+
+TEST(Ipv6RouteTableTest, LongestPrefixMatchFromTheDefaultToHostRoutesAndTheTopOfTheSpace) {
+  EXPECT_EQ(RouteError::kInvalidPrefixLength, Ipv6Prefix::Make({}, 129).error());
+  EXPECT_EQ(RouteError::kHostBitsSet, Ipv6Prefix::Make(V6("2001:db8::1"), 64).error());
+  auto table = MakeTable6();
+  EXPECT_FALSE(table->Read().Lookup(V6("2001:db8::1")).has_value()) << "empty: a miss";
+  std::map<Ipv6Prefix, uint32_t> rules = {
+      {P6("::", 0), 1},
+      {P6("2001:db8::", 32), 2},
+      {P6("2001:db8:1::", 48), 3},
+      {P6("2001:db8:1::1", 128), 4},
+      {P6("2001:db8:1:2:3:4:5:0", 112), 5},
+      {P6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ff00", 120), 6},
+      {P6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 128), 7},
+      {P6("fff0::", 12), 8},
+      {P6("8000::", 1), 9},
+  };
+  for (const auto &[prefix, value] : rules) {
+    ASSERT_TRUE(table->Upsert(prefix, value));
+  }
+  const std::vector<bess::utils::Ipv6Address> addrs = {
+      V6("2001:db8:1::1"), V6("2001:db8:1::2"), V6("2001:db8:1:2:3:4:5:ffff"),
+      V6("2001:db8:2::1"), V6("2001:db9::1"),   V6("::"),
+      V6("::1"),           V6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+      V6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe"),
+      V6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:feff"),
+      V6("fff0::1"),       V6("ffef:ffff::"),   V6("8000::"),
+      V6("7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+  };
+  ExpectAgrees6(*table, rules, addrs);
+  size_t enumerated = 0;
+  table->ForEach([&](Ipv6Prefix, uint32_t) { enumerated++; });
+  EXPECT_EQ(rules.size(), enumerated);
+  EXPECT_EQ(rules.size(), table->size());
+  EXPECT_EQ(std::optional<uint32_t>(1), table->Find(P6("::", 0)));
+
+  // Erasing the host route, the top /128 and the default falls back to what
+  // covers them -- or to a miss.
+  for (const Ipv6Prefix prefix : {P6("2001:db8:1::1", 128),
+                                  P6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 128),
+                                  P6("::", 0)}) {
+    ASSERT_TRUE(table->Erase(prefix));
+    rules.erase(prefix);
+  }
+  EXPECT_EQ(RouteError::kNotFound, table->Erase(P6("::", 0)).error());
+  ExpectAgrees6(*table, rules, addrs);
+  EXPECT_EQ(LpmRouteTable::kNoDefault, table->Read().LookupOrMiss(V6("::1")));
+}
+
+// One rte_fib6_lookup_bulk per batch answers what the scalar lookup and an
+// independent reference answer, for random rules and a full batch of mixed
+// addresses, before and after churn.
+TEST(Ipv6RouteTableTest, BulkLookupMatchesScalarLookupAndAReference) {
+  auto table = MakeTable6(Cfg6(/*routes=*/256, /*tbl8=*/4096));
+  std::mt19937_64 rng(0x6a6b);
+  auto random_address = [&] {
+    bess::utils::Ipv6Address a;
+    for (auto &byte : a.bytes) {
+      byte = static_cast<uint8_t>(rng());
+    }
+    a.bytes[0] = 0x20;  // most rules and keys share a /8, so they nest
+    return a;
+  };
+  std::map<Ipv6Prefix, uint32_t> rules;
+  while (rules.size() < 200) {
+    static constexpr uint8_t kLengths[] = {16, 24, 29, 32, 40, 48, 56, 64, 96, 127, 128};
+    const uint8_t length = kLengths[rng() % std::size(kLengths)];
+    const auto prefix = Ipv6Prefix::Make(MaskTo(random_address(), length), length).value();
+    rules[prefix] = 1 + static_cast<uint32_t>(rng() % 1000);
+  }
+  for (const auto &[prefix, value] : rules) {
+    ASSERT_TRUE(table->Upsert(prefix, value)) << static_cast<int>(prefix.length());
+  }
+  auto keys = [&] {
+    std::vector<bess::utils::Ipv6Address> addrs;
+    auto it = rules.begin();
+    while (addrs.size() < Ipv6RouteTable::kMaxBatch) {
+      if (addrs.size() % 2 == 0 && it != rules.end()) {
+        // Inside a rule: its bits, random host bits.
+        bess::utils::Ipv6Address a = random_address();
+        const auto &p = it->first;
+        for (size_t bit = 0; bit < p.length(); bit++) {
+          const uint8_t mask = uint8_t(0x80u >> (bit % 8));
+          a.bytes[bit / 8] = uint8_t((a.bytes[bit / 8] & ~mask) | (p.addr().bytes[bit / 8] & mask));
+        }
+        addrs.push_back(a);
+        ++it;
+      } else {
+        addrs.push_back(random_address());
+      }
+    }
+    return addrs;
+  };
+  for (int round = 0; round < 4; round++) {
+    const auto addrs = keys();
+    ExpectAgrees6(*table, rules, addrs);
+    ExpectAgrees6(*table, rules, std::span(addrs).first(1));
+    ExpectAgrees6(*table, rules, std::span(addrs).first(63));
+    // Churn: erase a quarter, re-point a quarter, flip the default.
+    size_t i = 0;
+    for (auto it = rules.begin(); it != rules.end(); i++) {
+      if (i % 4 == 0 && it->first.length() != 0) {
+        ASSERT_TRUE(table->Erase(it->first));
+        it = rules.erase(it);
+      } else {
+        if (i % 4 == 1) {
+          it->second = 1 + static_cast<uint32_t>(rng() % 1000);
+          ASSERT_TRUE(table->Upsert(it->first, it->second));
+        }
+        ++it;
+      }
+    }
+    if (round % 2 == 0) {
+      rules[P6("::", 0)] = 999;
+      ASSERT_TRUE(table->Upsert(P6("::", 0), 999));
+    } else {
+      rules.erase(P6("::", 0));
+      ASSERT_TRUE(table->Erase(P6("::", 0)));
+    }
+  }
+  bess::runtime::runtime().rcu().Drain();
+}
+
+// max_routes bounds the prefixes other than ::/0, as it bounds the IPv4
+// rules: a new prefix past it is refused, a replaced one and the default are
+// not; a value past max_value is refused.
 TEST(Ipv6RouteTableTest, MaxRoutesBoundsNewPrefixes) {
-  auto created = Ipv6RouteTable::Create(bess::runtime::runtime().rcu(), 2);
-  ASSERT_TRUE(created);
-  auto &table = **created;
-  ASSERT_TRUE(table.Upsert(P6("2001:db8::", 32), 1));
-  ASSERT_TRUE(table.Upsert(P6("2001:db9::", 32), 2));
-  const auto full = table.Upsert(P6("2001:dba::", 32), 3);
+  auto table = MakeTable6(Cfg6(/*routes=*/2));
+  ASSERT_TRUE(table->Upsert(P6("2001:db8::", 32), 1));
+  ASSERT_TRUE(table->Upsert(P6("2001:db9::", 32), 2));
+  const auto full = table->Upsert(P6("2001:dba::", 32), 3);
   ASSERT_FALSE(full);
   EXPECT_EQ(RouteError::kTableFull, full.error());
-  EXPECT_EQ(2u, table.size());
-  EXPECT_FALSE(table.Read().Lookup(V6("2001:dba::1")).has_value());
-  EXPECT_TRUE(table.Upsert(P6("2001:db8::", 32), 4)) << "a replacement fits";
-  EXPECT_EQ(4, table.Read().Lookup(V6("2001:db8::1")));
+  EXPECT_EQ(2u, table->size());
+  EXPECT_FALSE(table->Read().Lookup(V6("2001:dba::1")).has_value());
+  EXPECT_TRUE(table->Upsert(P6("2001:db8::", 32), 4)) << "a replacement fits";
+  EXPECT_EQ(4u, table->Read().Lookup(V6("2001:db8::1")));
+  EXPECT_TRUE(table->Upsert(P6("::", 0), 5)) << "the default is not a counted rule";
+  EXPECT_EQ(5u, table->Read().Lookup(V6("2001:dba::1")));
+  EXPECT_EQ(RouteError::kValueOutOfRange, table->Upsert(P6("2001:db8::", 32), 1001).error());
+  EXPECT_EQ(std::optional<uint32_t>(4), table->Find(P6("2001:db8::", 32)));
+  bess::runtime::runtime().rcu().Drain();
 }
 
-// A Stage composes several edits off to the side; readers see none of them
-// until Commit(), then all of them. Erased prefixes stop matching.
-TEST(Ipv6RouteTableTest, AStageIsInvisibleUntilCommitted) {
-  auto created = Ipv6RouteTable::Create(bess::runtime::runtime().rcu(), 16);
-  ASSERT_TRUE(created);
-  auto &table = **created;
-  ASSERT_TRUE(table.Upsert(P6("2001:db8::", 32), 1));
-  ASSERT_TRUE(table.Upsert(P6("2001:db8:1::", 48), 2));
+// A /48 reserves three tbl8 groups (the levels below /24). With four, a second
+// /48 under another /24 cannot fit: it is refused in the spare, and readers
+// and the rules keep the table they had. The next change still works.
+TEST(Ipv6RouteTableTest, Tbl8ExhaustionLeavesTheLiveTableUnchanged) {
+  auto table = MakeTable6(Cfg6(/*routes=*/16, /*tbl8=*/4));
+  ASSERT_TRUE(table->Upsert(P6("2001:db8:1::", 48), 1));
+  const auto full = table->Upsert(P6("2001:db9:1::", 48), 2);
+  ASSERT_FALSE(full);
+  EXPECT_EQ(RouteError::kTableFull, full.error());
+  EXPECT_EQ(1u, table->Read().Lookup(V6("2001:db8:1::5")));
+  EXPECT_FALSE(table->Read().Lookup(V6("2001:db9:1::5")).has_value());
+  EXPECT_FALSE(table->Find(P6("2001:db9:1::", 48)).has_value());
+  EXPECT_EQ(1u, table->size());
 
-  auto stage = table.BeginStage();
+  // A stage refused the same way can only be aborted, and changes nothing.
+  auto stage = table->BeginStage();
+  ASSERT_TRUE(stage);
+  EXPECT_EQ(RouteError::kTableFull, (*stage)->Upsert(P6("2001:dba:1::", 48), 3).error());
+  EXPECT_EQ(RouteError::kBackendFailure, (*stage)->Upsert(P6("2001:db8::", 32), 3).error())
+      << "a stage whose edit DPDK refused is unusable";
+  table->Abort(**stage);
+  EXPECT_EQ(1u, table->Read().Lookup(V6("2001:db8:1::5")));
+
+  ASSERT_TRUE(table->Upsert(P6("2001:db8:1::", 48), 7)) << "a change that fits";
+  EXPECT_EQ(7u, table->Read().Lookup(V6("2001:db8:1::5")));
+  ASSERT_TRUE(table->Erase(P6("2001:db8:1::", 48)));
+  ASSERT_TRUE(table->Upsert(P6("2001:db9:1::", 48), 2)) << "the groups came back";
+  EXPECT_EQ(2u, table->Read().Lookup(V6("2001:db9:1::5")));
+  bess::runtime::runtime().rcu().Drain();
+}
+
+// A stage composes several edits on one table; readers and Find() see none of
+// them until Commit(), then all of them.
+TEST(Ipv6RouteTableTest, AStageIsInvisibleUntilCommitted) {
+  auto table = MakeTable6();
+  ASSERT_TRUE(table->Upsert(P6("2001:db8::", 32), 1));
+  ASSERT_TRUE(table->Upsert(P6("2001:db8:1::", 48), 2));
+  ASSERT_TRUE(table->Upsert(P6("2001:db8:4::", 48), 9));
+
+  auto stage = table->BeginStage();
   ASSERT_TRUE(stage);
   ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:2::", 48), 3));
   ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:3::", 48), 4));
   ASSERT_TRUE((*stage)->Erase(P6("2001:db8:1::", 48)));
+  ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:4::", 48), 5));
+  ASSERT_TRUE((*stage)->Upsert(P6("::", 0), 6));
+  ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:5::", 48), 7));
+  ASSERT_TRUE((*stage)->Erase(P6("2001:db8:5::", 48))) << "added and erased in one stage";
   EXPECT_EQ(RouteError::kNotFound, (*stage)->Erase(P6("2001:db9::", 32)).error());
-  EXPECT_EQ(2, table.Read().Lookup(V6("2001:db8:1::1")));
-  EXPECT_EQ(1, table.Read().Lookup(V6("2001:db8:2::1")));
-  EXPECT_EQ(2u, table.size());
+  EXPECT_EQ(RouteError::kNotFound, (*stage)->Erase(P6("2001:db8:1::", 48)).error());
+  EXPECT_EQ(std::optional<uint32_t>(3), (*stage)->Find(P6("2001:db8:2::", 48)));
+  EXPECT_FALSE((*stage)->Find(P6("2001:db8:1::", 48)).has_value());
+  EXPECT_EQ(2u, table->Read().Lookup(V6("2001:db8:1::1")));
+  EXPECT_EQ(1u, table->Read().Lookup(V6("2001:db8:2::1")));
+  EXPECT_EQ(9u, table->Read().Lookup(V6("2001:db8:4::1")));
+  EXPECT_FALSE(table->Read().Lookup(V6("3000::1")).has_value());
+  EXPECT_EQ(3u, table->size());
+  EXPECT_FALSE(table->Find(P6("2001:db8:2::", 48)).has_value());
 
-  Ipv6RouteTable::Retired old = table.Commit(**stage);
-  EXPECT_NE(nullptr, old);
-  EXPECT_EQ(1, table.Read().Lookup(V6("2001:db8:1::1")));
-  EXPECT_EQ(3, table.Read().Lookup(V6("2001:db8:2::1")));
-  EXPECT_EQ(4, table.Read().Lookup(V6("2001:db8:3::1")));
-  EXPECT_EQ(3u, table.size());
-  EXPECT_EQ(std::optional<uint32_t>(3), table.Find(P6("2001:db8:2::", 48)));
-  EXPECT_FALSE(table.Find(P6("2001:db8:1::", 48)).has_value());
+  table->Commit(**stage);
+  table->Committed(bess::runtime::runtime().rcu().StartGracePeriod());
+  EXPECT_EQ(1u, table->Read().Lookup(V6("2001:db8:1::1")));
+  EXPECT_EQ(3u, table->Read().Lookup(V6("2001:db8:2::1")));
+  EXPECT_EQ(4u, table->Read().Lookup(V6("2001:db8:3::1")));
+  EXPECT_EQ(5u, table->Read().Lookup(V6("2001:db8:4::1")));
+  EXPECT_EQ(1u, table->Read().Lookup(V6("2001:db8:5::1")));
+  EXPECT_EQ(6u, table->Read().Lookup(V6("3000::1")));
+  EXPECT_EQ(5u, table->size());
+  EXPECT_EQ(std::optional<uint32_t>(3), table->Find(P6("2001:db8:2::", 48)));
+  EXPECT_FALSE(table->Find(P6("2001:db8:1::", 48)).has_value());
+  EXPECT_FALSE(table->Find(P6("2001:db8:5::", 48)).has_value());
+  bess::runtime::runtime().rcu().Drain();
+}
+
+// An aborted stage leaves lookups, Find() and the size as they were, and the
+// edits it made to the spare are undone by the next stage (its lag replay):
+// the next stage's table is exactly the committed rules plus its own edits.
+TEST(Ipv6RouteTableTest, AnAbortedStageChangesNothingAndTheNextStageWorks) {
+  auto table = MakeTable6();
+  ASSERT_TRUE(table->Upsert(P6("2001:db8:1::", 48), 1));
+  ASSERT_TRUE(table->Upsert(P6("2001:db8:2::", 48), 2));
+  {
+    auto stage = table->BeginStage();
+    ASSERT_TRUE(stage);
+    ASSERT_TRUE((*stage)->Erase(P6("2001:db8:1::", 48)));
+    ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:2::", 48), 7));
+    ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:3::", 48), 8));
+    ASSERT_TRUE((*stage)->Upsert(P6("::", 0), 9));
+    table->Abort(**stage);
+  }
+  EXPECT_EQ(1u, table->Read().Lookup(V6("2001:db8:1::1")));
+  EXPECT_EQ(2u, table->Read().Lookup(V6("2001:db8:2::1")));
+  EXPECT_FALSE(table->Read().Lookup(V6("2001:db8:3::1")).has_value());
+  EXPECT_FALSE(table->Read().Lookup(V6("3000::1")).has_value());
+  EXPECT_EQ(std::optional<uint32_t>(1), table->Find(P6("2001:db8:1::", 48)));
+  EXPECT_EQ(2u, table->size());
+  {
+    // A stage dropped without Commit() or Abort() aborts itself.
+    auto stage = table->BeginStage();
+    ASSERT_TRUE(stage);
+    ASSERT_TRUE((*stage)->Erase(P6("2001:db8:2::", 48)));
+  }
+  EXPECT_EQ(2u, table->Read().Lookup(V6("2001:db8:2::1")));
+
+  auto stage = table->BeginStage();
+  ASSERT_TRUE(stage);
+  EXPECT_EQ(std::optional<uint32_t>(1), (*stage)->Find(P6("2001:db8:1::", 48)));
+  ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:4::", 48), 4));
+  table->Commit(**stage);
+  table->Committed(bess::runtime::runtime().rcu().StartGracePeriod());
+  const std::map<Ipv6Prefix, uint32_t> rules = {{P6("2001:db8:1::", 48), 1},
+                                                {P6("2001:db8:2::", 48), 2},
+                                                {P6("2001:db8:4::", 48), 4}};
+  const std::vector<bess::utils::Ipv6Address> addrs = {
+      V6("2001:db8:1::1"), V6("2001:db8:2::1"), V6("2001:db8:3::1"),
+      V6("2001:db8:4::1"), V6("3000::1")};
+  ExpectAgrees6(*table, rules, addrs);
+  bess::runtime::runtime().rcu().Drain();
+}
+
+// Back-to-back stages. With the replaced instance's grace period complete,
+// the next stage reuses it and replays what it lags by (no new instance);
+// with a reader still inside it, the next stage retires it and builds a fresh
+// spare from the rules. Both give the right table.
+TEST(Ipv6RouteTableTest, BackToBackStagesReplayOrRebuildTheSpare) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  auto table = MakeTable6();
+  std::map<Ipv6Prefix, uint32_t> rules;
+  const std::vector<bess::utils::Ipv6Address> addrs = {
+      V6("2001:db8:1::1"), V6("2001:db8:2::1"), V6("2001:db8:3::1"), V6("3000::1")};
+  auto apply = [&](std::vector<std::pair<Ipv6Prefix, std::optional<uint32_t>>> edits) {
+    auto stage = table->BeginStage();
+    ASSERT_TRUE(stage);
+    for (const auto &[prefix, value] : edits) {
+      if (value) {
+        ASSERT_TRUE((*stage)->Upsert(prefix, *value));
+        rules[prefix] = *value;
+      } else {
+        ASSERT_TRUE((*stage)->Erase(prefix));
+        rules.erase(prefix);
+      }
+    }
+    table->Commit(**stage);
+    table->Committed(domain.StartGracePeriod());
+    ExpectAgrees6(*table, rules, addrs);
+  };
+  EXPECT_EQ(1u, table->builds()) << "the first live instance";
+  apply({{P6("2001:db8:1::", 48), 1}, {P6("2001:db8:2::", 48), 2}});
+  EXPECT_EQ(2u, table->builds()) << "the first spare";
+  // No reader online: every grace period completes at once.
+  apply({{P6("2001:db8:1::", 48), std::nullopt}, {P6("2001:db8:3::", 48), 3}});
+  apply({{P6("2001:db8:2::", 48), 5}, {P6("::", 0), 6}});
+  apply({{P6("2001:db8:1::", 48), 1}, {P6("::", 0), std::nullopt}});
+  EXPECT_EQ(2u, table->builds()) << "the replaced instance was reused";
+
+  // A reader online and never quiescent: no grace period started from now on
+  // completes. The first stage still reuses the spare (its grace period
+  // started before the reader came online); the next one cannot.
+  constexpr uint32_t kReader = 23;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+  apply({{P6("2001:db8:3::", 48), std::nullopt}, {P6("2001:db8:2::", 48), 9}});
+  EXPECT_EQ(2u, table->builds());
+  apply({{P6("2001:db8:1::", 48), 4}});
+  EXPECT_EQ(3u, table->builds()) << "a spare a reader may be in is rebuilt";
+  // The direct API takes the same paths.
+  ASSERT_TRUE(table->Upsert(P6("2001:db8:3::", 48), 3));
+  rules[P6("2001:db8:3::", 48)] = 3;
+  ExpectAgrees6(*table, rules, addrs);
+  EXPECT_EQ(4u, table->builds());
+  domain.Quiescent(kReader);
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+  ASSERT_TRUE(table->Erase(P6("2001:db8:3::", 48)));
+  rules.erase(P6("2001:db8:3::", 48));
+  ExpectAgrees6(*table, rules, addrs);
+  EXPECT_EQ(4u, table->builds()) << "reused again once readers moved on";
+  domain.Drain();
+}
+
+// Entries are 2 bytes when both the miss marker (max_value + 1) and the tbl8
+// pool fit rte_fib6's 2-byte next hop (2^15 - 1), else 4.
+TEST(Ipv6RouteTableTest, EntrySizeFollowsMaxValueAndTbl8Groups) {
+  auto config = [](uint32_t max_value, uint32_t tbl8) {
+    Ipv6RouteTable::Config c;
+    c.max_value = max_value;
+    c.tbl8_groups = tbl8;
+    return c;
+  };
+  EXPECT_EQ(2u, Ipv6RouteTable::EntryBytes(config(32766, 32767)));
+  EXPECT_EQ(4u, Ipv6RouteTable::EntryBytes(config(32767, 64)));
+  EXPECT_EQ(4u, Ipv6RouteTable::EntryBytes(config(1000, 32768)));
+  EXPECT_EQ(4u, Ipv6RouteTable::EntryBytes(Ipv6RouteTable::Config{}));
+  EXPECT_EQ(RouteError::kValueOutOfRange,
+            Ipv6RouteTable::Create("v6_wide", config(LpmRouteTable::kMaxValue + 1, 64),
+                                   bess::runtime::runtime().rcu())
+                .error());
+
+  {
+    auto two = MakeTable6(config(32766, 64));
+    EXPECT_EQ(2u, two->entry_bytes());
+    ASSERT_TRUE(two->Upsert(P6("2001:db8::", 32), 32766));
+    ASSERT_TRUE(two->Upsert(P6("2001:db8:1:2::", 64), 0));
+    EXPECT_EQ(32766u, two->Read().Lookup(V6("2001:db8::1")));
+    EXPECT_EQ(0u, two->Read().Lookup(V6("2001:db8:1:2::1")));
+    EXPECT_EQ(RouteError::kValueOutOfRange, two->Upsert(P6("2001:db8::", 32), 32767).error());
+  }
+  {
+    auto four = MakeTable6(config(LpmRouteTable::kMaxValue, 64));
+    EXPECT_EQ(4u, four->entry_bytes());
+    ASSERT_TRUE(four->Upsert(P6("2001:db8::", 32), LpmRouteTable::kMaxValue));
+    EXPECT_EQ(LpmRouteTable::kMaxValue, four->Read().Lookup(V6("2001:db8::1")));
+  }
+  bess::runtime::runtime().rcu().Drain();
 }
 
 }  // namespace

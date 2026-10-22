@@ -148,9 +148,7 @@ using bess::modules::router::GateOf;
 using bess::modules::router::InterfaceOf;
 
 CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
-  if (arg.max_routes() > std::numeric_limits<uint32_t>::max() ||
-      arg.max_tbl8s() > std::numeric_limits<uint32_t>::max() ||
-      arg.max_next_hops() > route::LpmRouteTable::kMaxValue) {
+  if (arg.max_next_hops() > route::LpmRouteTable::kMaxValue) {
     return CommandFailure(EINVAL, "router capacity exceeds backend limits");
   }
   // The packet path's mode is configuration (D-155): an unknown value is
@@ -184,18 +182,76 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // unknown value (an arg from a newer binary) keeps that default too.
   flow_fields_ = arg.flow_hash() == bess::pb::FLOW_HASH_L3 ? route::FlowHashFields::kL3
                                                            : route::FlowHashFields::kL3L4;
-  route::LpmRouteTable::Config config;
-  config.max_routes = arg.max_routes() ? arg.max_routes() : 4096;
-  config.tbl8_groups = arg.max_tbl8s() ? arg.max_tbl8s() : 256;
-  switch (arg.backend()) {
-    case bess::pb::ROUTE_BACKEND_LPM:
-      config.backend = route::RouteBackend::kRteLpm;
-      break;
-    case bess::pb::ROUTE_BACKEND_FIB:
-      config.backend = route::RouteBackend::kRteFib;
-      break;
-    default:
-      return CommandFailure(EINVAL, "unknown route backend %d", arg.backend());
+  // Address families (D-179): a family is enabled exactly when its route
+  // capacity is set, and sized independently of the other. A disabled family
+  // has no FIB in any domain, so it costs nothing.
+  std::string family_error;
+  auto capacity = [&family_error](bool has_routes, uint64_t routes, bool has_tbl8s,
+                                   uint64_t tbl8s, uint64_t default_tbl8s,
+                                   const char *family)
+      -> std::optional<std::pair<uint32_t, uint32_t>> {
+    if (!has_routes) {
+      if (has_tbl8s) {
+        family_error = bess::utils::Format(
+            "max_%s_tbl8s needs max_%s_routes (unset routes disable %s)", family,
+            family, family);
+      }
+      return std::nullopt;
+    }
+    if (routes == 0 || (has_tbl8s && tbl8s == 0)) {
+      family_error = bess::utils::Format(
+          "max_%s_routes and max_%s_tbl8s must be nonzero (leave max_%s_routes "
+          "unset to disable %s)",
+          family, family, family, family);
+      return std::nullopt;
+    }
+    const uint64_t groups = has_tbl8s ? tbl8s : default_tbl8s;
+    if (routes > std::numeric_limits<uint32_t>::max() ||
+        groups > std::numeric_limits<uint32_t>::max()) {
+      family_error = bess::utils::Format("%s capacity exceeds backend limits", family);
+      return std::nullopt;
+    }
+    return std::make_pair(static_cast<uint32_t>(routes), static_cast<uint32_t>(groups));
+  };
+  const auto ipv4 = capacity(arg.has_max_ipv4_routes(), arg.max_ipv4_routes(),
+                             arg.has_max_ipv4_tbl8s(), arg.max_ipv4_tbl8s(),
+                             kDefaultIpv4Tbl8s, "ipv4");
+  const auto ipv6 = capacity(arg.has_max_ipv6_routes(), arg.max_ipv6_routes(),
+                             arg.has_max_ipv6_tbl8s(), arg.max_ipv6_tbl8s(),
+                             kDefaultIpv6Tbl8s, "ipv6");
+  if (!family_error.empty()) {
+    return CommandFailure(EINVAL, "%s", family_error.c_str());
+  }
+  if (!ipv4 && !ipv6) {
+    return CommandFailure(EINVAL,
+                          "no address family is enabled: set max_ipv4_routes, "
+                          "max_ipv6_routes or both");
+  }
+  route::Router::Config config;
+  if (ipv4) {
+    route::LpmRouteTable::Config table;
+    table.max_routes = ipv4->first;
+    table.tbl8_groups = ipv4->second;
+    switch (arg.backend()) {
+      case bess::pb::ROUTE_BACKEND_LPM:
+        table.backend = route::RouteBackend::kRteLpm;
+        break;
+      case bess::pb::ROUTE_BACKEND_FIB:
+        table.backend = route::RouteBackend::kRteFib;
+        break;
+      default:
+        return CommandFailure(EINVAL, "unknown route backend %d", arg.backend());
+    }
+    config.ipv4 = table;
+  } else if (arg.backend() != bess::pb::ROUTE_BACKEND_LPM) {
+    return CommandFailure(EINVAL,
+                          "backend selects the IPv4 table, and IPv4 is not enabled");
+  }
+  if (ipv6) {
+    route::Ipv6RouteTable::Config table;
+    table.max_routes = ipv6->first;
+    table.tbl8_groups = ipv6->second;
+    config.ipv6 = table;
   }
   const size_t max_next_hops =
       arg.max_next_hops() ? static_cast<size_t>(arg.max_next_hops()) : 4096;
@@ -342,6 +398,11 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       }
       uint32_t ipv4 = 0;
       if (!entry.ipv4().empty()) {
+        if (!router_->has_ipv4()) {
+          return CommandFailure(EINVAL,
+                                "interface IPv4 address on a router without IPv4 "
+                                "(set max_ipv4_routes to enable it)");
+        }
         bess::utils::be32_t address;
         if (!bess::utils::ParseIpv4Address(entry.ipv4(), &address)) {
           return CommandFailure(EINVAL, "invalid interface IPv4 address '%s'",
@@ -354,6 +415,11 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       }
       bess::utils::Ipv6Address ipv6{};
       if (!entry.ipv6().empty()) {
+        if (!router_->has_ipv6()) {
+          return CommandFailure(EINVAL,
+                                "interface IPv6 address on a router without IPv6 "
+                                "(set max_ipv6_routes to enable it)");
+        }
         auto address = bess::utils::ParseIpv6Address(entry.ipv6());
         if (!address) {
           return CommandFailure(EINVAL, "invalid interface IPv6 address '%s'",
@@ -391,6 +457,10 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       }
       route::NeighborResolver::Key key;
       if (!binding.ipv4().empty()) {
+        if (!router_->has_ipv4()) {
+          return CommandFailure(EINVAL,
+                                "IPv4 neighbor binding on a router without IPv4");
+        }
         if (!families->second.first) {
           return CommandFailure(EINVAL,
                                 "IPv4 neighbor binding requires local IPv4");
@@ -403,6 +473,10 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
         key = route::NeighborResolver::Key(
             dataplane::InterfaceId(binding.interface_id()), peer.value());
       } else {
+        if (!router_->has_ipv6()) {
+          return CommandFailure(EINVAL,
+                                "IPv6 neighbor binding on a router without IPv6");
+        }
         if (!families->second.second) {
           return CommandFailure(EINVAL,
                                 "IPv6 neighbor binding requires local IPv6");
@@ -834,8 +908,12 @@ int Router::OnEvent(bess::Event event) {
 // ARP request or a Neighbor Solicitation) is this node's responder's business:
 // it goes to the local punt gate, where a graph puts one, or is dropped, and
 // is counted either way. Everything else stays in the batch and is routed.
+// A family the router does not enable has no neighbor protocol here (D-179):
+// its ARP or ND frames stay in the batch like any other frame of that kind.
 void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
   constexpr size_t kEth = sizeof(bess::utils::Ethernet);
+  const bool arp_input = router_->has_ipv4();
+  const bool nd_input = router_->has_ipv6();
   // The interface a frame arrived on is read here, with the offsets of the
   // graph that delivered it, and travels with the frame (NeighborFrame).
   const bess::metadata::mt_offset_t interface_offset =
@@ -850,7 +928,7 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
     enum class Kind { kRouted, kReply, kRequest, kUnusable } kind = Kind::kRouted;
     if (len >= kEth) {
       const auto *eth = reinterpret_cast<const bess::utils::Ethernet *>(frame);
-      if (eth->ether_type.value() == bess::utils::Ethernet::kArp) {
+      if (arp_input && eth->ether_type.value() == bess::utils::Ethernet::kArp) {
         if (len < kEth + sizeof(bess::utils::Arp)) {
           kind = Kind::kUnusable;
         } else {
@@ -860,7 +938,7 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
                      ? Kind::kReply
                      : Kind::kRequest;
         }
-      } else if (eth->ether_type.value() == bess::utils::Ethernet::kIpv6 &&
+      } else if (nd_input && eth->ether_type.value() == bess::utils::Ethernet::kIpv6 &&
                  len > kEth + route::kIpv6HeaderSize &&
                  frame[kEth + 6] == route::kIpv6NextHeaderIcmpv6) {
         const uint8_t type = frame[kEth + route::kIpv6HeaderSize];
@@ -1128,10 +1206,11 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     // The destination mode's write path, so the two modes cannot disagree
     // about a hop-count boundary or about which addresses a hop writes
     // (D-153): the IPv4 TTL or IPv6 hop limit first, then the addresses when
-    // the hop names both. A frame that is not IP has no hop count to
-    // decrement: it keeps what it arrived with and, as before, still gets the
-    // hop's addresses when it names them. A header the parser cannot read is
-    // dropped and counted, never forwarded.
+    // the hop names both (route::WriteForwarded). A frame that is not IP has
+    // no hop count to decrement: it keeps what it arrived with and, as
+    // before, still gets the hop's addresses. A header the parser cannot read
+    // is dropped and counted, never forwarded, and so is a frame of a family
+    // the router does not enable (D-179).
     bess::conntrack::ParsedFlowPacket parsed;
     const bess::conntrack::ParseStatus status = bess::conntrack::ParseFrame(
         std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), parsed,
@@ -1143,6 +1222,20 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
       header_write_failures_.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
+    // A non-initial fragment still carries its IP header; only its L4 header
+    // is missing. So the hop count is every IP frame's, fragments included:
+    // the destination mode drops a fragment because its group hash needs
+    // ports, while this mode routes by id and forwards it with the hop count
+    // written.
+    const bool ip = status != bess::conntrack::ParseStatus::kNotIp;
+    const route::L3Family family = parsed.l3 == bess::conntrack::L3Kind::kIpv6
+                                       ? route::L3Family::kIpv6
+                                       : route::L3Family::kIpv4;
+    if (ip && !FamilyEnabled(family)) {
+      gates[i] = DROP_GATE;
+      family_disabled_frames_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
     bess::PacketHandle handle = pkt.handle();
     if (!bess::packet::EnsureWritable(handle)) {
       gates[i] = DROP_GATE;
@@ -1151,51 +1244,26 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     }
     batch->handles()[i] = handle;
     bess::PacketRef writable(handle);
-    // A non-initial fragment still carries its IPv4 header; only its L4 header
-    // is missing. So the hop count is every IPv4 frame's, fragments included:
-    // the destination mode drops a fragment because its group hash needs ports,
-    // while this mode routes by id and forwards it with the TTL written.
-    if ((status == bess::conntrack::ParseStatus::kOk ||
-         status == bess::conntrack::ParseStatus::kFragment) &&
-        parsed.l3 == bess::conntrack::L3Kind::kIpv4) {
-      // The parse ran before EnsureWritable, and the copy may have resegmented
-      // the frame: where the header is is re-established, not assumed. Writing
-      // it through a stale offset would touch bytes outside this segment.
-      if (writable.head_len() <
-          static_cast<size_t>(parsed.l3_offset) + sizeof(bess::utils::Ipv4)) {
-        gates[i] = DROP_GATE;
-        header_write_failures_.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      if (route::WriteForwarded(
-              std::span(writable.head_data<uint8_t *>(), writable.head_len()),
-              parsed.l3_offset, *hop) != route::TtlResult::kForward) {
-        gates[i] = DROP_GATE;
-        ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
-      }
-    } else if ((status == bess::conntrack::ParseStatus::kOk ||
-                status == bess::conntrack::ParseStatus::kFragment) &&
-               parsed.l3 == bess::conntrack::L3Kind::kIpv6) {
-      // IPv6 the same way (the destination mode's RouteIpv6 does the same):
-      // the hop limit first (no header checksum), then the addresses.
-      const size_t l3 = parsed.l3_offset;
-      if (writable.head_len() < l3 + route::kIpv6HeaderSize) {
-        gates[i] = DROP_GATE;
-        header_write_failures_.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      if (route::DecrementHopLimit(std::span<uint8_t>(
-              writable.head_data<uint8_t *>() + l3, writable.head_len() - l3)) !=
-          route::TtlResult::kForward) {
-        gates[i] = DROP_GATE;
-        ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
-      } else if (!route::RewriteL2(writable, *hop)) {
+    if (!ip) {
+      if (!route::RewriteL2(writable, *hop)) {
         gates[i] = DROP_GATE;
         header_write_failures_.fetch_add(1, std::memory_order_relaxed);
       }
-    } else if (!route::RewriteL2(writable, *hop)) {
+      continue;
+    }
+    // The parse ran before EnsureWritable, and the copy may have resegmented
+    // the frame: where the header is is re-established, not assumed. Writing
+    // it through a stale offset would touch bytes outside this segment.
+    if (!HeaderFits(writable, family, parsed.l3_offset)) {
       gates[i] = DROP_GATE;
       header_write_failures_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    if (route::WriteForwarded(
+            std::span(writable.head_data<uint8_t *>(), writable.head_len()), family,
+            parsed.l3_offset, *hop) != route::TtlResult::kForward) {
+      gates[i] = DROP_GATE;
+      ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
     }
   }
   EmitBatch(ctx, batch, gates);
@@ -1204,14 +1272,20 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
 // One counter per verdict the chain reports (route/forward.h). kForward is not
 // a drop; kLocalDelivery is a delivery (D-178); kNoEgress is the blackhole
 // shape (D-160), counted apart from a miss because the route exists and chose
-// that hop.
+// that hop; kLinkScope is IPv6 that is never forwarded (D-179).
 void Router::CountVerdict(route::ForwardVerdict verdict) {
   switch (verdict) {
     case route::ForwardVerdict::kLocalDelivery:
       local_frames_.fetch_add(1, std::memory_order_relaxed);
       return;
-    case route::ForwardVerdict::kNotIpv4:
+    case route::ForwardVerdict::kNotIp:
       not_ip_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kFamilyDisabled:
+      family_disabled_frames_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case route::ForwardVerdict::kLinkScope:
+      link_scope_frames_.fetch_add(1, std::memory_order_relaxed);
       return;
     case route::ForwardVerdict::kMalformed:
       malformed_frames_.fetch_add(1, std::memory_order_relaxed);
@@ -1239,6 +1313,8 @@ void Router::CountVerdict(route::ForwardVerdict verdict) {
   }
 }
 
+// A link-scoped IPv6 frame is the node's own business, as a local route's is:
+// both take the local punt gate (D-178, D-179).
 gate_idx_t Router::PuntGateOf(route::ForwardVerdict verdict) const {
   switch (verdict) {
     case route::ForwardVerdict::kNoRoute:
@@ -1246,91 +1322,19 @@ gate_idx_t Router::PuntGateOf(route::ForwardVerdict verdict) const {
     case route::ForwardVerdict::kUnresolved:
       return punt_unresolved_gate_;
     case route::ForwardVerdict::kLocalDelivery:
+    case route::ForwardVerdict::kLinkScope:
       return punt_local_gate_;
     default:
       return DROP_GATE;
   }
 }
 
-// Destination mode for an IPv6 frame (D-179). forward.h's chain is IPv4-only,
-// so the steps are spelled here, in its order and with its verdicts and
-// counters: link scope, lookup (with the group flow hash), local hop,
-// blackhole, neighbor, hop limit, then the copy a shared payload needs, the
-// hop-limit decrement (route::DecrementHopLimit; IPv6 has no header checksum)
-// and the addresses when the hop names both.
-gate_idx_t Router::RouteIpv6(bess::PacketBatch *batch, int i,
-                             route::RouteDomainId domain,
-                             const bess::conntrack::ParsedFlowPacket &parsed) {
-  bess::utils::Ipv6Address src;
-  bess::utils::Ipv6Address dst;
-  std::copy(parsed.src.begin(), parsed.src.end(), src.bytes);
-  std::copy(parsed.dst.begin(), parsed.dst.end(), dst.bytes);
-  // A router never forwards a link-local source or destination (RFC 4291
-  // 2.5.6), and multicast is not unicast routing's: Router and Neighbor
-  // Solicitations, MLD and link-local traffic are the node's own business.
-  if (dst.IsLinkLocal() || dst.IsMulticast() || src.IsLinkLocal()) {
-    link_scope_frames_.fetch_add(1, std::memory_order_relaxed);
-    return punt_local_gate_;
-  }
-  uint32_t src_words[4];
-  uint32_t dst_words[4];
-  std::memcpy(src_words, parsed.src.data(), sizeof(src_words));
-  std::memcpy(dst_words, parsed.dst.data(), sizeof(dst_words));
-  const uint32_t hash = route::FlowHash(
-      src_words[0] ^ src_words[1] ^ src_words[2] ^ src_words[3],
-      dst_words[0] ^ dst_words[1] ^ dst_words[2] ^ dst_words[3],
-      parsed.src_port, parsed.dst_port, parsed.protocol, flow_fields_);
-  const route::NextHop *hop = router_->Resolve(domain, dst, hash);
-  bess::PacketRef pkt = batch->packet(i);
-  const size_t l3 = parsed.l3_offset;
-  route::ForwardVerdict verdict = route::ForwardVerdict::kForward;
-  if (hop == nullptr) {
-    verdict = route::ForwardVerdict::kNoRoute;
-  } else if (hop->kind == route::NextHopKind::kLocal) {
-    verdict = route::ForwardVerdict::kLocalDelivery;
-  } else if (hop->egress == bess::dataplane::kInvalidInterfaceId) {
-    verdict = route::ForwardVerdict::kNoEgress;
-  } else if (hop->neighbor != route::NeighborState::kResolved) {
-    verdict = route::ForwardVerdict::kUnresolved;
-  } else if (pkt.head_len() < l3 + route::kIpv6HeaderSize ||
-             pkt.head_data<const uint8_t *>()[l3 + 7] <= 1) {
-    // Checked before the copy below, so an expiring frame is never copied.
-    verdict = route::ForwardVerdict::kTtlExpired;
-  }
-  if (verdict != route::ForwardVerdict::kForward) {
-    CountVerdict(verdict);
-    return PuntGateOf(verdict);
-  }
-  const gate_idx_t gate = GateOf(hop->egress);
-  if (gate == DROP_GATE) {
-    return DROP_GATE;  // configuration, as for IPv4: nothing counted
-  }
-  bess::PacketHandle handle = pkt.handle();
-  if (!bess::packet::EnsureWritable(handle)) {
-    header_write_failures_.fetch_add(1, std::memory_order_relaxed);
-    return DROP_GATE;
-  }
-  batch->handles()[i] = handle;
-  bess::PacketRef writable(handle);
-  // The copy may have resegmented the frame: the header's place is checked
-  // again rather than assumed.
-  if (writable.head_len() < l3 + route::kIpv6HeaderSize) {
-    header_write_failures_.fetch_add(1, std::memory_order_relaxed);
-    return DROP_GATE;
-  }
-  uint8_t *frame = writable.head_data<uint8_t *>();
-  if (route::DecrementHopLimit(std::span<uint8_t>(frame + l3,
-                                                  writable.head_len() - l3)) !=
-      route::TtlResult::kForward) {
-    ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
-    return DROP_GATE;
-  }
-  if (!hop->dst_mac.IsZero() && !hop->src_mac.IsZero()) {
-    auto *eth = reinterpret_cast<bess::utils::Ethernet *>(frame);
-    eth->dst_addr = hop->dst_mac;
-    eth->src_addr = hop->src_mac;
-  }
-  return gate;
+bool Router::HeaderFits(bess::PacketRef pkt, route::L3Family family,
+                        size_t l3_offset) {
+  const size_t header = family == route::L3Family::kIpv6
+                            ? route::kIpv6HeaderSize
+                            : sizeof(bess::utils::Ipv4);
+  return pkt.head_len() >= l3_offset + header;
 }
 
 // Mode 2 (D-155): the destination path, through the library's forwarding chain
@@ -1419,20 +1423,6 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
   for (size_t k = 0; k < n; k++) {
     const int i = begin + static_cast<int>(k);
     const route::FrameRoute &r = resolved[k];
-    // forward.h is IPv4-only (D-179): a parsed IPv6 frame comes back as "not
-    // IPv4", and is routed here against the domain's IPv6 routes.
-    if (r.verdict == route::ForwardVerdict::kNotIpv4) {
-      bess::PacketRef pkt = batch->packet(i);
-      bess::conntrack::ParsedFlowPacket parsed;
-      const auto status = bess::conntrack::ParseFrame(
-          std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), parsed,
-          pkt.total_len());
-      if (status == bess::conntrack::ParseStatus::kOk &&
-          parsed.l3 == bess::conntrack::L3Kind::kIpv6) {
-        gates[i] = RouteIpv6(batch, i, domain, parsed);
-        continue;
-      }
-    }
     if (r.verdict != route::ForwardVerdict::kForward) {
       CountVerdict(r.verdict);
       // A punt gate is the application's slow path (D-162): a frame the
@@ -1451,7 +1441,7 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
       continue;
     }
 
-    // The TTL is written whatever the hop names, so the header must be
+    // The hop count is written whatever the hop names, so the header must be
     // writable: a shared payload is copied once (K4) and the copy replaces
     // the batch's handle.
     bess::PacketRef pkt = batch->packet(i);
@@ -1462,17 +1452,16 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
     }
     batch->handles()[i] = handle;
     bess::PacketRef writable(handle);
-    // The copy may have resegmented the frame, so where the IPv4 header is is
+    // The copy may have resegmented the frame, so where the IP header is is
     // re-established rather than assumed: writing it through a stale pointer
     // would touch bytes that are not in this segment.
-    if (writable.head_len() <
-        static_cast<size_t>(r.l3_offset) + sizeof(bess::utils::Ipv4)) {
+    if (!HeaderFits(writable, r.family, r.l3_offset)) {
       header_write_failures_.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     if (route::WriteForwarded(
-            std::span(writable.head_data<uint8_t *>(), writable.head_len()), r.l3_offset,
-            *r.hop) != route::TtlResult::kForward) {
+            std::span(writable.head_data<uint8_t *>(), writable.head_len()), r.family,
+            r.l3_offset, *r.hop) != route::TtlResult::kForward) {
       // ResolveFrames refuses a TTL of 0 or 1, so this is unreachable with the
       // same bytes; counting it keeps the boundary honest if a mutation ever
       // rewrote the header between the two calls.
@@ -1484,25 +1473,33 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
 }
 
 std::string Router::GetDesc() const {
+  // Which families the router routes (D-179): the other family's frames are
+  // dropped and counted as family disabled.
+  const char *families = router_->has_ipv4() && router_->has_ipv6() ? "IPv4+IPv6"
+                         : router_->has_ipv4()                     ? "IPv4"
+                                                                   : "IPv6";
   std::string desc;
   if (!routes_by_destination()) {
     desc = bess::utils::Format(
-        "%zu routes, %zu next hops, %zu groups, %zu header write failures, %zu local, "
-        "next-hop id from metadata",
-        router_->route_count(), router_->next_hop_count(),
+        "%s, %zu routes, %zu next hops, %zu groups, %zu header write failures, "
+        "%zu local, %zu family disabled, next-hop id from metadata",
+        families, router_->route_count(), router_->next_hop_count(),
         router_->next_hop_group_count(),
         static_cast<size_t>(header_write_failures()),
-        static_cast<size_t>(local_frames()));
+        static_cast<size_t>(local_frames()),
+        static_cast<size_t>(family_disabled_frames()));
   } else {
     desc = bess::utils::Format(
-        "%zu routes, %zu next hops, %zu groups, %zu header write failures, routing by "
-        "destination (not ip: %zu, malformed: %zu, non-initial fragments: %zu, "
-        "no route: %zu, unresolved: %zu, ttl expired: %zu, blackholed: %zu, local: %zu, "
-        "link scope: %zu)",
-        router_->route_count(), router_->next_hop_count(),
+        "%s, %zu routes, %zu next hops, %zu groups, %zu header write failures, "
+        "routing by destination (not ip: %zu, family disabled: %zu, malformed: %zu, "
+        "non-initial fragments: %zu, no route: %zu, unresolved: %zu, ttl expired: %zu, "
+        "blackholed: %zu, local: %zu, link scope: %zu)",
+        families, router_->route_count(), router_->next_hop_count(),
         router_->next_hop_group_count(),
         static_cast<size_t>(header_write_failures()),
-        static_cast<size_t>(not_ip_frames()), static_cast<size_t>(malformed_frames()),
+        static_cast<size_t>(not_ip_frames()),
+        static_cast<size_t>(family_disabled_frames()),
+        static_cast<size_t>(malformed_frames()),
         static_cast<size_t>(non_initial_fragments()), static_cast<size_t>(no_route_frames()),
         static_cast<size_t>(unresolved_frames()),
         static_cast<size_t>(ttl_expired_frames()),

@@ -32,6 +32,9 @@ void ReserveOneMore(std::vector<T> &v) {
 std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     std::string name, const Config &config, size_t max_next_hops,
     rcu::RcuDomain &domain, size_t max_domains, size_t max_groups) {
+  if (!config.ipv4 && !config.ipv6) {
+    return std::unexpected(RouteError::kFamilyDisabled);
+  }
   if (max_next_hops == 0 || max_next_hops > LpmRouteTable::kMaxValue ||
       max_groups > LpmRouteTable::kMaxValue - max_next_hops) {
     return std::unexpected(RouteError::kValueOutOfRange);
@@ -39,22 +42,45 @@ std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
   if (max_domains == 0 || max_domains > kMaxRouteDomains) {
     return std::unexpected(RouteError::kValueOutOfRange);
   }
-  auto routes = LpmRouteTable::Create(name, config, domain);
-  if (!routes) {
-    return std::unexpected(routes.error());
+  // The largest route value is the last group's: the IPv6 entry size follows.
+  Config sized = config;
+  if (sized.ipv6) {
+    sized.ipv6->max_value = static_cast<uint32_t>(max_next_hops + max_groups);
   }
-  auto routes6 = Ipv6RouteTable::Create(domain, config.max_routes);
-  if (!routes6) {
-    return std::unexpected(routes6.error());
+  auto default_domain = MakeDomain(name, sized, domain);
+  if (!default_domain) {
+    return std::unexpected(default_domain.error());
   }
-  return std::unique_ptr<Router>(new Router(
-      name, config, std::move(*routes), std::move(*routes6), max_next_hops,
-      max_domains, max_groups, domain));
+  return std::unique_ptr<Router>(new Router(name, sized,
+                                            std::move(*default_domain),
+                                            max_next_hops, max_domains,
+                                            max_groups, domain));
+}
+
+std::expected<std::unique_ptr<const Router::Domain>, RouteError>
+Router::MakeDomain(const std::string &name, const Config &config,
+                   rcu::RcuDomain &rcu) {
+  std::unique_ptr<LpmRouteTable> table;
+  if (config.ipv4) {
+    auto made = LpmRouteTable::Create(name, *config.ipv4, rcu);
+    if (!made) {
+      return std::unexpected(made.error());
+    }
+    table = std::move(*made);
+  }
+  std::unique_ptr<Ipv6RouteTable> table6;
+  if (config.ipv6) {
+    auto made = Ipv6RouteTable::Create(name + "_6", *config.ipv6, rcu);
+    if (!made) {
+      return std::unexpected(made.error());
+    }
+    table6 = std::move(*made);
+  }
+  return std::make_unique<const Domain>(std::move(table), std::move(table6));
 }
 
 Router::Router(const std::string &name, const Config &config,
-               std::unique_ptr<LpmRouteTable> default_routes,
-               std::unique_ptr<Ipv6RouteTable> default_routes6,
+               std::unique_ptr<const Domain> default_domain,
                size_t max_next_hops, size_t max_domains, size_t max_groups,
                rcu::RcuDomain &rcu)
     : name_(name),
@@ -63,7 +89,7 @@ Router::Router(const std::string &name, const Config &config,
       max_next_hops_(static_cast<uint32_t>(max_next_hops)),
       domain_config_(config),
       domains_(max_domains),
-      default_routes_(default_routes.get()),
+      default_routes_(default_domain->table()),
       domain_ids_{kDefaultRouteDomainId},
       next_hops_(max_next_hops),
       references_(max_next_hops + 1, 0),
@@ -76,9 +102,7 @@ Router::Router(const std::string &name, const Config &config,
       routes_name_(name + "/routes"),
       groups_name_(name + "/groups") {
   // Before any reader can exist: nothing to retire.
-  domains_.Publish(SlotOf(kDefaultRouteDomainId),
-                   std::make_unique<const Domain>(std::move(default_routes),
-                                                  std::move(default_routes6)));
+  domains_.Publish(SlotOf(kDefaultRouteDomainId), std::move(default_domain));
 }
 
 // The SlotTables free what is still published (including retiring next hops
@@ -119,16 +143,21 @@ Router::~Router() {
 // prefixes are "pending" to Contains()/ReferencesOf() until the transaction
 // ends.
 //
-// IPv6 routes (Ipv6RouteTable) are immutable tries, so nothing is placed: the
-// first IPv6 operation of a transaction on a domain begins that table's
-// Stage, and it and every later IPv6 operation on the same table edit the
-// stage in Reserve(), where all allocation and the max_routes bound are
-// settled. The first of them to publish commits the stage -- one pointer
-// exchange, the replaced trie to the Retirer -- and the rest find it done.
-// That publishes the transaction's IPv6 upserts and erases on a table
-// together, during the route rank's upserts: earlier than an erase would
-// otherwise publish, which is safe because nothing references a route. An
-// aborted transaction discards its stages, so the tables never changed.
+// IPv6 routes (Ipv6RouteTable) are never placed: the first IPv6 operation of
+// a transaction on a domain begins that table's Stage, which readies the
+// table's unpublished spare instance, and it and every later IPv6 operation
+// on the same table edit the spare in Reserve(), where all allocation, the
+// max_routes bound and every tbl8 group are settled. The first of them to
+// publish commits the stage -- one pointer exchange -- and hands the table
+// the transaction's grace period (AfterGracePeriodStarts), which guards
+// reuse of the instance it replaced; the rest find it done. That publishes
+// the transaction's IPv6 upserts and erases on a table together, during the
+// route rank's upserts: earlier than an erase would otherwise publish, which
+// is safe because nothing references a route. An aborted transaction aborts
+// each stage once, so readers never saw a change.
+//
+// A key of a family the router does not serve is refused at Reserve
+// (kFamilyDisabled); such a family has no FIB to hold it.
 class Router::RouteResource final : public dataplane::Resource {
  public:
   explicit RouteResource(Router &router)
@@ -159,19 +188,21 @@ class Router::RouteResource final : public dataplane::Resource {
   void VisitReferences(
       const std::function<void(const dataplane::Reference &)> &visit) const
       override {
-    router_.ForEachDomain([&](RouteDomainId, LpmRouteTable &routes) {
-      routes.ForEach([&](Ipv4Prefix, uint32_t value) {
-        for (const auto &ref : References(value)) {
-          visit(ref);
-        }
-      });
-    });
-    router_.ForEachDomain([&](RouteDomainId id, LpmRouteTable &) {
-      router_.Table6Of(id)->ForEach([&](Ipv6Prefix, uint32_t value) {
-        for (const auto &ref : References(value)) {
-          visit(ref);
-        }
-      });
+    router_.ForEachDomain([&](RouteDomainId, const Domain &domain) {
+      if (const LpmRouteTable *routes = domain.table()) {
+        routes->ForEach([&](Ipv4Prefix, uint32_t value) {
+          for (const auto &ref : References(value)) {
+            visit(ref);
+          }
+        });
+      }
+      if (const Ipv6RouteTable *routes = domain.table6()) {
+        routes->ForEach([&](Ipv6Prefix, uint32_t value) {
+          for (const auto &ref : References(value)) {
+            visit(ref);
+          }
+        });
+      }
     });
   }
 
@@ -179,12 +210,18 @@ class Router::RouteResource final : public dataplane::Resource {
   std::expected<Reservation, std::string> Reserve(
       const dataplane::Op &op) override {
     if (const auto id6 = Decode6(op.key)) {
+      if (!router_.has_ipv6()) {
+        return std::unexpected(RouteErrorName(RouteError::kFamilyDisabled));
+      }
       return Reserve6(op, *id6);
     }
     const auto id = Decode(op.key);
     if (!id) {
       return std::unexpected(
           "not a route key (Router::RouteKey) of a valid prefix");
+    }
+    if (!router_.has_ipv4()) {
+      return std::unexpected(RouteErrorName(RouteError::kFamilyDisabled));
     }
     LpmRouteTable *table = router_.TableOf(id->domain);
     const Ipv4Prefix prefix = id->prefix;
@@ -253,6 +290,11 @@ class Router::RouteResource final : public dataplane::Resource {
   }
   void EndTransaction() noexcept override {
     pending_.clear();
+    // A stage whose first edit was refused has no staged operation to abort
+    // it; every other one was committed or aborted already.
+    for (auto &[table, staged] : stages6_) {
+      staged->Abort();
+    }
     stages6_.clear();
   }
 
@@ -286,10 +328,19 @@ class Router::RouteResource final : public dataplane::Resource {
   }
 
   // One table's next version within a transaction (see the class comment).
+  // Exactly one of Commit and Abort reaches the table.
   struct Stage6 {
     Ipv6RouteTable &table;
     std::unique_ptr<Ipv6RouteTable::Stage> stage;
     bool committed = false;
+    bool aborted = false;
+
+    void Abort() noexcept {
+      if (!committed && !aborted) {
+        aborted = true;
+        table.Abort(*stage);
+      }
+    }
   };
 
   std::expected<Reservation, std::string> Reserve6(
@@ -350,8 +401,10 @@ class Router::RouteResource final : public dataplane::Resource {
     if (previous) {
       reservation.previous_references = References(*previous);
     }
-    // The stage's commit retires the replaced trie once per table.
-    reservation.footprint.retires = begins ? 1 : 0;
+    // The stage's commit hands the table the grace period once per table;
+    // nothing is retired (the replaced instance stays the table's spare).
+    reservation.footprint.retires = 0;
+    reservation.footprint.callbacks = begins ? 1 : 0;
     // The edit is last: everything above that can fail has.
     const auto edited = erase ? staged.stage->Erase(id.prefix)
                               : staged.stage->Upsert(id.prefix, value);
@@ -436,9 +489,10 @@ class Router::RouteResource final : public dataplane::Resource {
     Ipv4Prefix prefix_;
   };
   // Every IPv6 operation on a table publishes its transaction's stage; the
-  // first does it, the rest find it committed. Nothing allocates: the stage
-  // was built in Reserve(), and Commit() is a pointer exchange and a swap.
-  // Abort() has nothing to undo, since the table was never touched.
+  // first does it, the rest find it committed. Nothing allocates: the spare
+  // was edited in Reserve(), Commit() is a pointer exchange, and the callback
+  // that hands the table its grace period fits the Retirer's inline storage
+  // and the footprint the stage's first operation declared.
   class Commit6Op final : public dataplane::StagedOp {
    public:
     explicit Commit6Op(Stage6 &stage) : stage_(stage) {}
@@ -447,8 +501,12 @@ class Router::RouteResource final : public dataplane::Resource {
         return;
       }
       stage_.committed = true;
-      retirer.Retire(stage_.table.Commit(*stage_.stage));
+      stage_.table.Commit(*stage_.stage);
+      Ipv6RouteTable *table = &stage_.table;
+      retirer.AfterGracePeriodStarts(
+          [table](rcu::GracePeriod token) { table->Committed(token); });
     }
+    void Abort() noexcept override { stage_.Abort(); }
 
    private:
     Stage6 &stage_;
@@ -731,7 +789,15 @@ std::expected<void, RouteError> Router::CreateDomain(RouteDomainId domain,
   if (engine_ != nullptr) {
     return std::unexpected(RouteError::kEnrolled);
   }
-  return CreateDomainLocked(domain, config);
+  if (config.ipv4.has_value() != has_ipv4() ||
+      config.ipv6.has_value() != has_ipv6()) {
+    return std::unexpected(RouteError::kFamilyDisabled);
+  }
+  Config sized = config;
+  if (sized.ipv6) {
+    sized.ipv6->max_value = domain_config_.ipv6->max_value;
+  }
+  return CreateDomainLocked(domain, sized);
 }
 
 std::expected<void, RouteError> Router::CreateDomainLocked(
@@ -743,22 +809,26 @@ std::expected<void, RouteError> Router::CreateDomainLocked(
   if (domains_.Contains(slot)) {
     return std::unexpected(RouteError::kDomainExists);
   }
-  auto table = LpmRouteTable::Create(
-      name_ + "_d" + std::to_string(domain.value()), config, rcu_);
-  if (!table) {
-    return std::unexpected(table.error());
+  auto object =
+      MakeDomain(name_ + "_d" + std::to_string(domain.value()), config, rcu_);
+  if (!object) {
+    return std::unexpected(object.error());
   }
-  auto table6 = Ipv6RouteTable::Create(rcu_, config.max_routes);
-  if (!table6) {
-    return std::unexpected(table6.error());
-  }
-  auto object = std::make_unique<const Domain>(std::move(*table),
-                                               std::move(*table6));
   ReserveOneMore(domain_ids_);
-  domains_.Publish(slot, std::move(object));
+  domains_.Publish(slot, std::move(*object));
   domain_ids_.insert(
       std::lower_bound(domain_ids_.begin(), domain_ids_.end(), domain), domain);
   return {};
+}
+
+Router::FibCounts Router::fib_counts() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  FibCounts counts;
+  ForEachDomain([&](RouteDomainId, const Domain &d) {
+    counts.ipv4 += d.table() != nullptr ? 1 : 0;
+    counts.ipv6 += d.table6() != nullptr ? 1 : 0;
+  });
+  return counts;
 }
 
 std::expected<void, RouteError> Router::RemoveDomain(RouteDomainId domain) {
@@ -773,7 +843,7 @@ std::expected<void, RouteError> Router::RemoveDomain(RouteDomainId domain) {
   if (!domains_.Contains(slot)) {
     return std::unexpected(RouteError::kUnknownDomain);
   }
-  if (TableOf(domain)->size() != 0 || Table6Of(domain)->size() != 0) {
+  if (domains_.Lookup(slot)->size() != 0) {
     return std::unexpected(RouteError::kDomainInUse);
   }
   // A reader that already loaded the Domain keeps it (and its empty FIB)
@@ -805,7 +875,8 @@ std::expected<void, RouteError> Router::SetRoute(RouteDomainId domain,
   CompleteRetirementsLocked();
   LpmRouteTable *routes = TableOf(domain);
   if (routes == nullptr) {
-    return std::unexpected(RouteError::kUnknownDomain);
+    return std::unexpected(has_ipv4() ? RouteError::kUnknownDomain
+                                      : RouteError::kFamilyDisabled);
   }
   if (!ValidId(hop)) {
     return std::unexpected(RouteError::kInvalidId);
@@ -835,7 +906,8 @@ std::expected<void, RouteError> Router::SetRoute(RouteDomainId domain,
   CompleteRetirementsLocked();
   LpmRouteTable *routes = TableOf(domain);
   if (routes == nullptr) {
-    return std::unexpected(RouteError::kUnknownDomain);
+    return std::unexpected(has_ipv4() ? RouteError::kUnknownDomain
+                                      : RouteError::kFamilyDisabled);
   }
   if (!groups_.ValidId(group) || group.value() >= group_references_.size()) {
     return std::unexpected(RouteError::kInvalidId);
@@ -988,7 +1060,8 @@ std::expected<void, RouteError> Router::RemoveRoute(RouteDomainId domain,
   CompleteRetirementsLocked();
   LpmRouteTable *routes = TableOf(domain);
   if (routes == nullptr) {
-    return std::unexpected(RouteError::kUnknownDomain);
+    return std::unexpected(has_ipv4() ? RouteError::kUnknownDomain
+                                      : RouteError::kFamilyDisabled);
   }
   const std::optional<uint32_t> previous = routes->Find(prefix);
   if (!previous) {
@@ -1011,7 +1084,8 @@ std::expected<void, RouteError> Router::SetRoute(RouteDomainId domain,
   CompleteRetirementsLocked();
   Ipv6RouteTable *routes = Table6Of(domain);
   if (routes == nullptr) {
-    return std::unexpected(RouteError::kUnknownDomain);
+    return std::unexpected(has_ipv6() ? RouteError::kUnknownDomain
+                                      : RouteError::kFamilyDisabled);
   }
   if (!ValidId(hop)) {
     return std::unexpected(RouteError::kInvalidId);
@@ -1040,7 +1114,8 @@ std::expected<void, RouteError> Router::SetRoute(RouteDomainId domain,
   CompleteRetirementsLocked();
   Ipv6RouteTable *routes = Table6Of(domain);
   if (routes == nullptr) {
-    return std::unexpected(RouteError::kUnknownDomain);
+    return std::unexpected(has_ipv6() ? RouteError::kUnknownDomain
+                                      : RouteError::kFamilyDisabled);
   }
   if (!ValidGroupId(group)) {
     return std::unexpected(RouteError::kInvalidId);
@@ -1068,7 +1143,8 @@ std::expected<void, RouteError> Router::RemoveRoute(RouteDomainId domain,
   }
   Ipv6RouteTable *routes = Table6Of(domain);
   if (routes == nullptr) {
-    return std::unexpected(RouteError::kUnknownDomain);
+    return std::unexpected(has_ipv6() ? RouteError::kUnknownDomain
+                                      : RouteError::kFamilyDisabled);
   }
   const auto previous = routes->Find(prefix);
   if (!previous) {
@@ -1081,21 +1157,7 @@ std::expected<void, RouteError> Router::RemoveRoute(RouteDomainId domain,
   return {};
 }
 
-const NextHop *Router::Resolve(RouteDomainId domain,
-                               const utils::Ipv6Address &dst,
-                               uint32_t flow_hash) const noexcept {
-  const Ipv6RouteTable *routes = Table6Of(domain);
-  if (unlikely(routes == nullptr)) {
-    return nullptr;
-  }
-  const auto value = routes->Read().Lookup(dst);
-  if (!value) {
-    return nullptr;
-  }
-  std::atomic_thread_fence(std::memory_order_acquire);
-  const NextHop *hop = next_hops_.Lookup(NextHopId(*value));
-  return hop != nullptr ? hop : GroupMemberHop(*value, flow_hash);
-}
+
 std::expected<void, RouteError> Router::ReplaceRouteSetAtomic(
     RouteDomainId domain, const RouteSet &routes) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -1105,7 +1167,8 @@ std::expected<void, RouteError> Router::ReplaceRouteSetAtomic(
   CompleteRetirementsLocked();
   LpmRouteTable *table = TableOf(domain);
   if (table == nullptr) {
-    return std::unexpected(RouteError::kUnknownDomain);
+    return std::unexpected(has_ipv4() ? RouteError::kUnknownDomain
+                                      : RouteError::kFamilyDisabled);
   }
 
   // 1. Everything checkable without building: each route's next hop exists.
@@ -1150,12 +1213,7 @@ std::expected<void, RouteError> Router::ReplaceRouteSetAtomic(
 // exclusive access (Enroll's check).
 size_t Router::CountRoutes() const {
   size_t count = 0;
-  ForEachDomain([&](RouteDomainId, LpmRouteTable &routes) {
-    count += routes.size();
-  });
-  ForEachDomain([&](RouteDomainId id, LpmRouteTable &) {
-    count += Table6Of(id)->size();
-  });
+  ForEachDomain([&](RouteDomainId, const Domain &d) { count += d.size(); });
   return count;
 }
 
@@ -1166,9 +1224,8 @@ size_t Router::route_count() const {
 
 size_t Router::route_count(RouteDomainId domain) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  const LpmRouteTable *routes = TableOf(domain);
-  const Ipv6RouteTable *routes6 = Table6Of(domain);
-  return routes != nullptr ? routes->size() + routes6->size() : 0;
+  const Domain *d = domains_.Lookup(SlotOf(domain));
+  return d != nullptr ? d->size() : 0;
 }
 
 size_t Router::next_hop_count() const {
@@ -1202,8 +1259,11 @@ void Router::ForEachRoute(
     const std::function<void(const ::bess::route::RouteKey &key, NextHopId hop,
                              NextHopGroupId group)> &fn) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  ForEachDomain([&](RouteDomainId domain, const LpmRouteTable &routes) {
-    routes.ForEach([&](Ipv4Prefix prefix, uint32_t value) {
+  ForEachDomain([&](RouteDomainId domain, const Domain &d) {
+    if (d.table() == nullptr) {
+      return;
+    }
+    d.table()->ForEach([&](Ipv4Prefix prefix, uint32_t value) {
       const ::bess::route::RouteKey key{domain, prefix};
       if (value > max_next_hops_) {
         fn(key, NextHopId(0), NextHopGroupId(value - max_next_hops_));
@@ -1217,8 +1277,11 @@ void Router::ForEachIpv6Route(
     const std::function<void(RouteDomainId, Ipv6Prefix, NextHopId,
                              NextHopGroupId)> &fn) const {
   std::lock_guard<std::mutex> lock(mutex_);
-  ForEachDomain([&](RouteDomainId domain, LpmRouteTable &) {
-    Table6Of(domain)->ForEach([&](Ipv6Prefix prefix, uint32_t value) {
+  ForEachDomain([&](RouteDomainId domain, const Domain &d) {
+    if (d.table6() == nullptr) {
+      return;
+    }
+    d.table6()->ForEach([&](Ipv6Prefix prefix, uint32_t value) {
       if (value > max_next_hops_) {
         fn(domain, prefix, NextHopId(0),
            NextHopGroupId(value - max_next_hops_));

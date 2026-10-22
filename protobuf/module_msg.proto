@@ -1495,37 +1495,46 @@ enum FlowHashFields {
 /**
  * The Router module forwards a packet to the egress its next-hop id (from
  * packet metadata) names, or -- in ROUTE_MODE_DESTINATION -- routes it by its
- * destination address (IPv4 or IPv6) in the route domain it carries (D-155).
- * Routes, next hops and next-hop groups are the resources D-023 describes,
- * changed together or not at all.
+ * destination address in the route domain it carries (D-155). Routes, next
+ * hops and next-hop groups are the resources D-023 describes, changed
+ * together or not at all.
+ *
+ * Address families (D-179). A family is enabled exactly when its route
+ * capacity is set: IPv4 with max_ipv4_routes, IPv6 with max_ipv6_routes, at
+ * least one of them. A disabled family has no FIB in any domain; its frames
+ * are dropped and counted (family_disabled), its routes, interface addresses
+ * and neighbor bindings are refused, and its neighbor protocol (ARP, or
+ * Neighbor Discovery) is not processed.
  *
  * __Input Gates__: 1
  * __Output Gates__: many (the next hop's egress)
  */
 message RouterArg {
-  uint64 max_routes = 1; /// Most routes (default 4096).
-  uint64 max_tbl8s = 2; /// Most tbl8 groups (default 256).
-  uint64 max_next_hops = 3; /// Most next hops (default 4096).
-  uint64 max_domains = 4; /// Route domains (VRFs) 0..n-1, each with its own FIB sized as above (default 1: the default domain only).
-  RouteBackend backend = 5; /// Every domain's route table structure (default: LPM).
-  RouteMode mode = 6; /// What the packet path decides from (default: the next_hop_id metadata).
+  optional uint64 max_ipv4_routes = 1; /// IPv4 routes per domain; setting it enables IPv4 (0 is refused).
+  optional uint64 max_ipv4_tbl8s = 2; /// IPv4 tbl8 groups per domain, one per /24 holding a longer route (absent: 256; 0 is refused; needs max_ipv4_routes).
+  optional uint64 max_ipv6_routes = 3; /// IPv6 routes per domain; setting it enables IPv6 (0 is refused).
+  optional uint64 max_ipv6_tbl8s = 4; /// IPv6 (rte_fib6) tbl8 groups per domain (absent: 8192; 0 is refused; needs max_ipv6_routes). A route reserves one per byte between its length and its covering route's, counted from /24.
+  RouteBackend backend = 5; /// The IPv4 route table structure (default: LPM). IPv6 always uses rte_fib6.
+  uint64 max_next_hops = 6; /// Most next hops (default 4096).
   uint64 max_groups = 7; /// Most next-hop groups (default 0: none; a route may name a group only with a nonzero bound). Together with max_next_hops, bounded by the 24-bit route value.
-  uint64 punt_miss_gate = 8; /// Where a frame the FIB has no route for goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. Gate 0 is a real gate, so a punt target is any other gate. The frame is counted either way (D-162).
-  uint64 punt_unresolved_gate = 9; /// Where a frame whose hop's neighbor is unresolved goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE to drop it. The frame is counted either way (D-162).
+  uint64 max_domains = 8; /// Route domains (VRFs) 0..n-1, each with its own FIB per enabled family, sized as above (default 1: the default domain only).
+  RouteMode mode = 9; /// What the packet path decides from (default: the next_hop_id metadata).
   FlowHashFields flow_hash = 10; /// Which fields a route that names a next-hop group hashes to pick its member (default: the whole flow, D-163).
   string next_hop_attr = 11; /// The metadata attribute next-hop mode reads the next-hop id from (default "next_hop_id").
   string domain_attr = 12; /// The metadata attribute destination mode reads the route domain from (default "route_domain").
-  uint64 punt_local_gate = 13; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. With a neighbor resolver, ARP requests and Neighbor Solicitations go here too; and so do link-local or multicast IPv6 frames in destination mode, which are never forwarded. The frame is counted either way (D-178, D-179).
-  string ingress_interface_attr = 14; /// The metadata attribute naming the RouterInterface a frame arrived on, read for ARP and Neighbor Discovery input (default "vif_id", what Vif writes).
-  repeated RouterInterface interfaces = 15; /// The router's own interfaces that neighbor resolution solicits from. Fixed at Init.
-  repeated RouterNeighborBinding neighbor_bindings = 16; /// Resolver-owned next-hop ids; configure routes to these, not static MACs. Fixed at Init.
-  uint64 max_neighbors = 17; /// Neighbor resolver capacity (default 1024).
-  optional uint64 neighbor_first_probe_ms = 18; /// Delay from Init to a neighbor's first solicitation (absent: 1000; 0: on the first maintenance tick).
-  optional uint64 neighbor_probe_interval_ms = 19; /// First retry delay of an attempt; later retries double it (absent: 1000; 0 is refused).
-  optional uint64 neighbor_max_probe_interval_ms = 20; /// Retry backoff ceiling (absent: 8000; 0 or below the probe interval is refused).
-  optional uint64 neighbor_max_probes = 21; /// Solicitations per resolution attempt (absent: 3; 0 is refused).
-  optional uint64 neighbor_reachable_lifetime_ms = 22; /// How long a resolved neighbor goes unconfirmed before it is solicited again; it keeps forwarding while that attempt runs and fails only when the attempt does (absent: 30000; 0: never re-solicit, D-179).
-  optional uint64 neighbor_unreachable_retry_ms = 23; /// How long an unreachable neighbor waits before another attempt (absent: 8000, the backoff ceiling's default; 0: no further attempt).
+  uint64 punt_miss_gate = 13; /// Where a frame the FIB has no route for goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. Gate 0 is a real gate, so a punt target is any other gate. The frame is counted either way (D-162).
+  uint64 punt_unresolved_gate = 14; /// Where a frame whose hop's neighbor is unresolved goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE to drop it. The frame is counted either way (D-162).
+  uint64 punt_local_gate = 15; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. With a neighbor resolver, ARP requests and Neighbor Solicitations go here too; and so do link-local or multicast IPv6 frames in destination mode, which are never forwarded. The frame is counted either way (D-178, D-179).
+  string ingress_interface_attr = 16; /// The metadata attribute naming the RouterInterface a frame arrived on, read for ARP and Neighbor Discovery input (default "vif_id", what Vif writes).
+  repeated RouterInterface interfaces = 17; /// The router's own interfaces that neighbor resolution solicits from. Fixed at Init.
+  repeated RouterNeighborBinding neighbor_bindings = 18; /// Resolver-owned next-hop ids; configure routes to these, not static MACs. Fixed at Init.
+  uint64 max_neighbors = 19; /// Neighbor resolver capacity (default 1024).
+  optional uint64 neighbor_first_probe_ms = 20; /// Delay from Init to a neighbor's first solicitation (absent: 1000; 0: on the first maintenance tick).
+  optional uint64 neighbor_probe_interval_ms = 21; /// First retry delay of an attempt; later retries double it (absent: 1000; 0 is refused).
+  optional uint64 neighbor_max_probe_interval_ms = 22; /// Retry backoff ceiling (absent: 8000; 0 or below the probe interval is refused).
+  optional uint64 neighbor_max_probes = 23; /// Solicitations per resolution attempt (absent: 3; 0 is refused).
+  optional uint64 neighbor_reachable_lifetime_ms = 24; /// How long a resolved neighbor goes unconfirmed before it is solicited again; it keeps forwarding while that attempt runs and fails only when the attempt does (absent: 30000; 0: never re-solicit, D-179).
+  optional uint64 neighbor_unreachable_retry_ms = 25; /// How long an unreachable neighbor waits before another attempt (absent: 8000, the backoff ceiling's default; 0: no further attempt).
 }
 
 /**

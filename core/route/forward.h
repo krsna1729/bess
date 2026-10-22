@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <span>
 
 #include "conntrack/packet_parse.h"
@@ -18,10 +19,11 @@
 
 namespace bess::route {
 
-// The IPv4 destination path, one implementation: a caller with frames (an
-// appliance) and a graph adapter with packets (the Router module) both use
-// these two functions, so they cannot disagree about a fragment, a TTL
-// boundary or which hop address is written.
+// The destination path for IPv4 and IPv6, one implementation: a caller with
+// frames (an appliance) and a graph adapter with packets (the Router module)
+// both use these functions, so they cannot disagree about a fragment, a TTL
+// or hop-limit boundary, a link-scoped address or which hop address is
+// written. The frame is parsed once and its family decides the table.
 //
 // Policy stays outside. Which domain a packet is in is the caller's (an
 // interface, metadata, a port), what an unresolved neighbor means is the
@@ -31,112 +33,205 @@ namespace bess::route {
 // (tools/check_includes.py), and a caller that wants a new metadata output
 // adds it in its own adapter.
 
-// Why a forwarding attempt did or did not put the frame on a wire.
+// Why a forwarding attempt did or did not put the frame on a wire. After the
+// parse verdicts the checks run in this order: family, link scope, lookup,
+// local, egress, neighbor, TTL / hop limit.
 enum class ForwardVerdict : uint8_t {
-  kForward,             // TTL decremented, the hop's addresses written
+  kForward,             // TTL / hop limit decremented, the hop's addresses written
   kLocalDelivery,       // the destination is this node's own address (D-178)
-  kNotIpv4,             // a valid frame that is not an IPv4 packet
+  kNotIp,               // a valid frame that is neither IPv4 nor IPv6
   kMalformed,           // a header does not fit or its lengths are inconsistent
   kNonInitialFragment,  // no L4 header: a group route would hash by something
                         // other than the datagram's first fragment
+  kFamilyDisabled,      // the frame's family is not enabled on the router
+  kLinkScope,           // IPv6 link-local or multicast destination, or
+                        // link-local source: never routed (RFC 4291 2.5.6)
   kNoRoute,             // no route for this destination in this domain
   kUnresolved,          // the route's next hop has no L2 addresses yet
-  kTtlExpired,          // TTL 0 or 1: nothing written
+  kTtlExpired,          // TTL / hop limit 0 or 1: nothing written
   kNoEgress,            // the hop names no usable egress interface: nothing written
 };
+
+enum class L3Family : uint8_t { kIpv4, kIpv6 };
 
 // What the frame routes to. ResolveFrame() reads the frame and writes nothing,
 // so a caller can count, gate or drop without touching bytes it discards.
 struct FrameRoute {
-  ForwardVerdict verdict = ForwardVerdict::kNotIpv4;
+  ForwardVerdict verdict = ForwardVerdict::kNotIp;
+  // The frame's family, set whenever it parsed as IP.
+  L3Family family = L3Family::kIpv4;
   // The hop to write, for kForward.
   const NextHop *hop = nullptr;
   // The hop's egress once one is known: set for kForward, kUnresolved and
   // kTtlExpired, so a caller can say where the frame was headed.
   dataplane::InterfaceId egress = dataplane::kInvalidInterfaceId;
-  // Where the IPv4 header starts in the frame, for WriteForwarded().
+  // Where the IP header starts in the frame, for WriteForwarded(): set for
+  // kForward and kTtlExpired.
   uint16_t l3_offset = 0;
 };
 
-// The read half: the checked parse, the destination resolved in `domain` (a
-// group route picks its member with the frame's own flow hash, the one hash
-// both callers use, reading the fields the caller names -- D-163), the egress
-// check, the neighbor check, and the TTL read before anything is written.
-// `frame` is the packet's first segment and `total_len` the whole frame (0: the
-// span's length).
+namespace forward_internal {
+
+// The parse verdicts, and the family for an IP frame. Returns true when the
+// frame has a destination to resolve (`out` then holds its family only).
+inline bool ParseVerdict(conntrack::ParseStatus parsed,
+                         const conntrack::ParsedFlowPacket &p,
+                         FrameRoute &out) noexcept {
+  out = {};
+  if (p.l3 == conntrack::L3Kind::kIpv6) {
+    out.family = L3Family::kIpv6;
+  }
+  switch (parsed) {
+    case conntrack::ParseStatus::kOk:
+      break;
+    case conntrack::ParseStatus::kNotIp:
+      return false;
+    case conntrack::ParseStatus::kFragment:
+      out.verdict = ForwardVerdict::kNonInitialFragment;
+      return false;
+    default:
+      out.verdict = ForwardVerdict::kMalformed;
+      return false;
+  }
+  if (p.l3 != conntrack::L3Kind::kIpv4 && p.l3 != conntrack::L3Kind::kIpv6) {
+    return false;  // kNotIp
+  }
+  return true;
+}
+
+// The family and link-scope checks: true when the frame goes on to a lookup.
+inline bool Routable(const Router &router, const conntrack::ParsedFlowPacket &p,
+                     FrameRoute &out) noexcept {
+  if (out.family == L3Family::kIpv4 ? !router.has_ipv4() : !router.has_ipv6()) {
+    out.verdict = ForwardVerdict::kFamilyDisabled;
+    return false;
+  }
+  if (out.family == L3Family::kIpv6) {
+    utils::Ipv6Address src;
+    utils::Ipv6Address dst;
+    std::memcpy(src.bytes, p.src.data(), sizeof(src.bytes));
+    std::memcpy(dst.bytes, p.dst.data(), sizeof(dst.bytes));
+    // A router never forwards a link-local source or destination (RFC 4291
+    // 2.5.6), and multicast is not unicast routing's: solicitations, MLD and
+    // link-local traffic are the node's own business.
+    if (dst.IsLinkLocal() || dst.IsMulticast() || src.IsLinkLocal()) {
+      out.verdict = ForwardVerdict::kLinkScope;
+      return false;
+    }
+  }
+  return true;
+}
+
+// The flow hash a group route picks a member with: the address words are
+// opaque, so both callers pass the header's bytes as they are; IPv6 folds its
+// four words of each address.
+inline uint32_t FrameHash(const conntrack::ParsedFlowPacket &p, L3Family family,
+                          FlowHashFields fields) noexcept {
+  uint32_t src_words[4];
+  uint32_t dst_words[4];
+  std::memcpy(src_words, p.src.data(), sizeof(src_words));
+  std::memcpy(dst_words, p.dst.data(), sizeof(dst_words));
+  if (family == L3Family::kIpv4) {
+    return FlowHash(src_words[0], dst_words[0], p.src_port, p.dst_port,
+                    p.protocol, fields);
+  }
+  return FlowHash(src_words[0] ^ src_words[1] ^ src_words[2] ^ src_words[3],
+                  dst_words[0] ^ dst_words[1] ^ dst_words[2] ^ dst_words[3],
+                  p.src_port, p.dst_port, p.protocol, fields);
+}
+
+// The checks after the lookup: local, egress, neighbor, TTL / hop limit.
+// `out` holds the family; `l3_offset` is where the parse found the header.
+inline void Settle(const NextHop *hop, std::span<const uint8_t> frame,
+                   uint16_t l3_offset, FrameRoute &out) noexcept {
+  if (hop == nullptr) {
+    out.verdict = ForwardVerdict::kNoRoute;
+    return;
+  }
+  // A local route is delivery, not forwarding (D-178): it has no egress and no
+  // neighbor, so it is settled before either is consulted.
+  if (hop->kind == NextHopKind::kLocal) {
+    out.verdict = ForwardVerdict::kLocalDelivery;
+    return;
+  }
+  // The egress first: a hop that forwards nowhere is the blackhole shape
+  // (D-160) whatever its neighbor state says, and router.h promises that state
+  // is irrelevant for such a hop -- a route to it ends the packet rather than
+  // resolving anything.
+  if (hop->egress == dataplane::kInvalidInterfaceId) {
+    out.verdict = ForwardVerdict::kNoEgress;
+    return;
+  }
+  out.egress = hop->egress;
+  if (hop->neighbor != NeighborState::kResolved) {
+    out.verdict = ForwardVerdict::kUnresolved;
+    return;
+  }
+  // The boundary DecrementTtl()/DecrementHopLimit() refuse at, read here so a
+  // caller can drop the frame without making it writable (and so without
+  // copying a shared payload) first. The parse found the whole header in
+  // `frame`.
+  out.l3_offset = l3_offset;
+  const uint8_t ttl =
+      out.family == L3Family::kIpv4
+          ? reinterpret_cast<const utils::Ipv4 *>(frame.data() + l3_offset)->ttl
+          : frame[l3_offset + 7];
+  if (ttl <= 1) {
+    out.verdict = ForwardVerdict::kTtlExpired;
+    return;
+  }
+  out.verdict = ForwardVerdict::kForward;
+  out.hop = hop;
+}
+
+}  // namespace forward_internal
+
+// The read half: the checked parse, the family check, the IPv6 link-scope
+// check, the destination resolved in `domain` (a group route picks its member
+// with the frame's own flow hash, the one hash both callers use, reading the
+// fields the caller names -- D-163), the local, egress and neighbor checks,
+// and the TTL / hop limit read before anything is written. `frame` is the
+// packet's first segment and `total_len` the whole frame (0: the span's
+// length).
 inline FrameRoute ResolveFrame(const Router &router, RouteDomainId domain,
                                std::span<const uint8_t> frame, size_t total_len,
                                FlowHashFields fields = FlowHashFields::kL3L4) noexcept {
   conntrack::ParsedFlowPacket p;
   const conntrack::ParseStatus parsed = conntrack::ParseFrame(frame, p, total_len);
-  if (parsed == conntrack::ParseStatus::kNotIp) {
-    return {};
+  FrameRoute out;
+  if (!forward_internal::ParseVerdict(parsed, p, out) ||
+      !forward_internal::Routable(router, p, out)) {
+    return out;
   }
-  if (parsed == conntrack::ParseStatus::kFragment) {
-    return {.verdict = ForwardVerdict::kNonInitialFragment};
+  const uint32_t hash = forward_internal::FrameHash(p, out.family, fields);
+  const NextHop *hop;
+  if (out.family == L3Family::kIpv4) {
+    // The destination in the LPM's own order (host order, whatever the host
+    // is: the endian wrapper converts).
+    utils::be32_t dst;
+    std::memcpy(&dst, p.dst.data(), sizeof(dst));
+    hop = router.Resolve(domain, dst.value(), hash);
+  } else {
+    utils::Ipv6Address dst;
+    std::memcpy(dst.bytes, p.dst.data(), sizeof(dst.bytes));
+    hop = router.Resolve(domain, dst, hash);
   }
-  if (parsed != conntrack::ParseStatus::kOk) {
-    return {.verdict = ForwardVerdict::kMalformed};
-  }
-  if (p.l3 != conntrack::L3Kind::kIpv4) {
-    return {};
-  }
-  // The destination in the LPM's own order (host order, whatever the host is:
-  // the endian wrapper converts) and the flow hash a group route picks a member
-  // with. The address words are opaque, so both callers pass the header's bytes
-  // as they are.
-  utils::be32_t dst;
-  std::memcpy(&dst, p.dst.data(), sizeof(dst));
-  uint32_t src_word, dst_word;
-  std::memcpy(&src_word, p.src.data(), sizeof(src_word));
-  std::memcpy(&dst_word, p.dst.data(), sizeof(dst_word));
-  const NextHop *hop = router.Resolve(
-      domain, dst.value(),
-      FlowHash(src_word, dst_word, p.src_port, p.dst_port, p.protocol, fields));
-  if (hop == nullptr) {
-    return {.verdict = ForwardVerdict::kNoRoute};
-  }
-  // A local route is delivery, not forwarding (D-178): it has no egress and no
-  // neighbor, so it is settled before either is consulted.
-  if (hop->kind == NextHopKind::kLocal) {
-    return {.verdict = ForwardVerdict::kLocalDelivery};
-  }
-  // The egress first: a hop that forwards nowhere is the blackhole shape
-  // (D-160) whatever its neighbor state says, and router.h promises that state
-  // is irrelevant for such a hop -- a route to it ends the packet rather than
-  // resolving anything. The other order reported a blackhole hop's frames as
-  // kUnresolved, which the caller counts as its own outcome.
-  if (hop->egress == dataplane::kInvalidInterfaceId) {
-    return {.verdict = ForwardVerdict::kNoEgress};
-  }
-  if (hop->neighbor != NeighborState::kResolved) {
-    return {.verdict = ForwardVerdict::kUnresolved, .egress = hop->egress};
-  }
-  const auto *ip = reinterpret_cast<const utils::Ipv4 *>(frame.data() + p.l3_offset);
-  if (ip->ttl <= 1) {
-    // The boundary DecrementTtl() refuses at, read here so a caller can drop
-    // the frame without making it writable (and so without copying a shared
-    // payload) first.
-    return {.verdict = ForwardVerdict::kTtlExpired,
-            .egress = hop->egress,
-            .l3_offset = p.l3_offset};
-  }
-  return {.verdict = ForwardVerdict::kForward,
-          .hop = hop,
-          .egress = hop->egress,
-          .l3_offset = p.l3_offset};
+  forward_internal::Settle(hop, frame, p.l3_offset, out);
+  return out;
 }
 
-// The write half: the TTL, then the hop's addresses when it names both; a hop
-// that names none, or only one, is forwarded with the header it arrived with
-// (D-153). `frame` must be writable and the IPv4 header must lie inside it: a
-// packet whose payload is shared, or whose header sits in another segment, is
-// the caller's to make contiguous first, because packet ownership is not the
-// library's.
-inline TtlResult WriteForwarded(std::span<uint8_t> frame, uint16_t l3_offset,
-                                const NextHop &hop) noexcept {
-  auto *ip = reinterpret_cast<utils::Ipv4 *>(frame.data() + l3_offset);
-  const TtlResult ttl = DecrementTtl(*ip);
+// The write half: the IPv4 TTL (checksum updated) or the IPv6 hop limit, then
+// the hop's addresses when it names both; a hop that names none, or only one,
+// is forwarded with the header it arrived with (D-153). `frame` must be
+// writable and the IP header must lie inside it: a packet whose payload is
+// shared, or whose header sits in another segment, is the caller's to make
+// contiguous first, because packet ownership is not the library's.
+inline TtlResult WriteForwarded(std::span<uint8_t> frame, L3Family family,
+                                uint16_t l3_offset, const NextHop &hop) noexcept {
+  const TtlResult ttl =
+      family == L3Family::kIpv4
+          ? DecrementTtl(*reinterpret_cast<utils::Ipv4 *>(frame.data() + l3_offset))
+          : DecrementHopLimit(frame.subspan(l3_offset));
   if (ttl != TtlResult::kForward) {
     return ttl;
   }
@@ -149,18 +244,18 @@ inline TtlResult WriteForwarded(std::span<uint8_t> frame, uint16_t l3_offset,
 }
 
 // The batch read half: ResolveFrame's stages for frames that share one domain,
-// with the lookup done once for the whole batch, so a backend that has a bulk
-// lookup uses it -- one rte_fib_lookup_bulk per batch instead of one per frame,
-// which is the gap live_perf's M.router/fib row shows (D-132, K7).
+// with the lookups done once per family for the whole batch -- one IPv4 bulk
+// lookup for the IPv4 frames (one rte_fib_lookup_bulk with that backend, the
+// gap live_perf's M.router/fib row shows, D-132, K7) and one
+// Router::ResolveBatch6 (one rte_fib6_lookup_bulk) for the IPv6 frames.
 //
-// The parse and the checks are frame-local and run per frame; only the lookup
-// is shared. A frame the parse settles (not IP, a fragment, malformed) is
-// settled without a lookup, so the batch the lookup sees holds only the frames
-// that have a destination to resolve.
+// The parse and the checks are frame-local and run per frame; only the
+// lookups are shared. A frame the parse, family or link-scope checks settle is
+// settled without a lookup.
 //
-// Every frame must be in `domain`: the lookup is one call for one table, which
-// is what Router::ResolveBatch takes. A caller whose frames carry different
-// domains groups them, and can fall back to ResolveFrame.
+// Every frame must be in `domain`: each lookup is one call for one table. A
+// caller whose frames carry different domains groups them, and can fall back
+// to ResolveFrame.
 //
 // `frames[i]` is the packet's first segment and `total_lens[i]` the whole frame
 // (0: the span's length). At most Router::kMaxBatch frames.
@@ -171,87 +266,72 @@ inline void ResolveFrames(const Router &router, RouteDomainId domain,
                           FlowHashFields fields = FlowHashFields::kL3L4) noexcept {
   promise(frames.size() == out.size() && frames.size() == total_lens.size());
   promise(frames.size() <= Router::kMaxBatch);
-  uint32_t dsts[Router::kMaxBatch];
-  uint32_t hashes[Router::kMaxBatch];
-  size_t positions[Router::kMaxBatch];  // where each looked-up frame came from
-  uint16_t offsets[Router::kMaxBatch];  // its IPv4 header, for the TTL read
-  // Not zeroed: the mask is the authority, and ResolveBatchIn clears the bit
+  // Per family: the destinations, the hashes, where each looked-up frame came
+  // from and its header offset.
+  uint32_t dsts4[Router::kMaxBatch];
+  // Ipv6Address zero-initialises its bytes; a union leaves the array raw, and
+  // only the n6 elements a lookup reads are constructed below.
+  union Ipv6Batch {
+    Ipv6Batch() {}
+    utils::Ipv6Address at[Router::kMaxBatch];
+  } dsts6;
+  uint32_t hashes4[Router::kMaxBatch];
+  uint32_t hashes6[Router::kMaxBatch];
+  uint8_t positions4[Router::kMaxBatch];
+  uint8_t positions6[Router::kMaxBatch];
+  uint16_t offsets4[Router::kMaxBatch];
+  uint16_t offsets6[Router::kMaxBatch];
+  // Not zeroed: the mask is the authority, and a batch resolve clears the bit
   // for a position it leaves unwritten, so only written elements are read.
-  const NextHop *hops[Router::kMaxBatch];
-  size_t batch = 0;
+  const NextHop *hops4[Router::kMaxBatch];
+  const NextHop *hops6[Router::kMaxBatch];
+  size_t n4 = 0;
+  size_t n6 = 0;
   for (size_t i = 0; i < frames.size(); i++) {
     conntrack::ParsedFlowPacket p;
-    const conntrack::ParseStatus parsed = conntrack::ParseFrame(frames[i], p, total_lens[i]);
-    if (parsed == conntrack::ParseStatus::kNotIp) {
-      out[i] = {};
+    const conntrack::ParseStatus parsed =
+        conntrack::ParseFrame(frames[i], p, total_lens[i]);
+    if (!forward_internal::ParseVerdict(parsed, p, out[i]) ||
+        !forward_internal::Routable(router, p, out[i])) {
       continue;
     }
-    if (parsed == conntrack::ParseStatus::kFragment) {
-      out[i] = {.verdict = ForwardVerdict::kNonInitialFragment};
-      continue;
+    const uint32_t hash = forward_internal::FrameHash(p, out[i].family, fields);
+    if (out[i].family == L3Family::kIpv4) {
+      utils::be32_t dst;
+      std::memcpy(&dst, p.dst.data(), sizeof(dst));
+      dsts4[n4] = dst.value();
+      hashes4[n4] = hash;
+      positions4[n4] = static_cast<uint8_t>(i);
+      offsets4[n4] = p.l3_offset;
+      n4++;
+    } else {
+      std::memcpy(std::construct_at(&dsts6.at[n6])->bytes, p.dst.data(),
+                  sizeof(utils::Ipv6Address::bytes));
+      hashes6[n6] = hash;
+      positions6[n6] = static_cast<uint8_t>(i);
+      offsets6[n6] = p.l3_offset;
+      n6++;
     }
-    if (parsed != conntrack::ParseStatus::kOk) {
-      out[i] = {.verdict = ForwardVerdict::kMalformed};
-      continue;
-    }
-    if (p.l3 != conntrack::L3Kind::kIpv4) {
-      out[i] = {};
-      continue;
-    }
-    // The destination in the LPM's own order and the hash a group route picks
-    // a member with, as ResolveFrame reads them.
-    utils::be32_t dst;
-    std::memcpy(&dst, p.dst.data(), sizeof(dst));
-    uint32_t src_word, dst_word;
-    std::memcpy(&src_word, p.src.data(), sizeof(src_word));
-    std::memcpy(&dst_word, p.dst.data(), sizeof(dst_word));
-    dsts[batch] = dst.value();
-    hashes[batch] = FlowHash(src_word, dst_word, p.src_port, p.dst_port, p.protocol, fields);
-    positions[batch] = i;
-    offsets[batch] = p.l3_offset;
-    out[i] = {};
-    batch++;
   }
-  const uint64_t mask =
-      batch == 0 ? 0
-                 : router.ResolveBatch(domain, std::span(dsts, batch),
-                                       std::span(hashes, batch), std::span(hops, batch));
-  for (size_t b = 0; b < batch; b++) {
-    const size_t i = positions[b];
-    const NextHop *hop = (mask & (uint64_t{1} << b)) != 0 ? hops[b] : nullptr;
-    if (hop == nullptr) {
-      out[i].verdict = ForwardVerdict::kNoRoute;
-      continue;
+  if (n4 != 0) {
+    const uint64_t mask =
+        router.ResolveBatch(domain, std::span(dsts4, n4),
+                            std::span(hashes4, n4), std::span(hops4, n4));
+    for (size_t b = 0; b < n4; b++) {
+      const size_t i = positions4[b];
+      forward_internal::Settle((mask >> b & 1) != 0 ? hops4[b] : nullptr,
+                               frames[i], offsets4[b], out[i]);
     }
-    // Delivery, not forwarding (D-178), before either leg of the hop is read.
-    if (hop->kind == NextHopKind::kLocal) {
-      out[i].verdict = ForwardVerdict::kLocalDelivery;
-      continue;
+  }
+  if (n6 != 0) {
+    const uint64_t mask =
+        router.ResolveBatch6(domain, std::span(dsts6.at, n6),
+                             std::span(hashes6, n6), std::span(hops6, n6));
+    for (size_t b = 0; b < n6; b++) {
+      const size_t i = positions6[b];
+      forward_internal::Settle((mask >> b & 1) != 0 ? hops6[b] : nullptr,
+                               frames[i], offsets6[b], out[i]);
     }
-    // The egress first, as ResolveFrame has it: a hop that forwards nowhere is
-    // the blackhole shape (D-160) whatever its neighbor state says.
-    if (hop->egress == dataplane::kInvalidInterfaceId) {
-      out[i].verdict = ForwardVerdict::kNoEgress;
-      continue;
-    }
-    if (hop->neighbor != NeighborState::kResolved) {
-      out[i].verdict = ForwardVerdict::kUnresolved;
-      out[i].egress = hop->egress;
-      continue;
-    }
-    // The header offset is set where ResolveFrame sets it -- with the forward
-    // and the TTL boundary, the two verdicts a caller writes bytes for.
-    const auto *ip = reinterpret_cast<const utils::Ipv4 *>(frames[i].data() + offsets[b]);
-    if (ip->ttl <= 1) {
-      out[i].verdict = ForwardVerdict::kTtlExpired;
-      out[i].egress = hop->egress;
-      out[i].l3_offset = offsets[b];
-      continue;
-    }
-    out[i].verdict = ForwardVerdict::kForward;
-    out[i].hop = hop;
-    out[i].egress = hop->egress;
-    out[i].l3_offset = offsets[b];
   }
 }
 

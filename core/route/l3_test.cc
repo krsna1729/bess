@@ -193,7 +193,7 @@ TEST(L3PacketTest, ArpRequestAndReplyRoundTrip) {
 // neighbor follow its MAC with no route change, and a controller statement
 // and an ARP-learned answer produce the same NextHop.
 TEST(NeighborTableTest, ResolutionRepublishesBoundNextHopsOnly) {
-  LpmRouteTable::Config config;
+  const Router::Config config{.ipv4 = LpmRouteTable::Config{}};
   auto made = Router::Create("neighbors", config, 16, bess::runtime::runtime().rcu());
   ASSERT_TRUE(made.has_value());
   Router &router = **made;

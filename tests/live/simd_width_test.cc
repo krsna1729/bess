@@ -146,7 +146,7 @@ TEST_P(SimdWidthLiveTest, ForwardsAndShutsDownWithoutSigill) {
   // table is rte_lpm, one of the width-sensitive libraries this pipeline runs.
   auto router = types.Make(
       "bess.pb.RouterArg",
-      R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": 16, "max_next_hops": 2})");
+      R"({"mode": "ROUTE_MODE_DESTINATION", "max_ipv4_routes": 16, "max_next_hops": 2})");
   auto hop_key = types.Make("bess.pb.RouterNextHopIdKey", R"({"id": 1})");
   auto hop_value =
       types.Make("bess.pb.RouterNextHopValue",

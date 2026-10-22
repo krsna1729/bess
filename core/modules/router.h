@@ -41,22 +41,28 @@
 //     appliance does (examples/appliances/router) and with the same library
 //     calls: the route domain the packet carries (a `route_domain` be32
 //     attribute a VIF writes; domain 0 when nothing writes it) selects the
-//     FIB. An IPv4 frame goes through the library's forwarding chain
-//     (route/forward.h, D-157), which parses the frame, looks the destination
-//     up in that domain, checks the neighbor, decrements the TTL and writes
-//     the hop's addresses. forward.h is IPv4-only: an IPv6 frame is resolved
-//     here, against the domain's IPv6 routes, with the same hop, neighbor,
-//     group and punt policy, route::DecrementHopLimit and the same address
-//     write (D-179). Link-scoped IPv6 -- a link-local or multicast destination,
-//     or a link-local source -- is never forwarded (RFC 4291 2.5.6): it goes
-//     to the local punt gate, or is dropped, and is counted either way. A
-//     packet leaves on its hop's egress gate. A route names a next hop or a
-//     next-hop group; a group route picks its member by the frame's flow hash,
-//     so a flow keeps one member in both paths. A frame whose headers do not
-//     parse, a non-initial IPv4 fragment (its L4 header is in an earlier
-//     fragment, so it cannot be hashed consistently), and a frame that is
-//     neither IPv4 nor IPv6 are dropped and counted. The `next_hop_id`
-//     attribute is ignored in this mode, even if some module writes it.
+//     FIB. Every frame goes through the library's dual-stack forwarding chain
+//     (route/forward.h, D-157, D-179), which parses the frame once, looks the
+//     destination up in that domain's IPv4 or IPv6 FIB (one bulk lookup per
+//     family for a run of frames), checks the neighbor, decrements the TTL or
+//     hop limit and writes the hop's addresses. Link-scoped IPv6 -- a
+//     link-local or multicast destination, or a link-local source -- is never
+//     forwarded (RFC 4291 2.5.6): it goes to the local punt gate, or is
+//     dropped, and is counted either way. A packet leaves on its hop's egress
+//     gate. A route names a next hop or a next-hop group; a group route picks
+//     its member by the frame's flow hash, so a flow keeps one member in both
+//     paths. A frame whose headers do not parse, a non-initial fragment (its
+//     L4 header is in an earlier fragment, so it cannot be hashed
+//     consistently), and a frame that is neither IPv4 nor IPv6 are dropped and
+//     counted. The `next_hop_id` attribute is ignored in this mode, even if
+//     some module writes it.
+//
+// Address families (D-179). RouterArg enables IPv4 and IPv6 independently,
+// each with its own route and tbl8 capacity; at least one is enabled. A
+// disabled family has no FIB in any domain, and in both modes its frames are
+// dropped and counted (family_disabled_frames), its routes, interface
+// addresses and neighbor bindings are refused, and its neighbor protocol (ARP
+// or ND) is not read.
 //
 // Both modes drop a packet whose hop is unknown, or whose neighbor is not
 // resolved: what to do toward an unresolved neighbor (queue, punt, drop) is
@@ -179,6 +185,11 @@ class Router final : public Module {
   uint64_t link_scope_frames() const noexcept {
     return link_scope_frames_.load(std::memory_order_relaxed);
   }
+  // IP frames of a family the router does not enable (D-179): no FIB, no
+  // forwarding, dropped in both modes and counted here.
+  uint64_t family_disabled_frames() const noexcept {
+    return family_disabled_frames_.load(std::memory_order_relaxed);
+  }
   // ARP requests and Neighbor Solicitations a resolving router received: not
   // the resolver's input, so they go to punt_local_gate or are dropped, and
   // are counted either way.
@@ -198,6 +209,11 @@ class Router final : public Module {
   }
 
  private:
+  // tbl8 groups per domain when RouterArg sets a family's routes but not its
+  // groups (D-179): IPv4's rte_lpm/rte_fib default, and rte_fib6's.
+  static constexpr uint64_t kDefaultIpv4Tbl8s = 256;
+  static constexpr uint64_t kDefaultIpv6Tbl8s = 8192;
+
   // Mode 1 (D-155): resolve the `next_hop_id` each packet carries.
   void RouteById(Context *ctx, bess::PacketBatch *batch, bess::metadata::mt_offset_t offset);
   // Mode 2 (D-155): look each packet's destination address up in its domain's
@@ -216,11 +232,15 @@ class Router final : public Module {
   // The gate a counted, unforwarded verdict sends its frame to (D-162,
   // D-178): the miss, unresolved or local punt gate, else DROP_GATE.
   gate_idx_t PuntGateOf(bess::route::ForwardVerdict verdict) const;
-  // Destination mode for one IPv6 frame (forward.h is IPv4-only): resolves,
-  // counts, and writes the hop limit and addresses. Returns the frame's gate.
-  gate_idx_t RouteIpv6(bess::PacketBatch *batch, int i,
-                       bess::route::RouteDomainId domain,
-                       const bess::conntrack::ParsedFlowPacket &parsed);
+  // Whether `family` is one this router routes (D-179).
+  bool FamilyEnabled(bess::route::L3Family family) const noexcept {
+    return family == bess::route::L3Family::kIpv6 ? router_->has_ipv6()
+                                                  : router_->has_ipv4();
+  }
+  // Whether the frame's IPv4 or IPv6 header lies in its first segment, so it
+  // can be written in place.
+  static bool HeaderFits(bess::PacketRef pkt, bess::route::L3Family family,
+                         size_t l3_offset);
   // Takes resolver input (ARP replies, Neighbor Advertisements) out of the
   // batch onto the receive ring, punts or drops ARP requests and Neighbor
   // Solicitations, and leaves everything else in the batch.
@@ -300,6 +320,8 @@ class Router final : public Module {
   // A route said the destination is this node's address (D-178): delivery, not
   // a drop and not a miss.
   std::atomic<uint64_t> local_frames_{0};
+  // An IP frame of a family the router does not enable (D-179).
+  std::atomic<uint64_t> family_disabled_frames_{0};
   // An IPv6 frame of link scope (D-179): never forwarded.
   std::atomic<uint64_t> link_scope_frames_{0};
   // ARP requests and Neighbor Solicitations: punted or dropped, not resolved.

@@ -1681,6 +1681,7 @@ TEST_F(ApplyPipelineTest, ListedResourcesConvergeAndUnlistedOnesStay) {
 // resolver-owned hop in rt/routes.
 PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids) {
   bess::pb::RouterArg arg;
+  arg.set_max_ipv4_routes(16);
   auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
@@ -1923,6 +1924,8 @@ const std::map<std::string, std::string> &InitArgs() {
       {"RoundRobin", R"({"gates": [0]})"},
       {"RandomSplit", R"({"drop_rate": 0, "gates": [0]})"},
       {"Replicate", R"({"gates": [0]})"},
+      // A Router routes at least one address family (D-179).
+      {"Router", R"({"max_ipv4_routes": 16})"},
   };
   return args;
 }
