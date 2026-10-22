@@ -29,16 +29,28 @@
 
 namespace bess::route {
 
-// IPv4 neighbor resolution over Ethernet (ARP): solicitation with retries and
-// backoff, learning, aging, MAC changes, failure and recovery (M15, D-175).
+// IPv4 neighbor resolution over Ethernet (ARP) and IPv6 Neighbor Discovery:
+// solicitation with retries and backoff, learning, aging, MAC changes,
+// failure and recovery (M15, D-175).
 //
 // The resolver is the event source for the neighbor table
-// (`neighbor_table.h`): it owns one neighbor entry per (interface, IPv4
-// address), created by Bind, and moves it through
+// (`neighbor_table.h`): it owns one neighbor entry per (interface, address),
+// created by Bind, and moves it through
 //
-//   kIncomplete --reply--> kResolved --aging--> kIncomplete (re-solicit)
-//        |                                   |
-//        +--max probes--> kUnreachable --retry--> kIncomplete
+//   kIncomplete --reply--> kResolved --aging--> kResolved, reconfirming
+//        |                    ^   (keeps its MAC; solicits)  |      |
+//        |                    +-----------reply--------------+      |
+//        +--max probes--> kUnreachable <------max probes------------+
+//                              |
+//                              +--retry--> kIncomplete
+//
+// Aging does not take a resolved neighbor out of service (RFC 4861's STALE
+// and PROBE states, D-179): when its reachable lifetime ends it keeps
+// forwarding on the MAC it has while the resolver solicits again, with the
+// same probe count and backoff as a first attempt. A reply refreshes it; only
+// an attempt that sends max_probes without one fails it to kUnreachable, which
+// clears the MAC. So a live neighbor never drops traffic for being re-checked,
+// and a dead one is out of service after at most the probe budget.
 //
 // Every transition calls NeighborTable::Update and returns the next hops to
 // republish, so the caller still publishes adjacency with the existing
@@ -106,9 +118,11 @@ class NeighborResolver {
     // Solicitations per resolution attempt (1..). The attempt fails after the
     // last one, when its retry timer fires.
     uint32_t max_probes = 3;
-    // How long a resolved neighbor stays usable before it is solicited again.
-    // Zero disables aging: a resolved neighbor stays resolved until a reply
-    // changes it or it is unbound.
+    // How long a resolved neighbor goes unconfirmed before it is solicited
+    // again. It keeps forwarding on its MAC while that attempt runs and fails
+    // only when the attempt does (max_probes without a reply). Zero disables
+    // aging: a resolved neighbor stays resolved until a reply changes it or it
+    // is unbound.
     uint64_t reachable_lifetime = 30000;
     // How long an unreachable neighbor waits before another attempt. Zero
     // means no further attempt: it stays unreachable until a reply arrives or
@@ -231,6 +245,7 @@ class NeighborResolver {
         entry->second.epoch = epoch;
         entry->second.state = NeighborState::kIncomplete;
         entry->second.probes = 0;
+        entry->second.reconfirming = false;
         if (!Arm(update.key, entry->second, now, timing_.first_probe)) {
           // No usable timer node: forget the entry rather than keep a
           // neighbor that can never solicit. The committed update already
@@ -359,6 +374,7 @@ class NeighborResolver {
         learned ? learned->state : NeighborState::kIncomplete;
     entry->second.state = state;
     entry->second.probes = 0;
+    entry->second.reconfirming = false;
     // A neighbor that is already known continues from that state; a fresh
     // one solicits. The two "no timer" configurations (aging and retry
     // disabled) leave the entry in its current state.
@@ -475,6 +491,7 @@ class NeighborResolver {
     neighbors_.Commit(prepared);
     entry->second.state = NeighborState::kResolved;
     entry->second.probes = 0;
+    entry->second.reconfirming = false;
     AppendUpdates(std::move(prepared.updates), out);
     return out;
   }
@@ -557,6 +574,7 @@ class NeighborResolver {
     neighbors_.Commit(prepared);
     entry->second.state = NeighborState::kResolved;
     entry->second.probes = 0;
+    entry->second.reconfirming = false;
     AppendUpdates(std::move(prepared.updates), out);
     return out;
   }
@@ -604,7 +622,8 @@ class NeighborResolver {
           continue;
         }
         PlanDue(plan, entry->second, now);
-        update_count += plan.prepared.updates.size();
+        update_count +=
+            plan.prepared.updates.size() + plan.fail_closed.updates.size();
       }
       out.updates.reserve(update_count);
     } catch (...) {
@@ -630,6 +649,7 @@ class NeighborResolver {
       }
       entry->second.state = plan.state;
       entry->second.probes = plan.probes;
+      entry->second.reconfirming = plan.reconfirming;
       AppendUpdates(std::move(plan.prepared.updates), out);
       if (plan.solicit) {
         auto iface = interfaces_.find(plan.key.interface);
@@ -659,8 +679,13 @@ class NeighborResolver {
         if (!ArmAt(plan.key, entry->second, plan.deadline)) {
           // The wheel refused a new node for a timer the entry needs: forget
           // the entry rather than keep a neighbor that nothing will age,
-          // retry or recover. The committed plan state (incomplete or
-          // unreachable) already took the MAC out of service.
+          // retry or recover. An incomplete or unreachable plan state already
+          // took the MAC out of service; a reconfirming neighbor still has
+          // it, so it fails closed with the transition planned for that.
+          if (plan.fail_closed.changed) {
+            neighbors_.Commit(plan.fail_closed);
+            AppendUpdates(std::move(plan.fail_closed.updates), out);
+          }
           Disarm(entry->second);
           entries_.erase(entry);
         }
@@ -701,6 +726,9 @@ class NeighborResolver {
     uint32_t epoch = 0;
     NeighborState state = NeighborState::kIncomplete;
     uint32_t probes = 0;  // solicitations sent in the current attempt
+    // Resolved, its reachable lifetime over, and being solicited again: it
+    // keeps its MAC until the attempt fails (PlanDue).
+    bool reconfirming = false;
     uint32_t serial = 0;  // this entry's current arming
     dataplane::ExpiryHandle timer = dataplane::kNoExpiry;
   };
@@ -790,30 +818,38 @@ class NeighborResolver {
     bool remove = false;
     NeighborState state = NeighborState::kIncomplete;
     uint32_t probes = 0;
+    bool reconfirming = false;
     bool solicit = false;
     bool arm = false;
     uint64_t deadline = 0;
     NeighborTable::Prepared prepared;
+    // For a reconfirming plan: the unreachable transition to commit instead
+    // if its timer cannot be armed (Poll), staged here so that commit does
+    // not allocate.
+    NeighborTable::Prepared fail_closed;
   };
 
   // What firing `entry`'s timer means, without changing anything. A resolved
-  // or unreachable neighbor is solicited again from kIncomplete; an attempt
-  // that has sent max_probes fails into kUnreachable; otherwise the next
-  // solicitation is fired. The plan's table transition is prepared here.
+  // neighbor whose lifetime ran out starts reconfirming: it stays resolved,
+  // MAC included, and is solicited again. An unreachable neighbor's retry
+  // solicits again from kIncomplete. An attempt that has sent max_probes fails
+  // into kUnreachable (from reconfirming too); otherwise the next solicitation
+  // is fired. The plan's table transition is prepared here.
   void PlanDue(Plan &plan, const Entry &entry, uint64_t now) {
     NeighborState state = entry.state;
     uint32_t probes = entry.probes;
-    if (state == NeighborState::kResolved ||
-        state == NeighborState::kUnreachable) {
-      // Aging or the retry of a failed attempt: solicit again. A resolved
-      // neighbor loses its MAC until a reply arrives (NeighborTable::Make
-      // clears it for an incomplete state).
-      state = NeighborState::kIncomplete;
+    bool reconfirming = entry.reconfirming;
+    if (state == NeighborState::kResolved && !reconfirming) {
+      reconfirming = true;  // aging: keep the MAC, solicit again
+      probes = 0;
+    } else if (state == NeighborState::kUnreachable) {
+      state = NeighborState::kIncomplete;  // the retry of a failed attempt
       probes = 0;
     }
     if (probes >= timing_.max_probes) {
       state = NeighborState::kUnreachable;
       probes = 0;
+      reconfirming = false;
       plan.arm = timing_.unreachable_retry != 0;
       plan.deadline = dataplane::ExpiryWheel<TimerPayload>::After(
           now, timing_.unreachable_retry);
@@ -826,9 +862,14 @@ class NeighborResolver {
     }
     plan.state = state;
     plan.probes = probes;
+    plan.reconfirming = reconfirming;
     if (state != entry.state) {
       plan.prepared =
           neighbors_.Prepare(plan.key, state, utils::Ethernet::Address{});
+    }
+    if (reconfirming) {
+      plan.fail_closed = neighbors_.Prepare(
+          plan.key, NeighborState::kUnreachable, utils::Ethernet::Address{});
     }
   }
 

@@ -196,12 +196,67 @@ TEST(NeighborResolverTest, SolicitsWithBackoffThenFailsAndRecovers) {
   EXPECT_EQ(Mac("02:00:00:00:00:aa"), progress.updates[0].second.dst_mac);
   EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
 
-  // Aging solicits again and takes the MAC out of service meanwhile.
+  // Aging solicits again but keeps the neighbor in service: nothing the
+  // dataplane reads changes while it is reconfirmed.
   EXPECT_TRUE(resolver->Poll(209, 16).empty());
   progress = resolver->Poll(210, 16);
+  EXPECT_TRUE(progress.updates.empty());
+  EXPECT_EQ(1u, progress.solicitations.size());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+  EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+
+  // The reconfirmation backs off like a first attempt (10, then 20) and keeps
+  // the MAC throughout.
+  EXPECT_TRUE(resolver->Poll(219, 16).empty());
+  progress = resolver->Poll(220, 16);
+  EXPECT_TRUE(progress.updates.empty());
+  EXPECT_EQ(1u, progress.solicitations.size());
+  progress = resolver->Poll(240, 16);
+  EXPECT_TRUE(progress.updates.empty());
+  EXPECT_EQ(1u, progress.solicitations.size());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+
+  // Only when max_probes went unanswered does it fail closed.
+  EXPECT_TRUE(resolver->Poll(259, 16).empty());
+  progress = resolver->Poll(260, 16);
   ASSERT_EQ(1u, progress.updates.size());
-  EXPECT_EQ(NeighborState::kIncomplete, progress.updates[0].second.neighbor);
+  EXPECT_EQ(NeighborState::kUnreachable, progress.updates[0].second.neighbor);
   EXPECT_EQ(Ethernet::Address{}, progress.updates[0].second.dst_mac);
+  EXPECT_TRUE(progress.solicitations.empty());
+  EXPECT_EQ(NeighborState::kUnreachable, State(*resolver, key).state);
+}
+
+// A reply during reconfirmation ends it: the neighbor stays resolved with no
+// republication, and the next aging is a full reachable lifetime later.
+TEST(NeighborResolverTest, AReplyDuringReconfirmationKeepsTheNeighbor) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01",
+                                                 kMyIp),
+                                           0)
+                  .has_value());
+  const NeighborResolver::Key key = Key(kIface1, kPeer1);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  const auto reply = ReplyTo(progress.solicitations[0].frame,
+                             Mac("02:00:00:00:00:aa"));
+  ASSERT_EQ(1u, resolver->OnArp(10, kIface1, reply).updates.size());
+
+  // Aging at 110 solicits; the neighbor answers before the attempt runs out.
+  progress = resolver->Poll(110, 16);
+  EXPECT_TRUE(progress.updates.empty());
+  ASSERT_EQ(1u, progress.solicitations.size());
+  EXPECT_TRUE(resolver->Poll(120, 16).updates.empty());
+  EXPECT_TRUE(resolver->OnArp(125, kIface1, reply).empty());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+
+  // The attempt's remaining retries are gone, and nothing fails at 140/160.
+  EXPECT_TRUE(resolver->Poll(224, 16).empty());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+  // The next aging, 100 after the reply, starts a fresh reconfirmation.
+  progress = resolver->Poll(225, 16);
+  EXPECT_TRUE(progress.updates.empty());
   EXPECT_EQ(1u, progress.solicitations.size());
 }
 
@@ -245,9 +300,9 @@ TEST(NeighborResolverTest, ARepeatedReplyRefreshesAgingWithoutRepublishing) {
   EXPECT_TRUE(resolver->OnArp(50, kIface1, reply).empty());
   EXPECT_TRUE(resolver->Poll(110, 16).empty());
   progress = resolver->Poll(150, 16);
-  ASSERT_EQ(1u, progress.updates.size());
-  EXPECT_EQ(NeighborState::kIncomplete, progress.updates[0].second.neighbor);
+  EXPECT_TRUE(progress.updates.empty()) << "aging keeps the neighbor in service";
   EXPECT_EQ(1u, progress.solicitations.size());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
 }
 
 TEST(NeighborResolverTest, AMacChangeRepublishesEveryBoundNextHopAndNoRoute) {
@@ -702,59 +757,83 @@ std::unique_ptr<NeighborResolver> ResolvedPair(NeighborResolver::Key *a,
   return resolver;
 }
 
-// A refused allocation while Poll commits an aging transition must not lose
-// the timer or change the table: every due entry is re-armed at its own
-// deadline, and the retry produces the same update and solicitation.
+// A refused allocation while Poll plans a transition must not lose the timer
+// or change the table: every due entry is re-armed at its own deadline, and
+// the retry produces the same transitions. Checked at both aging steps: the
+// start of a reconfirmation (solicitations, no table change) and its failure
+// (no solicitation, both neighbors unreachable).
 TEST(NeighborResolverFaultTest, PollAllocationFailureLosesNoTimerOrUpdate) {
-  const size_t points = ForEachFailurePoint([&](size_t fail_at) {
-    NeighborResolver::Key key_a;
-    NeighborResolver::Key key_b;
-    auto resolver = ResolvedPair(&key_a, &key_b);
-    if (!resolver) {
-      return;
-    }
-    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_a).state);
-    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_b).state);
-    EXPECT_EQ(2u, resolver->armed());
-    bool threw = false;
-    bool injected = false;
-    NeighborResolver::Progress progress;
-    {
-      AllocationFaults faults(fail_at);
-      try {
-        progress = resolver->Poll(110, 16);
-      } catch (const std::bad_alloc &) {
-        threw = true;
+  // The reconfirmation's probes before `until`, outside the fault window.
+  const auto probe_until = [](NeighborResolver &resolver, uint64_t until) {
+    for (const uint64_t t : {uint64_t{110}, uint64_t{120}, uint64_t{140}}) {
+      if (t >= until) {
+        return;
       }
-      injected = faults.injected();
-    }
-    if (!injected) {
-      EXPECT_FALSE(threw);
-      EXPECT_EQ(2u, progress.updates.size());
+      const auto progress = resolver.Poll(t, 16);
+      EXPECT_TRUE(progress.updates.empty());
       EXPECT_EQ(2u, progress.solicitations.size());
-      EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key_a).state);
-      EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key_b).state);
-      return;
     }
-    EXPECT_TRUE(threw);
-    // Nothing committed, and both aging timers are still live (re-armed at
-    // 110 after the wheel spent their nodes during planning).
-    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_a).state);
-    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_b).state);
-    EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key_a).mac);
-    EXPECT_EQ(Mac("02:00:00:00:00:bb"), State(*resolver, key_b).mac);
-    EXPECT_EQ(2u, resolver->armed());
+  };
+  struct Step {
+    uint64_t now;
+    size_t updates;
+    size_t solicitations;
+    NeighborState after;
+  };
+  for (const Step step : {Step{110, 0, 2, NeighborState::kResolved},
+                          Step{160, 2, 0, NeighborState::kUnreachable}}) {
+    SCOPED_TRACE(step.now);
+    const size_t points = ForEachFailurePoint([&](size_t fail_at) {
+      NeighborResolver::Key key_a;
+      NeighborResolver::Key key_b;
+      auto resolver = ResolvedPair(&key_a, &key_b);
+      if (!resolver) {
+        return;
+      }
+      probe_until(*resolver, step.now);
+      EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_a).state);
+      EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_b).state);
+      EXPECT_EQ(2u, resolver->armed());
+      bool threw = false;
+      bool injected = false;
+      NeighborResolver::Progress progress;
+      {
+        AllocationFaults faults(fail_at);
+        try {
+          progress = resolver->Poll(step.now, 16);
+        } catch (const std::bad_alloc &) {
+          threw = true;
+        }
+        injected = faults.injected();
+      }
+      if (!injected) {
+        EXPECT_FALSE(threw);
+        EXPECT_EQ(step.updates, progress.updates.size());
+        EXPECT_EQ(step.solicitations, progress.solicitations.size());
+        EXPECT_EQ(step.after, State(*resolver, key_a).state);
+        EXPECT_EQ(step.after, State(*resolver, key_b).state);
+        return;
+      }
+      EXPECT_TRUE(threw);
+      // Nothing committed, and both timers are still live (re-armed at their
+      // deadline after the wheel spent their nodes during planning).
+      EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_a).state);
+      EXPECT_EQ(NeighborState::kResolved, State(*resolver, key_b).state);
+      EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key_a).mac);
+      EXPECT_EQ(Mac("02:00:00:00:00:bb"), State(*resolver, key_b).mac);
+      EXPECT_EQ(2u, resolver->armed());
 
-    // The retry converges to the transitions the refused poll was making,
-    // for both entries, so no other due work was lost either.
-    progress = resolver->Poll(110, 16);
-    EXPECT_EQ(2u, progress.updates.size());
-    EXPECT_EQ(2u, progress.solicitations.size());
-    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key_a).state);
-    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key_b).state);
-    EXPECT_EQ(2u, resolver->armed());
-  });
-  EXPECT_GT(points, 0u);
+      // The retry converges to the transitions the refused poll was making,
+      // for both entries, so no other due work was lost either.
+      progress = resolver->Poll(step.now, 16);
+      EXPECT_EQ(step.updates, progress.updates.size());
+      EXPECT_EQ(step.solicitations, progress.solicitations.size());
+      EXPECT_EQ(step.after, State(*resolver, key_a).state);
+      EXPECT_EQ(step.after, State(*resolver, key_b).state);
+      EXPECT_EQ(2u, resolver->armed());
+    });
+    EXPECT_GT(points, 0u);
+  }
 }
 
 // A refused allocation while ConfigureInterface stages an identity change
@@ -977,16 +1056,25 @@ TEST(NeighborResolverTest, NdSolicitationResolvesAndAges) {
   EXPECT_EQ(kIface1, progress.updates[0].second.egress);
   EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
 
-  // Aging takes it out of service and solicits again over ND.
+  // Aging solicits again over ND and keeps the neighbor in service.
   progress = resolver->Poll(110, 16);
-  ASSERT_EQ(1u, progress.updates.size());
-  EXPECT_EQ(NeighborState::kIncomplete, progress.updates[0].second.neighbor);
+  EXPECT_TRUE(progress.updates.empty());
+  EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
   ASSERT_EQ(1u, progress.solicitations.size());
   EXPECT_EQ(NdType::kNeighborSolicitation,
             Nd(ParseNeighborDiscovery(std::span<const uint8_t>(
                    progress.solicitations[0].frame.data(),
                    progress.solicitations[0].length)))
                 .type);
+
+  // Unanswered (probes at 120 and 140), it fails closed at 160.
+  EXPECT_TRUE(resolver->Poll(120, 16).updates.empty());
+  EXPECT_TRUE(resolver->Poll(140, 16).updates.empty());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+  progress = resolver->Poll(160, 16);
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kUnreachable, progress.updates[0].second.neighbor);
+  EXPECT_EQ(Ethernet::Address{}, progress.updates[0].second.dst_mac);
 }
 
 TEST(NeighborResolverTest, NdAdvertisementsFollowMacAndOverrideSemantics) {
@@ -1413,9 +1501,9 @@ TEST(NeighborResolverFaultTest, NdPollAllocationFailureLosesNoTimer) {
     }
     if (!injected) {
       EXPECT_FALSE(threw);
-      EXPECT_EQ(1u, progress.updates.size());
+      EXPECT_TRUE(progress.updates.empty());
       EXPECT_EQ(1u, progress.solicitations.size());
-      EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+      EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
       return;
     }
     EXPECT_TRUE(threw);
@@ -1423,9 +1511,10 @@ TEST(NeighborResolverFaultTest, NdPollAllocationFailureLosesNoTimer) {
     EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
     EXPECT_EQ(1u, resolver->armed());
     progress = resolver->Poll(110, 16);
-    EXPECT_EQ(1u, progress.updates.size());
+    EXPECT_TRUE(progress.updates.empty());
     EXPECT_EQ(1u, progress.solicitations.size());
-    EXPECT_EQ(NeighborState::kIncomplete, State(*resolver, key).state);
+    EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+    EXPECT_EQ(1u, resolver->armed());
   });
   EXPECT_GT(points, 0u);
 }
