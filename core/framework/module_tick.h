@@ -43,6 +43,7 @@
 #ifndef BESS_FRAMEWORK_MODULE_TICK_H_
 #define BESS_FRAMEWORK_MODULE_TICK_H_
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -129,12 +130,21 @@ class TickHub {
   // The maintenance loop's interval: how much time one tick stands for, so a
   // module can turn a configured duration into ticks. Zero when no loop runs
   // (the daemon's --maintenance_interval_us=0): no endpoint is ever called.
-  // The loop sets it while it runs; a test standing in for the loop sets its
-  // own.
-  std::chrono::microseconds interval() const noexcept { return interval_; }
-  void set_interval(std::chrono::microseconds interval) noexcept { interval_ = interval; }
+  // Atomic because it is the one field read outside the control-plane lock's
+  // ordering with the loop: the loop sets it in its constructor, and the
+  // daemon starts the loop before it starts serving RPCs, so a module's Init
+  // never sees zero while the loop runs.
+  std::chrono::microseconds interval() const noexcept {
+    return std::chrono::microseconds(interval_us_.load(std::memory_order_acquire));
+  }
+  // For the maintenance loop and for tests standing in for it only; a module
+  // reads interval() and never sets it.
+  void set_interval(std::chrono::microseconds interval) noexcept {
+    interval_us_.store(interval.count(), std::memory_order_release);
+  }
   // The tick count of the latest Run() (0 before the first): the clock a
-  // module started from Init should start at.
+  // module started from Init should start at. Run() and module Init both hold
+  // the control-plane lock, which orders this read.
   uint64_t current_tick() const noexcept { return current_tick_; }
   // Calls that ran past their slice, since the hub was created.
   uint64_t overruns() const noexcept { return overruns_; }
@@ -153,7 +163,7 @@ class TickHub {
   uint64_t overruns_ = 0;
   uint64_t calls_ = 0;
   uint64_t current_tick_ = 0;
-  std::chrono::microseconds interval_{0};
+  std::atomic<int64_t> interval_us_{0};
 };
 
 inline void TickContext::Emit(std::string type, std::string source,

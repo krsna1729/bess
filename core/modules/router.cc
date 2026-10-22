@@ -305,48 +305,61 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                             "which is disabled (--maintenance_interval_us=0)");
     }
     // Durations are configured in milliseconds and kept in ticks: rounded up,
-    // so a nonzero duration is at least one tick.
+    // so a nonzero duration is at least one tick and never less than
+    // configured. The rounding is a quotient plus a remainder test, which
+    // cannot overflow where adding tick_us - 1 to the microseconds could.
     const uint64_t tick_us = static_cast<uint64_t>(tick.count());
     std::string timing_error;
-    auto to_ticks = [&](bool present, uint64_t ms, uint64_t absent_ms,
-                        bool zero_allowed, const char *field) -> uint64_t {
+    auto ms_of = [&](bool present, uint64_t ms, uint64_t absent_ms,
+                     bool zero_allowed, const char *field) -> uint64_t {
       const uint64_t value = present ? ms : absent_ms;
+      if (!timing_error.empty()) {
+        return value;  // the first error is the one reported
+      }
       if (value == 0 && !zero_allowed) {
         timing_error = std::string(field) + " must be nonzero";
-        return 0;
-      }
-      if (value > std::numeric_limits<uint64_t>::max() / 1000) {
+      } else if (value > std::numeric_limits<uint64_t>::max() / 1000) {
         timing_error = std::string(field) + " is out of range";
-        return 0;
       }
-      return (value * 1000 + tick_us - 1) / tick_us;
+      return value;
     };
-    const uint64_t first_probe =
-        to_ticks(arg.has_neighbor_first_probe_ms(), arg.neighbor_first_probe_ms(),
-                 1000, true, "neighbor_first_probe_ms");
-    const uint64_t probe_interval = to_ticks(
+    auto to_ticks = [tick_us](uint64_t ms) -> uint64_t {
+      const uint64_t us = ms * 1000;  // ms_of bounded it
+      return us / tick_us + (us % tick_us != 0 ? 1 : 0);
+    };
+    const uint64_t first_probe_ms =
+        ms_of(arg.has_neighbor_first_probe_ms(), arg.neighbor_first_probe_ms(),
+              1000, true, "neighbor_first_probe_ms");
+    const uint64_t probe_interval_ms = ms_of(
         arg.has_neighbor_probe_interval_ms(), arg.neighbor_probe_interval_ms(),
         1000, false, "neighbor_probe_interval_ms");
-    const uint64_t max_probe_interval =
-        to_ticks(arg.has_neighbor_max_probe_interval_ms(),
-                 arg.neighbor_max_probe_interval_ms(), 8000, false,
-                 "neighbor_max_probe_interval_ms");
-    const uint64_t reachable_lifetime =
-        to_ticks(arg.has_neighbor_reachable_lifetime_ms(),
-                 arg.neighbor_reachable_lifetime_ms(), 30000, true,
-                 "neighbor_reachable_lifetime_ms");
-    const uint64_t unreachable_retry =
-        to_ticks(arg.has_neighbor_unreachable_retry_ms(),
-                 arg.neighbor_unreachable_retry_ms(), 8000, true,
-                 "neighbor_unreachable_retry_ms");
+    const uint64_t max_probe_interval_ms =
+        ms_of(arg.has_neighbor_max_probe_interval_ms(),
+              arg.neighbor_max_probe_interval_ms(), 8000, false,
+              "neighbor_max_probe_interval_ms");
+    const uint64_t reachable_lifetime_ms =
+        ms_of(arg.has_neighbor_reachable_lifetime_ms(),
+              arg.neighbor_reachable_lifetime_ms(), 30000, true,
+              "neighbor_reachable_lifetime_ms");
+    const uint64_t unreachable_retry_ms =
+        ms_of(arg.has_neighbor_unreachable_retry_ms(),
+              arg.neighbor_unreachable_retry_ms(), 8000, true,
+              "neighbor_unreachable_retry_ms");
     if (!timing_error.empty()) {
       return CommandFailure(EINVAL, "%s", timing_error.c_str());
     }
-    if (max_probe_interval < probe_interval) {
+    // Compared as configured: rounding both up to ticks could make two
+    // different values equal, and hide an inverted pair.
+    if (max_probe_interval_ms < probe_interval_ms) {
       return CommandFailure(EINVAL,
                             "neighbor_max_probe_interval_ms is below "
                             "neighbor_probe_interval_ms");
     }
+    const uint64_t first_probe = to_ticks(first_probe_ms);
+    const uint64_t probe_interval = to_ticks(probe_interval_ms);
+    const uint64_t max_probe_interval = to_ticks(max_probe_interval_ms);
+    const uint64_t reachable_lifetime = to_ticks(reachable_lifetime_ms);
+    const uint64_t unreachable_retry = to_ticks(unreachable_retry_ms);
     const uint64_t max_probes =
         arg.has_neighbor_max_probes() ? arg.neighbor_max_probes() : 3;
     if (max_probes == 0 || max_probes > std::numeric_limits<uint32_t>::max()) {

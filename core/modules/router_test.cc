@@ -1973,6 +1973,31 @@ TEST_F(RouterTest, NeighborTimingZerosAreRefusedWhereMeaningless) {
   EXPECT_EQ(1u, h_.RunTask(rt, {0, 1})[1].size()) << "first probe at once";
 }
 
+// The ceiling is compared with the interval as configured, in milliseconds:
+// with a 10 ms tick both of these round up to 101 ticks, and comparing ticks
+// would have taken a ceiling below the interval.
+TEST_F(RouterTest, AProbeCeilingBelowTheIntervalIsRefusedBeforeRounding) {
+  bess::runtime::runtime().ticks().set_interval(std::chrono::milliseconds(10));
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.set_neighbor_probe_interval_ms(1009);
+  arg.set_neighbor_max_probe_interval_ms(1001);
+  EXPECT_NE("", h_.CreateError("Router", arg));
+}
+
+// The largest accepted duration rounds up to ticks without wrapping: with a
+// 1 ms tick, adding the rounding term to its microseconds would overflow to a
+// few ticks, and a first probe meant for the far future would go out at once.
+TEST_F(RouterTest, TheLargestDurationDoesNotWrapWhenRounded) {
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.set_neighbor_first_probe_ms(std::numeric_limits<uint64_t>::max() / 1000);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1000);
+  EXPECT_TRUE(h_.RunTask(rt, {0, 1})[1].empty());
+  arg.set_neighbor_first_probe_ms(std::numeric_limits<uint64_t>::max() / 1000 + 1);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "past the bound is refused";
+}
+
 // An interface id of 0 is derived from its gate (egress_gate + 1); any other
 // id must equal that, and the MAC is the "aa:bb:cc:dd:ee:ff" text form.
 TEST_F(RouterTest, AnInterfaceIdIsDerivedOrMustMatchItsGate) {

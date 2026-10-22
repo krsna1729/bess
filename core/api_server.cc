@@ -5,6 +5,7 @@
 #include "api_server.h"
 
 #include <chrono>
+#include <optional>
 
 #include <gflags/gflags.h>
 #include <grpcpp/server.h>
@@ -59,6 +60,24 @@ void ApiServer::Run() {
   builder_->SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, 1);
   bess::control::ConfigureControlServer(builder_.get());
 
+  // Worker-to-control module requests (TP4, D-077), delivered under the
+  // control-plane lock, and workers' events moved into the event log (M25);
+  // stopped before the dataplane is torn down below.
+  // The built-in fill watch (D-165): every registered resource's fill is
+  // read against the level on this loop's tick, and each crossing is one
+  // event on the log below.
+  // Started before the server: the loop publishes its tick interval
+  // (TickHub::interval) as it starts, and a module created by the first RPC
+  // reads it in Init, so serving first would let that Init see no loop.
+  bess::control::ResourceFillWatch fills(bess::runtime::runtime().transactions(),
+                                         bess::framework::ResourceBindings::ProcessDefault());
+  std::optional<bess::control::MaintenanceLoop> maintenance;
+  maintenance.emplace(control_plane, bess::runtime::runtime().requests(),
+                      bess::runtime::runtime().ticks(),
+                      std::chrono::microseconds(FLAGS_maintenance_interval_us),
+                      &bess::runtime::runtime().events(), std::chrono::seconds(1),
+                      std::chrono::microseconds(250), &fills);
+
   std::unique_ptr<grpc::Server> server = builder_->BuildAndStart();
   if (server == nullptr) {
     LOG(ERROR) << "ServerBuilder::BuildAndStart() failed";
@@ -84,23 +103,11 @@ void ApiServer::Run() {
   };
   admin_v2.set_shutdown(shutdown);
   {
-    // Worker-to-control module requests (TP4, D-077), delivered under the
-    // control-plane lock, and workers' events moved into the event log (M25);
-    // stopped before the dataplane is torn down below.
-    // The built-in fill watch (D-165): every registered resource's fill is
-    // read against the level on this loop's tick, and each crossing is one
-    // event on the log below.
-    bess::control::ResourceFillWatch fills(bess::runtime::runtime().transactions(),
-                                           bess::framework::ResourceBindings::ProcessDefault());
-    bess::control::MaintenanceLoop maintenance(
-        control_plane, bess::runtime::runtime().requests(), bess::runtime::runtime().ticks(),
-        std::chrono::microseconds(FLAGS_maintenance_interval_us),
-        &bess::runtime::runtime().events(), std::chrono::seconds(1),
-        std::chrono::microseconds(250), &fills);
     // SIGTERM/SIGINT: the same shutdown as Admin.Shutdown (D-030).
     bess::startup::TerminationWatcher watcher(shutdown);
     server->Wait();
   }
+  maintenance.reset();
   // Its calls already fail (the server is down); its event streams ended
   // with the event log.
   if (http_) {
