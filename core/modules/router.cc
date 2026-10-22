@@ -226,8 +226,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // while a router configured for many network instances pays only for the ones
   // that hold routes. A failure to create one surfaces at the route write, as a
   // refused transaction.
-  if (arg.resolver_interfaces_size() != 0 ||
-      arg.neighbor_bindings_size() != 0) {
+  if (arg.interfaces_size() != 0 || arg.neighbor_bindings_size() != 0) {
     const size_t resolver_capacity =
         arg.max_neighbors() == 0 ? 1024 : static_cast<size_t>(arg.max_neighbors());
     if (static_cast<uint64_t>(resolver_capacity) !=
@@ -235,103 +234,153 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       return CommandFailure(EINVAL,
                             "neighbor resolver capacity is out of range");
     }
-    if (arg.resolver_interfaces_size() == 0 ||
-        arg.neighbor_bindings_size() == 0) {
+    if (arg.interfaces_size() == 0 || arg.neighbor_bindings_size() == 0) {
       return CommandFailure(EINVAL,
                             "neighbor resolution requires interfaces and bindings");
     }
-    if (arg.neighbor_max_probes() > std::numeric_limits<uint32_t>::max()) {
+    // The resolver runs on the maintenance loop's ticks; with the loop off
+    // (--maintenance_interval_us=0) no neighbor would ever be solicited and
+    // every bound hop would stay unresolved, so refuse rather than blackhole.
+    const std::chrono::microseconds tick =
+        init_context().ticks().interval();
+    if (tick.count() <= 0) {
+      return CommandFailure(EINVAL,
+                            "neighbor resolution needs the maintenance loop, "
+                            "which is disabled (--maintenance_interval_us=0)");
+    }
+    // Durations are configured in milliseconds and kept in ticks: rounded up,
+    // so a nonzero duration is at least one tick.
+    const uint64_t tick_us = static_cast<uint64_t>(tick.count());
+    std::string timing_error;
+    auto to_ticks = [&](bool present, uint64_t ms, uint64_t absent_ms,
+                        bool zero_allowed, const char *field) -> uint64_t {
+      const uint64_t value = present ? ms : absent_ms;
+      if (value == 0 && !zero_allowed) {
+        timing_error = std::string(field) + " must be nonzero";
+        return 0;
+      }
+      if (value > std::numeric_limits<uint64_t>::max() / 1000) {
+        timing_error = std::string(field) + " is out of range";
+        return 0;
+      }
+      return (value * 1000 + tick_us - 1) / tick_us;
+    };
+    const uint64_t first_probe =
+        to_ticks(arg.has_neighbor_first_probe_ms(), arg.neighbor_first_probe_ms(),
+                 1000, true, "neighbor_first_probe_ms");
+    const uint64_t probe_interval = to_ticks(
+        arg.has_neighbor_probe_interval_ms(), arg.neighbor_probe_interval_ms(),
+        1000, false, "neighbor_probe_interval_ms");
+    const uint64_t max_probe_interval =
+        to_ticks(arg.has_neighbor_max_probe_interval_ms(),
+                 arg.neighbor_max_probe_interval_ms(), 8000, false,
+                 "neighbor_max_probe_interval_ms");
+    const uint64_t reachable_lifetime =
+        to_ticks(arg.has_neighbor_reachable_lifetime_ms(),
+                 arg.neighbor_reachable_lifetime_ms(), 30000, true,
+                 "neighbor_reachable_lifetime_ms");
+    const uint64_t unreachable_retry =
+        to_ticks(arg.has_neighbor_unreachable_retry_ms(),
+                 arg.neighbor_unreachable_retry_ms(), 8000, true,
+                 "neighbor_unreachable_retry_ms");
+    if (!timing_error.empty()) {
+      return CommandFailure(EINVAL, "%s", timing_error.c_str());
+    }
+    if (max_probe_interval < probe_interval) {
+      return CommandFailure(EINVAL,
+                            "neighbor_max_probe_interval_ms is below "
+                            "neighbor_probe_interval_ms");
+    }
+    const uint64_t max_probes =
+        arg.has_neighbor_max_probes() ? arg.neighbor_max_probes() : 3;
+    if (max_probes == 0 || max_probes > std::numeric_limits<uint32_t>::max()) {
       return CommandFailure(EINVAL, "neighbor_max_probes is out of range");
     }
     std::unordered_set<uint32_t> bound_next_hops;
     route::NeighborResolver::Config resolver_config;
     resolver_config.capacity = resolver_capacity;
     resolver_config.timing = {
-        .first_probe = arg.neighbor_first_probe() == 0
-                           ? 1000
-                           : arg.neighbor_first_probe(),
-        .probe_interval = arg.neighbor_probe_interval() == 0
-                              ? 1000
-                              : arg.neighbor_probe_interval(),
-        .max_probe_interval = arg.neighbor_max_probe_interval() == 0
-                                  ? 8000
-                                  : arg.neighbor_max_probe_interval(),
-        .max_probes = arg.neighbor_max_probes() == 0
-                          ? 3
-                          : static_cast<uint32_t>(arg.neighbor_max_probes()),
-        // Presence, not zero, selects the default: an explicit 0 is the
-        // library's "disabled" (no aging; no retry after a failure).
-        .reachable_lifetime = arg.has_neighbor_reachable_lifetime()
-                                  ? arg.neighbor_reachable_lifetime()
-                                  : 30000,
-        .unreachable_retry = arg.has_neighbor_unreachable_retry()
-                                 ? arg.neighbor_unreachable_retry()
-                                 : 60000,
+        .first_probe = first_probe,
+        .probe_interval = probe_interval,
+        .max_probe_interval = max_probe_interval,
+        .max_probes = static_cast<uint32_t>(max_probes),
+        // An explicit 0 is the library's "disabled" (no aging; no retry
+        // after a failure).
+        .reachable_lifetime = reachable_lifetime,
+        .unreachable_retry = unreachable_retry,
     };
-    auto resolver = route::NeighborResolver::Create(resolver_config);
+    // The resolver's clock is the maintenance tick count, which runs from
+    // daemon start: start it now, so first_probe counts from Init.
+    const uint64_t now = init_context().ticks().current_tick();
+    auto resolver = route::NeighborResolver::Create(resolver_config, now);
     if (!resolver) {
       return CommandFailure(EINVAL, "%s", resolver.error().c_str());
     }
     neighbor_resolver_ = std::move(*resolver);
-    for (const auto &entry : arg.resolver_interfaces()) {
-      if (entry.id() == 0 || !bess::IsValidGateValue(entry.egress_gate()) ||
-          InterfaceOf(entry.egress_gate()).value() != entry.id() ||
-          resolver_gates_.contains(entry.id())) {
-        return CommandFailure(EINVAL,
-                              "resolver interface id must be unique and equal "
-                              "to egress_gate + 1");
+    // Interface id -> whether it has a local IPv4 / IPv6 address.
+    std::unordered_map<uint32_t, std::pair<bool, bool>> interface_families;
+    for (const auto &entry : arg.interfaces()) {
+      if (!bess::IsValidGateValue(entry.egress_gate())) {
+        return CommandFailure(EINVAL, "interface egress_gate %u is invalid",
+                              entry.egress_gate());
       }
-      auto mac = MacFromPb(entry.mac(), "resolver interface mac");
-      if (!mac || mac->IsZero()) {
-        return CommandFailure(EINVAL, "%s",
-                              mac ? "resolver interface MAC must be nonzero"
-                                  : mac.error().c_str());
+      // 0 derives the id from the gate; any other value must agree with it.
+      const uint32_t id = InterfaceOf(entry.egress_gate()).value();
+      if ((entry.id() != 0 && entry.id() != id) ||
+          resolver_gates_.contains(id)) {
+        return CommandFailure(EINVAL,
+                              "interface id must be unique and equal "
+                              "to egress_gate + 1 (or 0 to derive it)");
+      }
+      bess::utils::Ethernet::Address mac;
+      if (!mac.FromString(entry.mac_addr())) {
+        return CommandFailure(EINVAL, "invalid interface mac_addr '%s'",
+                              entry.mac_addr().c_str());
+      }
+      if (mac.IsZero()) {
+        return CommandFailure(EINVAL, "interface mac_addr must be nonzero");
       }
       uint32_t ipv4 = 0;
       if (!entry.ipv4().empty()) {
         bess::utils::be32_t address;
         if (!bess::utils::ParseIpv4Address(entry.ipv4(), &address)) {
-          return CommandFailure(EINVAL, "invalid resolver IPv4 address '%s'",
+          return CommandFailure(EINVAL, "invalid interface IPv4 address '%s'",
                                 entry.ipv4().c_str());
         }
         ipv4 = address.value();
         if (ipv4 == 0 || ipv4 == 0xffffffffu) {
-          return CommandFailure(EINVAL, "invalid resolver IPv4 address");
+          return CommandFailure(EINVAL, "invalid interface IPv4 address");
         }
       }
       bess::utils::Ipv6Address ipv6{};
       if (!entry.ipv6().empty()) {
         auto address = bess::utils::ParseIpv6Address(entry.ipv6());
         if (!address) {
-          return CommandFailure(EINVAL, "invalid resolver IPv6 address '%s'",
+          return CommandFailure(EINVAL, "invalid interface IPv6 address '%s'",
                                 entry.ipv6().c_str());
         }
         ipv6 = *address;
         if (ipv6.IsUnspecified() || ipv6.IsMulticast()) {
-          return CommandFailure(EINVAL, "invalid resolver IPv6 address");
+          return CommandFailure(EINVAL, "invalid interface IPv6 address");
         }
       }
       if (ipv4 == 0 && ipv6.IsUnspecified()) {
         return CommandFailure(EINVAL,
-                              "resolver interface needs an IPv4 or IPv6 address");
+                              "interface needs an IPv4 or IPv6 address");
       }
       route::NeighborResolver::Interface interface{
-          dataplane::InterfaceId(entry.id()), *mac, ipv4, ipv6};
-      auto configured =
-          neighbor_resolver_->ConfigureInterface(interface, 0);
+          dataplane::InterfaceId(id), mac, ipv4, ipv6};
+      auto configured = neighbor_resolver_->ConfigureInterface(interface, now);
       if (!configured) {
         return CommandFailure(EINVAL, "%s", configured.error().c_str());
       }
-      resolver_gates_.emplace(entry.id(),
-                              static_cast<gate_idx_t>(entry.egress_gate()));
+      resolver_gates_.emplace(id, static_cast<gate_idx_t>(entry.egress_gate()));
+      interface_families.emplace(
+          id, std::make_pair(ipv4 != 0, !ipv6.IsUnspecified()));
     }
     for (const auto &binding : arg.neighbor_bindings()) {
-      const auto matching_interface = std::find_if(
-          arg.resolver_interfaces().begin(), arg.resolver_interfaces().end(),
-          [&binding](const auto &interface) {
-            return interface.id() == binding.interface_id();
-          });
-      if (matching_interface == arg.resolver_interfaces().end()) {
+      const auto families = interface_families.find(binding.interface_id());
+      if (families == interface_families.end()) {
         return CommandFailure(EINVAL,
                               "neighbor binding names unknown interface %u",
                               binding.interface_id());
@@ -342,7 +391,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       }
       route::NeighborResolver::Key key;
       if (!binding.ipv4().empty()) {
-        if (matching_interface->ipv4().empty()) {
+        if (!families->second.first) {
           return CommandFailure(EINVAL,
                                 "IPv4 neighbor binding requires local IPv4");
         }
@@ -354,7 +403,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
         key = route::NeighborResolver::Key(
             dataplane::InterfaceId(binding.interface_id()), peer.value());
       } else {
-        if (matching_interface->ipv6().empty()) {
+        if (!families->second.second) {
           return CommandFailure(EINVAL,
                                 "IPv6 neighbor binding requires local IPv6");
         }
@@ -371,7 +420,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                               binding.next_hop_id());
       }
       auto hop = neighbor_resolver_->Bind(
-          route::NextHopId(binding.next_hop_id()), key, 0);
+          route::NextHopId(binding.next_hop_id()), key, now);
       if (!hop) {
         return CommandFailure(EINVAL, "%s", hop.error().c_str());
       }
@@ -388,10 +437,9 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                               route::RouteErrorName(managed.error()));
       }
     }
-    neighbor_interface_attr_name_ =
-        arg.neighbor_interface_attr().empty()
-            ? "neighbor_interface_id"
-            : arg.neighbor_interface_attr();
+    ingress_interface_attr_name_ = arg.ingress_interface_attr().empty()
+                                       ? "vif_id"
+                                       : arg.ingress_interface_attr();
   }
   if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
@@ -667,11 +715,11 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   if (neighbor_resolver_ != nullptr) {
     static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
         kNoNeighborInterface{};
-    neighbor_interface_attr_ = AddMetadataAttrWithDefault(
-        neighbor_interface_attr_name_, sizeof(bess::utils::be32_t),
+    ingress_interface_attr_ = AddMetadataAttrWithDefault(
+        ingress_interface_attr_name_, sizeof(bess::utils::be32_t),
         bess::metadata::Attribute::AccessMode::kRead, kNoNeighborInterface);
-    if (neighbor_interface_attr_ < 0) {
-      return CommandFailure(-neighbor_interface_attr_,
+    if (ingress_interface_attr_ < 0) {
+      return CommandFailure(-ingress_interface_attr_,
                             "add_metadata_attr() failed");
     }
     static std::atomic<uint32_t> next_ring_id{0};
@@ -744,9 +792,9 @@ int Router::OnEvent(bess::Event event) {
   }
   if (neighbor_resolver_ != nullptr &&
       !bess::metadata::IsValidOffset(
-          attr_offset(neighbor_interface_attr_))) {
+          attr_offset(ingress_interface_attr_))) {
     LOG(ERROR) << "Router '" << name() << "': the '"
-               << neighbor_interface_attr_name_
+               << ingress_interface_attr_name_
                << "' attribute is unreadable; ARP/ND input will be dropped";
   }
   // Metadata offsets are assigned just before this: an attribute with no
@@ -791,7 +839,7 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
   // The interface a frame arrived on is read here, with the offsets of the
   // graph that delivered it, and travels with the frame (NeighborFrame).
   const bess::metadata::mt_offset_t interface_offset =
-      attr_offset(neighbor_interface_attr_);
+      attr_offset(ingress_interface_attr_);
   std::array<bess::PacketHandle, bess::PacketBatch::kMaxBurst> routed;
   size_t routed_count = 0;
   const int count = batch->cnt();
@@ -1078,12 +1126,12 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     gates[i] = GateOf(hop->egress);
     bess::PacketRef pkt = batch->packet(i);
     // The destination mode's write path, so the two modes cannot disagree
-    // about a TTL boundary or about which addresses a hop writes (D-153): the
-    // TTL first, then the addresses when the hop names both. A frame that is
-    // not an IPv4 packet has no hop count to decrement: it keeps the TTL it
-    // arrived with and, as before, still gets the hop's addresses when it
-    // names them. A header the parser cannot read is dropped and counted,
-    // never forwarded.
+    // about a hop-count boundary or about which addresses a hop writes
+    // (D-153): the IPv4 TTL or IPv6 hop limit first, then the addresses when
+    // the hop names both. A frame that is not IP has no hop count to
+    // decrement: it keeps what it arrived with and, as before, still gets the
+    // hop's addresses when it names them. A header the parser cannot read is
+    // dropped and counted, never forwarded.
     bess::conntrack::ParsedFlowPacket parsed;
     const bess::conntrack::ParseStatus status = bess::conntrack::ParseFrame(
         std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), parsed,
@@ -1124,6 +1172,26 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
               parsed.l3_offset, *hop) != route::TtlResult::kForward) {
         gates[i] = DROP_GATE;
         ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else if ((status == bess::conntrack::ParseStatus::kOk ||
+                status == bess::conntrack::ParseStatus::kFragment) &&
+               parsed.l3 == bess::conntrack::L3Kind::kIpv6) {
+      // IPv6 the same way (the destination mode's RouteIpv6 does the same):
+      // the hop limit first (no header checksum), then the addresses.
+      const size_t l3 = parsed.l3_offset;
+      if (writable.head_len() < l3 + route::kIpv6HeaderSize) {
+        gates[i] = DROP_GATE;
+        header_write_failures_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      if (route::DecrementHopLimit(std::span<uint8_t>(
+              writable.head_data<uint8_t *>() + l3, writable.head_len() - l3)) !=
+          route::TtlResult::kForward) {
+        gates[i] = DROP_GATE;
+        ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
+      } else if (!route::RewriteL2(writable, *hop)) {
+        gates[i] = DROP_GATE;
+        header_write_failures_.fetch_add(1, std::memory_order_relaxed);
       }
     } else if (!route::RewriteL2(writable, *hop)) {
       gates[i] = DROP_GATE;

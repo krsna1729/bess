@@ -64,13 +64,15 @@
 // guess. docs/routing.md is the guide: the library's pieces, the two recipes
 // and what a graph decides.
 //
-// Neighbor resolution (D-179). With `resolver_interfaces` and
-// `neighbor_bindings`, the module owns those next hops' adjacencies: a
+// Neighbor resolution (D-179). With `interfaces` and `neighbor_bindings`
+// (both fixed at Init), the module owns those next hops' adjacencies: a
 // route::NeighborResolver solicits (ARP, ND) from a task, learns from ARP
-// replies and Neighbor Advertisements, ages and fails neighbors, and
-// publishes each change as a next-hop update through the engine on the
-// maintenance tick. ARP requests and Neighbor Solicitations are not the
-// resolver's: they go to the local punt gate, or are dropped, and are counted.
+// replies and Neighbor Advertisements read with the ingress interface
+// attribute (default `vif_id`), ages and fails neighbors, and publishes each
+// change as a next-hop update through the engine on the maintenance tick.
+// Timings are configured in milliseconds and converted to ticks at Init.
+// ARP requests and Neighbor Solicitations are not the resolver's: they go to
+// the local punt gate, or are dropped, and are counted.
 // docs/neighbor-resolution.md describes the state machine.
 //
 // A resolved hop that names both of its addresses has them written into the
@@ -254,8 +256,8 @@ class Router final : public Module {
   bess::framework::TickEndpoint neighbor_tick_;
   rte_ring *neighbor_rx_ring_ = nullptr;  // NeighborFrame elements
   rte_ring *neighbor_tx_ring_ = nullptr;
-  int neighbor_interface_attr_ = -1;
-  std::string neighbor_interface_attr_name_;
+  int ingress_interface_attr_ = -1;
+  std::string ingress_interface_attr_name_;
   // Fixed after Init, so workers read it without a lock.
   std::unordered_map<uint32_t, gate_idx_t> resolver_gates_;
   std::vector<std::pair<bess::route::NextHopId, bess::route::NextHop>>

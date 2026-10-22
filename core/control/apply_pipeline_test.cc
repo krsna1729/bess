@@ -1681,10 +1681,10 @@ TEST_F(ApplyPipelineTest, ListedResourcesConvergeAndUnlistedOnesStay) {
 // resolver-owned hop in rt/routes.
 PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids) {
   bess::pb::RouterArg arg;
-  auto *interface = arg.add_resolver_interfaces();
+  auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
-  interface->set_mac(std::string("\x02\x00\x00\x00\x00\x01", 6));
+  interface->set_mac_addr("02:00:00:00:00:01");
   interface->set_ipv4("192.0.2.1");
   auto *binding = arg.add_neighbor_bindings();
   binding->set_next_hop_id(1);
@@ -1717,6 +1717,8 @@ PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids) {
 // erasing (or being refused for) the bound one, and a list that names a
 // resolver-owned id is refused and changes nothing.
 TEST_F(ApplyPipelineTest, ResolverOwnedNextHopsAreOutsideDesiredStateConvergence) {
+  // Neighbor resolution runs on the maintenance loop; stand in for its interval.
+  bess::runtime::runtime().ticks().set_interval(std::chrono::milliseconds(1));
   auto applied = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2, 3}), {});
   ASSERT_TRUE(applied) << applied.error().message;
   EXPECT_EQ(3u, applied->resource_ops) << "hops 2 and 3, and the route to hop 1";

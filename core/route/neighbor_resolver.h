@@ -124,10 +124,11 @@ class NeighborResolver {
     // aging: a resolved neighbor stays resolved until a reply changes it or it
     // is unbound.
     uint64_t reachable_lifetime = 30000;
-    // How long an unreachable neighbor waits before another attempt. Zero
-    // means no further attempt: it stays unreachable until a reply arrives or
-    // the caller removes and rebinds it.
-    uint64_t unreachable_retry = 60000;
+    // How long an unreachable neighbor waits before another attempt; the
+    // default is the backoff ceiling, so a failed neighbor keeps being probed
+    // at that rate. Zero means no further attempt: it stays unreachable until
+    // a reply arrives or the caller removes and rebinds it.
+    uint64_t unreachable_retry = 8000;
   };
 
   struct Config {

@@ -40,8 +40,8 @@ using bess::testing::OnesSum;
 using bess::testing::PacketBuilder;
 using bess::utils::Ethernet;
 
-// The frame the tests send: the addresses it arrives with (a gNB's toward the
-// N3 port, say), an IPv4 payload.
+// The frame the tests send: the addresses it arrives with (an upstream
+// neighbor's toward this port, say), an IPv4 payload.
 Bytes Frame() {
   return PacketBuilder()
       .Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b")
@@ -112,8 +112,21 @@ class Sharer final : public Module {
 ADD_MODULE(Sharer, "router_test_sharer",
            "test: forwards a clone of each packet and keeps the original")
 
+// The "aa:bb:cc:dd:ee:ff" form RouterInterface.mac_addr takes.
+std::string MacString(const std::array<uint8_t, 6> &mac) {
+  return Ethernet::Address(mac.data()).ToString();
+}
+
 class RouterTest : public ::testing::Test {
  protected:
+  // The tests stand in for the maintenance loop: one tick is 1 ms, so the
+  // resolver's millisecond timings equal ticks, and the tick count restarts
+  // at 0 for each test.
+  void SetUp() override {
+    bess::runtime::runtime().ticks().set_interval(std::chrono::milliseconds(1));
+    (void)bess::runtime::runtime().ticks().Run(std::chrono::nanoseconds(0), 0);
+  }
+
   // A router named "rt" with one next hop, written as a client writes it (the
   // codec path, so the MAC fields are the RPC's; a null `dst_mac`/`src_mac`
   // leaves the field out, which reads back as the zero address, D-129).
@@ -282,7 +295,7 @@ class RouterTest : public ::testing::Test {
   Module *MakeNeighborInterfaceWriter(uint32_t id) {
     bess::pb::SetMetadataArg arg;
     bess::pb::SetMetadataArg::Attribute *attr = arg.add_attrs();
-    attr->set_name("neighbor_interface_id");
+    attr->set_name("vif_id");
     attr->set_size(4);
     const uint8_t bytes[4] = {static_cast<uint8_t>(id >> 24),
                               static_cast<uint8_t>(id >> 16),
@@ -312,23 +325,22 @@ TEST_F(RouterTest, ArpReplyPublishesResolverNextHop) {
   constexpr char kLocalMac[] = "02:00:00:00:00:01";
   constexpr char kPeerMac[] = "02:00:00:00:00:02";
   bess::pb::RouterArg arg;
-  auto *interface = arg.add_resolver_interfaces();
+  auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
   const auto local_mac = Mac(kLocalMac);
-  interface->set_mac(reinterpret_cast<const char *>(local_mac.data()),
-                     local_mac.size());
+  interface->set_mac_addr(MacString(local_mac));
   interface->set_ipv4("192.0.2.1");
   auto *binding = arg.add_neighbor_bindings();
   binding->set_next_hop_id(1);
   binding->set_interface_id(2);
   binding->set_ipv4("192.0.2.2");
-  arg.set_neighbor_first_probe(1);
-  arg.set_neighbor_probe_interval(1);
-  arg.set_neighbor_max_probe_interval(1);
+  arg.set_neighbor_first_probe_ms(1);
+  arg.set_neighbor_probe_interval_ms(1);
+  arg.set_neighbor_max_probe_interval_ms(1);
   arg.set_neighbor_max_probes(2);
-  arg.set_neighbor_reachable_lifetime(4);
-  arg.set_neighbor_unreachable_retry(2);
+  arg.set_neighbor_reachable_lifetime_ms(4);
+  arg.set_neighbor_unreachable_retry_ms(2);
   auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
   ASSERT_NE(nullptr, rt);
   const auto *initial =
@@ -407,18 +419,18 @@ TEST_F(RouterTest, ArpReplyPublishesResolverNextHop) {
 TEST_F(RouterTest, SolicitationsOnTwoInterfacesLeaveThroughBothGates) {
   bess::pb::RouterArg arg;
   for (uint32_t id = 1; id <= 2; id++) {
-    auto *interface = arg.add_resolver_interfaces();
+    auto *interface = arg.add_interfaces();
     interface->set_id(id);
     interface->set_egress_gate(id - 1);
     const auto mac = Mac(id == 1 ? "02:00:00:00:00:01" : "02:00:00:00:00:02");
-    interface->set_mac(reinterpret_cast<const char *>(mac.data()), mac.size());
+    interface->set_mac_addr(MacString(mac));
     interface->set_ipv4(id == 1 ? "192.0.2.1" : "198.51.100.1");
     auto *binding = arg.add_neighbor_bindings();
     binding->set_next_hop_id(id);
     binding->set_interface_id(id);
     binding->set_ipv4(id == 1 ? "192.0.2.2" : "198.51.100.2");
   }
-  arg.set_neighbor_first_probe(1);
+  arg.set_neighbor_first_probe_ms(1);
   auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
   ASSERT_NE(nullptr, rt);
   Module *writer = MakeNeighborInterfaceWriter(1);
@@ -434,12 +446,11 @@ TEST_F(RouterTest, NeighborResolverCapacityIsBounded) {
   constexpr char kLocalMac[] = "02:00:00:00:00:01";
   bess::pb::RouterArg arg;
   arg.set_max_neighbors(1);
-  auto *interface = arg.add_resolver_interfaces();
+  auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
   const auto local_mac = Mac(kLocalMac);
-  interface->set_mac(reinterpret_cast<const char *>(local_mac.data()),
-                     local_mac.size());
+  interface->set_mac_addr(MacString(local_mac));
   interface->set_ipv4("192.0.2.1");
   for (uint32_t id = 1; id <= 2; id++) {
     auto *binding = arg.add_neighbor_bindings();
@@ -460,17 +471,16 @@ TEST_F(RouterTest, NdAdvertisementPublishesResolverNextHop) {
   const auto local_ip = bess::utils::ParseIpv6Address("fe80::1").value();
   const auto peer_ip = bess::utils::ParseIpv6Address("fe80::2").value();
   bess::pb::RouterArg arg;
-  auto *interface = arg.add_resolver_interfaces();
+  auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
-  interface->set_mac(reinterpret_cast<const char *>(local_mac.data()),
-                     local_mac.size());
+  interface->set_mac_addr(MacString(local_mac));
   interface->set_ipv6("fe80::1");
   auto *binding = arg.add_neighbor_bindings();
   binding->set_next_hop_id(1);
   binding->set_interface_id(2);
   binding->set_ipv6("fe80::2");
-  arg.set_neighbor_first_probe(1);
+  arg.set_neighbor_first_probe_ms(1);
   auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
   ASSERT_NE(nullptr, rt);
 
@@ -701,6 +711,30 @@ Bytes Frame6To(const char *dst, uint8_t hop_limit = 64) {
 }
 
 uint8_t HopLimitOf(const Bytes &frame) { return frame[14 + 7]; }
+
+// The hop mode decrements the IPv6 hop limit as it does the IPv4 TTL (and as
+// the destination mode does): 2 leaves as 1 with the hop's addresses, and 1
+// is dropped and counted as expired.
+TEST_F(RouterTest, AHopModeDecrementsTheIpv6HopLimit) {
+  Router *rt = MakeRouter(1, "02:00:00:00:00:bb", "02:00:00:00:00:aa",
+                          bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED);
+  ASSERT_NE(nullptr, rt);
+  Module *writer = MakeWriter(1);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  const Bytes frame = Frame6To("2001:db8:1::9", 2);
+  auto out = h_.RunPipeline(writer, 0, {frame}, rt, {0, 1});
+  ASSERT_EQ(1u, out[1].size());
+  EXPECT_EQ(1, HopLimitOf(out[1][0]));
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), DstOf(out[1][0]));
+  EXPECT_TRUE(std::equal(frame.begin() + 22, frame.end(), out[1][0].begin() + 22));
+  EXPECT_EQ(0u, rt->ttl_expired_frames());
+
+  auto expired =
+      h_.RunPipeline(writer, 0, {Frame6To("2001:db8:1::9", 1)}, rt, {0, 1});
+  EXPECT_TRUE(expired[1].empty()) << "expired, not forwarded";
+  EXPECT_EQ(1u, rt->ttl_expired_frames());
+  EXPECT_EQ(0u, rt->header_write_failures());
+}
 
 // The frame's IPv4 TTL: Ethernet is 14 bytes, and TTL is byte 8 of the header.
 uint8_t TtlOf(const Bytes &frame) { return frame[14 + 8]; }
@@ -1136,15 +1170,15 @@ TEST_F(RouterTest, TheDomainAttributeSelectsTheFib) {
   EXPECT_TRUE(unknown[1].empty());
 }
 
-TEST_F(RouterTest, ConfiguredTransportDomainAttributeSelectsItsFib) {
+TEST_F(RouterTest, AConfiguredDomainAttributeNameSelectsTheFib) {
   Router *rt = MakeDestinationRouter(/*domains=*/3, /*groups=*/0,
-                                     "transport_route_domain");
+                                     "vrf");
   ASSERT_NE(nullptr, rt);
   MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
   MakeRoute(rt, "10.0.0.0", 8, 2, 1);
 
   auto routed = RunToDestination(rt, FrameTo("10.1.2.3"), /*domain=*/2,
-                                 {0, 1}, "transport_route_domain");
+                                 {0, 1}, "vrf");
   ASSERT_EQ(1u, routed[1].size());
   EXPECT_TRUE(routed[0].empty());
 }
@@ -1575,12 +1609,11 @@ TEST_F(RouterTest, LinkScopedIpv6WithoutALocalGateIsDroppedAndCounted) {
 // with next hops 1..`bindings` bound to 192.0.2.2, and `punt_local_gate`.
 bess::pb::RouterArg ResolverArg(uint64_t punt_local_gate, uint32_t bindings = 1) {
   bess::pb::RouterArg arg;
-  auto *interface = arg.add_resolver_interfaces();
+  auto *interface = arg.add_interfaces();
   interface->set_id(2);
   interface->set_egress_gate(1);
   const auto local_mac = Mac("02:00:00:00:00:01");
-  interface->set_mac(reinterpret_cast<const char *>(local_mac.data()),
-                     local_mac.size());
+  interface->set_mac_addr(MacString(local_mac));
   interface->set_ipv4("192.0.2.1");
   interface->set_ipv6("fe80::1");
   for (uint32_t id = 1; id <= bindings; id++) {
@@ -1590,7 +1623,7 @@ bess::pb::RouterArg ResolverArg(uint64_t punt_local_gate, uint32_t bindings = 1)
     binding->set_ipv4("192.0.2.2");
   }
   arg.set_punt_local_gate(punt_local_gate);
-  arg.set_neighbor_first_probe(1);
+  arg.set_neighbor_first_probe_ms(1);
   return arg;
 }
 
@@ -1664,7 +1697,7 @@ TEST_F(RouterTest, AReplyOnAnUnknownInterfaceIsDroppedAtInput) {
 // solicited again however long it goes unconfirmed.
 TEST_F(RouterTest, AnExplicitZeroReachableLifetimeDisablesAging) {
   bess::pb::RouterArg arg = ResolverArg(0);
-  arg.set_neighbor_reachable_lifetime(0);
+  arg.set_neighbor_reachable_lifetime_ms(0);
   auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
   ASSERT_NE(nullptr, rt);
   Module *writer = MakeNeighborInterfaceWriter(2);
@@ -1696,9 +1729,9 @@ TEST_F(RouterTest, AnExplicitZeroReachableLifetimeDisablesAging) {
 TEST_F(RouterTest, NeighborPublicationIsBoundedPerTickAndConverges) {
   constexpr uint32_t kHops = 70;  // more than one tick publishes (64)
   bess::pb::RouterArg arg = ResolverArg(0, kHops);
-  arg.set_neighbor_probe_interval(1);
+  arg.set_neighbor_probe_interval_ms(1);
   arg.set_neighbor_max_probes(1);
-  arg.set_neighbor_unreachable_retry(0);  // stays unreachable once failed
+  arg.set_neighbor_unreachable_retry_ms(0);  // stays unreachable once failed
   auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
   ASSERT_NE(nullptr, rt);
   const auto unreachable = [rt] {
@@ -1732,8 +1765,76 @@ TEST_F(RouterTest, ADestinationRouterDoesNotDeclareTheNextHopAttribute) {
   for (const auto &attr : rt->all_attrs()) {
     names.push_back(attr.name);
   }
-  EXPECT_EQ((std::vector<std::string>{"route_domain", "neighbor_interface_id"}),
+  EXPECT_EQ((std::vector<std::string>{"route_domain", "vif_id"}),
             names);
+}
+
+// Neighbor resolution runs on the maintenance loop's ticks: with the loop off
+// nothing would ever be solicited, so Init refuses instead of leaving every
+// bound hop unresolved.
+TEST_F(RouterTest, NeighborResolutionWithoutTheMaintenanceLoopIsRefused) {
+  bess::runtime::runtime().ticks().set_interval(std::chrono::microseconds(0));
+  EXPECT_NE("", h_.CreateError("Router", ResolverArg(0)));
+}
+
+// Timings are milliseconds, turned into ticks from the loop's interval and
+// counted from Init, not from daemon start.
+TEST_F(RouterTest, NeighborTimingsAreMillisecondsFromInit) {
+  bess::runtime::runtime().ticks().set_interval(std::chrono::milliseconds(10));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::nanoseconds(0), 100);
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.set_neighbor_first_probe_ms(25);  // 2.5 ticks, rounded up to 3
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 102);
+  EXPECT_TRUE(h_.RunTask(rt, {0, 1})[1].empty()) << "not yet 25 ms after Init";
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 103);
+  EXPECT_EQ(1u, h_.RunTask(rt, {0, 1})[1].size());
+}
+
+// Zero has one meaning per timing field: immediate for the first probe,
+// "never" for the lifetimes, and refused where it has no sensible meaning.
+TEST_F(RouterTest, NeighborTimingZerosAreRefusedWhereMeaningless) {
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.set_neighbor_probe_interval_ms(0);
+  EXPECT_NE("", h_.CreateError("Router", arg));
+  arg = ResolverArg(0);
+  arg.set_neighbor_max_probe_interval_ms(0);
+  EXPECT_NE("", h_.CreateError("Router", arg));
+  arg = ResolverArg(0);
+  arg.set_neighbor_max_probes(0);
+  EXPECT_NE("", h_.CreateError("Router", arg));
+  arg = ResolverArg(0);
+  arg.set_neighbor_probe_interval_ms(2000);
+  arg.set_neighbor_max_probe_interval_ms(1000);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "ceiling below the interval";
+  arg = ResolverArg(0);
+  arg.set_neighbor_first_probe_ms(0);
+  arg.set_neighbor_reachable_lifetime_ms(0);
+  arg.set_neighbor_unreachable_retry_ms(0);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 0);
+  EXPECT_EQ(1u, h_.RunTask(rt, {0, 1})[1].size()) << "first probe at once";
+}
+
+// An interface id of 0 is derived from its gate (egress_gate + 1); any other
+// id must equal that, and the MAC is the "aa:bb:cc:dd:ee:ff" text form.
+TEST_F(RouterTest, AnInterfaceIdIsDerivedOrMustMatchItsGate) {
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.mutable_interfaces(0)->set_id(0);
+  EXPECT_NE(nullptr, h_.Create("Router", arg, "derived"));
+  arg.mutable_interfaces(0)->set_id(3);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "gate 1 is interface 2";
+  arg = ResolverArg(0);
+  arg.mutable_interfaces(0)->set_mac_addr("02:00:00:00:00");
+  EXPECT_NE("", h_.CreateError("Router", arg));
+  arg.mutable_interfaces(0)->set_mac_addr("00:00:00:00:00:00");
+  EXPECT_NE("", h_.CreateError("Router", arg));
 }
 
 }  // namespace

@@ -361,11 +361,12 @@ message RouterGroupValue {
   repeated uint32 member_ids = 1;
 }
 
+/** A route's prefix. Exactly one of ipv4 or ipv6 is set. */
 message RouterRouteKey {
-  string ipv4 = 1; /// IPv4 prefix address; retained for existing IPv4 keys.
-  uint32 prefix_length = 2;
+  string ipv4 = 1; /// IPv4 prefix address, e.g. "198.51.100.0".
+  uint32 prefix_length = 2; /// Prefix length: 0..32 for ipv4, 0..128 for ipv6.
   uint32 domain = 3; /// Route domain (default 0); must be below the router's max_domains.
-  string ipv6 = 4; /// IPv6 prefix address; set ipv4 empty for IPv6.
+  string ipv6 = 4; /// IPv6 prefix address, e.g. "2001:db8::".
 }
 
 /**
@@ -380,24 +381,28 @@ message RouterRouteValue {
   uint32 group_id = 2; /// The group the route forwards through (0: not that; needs max_groups).
 }
 
-/** One logical interface whose MAC and addresses seed neighbor resolution. */
-message RouterResolverInterface {
-  uint32 id = 1; /// Logical interface id (the Router next-hop interface id).
-  uint32 egress_gate = 2; /// Router output gate used for resolver solicitations.
-  bytes mac = 3; /// Six-byte local Ethernet address.
-  string ipv4 = 4; /// Optional local IPv4 address.
-  string ipv6 = 5; /// Optional local IPv6 address.
+/**
+ * One of the router's own L3 interfaces: the MAC and addresses its neighbor
+ * solicitations come from, and the output gate they leave through.
+ */
+message RouterInterface {
+  uint32 id = 1; /// Interface id: must equal egress_gate + 1, or 0 to derive it. The ingress interface attribute carries the same id.
+  uint32 egress_gate = 2; /// Router output gate this interface transmits on.
+  string mac_addr = 3; /// Local Ethernet address, "aa:bb:cc:dd:ee:ff"; nonzero.
+  string ipv4 = 4; /// Local IPv4 address (optional; needed for IPv4 bindings).
+  string ipv6 = 5; /// Local IPv6 address (optional; needed for IPv6 bindings).
 }
 
 /**
- * Bind one Router next hop to a resolver interface and a family-tagged peer.
+ * Bind one Router next hop to a neighbor on one of the router's interfaces.
  * The binding owns its next-hop id; configure routes to it, not a static MAC.
+ * Exactly one of ipv4 or ipv6 is set.
  */
 message RouterNeighborBinding {
-  uint32 next_hop_id = 1;
-  uint32 interface_id = 2;
-  string ipv4 = 3; /// Set exactly one of ipv4 or ipv6.
-  string ipv6 = 4;
+  uint32 next_hop_id = 1; /// The next-hop id routes name; nonzero and unique.
+  uint32 interface_id = 2; /// The RouterInterface the neighbor is on.
+  string ipv4 = 3; /// Neighbor IPv4 address (resolved with ARP).
+  string ipv6 = 4; /// Neighbor IPv6 address (resolved with Neighbor Discovery).
 }
 
 
@@ -1511,16 +1516,16 @@ message RouterArg {
   string next_hop_attr = 11; /// The metadata attribute next-hop mode reads the next-hop id from (default "next_hop_id").
   string domain_attr = 12; /// The metadata attribute destination mode reads the route domain from (default "route_domain").
   uint64 punt_local_gate = 13; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. With a neighbor resolver, ARP requests and Neighbor Solicitations go here too; and so do link-local or multicast IPv6 frames in destination mode, which are never forwarded. The frame is counted either way (D-178, D-179).
-  string neighbor_interface_attr = 14; /// The metadata attribute naming the resolver interface an ARP/ND frame arrived on (default "neighbor_interface_id").
-  repeated RouterResolverInterface resolver_interfaces = 15; /// Resolver interfaces; id follows the existing gate+1 InterfaceId mapping.
-  repeated RouterNeighborBinding neighbor_bindings = 16; /// Resolver-owned next-hop ids; configure routes to these, not static MACs.
+  string ingress_interface_attr = 14; /// The metadata attribute naming the RouterInterface a frame arrived on, read for ARP and Neighbor Discovery input (default "vif_id", what Vif writes).
+  repeated RouterInterface interfaces = 15; /// The router's own interfaces that neighbor resolution solicits from. Fixed at Init.
+  repeated RouterNeighborBinding neighbor_bindings = 16; /// Resolver-owned next-hop ids; configure routes to these, not static MACs. Fixed at Init.
   uint64 max_neighbors = 17; /// Neighbor resolver capacity (default 1024).
-  uint64 neighbor_first_probe = 18; /// Resolver ticks until first probe (default 1000; zero selects default).
-  uint64 neighbor_probe_interval = 19; /// Initial retry interval in resolver ticks (default 1000; zero selects default).
-  uint64 neighbor_max_probe_interval = 20; /// Backoff ceiling in resolver ticks (default 8000; zero selects default).
-  uint64 neighbor_max_probes = 21; /// Solicitation count per attempt (default 3; zero selects default).
-  optional uint64 neighbor_reachable_lifetime = 22; /// Resolver ticks a resolved neighbor goes unconfirmed before it is solicited again; it keeps forwarding while that attempt runs and fails only when the attempt does (absent: 30000; 0: never re-solicit, D-179).
-  optional uint64 neighbor_unreachable_retry = 23; /// Resolver ticks an unreachable neighbor waits before another attempt (absent: 60000; 0: no further attempt).
+  optional uint64 neighbor_first_probe_ms = 18; /// Delay from Init to a neighbor's first solicitation (absent: 1000; 0: on the first maintenance tick).
+  optional uint64 neighbor_probe_interval_ms = 19; /// First retry delay of an attempt; later retries double it (absent: 1000; 0 is refused).
+  optional uint64 neighbor_max_probe_interval_ms = 20; /// Retry backoff ceiling (absent: 8000; 0 or below the probe interval is refused).
+  optional uint64 neighbor_max_probes = 21; /// Solicitations per resolution attempt (absent: 3; 0 is refused).
+  optional uint64 neighbor_reachable_lifetime_ms = 22; /// How long a resolved neighbor goes unconfirmed before it is solicited again; it keeps forwarding while that attempt runs and fails only when the attempt does (absent: 30000; 0: never re-solicit, D-179).
+  optional uint64 neighbor_unreachable_retry_ms = 23; /// How long an unreachable neighbor waits before another attempt (absent: 8000, the backoff ceiling's default; 0: no further attempt).
 }
 
 /**

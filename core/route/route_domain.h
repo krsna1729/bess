@@ -15,7 +15,7 @@
 namespace bess::route {
 
 // Identifies a virtual routing and forwarding (VRF) or network instance
-// domain (K7.1, M6; e.g. N3 access vs N6 core vs N9 roaming in OMEC UPF).
+// domain (K7.1, M6; e.g. an access, a core and a peering network kept apart).
 // Domains are owned by a Router (route/router.h), which indexes them densely:
 // the id is the domain's slot, so ids are small and a Router is created with
 // the bound it will accept. Nothing here depends on gates, modules or
