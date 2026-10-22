@@ -792,6 +792,12 @@ rules. Uniform records contain 1–8 four-byte fields; `mixed8` and `mixed16`
 use heterogeneous widths. The second table holds 100%, 50%, 30%, 20%, 10%,
 or 5% as many entries (mixed-width arms use 100%, 50%, and 20%).
 
+RecordArena's record chunks and packet-path chunk-pointer array use the
+framework DPDK heap. `bess::utils::DpdkAllocate` follows the initialized EAL:
+hugepage-backed when enabled, normal-page-backed under `--no-huge`, using the
+framework memory-node policy. Allocation and exhaustion handling remain on
+the control path; the arena adds no separate hugepage detection or fallback.
+
 Hits use connected gate 0 and misses drop. At ratio R, both arms use the same
 rule→action→result mapping: rule i produces record i modulo
 max(1, floor(N×R/100)). Each direct arm therefore has its own `/rR` case;
@@ -812,6 +818,19 @@ all-ones tuple in these arms: results do not establish the cost of a
 many-tuple wildcard policy. Turbo-off does not guarantee a fixed clock on a
 laptop, so record the platform power profile too.
 
+Keep the control CPU inside the benchmark partition too: for worker CPU 4
+and control CPU 0, use wrapper `--cpu 0,4 --isolate` and runner
+`--cpu 4 --control-cpu 0`. Check the daemon's placement line reports control
+CPU 0 and worker CPU 4. A runner flag cannot move control threads onto a CPU
+excluded by the cgroup; a CPU-4-only partition reports no reserved control
+CPU and includes control-thread contention.
+
+The runner defaults to daemon `-m 0` (no hugepages). To require hugepages, pass
+an explicit positive memory cap through the build specification, for example
+`--build huge=/path/to/bessd,-m,1024`; do not infer the EAL mode from host free
+hugepages. Set `BESS_DPDK_LIB` to the repository-local DPDK library directory
+when the daemon needs that search path under `sudo`.
+
 #### Final EM/WM placement comparison
 
 The final implementation uses inline `RecordArena` accessors and the existing
@@ -824,11 +843,13 @@ bucketed `ResultPlan` kernels. The matrix varies:
 - Second-table ratio R: 100%, 50%, 30%, 20%, 10%, or 5%; mixed layouts use
   100%, 50%, and 20%. R is the number of distinct actions divided by N.
 
-All 432 placement cases passed the path and result-byte validators in both
-rounds of both builds. Each round used 1.5 s measurement and 0.3 s warmup,
-CPU 4 isolated, sibling CPU 5 offline, turbo off, and the balanced platform
-profile. Packet size was fixed at 64 bytes and the lookup key at four bytes.
-WM used one all-ones tuple, not a multi-tuple wildcard policy.
+The reference matrix below was captured at commit `a446fd39`, before the
+framework-allocation cutover, with daemon `-m 0`. All 432 placement cases
+passed the path and result-byte validators in both rounds of both builds.
+Each round used 1.5 s measurement and 0.3 s warmup, CPU 4 isolated, sibling
+CPU 5 offline, turbo off, and the balanced platform profile. Packet size was
+fixed at 64 bytes and the lookup key at four bytes. WM used one all-ones
+tuple, not a multi-tuple wildcard policy.
 
 The tables report the final build only. Each cell is `cycles/packet /
 ns/packet`, with `M.base` subtracted per round before taking the case median.
