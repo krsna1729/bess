@@ -157,11 +157,21 @@ TEST_F(BessctlTest, ManifestLifecycle) {
   TempDir tmp;
   const std::string path = tmp.Write("pipeline.json", kManifest);
 
-  const gp::Struct normalized = Json(Ok({"validate", path}).out);
+  const Output validated = Ok({"validate", path});
+  const gp::Struct normalized = Json(validated.out);
   EXPECT_EQ((std::vector<std::string>{"ctl_em", "ctl_sink", "ctl_src"}), ModuleNames(normalized));
   EXPECT_EQ(2, Get(Get(normalized, "resources").struct_value(), "ctl_em/rules")
                    .list_value()
                    .values_size());
+  // What each module would promise, on stderr (D-180).
+  EXPECT_TRUE(Contains(validated.err,
+                       "# ctl_em: state=none flow_affinity=none updates=live "
+                       "consistency=referential"))
+      << validated.err;
+  EXPECT_TRUE(Contains(validated.err,
+                       "# ctl_sink: state=none flow_affinity=none updates=none "
+                       "consistency=unspecified"))
+      << validated.err;
   const std::string plan = Ok({"plan", path}).out;
   EXPECT_TRUE(Contains(plan, "ctl_em/rules")) << plan;
   EXPECT_TRUE(Contains(plan, "RESOURCE")) << plan;

@@ -655,14 +655,16 @@ func (c *Client) Pipeline(ctx context.Context, query ...PipelineQuery) (Pipeline
 	}, nil
 }
 
-// ValidatePipeline is the daemon's canonical form of p (InvalidRequestError
-// if p is invalid).
-func (c *Client) ValidatePipeline(ctx context.Context, p *pb.Pipeline) (*pb.Pipeline, error) {
+// ValidatePipeline is the daemon's canonical form of p and what each of its
+// modules would promise about its state, by module name (D-180)
+// (InvalidRequestError if p is invalid).
+func (c *Client) ValidatePipeline(ctx context.Context, p *pb.Pipeline) (*pb.Pipeline, map[string]*pb.ModuleCapabilities, error) {
 	r, err := c.pipelineCall(ctx, &pb.ValidatePipelineRequest{Pipeline: p}, false, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return r.(*pb.ValidatePipelineResponse).GetNormalized(), nil
+	v := r.(*pb.ValidatePipelineResponse)
+	return v.GetNormalized(), v.GetCapabilities(), nil
 }
 
 // versionOf is a diff's or plan's version: with the resource generation when

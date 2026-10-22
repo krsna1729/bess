@@ -472,7 +472,7 @@ Result<PipelineSnapshot> Client::Pipeline(const PipelineQuery &query) {
                           .workers = {r->workers().begin(), r->workers().end()}};
 }
 
-Result<pb::Pipeline> Client::ValidatePipeline(const pb::Pipeline &p) {
+Result<PipelineValidation> Client::ValidatePipeline(const pb::Pipeline &p) {
   pb::ValidatePipelineRequest req;
   *req.mutable_pipeline() = p;
   auto r = PipelineCall<pb::ValidatePipelineResponse>(
@@ -483,7 +483,8 @@ Result<pb::Pipeline> Client::ValidatePipeline(const pb::Pipeline &p) {
   if (!r) {
     return std::unexpected(std::move(r.error()));
   }
-  return r->normalized();
+  return PipelineValidation{.normalized = r->normalized(),
+                            .capabilities = {r->capabilities().begin(), r->capabilities().end()}};
 }
 
 Result<PipelineDiffResult> Client::DiffPipeline(const pb::Pipeline &p) {

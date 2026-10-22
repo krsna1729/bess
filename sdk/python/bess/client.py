@@ -420,10 +420,12 @@ class Client:
         return PipelineSnapshot(response.pipeline, _version(response))
 
     def validate_pipeline(self, pipeline):
+        """The daemon's canonical form of `pipeline`, and what each of its
+        modules would promise about its state, by module name (D-180)."""
         request = v2.ValidatePipelineRequest()
         request.pipeline.CopyFrom(pipeline)
         response = self._call("ValidatePipeline", request)
-        return response.normalized
+        return response.normalized, dict(response.capabilities)
 
     def diff_pipeline(self, pipeline):
         request = v2.DiffPipelineRequest()

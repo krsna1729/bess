@@ -139,6 +139,19 @@ Go: `bess.NewPipeline(snap.Pipeline).Module(...).Chain(...).Build()`,
 `ApplyPipeline(ctx, p, bess.WithExpectedVersion(snap.Version))`, with
 `*PipelineConflictError`.
 
+Validation also answers what each module would promise about its state, by
+module name, before anything is created (`ModuleCapabilities`, D-180): who
+owns the state its packet path changes (`STATE_NONE`, `_SINGLE_WORKER`,
+`_PER_WORKER`, `_SHARED`), whether one flow's packets must reach one worker
+(`FLOW_AFFINITY_NONE`, `_PREFERRED`, `_REQUIRED`), how its tables change
+(`UPDATES_NONE`, `_LIVE`, `_REBUILD`: the cost follows the table,
+`_PAUSED_WORKERS`) and the consistency they provide. A controller's compiler
+uses it to refuse a graph before applying it - a module that needs flow
+affinity behind a distribution that does not keep flows together, or a
+per-change rebuild on a table it updates often. C++ `ValidatePipeline`
+returns `PipelineValidation{normalized, capabilities}`, Go
+`(normalized, capabilities, err)`, Python `(normalized, capabilities)`.
+
 A version is a generation and the daemon epoch it belongs to
 (`PipelineVersion`): generations start again when the daemon restarts, so a
 generation alone means nothing across a restart (D-106).
@@ -271,7 +284,7 @@ what `get` prints, `apply` reads back. Numbers are passed through as written:
 
 ```sh
 bessctl schema ExactMatch         # init type, gates, actions and resource tables
-bessctl validate pipeline.json    # the daemon's canonical form
+bessctl validate pipeline.json    # the daemon's canonical form; each module's capabilities on stderr
 bessctl diff pipeline.json        # what would change
 bessctl plan pipeline.json        # the steps, by phase
 bessctl apply pipeline.json [--generation G[/R]@E]

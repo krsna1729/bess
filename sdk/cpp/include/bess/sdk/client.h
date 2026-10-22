@@ -185,6 +185,12 @@ struct PipelineSnapshot {
   std::vector<pb::WorkerPlacement> workers;
 };
 
+struct PipelineValidation {
+  pb::Pipeline normalized;  // the daemon's canonical form
+  // What each module would promise about its state, by module name (D-180).
+  std::map<std::string, pb::ModuleCapabilities> capabilities;
+};
+
 struct PipelineDiffResult {
   pb::PipelineDiff diff;
   PipelineVersion version;  // what the diff was taken against
@@ -269,8 +275,9 @@ class Client {
   // The active pipeline; with `query.include_resources` its resources'
   // contents too, so it applies back as a no-op.
   Result<PipelineSnapshot> Pipeline(const PipelineQuery &query = {});
-  // The daemon's canonical form of `p` (kInvalidRequest if invalid).
-  Result<pb::Pipeline> ValidatePipeline(const pb::Pipeline &p);
+  // The daemon's canonical form of `p` and what each of its modules would
+  // promise (kInvalidRequest if invalid).
+  Result<PipelineValidation> ValidatePipeline(const pb::Pipeline &p);
   Result<PipelineDiffResult> DiffPipeline(const pb::Pipeline &p);
   Result<PipelinePlan> PlanPipeline(const pb::Pipeline &p);
   // Makes `p` the active pipeline, all or nothing (its listed resources'

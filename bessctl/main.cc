@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <csignal>
@@ -399,9 +400,10 @@ class Cli {
                      a.thread_safe() ? "  (no pause)" : "");
       }
       for (const pb::ResourceSchema &r : c.resources()) {
-        std::println("  resource  {:<20} {}{}", r.table(),
+        std::println("  resource  {:<20} {}{}{}", r.table(),
                      ResourceTypes(r.kind(), r.key_type(), r.value_type()),
-                     r.requires_paused_workers() ? "  (paused)" : "");
+                     r.requires_paused_workers() ? "  (paused)" : "",
+                     r.rebuilds() ? "  (rebuilds)" : "");
       }
       return 0;
     }
@@ -443,17 +445,39 @@ class Cli {
     return 0;
   }
 
+  // An enum value's name without its prefix, lower case: "STATE_PER_WORKER"
+  // -> "per_worker".
+  static std::string Short(const std::string &name, std::string_view prefix) {
+    std::string out = name.starts_with(prefix) ? name.substr(prefix.size()) : name;
+    std::ranges::transform(out, out.begin(), [](unsigned char c) { return std::tolower(c); });
+    return out;
+  }
+
   int Validate(const std::string &path, bessctl::Format format) {
     auto schema = LoadSchema();
     auto p = schema ? ReadManifest(**schema, path) : std::nullopt;
     if (!p) {
       return 1;
     }
-    auto normalized = client_->ValidatePipeline(*p);
-    if (!normalized) {
-      return Fail(normalized.error());
+    auto validated = client_->ValidatePipeline(*p);
+    if (!validated) {
+      return Fail(validated.error());
     }
-    return PrintPipeline(**schema, *normalized, format);
+    if (const int rc = PrintPipeline(**schema, validated->normalized, format); rc != 0) {
+      return rc;
+    }
+    // To stderr: stdout is the manifest. What each module would promise
+    // (D-180).
+    for (const auto &[module, caps] : validated->capabilities) {
+      std::println(stderr, "# {}: state={} flow_affinity={} updates={} consistency={}", module,
+                   Short(pb::ModuleCapabilities::State_Name(caps.state()), "STATE_"),
+                   Short(pb::ModuleCapabilities::FlowAffinity_Name(caps.flow_affinity()),
+                         "FLOW_AFFINITY_"),
+                   Short(pb::ModuleCapabilities::Updates_Name(caps.updates()), "UPDATES_"),
+                   Short(pb::ApplyTransactionRequest::Consistency_Name(caps.consistency()),
+                         "CONSISTENCY_"));
+    }
+    return 0;
   }
 
   // A resource change carries its entry counts; unchecked: its module is
