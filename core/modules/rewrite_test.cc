@@ -102,7 +102,8 @@ TEST(RewriteTest, WorkersAdvanceIndependentlyAndAReplacementRestartsEveryWorker)
   EXPECT_EQ((std::vector<Bytes>{B("b")}), run(0));
   EXPECT_EQ((std::vector<Bytes>{B("b")}), run(1));
 
-  ASSERT_EQ("", h.SetResource("rw_workers/templates", Templates({"x", "y"})));
+  // Both cursors are at 2: keeping them would emit "z", not the first template.
+  ASSERT_EQ("", h.SetResource("rw_workers/templates", Templates({"x", "y", "z"})));
   EXPECT_EQ((std::vector<Bytes>{B("x")}), run(1));
   EXPECT_EQ((std::vector<Bytes>{B("x")}), run(0));
   EXPECT_EQ((std::vector<Bytes>{B("y")}), run(1));
