@@ -2,8 +2,9 @@
 
 // Firewall in process: first match wins over one policy that holds both
 // families, a packet the table cannot judge is dropped even by a catch-all,
-// a fragment is not judged by ports it does not carry, and a refused rule
-// list changes nothing. D-129: "<name>/rules" holds the whole ordered policy.
+// and a fragment is not judged by ports it does not carry. D-179:
+// "<name>/rules" holds one entry per rule by id, ordered by priority; a
+// transaction changes the policy whole or not at all.
 
 #include <gtest/gtest.h>
 
@@ -11,6 +12,8 @@
 #include <optional>
 #include <random>
 #include <string>
+
+#include <google/protobuf/any.pb.h>
 
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
@@ -64,6 +67,19 @@ bess::pb::FirewallArg Rules(std::initializer_list<Rule> rules) {
     }
   }
   return arg;
+}
+
+bess::pb::FirewallRuleKey Id(uint32_t id) {
+  bess::pb::FirewallRuleKey key;
+  key.set_id(id);
+  return key;
+}
+
+bess::pb::FirewallRuleValue Entry(int64_t priority, const Rule &r) {
+  bess::pb::FirewallRuleValue value;
+  value.set_priority(priority);
+  *value.mutable_rule() = Rules({r}).rules(0);
+  return value;
 }
 
 // Whether `pkt` comes out (unchanged) on gate 0.
@@ -255,75 +271,128 @@ TEST(FirewallTest, RefusesRulesItCannotExpress) {
   EXPECT_NE("", h.CreateError("Firewall", Rules({{.drop = true, .action_id = 7}})));
 }
 
-// D-141: the ActionId a rule names travels with the policy, through the
-// resource's read-back, the way the peers' rule values carry theirs.
-TEST(FirewallTest, AnActionIdTravelsWithThePolicy) {
+// D-141: the ActionId a rule names travels with the rule, through the
+// resource's read-back, the way the peers' rule values carry theirs. Init's
+// rules are ids 1..n at priority 0.
+TEST(FirewallTest, AnActionIdTravelsWithTheRule) {
   ModuleHarness h;
-  const auto policy = Rules({{.src_ip = "10.0.0.0/8", .action_id = 7},
-                             {.src_ip = "11.0.0.0/8", .action_id = 9},
-                             {.src_ip = "12.0.0.0/8", .drop = true}});
-  Module *fw = h.Create("Firewall", policy, "fw_act");
+  const Rule acted{.src_ip = "10.0.0.0/8", .action_id = 7};
+  const Rule dropped{.src_ip = "12.0.0.0/8", .drop = true};
+  Module *fw = h.Create("Firewall", Rules({acted, dropped}), "fw_act");
   ASSERT_NE(nullptr, fw);
-  EXPECT_EQ("", h.ReadBackDiffers("fw_act/rules", {{nullptr, &policy}}));
-  // A refused set leaves the published policy alone (the refusal is the same
-  // one Init gives).
-  EXPECT_NE("", h.SetResource("fw_act/rules", Rules({{.drop = true, .action_id = 7}})));
-  EXPECT_EQ("", h.ReadBackDiffers("fw_act/rules", {{nullptr, &policy}}));
+  const auto k1 = Id(1);
+  const auto k2 = Id(2);
+  const auto v1 = Entry(0, acted);
+  const auto v2 = Entry(0, dropped);
+  EXPECT_EQ("", h.ReadBackDiffers("fw_act/rules", {{&k1, &v1}, {&k2, &v2}}));
+  // A rule that drops cannot name an action (the refusal Init gives); the
+  // rule stays as it was.
+  EXPECT_NE("", h.UpsertResource("fw_act/rules", k2,
+                                 Entry(0, {.drop = true, .action_id = 7})));
+  EXPECT_EQ("", h.ReadBackDiffers("fw_act/rules", {{&k1, &v1}, {&k2, &v2}}));
 }
 
-TEST(FirewallTest, RulesResourceReplacesThePolicy) {
+TEST(FirewallTest, PriorityOrdersTheRulesAndTheIdBreaksTies) {
   std::mt19937 rng = bess::testing::SeededRng(17);
+  const Bytes a = TcpPacket({.sip = "10.1.2.3", .dip = "20.0.0.1", .sport = 1000, .dport = 80}, rng);
+  const Bytes b = TcpPacket({.sip = "10.2.0.1", .dip = "20.0.0.1", .sport = 1000, .dport = 80}, rng);
+
+  ModuleHarness h;
+  Module *fw = h.Create("Firewall", Rules({{.src_ip = "10.0.0.0/8"}}), "fw_prio");
+  ASSERT_NE(nullptr, fw);
+  const std::string rules = "fw_prio/rules";
+  // An RCU swap, so a write never pauses the workers.
+  EXPECT_FALSE(RequiresPausedWorkers(rules));
+  EXPECT_TRUE(Passes(h, fw, a));
+  EXPECT_TRUE(Passes(h, fw, b));
+
+  // A higher priority is checked before a lower id.
+  EXPECT_EQ("", h.UpsertResource(rules, Id(7), Entry(10, {.src_ip = "10.1.0.0/16", .drop = true})));
+  EXPECT_FALSE(Passes(h, fw, a));
+  EXPECT_TRUE(Passes(h, fw, b));
+
+  // Equal priorities: the lower id first.
+  const auto pass_24 = Entry(10, {.src_ip = "10.1.2.0/24"});
+  EXPECT_EQ("", h.UpsertResource(rules, Id(3), pass_24));
+  EXPECT_TRUE(Passes(h, fw, a));
+
+  // Raising rule 7's priority moves it ahead; its id stays.
+  const auto drop_first = Entry(20, {.src_ip = "10.1.0.0/16", .drop = true});
+  EXPECT_EQ("", h.UpsertResource(rules, Id(7), drop_first));
+  EXPECT_FALSE(Passes(h, fw, a));
+  const auto k1 = Id(1);
+  const auto k3 = Id(3);
+  const auto k7 = Id(7);
+  const auto v1 = Entry(0, {.src_ip = "10.0.0.0/8"});
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&k1, &v1}, {&k3, &pass_24}, {&k7, &drop_first}}));
+
+  // Erasing a rule removes only it; a rule that is not there is refused.
+  EXPECT_EQ("", h.EraseResource(rules, k7));
+  EXPECT_TRUE(Passes(h, fw, a));
+  EXPECT_NE("", h.EraseResource(rules, k7));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&k1, &v1}, {&k3, &pass_24}}));
+}
+
+// One transaction is one policy change: every operation is checked before the
+// table is built, and a refusal anywhere leaves the policy and the rules as
+// they were.
+TEST(FirewallTest, ATransactionChangesThePolicyWholeOrNotAtAll) {
+  std::mt19937 rng = bess::testing::SeededRng(23);
   const Bytes a = TcpPacket({.sip = "10.1.2.3", .dip = "20.0.0.1", .sport = 1000, .dport = 80}, rng);
   const Bytes b = TcpPacket({.sip = "11.1.2.3", .dip = "20.0.0.1", .sport = 1000, .dport = 80}, rng);
 
   ModuleHarness h;
-  const auto initial = Rules({{.src_ip = "10.0.0.0/8"}});
-  Module *fw = h.Create("Firewall", initial, "fw_res");
+  Module *fw = h.Create("Firewall", Rules({{.src_ip = "10.0.0.0/8"}}), "fw_tx");
   ASSERT_NE(nullptr, fw);
-  const std::string rules = "fw_res/rules";
-  // An RCU swap, so a write never pauses the workers.
-  EXPECT_FALSE(RequiresPausedWorkers(rules));
-  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &initial}})) << "Init's rules";
+  const std::string rules = "fw_tx/rules";
+  const bess::framework::ResourceCodec *codec = h.Codec(rules);
+  ASSERT_NE(nullptr, codec);
+  // An operation as a client sends it; no value erases.
+  auto op = [&](uint32_t id, const bess::pb::FirewallRuleValue *value) {
+    google::protobuf::Any packed_key;
+    EXPECT_TRUE(packed_key.PackFrom(Id(id)));
+    auto key = codec->Key(packed_key.type_url(), packed_key.value());
+    EXPECT_TRUE(key.has_value());
+    if (value == nullptr) {
+      return bess::dataplane::Op::Erase(rules, *key);
+    }
+    google::protobuf::Any packed_value;
+    EXPECT_TRUE(packed_value.PackFrom(*value));
+    auto decoded = codec->Value(packed_value.type_url(), packed_value.value());
+    EXPECT_TRUE(decoded.has_value());
+    return bess::dataplane::Op::Upsert(rules, *key, std::move(*decoded));
+  };
 
-  const auto two = Rules({{.src_ip = "11.0.0.0/8"}, {.src_ip = "10.0.0.0/8", .drop = true}});
-  EXPECT_EQ("", h.SetResource(rules, two));
+  // Swap which network passes in one transaction.
+  const auto pass_11 = Entry(0, {.src_ip = "11.0.0.0/8"});
+  EXPECT_EQ("", h.Apply({op(1, nullptr), op(2, &pass_11)}));
   EXPECT_FALSE(Passes(h, fw, a));
   EXPECT_TRUE(Passes(h, fw, b));
-  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &two}}));
 
-  // A refused list changes nothing at all.
-  EXPECT_NE("", h.SetResource(rules, Rules({{.src_ip = "10.0.0.0/8"}, {.src_ip = "2001:db8::/129"}})));
-  EXPECT_NE("", h.SetResource(rules, Rules({{.src_ip = "10.0.0.0/8", .dst_ip = "2001:db8::/32"}})));
-  EXPECT_NE("", h.SetResource(rules, Rules({{.dst_port_low = 65616}})));
-  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &two}})) << "refused sets change nothing";
+  // A refused operation (an erase of a rule that is not there) refuses the
+  // upsert beside it.
+  const auto pass_10 = Entry(0, {.src_ip = "10.0.0.0/8"});
+  EXPECT_NE("", h.Apply({op(3, &pass_10), op(9, nullptr)}));
   EXPECT_FALSE(Passes(h, fw, a));
+  const auto k2 = Id(2);
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&k2, &pass_11}}));
+
+  // The codec checks each rule as it arrives, so a rule the table cannot
+  // express never reaches a transaction.
+  for (const Rule &bad : {Rule{.src_ip = "2001:db8::/129"},
+                          Rule{.src_ip = "10.0.0.0/8", .dst_ip = "2001:db8::/32"},
+                          Rule{.dst_port_low = 65616},
+                          Rule{.dst_port_low = 90, .dst_port_high = 80}}) {
+    EXPECT_NE("", h.UpsertResource(rules, Id(4), Entry(0, bad)));
+  }
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&k2, &pass_11}}));
   EXPECT_TRUE(Passes(h, fw, b));
 
-  // An empty policy drops everything (no rule, no match).
-  const bess::pb::FirewallArg none;
-  EXPECT_EQ("", h.SetResource(rules, none));
+  // No rules: everything is dropped.
+  EXPECT_EQ("", h.EraseResource(rules, k2));
   EXPECT_FALSE(Passes(h, fw, a));
   EXPECT_FALSE(Passes(h, fw, b));
-  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &none}}));
-}
-
-// action_attr registers the read at Init and cannot change at runtime; a
-// rules-only update must not erase it from the desired state the resource
-// reads back.
-TEST(FirewallTest, TheConfiguredActionNameSurvivesARulesUpdate) {
-  ModuleHarness h;
-  bess::pb::FirewallArg initial = Rules({{.src_ip = "10.0.0.0/8"}});
-  initial.set_action_attr("flow_action");
-  Module *fw = h.Create("Firewall", initial, "fw_named_rules");
-  ASSERT_NE(nullptr, fw);
-  const std::string rules = "fw_named_rules/rules";
-  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &initial}})) << "Init's name";
-
-  bess::pb::FirewallArg updated = Rules({{.src_ip = "10.0.0.0/8", .drop = true}});
-  EXPECT_EQ("", h.SetResource(rules, updated));
-  updated.set_action_attr("flow_action");
-  EXPECT_EQ("", h.ReadBackDiffers(rules, {{nullptr, &updated}}))
-      << "the rules changed; the Init-only name did not";
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {}));
 }
 
 TEST(FirewallTest, APacketThisTableCannotJudgeIsDropped) {

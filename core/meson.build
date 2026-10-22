@@ -1109,6 +1109,7 @@ if get_option('build_benchmarks')
     'modules_exact_match_bench': ['modules/exact_match_bench.cc', benchmark_main_dep],
     'modules_exact_match_update_bench': ['modules/exact_match_update_bench.cc', benchmark_main_dep],
     'modules_exact_match_transaction_bench': ['modules/exact_match_transaction_bench.cc', benchmark_main_dep],
+    'modules_firewall_update_bench': ['modules/firewall_update_bench.cc', benchmark_main_dep],
     'modules_wildcard_match_bench': ['modules/wildcard_match_bench.cc', benchmark_main_dep],
     'modules_wildcard_match_update_bench': ['modules/wildcard_match_update_bench.cc', benchmark_main_dep],
     'modules_table_scale_bench': ['modules/table_scale_bench.cc', benchmark_main_dep],
