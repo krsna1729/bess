@@ -1316,6 +1316,35 @@ BESS_INSTANTIATE_ROUTE_BACKENDS(RouteTableTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouterTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouterGroupTest);
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouteOracleTest);
+TEST(Ipv6RouteTableTest, ValidatesAndPerformsLongestPrefixLookup) {
+  auto created = Ipv6RouteTable::Create(bess::runtime::runtime().rcu());
+  ASSERT_TRUE(created);
+  auto &table = **created;
+  const auto address = [](const char *text) {
+    return bess::utils::ParseIpv6Address(text).value();
+  };
+  auto prefix = [](const char *text, uint8_t length) {
+    return Ipv6Prefix::Make(bess::utils::ParseIpv6Address(text).value(), length);
+  };
+  EXPECT_EQ(RouteError::kInvalidPrefixLength,
+            Ipv6Prefix::Make({}, 129).error());
+  EXPECT_EQ(RouteError::kHostBitsSet,
+            prefix("2001:db8::1", 64).error());
+  ASSERT_TRUE(table.Upsert(*prefix("::", 0), 1));
+  ASSERT_TRUE(table.Upsert(*prefix("2001:db8::", 32), 2));
+  ASSERT_TRUE(table.Upsert(*prefix("2001:db8:1::", 48), 3));
+  auto view = table.Read();
+  EXPECT_EQ(3, view.Lookup(address("2001:db8:1::1234")));
+  EXPECT_EQ(2, view.Lookup(address("2001:db8:2::1234")));
+  EXPECT_EQ(1, view.Lookup(address("2001:db9::1")));
+  EXPECT_EQ(2, table.CoveringValue(*prefix("2001:db8:1::", 48)));
+  size_t enumerated = 0;
+  table.ForEach([&](Ipv6Prefix, uint32_t) { enumerated++; });
+  EXPECT_EQ(3u, enumerated);
+  ASSERT_TRUE(table.Erase(*prefix("2001:db8:1::", 48)));
+  EXPECT_EQ(2, table.Read().Lookup(address("2001:db8:1::1234")));
+  EXPECT_EQ(2u, table.size());
+}
 
 }  // namespace
 }  // namespace bess::route

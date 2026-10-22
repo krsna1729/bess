@@ -16,6 +16,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <chrono>
 #include <vector>
 
 #include "gate.h"
@@ -25,6 +26,7 @@
 #include "pb/module_msg.pb.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
+#include "runtime/runtime_state.h"
 #include "utils/ether.h"
 
 namespace {
@@ -166,10 +168,14 @@ class RouterTest : public ::testing::Test {
 
   // A router that routes by destination (D-155): the mode is configuration,
   // not a guess about the graph's wiring. `groups` sets max_groups (D-156).
-  Router *MakeDestinationRouter(uint64_t domains = 1, uint64_t groups = 0) {
+  Router *MakeDestinationRouter(uint64_t domains = 1, uint64_t groups = 0,
+                                const std::string &domain_attr = "") {
     bess::pb::RouterArg arg;
     arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
     arg.set_max_domains(domains);
+    if (!domain_attr.empty()) {
+      arg.set_domain_attr(domain_attr);
+    }
     if (groups != 0) {
       arg.set_max_groups(groups);
     }
@@ -224,6 +230,16 @@ class RouterTest : public ::testing::Test {
     value.set_next_hop_id(hop);
     EXPECT_EQ("", h_.UpsertResource("rt/routes", key, value));
   }
+  void MakeRoute6(Router *rt, const char *prefix, uint32_t length,
+                  uint32_t domain, uint32_t hop) {
+    bess::pb::RouterRouteKey key;
+    key.set_ipv6(prefix);
+    key.set_prefix_length(length);
+    key.set_domain(domain);
+    bess::pb::RouterRouteValue value;
+    value.set_next_hop_id(hop);
+    EXPECT_EQ("", h_.UpsertResource("rt/routes", key, value));
+  }
 
   // One next-hop group (D-156), written as a client writes it: the members in
   // selection order, a repeated member a weight.
@@ -251,22 +267,38 @@ class RouterTest : public ::testing::Test {
 
   // What a VIF writes: the route domain a packet arrived in. A fresh name per
   // call, as MakeWriter's.
-  Module *MakeDomainWriter(uint32_t domain) {
+  Module *MakeDomainWriter(uint32_t domain,
+                           const std::string &attr_name = "route_domain") {
     bess::pb::SetMetadataArg arg;
     bess::pb::SetMetadataArg::Attribute *attr = arg.add_attrs();
-    attr->set_name("route_domain");
+    attr->set_name(attr_name);
     attr->set_size(4);
-    const uint8_t bytes[4] = {static_cast<uint8_t>(domain >> 24), static_cast<uint8_t>(domain >> 16),
-                              static_cast<uint8_t>(domain >> 8), static_cast<uint8_t>(domain)};
+    const uint8_t bytes[4] = {
+        static_cast<uint8_t>(domain >> 24), static_cast<uint8_t>(domain >> 16),
+        static_cast<uint8_t>(domain >> 8), static_cast<uint8_t>(domain)};
     attr->set_value_bin(reinterpret_cast<const char *>(bytes), sizeof(bytes));
     return h_.Create("SetMetadata", arg, "vif" + std::to_string(next_writer_++));
   }
+  Module *MakeNeighborInterfaceWriter(uint32_t id) {
+    bess::pb::SetMetadataArg arg;
+    bess::pb::SetMetadataArg::Attribute *attr = arg.add_attrs();
+    attr->set_name("neighbor_interface_id");
+    attr->set_size(4);
+    const uint8_t bytes[4] = {static_cast<uint8_t>(id >> 24),
+                              static_cast<uint8_t>(id >> 16),
+                              static_cast<uint8_t>(id >> 8),
+                              static_cast<uint8_t>(id)};
+    attr->set_value_bin(reinterpret_cast<const char *>(bytes), sizeof(bytes));
+    return h_.Create("SetMetadata", arg,
+                     "neighbor_vif" + std::to_string(next_writer_++));
+  }
 
   // A frame in the domain it carries, through the VIF that writes it.
-  std::map<gate_idx_t, std::vector<Bytes>> RunToDestination(Router *rt, const Bytes &frame,
-                                                           uint32_t domain = 0,
-                                                           std::vector<gate_idx_t> ogates = {0, 1}) {
-    Module *vif = MakeDomainWriter(domain);
+  std::map<gate_idx_t, std::vector<Bytes>> RunToDestination(
+      Router *rt, const Bytes &frame, uint32_t domain = 0,
+      std::vector<gate_idx_t> ogates = {0, 1},
+      const std::string &domain_attr = "route_domain") {
+    Module *vif = MakeDomainWriter(domain, domain_attr);
     EXPECT_EQ(0, ModuleGraph::ConnectModules(vif, 0, rt, 0, true));
     return h_.RunPipeline(vif, 0, {frame}, rt, std::move(ogates));
   }
@@ -275,6 +307,185 @@ class RouterTest : public ::testing::Test {
   int next_writer_ = 0;
   ModuleHarness h_;
 };
+
+TEST_F(RouterTest, ArpReplyPublishesResolverNextHop) {
+  constexpr char kLocalMac[] = "02:00:00:00:00:01";
+  constexpr char kPeerMac[] = "02:00:00:00:00:02";
+  bess::pb::RouterArg arg;
+  auto *interface = arg.add_resolver_interfaces();
+  interface->set_id(2);
+  interface->set_egress_gate(1);
+  const auto local_mac = Mac(kLocalMac);
+  interface->set_mac(reinterpret_cast<const char *>(local_mac.data()),
+                     local_mac.size());
+  interface->set_ipv4("192.0.2.1");
+  auto *binding = arg.add_neighbor_bindings();
+  binding->set_next_hop_id(1);
+  binding->set_interface_id(2);
+  binding->set_ipv4("192.0.2.2");
+  arg.set_neighbor_first_probe(1);
+  arg.set_neighbor_probe_interval(1);
+  arg.set_neighbor_max_probe_interval(1);
+  arg.set_neighbor_max_probes(2);
+  arg.set_neighbor_reachable_lifetime(4);
+  arg.set_neighbor_unreachable_retry(2);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  const auto *initial =
+      rt->router()->LookupNextHop(bess::route::NextHopId(1));
+  ASSERT_NE(nullptr, initial);
+  EXPECT_EQ(bess::route::NeighborState::kIncomplete, initial->neighbor);
+  bess::pb::RouterNextHopIdKey hop_key;
+  hop_key.set_id(1);
+  bess::pb::RouterNextHopValue static_hop;
+  static_hop.set_egress_gate(1);
+  EXPECT_NE("", h_.UpsertResource("rt/next_hops", hop_key, static_hop))
+      << "a configured resolver binding owns its next-hop id";
+
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+  const auto first_probe = h_.RunTask(rt, {0, 1});
+  ASSERT_EQ(1u, first_probe.at(1).size());
+  const auto request = bess::route::ParseArp(first_probe.at(1)[0]);
+  ASSERT_TRUE(request.has_value());
+  EXPECT_EQ(bess::utils::Arp::kRequest, request->opcode);
+
+  const Bytes reply =
+      PacketBuilder()
+          .Ether(kLocalMac, kPeerMac)
+          .Arp(2, kPeerMac, "192.0.2.2", kLocalMac, "192.0.2.1")
+          .PadTo(60)
+          .Build();
+  (void)h_.RunPipeline(writer, 0, {reply}, rt, {0});
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 2);
+  const auto *resolved =
+      rt->router()->LookupNextHop(bess::route::NextHopId(1));
+  ASSERT_NE(nullptr, resolved);
+  EXPECT_EQ(bess::route::NeighborState::kResolved, resolved->neighbor);
+  EXPECT_EQ(Ethernet::Address(Mac(kPeerMac).data()), resolved->dst_mac);
+  EXPECT_EQ(Ethernet::Address(local_mac.data()), resolved->src_mac);
+
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 6);
+  const auto *aged =
+      rt->router()->LookupNextHop(bess::route::NextHopId(1));
+  ASSERT_NE(nullptr, aged);
+  EXPECT_EQ(bess::route::NeighborState::kIncomplete, aged->neighbor);
+  EXPECT_EQ(1u, h_.RunTask(rt, {0, 1})[1].size());
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 7);
+  (void)h_.RunTask(rt, {0, 1});
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 8);
+  const auto *unreachable =
+      rt->router()->LookupNextHop(bess::route::NextHopId(1));
+  ASSERT_NE(nullptr, unreachable);
+  EXPECT_EQ(bess::route::NeighborState::kUnreachable, unreachable->neighbor);
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 10);
+  const auto retry_probe = h_.RunTask(rt, {0, 1});
+  ASSERT_EQ(1u, retry_probe.at(1).size());
+  const auto *retry =
+      rt->router()->LookupNextHop(bess::route::NextHopId(1));
+  ASSERT_NE(nullptr, retry);
+  EXPECT_EQ(bess::route::NeighborState::kIncomplete, retry->neighbor);
+}
+// One resolver task run that solicits on two interfaces leaves through two
+// gates. The task module must flush its own per-gate batches: left in the
+// shared Context, the next module would read them against its own gates.
+TEST_F(RouterTest, SolicitationsOnTwoInterfacesLeaveThroughBothGates) {
+  bess::pb::RouterArg arg;
+  for (uint32_t id = 1; id <= 2; id++) {
+    auto *interface = arg.add_resolver_interfaces();
+    interface->set_id(id);
+    interface->set_egress_gate(id - 1);
+    const auto mac = Mac(id == 1 ? "02:00:00:00:00:01" : "02:00:00:00:00:02");
+    interface->set_mac(reinterpret_cast<const char *>(mac.data()), mac.size());
+    interface->set_ipv4(id == 1 ? "192.0.2.1" : "198.51.100.1");
+    auto *binding = arg.add_neighbor_bindings();
+    binding->set_next_hop_id(id);
+    binding->set_interface_id(id);
+    binding->set_ipv4(id == 1 ? "192.0.2.2" : "198.51.100.2");
+  }
+  arg.set_neighbor_first_probe(1);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(1);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+  const auto probes = h_.RunTask(rt, {0, 1});
+  ASSERT_EQ(1u, probes.count(0));
+  ASSERT_EQ(1u, probes.count(1));
+  EXPECT_EQ(1u, probes.at(0).size());
+  EXPECT_EQ(1u, probes.at(1).size());
+}
+TEST_F(RouterTest, NeighborResolverCapacityIsBounded) {
+  constexpr char kLocalMac[] = "02:00:00:00:00:01";
+  bess::pb::RouterArg arg;
+  arg.set_max_neighbors(1);
+  auto *interface = arg.add_resolver_interfaces();
+  interface->set_id(2);
+  interface->set_egress_gate(1);
+  const auto local_mac = Mac(kLocalMac);
+  interface->set_mac(reinterpret_cast<const char *>(local_mac.data()),
+                     local_mac.size());
+  interface->set_ipv4("192.0.2.1");
+  for (uint32_t id = 1; id <= 2; id++) {
+    auto *binding = arg.add_neighbor_bindings();
+    binding->set_next_hop_id(id);
+    binding->set_interface_id(2);
+    binding->set_ipv4(id == 1 ? "192.0.2.2" : "192.0.2.3");
+  }
+  const std::string error = h_.CreateError("Router", arg);
+  EXPECT_NE(std::string::npos, error.find("neighbor capacity exhausted"));
+}
+TEST_F(RouterTest, NdAdvertisementPublishesResolverNextHop) {
+  constexpr char kLocalMac[] = "02:00:00:00:00:01";
+  constexpr char kPeerMac[] = "02:00:00:00:00:02";
+  const auto local_mac = Mac(kLocalMac);
+  const auto peer_mac = Mac(kPeerMac);
+  const auto local_ip = bess::utils::ParseIpv6Address("fe80::1").value();
+  const auto peer_ip = bess::utils::ParseIpv6Address("fe80::2").value();
+  bess::pb::RouterArg arg;
+  auto *interface = arg.add_resolver_interfaces();
+  interface->set_id(2);
+  interface->set_egress_gate(1);
+  interface->set_mac(reinterpret_cast<const char *>(local_mac.data()),
+                     local_mac.size());
+  interface->set_ipv6("fe80::1");
+  auto *binding = arg.add_neighbor_bindings();
+  binding->set_next_hop_id(1);
+  binding->set_interface_id(2);
+  binding->set_ipv6("fe80::2");
+  arg.set_neighbor_first_probe(1);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+  const auto first_probe = h_.RunTask(rt, {0, 1});
+  ASSERT_EQ(1u, first_probe.at(1).size());
+  const auto solicitation =
+      bess::route::ParseNeighborDiscovery(first_probe.at(1)[0]);
+  ASSERT_TRUE(solicitation.has_value());
+  EXPECT_EQ(bess::route::NdType::kNeighborSolicitation,
+            solicitation->type);
+
+  std::array<uint8_t, bess::route::kNdFrameSize> frame{};
+  ASSERT_EQ(frame.size(),
+            bess::route::BuildNeighborAdvertisement(
+                Ethernet::Address(peer_mac.data()), peer_ip, peer_ip,
+                Ethernet::Address(local_mac.data()), local_ip, true, true,
+                frame));
+  (void)h_.RunPipeline(
+      writer, 0, {Bytes(frame.begin(), frame.end())}, rt, {0});
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 2);
+
+  const auto *resolved =
+      rt->router()->LookupNextHop(bess::route::NextHopId(1));
+  ASSERT_NE(nullptr, resolved);
+  EXPECT_EQ(bess::route::NeighborState::kResolved, resolved->neighbor);
+  EXPECT_EQ(Ethernet::Address(peer_mac.data()), resolved->dst_mac);
+  EXPECT_EQ(Ethernet::Address(local_mac.data()), resolved->src_mac);
+}
 
 // A hop that names both addresses: the frame leaves with them, on the gate the
 // hop's egress names, and every other byte of the frame is untouched.
@@ -463,6 +674,17 @@ Bytes FrameTo(const char *dst, uint8_t ttl = 64) {
   b.Last<PacketBuilder::IPv4Hdr>().ttl = ttl;
   return b.Build();
 }
+Bytes Frame6To(const char *dst, uint8_t hop_limit = 64) {
+  PacketBuilder b;
+  b.Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b")
+      .IPv6("2001:db8::1", dst)
+      .Udp(1000, 2000)
+      .Payload("payload");
+  b.Last<PacketBuilder::IPv6Hdr>().hlim = hop_limit;
+  return b.Build();
+}
+
+uint8_t HopLimitOf(const Bytes &frame) { return frame[14 + 7]; }
 
 // The frame's IPv4 TTL: Ethernet is 14 bytes, and TTL is byte 8 of the header.
 uint8_t TtlOf(const Bytes &frame) { return frame[14 + 8]; }
@@ -897,6 +1119,19 @@ TEST_F(RouterTest, TheDomainAttributeSelectsTheFib) {
   EXPECT_TRUE(unknown[1].empty());
 }
 
+TEST_F(RouterTest, ConfiguredTransportDomainAttributeSelectsItsFib) {
+  Router *rt = MakeDestinationRouter(/*domains=*/3, /*groups=*/0,
+                                     "transport_route_domain");
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "10.0.0.0", 8, 2, 1);
+
+  auto routed = RunToDestination(rt, FrameTo("10.1.2.3"), /*domain=*/2,
+                                 {0, 1}, "transport_route_domain");
+  ASSERT_EQ(1u, routed[1].size());
+  EXPECT_TRUE(routed[0].empty());
+}
+
 // What destination routing cannot route: a frame that is not IP, one whose
 // headers do not parse, and a non-initial fragment (its L4 header, and so the
 // flow hash a group route needs, is in an earlier fragment).
@@ -928,12 +1163,16 @@ TEST_F(RouterTest, FramesWithoutARoutableIpv4HeaderAreDroppedAndCounted) {
                              .Payload("payload")
                              .Build();
 
-  for (const Bytes *frame : {&arp, &ipv6, &no_header, &fragment}) {
+  for (const Bytes *frame : {&arp, &no_header, &fragment}) {
     auto out = RunToDestination(rt, *frame);
     EXPECT_TRUE(out[0].empty());
     EXPECT_TRUE(out[1].empty());
   }
-  EXPECT_EQ(2u, rt->not_ipv4_frames()) << "the ARP frame and the IPv6 one";
+  auto v6_out = RunToDestination(rt, ipv6);
+  EXPECT_TRUE(v6_out[0].empty());
+  EXPECT_TRUE(v6_out[1].empty());
+  EXPECT_EQ(1u, rt->not_ipv4_frames()) << "the ARP frame";
+  EXPECT_EQ(1u, rt->no_route_frames()) << "IPv6 is recognized, but has no IPv6 route";
   EXPECT_EQ(1u, rt->malformed_frames()) << "the frame that says IPv4 and has none";
   EXPECT_EQ(1u, rt->non_initial_fragments());
   EXPECT_NE(std::string::npos, rt->GetDesc().find("non-initial fragments: 1")) << rt->GetDesc();
@@ -1196,6 +1435,53 @@ TEST_F(RouterTest, WithoutMaxGroupsTheGroupsResourceIsEmpty) {
   route_value.set_group_id(1);
   EXPECT_NE("", h_.UpsertResource("rt/routes", route_key, route_value));
   EXPECT_NE(std::string::npos, rt->GetDesc().find("0 groups")) << rt->GetDesc();
+}
+
+TEST_F(RouterTest, DestinationModeForwardsIpv4AndIpv6Routes) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeRoute(rt, "198.51.100.0", 24, 0, 1);
+  MakeRoute6(rt, "2001:db8:1::", 64, 0, 1);
+
+  const Bytes v4 = FrameTo("198.51.100.9");
+  auto out4 = RunToDestination(rt, v4);
+  ASSERT_EQ(1u, out4[1].size());
+  EXPECT_EQ(63, TtlOf(out4[1][0]));
+  EXPECT_EQ(0, FoldChecksum(OnesSum(
+                   std::span<const uint8_t>(out4[1][0].data() + 14, 20))));
+  EXPECT_TRUE(std::equal(v4.begin() + 34, v4.end(),
+                         out4[1][0].begin() + 34));
+
+  const Bytes v6 = Frame6To("2001:db8:1::9");
+  auto out6 = RunToDestination(rt, v6);
+  ASSERT_EQ(1u, out6[1].size());
+  EXPECT_EQ(63, HopLimitOf(out6[1][0]));
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), DstOf(out6[1][0]));
+  EXPECT_TRUE(std::equal(v6.begin() + 22, v6.end(),
+                         out6[1][0].begin() + 22));
+
+  const auto routes = h_.ReadResource("rt/routes");
+  EXPECT_EQ(2u, routes.size());
+}
+
+TEST_F(RouterTest, Ipv6NoRouteAndMalformedFramesFailClosed) {
+  Router *rt = MakeDestinationRouter();
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, nullptr, nullptr);
+  MakeRoute6(rt, "2001:db8:1::", 64, 0, 1);
+
+  auto miss = RunToDestination(rt, Frame6To("2001:db8:2::1"));
+  EXPECT_TRUE(miss[0].empty());
+  EXPECT_TRUE(miss[1].empty());
+  EXPECT_EQ(1u, rt->no_route_frames());
+
+  Bytes malformed = Frame6To("2001:db8:1::9");
+  malformed.resize(20);
+  auto bad = RunToDestination(rt, malformed);
+  EXPECT_TRUE(bad[0].empty());
+  EXPECT_TRUE(bad[1].empty());
+  EXPECT_EQ(1u, rt->malformed_frames());
 }
 
 }  // namespace

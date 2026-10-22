@@ -362,9 +362,10 @@ message RouterGroupValue {
 }
 
 message RouterRouteKey {
-  string ipv4 = 1;
+  string ipv4 = 1; /// IPv4 prefix address; retained for existing IPv4 keys.
   uint32 prefix_length = 2;
   uint32 domain = 3; /// Route domain (default 0); must be below the router's max_domains.
+  string ipv6 = 4; /// IPv6 prefix address; set ipv4 empty for IPv6.
 }
 
 /**
@@ -378,6 +379,27 @@ message RouterRouteValue {
   uint32 next_hop_id = 1; /// The next hop the route forwards to (0: not that).
   uint32 group_id = 2; /// The group the route forwards through (0: not that; needs max_groups).
 }
+
+/** One logical interface whose MAC and addresses seed neighbor resolution. */
+message RouterResolverInterface {
+  uint32 id = 1; /// Logical interface id (the Router next-hop interface id).
+  uint32 egress_gate = 2; /// Router output gate used for resolver solicitations.
+  bytes mac = 3; /// Six-byte local Ethernet address.
+  string ipv4 = 4; /// Optional local IPv4 address.
+  string ipv6 = 5; /// Optional local IPv6 address.
+}
+
+/**
+ * Bind one Router next hop to a resolver interface and a family-tagged peer.
+ * The binding owns its next-hop id; configure routes to it, not a static MAC.
+ */
+message RouterNeighborBinding {
+  uint32 next_hop_id = 1;
+  uint32 interface_id = 2;
+  string ipv4 = 3; /// Set exactly one of ipv4 or ipv6.
+  string ipv6 = 4;
+}
+
 
 
 message WildcardMatchRuleKey {
@@ -1457,7 +1479,7 @@ message MeterCommandGetStatusResponse {
  */
 enum RouteMode {
   ROUTE_MODE_NEXT_HOP_ID = 0; /// The `next_hop_id` metadata a classifier writes: the module executes a decision made upstream. With no writer it drops every packet and reports it once per resume (D-129), never guessing.
-  ROUTE_MODE_DESTINATION = 1; /// The packet's own IPv4 destination address, looked up in the route domain it carries: the module makes the decision, the way the router appliance does.
+  ROUTE_MODE_DESTINATION = 1; /// The packet's IPv4 or IPv6 destination address, looked up in the route domain it carries.
 }
 
 enum FlowHashFields {
@@ -1468,9 +1490,9 @@ enum FlowHashFields {
 /**
  * The Router module forwards a packet to the egress its next-hop id (from
  * packet metadata) names, or -- in ROUTE_MODE_DESTINATION -- routes it by its
- * own IPv4 destination address in the route domain it carries (D-155). Routes,
- * next hops and next-hop groups are the resources D-023 describes, changed
- * together or not at all.
+ * destination address (IPv4 or IPv6) in the route domain it carries (D-155).
+ * Routes, next hops and next-hop groups are the resources D-023 describes,
+ * changed together or not at all.
  *
  * __Input Gates__: 1
  * __Output Gates__: many (the next hop's egress)
@@ -1489,6 +1511,16 @@ message RouterArg {
   string next_hop_attr = 11; /// The metadata attribute next-hop mode reads the next-hop id from (default "next_hop_id").
   string domain_attr = 12; /// The metadata attribute destination mode reads the route domain from (default "route_domain").
   uint64 punt_local_gate = 13; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. The frame is counted either way (D-178).
+  string neighbor_interface_attr = 14; /// Metadata field containing a Router resolver interface id.
+  repeated RouterResolverInterface resolver_interfaces = 15; /// Resolver interfaces; id follows the existing gate+1 InterfaceId mapping.
+  repeated RouterNeighborBinding neighbor_bindings = 16; /// Resolver-owned next-hop ids; configure routes to these, not static MACs.
+  uint64 max_neighbors = 17; /// Neighbor resolver capacity (default 1024).
+  uint64 neighbor_first_probe = 18; /// Resolver ticks until first probe (default 1000; zero selects default).
+  uint64 neighbor_probe_interval = 19; /// Initial retry interval in resolver ticks (default 1000; zero selects default).
+  uint64 neighbor_max_probe_interval = 20; /// Backoff ceiling in resolver ticks (default 8000; zero selects default).
+  uint64 neighbor_max_probes = 21; /// Solicitation count per attempt (default 3; zero selects default).
+  uint64 neighbor_reachable_lifetime = 22; /// Resolved-neighbor aging in resolver ticks (default 30000; zero selects default).
+  uint64 neighbor_unreachable_retry = 23; /// Retry delay after failure in resolver ticks (default 60000; zero selects default).
 }
 
 /**

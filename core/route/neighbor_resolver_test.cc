@@ -205,6 +205,24 @@ TEST(NeighborResolverTest, SolicitsWithBackoffThenFailsAndRecovers) {
   EXPECT_EQ(1u, progress.solicitations.size());
 }
 
+TEST(NeighborResolverTest, PollHonorsWorkBudget) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(
+                  Iface(kIface1, "02:00:00:00:00:01", kMyIp), 0)
+                  .has_value());
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), Key(kIface1, kPeer1), 0).has_value());
+  ASSERT_TRUE(
+      resolver->Bind(NextHopId(2), Key(kIface1, kPeer1 + 1), 0).has_value());
+
+  const auto first = resolver->Poll(10, 1);
+  ASSERT_EQ(1u, first.solicitations.size());
+  const auto second = resolver->Poll(10, 1);
+  ASSERT_EQ(1u, second.solicitations.size());
+  EXPECT_NE(first.solicitations[0].frame, second.solicitations[0].frame);
+}
+
+
 TEST(NeighborResolverTest, ARepeatedReplyRefreshesAgingWithoutRepublishing) {
   auto resolver = MakeResolver();
   ASSERT_NE(nullptr, resolver);

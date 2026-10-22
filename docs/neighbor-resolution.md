@@ -115,17 +115,16 @@ arms/reschedules the aging timer before committing, exactly as `OnArp` does.
 The resolver never writes a `NextHop` in place. It asks `NeighborTable::Update`
 for the new immutable objects and returns them:
 
-- direct users call `Publish(router, updates)`, which is one
-  `Router::SetNextHop` per bound hop: one pointer store each, no FIB write;
+- direct users call `Publish(router, updates)` for an unenrolled Router: one
+  `Router::SetNextHop` per bound hop, one pointer store each and no FIB write;
 - transactional users build `NextHopOps(router, updates)` and apply them in
-  one `TransactionEngine::Apply`: all-or-nothing (a refused transaction makes
-  none of them visible), in the engine's referential order -- each next-hop
-  object is replaced whole, one at a time, so a packet may see one hop's new
-  adjacency and another's old one before the transaction finishes. This is
-  not a snapshot: the Router's next-hop resource is referential, and a
-  `kScopeSnapshot` request is refused.
+  one `TransactionEngine::Apply`: all-or-nothing, but referential rather than
+  snapshot visibility, so different hops may change one at a time;
+- the `Router` module uses resolver-owned next-hop operations through the
+  control-side `ResourceRegistry::Apply`. Its next-hop resource rejects
+  ordinary writes and erases for configured resolver-owned ids.
 
-In both cases a packet-path lookup (`Router::Resolve` /
+In each case a packet-path lookup (`Router::Resolve` /
 `LookupNextHop`) obtains one whole `NextHop` pointer through the `SlotTable`'s
 acquire load. Readers see the old object or the new one, never a half-written
 MAC, egress or state; the replaced object is retired after a grace period. The
@@ -152,6 +151,30 @@ The resolver itself is single-threaded (one control-side writer). ARP and ND
 frames arriving on workers must be handed to that writer; the packet path
 never calls into the resolver. This is the same ownership split as every other control-side
 table in BESS and is what lets the state machine allocate without locks.
+
+## Router module configuration and handoff
+
+`RouterArg.resolver_interfaces` provides `{id, egress_gate, mac, ipv4, ipv6}`
+for each resolver interface; `id` is the Router `InterfaceId` and follows the
+current `egress_gate + 1` mapping. `neighbor_bindings` binds a
+`next_hop_id` to an interface and exactly one IPv4 or IPv6 peer address.
+Those bindings seed incomplete next hops and own those ids; routes may refer
+to them, but a static `RouterNextHopValue` must not be written for them.
+
+`neighbor_interface_attr` (default `neighbor_interface_id`) tags ARP/ND input
+with the resolver interface id. This metadata is distinct from `route_domain`
+or `transport_route_domain`, an endpoint id, and a queue id. The Router hands
+control frames from workers to a bounded ring; its maintenance tick calls
+`OnArp`, `OnNd` and `Poll` with a bounded work budget, then publishes complete
+next-hop objects transactionally. A Router task emits queued solicitation
+frames on the configured output gate. `max_neighbors` bounds resolver state;
+the `neighbor_*` timing fields are in maintenance ticks; zero selects the
+default. Defaults are 1000/1000/8000 ticks, 3 probes, 30000 ticks reachable,
+and 60000 ticks unreachable retry. The receive and solicitation rings each
+hold 1024 entries; a full ring drops that control frame or solicitation and
+the timer retry keeps behavior bounded. Each maintenance tick handles at most
+64 received frames and polls at most 64 timer records. An idle Router output
+task blocks until it is scheduled again.
 
 ## What moved out of Vif, and what stayed
 

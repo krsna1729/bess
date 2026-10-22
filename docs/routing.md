@@ -1,22 +1,22 @@
 # Routing in BESS
 
-The router library (`core/route/`) is a complete IPv4 router: per-domain longest-prefix FIBs, next hops with
-neighbor state and link addresses, ECMP groups, a neighbor table whose resolution events are next-hop updates,
-and the packet mechanics (TTL, MTU, ICMPv4, ARP). Two callers use it: the reference appliance R1
-(`examples/appliances/router/`, an application) and the `Router` module (`core/modules/router.cc`, a graph
-adapter). This is the guide to the pieces and to the two ways a graph uses them.
+The router library (`core/route/`) provides per-domain dual-stack longest-prefix FIBs, next hops with
+neighbor state and link addresses, ECMP groups, and IPv4/IPv6 packet mechanics. `NeighborResolver` supplies
+ARP and ND state transitions. The reference appliance R1 (`examples/appliances/router/`, an application) and
+the `Router` module (`core/modules/router.cc`, a graph adapter) use the route library. The Router module also
+drives the resolver through its maintenance and task paths.
 
 ## The machine, in five steps
 
 1. **A frame arrives.** The interface it arrived on decides the routing context: a **route domain** (a VRF; in
    3GPP terms a network instance). A packet carries it as the `route_domain` metadata a VIF writes, or the
    caller passes it (an interface's VRF).
-2. **Look the destination up** in that domain's FIB: longest prefix match. `10.1.2.3` matches `0/0`, `10/8`,
-   `10.1/16`, `10.1.2/24`; the longest wins.
+2. **Look the destination up** in that domain's IPv4 or IPv6 FIB: longest prefix match. The most-specific
+   matching prefix wins.
 3. **The entry names a next hop.** The next hop's egress interface, neighbor state and link addresses are the
    **adjacency**: "write these MACs, send out this interface."
-4. **Per-hop duties**: decrement the TTL (and fix the IPv4 checksum); a graph that enforces an MTU checks it
-   here (`CheckMtu` is the library's helper for that; the Router module does not do it).
+4. **Per-hop duties**: decrement the IPv4 TTL (and fix its header checksum), or decrement the IPv6 hop limit;
+   a graph that enforces an MTU checks it here (`CheckMtu` is the library's helper for IPv4 only).
 5. **Egress.** If the neighbor's MAC is not known, the policy decides: drop, queue (which triggers the
    resolution), or punt to a slow path. BESS leaves that choice to the application.
 
@@ -61,14 +61,14 @@ route exists and chose that hop (D-160).
 
 | file | what it is |
 |---|---|
-| `route/route_table.h` | the FIB: `LpmRouteTable` (rte_lpm or rte_fib, D-132), lock-free lookups, RCU publication, the `/0` route kept beside the structure |
-| `route/router.h` | the router: route domains, per-domain FIBs, next hops, next-hop groups, `Resolve`/`ResolveBatch`, the direct setters and the transactional resource (`Enroll`) |
-| `route/neighbor_table.h` | neighbor state keyed by (interface, address); `Bind`/`Update` return the next hops to republish |
+| `route/route_table.h` | the FIB: `LpmRouteTable` (rte_lpm or rte_fib, D-132) for IPv4 and the RCU-published IPv6 prefix trie, lock-free lookups, the `/0` route kept beside the structure |
+| `route/router.h` | the router: route domains, per-domain dual-stack FIBs, next hops, next-hop groups, `Resolve`/`ResolveBatch`, the direct setters and the transactional resource (`Enroll`) |
+| `route/neighbor_table.h` | neighbor state keyed by (interface, address family, address); `Bind`/`Update` return the next hops to republish |
 | `route/neighbor_resolver.h` | the IPv4/IPv6 neighbor state machine: ARP or ND solicitation, retries/backoff, aging, MAC change, failure/recovery, interface identity; returns frames and neighbor updates (`docs/neighbor-resolution.md`) |
-| `route/l3_packet.h` | packet mechanics: `DecrementTtl`, `FlowHash`, MTU, ICMPv4 errors, ARP and IPv6 ND build/parse |
-| `route/forward.h` | the IPv4 forwarding chain both callers share (D-157): `ResolveFrame` (read) and `WriteForwarded` (write) |
+| `route/l3_packet.h` | packet mechanics: IPv4 TTL/checksum, IPv6 hop limit, `FlowHash`, MTU, ICMPv4 errors, ARP and IPv6 ND build/parse |
+| `route/forward.h` | the IPv4/IPv6 forwarding chain both callers share (D-157): `ResolveFrame` (read) and `WriteForwarded` (write) |
 | `route/connected_routes.h` | the routes an interface address implies (D-178): `DerivedRoutes::Derive` for connected + local, deterministic order and stable keys, `InstallationOps`/`EraseOps` for the controller's transaction |
-| `route/lpm_resource.h` | one `LpmRouteTable` as a transaction resource (D-111): prefix → an opaque value whose meaning is the module's |
+| `route/lpm_resource.h` | one IPv4 `LpmRouteTable` as a transaction resource (D-111): prefix → an opaque value whose meaning is the module's |
 | `conntrack/packet_parse.h` | the checked parse the chain starts from |
 
 ## Two recipes
@@ -77,12 +77,14 @@ route exists and chose that hop (D-160).
 `next_hop_id` metadata, and the Router resolves it and leaves on that hop's egress gate:
 
 ```
-ports/vifs -> classifier (next_hop_id) -> Router -> ports -> UpdateTTL
+ports/vifs -> classifier (next_hop_id) -> Router -> ports
 ```
 
-No routes are written; the router is a next-hop mux, and it writes no TTL -- this is the mode whose contract is
-byte preservation apart from the addresses, so the graph's `UpdateTTL` decrements it. This is the shape the UPF
-and OMEC use today, and it stays first-class.
+The Router decrements IPv4 TTL and fixes its checksum before the L2 rewrite.
+It does not decrement an IPv6 hop limit in next-hop mode. No FIB routes are
+needed: the classifier selects a hop, and the Router resolves it to an egress
+gate. The UPF uses this mode for inner session forwarding; its default PDR
+fields are IPv4.
 
 **Recipe B — a routed network.** Ports and VIFs feed the Router, which looks each packet's own destination up
 in its route domain and forwards it:
@@ -91,20 +93,27 @@ in its route domain and forwards it:
 ports/vifs -> Router (domains, routes, groups, next hops) -> ports
 ```
 
-This is R1 written as a graph, and it is what replaces `IPLookup`. The chain decrements the TTL and fixes the
-checksum itself in this mode (D-155), so `UpdateTTL` has no place in this graph: wired as drawn above, it would
-decrement twice. The Router carries neighbor *state*, not resolution: the module itself sends no ARP or ND
-request (D-153). `route/neighbor_resolver.h` is the resolution component (D-175, D-176): it emits the
-ARP or ND solicitations and the neighbor updates, and the graph sends the frames and republishes the affected
-next hops (`NeighborTable::Update` -> `Router::SetNextHop`), so what an unresolved neighbor means stays
-policy. IPv6 next hops use the same representation; the IPv6 FIB is still to come.
-Routes, next hops and groups are written through the module's resources (`<router>/routes`, `/next_hops`,
-`/groups`) in transactions, or directly by an application. The first routes a router usually writes are its
-connected ones: an interface's own address implies the subnet reachable on it, and
-`route::ConnectedRouteFor(address, length, egress)` (D-164) returns that prefix with a hop on the interface,
-whose neighbor stays unresolved -- the hop names the interface, not a neighbor, so nothing resolves it and a
-frame to the subnet itself is unresolved. Reaching a host on that subnet is a /32 route and hop the application
-writes when resolution learns the host (`NeighborTable::Bind` is what makes a learned neighbor update a hop).
+The chain decrements the IPv4 TTL and fixes its checksum, or decrements the IPv6 hop limit, in this mode
+(D-155). The Router module's configured NeighborResolver processes ARP/ND input and timers on its control
+maintenance path, publishes whole next-hop objects through transactions, and emits solicitation frames from
+its task on the configured output gate. An unresolved neighbor remains fail-closed until a valid reply or
+advertisement updates it. Routes, next hops and groups use the module resources (`<router>/routes`,
+`/next_hops`, `/groups`) in transactions, or direct library APIs.
+For IPv4, `route::ConnectedRouteFor(address, length, egress)` returns an
+interface prefix with an unresolved next hop (D-164). IPv6 routes are
+configured with `RouterRouteKey.ipv6` and an `Ipv6Prefix`; they share the
+same route domain and next-hop resources. The Router does not synthesize
+connected IPv6 routes.
+
+`RouterArg.domain_attr` defaults to `route_domain`; a second Router can read
+`transport_route_domain` for an outer transport FIB. The Router resource key
+keeps the IPv4 spelling (`ipv4`, `prefix_length`, `domain`) and adds the
+mutually exclusive `ipv6` field. Resolver interface metadata defaults to
+`neighbor_interface_id`, independent of the route domain. A configured
+`RouterNeighborBinding` owns its next-hop id: create routes to it, and do not
+write a static `RouterNextHopValue` for that id. The resolver interface id is
+the Router's logical `InterfaceId` (currently gate + 1), not a queue or UPF
+endpoint id; the deployment graph must tag resolver input with that interface id.
 
 An interface address also implies a **local route** (D-178): the address itself is this node's, so a packet to
 it is delivered here and never forwarded. `route::DerivedRoutes::Derive(interfaces)` returns both routes per

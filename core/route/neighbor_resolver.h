@@ -87,9 +87,8 @@ namespace bess::route {
 // knows no rate. Timing values are therefore ticks too, and zero has the
 // documented meaning at each field.
 //
-// IPv6 ND is not implemented yet; the state machine and the key are ready for
-// another address family over the same entries, and the packet helpers are
-// address-family specific.
+// IPv4 ARP and IPv6 Neighbor Discovery use the same address-family-tagged
+// entries; packet helpers remain family-specific.
 class NeighborResolver {
  public:
   using Key = NeighborTable::Key;

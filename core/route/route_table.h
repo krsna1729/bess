@@ -3,6 +3,7 @@
 #ifndef BESS_ROUTE_ROUTE_TABLE_H_
 #define BESS_ROUTE_ROUTE_TABLE_H_
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <compare>
@@ -15,7 +16,9 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <limits>
 #include <unordered_map>
+#include <vector>
 
 #include <rte_fib.h>
 #include <rte_lpm.h>
@@ -26,6 +29,7 @@
 #include "rcu/rcu_ptr.h"
 #include "utils/common.h"
 #include "utils/dpdk_memory.h"
+#include "utils/ip.h"
 
 namespace bess::route {
 
@@ -93,6 +97,75 @@ class Ipv4Prefix {
 
   uint32_t addr_;
   uint8_t length_;
+};
+
+// A validated IPv6 prefix, stored as network-order bytes.
+class Ipv6Prefix {
+ public:
+  static std::expected<Ipv6Prefix, RouteError> Make(
+      utils::Ipv6Address addr, uint8_t length);
+
+  const utils::Ipv6Address &addr() const noexcept { return addr_; }
+  uint8_t length() const noexcept { return length_; }
+  friend auto operator<=>(const Ipv6Prefix &, const Ipv6Prefix &) = default;
+
+  friend class Ipv6RouteTable;
+  Ipv6Prefix(utils::Ipv6Address addr, uint8_t length)
+      : addr_(addr), length_(length) {}
+  utils::Ipv6Address addr_;
+  uint8_t length_;
+};
+
+// Immutable binary-trie snapshots: control writes rebuild and publish the
+// complete trie through RCU; packet lookup follows at most 128 branches.
+class Ipv6RouteTable {
+ public:
+  struct View;
+  static std::expected<std::unique_ptr<Ipv6RouteTable>, RouteError> Create(
+      rcu::RcuDomain &domain);
+  ~Ipv6RouteTable();
+  Ipv6RouteTable(const Ipv6RouteTable &) = delete;
+  Ipv6RouteTable &operator=(const Ipv6RouteTable &) = delete;
+
+  std::expected<void, RouteError> Upsert(Ipv6Prefix prefix, uint32_t value);
+  std::expected<void, RouteError> Erase(Ipv6Prefix prefix);
+  std::optional<uint32_t> Find(Ipv6Prefix prefix) const;
+  size_t size() const;
+  std::optional<uint32_t> CoveringValue(Ipv6Prefix prefix) const;
+  template <typename Fn>
+  void ForEach(Fn &&fn) const {
+    std::lock_guard<std::mutex> lock(writer_mutex_);
+    for (const auto &[route_prefix, value] : rules_) {
+      fn(route_prefix, value);
+    }
+  }
+  View Read() const noexcept;
+
+ private:
+  using Rules = std::map<Ipv6Prefix, uint32_t>;
+  static constexpr size_t kNoNode = std::numeric_limits<size_t>::max();
+  struct Node {
+    std::array<size_t, 2> child{kNoNode, kNoNode};
+    uint32_t value = 0;
+    bool has_value = false;
+  };
+  struct Snapshot { std::vector<Node> nodes; };
+  static std::expected<std::unique_ptr<Snapshot>, RouteError> BuildSnapshot(
+      const Rules &rules);
+  explicit Ipv6RouteTable(rcu::RcuDomain &domain) : domain_(domain), live_(domain) {}
+  rcu::RcuDomain &domain_;
+  rcu::RcuPtr<Snapshot> live_;
+  mutable std::mutex writer_mutex_;
+  Rules rules_;
+};
+
+struct Ipv6RouteTable::View {
+  std::optional<uint32_t> Lookup(const utils::Ipv6Address &addr) const noexcept;
+
+ private:
+  friend class Ipv6RouteTable;
+  explicit View(const Snapshot *snapshot) : snapshot_(snapshot) {}
+  const Snapshot *snapshot_;
 };
 
 // Which DPDK longest-prefix-match structure holds a table's rules (D-132).

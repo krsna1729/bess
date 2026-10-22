@@ -6,12 +6,19 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <rte_ring.h>
 
+#include "framework/module_tick.h"
 #include "framework/resource_bindings.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "route/forward.h"
+#include "route/neighbor_resolver.h"
 #include "route/router.h"
 
 // K7's route table and next hops as a module, enrolled in the transaction
@@ -34,17 +41,15 @@
 //     appliance does (examples/appliances/router) and with the same library
 //     calls: the route domain the packet carries (a `route_domain` be32
 //     attribute a VIF writes; domain 0 when nothing writes it) and the
-//     library's forwarding chain (route/forward.h, D-157), which parses the
-//     frame, looks the destination address up in that domain, checks the
-//     neighbor, decrements the TTL and writes the hop's addresses; the packet
-//     leaves on the hop's egress gate. A route names a next hop or a next-hop
-//     group; a group route picks its member by the frame's flow hash
-//     (route::FlowHash), so a flow keeps one member in both paths. A frame
-//     that is not an IPv4 packet, one whose headers do not parse, and a
-//     non-initial fragment (its L4 header is in an earlier fragment, so it
-//     cannot be hashed to a group member) are dropped and counted. The
-//     `next_hop_id` attribute is ignored in this mode, even if some module
-//     writes it.
+//     parses the frame, looks the IPv4 or IPv6 destination up in that domain,
+//     checks the neighbor, decrements the TTL/hop limit and writes the hop's
+//     addresses; the packet leaves on the hop's egress gate. A route names a
+//     next hop or a next-hop group; a group route picks its member by the
+//     frame's flow hash, so a flow keeps one member in both paths. A frame
+//     whose headers do not parse, a non-initial fragment (its L4 header is in
+//     an earlier fragment, so it cannot be hashed consistently), and an
+//     unsupported family are dropped and counted. The `next_hop_id` attribute
+//     is ignored in this mode, even if some module writes it.
 //
 // Both modes drop a packet whose hop is unknown, or whose neighbor is not
 // resolved: what to do toward an unresolved neighbor (queue, punt, drop) is
@@ -95,7 +100,9 @@ class Router final : public Module {
   int OnEvent(bess::Event event) override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
-
+  // Emits queued ARP/ND solicitations from the resolver's control ring.
+  struct task_result RunTask(Context *ctx, bess::PacketBatch *batch,
+                             void *arg) override;
   std::string GetDesc() const override;
 
   // The enrolled router, for tests and for the module's own introspection.
@@ -165,12 +172,26 @@ class Router final : public Module {
   // not a drop; kNoEgress is the blackhole shape (D-160), counted apart from a
   // miss because the route exists and chose that hop.
   void CountVerdict(bess::route::ForwardVerdict verdict);
+  void ResolverTick(bess::framework::TickContext &ctx);
+  void QueueNeighborUpdates(
+      std::span<const std::pair<bess::route::NextHopId,
+                                bess::route::NextHop>> updates);
+  void CleanupNeighborResolver();
 
   std::unique_ptr<bess::route::Router> router_;
   // After router_, which owns the resources they bind (D-044).
   bess::framework::ResourceBinding next_hops_binding_;
   bess::framework::ResourceBinding groups_binding_;
   bess::framework::ResourceBinding routes_binding_;
+  std::unique_ptr<bess::route::NeighborResolver> neighbor_resolver_;
+  bess::framework::TickEndpoint neighbor_tick_;
+  rte_ring *neighbor_rx_ring_ = nullptr;
+  rte_ring *neighbor_tx_ring_ = nullptr;
+  int neighbor_interface_attr_ = -1;
+  std::string neighbor_interface_attr_name_;
+  std::unordered_map<uint32_t, gate_idx_t> resolver_gates_;
+  std::vector<std::pair<bess::route::NextHopId, bess::route::NextHop>>
+      pending_neighbor_updates_;
   int next_hop_id_attr_ = -1;
   // The registered names, for the log lines that name them.
   std::string next_hop_attr_name_;

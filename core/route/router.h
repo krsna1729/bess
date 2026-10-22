@@ -82,6 +82,10 @@ struct NextHop {
   utils::Ethernet::Address dst_mac{};
   utils::Ethernet::Address src_mac{};
 };
+// A transaction value accepted only by Router's internal neighbor publisher.
+struct NeighborManagedNextHop {
+  NextHop value;
+};
 
 // Every resolved packet loads one; at 16 bytes four fill a cache line and none
 // straddles two. A 32-bit egress made it 20 bytes and cost a hot 1K-route
@@ -254,6 +258,9 @@ class Router {
 
   // Adds next hop `id`, or replaces it (a neighbor update).
   std::expected<void, RouteError> SetNextHop(NextHopId id, const NextHop &hop);
+  // Marks an existing next hop as NeighborResolver-owned before Enroll().
+  // The ordinary next_hops resource then refuses writes to its id.
+  std::expected<void, RouteError> MarkNeighborManagedNextHop(NextHopId id);
   std::expected<void, RouteError> RemoveNextHop(NextHopId id);
 
   // Drops retiring next hops and groups whose grace period has completed, and
@@ -273,7 +280,11 @@ class Router {
   // referenced until then.
   std::expected<void, RouteError> RemoveNextHopGroup(NextHopGroupId id);
   // Points a route at a group (the next-hop overload's semantics otherwise).
-  std::expected<void, RouteError> SetRoute(RouteDomainId domain, Ipv4Prefix prefix,
+  std::expected<void, RouteError> SetRoute(RouteDomainId domain,
+                                           Ipv4Prefix prefix,
+                                           NextHopGroupId group);
+  std::expected<void, RouteError> SetRoute(RouteDomainId domain,
+                                           Ipv6Prefix prefix,
                                            NextHopGroupId group);
   size_t next_hop_group_count() const;
   // Routes naming group `id`, across all domains. Takes the engine's lock
@@ -317,10 +328,20 @@ class Router {
                                            Ipv4Prefix prefix, NextHopId hop);
   std::expected<void, RouteError> RemoveRoute(RouteDomainId domain,
                                               Ipv4Prefix prefix);
+  std::expected<void, RouteError> SetRoute(RouteDomainId domain,
+                                           Ipv6Prefix prefix, NextHopId hop);
+  std::expected<void, RouteError> RemoveRoute(RouteDomainId domain,
+                                              Ipv6Prefix prefix);
   std::expected<void, RouteError> SetRoute(Ipv4Prefix prefix, NextHopId hop) {
     return SetRoute(kDefaultRouteDomainId, prefix, hop);
   }
   std::expected<void, RouteError> RemoveRoute(Ipv4Prefix prefix) {
+    return RemoveRoute(kDefaultRouteDomainId, prefix);
+  }
+  std::expected<void, RouteError> SetRoute(Ipv6Prefix prefix, NextHopId hop) {
+    return SetRoute(kDefaultRouteDomainId, prefix, hop);
+  }
+  std::expected<void, RouteError> RemoveRoute(Ipv6Prefix prefix) {
     return RemoveRoute(kDefaultRouteDomainId, prefix);
   }
 
@@ -364,6 +385,9 @@ class Router {
   // grace period ends.
   void ForEachNextHopGroup(
       const std::function<void(NextHopGroupId, const NextHopGroup &)> &fn) const;
+  void ForEachIpv6Route(
+      const std::function<void(RouteDomainId, Ipv6Prefix, NextHopId,
+                               NextHopGroupId)> &fn) const;
 
   // -- transactions (D-023) ---------------------------------------------------
 
@@ -410,6 +434,16 @@ class Router {
     return dataplane::EncodeKey(uint64_t{domain.value()} << 40 |
                                 uint64_t{prefix.addr()} << 8 | prefix.length());
   }
+  static dataplane::ResourceKey RouteKey(RouteDomainId domain,
+                                         Ipv6Prefix prefix) {
+    DCHECK_LT(domain.value(), kMaxRouteDomains);
+    dataplane::ResourceKey key(1, '\6');
+    const uint32_t domain_id = domain.value();
+    key.append(reinterpret_cast<const char *>(&domain_id), sizeof(domain_id));
+    key.append(reinterpret_cast<const char *>(prefix.addr().bytes), 16);
+    key.push_back(static_cast<char>(prefix.length()));
+    return key;
+  }
   static dataplane::ResourceKey RouteKey(Ipv4Prefix prefix) {
     return RouteKey(kDefaultRouteDomainId, prefix);
   }
@@ -422,6 +456,14 @@ class Router {
     return dataplane::Op::Upsert(next_hops_name_, dataplane::EncodeKey(id),
                                  std::any(hop));
   }
+  // Privileged transaction update for a next hop previously marked as
+  // NeighborResolver-owned. Static next_hops resource writes are rejected.
+  dataplane::Op SetNeighborManagedNextHopOp(NextHopId id,
+                                            const NextHop &hop) const {
+    return dataplane::Op::Upsert(
+        next_hops_name_, dataplane::EncodeKey(id),
+        std::any(NeighborManagedNextHop{hop}));
+  }
   dataplane::Op RemoveNextHopOp(NextHopId id) const {
     return dataplane::Op::Erase(next_hops_name_, dataplane::EncodeKey(id));
   }
@@ -433,11 +475,24 @@ class Router {
   dataplane::Op RemoveRouteOp(RouteDomainId domain, Ipv4Prefix prefix) const {
     return dataplane::Op::Erase(routes_name_, RouteKey(domain, prefix));
   }
+  dataplane::Op SetRouteOp(RouteDomainId domain, Ipv6Prefix prefix,
+                           NextHopId hop) const {
+    return dataplane::Op::Upsert(routes_name_, RouteKey(domain, prefix),
+                                 std::any(hop));
+  }
+  dataplane::Op RemoveRouteOp(RouteDomainId domain, Ipv6Prefix prefix) const {
+    return dataplane::Op::Erase(routes_name_, RouteKey(domain, prefix));
+  }
   dataplane::Op SetRouteOp(Ipv4Prefix prefix, NextHopId hop) const {
     return SetRouteOp(kDefaultRouteDomainId, prefix, hop);
   }
   // A route to a group.
   dataplane::Op SetRouteOp(RouteDomainId domain, Ipv4Prefix prefix,
+                           NextHopGroupId group) const {
+    return dataplane::Op::Upsert(routes_name_, RouteKey(domain, prefix),
+                                 std::any(group));
+  }
+  dataplane::Op SetRouteOp(RouteDomainId domain, Ipv6Prefix prefix,
                            NextHopGroupId group) const {
     return dataplane::Op::Upsert(routes_name_, RouteKey(domain, prefix),
                                  std::any(group));
@@ -497,6 +552,8 @@ class Router {
   // The next hop `dst` resolves to in `domain`, or nullptr for a miss or an
   // unknown domain. Valid until the calling worker's next quiescent state.
   // `flow_hash` picks the member of a group route.
+  const NextHop *Resolve(RouteDomainId domain, const utils::Ipv6Address &dst,
+                         uint32_t flow_hash = 0) const noexcept;
   const NextHop *Resolve(RouteDomainId domain, uint32_t dst,
                          uint32_t flow_hash = 0) const noexcept {
     const LpmRouteTable *routes = TableOf(domain);
@@ -575,12 +632,15 @@ class Router {
   // const Domain.
   class Domain {
    public:
-    explicit Domain(std::unique_ptr<LpmRouteTable> table)
-        : table_(std::move(table)) {}
+    Domain(std::unique_ptr<LpmRouteTable> table,
+           std::unique_ptr<Ipv6RouteTable> table6)
+        : table_(std::move(table)), table6_(std::move(table6)) {}
     LpmRouteTable &table() const noexcept { return *table_; }
+    Ipv6RouteTable &table6() const noexcept { return *table6_; }
 
    private:
     std::unique_ptr<LpmRouteTable> table_;
+    std::unique_ptr<Ipv6RouteTable> table6_;
   };
 
   // SlotTable ids are one-based; a domain's slot is its id + 1.
@@ -592,16 +652,22 @@ class Router {
   }
 
   Router(const std::string &name, const Config &config,
-         std::unique_ptr<LpmRouteTable> default_routes, size_t max_next_hops,
-         size_t max_domains, size_t max_groups, rcu::RcuDomain &rcu);
+         std::unique_ptr<LpmRouteTable> default_routes,
+         std::unique_ptr<Ipv6RouteTable> default_routes6,
+         size_t max_next_hops, size_t max_domains, size_t max_groups,
+         rcu::RcuDomain &rcu);
 
   class RouteResource;
+  class NextHopResource;
   class GroupResource;
 
-  // The domain's FIB, or nullptr for a domain that does not exist.
   LpmRouteTable *TableOf(RouteDomainId domain) const noexcept {
     const Domain *d = domains_.Lookup(SlotOf(domain));
     return d != nullptr ? &d->table() : nullptr;
+  }
+  Ipv6RouteTable *Table6Of(RouteDomainId domain) const noexcept {
+    const Domain *d = domains_.Lookup(SlotOf(domain));
+    return d != nullptr ? &d->table6() : nullptr;
   }
 
   // Control-side walk over the existing domains, in id order. The caller holds
@@ -739,6 +805,7 @@ class Router {
   std::unique_ptr<dataplane::Resource> next_hops_res_;
   std::unique_ptr<dataplane::Resource> groups_res_;  // holds nothing without max_groups
   std::unique_ptr<dataplane::Resource> routes_res_;
+  std::vector<NextHopId> neighbor_managed_next_hops_;
 };
 
 }  // namespace bess::route

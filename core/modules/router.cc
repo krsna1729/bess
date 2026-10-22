@@ -2,10 +2,15 @@
 
 #include "router.h"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <limits>
+#include <cstring>
 #include <expected>
+#include <new>
+#include <unordered_set>
 #include <memory>
 #include <span>
 #include <string>
@@ -14,6 +19,8 @@
 #include "framework/resource_bindings.h"
 #include "dataplane/transaction_engine.h"
 #include "modules/router_gate_map.h"
+#include "packet_pool.h"
+#include "worker.h"
 #include "packet_reshape.h"
 #include "route/forward.h"
 #include "route/l3_packet.h"
@@ -208,6 +215,171 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // while a router configured for many network instances pays only for the ones
   // that hold routes. A failure to create one surfaces at the route write, as a
   // refused transaction.
+  if (arg.resolver_interfaces_size() != 0 ||
+      arg.neighbor_bindings_size() != 0) {
+    const size_t resolver_capacity =
+        arg.max_neighbors() == 0 ? 1024 : static_cast<size_t>(arg.max_neighbors());
+    if (static_cast<uint64_t>(resolver_capacity) !=
+        (arg.max_neighbors() == 0 ? 1024u : arg.max_neighbors())) {
+      return CommandFailure(EINVAL,
+                            "neighbor resolver capacity is out of range");
+    }
+    if (arg.resolver_interfaces_size() == 0 ||
+        arg.neighbor_bindings_size() == 0) {
+      return CommandFailure(EINVAL,
+                            "neighbor resolution requires interfaces and bindings");
+    }
+    if (arg.neighbor_max_probes() > std::numeric_limits<uint32_t>::max()) {
+      return CommandFailure(EINVAL, "neighbor_max_probes is out of range");
+    }
+    std::unordered_set<uint32_t> bound_next_hops;
+    route::NeighborResolver::Config resolver_config;
+    resolver_config.capacity = resolver_capacity;
+    resolver_config.timing = {
+        .first_probe = arg.neighbor_first_probe() == 0
+                           ? 1000
+                           : arg.neighbor_first_probe(),
+        .probe_interval = arg.neighbor_probe_interval() == 0
+                              ? 1000
+                              : arg.neighbor_probe_interval(),
+        .max_probe_interval = arg.neighbor_max_probe_interval() == 0
+                                  ? 8000
+                                  : arg.neighbor_max_probe_interval(),
+        .max_probes = arg.neighbor_max_probes() == 0
+                          ? 3
+                          : static_cast<uint32_t>(arg.neighbor_max_probes()),
+        .reachable_lifetime = arg.neighbor_reachable_lifetime() == 0
+                                  ? 30000
+                                  : arg.neighbor_reachable_lifetime(),
+        .unreachable_retry = arg.neighbor_unreachable_retry() == 0
+                                  ? 60000
+                                  : arg.neighbor_unreachable_retry(),
+    };
+    auto resolver = route::NeighborResolver::Create(resolver_config);
+    if (!resolver) {
+      return CommandFailure(EINVAL, "%s", resolver.error().c_str());
+    }
+    neighbor_resolver_ = std::move(*resolver);
+    for (const auto &entry : arg.resolver_interfaces()) {
+      if (entry.id() == 0 || !bess::IsValidGateValue(entry.egress_gate()) ||
+          InterfaceOf(entry.egress_gate()).value() != entry.id() ||
+          resolver_gates_.contains(entry.id())) {
+        return CommandFailure(EINVAL,
+                              "resolver interface id must be unique and equal "
+                              "to egress_gate + 1");
+      }
+      auto mac = MacFromPb(entry.mac(), "resolver interface mac");
+      if (!mac || mac->IsZero()) {
+        return CommandFailure(EINVAL, "%s",
+                              mac ? "resolver interface MAC must be nonzero"
+                                  : mac.error().c_str());
+      }
+      uint32_t ipv4 = 0;
+      if (!entry.ipv4().empty()) {
+        bess::utils::be32_t address;
+        if (!bess::utils::ParseIpv4Address(entry.ipv4(), &address)) {
+          return CommandFailure(EINVAL, "invalid resolver IPv4 address '%s'",
+                                entry.ipv4().c_str());
+        }
+        ipv4 = address.value();
+        if (ipv4 == 0 || ipv4 == 0xffffffffu) {
+          return CommandFailure(EINVAL, "invalid resolver IPv4 address");
+        }
+      }
+      bess::utils::Ipv6Address ipv6{};
+      if (!entry.ipv6().empty()) {
+        auto address = bess::utils::ParseIpv6Address(entry.ipv6());
+        if (!address) {
+          return CommandFailure(EINVAL, "invalid resolver IPv6 address '%s'",
+                                entry.ipv6().c_str());
+        }
+        ipv6 = *address;
+        if (ipv6.IsUnspecified() || ipv6.IsMulticast()) {
+          return CommandFailure(EINVAL, "invalid resolver IPv6 address");
+        }
+      }
+      if (ipv4 == 0 && ipv6.IsUnspecified()) {
+        return CommandFailure(EINVAL,
+                              "resolver interface needs an IPv4 or IPv6 address");
+      }
+      route::NeighborResolver::Interface interface{
+          dataplane::InterfaceId(entry.id()), *mac, ipv4, ipv6};
+      auto configured =
+          neighbor_resolver_->ConfigureInterface(interface, 0);
+      if (!configured) {
+        return CommandFailure(EINVAL, "%s", configured.error().c_str());
+      }
+      resolver_gates_.emplace(entry.id(),
+                              static_cast<gate_idx_t>(entry.egress_gate()));
+    }
+    for (const auto &binding : arg.neighbor_bindings()) {
+      const auto matching_interface = std::find_if(
+          arg.resolver_interfaces().begin(), arg.resolver_interfaces().end(),
+          [&binding](const auto &interface) {
+            return interface.id() == binding.interface_id();
+          });
+      if (matching_interface == arg.resolver_interfaces().end()) {
+        return CommandFailure(EINVAL,
+                              "neighbor binding names unknown interface %u",
+                              binding.interface_id());
+      }
+      if (binding.next_hop_id() == 0 ||
+          (binding.ipv4().empty() == binding.ipv6().empty())) {
+        return CommandFailure(EINVAL, "invalid neighbor binding");
+      }
+      route::NeighborResolver::Key key;
+      if (!binding.ipv4().empty()) {
+        if (matching_interface->ipv4().empty()) {
+          return CommandFailure(EINVAL,
+                                "IPv4 neighbor binding requires local IPv4");
+        }
+        bess::utils::be32_t peer;
+        if (!bess::utils::ParseIpv4Address(binding.ipv4(), &peer)) {
+          return CommandFailure(EINVAL, "invalid neighbor IPv4 address '%s'",
+                                binding.ipv4().c_str());
+        }
+        key = route::NeighborResolver::Key(
+            dataplane::InterfaceId(binding.interface_id()), peer.value());
+      } else {
+        if (matching_interface->ipv6().empty()) {
+          return CommandFailure(EINVAL,
+                                "IPv6 neighbor binding requires local IPv6");
+        }
+        auto peer = bess::utils::ParseIpv6Address(binding.ipv6());
+        if (!peer) {
+          return CommandFailure(EINVAL, "invalid neighbor IPv6 address '%s'",
+                                binding.ipv6().c_str());
+        }
+        key = route::NeighborResolver::Key(
+            dataplane::InterfaceId(binding.interface_id()), *peer);
+      }
+      if (!bound_next_hops.insert(binding.next_hop_id()).second) {
+        return CommandFailure(EINVAL, "duplicate neighbor binding next hop %u",
+                              binding.next_hop_id());
+      }
+      auto hop = neighbor_resolver_->Bind(
+          route::NextHopId(binding.next_hop_id()), key, 0);
+      if (!hop) {
+        return CommandFailure(EINVAL, "%s", hop.error().c_str());
+      }
+      if (auto set = router_->SetNextHop(route::NextHopId(binding.next_hop_id()),
+                                         *hop);
+          !set) {
+        return CommandFailure(route::RouteErrno(set.error()), "%s",
+                              route::RouteErrorName(set.error()));
+      }
+      if (auto managed = router_->MarkNeighborManagedNextHop(
+              route::NextHopId(binding.next_hop_id()));
+          !managed) {
+        return CommandFailure(route::RouteErrno(managed.error()), "%s",
+                              route::RouteErrorName(managed.error()));
+      }
+    }
+    neighbor_interface_attr_name_ =
+        arg.neighbor_interface_attr().empty()
+            ? "neighbor_interface_id"
+            : arg.neighbor_interface_attr();
+  }
   if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
     next_hops_binding_.Reset();
@@ -335,28 +507,45 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                                              bess::pb::RouterRouteValue>>(
           [](const bess::pb::RouterRouteKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
-            bess::utils::be32_t addr;
-            if (!bess::utils::ParseIpv4Address(key.ipv4(), &addr)) {
-              return std::unexpected("invalid IPv4 prefix address '" +
-                                     key.ipv4() + "'");
-            }
-            if (key.prefix_length() > 32) {
-              return std::unexpected("invalid prefix length");
-            }
-            const auto prefix = route::Ipv4Prefix::Make(
-                addr.value(), static_cast<uint8_t>(key.prefix_length()));
-            if (!prefix) {
-              return std::unexpected(route::RouteErrorName(prefix.error()));
-            }
-            // Absent means the default domain, as before domains existed. A
-            // domain the router does not have is created by an upsert's key use
-            // (D-158); an erase in a missing domain stays "not found".
             if (key.domain() >= route::kMaxRouteDomains) {
               return std::unexpected("invalid route domain " +
                                      std::to_string(key.domain()));
             }
-            return route::Router::RouteKey(route::RouteDomainId(key.domain()),
-                                           *prefix);
+            if (!key.ipv4().empty() && key.ipv6().empty()) {
+              bess::utils::be32_t addr;
+              if (!bess::utils::ParseIpv4Address(key.ipv4(), &addr)) {
+                return std::unexpected("invalid IPv4 prefix address '" +
+                                       key.ipv4() + "'");
+              }
+              if (key.prefix_length() > 32) {
+                return std::unexpected("invalid IPv4 prefix length");
+              }
+              const auto prefix = route::Ipv4Prefix::Make(
+                  addr.value(), static_cast<uint8_t>(key.prefix_length()));
+              if (!prefix) {
+                return std::unexpected(route::RouteErrorName(prefix.error()));
+              }
+              return route::Router::RouteKey(route::RouteDomainId(key.domain()),
+                                             *prefix);
+            }
+            if (key.ipv4().empty() && !key.ipv6().empty()) {
+              const auto addr = bess::utils::ParseIpv6Address(key.ipv6());
+              if (!addr) {
+                return std::unexpected("invalid IPv6 prefix address '" +
+                                       key.ipv6() + "'");
+              }
+              if (key.prefix_length() > 128) {
+                return std::unexpected("invalid IPv6 prefix length");
+              }
+              const auto prefix = route::Ipv6Prefix::Make(
+                  *addr, static_cast<uint8_t>(key.prefix_length()));
+              if (!prefix) {
+                return std::unexpected(route::RouteErrorName(prefix.error()));
+              }
+              return route::Router::RouteKey(route::RouteDomainId(key.domain()),
+                                             *prefix);
+            }
+            return std::unexpected("a route key must set exactly one of ipv4 or ipv6");
           },
           [](const bess::pb::RouterRouteValue &value)
               -> std::expected<std::any, std::string> {
@@ -392,6 +581,22 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
               }
               visit(key, value);
             });
+            router_->ForEachIpv6Route(
+                [&visit](route::RouteDomainId domain,
+                         route::Ipv6Prefix prefix, route::NextHopId hop,
+                         route::NextHopGroupId group) {
+                  bess::pb::RouterRouteKey key;
+                  key.set_ipv6(bess::utils::ToIpv6Address(prefix.addr()));
+                  key.set_prefix_length(prefix.length());
+                  key.set_domain(domain.value());
+                  bess::pb::RouterRouteValue value;
+                  if (group.value() != 0) {
+                    value.set_group_id(group.value());
+                  } else {
+                    value.set_next_hop_id(hop.value());
+                  }
+                  visit(key, value);
+                });
           }));
 
   next_hop_attr_name_ = arg.next_hop_attr().empty() ? "next_hop_id" : arg.next_hop_attr();
@@ -428,10 +633,67 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     router_.reset();
     return CommandFailure(-route_domain_attr_, "add_metadata_attr() failed");
   }
+  if (neighbor_resolver_ != nullptr) {
+    static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
+        kNoNeighborInterface{};
+    neighbor_interface_attr_ = AddMetadataAttrWithDefault(
+        neighbor_interface_attr_name_, sizeof(bess::utils::be32_t),
+        bess::metadata::Attribute::AccessMode::kRead, kNoNeighborInterface);
+    if (neighbor_interface_attr_ < 0) {
+      return CommandFailure(-neighbor_interface_attr_,
+                            "add_metadata_attr() failed");
+    }
+    static std::atomic<uint32_t> next_ring_id{0};
+    const std::string ring_suffix =
+        std::to_string(next_ring_id.fetch_add(1, std::memory_order_relaxed));
+    const std::string rx_name = "rrx" + ring_suffix;
+    const std::string tx_name = "rtx" + ring_suffix;
+    neighbor_rx_ring_ =
+        rte_ring_create(rx_name.c_str(), 1024, SOCKET_ID_ANY, 0);
+    neighbor_tx_ring_ =
+        rte_ring_create(tx_name.c_str(), 1024, SOCKET_ID_ANY, 0);
+    if (neighbor_rx_ring_ == nullptr || neighbor_tx_ring_ == nullptr) {
+      return CommandFailure(ENOMEM, "neighbor resolver ring creation failed");
+    }
+    if (RegisterTask(nullptr) == INVALID_TASK_ID) {
+      return CommandFailure(ENOMEM, "neighbor resolver task creation failed");
+    }
+    neighbor_tick_ = bess::framework::TickEndpoint(
+        init_context().ticks(), std::chrono::steady_clock::duration::zero(),
+        [this](bess::framework::TickContext &ctx) { ResolverTick(ctx); });
+  }
   return CommandSuccess();
 }
 
+void Router::CleanupNeighborResolver() {
+  neighbor_tick_ = bess::framework::TickEndpoint{};
+  if (neighbor_rx_ring_ != nullptr) {
+    bess::PacketHandle handle = nullptr;
+    while (rte_ring_dequeue(
+               neighbor_rx_ring_,
+               reinterpret_cast<void **>(&handle)) == 0) {
+      bess::PacketFree(handle);
+    }
+    rte_ring_free(neighbor_rx_ring_);
+    neighbor_rx_ring_ = nullptr;
+  }
+  if (neighbor_tx_ring_ != nullptr) {
+    route::NeighborResolver::Solicitation *item = nullptr;
+    while (rte_ring_dequeue(
+               neighbor_tx_ring_,
+               reinterpret_cast<void **>(&item)) == 0) {
+      delete item;
+    }
+    rte_ring_free(neighbor_tx_ring_);
+    neighbor_tx_ring_ = nullptr;
+  }
+  neighbor_resolver_.reset();
+  resolver_gates_.clear();
+  pending_neighbor_updates_.clear();
+}
+
 void Router::DeInit() {
+  CleanupNeighborResolver();
   if (router_ == nullptr) {
     return;
   }
@@ -449,6 +711,13 @@ void Router::DeInit() {
 int Router::OnEvent(bess::Event event) {
   if (event != bess::Event::PreResume) {
     return -ENOTSUP;
+  }
+  if (neighbor_resolver_ != nullptr &&
+      !bess::metadata::IsValidOffset(
+          attr_offset(neighbor_interface_attr_))) {
+    LOG(ERROR) << "Router '" << name() << "': the '"
+               << neighbor_interface_attr_name_
+               << "' attribute is unreadable; ARP/ND input will be dropped";
   }
   // Metadata offsets are assigned just before this: an attribute with no
   // valid offset means the packet path would read byte 0, which is worth
@@ -482,11 +751,188 @@ int Router::OnEvent(bess::Event event) {
 }
 
 void Router::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  if (neighbor_resolver_ != nullptr) {
+    std::array<bess::PacketHandle, bess::PacketBatch::kMaxBurst> forwarded;
+    size_t forwarded_count = 0;
+    const int count = batch->cnt();
+    for (int i = 0; i < count; i++) {
+      bess::PacketRef pkt = batch->packet(i);
+      const uint8_t *frame = pkt.head_data<const uint8_t *>();
+      bool neighbor_frame = false;
+      if (pkt.head_len() >= sizeof(bess::utils::Ethernet)) {
+        const auto *eth =
+            reinterpret_cast<const bess::utils::Ethernet *>(frame);
+        if (eth->ether_type.value() == bess::utils::Ethernet::kArp) {
+          neighbor_frame = true;
+        } else if (eth->ether_type.value() == bess::utils::Ethernet::kIpv6 &&
+                   pkt.head_len() >= sizeof(bess::utils::Ethernet) + 41) {
+          const size_t l3 = sizeof(bess::utils::Ethernet);
+          neighbor_frame =
+              frame[l3 + 6] == route::kIpv6NextHeaderIcmpv6 &&
+              (frame[l3 + 40] == static_cast<uint8_t>(
+                                     route::NdType::kNeighborSolicitation) ||
+               frame[l3 + 40] == static_cast<uint8_t>(
+                                     route::NdType::kNeighborAdvertisement));
+        }
+      }
+      if (!neighbor_frame) {
+        forwarded[forwarded_count++] = pkt.handle();
+        continue;
+      }
+      if (rte_ring_enqueue(neighbor_rx_ring_, pkt.handle()) != 0) {
+        // Resolver input is bounded; a full ring fails closed rather than
+        // forwarding an ARP/ND control frame as routed IP.
+        bess::PacketFree(pkt.handle());
+      }
+    }
+    batch->clear();
+    for (size_t i = 0; i < forwarded_count; i++) {
+      batch->add(bess::PacketRef(forwarded[i]));
+    }
+    if (batch->cnt() == 0) {
+      return;
+    }
+  }
   if (!routes_by_destination()) {
     RouteById(ctx, batch, attr_offset(next_hop_id_attr_));
     return;
   }
   RouteByDestination(ctx, batch);
+}
+
+void Router::QueueNeighborUpdates(
+    std::span<const std::pair<route::NextHopId, route::NextHop>> updates) {
+  for (const auto &update : updates) {
+    const auto it = std::find_if(
+        pending_neighbor_updates_.begin(), pending_neighbor_updates_.end(),
+        [&update](const auto &pending) { return pending.first == update.first; });
+    if (it == pending_neighbor_updates_.end()) {
+      pending_neighbor_updates_.push_back(update);
+    } else {
+      it->second = update.second;
+    }
+  }
+}
+
+void Router::ResolverTick(bess::framework::TickContext &ctx) {
+  if (neighbor_resolver_ == nullptr) {
+    return;
+  }
+  const uint64_t now = ctx.tick();
+  constexpr unsigned kResolverWorkBudget = 64;
+  const bess::metadata::mt_offset_t interface_offset =
+      attr_offset(neighbor_interface_attr_);
+  for (unsigned n = 0; n < kResolverWorkBudget && !ctx.Expired(); n++) {
+    bess::PacketHandle handle = nullptr;
+    if (rte_ring_dequeue(neighbor_rx_ring_,
+                         reinterpret_cast<void **>(&handle)) != 0) {
+      break;
+    }
+    bess::PacketRef pkt(handle);
+    if (!bess::metadata::IsValidOffset(interface_offset) ||
+        pkt.head_len() < sizeof(bess::utils::Ethernet)) {
+      bess::PacketFree(handle);
+      continue;
+    }
+    const uint32_t id =
+        get_attr_with_offset<bess::utils::be32_t>(interface_offset, pkt)
+            .value();
+    if (id > std::numeric_limits<uint16_t>::max() ||
+        !resolver_gates_.contains(id)) {
+      bess::PacketFree(handle);
+      continue;
+    }
+    const auto *frame = pkt.head_data<const uint8_t *>();
+    const std::span<const uint8_t> bytes(frame, pkt.head_len());
+    route::NeighborResolver::Progress progress;
+    const auto *eth = reinterpret_cast<const bess::utils::Ethernet *>(frame);
+    if (eth->ether_type.value() == bess::utils::Ethernet::kArp) {
+      progress = neighbor_resolver_->OnArp(
+          now, dataplane::InterfaceId(static_cast<uint16_t>(id)), bytes);
+    } else {
+      progress = neighbor_resolver_->OnNd(
+          now, dataplane::InterfaceId(static_cast<uint16_t>(id)), bytes);
+    }
+    QueueNeighborUpdates(progress.updates);
+    bess::PacketFree(handle);
+  }
+
+  if (!ctx.Expired()) {
+    route::NeighborResolver::Progress progress =
+        neighbor_resolver_->Poll(now, kResolverWorkBudget);
+    QueueNeighborUpdates(progress.updates);
+    for (const auto &solicitation : progress.solicitations) {
+      if (!resolver_gates_.contains(solicitation.egress.value())) {
+        continue;
+      }
+      auto *queued =
+          new (std::nothrow) route::NeighborResolver::Solicitation(solicitation);
+      if (queued == nullptr || rte_ring_enqueue(neighbor_tx_ring_, queued) != 0) {
+        delete queued;
+      }
+    }
+  }
+  if (!pending_neighbor_updates_.empty()) {
+    std::vector<dataplane::Op> ops;
+    ops.reserve(pending_neighbor_updates_.size());
+    for (const auto &[id, hop] : pending_neighbor_updates_) {
+      ops.push_back(router_->SetNeighborManagedNextHopOp(id, hop));
+    }
+    auto applied = init_context().resources().Apply(ops);
+    if (applied) {
+      pending_neighbor_updates_.clear();
+    } else {
+      LOG(WARNING) << "Router '" << name()
+                   << "': neighbor publication deferred: " << applied.error();
+    }
+  }
+}
+
+struct task_result Router::RunTask(Context *ctx, bess::PacketBatch *batch,
+                                   void *) {
+  batch->clear();
+  if (neighbor_resolver_ == nullptr || neighbor_tx_ring_ == nullptr) {
+    return {.block = true, .packets = 0, .bits = 0};
+  }
+  route::NeighborResolver::Solicitation *items[
+      bess::PacketBatch::kMaxBurst] = {};
+  const unsigned count = rte_ring_dequeue_burst(
+      neighbor_tx_ring_, reinterpret_cast<void **>(items),
+      bess::PacketBatch::kMaxBurst, nullptr);
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  uint64_t bits = 0;
+  for (unsigned i = 0; i < count; i++) {
+    route::NeighborResolver::Solicitation *item = items[i];
+    const auto gate = resolver_gates_.find(item->egress.value());
+    if (gate == resolver_gates_.end() || gate->second == DROP_GATE) {
+      delete item;
+      continue;
+    }
+    bess::PacketHandle handle =
+        current_worker.packet_pool()->Alloc(item->length);
+    if (handle == nullptr) {
+      delete item;
+      continue;
+    }
+    bess::PacketRef packet(handle);
+    std::memcpy(packet.head_data<uint8_t *>(), item->frame.data(),
+                item->length);
+    bits += static_cast<uint64_t>(item->length) * 8;
+    batch->add(packet);
+    gates[batch->cnt() - 1] = gate->second;
+    delete item;
+  }
+  const uint32_t emitted = static_cast<uint32_t>(batch->cnt());
+  if (emitted != 0) {
+    EmitBatch(ctx, batch, gates);
+    // Solicitations to several interfaces leave through EmitPacket, which
+    // records this module's gates in the shared Context. Task::operator()
+    // flushes those only after a ProcessBatch, so a task module flushes its
+    // own -- otherwise the next module's ProcessOGates reads these indexes
+    // against its own gates.
+    ProcessOGates(ctx);
+  }
+  return {.block = emitted == 0, .packets = emitted, .bits = bits};
 }
 
 // Mode 1 (D-155): the next-hop id each packet carries, resolved to a hop.
@@ -712,6 +1158,76 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
   for (size_t k = 0; k < n; k++) {
     const int i = begin + static_cast<int>(k);
     const route::FrameRoute &r = resolved[k];
+    // IPv6 shares the same domain, next-hop, neighbor, group and gate policy;
+    // only its L3 header mutation differs (hop limit, with no header checksum).
+    if (r.verdict == route::ForwardVerdict::kNotIpv4) {
+      bess::PacketRef pkt = batch->packet(i);
+      bess::conntrack::ParsedFlowPacket parsed;
+      const auto status = bess::conntrack::ParseFrame(
+          std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), parsed,
+          pkt.total_len());
+      if (status == bess::conntrack::ParseStatus::kOk &&
+          parsed.l3 == bess::conntrack::L3Kind::kIpv6) {
+        bess::utils::Ipv6Address dst;
+        std::copy(parsed.dst.begin(), parsed.dst.end(), dst.bytes);
+        uint32_t src_words[4], dst_words[4];
+        std::memcpy(src_words, parsed.src.data(), sizeof(src_words));
+        std::memcpy(dst_words, parsed.dst.data(), sizeof(dst_words));
+        const uint32_t hash = route::FlowHash(
+            src_words[0] ^ src_words[2] ^ src_words[1] ^ src_words[3],
+            dst_words[0] ^ dst_words[2] ^ dst_words[1] ^ dst_words[3],
+            parsed.src_port, parsed.dst_port, parsed.protocol, flow_fields_);
+        const route::NextHop *hop = router_->Resolve(domain, dst, hash);
+        route::ForwardVerdict verdict = route::ForwardVerdict::kForward;
+        if (hop == nullptr) {
+          verdict = route::ForwardVerdict::kNoRoute;
+        } else if (hop->egress == bess::dataplane::kInvalidInterfaceId) {
+          verdict = route::ForwardVerdict::kNoEgress;
+        } else if (hop->neighbor != route::NeighborState::kResolved) {
+          verdict = route::ForwardVerdict::kUnresolved;
+        } else if (pkt.head_len() <= static_cast<size_t>(parsed.l3_offset) + 7 ||
+                   pkt.head_data<const uint8_t *>()[parsed.l3_offset + 7] <= 1) {
+          verdict = route::ForwardVerdict::kTtlExpired;
+        }
+        if (verdict != route::ForwardVerdict::kForward) {
+          CountVerdict(verdict);
+          const gate_idx_t punt =
+              verdict == route::ForwardVerdict::kNoRoute
+                  ? punt_miss_gate_
+                  : verdict == route::ForwardVerdict::kUnresolved
+                        ? punt_unresolved_gate_
+                        : DROP_GATE;
+          if (punt != DROP_GATE) {
+            gates[i] = punt;
+          }
+          continue;
+        }
+        const gate_idx_t gate = GateOf(hop->egress);
+        if (gate == DROP_GATE) {
+          continue;
+        }
+        bess::PacketHandle handle = pkt.handle();
+        if (!bess::packet::EnsureWritable(handle)) {
+          header_write_failures_.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        batch->handles()[i] = handle;
+        bess::PacketRef writable(handle);
+        if (writable.head_len() <= static_cast<size_t>(parsed.l3_offset) + 7) {
+          header_write_failures_.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        uint8_t *frame = writable.head_data<uint8_t *>();
+        --frame[parsed.l3_offset + 7];
+        if (!hop->dst_mac.IsZero() && !hop->src_mac.IsZero()) {
+          auto *eth = reinterpret_cast<bess::utils::Ethernet *>(frame);
+          eth->dst_addr = hop->dst_mac;
+          eth->src_addr = hop->src_mac;
+        }
+        gates[i] = gate;
+        continue;
+      }
+    }
     if (r.verdict != route::ForwardVerdict::kForward) {
       CountVerdict(r.verdict);
       // A punt gate is the application's slow path (D-162): a frame the
