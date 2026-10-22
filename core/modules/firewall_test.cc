@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <optional>
 #include <random>
 #include <string>
@@ -20,6 +21,7 @@
 #include "framework/resource_codec.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
+#include "testing/allocation_faults.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 #include "testing/rng.h"
@@ -80,6 +82,26 @@ bess::pb::FirewallRuleValue Entry(int64_t priority, const Rule &r) {
   value.set_priority(priority);
   *value.mutable_rule() = Rules({r}).rules(0);
   return value;
+}
+
+// An operation as a client sends it, decoded by the resource's codec; no
+// value erases.
+bess::dataplane::Op CodecOp(ModuleHarness &h, const std::string &resource,
+                            uint32_t id, const bess::pb::FirewallRuleValue *value) {
+  const bess::framework::ResourceCodec *codec = h.Codec(resource);
+  EXPECT_NE(nullptr, codec);
+  google::protobuf::Any packed_key;
+  EXPECT_TRUE(packed_key.PackFrom(Id(id)));
+  auto key = codec->Key(packed_key.type_url(), packed_key.value());
+  EXPECT_TRUE(key.has_value());
+  if (value == nullptr) {
+    return bess::dataplane::Op::Erase(resource, *key);
+  }
+  google::protobuf::Any packed_value;
+  EXPECT_TRUE(packed_value.PackFrom(*value));
+  auto decoded = codec->Value(packed_value.type_url(), packed_value.value());
+  EXPECT_TRUE(decoded.has_value());
+  return bess::dataplane::Op::Upsert(resource, *key, std::move(*decoded));
 }
 
 // Whether `pkt` comes out (unchanged) on gate 0.
@@ -345,22 +367,8 @@ TEST(FirewallTest, ATransactionChangesThePolicyWholeOrNotAtAll) {
   Module *fw = h.Create("Firewall", Rules({{.src_ip = "10.0.0.0/8"}}), "fw_tx");
   ASSERT_NE(nullptr, fw);
   const std::string rules = "fw_tx/rules";
-  const bess::framework::ResourceCodec *codec = h.Codec(rules);
-  ASSERT_NE(nullptr, codec);
-  // An operation as a client sends it; no value erases.
   auto op = [&](uint32_t id, const bess::pb::FirewallRuleValue *value) {
-    google::protobuf::Any packed_key;
-    EXPECT_TRUE(packed_key.PackFrom(Id(id)));
-    auto key = codec->Key(packed_key.type_url(), packed_key.value());
-    EXPECT_TRUE(key.has_value());
-    if (value == nullptr) {
-      return bess::dataplane::Op::Erase(rules, *key);
-    }
-    google::protobuf::Any packed_value;
-    EXPECT_TRUE(packed_value.PackFrom(*value));
-    auto decoded = codec->Value(packed_value.type_url(), packed_value.value());
-    EXPECT_TRUE(decoded.has_value());
-    return bess::dataplane::Op::Upsert(rules, *key, std::move(*decoded));
+    return CodecOp(h, rules, id, value);
   };
 
   // Swap which network passes in one transaction.
@@ -385,6 +393,11 @@ TEST(FirewallTest, ATransactionChangesThePolicyWholeOrNotAtAll) {
                           Rule{.dst_port_low = 90, .dst_port_high = 80}}) {
     EXPECT_NE("", h.UpsertResource(rules, Id(4), Entry(0, bad)));
   }
+  // A value without its rule is refused rather than read as the empty rule
+  // (match everything, pass), which a catch-all writes as "rule": {}.
+  bess::pb::FirewallRuleValue no_rule;
+  no_rule.set_priority(1);
+  EXPECT_NE("", h.UpsertResource(rules, Id(4), no_rule));
   EXPECT_EQ("", h.ReadBackDiffers(rules, {{&k2, &pass_11}}));
   EXPECT_TRUE(Passes(h, fw, b));
 
@@ -393,6 +406,39 @@ TEST(FirewallTest, ATransactionChangesThePolicyWholeOrNotAtAll) {
   EXPECT_FALSE(Passes(h, fw, a));
   EXPECT_FALSE(Passes(h, fw, b));
   EXPECT_EQ("", h.ReadBackDiffers(rules, {}));
+}
+
+// The engine reserved everything publication needs: inserting a rule,
+// replacing one and erasing one - alone and in one transaction - publish
+// without allocating.
+TEST(FirewallTest, PublishingAChangeAllocatesNothing) {
+  ModuleHarness h;
+  Module *fw = h.Create("Firewall", Rules({{.src_ip = "10.0.0.0/8"}}), "fw_alloc");
+  ASSERT_NE(nullptr, fw);
+  const std::string rules = "fw_alloc/rules";
+  static std::optional<bess::fault_injection::AllocationFaults> window;
+  static size_t allocations;
+  allocations = 0;
+  bess::dataplane::internal::g_publish_window_hook = [](bool entering) {
+    if (entering) {
+      window.emplace();
+    } else if (window) {
+      allocations += window->allocations();
+      window.reset();
+    }
+  };
+  const auto drop_11 = Entry(5, {.src_ip = "11.0.0.0/8", .drop = true});
+  const auto pass_12 = Entry(0, {.src_ip = "12.0.0.0/8"});
+  EXPECT_EQ("", h.UpsertResource(rules, Id(2), drop_11));  // insert
+  EXPECT_EQ("", h.UpsertResource(rules, Id(1), pass_12));  // replace
+  // A replace, an insert and an erase in one transaction.
+  EXPECT_EQ("", h.Apply({CodecOp(h, rules, 1, &drop_11), CodecOp(h, rules, 3, &pass_12),
+                         CodecOp(h, rules, 2, nullptr)}));
+  EXPECT_EQ("", h.EraseResource(rules, Id(3)));  // erase
+  bess::dataplane::internal::g_publish_window_hook = nullptr;
+  EXPECT_EQ(0u, allocations) << "a firewall publish allocated";
+  const auto k1 = Id(1);
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&k1, &drop_11}}));
 }
 
 TEST(FirewallTest, APacketThisTableCannotJudgeIsDropped) {

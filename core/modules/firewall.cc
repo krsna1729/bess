@@ -404,6 +404,12 @@ CommandResponse Firewall::Init(const bess::pb::FirewallArg &arg) {
           },
           [](const bess::pb::FirewallRuleValue &value)
               -> std::expected<std::any, std::string> {
+            // An absent rule would decode as the empty rule - match all,
+            // pass - and read back as a present one; a catch-all is written
+            // as "rule": {}.
+            if (!value.has_rule()) {
+              return std::unexpected("a firewall rule value needs its rule");
+            }
             auto parsed = ParseRule(value.rule());
             if (!parsed) {
               return std::unexpected(parsed.error());

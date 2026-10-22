@@ -476,7 +476,7 @@ message FirewallRuleKey {
  */
 message FirewallRuleValue {
   int64 priority = 1;
-  FirewallArg.Rule rule = 2;
+  FirewallArg.Rule rule = 2;  // required; a catch-all is the empty rule {}
 }
 
 /**

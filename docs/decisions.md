@@ -12192,15 +12192,18 @@ order, not the request's: the last table published could be one that misses a la
   is stable: changing a rule's priority moves it and keeps its id. The init argument's list becomes ids
   1..n at priority 0, so its given order is still the policy order, and it reads back as given.
 - **The codec checks each rule** (`FirewallTable::Refusal`, the same checks `Build` makes), so a rule the
-  table cannot express is refused by name when it arrives, not when the table is built.
+  table cannot express is refused by name when it arrives, not when the table is built. A value without its
+  rule is refused too: it would decode as the empty rule (match everything, pass) and read back as a present
+  one; a catch-all is written `"rule": {}`.
 - **One build per transaction: `Resource::Prepare()`.** A new engine hook, called once per touched resource
   after every operation was reserved and every reference checked, before anything publishes. The default
   does nothing. A refusal is reported against the resource's last operation and aborts every reservation,
   as a `Reserve` refusal does. The Firewall's `Reserve` records the operation (an upsert's map node is
   allocated there); `Prepare` merges the committed rules with the changes in id order and builds the table
-  once; the first operation's publish swaps it in - one RCU exchange, one retire, footprint declared by the
-  first operation only - and moves the nodes into the committed map without allocating. The other
-  operations' publishes find nothing left to do.
+  once; the first of its operations to publish (an upsert when there is one) swaps it in - one RCU exchange,
+  one retire, footprint declared by the first operation reserved, the retirer counting the whole
+  transaction - and moves the nodes into the committed map without allocating. The other operations'
+  publishes find nothing left to do.
 - **Workers are not paused** and the consistency stays referential: a transaction is one RCU swap, so a packet
   sees the old policy or the new one, but the resource does not yet claim scope snapshot.
 - **No incremental backend.** The measured cost is the rebuild itself (below); a backend that inserts into
@@ -12230,9 +12233,10 @@ a one-rule change at 10,000 rules is the build. Tests:
 `TransactionEngineTest.PrepareBuildsOnceAfterEveryReservation` (one prepare after four reserves, none for an
 untouched resource, a refusal marks its last operation failed and publishes nothing);
 `FirewallTest.PriorityOrdersTheRulesAndTheIdBreaksTies`, `ATransactionChangesThePolicyWholeOrNotAtAll` and
-`AnActionIdTravelsWithTheRule`; `ResourceParityTest.DeclaredTablesAreLiveTypedAndReleased` now asserts that
-publishing every module's sample, and its erase, allocates nothing (an allocation added to the Firewall's
-publish fails it).
+`AnActionIdTravelsWithTheRule`; `FirewallTest.PublishingAChangeAllocatesNothing` (an insert, a replace and
+an erase, alone and in one transaction, publish with no allocation); and
+`ResourceParityTest.DeclaredTablesAreLiveTypedAndReleased` now asserts that publishing every module's
+sample, and its erase, allocates nothing (an allocation added to the Firewall's publish fails it).
 
 **Consequences.** A controller that wrote the singleton writes entries instead; a desired-state list of
 entries replaces the old whole-policy value. `action_attr` is an init argument only. The resource reports no

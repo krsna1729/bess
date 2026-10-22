@@ -468,8 +468,8 @@ reference to something missing.
   reserved for it. D-024.
 - **Firewall** registers its rules as `<module>/rules` (key: the rule id;
   value: `{priority, rule}`) and rebuilds its table once per transaction in
-  `Prepare()`; the first operation's publish swaps the policy in whole, so the
-  workers are never paused. D-147, D-179.
+  `Prepare()`; the first of its operations to publish swaps the policy in
+  whole, so the workers are never paused. D-147, D-179.
 - **Router** (opt-in, `Router::Enroll(engine)`): next hops as
   `<router>/next_hops`, groups as `<router>/groups` (a member list, D-156),
   routes as `<router>/routes` (each route references the next hop or the

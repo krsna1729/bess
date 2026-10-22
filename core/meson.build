@@ -902,6 +902,7 @@ allocation_fault_tests = [
   'dataplane/handoff_test.cc',
   'dataplane/transaction_engine_test.cc',
   'dataplane/transaction_lifecycle_test.cc',
+  'modules/firewall_test.cc',
   'modules/transaction_conformance_test.cc',
   'flow/shared_flow_table_test.cc',
   'flow/worker_flow_table_test.cc',
