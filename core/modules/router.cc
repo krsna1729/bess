@@ -201,11 +201,13 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // this graph can have; gate 0 itself is a real gate and is not a target.
   if (!bess::IsValidGateValue(arg.punt_miss_gate()) ||
       !bess::IsValidGateValue(arg.punt_unresolved_gate()) ||
-      !bess::IsValidGateValue(arg.punt_local_gate())) {
-    return CommandFailure(EINVAL, "invalid punt gate %llu/%llu/%llu",
+      !bess::IsValidGateValue(arg.punt_local_gate()) ||
+      !bess::IsValidGateValue(arg.punt_neighbor_gate())) {
+    return CommandFailure(EINVAL, "invalid punt gate %llu/%llu/%llu/%llu",
                           static_cast<unsigned long long>(arg.punt_miss_gate()),
                           static_cast<unsigned long long>(arg.punt_unresolved_gate()),
-                          static_cast<unsigned long long>(arg.punt_local_gate()));
+                          static_cast<unsigned long long>(arg.punt_local_gate()),
+                          static_cast<unsigned long long>(arg.punt_neighbor_gate()));
   }
   punt_miss_gate_ = arg.punt_miss_gate() == 0
                         ? DROP_GATE
@@ -216,6 +218,11 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   punt_local_gate_ = arg.punt_local_gate() == 0
                          ? DROP_GATE
                          : static_cast<gate_idx_t>(arg.punt_local_gate());
+  // Unlike the others, 0 is not "drop": it follows the local gate, where
+  // neighbor requests went before they had a gate of their own.
+  punt_neighbor_gate_ = arg.punt_neighbor_gate() == 0
+                            ? punt_local_gate_
+                            : static_cast<gate_idx_t>(arg.punt_neighbor_gate());
   // The flow hash's fields (D-163): the proto default is the whole flow, and an
   // unknown value (an arg from a newer binary) keeps that default too.
   flow_fields_ = arg.flow_hash() == bess::pb::FLOW_HASH_L3 ? route::FlowHashFields::kL3
@@ -1025,8 +1032,8 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
             neighbor_input_drops_.fetch_add(1, std::memory_order_relaxed);
           }
         }
-        if (punt_local_gate_ != DROP_GATE) {
-          EmitPacket(ctx, pkt, punt_local_gate_);
+        if (punt_neighbor_gate_ != DROP_GATE) {
+          EmitPacket(ctx, pkt, punt_neighbor_gate_);
         } else {
           bess::PacketFree(pkt.handle());
         }
@@ -1606,11 +1613,12 @@ std::string Router::GetDesc() const {
         ", %zu neighbors (requests: %zu, input drops: %zu, unpublished changes: %zu)",
         neighbor_resolver_->size(), static_cast<size_t>(neighbor_requests()),
         static_cast<size_t>(neighbor_input_drops()), pending_neighbor_updates());
-    // ARP requests and Neighbor Solicitations take the local punt gate in
-    // either mode: they are this node's, not a route's.
-    if (punt_local_gate_ != DROP_GATE && !routes_by_destination()) {
+    // ARP requests and Neighbor Solicitations take the neighbor punt gate
+    // (by default the local one) in either mode: they are this node's, not a
+    // route's.
+    if (punt_neighbor_gate_ != DROP_GATE) {
       desc += bess::utils::Format(", neighbor requests punt to gate %d",
-                                  punt_local_gate_);
+                                  punt_neighbor_gate_);
     }
   }
   return desc;

@@ -1825,6 +1825,38 @@ TEST_F(RouterTest, WithoutALocalGateNeighborRequestsAreDroppedAndCounted) {
   EXPECT_NE(std::string::npos, rt->GetDesc().find("requests: 2")) << rt->GetDesc();
 }
 
+// punt_neighbor_gate gives requests a gate of their own (a responder), apart
+// from local delivery; DROP_GATE drops them even with a local gate set.
+TEST_F(RouterTest, NeighborRequestsTakeTheNeighborGateWhenOneIsSet) {
+  bess::pb::RouterArg arg = ResolverArg(3);
+  arg.set_punt_neighbor_gate(4);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  const std::vector<Bytes> requests = NeighborRequests();
+  auto out = h_.RunPipeline(writer, 0, requests, rt, {0, 1, 3, 4});
+  ASSERT_EQ(2u, out[4].size());
+  EXPECT_EQ(requests[0], out[4][0]);
+  EXPECT_EQ(requests[1], out[4][1]);
+  EXPECT_TRUE(out[3].empty());
+  EXPECT_NE(std::string::npos, rt->GetDesc().find("neighbor requests punt to gate 4"))
+      << rt->GetDesc();
+
+  arg.set_punt_neighbor_gate(DROP_GATE);
+  auto *dropping = dynamic_cast<Router *>(h_.Create("Router", arg, "rt_drop"));
+  ASSERT_NE(nullptr, dropping);
+  Module *writer2 = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer2, 0, dropping, 0, true));
+  out = h_.RunPipeline(writer2, 0, requests, dropping, {0, 1, 3, 4});
+  EXPECT_TRUE(out[3].empty());
+  EXPECT_TRUE(out[4].empty());
+  EXPECT_EQ(2u, dropping->neighbor_requests());
+
+  arg.set_punt_neighbor_gate(MAX_GATES + 1);
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "not a gate";
+}
+
 // A reply on an interface the resolver does not have is dropped and counted
 // when it arrives, never queued for the resolver.
 TEST_F(RouterTest, AReplyOnAnUnknownInterfaceIsDroppedAtInput) {

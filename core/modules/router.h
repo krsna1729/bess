@@ -78,9 +78,10 @@
 // change as a next-hop update through the engine on the maintenance tick.
 // Timings are configured in milliseconds and converted to ticks at Init.
 // ARP requests and Neighbor Solicitations are answered elsewhere: they go to
-// the local punt gate, or are dropped, and are counted. An ARP request (a
-// gratuitous one included) is also copied to the resolver, which moves a
-// bound neighbor to the MAC it announces (RFC 826's merge).
+// punt_neighbor_gate (by default the local punt gate), or are dropped, and
+// are counted. An ARP request (a gratuitous one included) is also copied to
+// the resolver, which moves a bound neighbor to the MAC it announces (RFC
+// 826's merge).
 // docs/neighbor-resolution.md describes the state machine.
 //
 // A resolved hop that names both of its addresses has them written into the
@@ -192,15 +193,16 @@ class Router final : public Module {
   uint64_t family_disabled_frames() const noexcept {
     return family_disabled_frames_.load(std::memory_order_relaxed);
   }
-  // ARP requests and Neighbor Solicitations a resolving router received: not
-  // the resolver's input, so they go to punt_local_gate or are dropped, and
-  // are counted either way.
+  // ARP requests and Neighbor Solicitations a resolving router received: they
+  // go to punt_neighbor_gate or are dropped, and are counted either way.
   uint64_t neighbor_requests() const noexcept {
     return neighbor_requests_.load(std::memory_order_relaxed);
   }
-  // ARP replies and Neighbor Advertisements dropped before the resolver saw
-  // them: no readable interface id, an interface the resolver does not have,
-  // or a full input ring.
+  // Resolver input dropped before the resolver saw it: an ARP reply or
+  // Neighbor Advertisement with no readable interface id, on an interface the
+  // resolver does not have, or meeting a full input ring; or the copy of an
+  // ARP request that could not be queued (the request itself is still
+  // punted).
   uint64_t neighbor_input_drops() const noexcept {
     return neighbor_input_drops_.load(std::memory_order_relaxed);
   }
@@ -315,6 +317,10 @@ class Router final : public Module {
   // exists in a dataplane graph, so the graph names the slow path (a stack
   // adapter, a control endpoint) or drops. Either way it is counted.
   gate_idx_t punt_local_gate_ = DROP_GATE;
+  // Where ARP requests and Neighbor Solicitations go (D-179): the responder's
+  // gate, else punt_local_gate_ (RouterArg.punt_neighbor_gate 0), DROP_GATE
+  // meaning drop. Counted either way.
+  gate_idx_t punt_neighbor_gate_ = DROP_GATE;
   // Which fields a group route hashes to pick its member (D-163). The proto
   // default is the whole flow, so this only differs when a graph says so.
   bess::route::FlowHashFields flow_fields_ = bess::route::FlowHashFields::kL3L4;
