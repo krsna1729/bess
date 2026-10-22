@@ -167,6 +167,31 @@ TEST_F(MetadataTest, SingleAttrSimplePipeBackwardsFails) {
   ASSERT_EQ(kMetadataOffsetNoWrite, m1->attr_offset(0));
 }
 
+// A module that matches on an attribute and writes it back (a classifier key
+// field and a result field of one name) is one kUpdate attribute: it reads the
+// upstream writer's value and its write is what the downstream reader sees.
+TEST_F(MetadataTest, AReadAndAWriteOfOneNameAreAnUpdate) {
+  Module *reader = ::create_foo("downstream");
+  ASSERT_EQ(0, m0->AddMetadataAttr("a", 4, Attribute::AccessMode::kWrite));
+  ASSERT_EQ(0, m1->AddMetadataAttr("a", 4, Attribute::AccessMode::kRead));
+  ASSERT_EQ(0, m1->AddMetadataAttr("a", 4, Attribute::AccessMode::kWrite));
+  ASSERT_EQ(1u, m1->all_attrs().size());
+  EXPECT_EQ(Attribute::AccessMode::kUpdate, m1->all_attrs()[0].mode);
+  // Only one read and one write merge, and only at one size.
+  EXPECT_EQ(-EEXIST, m1->AddMetadataAttr("a", 4, Attribute::AccessMode::kRead));
+  ASSERT_EQ(1, m0->AddMetadataAttr("b", 2, Attribute::AccessMode::kWrite));
+  EXPECT_EQ(-EEXIST, m0->AddMetadataAttr("b", 2, Attribute::AccessMode::kWrite));
+  EXPECT_EQ(-EEXIST, m0->AddMetadataAttr("b", 4, Attribute::AccessMode::kRead));
+  ASSERT_EQ(0, reader->AddMetadataAttr("a", 4, Attribute::AccessMode::kRead));
+
+  ModuleGraph::ConnectModules(m0, 0, m1, 0);
+  ModuleGraph::ConnectModules(m1, 0, reader, 0);
+  ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
+  ASSERT_GE(m1->attr_offset(0), 0);
+  EXPECT_EQ(m0->attr_offset(0), m1->attr_offset(0));
+  EXPECT_EQ(m1->attr_offset(0), reader->attr_offset(0));
+}
+
 // A contract is orthogonal to the access mode: an existing three-argument
 // declaration is best-effort, so an unresolved reader keeps the historical
 // kMetadataOffsetNoRead and the report names it.

@@ -285,21 +285,41 @@ int Module::AddMetadataAttrImpl(
     const uint8_t *default_value) {
   int ret;
 
-  if (attrs_.size() >= bess::metadata::kMaxAttrsPerModule)
-    return -ENOSPC;
-
   if (name.empty())
     return -EINVAL;
 
   if (size < 1 || size > bess::metadata::kMetadataAttrMaxSize)
     return -EINVAL;
 
-  // We do not allow a module to have multiple attributes with the same name
-  for (const auto &it : attrs_) {
-    if (it.name == name) {
+  // One attribute per name. A module that reads an attribute and also writes
+  // it -- a classifier that matches on a field and sets it in its result --
+  // updates it: the two registrations become one kUpdate attribute, keeping the
+  // reader's contract and default. Anything else under a taken name is refused.
+  for (size_t i = 0; i < attrs_.size(); ++i) {
+    auto &attr = attrs_[i];
+    if (attr.name != name) {
+      continue;
+    }
+    using AccessMode = bess::metadata::Attribute::AccessMode;
+    const bool read_then_write =
+        attr.mode == AccessMode::kRead && mode == AccessMode::kWrite;
+    const bool write_then_read =
+        attr.mode == AccessMode::kWrite && mode == AccessMode::kRead;
+    if (attr.size != size || !(read_then_write || write_then_read)) {
       return -EEXIST;
     }
+    attr.mode = AccessMode::kUpdate;
+    if (write_then_read) {
+      attr.contract = contract;
+      if (default_value != nullptr) {
+        std::memcpy(attr.default_value.data(), default_value, size);
+      }
+    }
+    return static_cast<int>(i);
   }
+
+  if (attrs_.size() >= bess::metadata::kMaxAttrsPerModule)
+    return -ENOSPC;
 
   if ((ret = pipeline_->RegisterAttribute(name, size))) {
     return ret;
