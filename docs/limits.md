@@ -85,7 +85,7 @@ Columns:
 | Router | address families | IPv4, IPv6 or both; at least one | `RouterArg.max_ipv4_routes`, `max_ipv6_routes` (D-179) | a family is enabled by setting its route capacity | EINVAL "no address family is enabled"; an explicit 0 is refused |
 | Router | IPv4 routes; tbl8 groups per domain | 4G − 1; default 256 | `RouterArg.max_ipv4_routes`, `max_ipv4_tbl8s`, `Router::kDefaultIpv4Tbl8s` (`modules/router.h`) | yes | EINVAL "ipv4 capacity exceeds backend limits"; a full table refuses the route write (`kTableFull`) |
 | Router | IPv6 routes; tbl8 groups per domain | 1G − 1 (rte_fib6's rule pool is 2 × routes); default 8,192 | `RouterArg.max_ipv6_routes`, `max_ipv6_tbl8s`, `Router::kDefaultIpv6Tbl8s` (`modules/router.h`) | yes | a full table refuses the route write (`kTableFull`); the transaction changes nothing |
-| Router | IPv6 FIB entry width | 2 B while the largest value (`max_next_hops + max_groups`) and the tbl8 count are at most 32,767, else 4 B | `kMaxTwoByteValue` (`route/route_table.cc`) | follows from the capacities | — (each IPv6 table instance is 2^24 entries, 32 MiB at 2 B, 64 MiB at 4 B, plus its tbl8 groups; a written table keeps two instances) |
+| Router | IPv6 FIB entry width; memory per domain | 2 B while the largest value (`max_next_hops + max_groups`) and `max_ipv6_tbl8s` are at most 32,767, else 4 B; at 2 B one instance is 32 MiB + 512 B × `max_ipv6_tbl8s` plus the rib | `kMaxTwoByteValue` (`route/route_table.cc`) | follows from the capacities | — (a domain holds one instance until its first IPv6 change and two after, live and spare; double the bytes at 4 B) |
 | Router | next hops | 16M − 1 | `LpmRouteTable::kMaxValue` | `max_next_hops` up to the bound | EINVAL "router capacity exceeds backend limits" |
 | Router | next-hop groups | 16M − 1 − `max_next_hops` | `LpmRouteTable::kMaxValue` (shares the bound with `max_next_hops`) | `max_groups` up to the bound; 0 (the default) registers the empty resource | EINVAL "router capacity exceeds backend limits" |
 | Router | route domains | 16M | `route::kMaxRouteDomains` | `max_domains` up to the bound | EINVAL |
@@ -113,9 +113,10 @@ Columns:
 | Dump | sampling interval | 1 s | `DEFAULT_INTERVAL_NS` (`dump.cc`) | `interval` | — |
 | Router | default route domain | 0 | `kDefaultRouteDomainId` (`route/route_domain.h`) | the route key's `domain` | — |
 | Router | neighbor next-hop updates published per tick | 64 | `Router::kMaxNeighborUpdatesPerTick` (`modules/router.h`) | No | the rest stay pending for the next tick (D-179) |
-| Router | neighbor interfaces and bindings | fixed at Init | `RouterArg.interfaces`, `neighbor_bindings` | No (recreate the Router) | no runtime change; route gateways are not resolved on demand, so every neighbor needs a binding (D-179) |
-| Router | neighbor state visibility | counts only | `Router::GetDesc` | No | bound hops are hidden from `<router>/next_hops`; no neighbors view yet (D-179) |
-| Router | addresses per interface | one IPv4, one IPv6, no prefix length | `RouterInterface` | No | — |
+| Router | neighbor interfaces | fixed at Init | `RouterArg.interfaces` | No (recreate the Router) | no runtime change; bindings are the runtime `<router>/neighbors` resource |
+| Router | neighbor bindings | default min(1,024, `max_next_hops`) | `RouterArg.max_neighbors` | up to `max_next_hops` | EINVAL above `max_next_hops`; a binding past the bound refuses its transaction |
+| Router | on-demand resolution (glean) | none | — | No | a route gateway or connected host resolves only through a bound next-hop id; every neighbor needs a binding (D-179) |
+| Router | neighbor input rings | 1,024 replies/advertisements, 256 ARP request copies, 1,024 solicitations | `router.cc` | No | the frame or solicitation is dropped and counted; timers retry |
 
 ## Other fixed constants
 

@@ -72,7 +72,8 @@ buffers, gates and the policy for unresolved traffic. That keeps the library
 free of `Module`, gate, worker and protobuf dependencies, as the rest of
 `core/route` is.
 
-Interface identity is explicit: `ConfigureInterface({id, mac, ipv4, ipv6})`
+Interface identity is explicit: `ConfigureInterface({id, mac, addresses})`
+(any number of IPv4 and IPv6 addresses, each with its on-link prefix length)
 assigns a generation (epoch) per interface. Every entry records the epoch it was created
 under, and a reply is accepted only if the arrival interface, the epoch, the
 reply's sender and target addresses, its Ethernet source/destination and a
@@ -89,7 +90,33 @@ moves the bindings' captured source MAC, so the republished next hops send
 from the interface's current MAC. `Bind` enforces the neighbor-entry bound
 itself (a neighbor with aging disabled holds no timer), permits a full table
 when the rebind releases its old neighbor's last hop, and rolls the binding
-back if the wheel refuses the new timer.
+back if the wheel refuses the new timer. `CheckBind(key)` answers whether a
+`Bind` of that key would be taken (a known interface, an address of the
+interface's families, not one of the interface's own addresses) without
+changing anything, so a caller can refuse a binding before it commits to it.
+
+ARP that answers nothing still says where its sender is (RFC 826's merge).
+`OnArp` treats an ARP frame from a bound neighbor in one of two ways:
+
+- a reply whose target is one of the interface's addresses, unicast to the
+  interface's MAC or broadcast, answers a solicitation: the neighbor resolves
+  on the sender's MAC and its reachable lifetime restarts;
+- a request (for any target, gratuitous announcements included) or a
+  broadcast reply naming another target is a merge: unless the neighbor is
+  already resolved on that MAC, the new MAC is published as resolved at once
+  and the neighbor is reconfirmed on the next `Poll` (solicited, and failed to
+  `kUnreachable` if it does not answer). A unicast reply naming another target
+  answers nothing asked and is ignored.
+
+Either way the frame needs an Ethernet source equal to the ARP sender, a
+usable unicast sender MAC that is not the interface's own, an Ethernet
+destination that is the interface's MAC or broadcast, and the generation the
+entry was bound under; a sender no `Bind` named is ignored.
+
+An interface can hold several addresses of a family. A solicitation leaves
+from the address whose prefix holds the neighbor, and from the first address
+of the neighbor's family when none does; a reply is accepted when its target
+is any of the interface's current addresses.
 
 Timing is in caller ticks, matching `ExpiryWheel` and `docs/expiry.md`: the
 first probe, the retry interval with exponential backoff capped at a maximum,
@@ -122,10 +149,10 @@ for the new immutable objects and returns them:
   snapshot visibility, so different hops may change one at a time;
 - the `Router` module applies resolver-owned next-hop operations through the
   in-process transaction engine, at most 64 per tick in one transaction; the
-  rest wait for the next tick (D-179). Its next-hop resource rejects ordinary
-  writes and erases for configured resolver-owned ids, and its codec does not
-  enumerate them, so desired-state convergence of `<router>/next_hops` leaves
-  them alone while a manifest naming one is refused.
+  rest wait for the next tick (D-179). A bound next-hop id lives in
+  `<router>/neighbors`, not `<router>/next_hops`: the next-hop resource
+  refuses a write or erase of a bound id and does not enumerate one, so
+  desired-state convergence of `<router>/next_hops` leaves bound hops alone.
 
 Aging does not stop forwarding: when a resolved neighbor's reachable lifetime
 expires it stays resolved, with its MAC, while the resolver probes it with the
@@ -135,9 +162,12 @@ without republishing. In the `Router` module each `neighbor_*` field is
 optional: unset takes the default, and an explicit 0 has one meaning per field
 (listed below). ARP replies and Neighbor
 Advertisements are queued with the interface id read when they arrive (an
-unknown interface or a full queue drops and counts them); ARP requests and
-Neighbor Solicitations are not resolver input and take the local punt gate, or
-are dropped, and are counted.
+unknown interface or a full queue drops and counts them). ARP requests and
+Neighbor Solicitations are answered elsewhere: they go to `punt_neighbor_gate`
+(by default the gate `punt_local_gate` names), or are dropped, and are
+counted. An ARP request is also copied to the resolver on a ring of its own,
+so a busy segment's requests cannot take the room replies need; that copy is
+what lets a gratuitous ARP move a bound neighbor.
 
 In each case a packet-path lookup (`Router::Resolve` /
 `LookupNextHop`) obtains one whole `NextHop` pointer through the `SlotTable`'s
@@ -170,15 +200,64 @@ table in BESS and is what lets the state machine allocate without locks.
 ## Router module configuration and handoff
 
 `RouterArg.interfaces` lists the router's own interfaces, each a
-`RouterInterface {id, egress_gate, mac_addr, ipv4, ipv6}`. `id` is the Router
+`RouterInterface {id, egress_gate, mac_addr, addresses}`. `id` is the Router
 `InterfaceId`, which is `egress_gate + 1`; leave it 0 to derive it, and any
 other value must equal it. `mac_addr` is text, `"aa:bb:cc:dd:ee:ff"`, as in
-Vif, and must be nonzero; `ipv4`/`ipv6` are the local source addresses of its
-solicitations, and a binding of a family needs the interface to have that
-family's address. `neighbor_bindings` binds a `next_hop_id` to an interface
-and exactly one IPv4 or IPv6 peer address. Those bindings seed incomplete next
-hops and own those ids; routes may refer to them, but a static
-`RouterNextHopValue` must not be written for them.
+Vif, and must be nonzero. `addresses` is a list of the interface's own
+addresses in CIDR form (`"192.0.2.1/24"`, `"2001:db8::1/64"`): any number of
+either enabled family, at least one. Init refuses an address of a family the
+router does not enable, a malformed address, and an interface without one.
+The interfaces are fixed at Init; setting any enables neighbor resolution and
+the `<router>/neighbors` resource.
+
+### The `<router>/neighbors` resource
+
+`<router>/neighbors` maps a next-hop id (`RouterNextHopIdKey {id}`) to a
+`RouterNeighborBinding {interface_id, ipv4, ipv6}` with exactly one of `ipv4`
+or `ipv6` set. Bindings come and go at runtime, in transactions like any
+other resource:
+
+- **Binding publishes the hop.** The committed transaction publishes the id
+  as an incomplete next hop. The resolver takes the binding up on the next
+  maintenance tick, and `neighbor_first_probe_ms` counts from that tick.
+- **Validated before it is staged.** A binding must name a configured
+  interface, an address of a family the router enables and the interface has
+  an address of, and not one of the interface's own addresses
+  (`NeighborResolver::CheckBind`). A refused binding refuses the transaction.
+- **Static and bound ids are disjoint.** An id is in `<router>/next_hops` or
+  in `<router>/neighbors`, never both; a transaction that would make it both
+  is refused.
+- **Refused while referenced.** Routes and groups name a bound id like any
+  next hop and hold a reference to its binding, so an unbind is refused while
+  any route or group names it. Remove (or repoint) them in the same or an
+  earlier transaction.
+- **Abort leaves nothing.** An aborted transaction leaves no binding, hop or
+  pending resolver change behind.
+- **Apply order.** Desired-state apply upserts resources by ascending rank
+  and erases by descending rank, so a manifest may list `<router>/neighbors`
+  after the routes that name its ids: bindings are upserted before routes
+  and erased after them.
+- **Capacity.** `max_neighbors` bounds the bindings (and so the neighbors
+  resolved). It defaults to 1024 or `max_next_hops`, whichever is smaller;
+  a value above `max_next_hops` is refused. A binding past it refuses the
+  transaction.
+
+Reading `<router>/neighbors` back returns the bindings in the same form, with
+canonical address text. A router without interfaces has no resolver, so it
+binds nothing.
+
+### `get_neighbors`
+
+The `get_neighbors` action (`EmptyArg` →
+`RouterCommandGetNeighborsResponse`) lists every binding in id order as a
+`RouterNeighborStatus {next_hop_id, interface_id, ipv4, ipv6, state,
+mac_addr, reconfirming, probes}`. `state` is resolved, incomplete or
+unreachable; `mac_addr` is empty until a MAC is learned; `reconfirming` marks
+a resolved neighbor whose reachable lifetime ran out and which is being
+probed while it still forwards; `probes` counts the solicitations of the
+current attempt. A binding made since the last tick reads incomplete with no
+probes. The action reads control-side state under the control-plane lock, so
+it runs while workers run.
 
 ### Who does what in the graph
 
@@ -188,20 +267,71 @@ hops and own those ids; routes may refer to them, but a static
   interface it feeds (`egress_gate + 1`). Without a Vif, a `SetMetadata` on
   each ingress path writes it.
 - **Answering for the router's own addresses.** The Router does not answer ARP
-  requests or Neighbor Solicitations: it sends them to `punt_local_gate`, or
-  drops them, and counts them. Configure the interface's `ip_addr`/`ipv6_addr`
-  on its Vif (or put an ARP responder on the path) so neighbors can resolve
+  requests or Neighbor Solicitations: it sends them to `punt_neighbor_gate`,
+  or drops them, and counts them. `punt_neighbor_gate` 0 (the default) follows
+  `punt_local_gate`, 8192 (`DROP_GATE`) drops them, and any other invalid
+  gate is refused at Init. Configure the interface's `ip_addr`/`ipv6_addr` on
+  its Vif (or put an ARP/ND responder on the gate) so neighbors can resolve
   the router.
+- **What reaches the Router.** Only frames for the interface MAC should reach
+  the Router, plus the Vif's own answers, which must be diverted before it
+  (below). Give each Vif `default_gate: 8192` so a frame for any other MAC is
+  dropped by the Vif rather than delivered.
 - **Diverting the Vif's answers.** A Vif emits its ARP and NA answers on the
   interface's data gate, the same gate that feeds the Router. Divert them to
   the port before the Router, e.g. with an `ExactMatch` on the Ethernet source
   MAC (an answer carries the interface's own MAC). Otherwise the Router takes
   them as input and drops them.
 
-### Example
+### Examples
 
-Two ports, one destination-mode Router, an IPv4 and an IPv6 neighbor on the
-second port, and one route of each family to them:
+A family is enabled exactly when its route capacity (`max_ipv4_routes`,
+`max_ipv6_routes`) is set; at least one must be. Interface addresses and
+bindings must be of an enabled family. The three Router configurations
+below differ only in that; the graph around them is the one in the dual-stack
+example.
+
+IPv4 only (`rte_lpm`, 256 tbl8 groups per domain by default):
+
+```yaml
+  - name: rt
+    mclass: Router
+    arg:
+      mode: ROUTE_MODE_DESTINATION
+      max_ipv4_routes: 1024
+      interfaces:
+        - {egress_gate: 0, mac_addr: "02:00:00:00:00:01", addresses: ["192.0.2.1/24"]}
+        - {egress_gate: 1, mac_addr: "02:00:00:00:00:02", addresses: ["198.51.100.1/24"]}
+resources:
+  rt/neighbors:
+    - {key: {id: 1}, value: {interface_id: 2, ipv4: "198.51.100.254"}}
+  rt/routes:
+    - {key: {ipv4: "203.0.113.0", prefix_length: 24}, value: {next_hop_id: 1}}
+```
+
+IPv6 only (`rte_fib6`; `max_ipv6_tbl8s` sizes each domain, see
+docs/routing.md):
+
+```yaml
+  - name: rt
+    mclass: Router
+    arg:
+      mode: ROUTE_MODE_DESTINATION
+      max_ipv6_routes: 1024
+      max_ipv6_tbl8s: 1024
+      interfaces:
+        - {egress_gate: 0, mac_addr: "02:00:00:00:00:01", addresses: ["2001:db8:1::1/64"]}
+        - {egress_gate: 1, mac_addr: "02:00:00:00:00:02", addresses: ["2001:db8:2::1/64"]}
+resources:
+  rt/neighbors:
+    - {key: {id: 2}, value: {interface_id: 2, ipv6: "2001:db8:2::fe"}}
+  rt/routes:
+    - {key: {ipv6: "2001:db8:100::", prefix_length: 48}, value: {next_hop_id: 2}}
+```
+
+Dual-stack, with the whole graph: two ports, one destination-mode Router, an
+IPv4 and an IPv6 neighbor on the second port, and one route of each family to
+them:
 
 ```yaml
 ports:
@@ -210,15 +340,18 @@ ports:
 modules:
   - {name: in0, mclass: PortInc, arg: {port: p0}}
   - {name: in1, mclass: PortInc, arg: {port: p1}}
-  # Vif interface id == Router interface id == egress_gate + 1.
+  # Vif interface id == Router interface id == egress_gate + 1. A frame for
+  # another MAC takes the default gate, 8192: dropped.
   - name: vif0
     mclass: Vif
     arg:
+      default_gate: 8192
       interfaces:
         - {id: 1, mac_addr: "02:00:00:00:00:01", ip_addr: "192.0.2.1", ipv6_addr: "2001:db8:1::1", gate: 0}
   - name: vif1
     mclass: Vif
     arg:
+      default_gate: 8192
       interfaces:
         - {id: 2, mac_addr: "02:00:00:00:00:02", ip_addr: "198.51.100.1", ipv6_addr: "2001:db8:2::1", gate: 0}
   # The Vif's own answers carry the interface MAC as their source: send them
@@ -229,12 +362,12 @@ modules:
     mclass: Router
     arg:
       mode: ROUTE_MODE_DESTINATION
+      max_ipv4_routes: 1024
+      max_ipv6_routes: 1024
+      max_ipv6_tbl8s: 1024
       interfaces:
-        - {egress_gate: 0, mac_addr: "02:00:00:00:00:01", ipv4: "192.0.2.1", ipv6: "2001:db8:1::1"}
-        - {egress_gate: 1, mac_addr: "02:00:00:00:00:02", ipv4: "198.51.100.1", ipv6: "2001:db8:2::1"}
-      neighbor_bindings:
-        - {next_hop_id: 1, interface_id: 2, ipv4: "198.51.100.254"}
-        - {next_hop_id: 2, interface_id: 2, ipv6: "2001:db8:2::fe"}
+        - {egress_gate: 0, mac_addr: "02:00:00:00:00:01", addresses: ["192.0.2.1/24", "2001:db8:1::1/64"]}
+        - {egress_gate: 1, mac_addr: "02:00:00:00:00:02", addresses: ["198.51.100.1/24", "2001:db8:2::1/64"]}
   - {name: out0, mclass: PortOut, arg: {port: p0}}
   - {name: out1, mclass: PortOut, arg: {port: p1}}
 connections:
@@ -253,13 +386,18 @@ resources:
     - {key: {fields: [{value_bin: "AgAAAAAB"}]}, value: {gate: 0}}
   own1/rules:
     - {key: {fields: [{value_bin: "AgAAAAAC"}]}, value: {gate: 0}}
+  rt/neighbors:
+    - {key: {id: 1}, value: {interface_id: 2, ipv4: "198.51.100.254"}}
+    - {key: {id: 2}, value: {interface_id: 2, ipv6: "2001:db8:2::fe"}}
   rt/routes:
     - {key: {ipv4: "203.0.113.0", prefix_length: 24}, value: {next_hop_id: 1}}
     - {key: {ipv6: "2001:db8:100::", prefix_length: 48}, value: {next_hop_id: 2}}
 ```
 
 The interfaces omit `id`, so each is derived from its gate (1 and 2), matching
-the Vif ids. A packet-path workload also needs workers; start from
+the Vif ids. No punt gate is set, so ARP requests and Neighbor Solicitations
+that reach the Router are dropped and counted; the Vifs answer for the
+interface addresses. A packet-path workload also needs workers; start from
 `bessctl get` (docs/control-sdk.md).
 
 ### Handoff, timings and bounds
@@ -268,12 +406,15 @@ The Router hands control frames from workers to a bounded ring; its
 maintenance tick calls `OnArp`, `OnNd` and `Poll` with a bounded work budget,
 then publishes complete next-hop objects transactionally. A Router task emits
 queued solicitation frames on the interface's egress gate. `max_neighbors`
-bounds resolver state (default 1024).
+bounds resolver state (default 1024 or `max_next_hops`, whichever is
+smaller).
 
-Timings are milliseconds; Init converts them to maintenance ticks from the
-daemon's `--maintenance_interval_us`, rounding up, and the resolver's clock
-starts at Init. Init refuses a resolver when the maintenance loop is disabled
-(`--maintenance_interval_us=0`), since no neighbor would ever be solicited.
+Timings are configured in milliseconds and counted in maintenance ticks: Init
+converts each to ticks from the daemon's `--maintenance_interval_us`, rounding
+up, so a configured N ms is at least N ms (and may be up to one tick more).
+The resolver's clock starts at the tick current at Init. Init refuses a
+resolver when the maintenance loop is disabled (`--maintenance_interval_us=0`),
+since no neighbor would ever be solicited.
 
 | field | unset | explicit 0 |
 |---|---|---|
@@ -284,26 +425,22 @@ starts at Init. Init refuses a resolver when the maintenance loop is disabled
 | `neighbor_reachable_lifetime_ms` | 30000 | never re-solicit a resolved neighbor |
 | `neighbor_unreachable_retry_ms` | 8000 (the backoff ceiling) | never retry an unreachable neighbor |
 
-The receive and solicitation rings each hold 1024 entries; a full ring drops
-that control frame or solicitation and the timer retry keeps behavior bounded.
-Each maintenance tick handles at most 64 received frames and polls at most 64
-timer records. An idle Router output task blocks until it is scheduled again.
+The receive and solicitation rings each hold 1024 entries and the ARP request
+copy ring 256; a full ring drops that control frame or solicitation and the
+timer retry keeps behavior bounded. Each maintenance tick handles at most 64
+received frames and polls at most 64 timer records. An idle Router output
+task blocks until it is scheduled again.
 
 ### Current limits
 
-- Interfaces and bindings are fixed at Init: adding or removing a neighbor
-  means recreating the Router.
-- Route gateways are not resolved on demand: a route resolves only through a
-  bound next-hop id, so every neighbor (each host on a connected subnet
-  included) needs a binding.
-- Neighbor state is not inspectable yet: bound hops are hidden from
-  `<router>/next_hops`, so a route read-back can name an id the next-hop
-  read-back omits; GetDesc shows only counts.
-- ARP requests and Neighbor Solicitations share `punt_local_gate` with local
-  delivery; there is no separate neighbor punt gate.
-- Gratuitous ARP is not learned: an IPv4 MAC move is noticed only when the
-  neighbor is next reconfirmed.
-- One address per family per interface, without a prefix length.
+- Interfaces are fixed at Init: adding, removing or readdressing one means
+  recreating the Router. Bindings are runtime state (`<router>/neighbors`).
+- No glean: route gateways and connected hosts are not resolved on demand. A
+  route resolves only through a bound next-hop id, so every neighbor (each
+  host on a connected subnet included) needs a binding. Resolving on demand
+  would need the packet path to create neighbor entries from traffic, which
+  lets any sender grow the table and costs the miss path a control handoff;
+  explicit bindings keep the table bounded and owned by the controller.
 
 ## What moved out of Vif, and what stayed
 
@@ -331,10 +468,10 @@ An advertisement is accepted only when all of the following hold:
   version 6, next header ICMPv6, hop limit 255, a correct ICMPv6 checksum
   over the pseudo-header, an ND type, no malformed option;
 - the destination is this generation's: either the Ethernet destination is
-  the interface's MAC and the IPv6 destination is its current address
-  (solicited), or both are all-nodes (the unsolicited MAC-change form); a
-  multicast destination requires the Solicited flag to be clear (RFC 4861
-  7.1.1), and an interface with no IPv6 address (`::`) never matches a
+  the interface's MAC and the IPv6 destination is one of its current IPv6
+  addresses (solicited), or both are all-nodes (the unsolicited MAC-change
+  form); a multicast destination requires the Solicited flag to be clear (RFC
+  4861 7.1.1), and an interface with no IPv6 address never matches a
   unicast destination; the
   source/target link-layer option, if present, equals the Ethernet source,
   and the sender MAC is unicast, non-zero and not the interface's own;
@@ -355,8 +492,8 @@ addresses are both accepted; there is no scope/zone field, so an application
 that needs a non-link-local scope must use distinct interfaces or addresses.
 
 Solicitations are sent to the target's solicited-node multicast address
-(`ff02::1:ffXX:XXXX`, MAC `33:33:ff:XX:XX:XX`), with the interface's own
-address as source. `Vif` answers a solicitation for its local address with
+(`ff02::1:ffXX:XXXX`, MAC `33:33:ff:XX:XX:XX`), from the interface address
+whose prefix holds the target (else its first IPv6 address). `Vif` answers a solicitation for its local address with
 `AnswerNeighborSolicitation`, setting S for a normal solicitation and
 answering a duplicate-address-detection solicitation (source `::`, no source
 link-layer option, destination the target's solicited-node group) to
