@@ -115,7 +115,7 @@ file is the reasoning.
 | D-092 | Classified live perf tests; master vs develop: framework cost predates the roadmap, module costs located | accepted |
 | D-093 | User decisions of 2026-10-05: public codecs, installed archives, TSan gates, keyless signing; MacTable fold deferred | accepted |
 | D-094 | Experimental public codec facade (`init_context().codecs()`); R4 an installed-tree plugin driven over the control API | accepted |
-| D-095 | Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd | accepted |
+| D-095 | Installed static archives of route, dataplane core, RCU, flow and classifier (`bess-dev-static`); R1 linked without bessd | accepted |
 | D-096 | Static DPDK links its constructor-registered drivers (whole-archive kept); release smoke starts bessd | accepted |
 | D-097 | The framework floor was the packet alloc and free path: four per-packet operations master did not do | accepted |
 | D-098 | WildcardMatch ranks by a packed priority and skips tuples that cannot win (19.2 ns master, 44.8 develop, 14.6 now) | accepted |
@@ -7716,10 +7716,11 @@ and then removed with the session. Mutant: the action codec decoding key `id + 1
 **Revisit when:** a codec API that is not protobuf-bound is wanted, or the facade is promoted to public.
 
 
-## D-095 Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd
+## D-095 Installed static archives of route, dataplane core, RCU, flow and classifier (`bess-dev-static`); R1 linked without bessd
 
 **Status:** accepted (2026-10-05; D-093 item 2).
-**Code:** `core/meson.build` (`bess_route`, `bess_dataplane_core`, `bess_rcu`, `bess_eal`, `bess_utils` installed in
+**Code:** `core/meson.build` (`bess_route`, `bess_dataplane_core`, `bess_rcu`, `bess_eal`, `bess_utils`, `bess_flow`,
+`bess_classifier` installed in
 `${libdir}/bess`; `bess-dev-static.pc`), `examples/static_router/` (new), `tools/ci_profile.py` (`verify-install`
 stages both pc files and builds and runs the example), `tools/package_release.py` (the archives and the pc file in
 the `bess-dev` package), `docs/plugin-api.md` (section 6), `docs/architecture.md`, `examples/appliances/README.md`.

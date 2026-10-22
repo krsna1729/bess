@@ -16,7 +16,8 @@ bessctl, the sample manifests, the protobuf schema, the build metadata and
 the SPDX SBOM; no Python), `bess-tools` (dpdk-devbind.py; Python 3),
 `bess-dev` (the
 headers and bess-dev.pc plugins build against, and the experimental route,
-dataplane and RCU archives with bess-dev-static.pc, D-095) and `bess-sdk` (the
+dataplane, RCU, flow and classifier archives with bess-dev-static.pc, D-095)
+and `bess-sdk` (the
 C++ control SDK). `bess` depends on the packages that own every shared library
 bessd loads (`ldd`, then `dpkg -S`): a library no package owns stops the
 build, so the package never claims less than they need.
@@ -209,7 +210,8 @@ def deb(args) -> list[Path]:
                       [f'{prefix}/include/bess/core', f'{lib}/pkgconfig/bess-dev.pc',
                        f'{lib}/pkgconfig/bess-dev-static.pc',
                        *(f'{lib}/bess/libbess_{name}.a'
-                         for name in ('route', 'dataplane_core', 'eal', 'rcu', 'utils'))]),
+                         for name in ('route', 'dataplane_core', 'eal', 'rcu', 'utils',
+                                      'flow', 'classifier'))]),
             # The control SDK (bess-sdk.pc): a client of any bessd, so it
             # needs no bess package, only what bess-sdk.pc requires.
             build_deb(stage, 'bess-sdk', version, ['libgrpc++-dev', 'libprotobuf-dev'],
