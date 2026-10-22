@@ -783,3 +783,181 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | LPM lookup and update cost | `route_bench` |
 | the Router's destination path at scale (route count × destination spread), LPM and FIB | `live_perf --tests M.router,M.router/s256,M.router/s64k,M.router/r2560s64k,M.router/r2560,M.router/r10240,M.router/r65536,M.router/r2560s64k-fib` |
 | meters, counters, RCU | `meter_bench`, `stats_bench`, `rcu_bench` |
+
+### Classifier result placement: live comparison
+
+`tests/perf/live_perf.cc` contains `M.place/*` arms for direct EM/WM result
+placement and EM→EM / WM→EM composition. The first table has 1,024 or 65,536
+rules. Uniform records contain 1–8 four-byte fields; `mixed8` and `mixed16`
+use heterogeneous widths. The second table holds 100%, 50%, 30%, 20%, 10%,
+or 5% as many entries (mixed-width arms use 100%, 50%, and 20%).
+
+RecordArena's record chunks and packet-path chunk-pointer array use the
+framework DPDK heap. `bess::utils::DpdkAllocate` follows the initialized EAL:
+hugepage-backed when enabled, normal-page-backed under `--no-huge`, using the
+framework memory-node policy. Allocation and exhaustion handling remain on
+the control path; the arena adds no separate hugepage detection or fallback.
+These allocations consume the shared EAL heap budget, including its default
+512 MB normal-page budget; provision that budget for result records too.
+
+Hits use connected gate 0 and misses drop. At ratio R, both arms use the same
+rule→action→result mapping: rule i produces record i modulo
+max(1, floor(N×R/100)). Each direct arm therefore has its own `/rR` case;
+the two-stage arm stores the same record behind that action ID.
+
+After timing, the runner pauses workers and checks every required stage's
+forwarded count. It then installs a verifier keyed by the original packet
+source and every result byte, resumes traffic briefly, and checks that none
+of that traffic was rejected. Eight-result-field cases use two verifier
+tables to respect ExactMatch's eight-key-field limit. Verifiers are absent
+from the measured graph. Failed path or byte checks discard the sample.
+
+Use the same corrected runner for both daemon builds, pinned to an isolated
+core with its SMT sibling offline. Save raw rounds with `--save`; compare
+cycles and instructions per packet as well as elapsed time, and retain the
+spread. Alternate build order (`--rounds 2` runs A/B then B/A). WM uses one
+all-ones tuple in these arms: results do not establish the cost of a
+many-tuple wildcard policy. Turbo-off does not guarantee a fixed clock on a
+laptop, so record the platform power profile too.
+
+Keep the control CPU inside the benchmark partition too: for worker CPU 4
+and control CPU 0, use wrapper `--cpu 0,4 --isolate` and runner
+`--cpu 4 --control-cpu 0`. Check the daemon's placement line reports control
+CPU 0 and worker CPU 4. A runner flag cannot move control threads onto a CPU
+excluded by the cgroup; a CPU-4-only partition reports no reserved control
+CPU and includes control-thread contention.
+
+The runner defaults to daemon `-m 0` (no hugepages). To require hugepages, pass
+an explicit positive memory cap through the build specification, for example
+`--build huge=/path/to/bessd,-m,1024`; do not infer the EAL mode from host free
+hugepages. Set `BESS_DPDK_LIB` to the repository-local DPDK library directory
+when the daemon needs that search path under `sudo`.
+
+#### Final EM/WM placement comparison
+
+The final implementation uses DPDK-backed `RecordArena` storage, inline
+accessors, and the existing bucketed `ResultPlan` kernels. The matrix varies:
+
+- Rule-table size N: 1,024 or 65,536.
+- Uniform result size M: 1–8 four-byte fields (4–32 bytes).
+- Heterogeneous field mix: `mixed8` uses 4+2+1+1-byte fields; `mixed16`
+  uses 8+4+2+1+1-byte fields.
+- Target action/rule ratio R: 100%, 50%, 30%, 20%, 10%, or 5%; mixed layouts
+  use 100%, 50%, and 20%. The action count is floor(N×R/100).
+- EAL memory mode: normal pages (`-m 0`) or hugepages (`-m 1024`).
+
+All 432 placement cases passed path and result-byte validation in both
+rounds of both EAL modes: 1,728 placement samples. Each round used 1.5 s
+measurement and 0.3 s warmup. CPUs 0 and 4 were in the isolated partition,
+with SMT siblings 1 and 5 offline; the daemon reported control CPU 0 and
+worker CPU 4. Turbo was off, governor/EPP were performance, and the platform
+profile was balanced. Packets were 64 bytes, keys four bytes, and traffic
+covered the full rule-key range. WM used one all-ones tuple.
+
+Each cell is `cycles/packet / ns/packet`, with that mode's `M.base`
+subtracted per round before taking the case median. The ratio tables then
+take the median across the listed geometries. These are module-cost deltas,
+not total pipeline latency. The EAL-mode comparison changes the whole
+daemon's DPDK heap, including hash tables and packet storage; it does not
+isolate the effect of RecordArena allocation alone.
+
+##### Normal-page EAL (`-m 0`)
+
+| R | geometries | EM inline | EM→EM | WM inline | WM→EM |
+|---:|---:|---:|---:|---:|---:|
+| 100% | 20 | 50.55 / 19.48 | 123.29 / 47.49 | 74.66 / 28.74 | 155.54 / 59.90 |
+| 50% | 20 | 50.42 / 19.45 | 121.26 / 46.71 | 75.19 / 28.94 | 152.21 / 58.63 |
+| 30% | 16 | 51.55 / 19.85 | 116.06 / 44.66 | 74.85 / 28.79 | 143.92 / 55.42 |
+| 20% | 20 | 50.37 / 19.42 | 117.55 / 45.26 | 74.56 / 28.70 | 149.39 / 57.56 |
+| 10% | 16 | 50.92 / 19.64 | 115.95 / 44.63 | 75.16 / 28.94 | 146.32 / 56.32 |
+| 5% | 16 | 51.16 / 19.74 | 112.49 / 43.33 | 74.67 / 28.74 | 142.37 / 54.83 |
+
+Table-size, result-size, and field-mix sensitivity at R20:
+
+| N | layout | EM inline | EM→EM | WM inline | WM→EM |
+|---:|---|---:|---:|---:|---:|
+| 1,024 | m1 | 42.83 / 16.49 | 102.66 / 39.55 | 61.26 / 23.60 | 126.70 / 48.80 |
+| 1,024 | m2 | 42.87 / 16.51 | 103.62 / 39.85 | 61.48 / 23.63 | 125.35 / 48.26 |
+| 1,024 | m3 | 48.95 / 18.88 | 110.32 / 42.49 | 72.25 / 27.80 | 132.83 / 51.17 |
+| 1,024 | m4 | 43.11 / 16.63 | 103.31 / 39.77 | 58.36 / 22.47 | 123.11 / 47.45 |
+| 1,024 | m5 | 51.62 / 19.92 | 111.10 / 42.79 | 74.52 / 28.67 | 134.81 / 51.90 |
+| 1,024 | m6 | 50.36 / 19.41 | 113.65 / 43.77 | 74.17 / 28.52 | 136.61 / 52.62 |
+| 1,024 | m7 | 50.36 / 19.42 | 110.06 / 42.38 | 74.59 / 28.73 | 134.95 / 51.93 |
+| 1,024 | m8 | 47.16 / 18.19 | 104.14 / 40.11 | 64.08 / 24.67 | 128.10 / 49.36 |
+| 1,024 | mixed8 | 41.05 / 15.83 | 101.30 / 39.01 | 61.05 / 23.47 | 123.63 / 47.60 |
+| 1,024 | mixed16 | 46.23 / 17.83 | 123.78 / 47.71 | 62.07 / 23.89 | 146.37 / 56.40 |
+| 65,536 | m1 | 50.25 / 19.35 | 118.25 / 45.52 | 74.96 / 28.83 | 169.34 / 65.21 |
+| 65,536 | m2 | 50.38 / 19.42 | 117.72 / 45.32 | 74.28 / 28.62 | 180.78 / 69.57 |
+| 65,536 | m3 | 58.98 / 22.72 | 127.99 / 49.28 | 83.71 / 32.21 | 162.67 / 62.58 |
+| 65,536 | m4 | 51.48 / 19.82 | 117.38 / 45.20 | 74.87 / 28.84 | 152.40 / 58.72 |
+| 65,536 | m5 | 58.16 / 22.43 | 127.53 / 49.10 | 83.36 / 32.12 | 159.59 / 61.50 |
+| 65,536 | m6 | 57.79 / 22.29 | 126.21 / 48.64 | 85.12 / 32.77 | 179.06 / 68.95 |
+| 65,536 | m7 | 58.22 / 22.42 | 131.02 / 50.41 | 84.60 / 32.59 | 189.23 / 72.76 |
+| 65,536 | m8 | 61.43 / 23.73 | 124.53 / 47.93 | 90.26 / 34.71 | 169.19 / 64.94 |
+| 65,536 | mixed8 | 50.65 / 19.55 | 123.14 / 47.43 | 82.98 / 31.97 | 165.42 / 63.76 |
+| 65,536 | mixed16 | 51.96 / 20.03 | 144.51 / 55.62 | 84.63 / 32.60 | 203.84 / 78.45 |
+
+##### Hugepage EAL (`-m 1024`)
+
+| R | geometries | EM inline | EM→EM | WM inline | WM→EM |
+|---:|---:|---:|---:|---:|---:|
+| 100% | 20 | 49.37 / 19.03 | 118.88 / 45.77 | 73.51 / 28.32 | 152.86 / 58.88 |
+| 50% | 20 | 49.08 / 18.93 | 116.45 / 44.83 | 72.41 / 27.88 | 149.07 / 57.40 |
+| 30% | 16 | 48.96 / 18.90 | 112.39 / 43.30 | 72.83 / 28.06 | 141.44 / 54.49 |
+| 20% | 20 | 48.87 / 18.86 | 113.21 / 43.58 | 72.98 / 28.09 | 145.24 / 55.93 |
+| 10% | 16 | 49.05 / 18.93 | 111.00 / 42.74 | 73.09 / 28.15 | 138.67 / 53.45 |
+| 5% | 16 | 49.51 / 19.11 | 109.61 / 42.21 | 73.57 / 28.35 | 139.00 / 53.52 |
+
+Table-size, result-size, and field-mix sensitivity at R20:
+
+| N | layout | EM inline | EM→EM | WM inline | WM→EM |
+|---:|---|---:|---:|---:|---:|
+| 1,024 | m1 | 42.79 / 16.50 | 103.37 / 39.79 | 61.71 / 23.76 | 125.02 / 48.13 |
+| 1,024 | m2 | 43.27 / 16.71 | 106.67 / 41.08 | 62.94 / 24.23 | 127.15 / 48.97 |
+| 1,024 | m3 | 50.06 / 19.33 | 110.23 / 42.48 | 74.11 / 28.55 | 134.32 / 51.78 |
+| 1,024 | m4 | 44.03 / 17.00 | 102.17 / 39.35 | 61.11 / 23.53 | 124.83 / 48.10 |
+| 1,024 | m5 | 48.82 / 18.84 | 109.65 / 42.23 | 73.78 / 28.40 | 136.58 / 52.57 |
+| 1,024 | m6 | 50.17 / 19.37 | 109.95 / 42.35 | 74.38 / 28.62 | 134.19 / 51.68 |
+| 1,024 | m7 | 49.56 / 19.13 | 110.90 / 42.72 | 74.63 / 28.73 | 136.13 / 52.44 |
+| 1,024 | m8 | 45.90 / 17.73 | 104.19 / 40.12 | 61.54 / 23.70 | 128.65 / 49.57 |
+| 1,024 | mixed8 | 42.54 / 16.43 | 101.61 / 39.12 | 60.59 / 23.30 | 125.36 / 48.25 |
+| 1,024 | mixed16 | 44.58 / 17.21 | 119.61 / 46.11 | 61.26 / 23.60 | 146.20 / 56.37 |
+| 65,536 | m1 | 48.25 / 18.61 | 113.96 / 43.89 | 71.01 / 27.34 | 146.23 / 56.31 |
+| 65,536 | m2 | 48.61 / 18.73 | 115.41 / 44.44 | 71.46 / 27.48 | 147.24 / 56.71 |
+| 65,536 | m3 | 52.94 / 20.43 | 123.67 / 47.64 | 81.05 / 31.22 | 154.58 / 59.51 |
+| 65,536 | m4 | 47.64 / 18.40 | 112.45 / 43.27 | 69.00 / 26.57 | 144.28 / 55.55 |
+| 65,536 | m5 | 53.34 / 20.58 | 122.77 / 47.27 | 80.63 / 31.05 | 156.45 / 60.26 |
+| 65,536 | m6 | 51.18 / 19.75 | 122.72 / 47.23 | 79.91 / 30.76 | 155.72 / 59.96 |
+| 65,536 | m7 | 53.75 / 20.71 | 122.82 / 47.29 | 81.19 / 31.28 | 154.37 / 59.48 |
+| 65,536 | m8 | 50.64 / 19.54 | 114.28 / 44.03 | 72.19 / 27.77 | 146.46 / 56.36 |
+| 65,536 | mixed8 | 51.30 / 19.79 | 117.17 / 45.13 | 76.40 / 29.39 | 168.56 / 64.92 |
+| 65,536 | mixed16 | 48.92 / 18.88 | 140.41 / 54.10 | 76.19 / 29.33 | 189.71 / 73.04 |
+
+#### Engineering guidance
+
+Prefer direct final-result placement for packet-path performance. It won all
+432 matched classifier/ratio/geometry/memory-mode comparisons, in both
+measured rounds: there is no measured crossover. Across the ratio-table
+medians, direct EM cost 54.5–59.0% fewer cycles than EM→EM; direct WM cost
+47.1–52.0% fewer than WM→EM. This applies to the tested matrix, not larger
+tables, values wider than 32 bytes, different key widths, or many-tuple
+wildcard policies.
+
+Use a second stage when shared action indirection is required, or when
+separately measured memory or update benefits justify its extra lookup.
+Memory consumption and update fan-out were not measured here. Do not infer
+their tradeoffs from packet-processing timings.
+
+Use the framework allocation policy in either EAL mode; the arena does not
+need its own mode switch. These tables do not show that hugepages improve
+every case, nor isolate an allocator-only gain. Observable IRQ/softirq
+activity remained on CPU 4 despite scheduler isolation. Absolute costs
+varied between rounds; these short laptop measurements do not establish a
+universal percentage saving.
+
+“Inline” means one classifier produces the final result, not arbitrary-width
+bytes embedded in an `rte_hash` scalar. RecordArena holds the records in both
+topologies. This is not a benchmark of alternative `rte_hash` value APIs.
+Raw rounds are retained locally under
+`.scratch/recordarena-evidence/final-allocation/`.
+

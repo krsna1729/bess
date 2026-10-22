@@ -7,10 +7,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "classifier/classifier.h"
 #include "rcu/rcu_domain.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::classifier {
 
@@ -49,8 +51,13 @@ class RecordArena {
   [[nodiscard]] MutableBytes Record(Id id) noexcept;
 
   // Reader access. Id 0 or an out-of-range id returns an empty span.
-  [[nodiscard]] ConstBytes Lookup(Id id) const noexcept;
-
+  [[nodiscard, gnu::always_inline]] inline ConstBytes Lookup(Id id) const noexcept {
+    const std::byte *base = Base(id);
+    if (base == nullptr) {
+      return {};
+    }
+    return ConstBytes(base, record_size_);
+  }
   // The record was never published: free it now.
   void Abort(Id id) noexcept;
 
@@ -85,7 +92,22 @@ class RecordArena {
   // in the record's own (aligned) bytes, so this path never allocates: Abort()
   // is called from noexcept rollback code.
   void Free(Id id) noexcept;
-  [[nodiscard]] std::byte *Base(Id id) const noexcept;
+  [[nodiscard, gnu::always_inline]] inline const std::byte *Base(
+      Id id) const noexcept {
+    const uint32_t chunk = id >> kChunkBits;
+    if (id == 0 || chunk >= kMaxChunks) {
+      return nullptr;
+    }
+    const std::byte *base = published_[chunk].load(std::memory_order_acquire);
+    if (base == nullptr) {
+      return nullptr;
+    }
+    const uint32_t offset = id & ((1u << kChunkBits) - 1);
+    return base + static_cast<size_t>(offset) * stride_;
+  }
+  [[nodiscard, gnu::always_inline]] inline std::byte *Base(Id id) noexcept {
+    return const_cast<std::byte *>(std::as_const(*this).Base(id));
+  }
 
   const size_t record_size_;
   const size_t stride_;
@@ -93,7 +115,7 @@ class RecordArena {
   // Chunk storage is stable: push_back moves the unique_ptr, never the bytes.
   std::vector<Chunk> chunks_;
   // Published chunk bases, so a reader reaches one with an acquire load.
-  std::unique_ptr<std::atomic<const std::byte *>[]> published_;
+  bess::utils::DpdkArray<std::atomic<const std::byte *>> published_;
   // Free ids are a LIFO list threaded through each record's first bytes.
   Id free_head_ = 0;
   size_t free_count_ = 0;
