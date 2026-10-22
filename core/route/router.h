@@ -278,9 +278,10 @@ struct NextHopGroup {
 // other's ids. A route or group that names a bound id references
 // "<name>/neighbors", so the engine refuses to unbind it while it is named.
 // Which resource a new value references is decided from the bindings as the
-// transaction has them so far: list a binding before the routes that name it
-// (desired-state convergence orders upserts by rank, which does). Without a
-// NeighborBindingPolicy the resource exists and binds nothing.
+// transaction has them: the engine reserves the referenced resources (next
+// hops, neighbors) before the routes and groups that name them, so a route
+// listed before the binding it names in one request still finds it. Without
+// a NeighborBindingPolicy the resource exists and binds nothing.
 class Router {
  public:
   // The address families a router serves and how each domain's table of each
@@ -290,14 +291,16 @@ class Router {
   // anywhere: its route writes are refused (kFamilyDisabled) and its lookups
   // miss. `ipv6->max_value` is the router's own (max_next_hops + max_groups,
   // the largest route value), whatever the caller sets, so the IPv6 entry
-  // size follows from the router's capacity.
+  // size follows from the router's capacity. A Config with neither family is
+  // a next-hop-only router: no FIB in any domain, every route write refused,
+  // next hops (static and bound) resolved by id as usual.
   struct Config {
     std::optional<LpmRouteTable::Config> ipv4;
     std::optional<Ipv6RouteTable::Config> ipv6;
   };
 
   // `config` sizes the default domain's FIBs and those created on demand;
-  // CreateDomain() takes the others'. kFamilyDisabled for neither family.
+  // CreateDomain() takes the others'.
   // `max_domains` (1..kMaxRouteDomains) bounds the domain ids: 0..max_domains-1.
   // `max_groups` bounds the next-hop group ids: 1..max_groups (0: none);
   // max_next_hops + max_groups must fit a route value (24 bits).

@@ -35,7 +35,9 @@
 //     egress port). This is the classifier's decision and the module executes
 //     it. A graph that writes no id fails closed: every packet is dropped,
 //     and the resume hook says so once, because a guessed gate is worse than
-//     a drop.
+//     a drop. This mode has no FIB: it allocates none, refuses the FIB
+//     sizing fields and every route write, and forwards IPv4 and IPv6 alike,
+//     decrementing each packet's TTL or hop limit by its own family.
 //
 //  2. ROUTE_MODE_DESTINATION. The module decides, the way the router
 //     appliance does (examples/appliances/router) and with the same library
@@ -57,12 +59,14 @@
 //     counted. The `next_hop_id` attribute is ignored in this mode, even if
 //     some module writes it.
 //
-// Address families (D-180). RouterArg enables IPv4 and IPv6 independently,
-// each with its own route and tbl8 capacity; at least one is enabled. A
-// disabled family has no FIB in any domain, and in both modes its frames are
-// dropped and counted (family_disabled_frames), its routes, interface
-// addresses and neighbor bindings are refused, and its neighbor protocol (ARP
-// or ND) is not read.
+// Address families (D-180). In destination mode, RouterArg enables IPv4 and
+// IPv6 independently, each with its own route and tbl8 capacity; at least one
+// is enabled. A disabled family has no FIB in any domain: its frames are
+// dropped and counted (family_disabled_frames), and its routes, interface
+// addresses and neighbor bindings are refused. The next-hop-id mode has no
+// family setting: it holds no FIB, forwards both families, and takes
+// interface addresses and bindings of either. In both modes the neighbor
+// protocols read (ARP, ND) are those of the configured interface addresses.
 //
 // Both modes drop a packet whose hop is unknown, or whose neighbor is not
 // resolved: what to do toward an unresolved neighbor (queue, punt, drop) is
@@ -243,11 +247,6 @@ class Router final : public Module {
   // The gate a counted, unforwarded verdict sends its frame to (D-162,
   // D-178): the miss, unresolved or local punt gate, else DROP_GATE.
   gate_idx_t PuntGateOf(bess::route::ForwardVerdict verdict) const;
-  // Whether `family` is one this router routes (D-180).
-  bool FamilyEnabled(bess::route::L3Family family) const noexcept {
-    return family == bess::route::L3Family::kIpv6 ? router_->has_ipv6()
-                                                  : router_->has_ipv4();
-  }
   // Whether the frame's IPv4 or IPv6 header lies in its first segment, so it
   // can be written in place.
   static bool HeaderFits(bess::PacketRef pkt, bess::route::L3Family family,
@@ -303,6 +302,10 @@ class Router final : public Module {
   std::string ingress_interface_attr_name_;
   // Fixed after Init, so workers read it without a lock.
   std::unordered_map<uint32_t, gate_idx_t> resolver_gates_;
+  // Which neighbor protocols the resolver reads: those of the configured
+  // interface addresses (ARP for IPv4, ND for IPv6). Fixed after Init.
+  bool arp_input_ = false;
+  bool nd_input_ = false;
   std::vector<std::pair<bess::route::NextHopId, bess::route::NextHop>>
       pending_neighbor_updates_;
   // When the last publication warning was given (maintenance ticks).
@@ -347,7 +350,8 @@ class Router final : public Module {
   // A route said the destination is this node's address (D-178): delivery, not
   // a drop and not a miss.
   std::atomic<uint64_t> local_frames_{0};
-  // An IP frame of a family the router does not enable (D-180).
+  // An IP frame of a family a destination-mode router does not enable
+  // (D-180).
   std::atomic<uint64_t> family_disabled_frames_{0};
   // An IPv6 frame of link scope (D-180): never forwarded.
   std::atomic<uint64_t> link_scope_frames_{0};

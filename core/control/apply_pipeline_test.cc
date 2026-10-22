@@ -1685,6 +1685,7 @@ PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids,
                                      const std::vector<uint32_t> &bound_ids = {1},
                                      bool route = true) {
   bess::pb::RouterArg arg;
+  arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);  // routes need a FIB (D-180)
   arg.set_max_ipv4_routes(16);
   auto *interface = arg.add_interfaces();
   interface->set_id(2);
@@ -1964,8 +1965,6 @@ const std::map<std::string, std::string> &InitArgs() {
       {"RoundRobin", R"({"gates": [0]})"},
       {"RandomSplit", R"({"drop_rate": 0, "gates": [0]})"},
       {"Replicate", R"({"gates": [0]})"},
-      // A Router routes at least one address family (D-180).
-      {"Router", R"({"max_ipv4_routes": 16})"},
   };
   return args;
 }

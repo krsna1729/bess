@@ -32,9 +32,6 @@ void ReserveOneMore(std::vector<T> &v) {
 std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     std::string name, const Config &config, size_t max_next_hops,
     rcu::RcuDomain &domain, size_t max_domains, size_t max_groups) {
-  if (!config.ipv4 && !config.ipv6) {
-    return std::unexpected(RouteError::kFamilyDisabled);
-  }
   if (max_next_hops == 0 || max_next_hops > LpmRouteTable::kMaxValue ||
       max_groups > LpmRouteTable::kMaxValue - max_next_hops) {
     return std::unexpected(RouteError::kValueOutOfRange);
@@ -213,6 +210,11 @@ class Router::RouteResource final : public dataplane::Resource {
 
   std::expected<Reservation, std::string> Reserve(
       const dataplane::Op &op) override {
+    if (!router_.has_ipv4() && !router_.has_ipv6()) {
+      // A next-hop-only router (Config with no family): no FIB at all.
+      return std::unexpected("this router has no FIB (no address family is "
+                             "configured): it holds next hops, not routes");
+    }
     if (const auto id6 = Decode6(op.key)) {
       if (!router_.has_ipv6()) {
         return std::unexpected(RouteErrorName(RouteError::kFamilyDisabled));

@@ -465,14 +465,13 @@ std::vector<std::string> MSession(Build &b) {
         R"({"attr_name": "next_hop_id", "value_offset": 4, "num_bytes": 4,)"
         R"( "reference": "rt/next_hops", "reference_key": "BE32"}]})");
   b.Mod("Meter", "mt", R"({"capacity": 64})");
-  b.Mod("Router", "rt", R"({"max_ipv4_routes": 64, "max_ipv4_tbl8s": 16, "max_next_hops": 64})");
+  // The next-hop-id mode: no FIB, no routes (D-180).
+  b.Mod("Router", "rt", R"({"max_next_hops": 64})");
   b.Entry("mt/meters", "MeterIdKey", R"({"id": 1})", "MeterPolicyValue",
           R"({"tr_tcm": {"committed_rate": "1000000000000", "committed_burst": "1000000000",)"
           R"( "peak_rate": "1000000000000", "peak_burst": "1000000000"}})");
   b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 1})", "RouterNextHopValue",
           R"({"egress_gate": 0})");
-  b.Entry("rt/routes", "RouterRouteKey", R"({"ipv4": "11.0.0.0", "prefix_length": 8})",
-          "RouterRouteValue", R"({"next_hop_id": 1})");
   for (int i = 0; i < kFlows; i++) {
     b.Entry("em/rules", "ExactMatchRuleKey",
             R"({"fields": [{"value_bin": ")" + Base64(Be32(0x0a000001 + i)) + R"("}]})",

@@ -245,8 +245,7 @@ TEST_F(StatefulModulesTest, SessionTransactionsWhileTrafficRuns) {
                                   {"attr_name": "next_hop_id", "value_offset": 4, "num_bytes": 4,
                                    "reference": "rt/next_hops", "reference_key": "BE32"}]})");
   auto mt_arg = types_.Make("bess.pb.MeterArg", R"({"capacity": 64})");
-  auto rt_arg = types_.Make("bess.pb.RouterArg",
-                            R"({"max_ipv4_routes": 64, "max_ipv4_tbl8s": 16, "max_next_hops": 64})");
+  auto rt_arg = types_.Make("bess.pb.RouterArg", R"({"max_next_hops": 64})");
   Apply(bess::sdk::PipelineBuilder()
             .Worker(0, 0, "")
             .Module("src", "Source", src_arg.get())

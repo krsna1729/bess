@@ -1524,9 +1524,35 @@ TEST_F(RouterFamilyTest, Ipv4Only) { Check(true, false); }
 TEST_F(RouterFamilyTest, Ipv6Only) { Check(false, true); }
 TEST_F(RouterFamilyTest, DualStack) { Check(true, true); }
 
-TEST_F(RouterFamilyTest, ARouterServesAtLeastOneFamily) {
-  EXPECT_EQ(RouteError::kFamilyDisabled,
-            Router::Create("none", {}, 8, bess::runtime::runtime().rcu()).error());
+// A router with neither family is a next-hop-only router: no FIB in any
+// domain, next hops resolved by id, and every route write refused.
+TEST_F(RouterFamilyTest, ARouterWithNoFamilyHoldsNextHopsAndNoFib) {
+  TransactionEngine engine{bess::runtime::runtime().rcu()};
+  auto made = Router::Create("none", {}, 8, bess::runtime::runtime().rcu());
+  ASSERT_TRUE(made) << RouteErrorName(made.error());
+  Router &router = **made;
+  EXPECT_FALSE(router.has_ipv4());
+  EXPECT_FALSE(router.has_ipv6());
+  EXPECT_EQ(0u, router.fib_counts().ipv4);
+  EXPECT_EQ(0u, router.fib_counts().ipv6);
+  ASSERT_TRUE(router.Enroll(engine.registry()));
+  const Op hop = router.SetNextHopOp(NextHopId(1), Hop(1));
+  ASSERT_EQ(engine.Apply(std::span(&hop, 1)).outcome, Outcome::kApplied);
+  EXPECT_NE(nullptr, router.LookupNextHop(NextHopId(1)));
+  for (const Op &route : {router.SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                            NextHopId(1)),
+                          router.SetRouteOp(kDefaultRouteDomainId, P6("2001:db8::", 32),
+                                            NextHopId(1))}) {
+    const auto r = engine.Apply(std::span(&route, 1));
+    ASSERT_EQ(r.outcome, Outcome::kRejected);
+    EXPECT_NE(r.ops[0].error.find("no FIB"), std::string::npos) << r.ops[0].error;
+  }
+  EXPECT_EQ(0u, router.fib_counts().ipv4 + router.fib_counts().ipv6);
+  EXPECT_EQ(router.Resolve(Ip(10, 1, 2, 3)), nullptr);
+  const Op erase = router.RemoveNextHopOp(NextHopId(1));
+  ASSERT_EQ(engine.Apply(std::span(&erase, 1)).outcome, Outcome::kApplied);
+  while (engine.ReclaimRetired() != 0) {
+  }
 }
 
 // The router sizes its IPv6 entries from its own capacity: a small router's

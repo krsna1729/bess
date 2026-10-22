@@ -7,7 +7,8 @@
 #
 # and everything dynamic is in the modules' tables, not in the graph: the
 # resources below are one transaction that creates the session's meter, next
-# hop, route and the ExactMatch rule whose result names both.
+# hop and the ExactMatch rule whose result names both. The Router forwards on
+# the next-hop id the rule writes; in that mode it has no FIB (D-180).
 #
 # Converted from session_pipeline.bess (D-104). Rewrite templates are the packets it
 # built with scapy.
@@ -44,8 +45,6 @@ modules:
   - name: rt
     mclass: Router
     arg:
-      max_ipv4_routes: "64"
-      max_ipv4_tbl8s: "16"
       max_next_hops: "64"
   - name: sink0
     mclass: Sink
@@ -74,9 +73,6 @@ resources:
   rt/next_hops:
     - key: {id: 1}
       value: {egress_gate: 1}
-  rt/routes:
-    - key: {ipv4: 10.0.0.0, prefix_length: 8}
-      value: {next_hop_id: 1}
   # The session: TCP from 10.1.2.3 port 1234. Its 8-byte result names meter 1
   # and next hop 1, big-endian.
   em/rules:

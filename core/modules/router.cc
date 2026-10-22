@@ -283,76 +283,94 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // unknown value (an arg from a newer binary) keeps that default too.
   flow_fields_ = arg.flow_hash() == bess::pb::FLOW_HASH_L3 ? route::FlowHashFields::kL3
                                                            : route::FlowHashFields::kL3L4;
-  // Address families (D-180): a family is enabled exactly when its route
-  // capacity is set, and sized independently of the other. A disabled family
-  // has no FIB in any domain, so it costs nothing.
-  std::string family_error;
-  auto capacity = [&family_error](bool has_routes, uint64_t routes, bool has_tbl8s,
-                                   uint64_t tbl8s, uint64_t default_tbl8s,
-                                   const char *family)
-      -> std::optional<std::pair<uint32_t, uint32_t>> {
-    if (!has_routes) {
-      if (has_tbl8s) {
-        family_error = bess::utils::Format(
-            "max_%s_tbl8s needs max_%s_routes (unset routes disable %s)", family,
-            family, family);
-      }
-      return std::nullopt;
-    }
-    if (routes == 0 || (has_tbl8s && tbl8s == 0)) {
-      family_error = bess::utils::Format(
-          "max_%s_routes and max_%s_tbl8s must be nonzero (leave max_%s_routes "
-          "unset to disable %s)",
-          family, family, family, family);
-      return std::nullopt;
-    }
-    const uint64_t groups = has_tbl8s ? tbl8s : default_tbl8s;
-    if (routes > std::numeric_limits<uint32_t>::max() ||
-        groups > std::numeric_limits<uint32_t>::max()) {
-      family_error = bess::utils::Format("%s capacity exceeds backend limits", family);
-      return std::nullopt;
-    }
-    return std::make_pair(static_cast<uint32_t>(routes), static_cast<uint32_t>(groups));
-  };
-  const auto ipv4 = capacity(arg.has_max_ipv4_routes(), arg.max_ipv4_routes(),
-                             arg.has_max_ipv4_tbl8s(), arg.max_ipv4_tbl8s(),
-                             kDefaultIpv4Tbl8s, "ipv4");
-  const auto ipv6 = capacity(arg.has_max_ipv6_routes(), arg.max_ipv6_routes(),
-                             arg.has_max_ipv6_tbl8s(), arg.max_ipv6_tbl8s(),
-                             kDefaultIpv6Tbl8s, "ipv6");
-  if (!family_error.empty()) {
-    return CommandFailure(EINVAL, "%s", family_error.c_str());
-  }
-  if (!ipv4 && !ipv6) {
-    return CommandFailure(EINVAL,
-                          "no address family is enabled: set max_ipv4_routes, "
-                          "max_ipv6_routes or both");
-  }
+  // Address families (D-180). A next-hop-id router has no FIB: it forwards
+  // what the id names, of either family, so it takes no family setting and
+  // refuses the fields that would size a FIB it never consults.
   route::Router::Config config;
-  if (ipv4) {
-    route::LpmRouteTable::Config table;
-    table.max_routes = ipv4->first;
-    table.tbl8_groups = ipv4->second;
-    switch (arg.backend()) {
-      case bess::pb::ROUTE_BACKEND_LPM:
-        table.backend = route::RouteBackend::kRteLpm;
-        break;
-      case bess::pb::ROUTE_BACKEND_FIB:
-        table.backend = route::RouteBackend::kRteFib;
-        break;
-      default:
-        return CommandFailure(EINVAL, "unknown route backend %d", arg.backend());
+  if (!routes_by_destination()) {
+    if (arg.has_max_ipv4_routes() || arg.has_max_ipv4_tbl8s() ||
+        arg.has_max_ipv6_routes() || arg.has_max_ipv6_tbl8s()) {
+      return CommandFailure(EINVAL,
+                            "max_ipv4_routes, max_ipv4_tbl8s, max_ipv6_routes and "
+                            "max_ipv6_tbl8s size the FIBs of ROUTE_MODE_DESTINATION; "
+                            "a ROUTE_MODE_NEXT_HOP_ID router has no FIB");
     }
-    config.ipv4 = table;
-  } else if (arg.backend() != bess::pb::ROUTE_BACKEND_LPM) {
-    return CommandFailure(EINVAL,
-                          "backend selects the IPv4 table, and IPv4 is not enabled");
-  }
-  if (ipv6) {
-    route::Ipv6RouteTable::Config table;
-    table.max_routes = ipv6->first;
-    table.tbl8_groups = ipv6->second;
-    config.ipv6 = table;
+    if (arg.backend() != bess::pb::ROUTE_BACKEND_LPM) {
+      return CommandFailure(EINVAL,
+                            "backend selects the IPv4 FIB of ROUTE_MODE_DESTINATION; "
+                            "a ROUTE_MODE_NEXT_HOP_ID router has no FIB");
+    }
+  } else {
+    // A family is enabled exactly when its route capacity is set, and sized
+    // independently of the other. A disabled family has no FIB in any
+    // domain, so it costs nothing.
+    std::string family_error;
+    auto capacity = [&family_error](bool has_routes, uint64_t routes, bool has_tbl8s,
+                                     uint64_t tbl8s, uint64_t default_tbl8s,
+                                     const char *family)
+        -> std::optional<std::pair<uint32_t, uint32_t>> {
+      if (!has_routes) {
+        if (has_tbl8s) {
+          family_error = bess::utils::Format(
+              "max_%s_tbl8s needs max_%s_routes (unset routes disable %s)", family,
+              family, family);
+        }
+        return std::nullopt;
+      }
+      if (routes == 0 || (has_tbl8s && tbl8s == 0)) {
+        family_error = bess::utils::Format(
+            "max_%s_routes and max_%s_tbl8s must be nonzero (leave max_%s_routes "
+            "unset to disable %s)",
+            family, family, family, family);
+        return std::nullopt;
+      }
+      const uint64_t groups = has_tbl8s ? tbl8s : default_tbl8s;
+      if (routes > std::numeric_limits<uint32_t>::max() ||
+          groups > std::numeric_limits<uint32_t>::max()) {
+        family_error = bess::utils::Format("%s capacity exceeds backend limits", family);
+        return std::nullopt;
+      }
+      return std::make_pair(static_cast<uint32_t>(routes), static_cast<uint32_t>(groups));
+    };
+    const auto ipv4 = capacity(arg.has_max_ipv4_routes(), arg.max_ipv4_routes(),
+                               arg.has_max_ipv4_tbl8s(), arg.max_ipv4_tbl8s(),
+                               kDefaultIpv4Tbl8s, "ipv4");
+    const auto ipv6 = capacity(arg.has_max_ipv6_routes(), arg.max_ipv6_routes(),
+                               arg.has_max_ipv6_tbl8s(), arg.max_ipv6_tbl8s(),
+                               kDefaultIpv6Tbl8s, "ipv6");
+    if (!family_error.empty()) {
+      return CommandFailure(EINVAL, "%s", family_error.c_str());
+    }
+    if (!ipv4 && !ipv6) {
+      return CommandFailure(EINVAL,
+                            "no address family is enabled: ROUTE_MODE_DESTINATION "
+                            "needs max_ipv4_routes, max_ipv6_routes or both");
+    }
+    if (ipv4) {
+      route::LpmRouteTable::Config table;
+      table.max_routes = ipv4->first;
+      table.tbl8_groups = ipv4->second;
+      switch (arg.backend()) {
+        case bess::pb::ROUTE_BACKEND_LPM:
+          table.backend = route::RouteBackend::kRteLpm;
+          break;
+        case bess::pb::ROUTE_BACKEND_FIB:
+          table.backend = route::RouteBackend::kRteFib;
+          break;
+        default:
+          return CommandFailure(EINVAL, "unknown route backend %d", arg.backend());
+      }
+      config.ipv4 = table;
+    } else if (arg.backend() != bess::pb::ROUTE_BACKEND_LPM) {
+      return CommandFailure(EINVAL,
+                            "backend selects the IPv4 table, and IPv4 is not enabled");
+    }
+    if (ipv6) {
+      route::Ipv6RouteTable::Config table;
+      table.max_routes = ipv6->first;
+      table.tbl8_groups = ipv6->second;
+      config.ipv6 = table;
+    }
   }
   const size_t max_next_hops =
       arg.max_next_hops() ? static_cast<size_t>(arg.max_next_hops()) : 4096;
@@ -516,12 +534,16 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                                 address.error().c_str());
         }
         const bool v4 = address->address.is_ipv4();
-        if (v4 ? !router_->has_ipv4() : !router_->has_ipv6()) {
+        // Destination mode routes only its enabled families (D-180); the
+        // next-hop-id mode forwards both, so it takes addresses of either.
+        if (routes_by_destination() &&
+            (v4 ? !router_->has_ipv4() : !router_->has_ipv6())) {
           return CommandFailure(EINVAL,
                                 "interface %u: address '%s' is of a family the "
                                 "router does not enable (set max_%s_routes)",
                                 id, text.c_str(), v4 ? "ipv4" : "ipv6");
         }
+        (v4 ? arp_input_ : nd_input_) = true;
         interface.addresses.push_back(*address);
       }
       if (interface.addresses.empty()) {
@@ -544,7 +566,8 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     policy.capacity = resolver_capacity;
     policy.validate = [this](const route::NeighborKey &key)
         -> std::expected<void, std::string> {
-      if (key.address.is_ipv4() ? !router_->has_ipv4() : !router_->has_ipv6()) {
+      if (routes_by_destination() &&
+          (key.address.is_ipv4() ? !router_->has_ipv4() : !router_->has_ipv6())) {
         return std::unexpected(key.address.is_ipv4()
                                    ? "an IPv4 neighbor on a router without IPv4"
                                    : "an IPv6 neighbor on a router without IPv6");
@@ -722,8 +745,15 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       *router_->routes_resource_object(),
       std::make_shared<bess::framework::TypedCodec<bess::pb::RouterRouteKey,
                                              bess::pb::RouterRouteValue>>(
-          [](const bess::pb::RouterRouteKey &key)
+          [destination = routes_by_destination()](const bess::pb::RouterRouteKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
+            // The next-hop-id mode holds no FIB (D-180): a route there is a
+            // configuration error, said so rather than "family disabled".
+            if (!destination) {
+              return std::unexpected(
+                  "routes are not used in ROUTE_MODE_NEXT_HOP_ID (the router "
+                  "has no FIB); route by destination with ROUTE_MODE_DESTINATION");
+            }
             if (key.domain() >= route::kMaxRouteDomains) {
               return std::unexpected("invalid route domain " +
                                      std::to_string(key.domain()));
@@ -997,13 +1027,13 @@ int Router::OnEvent(bess::Event event) {
 // cannot take the room replies need): one from a bound neighbor -- a
 // gratuitous announcement included -- moves that neighbor to the MAC it
 // carries (RFC 826's merge, NeighborResolver::OnArp). Everything else stays in
-// the batch and is routed. A family the router does not enable has no
-// neighbor protocol here (D-180): its ARP or ND frames stay in the batch like
-// any other frame of that kind.
+// the batch and is routed. A family no configured interface has an address
+// of has no neighbor protocol here (D-180): its ARP or ND frames stay in the
+// batch like any other frame of that kind.
 void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
   constexpr size_t kEth = sizeof(bess::utils::Ethernet);
-  const bool arp_input = router_->has_ipv4();
-  const bool nd_input = router_->has_ipv6();
+  const bool arp_input = arp_input_;
+  const bool nd_input = nd_input_;
   // The interface a frame arrived on is read here, with the offsets of the
   // graph that delivered it, and travels with the frame (NeighborFrame).
   const bess::metadata::mt_offset_t interface_offset =
@@ -1201,20 +1231,49 @@ CommandResponse Router::CommandGetNeighbors(const bess::pb::EmptyArg &) {
   return CommandSuccess(response);
 }
 
-// Takes up the bindings transactions published since the last tick (D-180):
-// a bound id starts resolving from now, its hop published as the resolver
-// has it (already resolved, if another binding knows the neighbor); an
-// unbound one stops, and any of its updates still pending are dropped, since
-// its key is gone. The policy checked each binding when it was reserved, so
-// Bind refuses only for a full timer wheel or table, which max_neighbors
-// sizes; such a binding stays incomplete and is logged.
+// Takes up the bindings transactions published since the last tick (D-180).
+// Only each id's final binding matters -- several transactions may have
+// changed one id since the last tick, and one transaction publishes its binds
+// before its unbinds -- so the changes are coalesced per id first. Then every
+// resolver binding that is gone or replaced is released, and only then are
+// the new ones installed: capacity a transaction freed (an unbind next to a
+// bind at max_neighbors) is free before the bind needs it. A bound id starts
+// resolving from now, its hop published as the resolver has it (already
+// resolved, if another binding knows the neighbor); an unbound one stops, and
+// any of its updates still pending are dropped, since its key is gone. The
+// policy checked each binding when it was reserved, so Bind refuses only for
+// a full timer wheel or table, which max_neighbors sizes; such a binding
+// stays incomplete and is logged.
 void Router::ApplyNeighborBindingChanges(uint64_t now) {
-  for (const route::NeighborBindingChange &change :
-       router_->TakeNeighborBindingChanges()) {
-    std::erase_if(pending_neighbor_updates_,
-                  [&change](const auto &pending) { return pending.first == change.id; });
-    if (!change.neighbor) {
+  std::vector<route::NeighborBindingChange> changes =
+      router_->TakeNeighborBindingChanges();
+  if (changes.empty()) {
+    return;
+  }
+  // Last change per id wins; stable, so equal ids keep publication order.
+  std::stable_sort(changes.begin(), changes.end(),
+                   [](const auto &a, const auto &b) { return a.id < b.id; });
+  size_t out = 0;
+  for (size_t i = 0; i < changes.size(); i++) {
+    if (out != 0 && changes[out - 1].id == changes[i].id) {
+      changes[out - 1] = changes[i];
+    } else {
+      changes[out++] = changes[i];
+    }
+  }
+  changes.resize(out);
+  std::erase_if(pending_neighbor_updates_, [&changes](const auto &pending) {
+    return std::binary_search(
+        changes.begin(), changes.end(), route::NeighborBindingChange{pending.first, {}},
+        [](const auto &a, const auto &b) { return a.id < b.id; });
+  });
+  for (const route::NeighborBindingChange &change : changes) {
+    if (neighbor_resolver_->BindingOf(change.id) != change.neighbor) {
       neighbor_resolver_->Unbind(change.id);
+    }
+  }
+  for (const route::NeighborBindingChange &change : changes) {
+    if (!change.neighbor) {
       continue;
     }
     auto hop = neighbor_resolver_->Bind(change.id, *change.neighbor, now);
@@ -1386,8 +1445,9 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     // the hop names both (route::WriteForwarded). A frame that is not IP has
     // no hop count to decrement: it keeps what it arrived with and, as
     // before, still gets the hop's addresses. A header the parser cannot read
-    // is dropped and counted, never forwarded, and so is a frame of a family
-    // the router does not enable (D-180).
+    // is dropped and counted, never forwarded. Both families are forwarded:
+    // this mode has no FIB and so no family setting (D-180), and the hop
+    // count written is the packet's own family's.
     bess::conntrack::ParsedFlowPacket parsed;
     const bess::conntrack::ParseStatus status = bess::conntrack::ParseFrame(
         std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), parsed,
@@ -1408,11 +1468,6 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     const route::L3Family family = parsed.l3 == bess::conntrack::L3Kind::kIpv6
                                        ? route::L3Family::kIpv6
                                        : route::L3Family::kIpv4;
-    if (ip && !FamilyEnabled(family)) {
-      gates[i] = DROP_GATE;
-      family_disabled_frames_.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
     bess::PacketHandle handle = pkt.handle();
     if (!bess::packet::EnsureWritable(handle)) {
       gates[i] = DROP_GATE;
@@ -1650,22 +1705,21 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
 }
 
 std::string Router::GetDesc() const {
-  // Which families the router routes (D-180): the other family's frames are
-  // dropped and counted as family disabled.
-  const char *families = router_->has_ipv4() && router_->has_ipv6() ? "IPv4+IPv6"
-                         : router_->has_ipv4()                     ? "IPv4"
-                                                                   : "IPv6";
   std::string desc;
   if (!routes_by_destination()) {
+    // No FIB and no family setting (D-180): both families are forwarded.
     desc = bess::utils::Format(
-        "%s, %zu routes, %zu next hops, %zu groups, %zu header write failures, "
-        "%zu local, %zu family disabled, next-hop id from metadata",
-        families, router_->route_count(), router_->next_hop_count(),
-        router_->next_hop_group_count(),
-        static_cast<size_t>(header_write_failures()),
+        "%zu next hops, %zu header write failures, %zu local, ttl expired: %zu, "
+        "next-hop id from metadata (no FIB)",
+        router_->next_hop_count(), static_cast<size_t>(header_write_failures()),
         static_cast<size_t>(local_frames()),
-        static_cast<size_t>(family_disabled_frames()));
+        static_cast<size_t>(ttl_expired_frames()));
   } else {
+    // Which families the router routes (D-180): the other family's frames
+    // are dropped and counted as family disabled.
+    const char *families = router_->has_ipv4() && router_->has_ipv6() ? "IPv4+IPv6"
+                           : router_->has_ipv4()                     ? "IPv4"
+                                                                     : "IPv6";
     desc = bess::utils::Format(
         "%s, %zu routes, %zu next hops, %zu groups, %zu header write failures, "
         "routing by destination (not ip: %zu, family disabled: %zu, malformed: %zu, "

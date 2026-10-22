@@ -162,6 +162,9 @@ std::vector<ModuleCase> ParityCases() {
     ModuleCase c;
     c.mclass = "Router";
     auto arg = Msg<pb::RouterArg>();
+    // Destination mode: routes need a FIB, which the next-hop-id mode has
+    // none of (D-180).
+    arg->set_mode(pb::ROUTE_MODE_DESTINATION);
     arg->set_max_ipv4_routes(64);
     arg->set_max_next_hops(16);
     arg->set_max_groups(8);
