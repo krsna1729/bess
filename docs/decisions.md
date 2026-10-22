@@ -10708,7 +10708,7 @@ for a millisecond and has the test thread take the control lock 200 times, findi
 the lock is held across the call. `MaintenanceLoopTest.ATicksEventsReachTheLog` reads a tick's event, with its
 type, source and fields, from the daemon's log. Fast build: suite 214/214.
 
-**Amended 2026-10-22 (D-179).** A module that turns configured time into ticks needs to know what a tick is.
+**Amended 2026-10-22 (D-180).** A module that turns configured time into ticks needs to know what a tick is.
 `TickHub` now exposes `interval()` (the loop's interval; zero when `--maintenance_interval_us=0` disables the
 loop, so no endpoint is ever called) and `current_tick()` (the tick count of the latest run, the clock a module
 started in `Init` should start at). `set_interval()` is the loop's, called as it starts, and for tests standing
@@ -12334,7 +12334,8 @@ result field is no longer an error at resume: nothing reads it, so nothing is wr
 
 **Revisit when:** a consumer needs a result field's absence to be an error (then a per-field required flag),
 or the metadata pass gains per-path offsets.
-## D-179 The Router routes IPv6 by destination and resolves its own neighbors
+
+## D-180 The Router routes IPv6 by destination and resolves its own neighbors
 
 **Status:** accepted (2026-10-22; updated 2026-10-23). **Code:** `core/route/route_table.{h,cc}`
 (`Ipv6RouteTable` on rte_fib6, `Ipv6Prefix`), `core/route/router.{h,cc}` (per-family tables, `RouteResource` IPv6

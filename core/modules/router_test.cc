@@ -120,7 +120,7 @@ std::string MacString(const std::array<uint8_t, 6> &mac) {
 }
 
 // A router argument with both address families enabled and small FIBs
-// (D-179): RouterArg enables a family only when its route capacity is set.
+// (D-180): RouterArg enables a family only when its route capacity is set.
 bess::pb::RouterArg DualStackArg() {
   bess::pb::RouterArg arg;
   arg.set_max_ipv4_routes(64);
@@ -818,7 +818,7 @@ TEST_F(RouterTest, TheSelectorAttributesAreConfiguration) {
   arg.set_next_hop_attr("nh_id");
   arg.set_domain_attr("vrf");
   // Each mode declares the attribute it reads, under its configured name, and
-  // not the other mode's (D-179): a declared read is a requirement on every
+  // not the other mode's (D-180): a declared read is a requirement on every
   // path into the module.
   const auto reads = [](const Router *rt) {
     std::vector<std::string> names;
@@ -1638,7 +1638,7 @@ TEST_F(RouterTest, LinkScopedIpv6WithoutALocalGateIsDroppedAndCounted) {
   EXPECT_NE(std::string::npos, rt->GetDesc().find("link scope: 1")) << rt->GetDesc();
 }
 
-// -- address families (D-179) -------------------------------------------------
+// -- address families (D-180) -------------------------------------------------
 
 // A destination-mode router with only the families whose route capacity is
 // set: IPv4 when `ipv4`, IPv6 when `ipv6`.

@@ -1727,7 +1727,7 @@ PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids,
   return spec;
 }
 
-// Neighbor bindings are desired state of their own (D-179): a manifest lists
+// Neighbor bindings are desired state of their own (D-180): a manifest lists
 // them in rt/neighbors and the routes that name them in rt/routes, in any
 // order. The bound hops are not rt/next_hops entries, so a static list
 // neither erases nor reports them, and one that names a bound id is refused.
@@ -1964,7 +1964,7 @@ const std::map<std::string, std::string> &InitArgs() {
       {"RoundRobin", R"({"gates": [0]})"},
       {"RandomSplit", R"({"drop_rate": 0, "gates": [0]})"},
       {"Replicate", R"({"gates": [0]})"},
-      // A Router routes at least one address family (D-179).
+      // A Router routes at least one address family (D-180).
       {"Router", R"({"max_ipv4_routes": 16})"},
   };
   return args;

@@ -80,7 +80,7 @@ running daemon in the test suite.
   `bessctl/conf/samples/vrf_routing.yaml` (one Router, one FIB per route
   domain, a Vif writing the domain) is the VRF shape the two IPLookups in
   that sample used to have.
-- **`RouterArg` sizes each address family on its own** (D-179).
+- **`RouterArg` sizes each address family on its own** (D-180).
   `max_routes` and `max_tbl8s` are removed: `max_ipv4_routes`/`max_ipv4_tbl8s`
   and `max_ipv6_routes`/`max_ipv6_tbl8s` replace them, a family is enabled
   exactly when its route capacity is set, and a Router with neither is

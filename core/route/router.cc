@@ -570,7 +570,7 @@ class Router::NextHopResource final
   Router &router_;
 };
 
-// "<router>/neighbors" (D-179): next-hop id -> NeighborKey, the hops a
+// "<router>/neighbors" (D-180): next-hop id -> NeighborKey, the hops a
 // resolver owns. Binding publishes the id's next hop in the shared slot table
 // -- egress the neighbor's interface, incomplete -- and records the change for
 // the owner (TakeNeighborBindingChanges); a NeighborManagedNextHop upsert on a
@@ -884,7 +884,7 @@ std::expected<void, std::string> Router::Enroll(
   // set, and so is the groups resource whether or not max_groups is: the
   // control plane refuses a class that registers fewer tables than it
   // declares (CheckDeclaredResources), and the Router module declares all
-  // four (D-156, D-179). Without its policy or bound it holds nothing.
+  // four (D-156, D-180). Without its policy or bound it holds nothing.
   auto neighbors = std::make_unique<NeighborResource>(*this);
   auto groups = std::make_unique<GroupResource>(*this);
   auto routes = std::make_unique<RouteResource>(*this);
