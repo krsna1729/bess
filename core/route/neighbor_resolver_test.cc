@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <new>
 #include <optional>
@@ -54,9 +55,14 @@ Ethernet::Address Mac(const char *text) {
   return mac;
 }
 
+// An interface with one IPv4 address in a /24 (none when `address` is 0).
 NeighborResolver::Interface Iface(InterfaceId id, const char *mac,
                                   uint32_t address) {
-  return NeighborResolver::Interface{id, Mac(mac), address, {}};
+  NeighborResolver::Interface iface{id, Mac(mac), {}};
+  if (address != 0) {
+    iface.addresses.push_back({NeighborAddress::Ipv4(address), 24});
+  }
+  return iface;
 }
 
 Ipv6Address Ipv6(const char *text) {
@@ -71,9 +77,15 @@ NdMessage Nd(std::optional<NdMessage> message) {
       NdMessage{NdType::kNeighborSolicitation});
 }
 
+// An interface with one IPv6 address in a /64 (none for "::").
 NeighborResolver::Interface Iface6(InterfaceId id, const char *mac,
                                    const char *ipv6) {
-  return NeighborResolver::Interface{id, Mac(mac), 0, Ipv6(ipv6)};
+  NeighborResolver::Interface iface{id, Mac(mac), {}};
+  const Ipv6Address address = Ipv6(ipv6);
+  if (!address.IsUnspecified()) {
+    iface.addresses.push_back({NeighborAddress::Ipv6(address), 64});
+  }
+  return iface;
 }
 
 NeighborResolver::Key Key(InterfaceId id, uint32_t address) {
@@ -1848,6 +1860,171 @@ TEST(NeighborResolverTest, AnswerArpRequestRewritesARequestForMyAddressOnly) {
   // A reply is not answered again.
   EXPECT_FALSE(AnswerArpRequest(
       std::span<uint8_t>(frame.data(), frame.size()), me, be32_t(kMyIp)));
+}
+
+// -- ARP merge (RFC 826), broadcast replies --------------------------------------
+
+// A gratuitous ARP from a bound neighbor moves it to the MAC it announces at
+// once, and has it reconfirmed; the same announcement again changes nothing,
+// and one from an address nobody bound creates nothing.
+TEST(NeighborResolverTest, GratuitousArpMovesABoundNeighborAndNeverCreatesOne) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01", kMyIp), 0)
+                  .has_value());
+  const NeighborResolver::Key key = Key(kIface1, kPeer1);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  ASSERT_EQ(1u, resolver
+                    ->OnArp(10, kIface1,
+                            ReplyTo(progress.solicitations[0].frame,
+                                    Mac("02:00:00:00:00:aa")))
+                    .updates.size());
+
+  std::array<uint8_t, kArpFrameSize> announce{};
+  ASSERT_EQ(kArpFrameSize, BuildArpRequest(Mac("02:00:00:00:00:bb"), be32_t(kPeer1),
+                                           be32_t(kPeer1), announce));
+  progress = resolver->OnArp(15, kIface1, announce);
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kResolved, progress.updates[0].second.neighbor);
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), progress.updates[0].second.dst_mac);
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), State(*resolver, key).mac);
+
+  // Reconfirmed on the next Poll, keeping the new MAC meanwhile.
+  progress = resolver->Poll(15, 16);
+  EXPECT_TRUE(progress.updates.empty());
+  ASSERT_EQ(1u, progress.solicitations.size());
+  const auto status = resolver->StatusOf(key);
+  ASSERT_TRUE(status.has_value());
+  EXPECT_TRUE(status->reconfirming);
+  EXPECT_EQ(1u, status->probes);
+  EXPECT_EQ(Mac("02:00:00:00:00:bb"), status->mac);
+
+  // The same announcement: nothing new.
+  EXPECT_TRUE(resolver->OnArp(16, kIface1, announce).empty());
+
+  // An announcement from an unbound address creates nothing.
+  std::array<uint8_t, kArpFrameSize> stranger{};
+  ASSERT_EQ(kArpFrameSize, BuildArpRequest(Mac("02:00:00:00:00:cc"), be32_t(kPeer2),
+                                           be32_t(kPeer2), stranger));
+  EXPECT_TRUE(resolver->OnArp(16, kIface1, stranger).empty());
+  EXPECT_FALSE(resolver->Find(Key(kIface1, kPeer2)).has_value());
+  EXPECT_FALSE(resolver->StatusOf(Key(kIface1, kPeer2)).has_value());
+}
+
+// A request a bound neighbor sends -- for any target -- says where it is: an
+// incomplete neighbor resolves on it without waiting for its own probe's
+// answer, and is then reconfirmed.
+TEST(NeighborResolverTest, ARequestFromABoundNeighborResolvesIt) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01", kMyIp), 0)
+                  .has_value());
+  const NeighborResolver::Key key = Key(kIface1, kPeer1);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  std::array<uint8_t, kArpFrameSize> request{};
+  ASSERT_EQ(kArpFrameSize, BuildArpRequest(Mac("02:00:00:00:00:aa"), be32_t(kPeer1),
+                                           be32_t(0x0a000005), request));
+  auto progress = resolver->OnArp(3, kIface1, request);
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+  EXPECT_EQ(1u, resolver->Poll(3, 16).solicitations.size()) << "reconfirmed";
+}
+
+// A broadcast reply from a bound neighbor is accepted: one naming our address
+// answers the solicitation (no reconfirmation follows), and a unicast reply
+// naming another address is still ignored.
+TEST(NeighborResolverTest, ABroadcastReplyFromABoundNeighborIsAccepted) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01", kMyIp), 0)
+                  .has_value());
+  const NeighborResolver::Key key = Key(kIface1, kPeer1);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  auto reply = ReplyTo(progress.solicitations[0].frame, Mac("02:00:00:00:00:aa"));
+  reinterpret_cast<Ethernet *>(reply.data())->dst_addr = Mac("ff:ff:ff:ff:ff:ff");
+  ASSERT_EQ(1u, resolver->OnArp(10, kIface1, reply).updates.size());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+  EXPECT_TRUE(resolver->Poll(11, 16).empty()) << "an answer, not a merge";
+
+  auto elsewhere = ReplyTo(progress.solicitations[0].frame, Mac("02:00:00:00:00:bb"));
+  reinterpret_cast<Arp *>(elsewhere.data() + sizeof(Ethernet))->target_ip_addr =
+      be32_t(0x0a000008);
+  EXPECT_TRUE(resolver->OnArp(12, kIface1, elsewhere).empty());
+  EXPECT_EQ(Mac("02:00:00:00:00:aa"), State(*resolver, key).mac);
+}
+
+// -- interface addresses ----------------------------------------------------------
+
+// An interface holds any number of addresses of both families. A solicitation
+// leaves from the address whose prefix holds the neighbor, else from the first
+// address of the neighbor's family; a reply to any of them is an answer.
+TEST(NeighborResolverTest, ASolicitationLeavesFromTheAddressOnTheNeighborsPrefix) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  NeighborResolver::Interface iface{kIface1, Mac("02:00:00:00:00:01"), {}};
+  iface.addresses.push_back({NeighborAddress::Ipv4(kMyIp), 24});       // 10.0.0.1/24
+  iface.addresses.push_back({NeighborAddress::Ipv4(0xc0000201), 24});  // 192.0.2.1/24
+  iface.addresses.push_back({NeighborAddress::Ipv6(Ipv6("2001:db8::1")), 64});
+  iface.addresses.push_back({NeighborAddress::Ipv6(Ipv6("fe80::1")), 64});
+  ASSERT_TRUE(resolver->ConfigureInterface(iface, 0).has_value());
+
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), Key(kIface1, 0xc0000207), 0).has_value());
+  ASSERT_TRUE(resolver->Bind(NextHopId(2), Key(kIface1, 0xc6336401), 0).has_value());
+  ASSERT_TRUE(resolver
+                  ->Bind(NextHopId(3), NeighborResolver::Key(kIface1, Ipv6("fe80::2")), 0)
+                  .has_value());
+  ASSERT_TRUE(
+      resolver
+          ->Bind(NextHopId(4), NeighborResolver::Key(kIface1, Ipv6("2001:db8::2")), 0)
+          .has_value());
+  EXPECT_FALSE(resolver->Bind(NextHopId(5), Key(kIface1, 0xc0000201), 0).has_value())
+      << "any own address is not a neighbor";
+
+  const auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(4u, progress.solicitations.size());
+  std::map<uint32_t, uint32_t> arp_sources;  // target -> sender
+  std::map<std::string, std::string> nd_sources;
+  for (const auto &solicitation : progress.solicitations) {
+    const std::span<const uint8_t> frame(solicitation.frame.data(), solicitation.length);
+    if (const auto arp = ParseArp(frame)) {
+      arp_sources[arp->target_ip.value()] = arp->sender_ip.value();
+    } else {
+      const NdMessage ns = Nd(ParseNeighborDiscovery(frame));
+      nd_sources[utils::ToIpv6Address(ns.target_ip)] = utils::ToIpv6Address(ns.source_ip);
+    }
+  }
+  EXPECT_EQ(0xc0000201u, arp_sources[0xc0000207]) << "the prefix holding it";
+  EXPECT_EQ(kMyIp, arp_sources[0xc6336401]) << "no prefix holds it: the first";
+  EXPECT_EQ("fe80::1", nd_sources["fe80::2"]);
+  EXPECT_EQ("2001:db8::1", nd_sources["2001:db8::2"]);
+
+  // A reply to the second address answers its solicitation.
+  for (const auto &solicitation : progress.solicitations) {
+    const std::span<const uint8_t> frame(solicitation.frame.data(), solicitation.length);
+    const auto arp = ParseArp(frame);
+    if (arp && arp->target_ip.value() == 0xc0000207) {
+      EXPECT_EQ(1u, resolver->OnArp(11, kIface1, ReplyTo(frame, Mac("02:00:00:00:00:aa")))
+                        .updates.size());
+    }
+  }
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, Key(kIface1, 0xc0000207)).state);
+}
+
+TEST(NeighborResolverTest, InvalidOrRepeatedInterfaceAddressesAreRefused) {
+  auto resolver = MakeResolver();
+  ASSERT_NE(nullptr, resolver);
+  NeighborResolver::Interface iface{kIface1, Mac("02:00:00:00:00:01"), {}};
+  iface.addresses.push_back({NeighborAddress::Ipv4(kMyIp), 33});
+  EXPECT_FALSE(resolver->ConfigureInterface(iface, 0).has_value()) << "/33";
+  iface.addresses = {{NeighborAddress::Ipv6(Ipv6("ff02::1")), 64}};
+  EXPECT_FALSE(resolver->ConfigureInterface(iface, 0).has_value()) << "multicast";
+  iface.addresses = {{NeighborAddress::Ipv4(kMyIp), 24}, {NeighborAddress::Ipv4(kMyIp), 16}};
+  EXPECT_FALSE(resolver->ConfigureInterface(iface, 0).has_value()) << "repeated";
+  EXPECT_EQ(0u, resolver->interface_epoch(kIface1)) << "nothing configured";
 }
 
 }  // namespace

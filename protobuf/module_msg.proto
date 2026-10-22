@@ -389,8 +389,8 @@ message RouterInterface {
   uint32 id = 1; /// Interface id: must equal egress_gate + 1, or 0 to derive it. The ingress interface attribute carries the same id.
   uint32 egress_gate = 2; /// Router output gate this interface transmits on.
   string mac_addr = 3; /// Local Ethernet address, "aa:bb:cc:dd:ee:ff"; nonzero.
-  string ipv4 = 4; /// Local IPv4 address (optional; needed for IPv4 bindings).
-  string ipv6 = 5; /// Local IPv6 address (optional; needed for IPv6 bindings).
+  repeated string addresses = 4; /// The interface's own addresses with their on-link prefix lengths, e.g. "192.0.2.1/24" or "2001:db8::1/64": any number of either enabled family, at least one. A solicitation leaves from the address whose prefix holds the neighbor, else from the first address of its family.
+  reserved 5;
 }
 
 /**

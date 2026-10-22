@@ -142,6 +142,44 @@ bess::pb::RouterNextHopValue NextHopToPb(const route::NextHop &hop) {
   return value;
 }
 
+// One RouterInterface address: "<address>/<prefix length>", IPv4 or IPv6. The
+// prefix length is required (a host address is /32 or /128), so an on-link
+// prefix is never guessed; the resolver refuses what an interface cannot hold.
+std::expected<route::NeighborResolver::InterfaceAddress, std::string>
+InterfaceAddressFromPb(const std::string &text) {
+  const size_t slash = text.find('/');
+  if (slash == std::string::npos || slash + 1 == text.size() ||
+      text.size() - slash - 1 > 3) {
+    return std::unexpected("address '" + text +
+                           "' is not in CIDR form (address/prefix length)");
+  }
+  const std::string address = text.substr(0, slash);
+  unsigned length = 0;
+  for (size_t i = slash + 1; i < text.size(); i++) {
+    if (text[i] < '0' || text[i] > '9') {
+      return std::unexpected("address '" + text + "' has an invalid prefix length");
+    }
+    length = length * 10 + static_cast<unsigned>(text[i] - '0');
+  }
+  route::NeighborResolver::InterfaceAddress out;
+  bess::utils::be32_t ipv4;
+  if (bess::utils::ParseIpv4Address(address, &ipv4)) {
+    out.address = route::NeighborAddress::Ipv4(ipv4.value());
+    if (length > 32) {
+      return std::unexpected("address '" + text + "' has an invalid prefix length");
+    }
+  } else if (const auto ipv6 = bess::utils::ParseIpv6Address(address)) {
+    out.address = route::NeighborAddress::Ipv6(*ipv6);
+    if (length > 128) {
+      return std::unexpected("address '" + text + "' has an invalid prefix length");
+    }
+  } else {
+    return std::unexpected("invalid address '" + text + "'");
+  }
+  out.prefix_length = static_cast<uint8_t>(length);
+  return out;
+}
+
 }  // namespace
 
 using bess::modules::router::GateOf;
@@ -409,53 +447,38 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       if (mac.IsZero()) {
         return CommandFailure(EINVAL, "interface mac_addr must be nonzero");
       }
-      uint32_t ipv4 = 0;
-      if (!entry.ipv4().empty()) {
-        if (!router_->has_ipv4()) {
-          return CommandFailure(EINVAL,
-                                "interface IPv4 address on a router without IPv4 "
-                                "(set max_ipv4_routes to enable it)");
-        }
-        bess::utils::be32_t address;
-        if (!bess::utils::ParseIpv4Address(entry.ipv4(), &address)) {
-          return CommandFailure(EINVAL, "invalid interface IPv4 address '%s'",
-                                entry.ipv4().c_str());
-        }
-        ipv4 = address.value();
-        if (ipv4 == 0 || ipv4 == 0xffffffffu) {
-          return CommandFailure(EINVAL, "invalid interface IPv4 address");
-        }
-      }
-      bess::utils::Ipv6Address ipv6{};
-      if (!entry.ipv6().empty()) {
-        if (!router_->has_ipv6()) {
-          return CommandFailure(EINVAL,
-                                "interface IPv6 address on a router without IPv6 "
-                                "(set max_ipv6_routes to enable it)");
-        }
-        auto address = bess::utils::ParseIpv6Address(entry.ipv6());
+      route::NeighborResolver::Interface interface{dataplane::InterfaceId(id), mac,
+                                                   {}};
+      bool has_ipv4 = false;
+      bool has_ipv6 = false;
+      for (const std::string &text : entry.addresses()) {
+        auto address = InterfaceAddressFromPb(text);
         if (!address) {
-          return CommandFailure(EINVAL, "invalid interface IPv6 address '%s'",
-                                entry.ipv6().c_str());
+          return CommandFailure(EINVAL, "interface %u: %s", id,
+                                address.error().c_str());
         }
-        ipv6 = *address;
-        if (ipv6.IsUnspecified() || ipv6.IsMulticast()) {
-          return CommandFailure(EINVAL, "invalid interface IPv6 address");
+        const bool v4 = address->address.is_ipv4();
+        if (v4 ? !router_->has_ipv4() : !router_->has_ipv6()) {
+          return CommandFailure(EINVAL,
+                                "interface %u: address '%s' is of a family the "
+                                "router does not enable (set max_%s_routes)",
+                                id, text.c_str(), v4 ? "ipv4" : "ipv6");
         }
+        has_ipv4 = has_ipv4 || v4;
+        has_ipv6 = has_ipv6 || !v4;
+        interface.addresses.push_back(*address);
       }
-      if (ipv4 == 0 && ipv6.IsUnspecified()) {
-        return CommandFailure(EINVAL,
-                              "interface needs an IPv4 or IPv6 address");
+      if (interface.addresses.empty()) {
+        return CommandFailure(EINVAL, "interface %u needs at least one address",
+                              id);
       }
-      route::NeighborResolver::Interface interface{
-          dataplane::InterfaceId(id), mac, ipv4, ipv6};
       auto configured = neighbor_resolver_->ConfigureInterface(interface, now);
       if (!configured) {
-        return CommandFailure(EINVAL, "%s", configured.error().c_str());
+        return CommandFailure(EINVAL, "interface %u: %s", id,
+                              configured.error().c_str());
       }
       resolver_gates_.emplace(id, static_cast<gate_idx_t>(entry.egress_gate()));
-      interface_families.emplace(
-          id, std::make_pair(ipv4 != 0, !ipv6.IsUnspecified()));
+      interface_families.emplace(id, std::make_pair(has_ipv4, has_ipv6));
     }
     for (const auto &binding : arg.neighbor_bindings()) {
       const auto families = interface_families.find(binding.interface_id());
@@ -813,12 +836,18 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     const std::string ring_suffix =
         std::to_string(next_ring_id.fetch_add(1, std::memory_order_relaxed));
     const std::string rx_name = "rrx" + ring_suffix;
+    const std::string arp_name = "rarp" + ring_suffix;
     const std::string tx_name = "rtx" + ring_suffix;
     neighbor_rx_ring_ = BessRouterRingCreateElem(
         rx_name.c_str(), sizeof(NeighborFrame), 1024, SOCKET_ID_ANY, 0);
+    // Requests have their own ring, so a busy segment's requests cannot take
+    // the room replies need.
+    neighbor_arp_ring_ = BessRouterRingCreateElem(
+        arp_name.c_str(), sizeof(ArpRequestCopy), 256, SOCKET_ID_ANY, 0);
     neighbor_tx_ring_ =
         rte_ring_create(tx_name.c_str(), 1024, SOCKET_ID_ANY, 0);
-    if (neighbor_rx_ring_ == nullptr || neighbor_tx_ring_ == nullptr) {
+    if (neighbor_rx_ring_ == nullptr || neighbor_arp_ring_ == nullptr ||
+        neighbor_tx_ring_ == nullptr) {
       return CommandFailure(ENOMEM, "neighbor resolver ring creation failed");
     }
     if (RegisterTask(nullptr) == INVALID_TASK_ID) {
@@ -841,6 +870,10 @@ void Router::CleanupNeighborResolver() {
     }
     rte_ring_free(neighbor_rx_ring_);
     neighbor_rx_ring_ = nullptr;
+  }
+  if (neighbor_arp_ring_ != nullptr) {
+    rte_ring_free(neighbor_arp_ring_);
+    neighbor_arp_ring_ = nullptr;
   }
   if (neighbor_tx_ring_ != nullptr) {
     route::NeighborResolver::Solicitation *item = nullptr;
@@ -915,14 +948,18 @@ int Router::OnEvent(bess::Event event) {
   return 0;
 }
 
-// Resolver input is ARP replies and Neighbor Advertisements only: OnArp and
-// OnNd learn from nothing else, and each call stages a Progress, so a request
-// on a busy segment would only take ring space a reply needs. A request (an
-// ARP request or a Neighbor Solicitation) is this node's responder's business:
-// it goes to the local punt gate, where a graph puts one, or is dropped, and
-// is counted either way. Everything else stays in the batch and is routed.
-// A family the router does not enable has no neighbor protocol here (D-179):
-// its ARP or ND frames stay in the batch like any other frame of that kind.
+// Resolver input is ARP replies and Neighbor Advertisements, and a copy of
+// each ARP request. A reply or advertisement goes to the resolver whole. A
+// request (an ARP request or a Neighbor Solicitation) is this node's
+// responder's business: it goes to the local punt gate, where a graph puts
+// one, or is dropped, and is counted either way. An ARP request is also copied
+// (its 42 bytes, inline on a ring of its own, so a busy segment's requests
+// cannot take the room replies need): one from a bound neighbor -- a
+// gratuitous announcement included -- moves that neighbor to the MAC it
+// carries (RFC 826's merge, NeighborResolver::OnArp). Everything else stays in
+// the batch and is routed. A family the router does not enable has no
+// neighbor protocol here (D-179): its ARP or ND frames stay in the batch like
+// any other frame of that kind.
 void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
   constexpr size_t kEth = sizeof(bess::utils::Ethernet);
   const bool arp_input = router_->has_ipv4();
@@ -931,6 +968,13 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
   // graph that delivered it, and travels with the frame (NeighborFrame).
   const bess::metadata::mt_offset_t interface_offset =
       attr_offset(ingress_interface_attr_);
+  // 0 (no interface) when nothing readable writes the attribute.
+  const auto ReadInterface = [](bess::PacketRef pkt,
+                                bess::metadata::mt_offset_t offset) -> uint32_t {
+    return bess::metadata::IsValidOffset(offset)
+               ? get_attr_with_offset<bess::utils::be32_t>(offset, pkt).value()
+               : 0;
+  };
   std::array<bess::PacketHandle, bess::PacketBatch::kMaxBurst> routed;
   size_t routed_count = 0;
   const int count = batch->cnt();
@@ -939,6 +983,7 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
     const uint8_t *frame = pkt.head_data<const uint8_t *>();
     const size_t len = pkt.head_len();
     enum class Kind { kRouted, kReply, kRequest, kUnusable } kind = Kind::kRouted;
+    bool arp_request = false;
     if (len >= kEth) {
       const auto *eth = reinterpret_cast<const bess::utils::Ethernet *>(frame);
       if (arp_input && eth->ether_type.value() == bess::utils::Ethernet::kArp) {
@@ -950,6 +995,7 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
           kind = arp->opcode.value() == bess::utils::Arp::kReply
                      ? Kind::kReply
                      : Kind::kRequest;
+          arp_request = arp->opcode.value() == bess::utils::Arp::kRequest;
         }
       } else if (nd_input && eth->ether_type.value() == bess::utils::Ethernet::kIpv6 &&
                  len > kEth + route::kIpv6HeaderSize &&
@@ -969,6 +1015,16 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
         continue;
       case Kind::kRequest:
         neighbor_requests_.fetch_add(1, std::memory_order_relaxed);
+        if (arp_request) {
+          ArpRequestCopy copy;
+          copy.interface = ReadInterface(pkt, interface_offset);
+          std::memcpy(copy.frame.data(), frame, kEth + sizeof(bess::utils::Arp));
+          if (copy.interface == 0 || !resolver_gates_.contains(copy.interface) ||
+              rte_ring_enqueue_elem(neighbor_arp_ring_, &copy,
+                                    sizeof(ArpRequestCopy)) != 0) {
+            neighbor_input_drops_.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
         if (punt_local_gate_ != DROP_GATE) {
           EmitPacket(ctx, pkt, punt_local_gate_);
         } else {
@@ -976,12 +1032,7 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
         }
         continue;
       case Kind::kReply: {
-        const uint32_t id =
-            bess::metadata::IsValidOffset(interface_offset)
-                ? get_attr_with_offset<bess::utils::be32_t>(interface_offset,
-                                                            pkt)
-                      .value()
-                : 0;
+        const uint32_t id = ReadInterface(pkt, interface_offset);
         // Bounded input: an unknown interface or a full ring fails closed
         // rather than routing an ARP/ND control frame as IP.
         NeighborFrame queued{pkt.handle(), id, 0};
@@ -1106,6 +1157,21 @@ void Router::ResolverTick(bess::framework::TickContext &ctx) {
             : neighbor_resolver_->OnNd(now, ingress, bytes);
     QueueNeighborUpdates(progress.updates);
     bess::PacketFree(queued.packet);
+  }
+  // ARP requests after replies: a reply answers what was asked, a request
+  // only says where its sender is now.
+  for (unsigned n = 0; n < kResolverWorkBudget && !ctx.Expired(); n++) {
+    ArpRequestCopy copy;
+    if (rte_ring_dequeue_elem(neighbor_arp_ring_, &copy,
+                              sizeof(ArpRequestCopy)) != 0) {
+      break;
+    }
+    const route::NeighborResolver::Progress progress = neighbor_resolver_->OnArp(
+        now, dataplane::InterfaceId(static_cast<uint16_t>(copy.interface)),
+        std::span<const uint8_t>(copy.frame.data(),
+                                 sizeof(bess::utils::Ethernet) +
+                                     sizeof(bess::utils::Arp)));
+    QueueNeighborUpdates(progress.updates);
   }
 
   if (!ctx.Expired()) {

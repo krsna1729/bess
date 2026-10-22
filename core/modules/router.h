@@ -77,8 +77,10 @@
 // attribute (default `vif_id`), ages and fails neighbors, and publishes each
 // change as a next-hop update through the engine on the maintenance tick.
 // Timings are configured in milliseconds and converted to ticks at Init.
-// ARP requests and Neighbor Solicitations are not the resolver's: they go to
-// the local punt gate, or are dropped, and are counted.
+// ARP requests and Neighbor Solicitations are answered elsewhere: they go to
+// the local punt gate, or are dropped, and are counted. An ARP request (a
+// gratuitous one included) is also copied to the resolver, which moves a
+// bound neighbor to the MAC it announces (RFC 826's merge).
 // docs/neighbor-resolution.md describes the state machine.
 //
 // A resolved hop that names both of its addresses has them written into the
@@ -263,6 +265,14 @@ class Router final : public Module {
     uint32_t reserved;
   };
   static_assert(sizeof(NeighborFrame) % 4 == 0, "an rte_ring element size");
+  // An ARP request a resolving router received, copied for the resolver's
+  // merge (a bound neighbor announcing its MAC) while the frame itself goes to
+  // the responder's punt gate. Inline, so the worker allocates nothing.
+  struct ArpRequestCopy {
+    uint32_t interface;
+    std::array<uint8_t, 44> frame;  // Ethernet + ARP: 42 bytes
+  };
+  static_assert(sizeof(ArpRequestCopy) % 4 == 0, "an rte_ring element size");
   static constexpr size_t kMaxNeighborUpdatesPerTick = 64;
   // At most one publication warning per this many maintenance ticks.
   static constexpr uint64_t kNeighborWarningInterval = 1000;
@@ -275,6 +285,7 @@ class Router final : public Module {
   std::unique_ptr<bess::route::NeighborResolver> neighbor_resolver_;
   bess::framework::TickEndpoint neighbor_tick_;
   rte_ring *neighbor_rx_ring_ = nullptr;  // NeighborFrame elements
+  rte_ring *neighbor_arp_ring_ = nullptr;  // ArpRequestCopy elements
   rte_ring *neighbor_tx_ring_ = nullptr;
   int ingress_interface_attr_ = -1;
   std::string ingress_interface_attr_name_;
@@ -324,7 +335,8 @@ class Router final : public Module {
   std::atomic<uint64_t> family_disabled_frames_{0};
   // An IPv6 frame of link scope (D-179): never forwarded.
   std::atomic<uint64_t> link_scope_frames_{0};
-  // ARP requests and Neighbor Solicitations: punted or dropped, not resolved.
+  // ARP requests and Neighbor Solicitations: punted or dropped, not answered
+  // here (an ARP request from a bound neighbor is also read for its MAC).
   std::atomic<uint64_t> neighbor_requests_{0};
   // Resolver input dropped before the resolver saw it.
   std::atomic<uint64_t> neighbor_input_drops_{0};

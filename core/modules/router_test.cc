@@ -342,7 +342,7 @@ TEST_F(RouterTest, ArpReplyPublishesResolverNextHop) {
   interface->set_egress_gate(1);
   const auto local_mac = Mac(kLocalMac);
   interface->set_mac_addr(MacString(local_mac));
-  interface->set_ipv4("192.0.2.1");
+  interface->add_addresses("192.0.2.1/24");
   auto *binding = arg.add_neighbor_bindings();
   binding->set_next_hop_id(1);
   binding->set_interface_id(2);
@@ -436,7 +436,7 @@ TEST_F(RouterTest, SolicitationsOnTwoInterfacesLeaveThroughBothGates) {
     interface->set_egress_gate(id - 1);
     const auto mac = Mac(id == 1 ? "02:00:00:00:00:01" : "02:00:00:00:00:02");
     interface->set_mac_addr(MacString(mac));
-    interface->set_ipv4(id == 1 ? "192.0.2.1" : "198.51.100.1");
+    interface->add_addresses(id == 1 ? "192.0.2.1/24" : "198.51.100.1/24");
     auto *binding = arg.add_neighbor_bindings();
     binding->set_next_hop_id(id);
     binding->set_interface_id(id);
@@ -463,7 +463,7 @@ TEST_F(RouterTest, NeighborResolverCapacityIsBounded) {
   interface->set_egress_gate(1);
   const auto local_mac = Mac(kLocalMac);
   interface->set_mac_addr(MacString(local_mac));
-  interface->set_ipv4("192.0.2.1");
+  interface->add_addresses("192.0.2.1/24");
   for (uint32_t id = 1; id <= 2; id++) {
     auto *binding = arg.add_neighbor_bindings();
     binding->set_next_hop_id(id);
@@ -487,7 +487,7 @@ TEST_F(RouterTest, NdAdvertisementPublishesResolverNextHop) {
   interface->set_id(2);
   interface->set_egress_gate(1);
   interface->set_mac_addr(MacString(local_mac));
-  interface->set_ipv6("fe80::1");
+  interface->add_addresses("fe80::1/64");
   auto *binding = arg.add_neighbor_bindings();
   binding->set_next_hop_id(1);
   binding->set_interface_id(2);
@@ -1765,8 +1765,8 @@ bess::pb::RouterArg ResolverArg(uint64_t punt_local_gate, uint32_t bindings = 1)
   interface->set_egress_gate(1);
   const auto local_mac = Mac("02:00:00:00:00:01");
   interface->set_mac_addr(MacString(local_mac));
-  interface->set_ipv4("192.0.2.1");
-  interface->set_ipv6("fe80::1");
+  interface->add_addresses("192.0.2.1/24");
+  interface->add_addresses("fe80::1/64");
   for (uint32_t id = 1; id <= bindings; id++) {
     auto *binding = arg.add_neighbor_bindings();
     binding->set_next_hop_id(id);
@@ -2020,14 +2020,148 @@ TEST_F(RouterTest, ADisabledFamilysAddressesAreRefused) {
   arg.clear_max_ipv6_routes();
   arg.clear_max_ipv6_tbl8s();
   EXPECT_NE("", h_.CreateError("Router", arg)) << "IPv6 interface address";
-  arg.mutable_interfaces(0)->clear_ipv6();
+  arg.mutable_interfaces(0)->clear_addresses();
+  arg.mutable_interfaces(0)->add_addresses("192.0.2.1/24");
   EXPECT_NE(nullptr, h_.Create("Router", arg, "v4only"));
 
   arg = ResolverArg(0);
   arg.clear_max_ipv4_routes();
   arg.clear_max_ipv4_tbl8s();
-  arg.mutable_interfaces(0)->clear_ipv4();
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "IPv4 interface address";
+  arg.mutable_interfaces(0)->clear_addresses();
+  arg.mutable_interfaces(0)->add_addresses("fe80::1/64");
   EXPECT_NE("", h_.CreateError("Router", arg)) << "IPv4 neighbor binding";
+}
+
+// Interface addresses are CIDR, any number of each family: the prefix length
+// is required and bounded by the family, an interface needs one address, and
+// a repeated address is refused.
+TEST_F(RouterTest, InterfaceAddressesAreCidrAndRefusedWhenMalformed) {
+  for (const char *bad : {"192.0.2.1", "192.0.2.1/", "192.0.2.1/33", "192.0.2.1/2x",
+                          "2001:db8::1/129", "not-an-address/24", "0.0.0.0/8",
+                          "ff02::1/64"}) {
+    bess::pb::RouterArg arg = ResolverArg(0);
+    arg.mutable_interfaces(0)->add_addresses(bad);
+    EXPECT_NE("", h_.CreateError("Router", arg)) << bad;
+  }
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.mutable_interfaces(0)->add_addresses("192.0.2.1/16");
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "repeated address";
+  arg = ResolverArg(0);
+  arg.mutable_interfaces(0)->clear_addresses();
+  EXPECT_NE("", h_.CreateError("Router", arg)) << "no address";
+}
+
+// A solicitation leaves from the interface address whose prefix holds the
+// neighbor: a neighbor on a secondary subnet is asked from that subnet's
+// address, a global IPv6 neighbor from the global address.
+TEST_F(RouterTest, ASolicitationLeavesFromTheAddressOnTheNeighborsPrefix) {
+  bess::pb::RouterArg arg = DualStackArg();
+  auto *interface = arg.add_interfaces();
+  interface->set_egress_gate(1);
+  interface->set_mac_addr("02:00:00:00:00:01");
+  for (const char *address :
+       {"192.0.2.1/24", "198.51.100.1/24", "fe80::1/64", "2001:db8::1/64"}) {
+    interface->add_addresses(address);
+  }
+  auto *v4 = arg.add_neighbor_bindings();
+  v4->set_next_hop_id(1);
+  v4->set_interface_id(2);
+  v4->set_ipv4("198.51.100.2");
+  auto *v6 = arg.add_neighbor_bindings();
+  v6->set_next_hop_id(2);
+  v6->set_interface_id(2);
+  v6->set_ipv6("2001:db8::2");
+  arg.set_neighbor_first_probe_ms(1);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+  const auto probes = h_.RunTask(rt, {0, 1});
+  ASSERT_EQ(2u, probes.at(1).size());
+  bool saw_arp = false;
+  bool saw_ns = false;
+  for (const Bytes &probe : probes.at(1)) {
+    if (const auto arp = bess::route::ParseArp(probe)) {
+      saw_arp = true;
+      EXPECT_EQ("198.51.100.1", bess::utils::ToIpv4Address(arp->sender_ip));
+    } else if (const auto ns = bess::route::ParseNeighborDiscovery(probe)) {
+      saw_ns = true;
+      EXPECT_EQ("2001:db8::1", bess::utils::ToIpv6Address(ns->source_ip));
+    }
+  }
+  EXPECT_TRUE(saw_arp);
+  EXPECT_TRUE(saw_ns);
+}
+
+// An ARP frame `op` (1 request, 2 reply) from 192.0.2.2 at `sender_mac`,
+// sent to `eth_dst`, naming `target_ip`.
+Bytes ArpFrom(int op, const char *sender_mac, const char *eth_dst,
+              const char *target_ip) {
+  return PacketBuilder()
+      .Ether(eth_dst, sender_mac)
+      .Arp(op, sender_mac, "192.0.2.2",
+           op == 2 ? "02:00:00:00:00:01" : "00:00:00:00:00:00", target_ip)
+      .PadTo(60)
+      .Build();
+}
+
+// A gratuitous ARP from a bound neighbor moves its hop to the announced MAC
+// at once (and the request still reaches the responder's gate); one from an
+// address nobody bound creates nothing.
+TEST_F(RouterTest, AGratuitousArpMovesABoundNeighbor) {
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", ResolverArg(3), "rt"));
+  ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+  ASSERT_EQ(1u, h_.RunTask(rt, {0, 1})[1].size());
+  (void)h_.RunPipeline(writer, 0,
+                       {ArpFrom(2, "02:00:00:00:00:aa", "02:00:00:00:00:01",
+                                "192.0.2.1")},
+                       rt, {0});
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 2);
+  ASSERT_EQ(Ethernet::Address(Mac("02:00:00:00:00:aa").data()),
+            rt->router()->LookupNextHop(bess::route::NextHopId(1))->dst_mac);
+
+  const Bytes announce =
+      ArpFrom(1, "02:00:00:00:00:bb", "ff:ff:ff:ff:ff:ff", "192.0.2.2");
+  auto out = h_.RunPipeline(writer, 0, {announce}, rt, {0, 1, 3});
+  ASSERT_EQ(1u, out[3].size()) << "the responder still sees the request";
+  EXPECT_EQ(announce, out[3][0]);
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 3);
+  const auto *moved = rt->router()->LookupNextHop(bess::route::NextHopId(1));
+  ASSERT_NE(nullptr, moved);
+  EXPECT_EQ(bess::route::NeighborState::kResolved, moved->neighbor);
+  EXPECT_EQ(Ethernet::Address(Mac("02:00:00:00:00:bb").data()), moved->dst_mac);
+
+  const Bytes stranger = PacketBuilder()
+                             .Ether("ff:ff:ff:ff:ff:ff", "02:00:00:00:00:cc")
+                             .Arp(1, "02:00:00:00:00:cc", "192.0.2.9",
+                                  "00:00:00:00:00:00", "192.0.2.9")
+                             .PadTo(60)
+                             .Build();
+  (void)h_.RunPipeline(writer, 0, {stranger}, rt, {0, 1, 3});
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 4);
+  EXPECT_NE(std::string::npos, rt->GetDesc().find(", 1 neighbors")) << rt->GetDesc();
+}
+
+// A broadcast ARP reply from a bound neighbor resolves it, like a unicast one.
+TEST_F(RouterTest, ABroadcastArpReplyResolvesABoundNeighbor) {
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", ResolverArg(0), "rt"));
+  ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+  ASSERT_EQ(1u, h_.RunTask(rt, {0, 1})[1].size());
+  (void)h_.RunPipeline(writer, 0,
+                       {ArpFrom(2, "02:00:00:00:00:aa", "ff:ff:ff:ff:ff:ff",
+                                "192.0.2.1")},
+                       rt, {0});
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 2);
+  const auto *hop = rt->router()->LookupNextHop(bess::route::NextHopId(1));
+  ASSERT_NE(nullptr, hop);
+  EXPECT_EQ(bess::route::NeighborState::kResolved, hop->neighbor);
+  EXPECT_EQ(Ethernet::Address(Mac("02:00:00:00:00:aa").data()), hop->dst_mac);
 }
 
 }  // namespace
