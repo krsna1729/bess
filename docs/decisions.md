@@ -12281,16 +12281,17 @@ and which change in place. The transaction consistency a resource provides was a
 - **The update model comes from the tables, not a second declaration.** A resource table gains `rebuilds`
   (`.Rebuilds()`): a change rebuilds the structure and swaps it in, so it costs in proportion to the table. A
   module's `updates` is its most disruptive table's: `PAUSED_WORKERS` (`requires_paused_workers`), else
-  `REBUILD`, else `LIVE`; `NONE` without tables. Its consistency is `REFERENTIAL` when it has a table: every
-  module table provides exactly that (D-050), and the parity test now asserts it.
+  `REBUILD`, else `LIVE`; `NONE` without tables. Its consistency is `REFERENTIAL` when it has a table.
+  The parity test verifies that for its five resource-module cases.
 - **`ValidatePipeline` answers it**, per module by name, from the class and the argument alone - before
   anything exists, which is when a compiler needs it. Computing it unpacks the argument as the class's init
   type, so validation now refuses an argument of the wrong type, naming the module, where creation used to.
   `GetSchema` reports each table's `rebuilds`. The C++, Go and Python SDKs return the capabilities with the
   normalized pipeline; `bessctl validate` prints them on stderr, `bessctl schema` marks `(rebuilds)`.
 - **Declarations are checked where they can be.** `ModuleCapabilitiesTest`: every class linked into the
-  conformance binary declares both fields; affinity other than `kNone` only with `kPerWorker`; a module created
-  from an argument has worker limit 1 for `kSingleWorker` and above 1 for `kPerWorker`/`kShared`.
+  conformance binary declares both fields; affinity other than `kNone` only with `kPerWorker`. For the five
+  resource-module cases and ConnTrack's modes, created instances have worker limit 1 for `kSingleWorker`
+  and above 1 for `kPerWorker`/`kShared`.
 - **The daemon does not enforce affinity across the graph yet.** ConnTrack keeps its own resume check
   (`AsymmetricInputs`); the descriptor makes the requirement visible so a controller can refuse the graph
   first.
@@ -12301,7 +12302,8 @@ and which change in place. The transaction consistency a resource provides was a
 |---|---|---|
 | none | none | ACL, ArpResponder, BPF, Bypass, EtherEncap, ExactMatch, Firewall, GenericDecap, GenericEncap, HashLB, IPChecksum, IPEncap, IPSwap, L2Forward, L4Checksum, MACSwap, Merge, MetadataTest, MPLSPop, NoOP, PortInc, QueueInc, QueueOut, Replicate, Router, SetMetadata, Sink, Source, Split, StaticNAT, Timestamp, Update, UpdateTTL, VLANPop, VLANPush, VLANSplit, VXLANDecap, VXLANEncap, Vif, WildcardMatch, WorkerSplit |
 | single worker | none | Bridge, Buffer, Dump, FlowGen, RoundRobin, UrlFilter; ConnTrack `OWNED`; NAT (not shared) |
-| shared | none | DRR, Measure, Meter, PacketStore, PortOut, Queue, RandomSplit, RandomUpdate, Rewrite; ConnTrack `SHARED`; NAT `shared` |
+| shared | none | DRR, Measure, Meter, PacketStore, PortOut, Queue; ConnTrack `SHARED`; NAT `shared` |
+| per worker | none | RandomSplit, RandomUpdate, Rewrite |
 | per worker | required | ConnTrack `PER_WORKER` |
 | per worker | preferred | ConnTrack `PER_WORKER` with `fallback_shared` |
 
@@ -12309,12 +12311,15 @@ Tables that rebuild: ACL `rules`, BPF `filters`, Firewall `rules`, Meter `meters
 whole `MeterSet` again), PacketStore `flows` (the limits map is copied), Rewrite `templates`, UrlFilter
 `blacklist` (the trie) and Vif `interfaces` (every index is rebuilt).
 
-Judgement calls recorded: RandomSplit, RandomUpdate and Rewrite are `shared` though their shared member (an RNG,
-a round-robin cursor) is written without synchronization - a tolerated race, any value is correct. DRR, Queue
-and PacketStore are `shared` because every feeding worker enqueues into one multi-producer ring, although only
-the owning task drains it. A device queue is the port's state, not the module's (PortInc, QueueInc, QueueOut
-are `none`; PortOut is `shared` for the per-queue locks it takes). ExactMatch's `rules` is `live`: its occasional
-growth copies the table, an amortised cost, not a rebuild per change.
+RandomSplit and RandomUpdate use a worker-local RNG; Rewrite keeps a round-robin cursor per worker and resets
+every cursor when its templates change with workers paused. These use `stats::WorkerLocal` cache-line-separated
+slots: workers do not race on an RNG seed or cursor, and no flow affinity is needed.
+
+Judgement calls recorded: DRR, Queue and PacketStore are `shared` because every feeding worker enqueues into one
+multi-producer ring, although only the owning task drains it. A device queue is the port's state, not the
+module's (PortInc, QueueInc, QueueOut are `none`; PortOut is `shared` for the per-queue locks it takes).
+ExactMatch's `rules` is `live`: its occasional growth copies the table, an amortised cost, not a rebuild per
+change.
 
 **Why.** The roadmap's split - worker-owned state where steering gives affinity, shared state only where the
 workload demands it - is a placement decision a controller makes, so it needs the facts before it applies a
@@ -12329,8 +12334,9 @@ what the classes already declare, so they cannot drift from it.
 **Evidence.** `ApiV2ServiceTest.ValidateReportsEachModulesCapabilities` (ConnTrack's four modes, `LIVE`,
 `REBUILD`, `PAUSED_WORKERS` and `NONE`, the consistency, a wrongly typed argument refused naming the module and
 the expected type); `ModuleCapabilitiesTest.EveryClassDeclaresAndModulesAgree` (removing one class's
-declaration fails it); `ResourceParityTest` asserts every module table is referential; the Python SDK test
-reads both parts of the answer.
+declaration fails it); `ResourceParityTest` asserts referential consistency for its five resource-module cases;
+`RewriteTest.WorkersAdvanceIndependentlyAndAReplacementRestartsEveryWorker` checks independent cursors and
+reset after replacing templates; the Python SDK test reads both parts of the answer.
 
 **Revisit when:** a module provides scope-snapshot consistency from its own table (then the table declares
 it), the daemon should refuse an unsafe graph itself (then a resume check generalises ConnTrack's), or a class

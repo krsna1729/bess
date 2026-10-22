@@ -12,6 +12,7 @@
 #include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
+#include "stats/worker_local.h"
 #include "utils/random.h"
 
 // Maximum number of output gates to allow.
@@ -25,8 +26,8 @@ class RandomSplit final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
   static const Commands cmds;
   static const ResourceTables resource_tables;
-  // rng_ is written without synchronization (a tolerated race: any value is correct).
-  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+  // Each worker advances its own RNG; packets need no flow affinity.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kPerWorker,
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::RandomSplitArg &arg);
@@ -47,7 +48,7 @@ class RandomSplit final : public Module {
   void ApplySettings(const Settings &settings);
   bess::pb::RandomSplitArg ReadSettings() const;
 
-  Random rng_;  // Random number generator
+  bess::stats::WorkerLocal<Random> rng_;
   double drop_rate_;
   gate_idx_t gates_[MAX_SPLIT_GATES];
   gate_idx_t ngates_;

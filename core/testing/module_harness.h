@@ -55,6 +55,10 @@ class ModuleHarness {
   // The same refusal with its errno (code 0 when Init accepted).
   pb_error_t CreateFailure(const std::string &mclass, const google::protobuf::Message &arg);
 
+  // Selects the Context worker id for subsequent runs (default 0). Runs stay
+  // on the harness thread; this does not start a scheduler worker.
+  void SetWorker(dataplane::WorkerId worker) { worker_ = worker; }
+
   // Runs `in` into `m`'s input gate `igate` and returns what reached each
   // gate of `ogates` (by default 0-15 as far as `m` has them).
   std::map<gate_idx_t, std::vector<Bytes>> Run(Module *m, gate_idx_t igate,
@@ -115,10 +119,11 @@ class ModuleHarness {
   // `m` has when empty) and sizes `task`'s per-gate batches.
   void WireOutputs(Module *m, std::vector<gate_idx_t> ogates, Task &task);
   // Runs `task` once.
-  static void RunOnce(Task &task);
+  void RunOnce(Task &task);
   Module *capture_ = nullptr;
   Module *injector_ = nullptr;
   int next_name_ = 0;
+  dataplane::WorkerId worker_{0};
 };
 
 }  // namespace bess::testing

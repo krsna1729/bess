@@ -247,9 +247,9 @@ a client can do to it is an **action**.
   (several workers own or share it: the limit is above 1); affinity is
   `kNone`, `kPreferred` (correct anywhere, cheaper when a flow stays) or
   `kRequired`, and only per-worker state needs either. A class that declares
-  nothing reports both unspecified; every built-in class declares, and
-  `ModuleCapabilitiesTest` checks a created module's worker limit against its
-  declaration.
+  nothing reports both unspecified; every built-in class declares.
+  `ModuleCapabilitiesTest` checks declarations for every linked class and
+  worker limits for the five resource-module cases and ConnTrack's modes.
 - **Stating a bound (D-149).** `GetResourceStatus` reports each resource's
   live entries and, when the resource states one, its capacity, so a
   controller sees the ceiling it can plan against before it writes. The
