@@ -706,14 +706,17 @@ refused when the second module is created, so it cannot reach a report.
 ## 6. Static archives for programs without `bessd` (experimental, D-095)
 
 The libraries that implement the router and its FIB (`bess_route`), the
-resource and transaction core (`bess_dataplane_core`), the RCU domain
+shared flow index and its classifier backend (`bess_flow`, `bess_classifier`),
+the resource and transaction core (`bess_dataplane_core`), the RCU domain
 (`bess_rcu`), and the EAL bring-up and utilities they link against
 (`bess_eal`, `bess_utils`) are installed as static archives in
-`${libdir}/bess`, with `bess-dev-static.pc`:
+`${libdir}/bess`, with `bess-dev-static.pc`. A plugin's unit test may link
+them to build the `flow::SharedExactIndex` its resource wraps; the plugin
+itself never does:
 
 ```sh
 pkg-config --libs bess-dev-static
-# -L${libdir}/bess -lbess_route -lbess_dataplane_core -lbess_eal -lbess_rcu -lbess_utils
+# -L${libdir}/bess -lbess_route -lbess_flow -lbess_classifier -lbess_dataplane_core -lbess_eal -lbess_rcu -lbess_utils
 # then bess-dev's flags (DPDK's shared libraries, glog, protobuf) and gflags
 ```
 

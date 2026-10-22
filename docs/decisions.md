@@ -115,7 +115,7 @@ file is the reasoning.
 | D-092 | Classified live perf tests; master vs develop: framework cost predates the roadmap, module costs located | accepted |
 | D-093 | User decisions of 2026-10-05: public codecs, installed archives, TSan gates, keyless signing; MacTable fold deferred | accepted |
 | D-094 | Experimental public codec facade (`init_context().codecs()`); R4 an installed-tree plugin driven over the control API | accepted |
-| D-095 | Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd | accepted |
+| D-095 | Installed static archives of route, dataplane core, RCU, flow and classifier (`bess-dev-static`); R1 linked without bessd | accepted |
 | D-096 | Static DPDK links its constructor-registered drivers (whole-archive kept); release smoke starts bessd | accepted |
 | D-097 | The framework floor was the packet alloc and free path: four per-packet operations master did not do | accepted |
 | D-098 | WildcardMatch ranks by a packed priority and skips tuples that cannot win (19.2 ns master, 44.8 develop, 14.6 now) | accepted |
@@ -7716,10 +7716,11 @@ and then removed with the session. Mutant: the action codec decoding key `id + 1
 **Revisit when:** a codec API that is not protobuf-bound is wanted, or the facade is promoted to public.
 
 
-## D-095 Installed static archives of route, dataplane core and RCU (`bess-dev-static`); R1 linked without bessd
+## D-095 Installed static archives of route, dataplane core, RCU, flow and classifier (`bess-dev-static`); R1 linked without bessd
 
 **Status:** accepted (2026-10-05; D-093 item 2).
-**Code:** `core/meson.build` (`bess_route`, `bess_dataplane_core`, `bess_rcu`, `bess_eal`, `bess_utils` installed in
+**Code:** `core/meson.build` (`bess_route`, `bess_dataplane_core`, `bess_rcu`, `bess_eal`, `bess_utils`, `bess_flow`,
+`bess_classifier` installed in
 `${libdir}/bess`; `bess-dev-static.pc`), `examples/static_router/` (new), `tools/ci_profile.py` (`verify-install`
 stages both pc files and builds and runs the example), `tools/package_release.py` (the archives and the pc file in
 the `bess-dev` package), `docs/plugin-api.md` (section 6), `docs/architecture.md`, `examples/appliances/README.md`.
@@ -7734,14 +7735,17 @@ item 2).
   engine, handoff), `libbess_rcu.a`, and the two the router's link closure needs below them, `libbess_eal.a` (lazy
   EAL bring-up) and `libbess_utils.a`, in `${libdir}/bess`. Archive names and edges are the link graph's
   (`tools/layer_dag.json`); nothing changes in how bessd links them.
-- `bess-dev-static.pc`: `Libs: -L${libdir}/bess -lbess_route -lbess_dataplane_core -lbess_eal -lbess_rcu -lbess_utils`,
+- `bess-dev-static.pc`: `Libs: -L${libdir}/bess -lbess_route -lbess_flow -lbess_classifier -lbess_dataplane_core -lbess_eal -lbess_rcu -lbess_utils`,
   `Requires: bess-dev, gflags` (bess-dev's flags, DPDK's shared libraries, glog, protobuf; gflags for the EAL's
   process options). `bess-dev` is unchanged: plugins never link the archives (bessd provides the symbols, and a second
   copy would carry its own EAL and RCU state).
 - No ABI promise: an archive is linked only by a program built against the same install (bessd's compiler, options,
   ISA). The transaction engine's header stays internal (D-074: applying transactions is the control plane's), so the
-  dataplane archive serves the router's resources, not an engine a program drives. Classifier, flow, meter and stats
-  are not installed as archives.
+  dataplane archive serves the router's resources, not an engine a program drives. Meter and stats are not
+  installed as archives.
+- Revisited 2026-10-22: `libbess_flow.a` (`flow::SharedExactIndex`, whose header is already installed experimental)
+  and `libbess_classifier.a` (its `ConcurrentExactTable` backend) are installed too, so a plugin's unit test can
+  build the index its resource wraps without bessd. The plugin itself still links none of them.
 - `examples/static_router`: R1's `RouterApp` (`examples/appliances/router/router_app.h`) in a program with its own
   `rcu::RcuDomain`, no bessd, no `Module`, no framework; linked from `bess-dev-static` and DPDK, it routes 172.16.1.1
   from interface 1 and asserts the egress, the gateway's MAC, interface 1's source MAC and the TTL (64 to 63), VRF 2's
