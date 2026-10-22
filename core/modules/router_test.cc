@@ -2349,4 +2349,62 @@ TEST_F(RouterTest, ARouterWithoutInterfacesBindsNothing) {
   EXPECT_NE("", BindNeighbor("rt", 1, 2, "192.0.2.2"));
 }
 
+// get_neighbors reports every binding in id order: before the tick takes them
+// up, incomplete with no probes; after the first solicitation, one probe; and
+// once a reply resolves the IPv4 neighbor, resolved with its MAC.
+TEST_F(RouterTest, GetNeighborsReportsEachBindingsResolution) {
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.mutable_interfaces(0)->add_addresses("2001:db8::1/64");
+  arg.set_max_ipv6_routes(16);
+  auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
+  ASSERT_NE(nullptr, rt);
+  ASSERT_EQ("", BindNeighbor("rt", 2, 2, "2001:db8::2"));
+  ASSERT_EQ("", BindNeighbor("rt", 1, 2, "192.0.2.2"));
+  auto get = [&]() {
+    CommandResponse got = h_.Action(rt, "get_neighbors", bess::pb::EmptyArg());
+    EXPECT_EQ(0, got.error().code());
+    bess::pb::RouterCommandGetNeighborsResponse response;
+    EXPECT_TRUE(got.data().UnpackTo(&response));
+    return response;
+  };
+  auto response = get();
+  ASSERT_EQ(2, response.neighbors_size());
+  EXPECT_EQ(1u, response.neighbors(0).next_hop_id());
+  EXPECT_EQ("192.0.2.2", response.neighbors(0).ipv4());
+  EXPECT_EQ(2u, response.neighbors(1).next_hop_id());
+  EXPECT_EQ("2001:db8::2", response.neighbors(1).ipv6());
+  for (const auto &neighbor : response.neighbors()) {
+    EXPECT_EQ(2u, neighbor.interface_id());
+    EXPECT_EQ(bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE, neighbor.state());
+    EXPECT_EQ(0u, neighbor.probes());
+    EXPECT_EQ("", neighbor.mac_addr());
+  }
+
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+  ASSERT_EQ(2u, h_.RunTask(rt, {0, 1})[1].size());
+  response = get();
+  for (const auto &neighbor : response.neighbors()) {
+    EXPECT_EQ(bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE, neighbor.state());
+    EXPECT_EQ(1u, neighbor.probes());
+  }
+
+  const std::string local_mac = arg.interfaces(0).mac_addr();
+  constexpr char kPeerMac[] = "02:00:00:00:00:02";
+  const Bytes reply = PacketBuilder()
+                          .Ether(local_mac, kPeerMac)
+                          .Arp(2, kPeerMac, "192.0.2.2", local_mac, "192.0.2.1")
+                          .PadTo(60)
+                          .Build();
+  (void)h_.RunPipeline(writer, 0, {reply}, rt, {0});
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 2);
+  response = get();
+  EXPECT_EQ(bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED, response.neighbors(0).state());
+  EXPECT_EQ(Ethernet::Address(Mac(kPeerMac).data()).ToString(),
+            response.neighbors(0).mac_addr());
+  EXPECT_FALSE(response.neighbors(0).reconfirming());
+  EXPECT_EQ(bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE, response.neighbors(1).state());
+}
+
 }  // namespace

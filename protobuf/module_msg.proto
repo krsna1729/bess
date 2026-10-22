@@ -409,7 +409,27 @@ message RouterNeighborBinding {
   string ipv6 = 3; /// Neighbor IPv6 address (resolved with Neighbor Discovery).
 }
 
+/**
+ * One binding of "<module>/neighbors" as neighbor resolution sees it (the
+ * Router's get_neighbors action, D-179). A neighbor the resolver does not
+ * know yet -- bound since the last maintenance tick -- is incomplete with no
+ * probes.
+ */
+message RouterNeighborStatus {
+  uint32 next_hop_id = 1; /// The bound next-hop id.
+  uint32 interface_id = 2; /// The RouterInterface the neighbor is on.
+  string ipv4 = 3; /// Neighbor IPv4 address, when it is one.
+  string ipv6 = 4; /// Neighbor IPv6 address, when it is one.
+  RouterNeighborState state = 5; /// Resolved, incomplete or unreachable; never unspecified.
+  string mac_addr = 6; /// The neighbor's learned MAC, "aa:bb:cc:dd:ee:ff"; empty until one is learned.
+  bool reconfirming = 7; /// A resolved neighbor whose reachable lifetime ran out, being probed while it still forwards.
+  uint32 probes = 8; /// Solicitations sent in the current attempt.
+}
 
+/** The Router's get_neighbors action (EmptyArg): every binding, in id order. */
+message RouterCommandGetNeighborsResponse {
+  repeated RouterNeighborStatus neighbors = 1;
+}
 
 message WildcardMatchRuleKey {
   repeated FieldData values = 1;
@@ -1512,7 +1532,9 @@ enum FlowHashFields {
  *
  * Neighbor resolution (D-179). With `interfaces`, the router resolves the
  * next hops bound in its "<module>/neighbors" resource (RouterNeighborBinding)
- * and publishes their state.
+ * and publishes their state; its get_neighbors action
+ * (RouterCommandGetNeighborsResponse) reports each binding's state, MAC,
+ * reconfirmation and probe count.
  *
  * __Input Gates__: 1
  * __Output Gates__: many (the next hop's egress)

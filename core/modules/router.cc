@@ -42,7 +42,13 @@ extern "C" rte_ring *BessRouterRingCreateElem(const char *name, unsigned esize,
                                               unsigned flags)
     __asm__("rte_ring_create_elem");
 
-const Commands Router::cmds = {};
+// The tables are resources (D-129); get_neighbors is the class's one action,
+// a read of control-side resolver state, which the control plane's lock
+// serialises with the maintenance tick -- so it needs no paused workers.
+const Commands Router::cmds = {
+    {"get_neighbors", "EmptyArg", MODULE_CMD_FUNC(&Router::CommandGetNeighbors),
+     Command::THREAD_SAFE, "RouterCommandGetNeighborsResponse"},
+};
 
 const ResourceTables Router::resource_tables = {
     ResourceTable::Map<bess::pb::RouterNextHopIdKey,
@@ -216,6 +222,18 @@ bess::pb::RouterNeighborBinding NeighborKeyToPb(const route::NeighborKey &key) {
     value.set_ipv6(bess::utils::ToIpv6Address(key.address.ipv6()));
   }
   return value;
+}
+
+bess::pb::RouterNeighborState NeighborStateToPb(route::NeighborState state) {
+  switch (state) {
+    case route::NeighborState::kResolved:
+      return bess::pb::ROUTER_NEIGHBOR_STATE_RESOLVED;
+    case route::NeighborState::kIncomplete:
+      return bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE;
+    case route::NeighborState::kUnreachable:
+      return bess::pb::ROUTER_NEIGHBOR_STATE_UNREACHABLE;
+  }
+  return bess::pb::ROUTER_NEIGHBOR_STATE_UNSPECIFIED;
 }
 
 }  // namespace
@@ -1151,6 +1169,36 @@ void Router::PublishNeighborUpdates(uint64_t now) {
                << pending_neighbor_updates_.size()
                << " neighbor change(s) not yet published (" << why
                << "); retrying";
+}
+
+// Every binding, in id order, with the resolver's view of its neighbor. A
+// neighbor the resolver does not know yet (bound since the last tick) is
+// incomplete with no probes, as its published hop is.
+CommandResponse Router::CommandGetNeighbors(const bess::pb::EmptyArg &) {
+  bess::pb::RouterCommandGetNeighborsResponse response;
+  router_->ForEachNeighborBinding(
+      [&](route::NextHopId id, const route::NeighborKey &key) {
+        const bess::pb::RouterNeighborBinding binding = NeighborKeyToPb(key);
+        bess::pb::RouterNeighborStatus *status = response.add_neighbors();
+        status->set_next_hop_id(id.value());
+        status->set_interface_id(binding.interface_id());
+        status->set_ipv4(binding.ipv4());
+        status->set_ipv6(binding.ipv6());
+        status->set_state(bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);
+        const auto known = neighbor_resolver_ == nullptr
+                               ? std::nullopt
+                               : neighbor_resolver_->StatusOf(key);
+        if (!known) {
+          return;
+        }
+        status->set_state(NeighborStateToPb(known->state));
+        if (!known->mac.IsZero()) {
+          status->set_mac_addr(known->mac.ToString());
+        }
+        status->set_reconfirming(known->reconfirming);
+        status->set_probes(known->probes);
+      });
+  return CommandSuccess(response);
 }
 
 // Takes up the bindings transactions published since the last tick (D-179):

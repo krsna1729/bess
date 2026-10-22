@@ -112,6 +112,8 @@ class Router final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
 
+  // get_neighbors (EmptyArg -> RouterCommandGetNeighborsResponse): every
+  // binding with its neighbor's state, MAC, reconfirmation and probe count.
   static const Commands cmds;
   // "<module>/next_hops" (RouterNextHopIdKey -> RouterNextHopValue),
   // "<module>/neighbors" (RouterNextHopIdKey -> RouterNeighborBinding),
@@ -124,6 +126,7 @@ class Router final : public Module {
 
   CommandResponse Init(const bess::pb::RouterArg &arg);
   void DeInit() override;
+  CommandResponse CommandGetNeighbors(const bess::pb::EmptyArg &arg);
 
   // Reports an unreadable 'next_hop_id' attribute once per resume (the
   // control side's place for it, as in ExactMatch): the packet path only
