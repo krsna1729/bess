@@ -304,6 +304,16 @@ class Resource {
   // earlier reservations of the same transaction.
   virtual std::expected<Reservation, std::string> Reserve(const Op &op) = 0;
 
+  // Called once per transaction that reserved an operation here, after every
+  // operation of the transaction was reserved and its checks passed, and
+  // before anything publishes. For a resource that builds one replacement
+  // for all of a transaction's operations (a rebuilt table) instead of one
+  // per operation: Reserve() validates and records each operation, and this
+  // builds once. It may allocate and fail; a failure refuses the transaction,
+  // reported against this resource's last operation, and aborts every
+  // reservation. A resource that does its work in Reserve() inherits this.
+  virtual std::expected<void, std::string> Prepare() { return {}; }
+
   // Whether an erase keeps the key readable until the transaction's removal
   // cascade reaches it (Retirer::RemoveLater). Only such resources may be
   // referenced: a referrer's old value may still hand a reader the key's id

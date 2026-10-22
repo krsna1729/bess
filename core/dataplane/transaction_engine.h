@@ -35,7 +35,9 @@ namespace dataplane {
 //   2. reserve: every operation, in request order, does all its fallible work
 //      (Resource::Reserve); then every reference the transaction leaves is
 //      checked -- a value may only name a key that exists afterwards, and a
-//      key may only be erased if nothing references it afterwards. Any
+//      key may only be erased if nothing references it afterwards; then each
+//      resource the transaction touched prepares once (Resource::Prepare: a
+//      resource that rebuilds builds here, once for all its operations). Any
 //      failure aborts every reservation: nothing was published.
 //   3. publish (infallible): upserts in ascending resource rank (referents
 //      first), then erases in descending rank (referrers first), so a packet
@@ -273,6 +275,7 @@ class TransactionEngine {
     std::atomic<size_t> outstanding{0};
     size_t pending_removals = 0;  // cascade steps not yet run
     bool touched = false;         // during Apply: needs EndTransaction()
+    uint32_t last_op = 0;         // during Apply: names a Prepare() refusal
   };
   static Registration &RegistrationOf(const Resource *resource) {
     return *static_cast<Registration *>(resource->registration_);
