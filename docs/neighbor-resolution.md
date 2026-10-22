@@ -50,8 +50,8 @@ FDB already use it. Neighbor state used no timer.
 |---|---|---|
 | create | `Bind(hop, key, now)` | binds a next hop through `NeighborTable`, starts resolution if the neighbor is new |
 | learn | `OnArp(now, ingress, frame)` / `OnNd(now, ingress, frame)` | a valid reply or advertisement resolves the neighbor and publishes its new MAC |
-| refresh | `OnArp` again, or `Poll` when the aging timer fires | re-arms the lifetime, or starts a fresh solicitation |
-| fail | `Poll` after the last probe | publishes `kUnreachable` |
+| refresh | `OnArp` again, or `Poll` when the aging timer fires | re-arms the lifetime; on expiry the neighbor stays `kResolved` and is reconfirmed by probes |
+| fail | `Poll` after the last probe (of a first resolution or a reconfirmation) | publishes `kUnreachable` |
 | recover | `Poll` after the retry interval | publishes `kIncomplete`, solicits again |
 | identity change | `ConfigureInterface` / `RemoveInterface` | cancels timers, invalidates stale replies, republishes |
 
@@ -60,10 +60,10 @@ The state machine is:
 ```text
             Bind                      reply
    (new) --------> kIncomplete ----------------> kResolved
-                       |  ^                          |
-             max probes|  | retry/aging               | lifetime
-                       v  |                          v
-                  kUnreachable -----------------> kIncomplete
+                       |  ^                       |    ^
+             max probes|  | retry        lifetime |    | reply
+                       v  |                       v    |
+                  kUnreachable <-- max probes -- kResolved, reconfirming
 ```
 
 `Poll(now, budget)` returns the solicitations to send and the next-hop updates
@@ -120,9 +120,24 @@ for the new immutable objects and returns them:
 - transactional users build `NextHopOps(router, updates)` and apply them in
   one `TransactionEngine::Apply`: all-or-nothing, but referential rather than
   snapshot visibility, so different hops may change one at a time;
-- the `Router` module uses resolver-owned next-hop operations through the
-  control-side `ResourceRegistry::Apply`. Its next-hop resource rejects
-  ordinary writes and erases for configured resolver-owned ids.
+- the `Router` module applies resolver-owned next-hop operations through the
+  in-process transaction engine, at most 64 per tick in one transaction; the
+  rest wait for the next tick (D-179). Its next-hop resource rejects ordinary
+  writes and erases for configured resolver-owned ids, and its codec does not
+  enumerate them, so desired-state convergence of `<router>/next_hops` leaves
+  them alone while a manifest naming one is refused.
+
+Aging does not stop forwarding: when a resolved neighbor's reachable lifetime
+expires it stays resolved, with its MAC, while the resolver probes it with the
+normal backoff, and becomes unreachable only after `max_probes` unanswered
+probes (RFC 4861 STALE/PROBE). A reply during reconfirmation keeps it resolved
+without republishing. In the `Router` module an unset
+`neighbor_reachable_lifetime`/`neighbor_unreachable_retry` takes the default
+and an explicit 0 means never age / never retry. ARP replies and Neighbor
+Advertisements are queued with the interface id read when they arrive (an
+unknown interface or a full queue drops and counts them); ARP requests and
+Neighbor Solicitations are not resolver input and take the local punt gate, or
+are dropped, and are counted.
 
 In each case a packet-path lookup (`Router::Resolve` /
 `LookupNextHop`) obtains one whole `NextHop` pointer through the `SlotTable`'s

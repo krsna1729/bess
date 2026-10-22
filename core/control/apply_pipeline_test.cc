@@ -1676,6 +1676,77 @@ TEST_F(ApplyPipelineTest, ListedResourcesConvergeAndUnlistedOnesStay) {
   EXPECT_EQ(3u, DefaultGate(*control_plane_));
 }
 
+// A Router whose neighbor resolver owns next hop 1 (RouterArg.neighbor_bindings)
+// and whose manifest lists `static_ids` in rt/next_hops, plus a route to the
+// resolver-owned hop in rt/routes.
+PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids) {
+  bess::pb::RouterArg arg;
+  auto *interface = arg.add_resolver_interfaces();
+  interface->set_id(2);
+  interface->set_egress_gate(1);
+  interface->set_mac(std::string("\x02\x00\x00\x00\x00\x01", 6));
+  interface->set_ipv4("192.0.2.1");
+  auto *binding = arg.add_neighbor_bindings();
+  binding->set_next_hop_id(1);
+  binding->set_interface_id(2);
+  binding->set_ipv4("192.0.2.2");
+  PipelineSpec spec;
+  spec.modules.push_back({"rt", "Router", Packed(arg)});
+  bess::control::ResourceSpec hops{"rt/next_hops", {}};
+  for (uint32_t id : static_ids) {
+    bess::pb::RouterNextHopIdKey key;
+    key.set_id(id);
+    bess::pb::RouterNextHopValue value;
+    value.set_egress_gate(1);  // resolved: the canonical form omits the state
+    value.set_dst_mac(std::string("\x02\x00\x00\x00\x00\xaa", 6));
+    value.set_src_mac(std::string("\x02\x00\x00\x00\x00\x01", 6));
+    hops.entries.push_back({Packed(key), Packed(value)});
+  }
+  spec.resources.push_back(std::move(hops));
+  bess::pb::RouterRouteKey route;
+  route.set_ipv4("198.51.100.0");
+  route.set_prefix_length(24);
+  bess::pb::RouterRouteValue to_resolver_hop;
+  to_resolver_hop.set_next_hop_id(1);
+  spec.resources.push_back({"rt/routes", {{Packed(route), Packed(to_resolver_hop)}}});
+  return spec;
+}
+
+// Resolver-owned next hops are the module's configuration, not entries the
+// resource list owns (D-179): a list of only the static ids converges without
+// erasing (or being refused for) the bound one, and a list that names a
+// resolver-owned id is refused and changes nothing.
+TEST_F(ApplyPipelineTest, ResolverOwnedNextHopsAreOutsideDesiredStateConvergence) {
+  auto applied = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2, 3}), {});
+  ASSERT_TRUE(applied) << applied.error().message;
+  EXPECT_EQ(3u, applied->resource_ops) << "hops 2 and 3, and the route to hop 1";
+
+  auto again = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2, 3}), {});
+  ASSERT_TRUE(again) << again.error().message;
+  EXPECT_EQ(0u, again->resource_ops) << "the bound hop is not an unlisted entry";
+
+  // Hop 3 goes; hop 1 stays, as the route that names it shows.
+  auto shrunk = control_plane_->ApplyPipeline(ResolvingRouterPipeline({2}), {});
+  ASSERT_TRUE(shrunk) << shrunk.error().message;
+  EXPECT_EQ(1u, shrunk->resource_ops);
+  auto hops = ReadResource(*control_plane_, "rt/next_hops");
+  ASSERT_TRUE(hops);
+  ASSERT_EQ(1u, hops->entries.size());
+  bess::pb::RouterNextHopIdKey listed;
+  ASSERT_TRUE(hops->entries[0].key.UnpackTo(&listed));
+  EXPECT_EQ(2u, listed.id());
+  auto routes = ReadResource(*control_plane_, "rt/routes");
+  ASSERT_TRUE(routes);
+  EXPECT_EQ(1u, routes->entries.size()) << "the route to hop 1 still stands";
+
+  // Naming the resolver-owned id is refused, and the apply changes nothing.
+  auto owned = control_plane_->ApplyPipeline(ResolvingRouterPipeline({1, 2, 3}), {});
+  EXPECT_FALSE(owned);
+  hops = ReadResource(*control_plane_, "rt/next_hops");
+  ASSERT_TRUE(hops);
+  EXPECT_EQ(1u, hops->entries.size());
+}
+
 // A listed resource of a module the apply creates is reported, unchecked,
 // even when the list is empty: the apply converges it, and entries the module
 // seeds from its init argument would go without a delta saying so.

@@ -66,7 +66,7 @@ route exists and chose that hop (D-160).
 | `route/neighbor_table.h` | neighbor state keyed by (interface, address family, address); `Bind`/`Update` return the next hops to republish |
 | `route/neighbor_resolver.h` | the IPv4/IPv6 neighbor state machine: ARP or ND solicitation, retries/backoff, aging, MAC change, failure/recovery, interface identity; returns frames and neighbor updates (`docs/neighbor-resolution.md`) |
 | `route/l3_packet.h` | packet mechanics: IPv4 TTL/checksum, IPv6 hop limit, `FlowHash`, MTU, ICMPv4 errors, ARP and IPv6 ND build/parse |
-| `route/forward.h` | the IPv4/IPv6 forwarding chain both callers share (D-157): `ResolveFrame` (read) and `WriteForwarded` (write) |
+| `route/forward.h` | the IPv4 forwarding chain both callers share (D-157): `ResolveFrame` (read) and `WriteForwarded` (write). IPv6 is routed only by the `Router` module's destination mode, which resolves it against the domain's IPv6 table itself; link-local/multicast traffic is never routed (D-179) |
 | `route/connected_routes.h` | the routes an interface address implies (D-178): `DerivedRoutes::Derive` for connected + local, deterministic order and stable keys, `InstallationOps`/`EraseOps` for the controller's transaction |
 | `route/lpm_resource.h` | one IPv4 `LpmRouteTable` as a transaction resource (D-111): prefix → an opaque value whose meaning is the module's |
 | `conntrack/packet_parse.h` | the checked parse the chain starts from |

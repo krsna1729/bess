@@ -24,6 +24,7 @@
 #include "packet_reshape.h"
 #include "route/forward.h"
 #include "route/l3_packet.h"
+#include "runtime/runtime_state.h"
 #include "utils/endian.h"
 #include "utils/ether.h"
 #include "utils/format.h"
@@ -31,6 +32,16 @@
 
 namespace dataplane = bess::dataplane;
 namespace route = bess::route;
+
+// DPDK 25.11's rte_ring_elem.h has no `extern "C"` of its own (rte_ring.h
+// includes it before opening its block), so its out-of-line functions name
+// C++-mangled symbols the library does not define; as handoff.cc and
+// packet_store.cc do, this reaches the C function under another name. The
+// element ring's enqueue/dequeue are inline and need no alias.
+extern "C" rte_ring *BessRouterRingCreateElem(const char *name, unsigned esize,
+                                              unsigned count, int socket_id,
+                                              unsigned flags)
+    __asm__("rte_ring_create_elem");
 
 const Commands Router::cmds = {};
 
@@ -248,12 +259,14 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
         .max_probes = arg.neighbor_max_probes() == 0
                           ? 3
                           : static_cast<uint32_t>(arg.neighbor_max_probes()),
-        .reachable_lifetime = arg.neighbor_reachable_lifetime() == 0
-                                  ? 30000
-                                  : arg.neighbor_reachable_lifetime(),
-        .unreachable_retry = arg.neighbor_unreachable_retry() == 0
-                                  ? 60000
-                                  : arg.neighbor_unreachable_retry(),
+        // Presence, not zero, selects the default: an explicit 0 is the
+        // library's "disabled" (no aging; no retry after a failure).
+        .reachable_lifetime = arg.has_neighbor_reachable_lifetime()
+                                  ? arg.neighbor_reachable_lifetime()
+                                  : 30000,
+        .unreachable_retry = arg.has_neighbor_unreachable_retry()
+                                 ? arg.neighbor_unreachable_retry()
+                                 : 60000,
     };
     auto resolver = route::NeighborResolver::Create(resolver_config);
     if (!resolver) {
@@ -446,9 +459,18 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
             }
             return std::any(hop);
           },
+          // The read-back is desired state (D-129). A resolver-owned next hop
+          // is the module's configuration (RouterArg.neighbor_bindings) and
+          // learned adjacency, not an entry a resource list owns (D-179): it
+          // is not enumerated, so desired-state convergence neither erases
+          // it for being unlisted nor reports it, while a list that names it
+          // is an upsert the resource refuses.
           [this](const auto &visit) {
             router_->ForEachNextHop(
-                [&visit](route::NextHopId id, const route::NextHop &hop) {
+                [this, &visit](route::NextHopId id, const route::NextHop &hop) {
+                  if (router_->IsNeighborManagedNextHop(id)) {
+                    return;
+                  }
                   bess::pb::RouterNextHopIdKey key;
                   key.set_id(id.value());
                   visit(key, NextHopToPb(hop));
@@ -599,39 +621,48 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                 });
           }));
 
+  // Each mode declares only the attribute it reads (D-179). A declared read is
+  // a requirement on every upstream path: a destination-mode Router that
+  // declared `next_hop_id` would invalidate that attribute's scope for the
+  // other readers in the graph wherever its own input (ARP/ND, a VIF) has no
+  // writer, and a next-hop-mode Router has no use for the route domain.
   next_hop_attr_name_ = arg.next_hop_attr().empty() ? "next_hop_id" : arg.next_hop_attr();
-  next_hop_id_attr_ = AddMetadataAttr(next_hop_attr_name_,
-                                      sizeof(bess::utils::be32_t),
-                                      bess::metadata::Attribute::AccessMode::kRead);
-  if (next_hop_id_attr_ < 0) {
-    auto released = router_->Release();
-    CHECK(released) << released.error();
-    next_hops_binding_.Reset();
-    groups_binding_.Reset();
-    routes_binding_.Reset();
-    router_.reset();
-    return CommandFailure(-next_hop_id_attr_, "add_metadata_attr() failed");
-  }
-  // Optional (D-155): the route domain a packet arrived in, which the graph's
-  // VIF writes. No writer means domain 0, the default domain -- the same
-  // attribute name the VIF uses, so a graph gets the packet's own domain with
-  // no configuration on either side. Declared with the default contract: the
-  // framework resolves it at PreResume and the packet path reads the constant
-  // without touching packet metadata when no provider exists.
-  static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
-      kDefaultRouteDomain{};
   domain_attr_name_ = arg.domain_attr().empty() ? "route_domain" : arg.domain_attr();
-  route_domain_attr_ = AddMetadataAttrWithDefault(
-      domain_attr_name_, sizeof(bess::utils::be32_t),
-      bess::metadata::Attribute::AccessMode::kRead, kDefaultRouteDomain);
-  if (route_domain_attr_ < 0) {
-    auto released = router_->Release();
-    CHECK(released) << released.error();
-    next_hops_binding_.Reset();
-    groups_binding_.Reset();
-    routes_binding_.Reset();
-    router_.reset();
-    return CommandFailure(-route_domain_attr_, "add_metadata_attr() failed");
+  if (!routes_by_destination()) {
+    next_hop_id_attr_ = AddMetadataAttr(next_hop_attr_name_,
+                                        sizeof(bess::utils::be32_t),
+                                        bess::metadata::Attribute::AccessMode::kRead);
+    if (next_hop_id_attr_ < 0) {
+      auto released = router_->Release();
+      CHECK(released) << released.error();
+      next_hops_binding_.Reset();
+      groups_binding_.Reset();
+      routes_binding_.Reset();
+      router_.reset();
+      return CommandFailure(-next_hop_id_attr_, "add_metadata_attr() failed");
+    }
+  } else {
+    // Optional (D-155): the route domain a packet arrived in, which the
+    // graph's VIF writes. No writer means domain 0, the default domain -- the
+    // same attribute name the VIF uses, so a graph gets the packet's own
+    // domain with no configuration on either side. Declared with the default
+    // contract: the framework resolves it at PreResume and the packet path
+    // reads the constant without touching packet metadata when no provider
+    // exists.
+    static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
+        kDefaultRouteDomain{};
+    route_domain_attr_ = AddMetadataAttrWithDefault(
+        domain_attr_name_, sizeof(bess::utils::be32_t),
+        bess::metadata::Attribute::AccessMode::kRead, kDefaultRouteDomain);
+    if (route_domain_attr_ < 0) {
+      auto released = router_->Release();
+      CHECK(released) << released.error();
+      next_hops_binding_.Reset();
+      groups_binding_.Reset();
+      routes_binding_.Reset();
+      router_.reset();
+      return CommandFailure(-route_domain_attr_, "add_metadata_attr() failed");
+    }
   }
   if (neighbor_resolver_ != nullptr) {
     static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
@@ -648,8 +679,8 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
         std::to_string(next_ring_id.fetch_add(1, std::memory_order_relaxed));
     const std::string rx_name = "rrx" + ring_suffix;
     const std::string tx_name = "rtx" + ring_suffix;
-    neighbor_rx_ring_ =
-        rte_ring_create(rx_name.c_str(), 1024, SOCKET_ID_ANY, 0);
+    neighbor_rx_ring_ = BessRouterRingCreateElem(
+        rx_name.c_str(), sizeof(NeighborFrame), 1024, SOCKET_ID_ANY, 0);
     neighbor_tx_ring_ =
         rte_ring_create(tx_name.c_str(), 1024, SOCKET_ID_ANY, 0);
     if (neighbor_rx_ring_ == nullptr || neighbor_tx_ring_ == nullptr) {
@@ -668,11 +699,10 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
 void Router::CleanupNeighborResolver() {
   neighbor_tick_ = bess::framework::TickEndpoint{};
   if (neighbor_rx_ring_ != nullptr) {
-    bess::PacketHandle handle = nullptr;
-    while (rte_ring_dequeue(
-               neighbor_rx_ring_,
-               reinterpret_cast<void **>(&handle)) == 0) {
-      bess::PacketFree(handle);
+    NeighborFrame frame{};
+    while (rte_ring_dequeue_elem(neighbor_rx_ring_, &frame,
+                                 sizeof(NeighborFrame)) == 0) {
+      bess::PacketFree(frame.packet);
     }
     rte_ring_free(neighbor_rx_ring_);
     neighbor_rx_ring_ = nullptr;
@@ -750,45 +780,94 @@ int Router::OnEvent(bess::Event event) {
   return 0;
 }
 
-void Router::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  if (neighbor_resolver_ != nullptr) {
-    std::array<bess::PacketHandle, bess::PacketBatch::kMaxBurst> forwarded;
-    size_t forwarded_count = 0;
-    const int count = batch->cnt();
-    for (int i = 0; i < count; i++) {
-      bess::PacketRef pkt = batch->packet(i);
-      const uint8_t *frame = pkt.head_data<const uint8_t *>();
-      bool neighbor_frame = false;
-      if (pkt.head_len() >= sizeof(bess::utils::Ethernet)) {
-        const auto *eth =
-            reinterpret_cast<const bess::utils::Ethernet *>(frame);
-        if (eth->ether_type.value() == bess::utils::Ethernet::kArp) {
-          neighbor_frame = true;
-        } else if (eth->ether_type.value() == bess::utils::Ethernet::kIpv6 &&
-                   pkt.head_len() >= sizeof(bess::utils::Ethernet) + 41) {
-          const size_t l3 = sizeof(bess::utils::Ethernet);
-          neighbor_frame =
-              frame[l3 + 6] == route::kIpv6NextHeaderIcmpv6 &&
-              (frame[l3 + 40] == static_cast<uint8_t>(
-                                     route::NdType::kNeighborSolicitation) ||
-               frame[l3 + 40] == static_cast<uint8_t>(
-                                     route::NdType::kNeighborAdvertisement));
+// Resolver input is ARP replies and Neighbor Advertisements only: OnArp and
+// OnNd learn from nothing else, and each call stages a Progress, so a request
+// on a busy segment would only take ring space a reply needs. A request (an
+// ARP request or a Neighbor Solicitation) is this node's responder's business:
+// it goes to the local punt gate, where a graph puts one, or is dropped, and
+// is counted either way. Everything else stays in the batch and is routed.
+void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
+  constexpr size_t kEth = sizeof(bess::utils::Ethernet);
+  // The interface a frame arrived on is read here, with the offsets of the
+  // graph that delivered it, and travels with the frame (NeighborFrame).
+  const bess::metadata::mt_offset_t interface_offset =
+      attr_offset(neighbor_interface_attr_);
+  std::array<bess::PacketHandle, bess::PacketBatch::kMaxBurst> routed;
+  size_t routed_count = 0;
+  const int count = batch->cnt();
+  for (int i = 0; i < count; i++) {
+    bess::PacketRef pkt = batch->packet(i);
+    const uint8_t *frame = pkt.head_data<const uint8_t *>();
+    const size_t len = pkt.head_len();
+    enum class Kind { kRouted, kReply, kRequest, kUnusable } kind = Kind::kRouted;
+    if (len >= kEth) {
+      const auto *eth = reinterpret_cast<const bess::utils::Ethernet *>(frame);
+      if (eth->ether_type.value() == bess::utils::Ethernet::kArp) {
+        if (len < kEth + sizeof(bess::utils::Arp)) {
+          kind = Kind::kUnusable;
+        } else {
+          const auto *arp =
+              reinterpret_cast<const bess::utils::Arp *>(frame + kEth);
+          kind = arp->opcode.value() == bess::utils::Arp::kReply
+                     ? Kind::kReply
+                     : Kind::kRequest;
+        }
+      } else if (eth->ether_type.value() == bess::utils::Ethernet::kIpv6 &&
+                 len > kEth + route::kIpv6HeaderSize &&
+                 frame[kEth + 6] == route::kIpv6NextHeaderIcmpv6) {
+        const uint8_t type = frame[kEth + route::kIpv6HeaderSize];
+        if (type == static_cast<uint8_t>(route::NdType::kNeighborAdvertisement)) {
+          kind = Kind::kReply;
+        } else if (type ==
+                   static_cast<uint8_t>(route::NdType::kNeighborSolicitation)) {
+          kind = Kind::kRequest;
         }
       }
-      if (!neighbor_frame) {
-        forwarded[forwarded_count++] = pkt.handle();
+    }
+    switch (kind) {
+      case Kind::kRouted:
+        routed[routed_count++] = pkt.handle();
         continue;
+      case Kind::kRequest:
+        neighbor_requests_.fetch_add(1, std::memory_order_relaxed);
+        if (punt_local_gate_ != DROP_GATE) {
+          EmitPacket(ctx, pkt, punt_local_gate_);
+        } else {
+          bess::PacketFree(pkt.handle());
+        }
+        continue;
+      case Kind::kReply: {
+        const uint32_t id =
+            bess::metadata::IsValidOffset(interface_offset)
+                ? get_attr_with_offset<bess::utils::be32_t>(interface_offset,
+                                                            pkt)
+                      .value()
+                : 0;
+        // Bounded input: an unknown interface or a full ring fails closed
+        // rather than routing an ARP/ND control frame as IP.
+        NeighborFrame queued{pkt.handle(), id, 0};
+        if (id != 0 && resolver_gates_.contains(id) &&
+            rte_ring_enqueue_elem(neighbor_rx_ring_, &queued,
+                                  sizeof(NeighborFrame)) == 0) {
+          continue;
+        }
+        break;
       }
-      if (rte_ring_enqueue(neighbor_rx_ring_, pkt.handle()) != 0) {
-        // Resolver input is bounded; a full ring fails closed rather than
-        // forwarding an ARP/ND control frame as routed IP.
-        bess::PacketFree(pkt.handle());
-      }
+      case Kind::kUnusable:
+        break;
     }
-    batch->clear();
-    for (size_t i = 0; i < forwarded_count; i++) {
-      batch->add(bess::PacketRef(forwarded[i]));
-    }
+    neighbor_input_drops_.fetch_add(1, std::memory_order_relaxed);
+    bess::PacketFree(pkt.handle());
+  }
+  batch->clear();
+  for (size_t i = 0; i < routed_count; i++) {
+    batch->add(bess::PacketRef(routed[i]));
+  }
+}
+
+void Router::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  if (neighbor_resolver_ != nullptr) {
+    DivertNeighborFrames(ctx, batch);
     if (batch->cnt() == 0) {
       return;
     }
@@ -814,47 +893,80 @@ void Router::QueueNeighborUpdates(
   }
 }
 
+// A neighbor change is a next-hop write, applied through the process's
+// transaction engine like any other (D-179) -- the module is in-tree, so it
+// uses the engine directly; plugins keep the registry's narrower face (D-074).
+// At most kMaxNeighborUpdatesPerTick go in one transaction, so a burst of
+// changes (an interface with many bindings changing identity) is published
+// over several ticks rather than as one transaction the engine's retire budget
+// refuses on every tick. A transaction that is not applied (the engine is
+// busy reclaiming) leaves its updates pending for the next tick; the warning
+// for that is rate-limited, since the tick runs every millisecond.
+void Router::PublishNeighborUpdates(uint64_t now) {
+  if (pending_neighbor_updates_.empty()) {
+    return;
+  }
+  const size_t take =
+      std::min(pending_neighbor_updates_.size(), kMaxNeighborUpdatesPerTick);
+  std::vector<dataplane::Op> ops;
+  ops.reserve(take);
+  for (size_t i = 0; i < take; i++) {
+    const auto &[id, hop] = pending_neighbor_updates_[i];
+    ops.push_back(router_->SetNeighborManagedNextHopOp(id, hop));
+  }
+  const dataplane::TransactionEngine::Result result =
+      bess::runtime::runtime().transactions().Apply(ops);
+  if (result.outcome == dataplane::TransactionEngine::Outcome::kApplied) {
+    pending_neighbor_updates_.erase(
+        pending_neighbor_updates_.begin(),
+        pending_neighbor_updates_.begin() + static_cast<ptrdiff_t>(take));
+    neighbor_warned_ = false;
+    return;
+  }
+  if (neighbor_warned_ && now - neighbor_warned_tick_ < kNeighborWarningInterval) {
+    return;
+  }
+  neighbor_warned_ = true;
+  neighbor_warned_tick_ = now;
+  std::string why = "the engine is busy";
+  for (const auto &op : result.ops) {
+    if (!op.error.empty()) {
+      why = op.error;
+      break;
+    }
+  }
+  LOG(WARNING) << "Router '" << name() << "': "
+               << pending_neighbor_updates_.size()
+               << " neighbor change(s) not yet published (" << why
+               << "); retrying";
+}
+
 void Router::ResolverTick(bess::framework::TickContext &ctx) {
   if (neighbor_resolver_ == nullptr) {
     return;
   }
   const uint64_t now = ctx.tick();
   constexpr unsigned kResolverWorkBudget = 64;
-  const bess::metadata::mt_offset_t interface_offset =
-      attr_offset(neighbor_interface_attr_);
   for (unsigned n = 0; n < kResolverWorkBudget && !ctx.Expired(); n++) {
-    bess::PacketHandle handle = nullptr;
-    if (rte_ring_dequeue(neighbor_rx_ring_,
-                         reinterpret_cast<void **>(&handle)) != 0) {
+    NeighborFrame queued{};
+    if (rte_ring_dequeue_elem(neighbor_rx_ring_, &queued,
+                              sizeof(NeighborFrame)) != 0) {
       break;
     }
-    bess::PacketRef pkt(handle);
-    if (!bess::metadata::IsValidOffset(interface_offset) ||
-        pkt.head_len() < sizeof(bess::utils::Ethernet)) {
-      bess::PacketFree(handle);
-      continue;
-    }
-    const uint32_t id =
-        get_attr_with_offset<bess::utils::be32_t>(interface_offset, pkt)
-            .value();
-    if (id > std::numeric_limits<uint16_t>::max() ||
-        !resolver_gates_.contains(id)) {
-      bess::PacketFree(handle);
-      continue;
-    }
+    // The interface was checked against resolver_gates_ when the frame was
+    // queued; interface ids are 16 bits (InterfaceOf), so it fits.
+    const bess::PacketRef pkt(queued.packet);
     const auto *frame = pkt.head_data<const uint8_t *>();
     const std::span<const uint8_t> bytes(frame, pkt.head_len());
-    route::NeighborResolver::Progress progress;
+    const dataplane::InterfaceId ingress(
+        static_cast<uint16_t>(queued.interface));
     const auto *eth = reinterpret_cast<const bess::utils::Ethernet *>(frame);
-    if (eth->ether_type.value() == bess::utils::Ethernet::kArp) {
-      progress = neighbor_resolver_->OnArp(
-          now, dataplane::InterfaceId(static_cast<uint16_t>(id)), bytes);
-    } else {
-      progress = neighbor_resolver_->OnNd(
-          now, dataplane::InterfaceId(static_cast<uint16_t>(id)), bytes);
-    }
+    const route::NeighborResolver::Progress progress =
+        eth->ether_type.value() == bess::utils::Ethernet::kArp
+            ? neighbor_resolver_->OnArp(now, ingress, bytes)
+            : neighbor_resolver_->OnNd(now, ingress, bytes);
     QueueNeighborUpdates(progress.updates);
-    bess::PacketFree(handle);
+    bess::PacketFree(queued.packet);
   }
 
   if (!ctx.Expired()) {
@@ -872,20 +984,7 @@ void Router::ResolverTick(bess::framework::TickContext &ctx) {
       }
     }
   }
-  if (!pending_neighbor_updates_.empty()) {
-    std::vector<dataplane::Op> ops;
-    ops.reserve(pending_neighbor_updates_.size());
-    for (const auto &[id, hop] : pending_neighbor_updates_) {
-      ops.push_back(router_->SetNeighborManagedNextHopOp(id, hop));
-    }
-    auto applied = init_context().resources().Apply(ops);
-    if (applied) {
-      pending_neighbor_updates_.clear();
-    } else {
-      LOG(WARNING) << "Router '" << name()
-                   << "': neighbor publication deferred: " << applied.error();
-    }
-  }
+  PublishNeighborUpdates(now);
 }
 
 struct task_result Router::RunTask(Context *ctx, bess::PacketBatch *batch,
@@ -1044,7 +1143,7 @@ void Router::CountVerdict(route::ForwardVerdict verdict) {
       local_frames_.fetch_add(1, std::memory_order_relaxed);
       return;
     case route::ForwardVerdict::kNotIpv4:
-      not_ipv4_frames_.fetch_add(1, std::memory_order_relaxed);
+      not_ip_frames_.fetch_add(1, std::memory_order_relaxed);
       return;
     case route::ForwardVerdict::kMalformed:
       malformed_frames_.fetch_add(1, std::memory_order_relaxed);
@@ -1070,6 +1169,100 @@ void Router::CountVerdict(route::ForwardVerdict verdict) {
     case route::ForwardVerdict::kForward:
       return;
   }
+}
+
+gate_idx_t Router::PuntGateOf(route::ForwardVerdict verdict) const {
+  switch (verdict) {
+    case route::ForwardVerdict::kNoRoute:
+      return punt_miss_gate_;
+    case route::ForwardVerdict::kUnresolved:
+      return punt_unresolved_gate_;
+    case route::ForwardVerdict::kLocalDelivery:
+      return punt_local_gate_;
+    default:
+      return DROP_GATE;
+  }
+}
+
+// Destination mode for an IPv6 frame (D-179). forward.h's chain is IPv4-only,
+// so the steps are spelled here, in its order and with its verdicts and
+// counters: link scope, lookup (with the group flow hash), local hop,
+// blackhole, neighbor, hop limit, then the copy a shared payload needs, the
+// hop-limit decrement (route::DecrementHopLimit; IPv6 has no header checksum)
+// and the addresses when the hop names both.
+gate_idx_t Router::RouteIpv6(bess::PacketBatch *batch, int i,
+                             route::RouteDomainId domain,
+                             const bess::conntrack::ParsedFlowPacket &parsed) {
+  bess::utils::Ipv6Address src;
+  bess::utils::Ipv6Address dst;
+  std::copy(parsed.src.begin(), parsed.src.end(), src.bytes);
+  std::copy(parsed.dst.begin(), parsed.dst.end(), dst.bytes);
+  // A router never forwards a link-local source or destination (RFC 4291
+  // 2.5.6), and multicast is not unicast routing's: Router and Neighbor
+  // Solicitations, MLD and link-local traffic are the node's own business.
+  if (dst.IsLinkLocal() || dst.IsMulticast() || src.IsLinkLocal()) {
+    link_scope_frames_.fetch_add(1, std::memory_order_relaxed);
+    return punt_local_gate_;
+  }
+  uint32_t src_words[4];
+  uint32_t dst_words[4];
+  std::memcpy(src_words, parsed.src.data(), sizeof(src_words));
+  std::memcpy(dst_words, parsed.dst.data(), sizeof(dst_words));
+  const uint32_t hash = route::FlowHash(
+      src_words[0] ^ src_words[1] ^ src_words[2] ^ src_words[3],
+      dst_words[0] ^ dst_words[1] ^ dst_words[2] ^ dst_words[3],
+      parsed.src_port, parsed.dst_port, parsed.protocol, flow_fields_);
+  const route::NextHop *hop = router_->Resolve(domain, dst, hash);
+  bess::PacketRef pkt = batch->packet(i);
+  const size_t l3 = parsed.l3_offset;
+  route::ForwardVerdict verdict = route::ForwardVerdict::kForward;
+  if (hop == nullptr) {
+    verdict = route::ForwardVerdict::kNoRoute;
+  } else if (hop->kind == route::NextHopKind::kLocal) {
+    verdict = route::ForwardVerdict::kLocalDelivery;
+  } else if (hop->egress == bess::dataplane::kInvalidInterfaceId) {
+    verdict = route::ForwardVerdict::kNoEgress;
+  } else if (hop->neighbor != route::NeighborState::kResolved) {
+    verdict = route::ForwardVerdict::kUnresolved;
+  } else if (pkt.head_len() < l3 + route::kIpv6HeaderSize ||
+             pkt.head_data<const uint8_t *>()[l3 + 7] <= 1) {
+    // Checked before the copy below, so an expiring frame is never copied.
+    verdict = route::ForwardVerdict::kTtlExpired;
+  }
+  if (verdict != route::ForwardVerdict::kForward) {
+    CountVerdict(verdict);
+    return PuntGateOf(verdict);
+  }
+  const gate_idx_t gate = GateOf(hop->egress);
+  if (gate == DROP_GATE) {
+    return DROP_GATE;  // configuration, as for IPv4: nothing counted
+  }
+  bess::PacketHandle handle = pkt.handle();
+  if (!bess::packet::EnsureWritable(handle)) {
+    header_write_failures_.fetch_add(1, std::memory_order_relaxed);
+    return DROP_GATE;
+  }
+  batch->handles()[i] = handle;
+  bess::PacketRef writable(handle);
+  // The copy may have resegmented the frame: the header's place is checked
+  // again rather than assumed.
+  if (writable.head_len() < l3 + route::kIpv6HeaderSize) {
+    header_write_failures_.fetch_add(1, std::memory_order_relaxed);
+    return DROP_GATE;
+  }
+  uint8_t *frame = writable.head_data<uint8_t *>();
+  if (route::DecrementHopLimit(std::span<uint8_t>(frame + l3,
+                                                  writable.head_len() - l3)) !=
+      route::TtlResult::kForward) {
+    ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
+    return DROP_GATE;
+  }
+  if (!hop->dst_mac.IsZero() && !hop->src_mac.IsZero()) {
+    auto *eth = reinterpret_cast<bess::utils::Ethernet *>(frame);
+    eth->dst_addr = hop->dst_mac;
+    eth->src_addr = hop->src_mac;
+  }
+  return gate;
 }
 
 // Mode 2 (D-155): the destination path, through the library's forwarding chain
@@ -1158,8 +1351,8 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
   for (size_t k = 0; k < n; k++) {
     const int i = begin + static_cast<int>(k);
     const route::FrameRoute &r = resolved[k];
-    // IPv6 shares the same domain, next-hop, neighbor, group and gate policy;
-    // only its L3 header mutation differs (hop limit, with no header checksum).
+    // forward.h is IPv4-only (D-179): a parsed IPv6 frame comes back as "not
+    // IPv4", and is routed here against the domain's IPv6 routes.
     if (r.verdict == route::ForwardVerdict::kNotIpv4) {
       bess::PacketRef pkt = batch->packet(i);
       bess::conntrack::ParsedFlowPacket parsed;
@@ -1168,63 +1361,7 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
           pkt.total_len());
       if (status == bess::conntrack::ParseStatus::kOk &&
           parsed.l3 == bess::conntrack::L3Kind::kIpv6) {
-        bess::utils::Ipv6Address dst;
-        std::copy(parsed.dst.begin(), parsed.dst.end(), dst.bytes);
-        uint32_t src_words[4], dst_words[4];
-        std::memcpy(src_words, parsed.src.data(), sizeof(src_words));
-        std::memcpy(dst_words, parsed.dst.data(), sizeof(dst_words));
-        const uint32_t hash = route::FlowHash(
-            src_words[0] ^ src_words[2] ^ src_words[1] ^ src_words[3],
-            dst_words[0] ^ dst_words[2] ^ dst_words[1] ^ dst_words[3],
-            parsed.src_port, parsed.dst_port, parsed.protocol, flow_fields_);
-        const route::NextHop *hop = router_->Resolve(domain, dst, hash);
-        route::ForwardVerdict verdict = route::ForwardVerdict::kForward;
-        if (hop == nullptr) {
-          verdict = route::ForwardVerdict::kNoRoute;
-        } else if (hop->egress == bess::dataplane::kInvalidInterfaceId) {
-          verdict = route::ForwardVerdict::kNoEgress;
-        } else if (hop->neighbor != route::NeighborState::kResolved) {
-          verdict = route::ForwardVerdict::kUnresolved;
-        } else if (pkt.head_len() <= static_cast<size_t>(parsed.l3_offset) + 7 ||
-                   pkt.head_data<const uint8_t *>()[parsed.l3_offset + 7] <= 1) {
-          verdict = route::ForwardVerdict::kTtlExpired;
-        }
-        if (verdict != route::ForwardVerdict::kForward) {
-          CountVerdict(verdict);
-          const gate_idx_t punt =
-              verdict == route::ForwardVerdict::kNoRoute
-                  ? punt_miss_gate_
-                  : verdict == route::ForwardVerdict::kUnresolved
-                        ? punt_unresolved_gate_
-                        : DROP_GATE;
-          if (punt != DROP_GATE) {
-            gates[i] = punt;
-          }
-          continue;
-        }
-        const gate_idx_t gate = GateOf(hop->egress);
-        if (gate == DROP_GATE) {
-          continue;
-        }
-        bess::PacketHandle handle = pkt.handle();
-        if (!bess::packet::EnsureWritable(handle)) {
-          header_write_failures_.fetch_add(1, std::memory_order_relaxed);
-          continue;
-        }
-        batch->handles()[i] = handle;
-        bess::PacketRef writable(handle);
-        if (writable.head_len() <= static_cast<size_t>(parsed.l3_offset) + 7) {
-          header_write_failures_.fetch_add(1, std::memory_order_relaxed);
-          continue;
-        }
-        uint8_t *frame = writable.head_data<uint8_t *>();
-        --frame[parsed.l3_offset + 7];
-        if (!hop->dst_mac.IsZero() && !hop->src_mac.IsZero()) {
-          auto *eth = reinterpret_cast<bess::utils::Ethernet *>(frame);
-          eth->dst_addr = hop->dst_mac;
-          eth->src_addr = hop->src_mac;
-        }
-        gates[i] = gate;
+        gates[i] = RouteIpv6(batch, i, domain, parsed);
         continue;
       }
     }
@@ -1236,17 +1373,7 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
       // record of what happened. A local route's frame is not a failure: it is
       // delivered to this node's local path, and its gate is the one the graph
       // gave for that (D-178).
-      const gate_idx_t punt =
-          r.verdict == route::ForwardVerdict::kNoRoute
-              ? punt_miss_gate_
-              : r.verdict == route::ForwardVerdict::kUnresolved
-                    ? punt_unresolved_gate_
-                    : r.verdict == route::ForwardVerdict::kLocalDelivery
-                          ? punt_local_gate_
-                          : DROP_GATE;
-      if (punt != DROP_GATE) {
-        gates[i] = punt;
-      }
+      gates[i] = PuntGateOf(r.verdict);
       continue;
     }
     const gate_idx_t gate = GateOf(r.egress);
@@ -1301,17 +1428,19 @@ std::string Router::GetDesc() const {
   } else {
     desc = bess::utils::Format(
         "%zu routes, %zu next hops, %zu groups, %zu header write failures, routing by "
-        "destination (not ipv4: %zu, malformed: %zu, non-initial fragments: %zu, "
-        "no route: %zu, unresolved: %zu, ttl expired: %zu, blackholed: %zu, local: %zu)",
+        "destination (not ip: %zu, malformed: %zu, non-initial fragments: %zu, "
+        "no route: %zu, unresolved: %zu, ttl expired: %zu, blackholed: %zu, local: %zu, "
+        "link scope: %zu)",
         router_->route_count(), router_->next_hop_count(),
         router_->next_hop_group_count(),
         static_cast<size_t>(header_write_failures()),
-        static_cast<size_t>(not_ipv4_frames()), static_cast<size_t>(malformed_frames()),
+        static_cast<size_t>(not_ip_frames()), static_cast<size_t>(malformed_frames()),
         static_cast<size_t>(non_initial_fragments()), static_cast<size_t>(no_route_frames()),
         static_cast<size_t>(unresolved_frames()),
         static_cast<size_t>(ttl_expired_frames()),
         static_cast<size_t>(blackholed_frames()),
-        static_cast<size_t>(local_frames()));
+        static_cast<size_t>(local_frames()),
+        static_cast<size_t>(link_scope_frames()));
     // A punt is configuration a reader has to know about (D-162): without it,
     // the counters above mean "dropped". Only the destination path has punt
     // gates -- the next-hop-id path forwards what the attribute names and
@@ -1325,6 +1454,18 @@ std::string Router::GetDesc() const {
     }
     if (punt_local_gate_ != DROP_GATE) {
       desc += bess::utils::Format(", a local address punts to gate %d",
+                                  punt_local_gate_);
+    }
+  }
+  if (neighbor_resolver_ != nullptr) {
+    desc += bess::utils::Format(
+        ", %zu neighbors (requests: %zu, input drops: %zu, unpublished changes: %zu)",
+        neighbor_resolver_->size(), static_cast<size_t>(neighbor_requests()),
+        static_cast<size_t>(neighbor_input_drops()), pending_neighbor_updates());
+    // ARP requests and Neighbor Solicitations take the local punt gate in
+    // either mode: they are this node's, not a route's.
+    if (punt_local_gate_ != DROP_GATE && !routes_by_destination()) {
+      desc += bess::utils::Format(", neighbor requests punt to gate %d",
                                   punt_local_gate_);
     }
   }

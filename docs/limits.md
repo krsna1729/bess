@@ -108,6 +108,7 @@ Columns:
 | VXLANEncap | UDP destination port | 4789 | `VXLANEncap::kDefaultDstPort` | `dstport` | — |
 | Dump | sampling interval | 1 s | `DEFAULT_INTERVAL_NS` (`dump.cc`) | `interval` | — |
 | Router | default route domain | 0 | `kDefaultRouteDomainId` (`route/route_domain.h`) | the route key's `domain` | — |
+| Router | neighbor next-hop updates published per tick | 64 | `Router::kMaxNeighborUpdatesPerTick` (`modules/router.h`) | No | the rest stay pending for the next tick (D-179) |
 
 ## Other fixed constants
 

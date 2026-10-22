@@ -40,22 +40,38 @@
 //  2. ROUTE_MODE_DESTINATION. The module decides, the way the router
 //     appliance does (examples/appliances/router) and with the same library
 //     calls: the route domain the packet carries (a `route_domain` be32
-//     attribute a VIF writes; domain 0 when nothing writes it) and the
-//     parses the frame, looks the IPv4 or IPv6 destination up in that domain,
-//     checks the neighbor, decrements the TTL/hop limit and writes the hop's
-//     addresses; the packet leaves on the hop's egress gate. A route names a
-//     next hop or a next-hop group; a group route picks its member by the
-//     frame's flow hash, so a flow keeps one member in both paths. A frame
-//     whose headers do not parse, a non-initial fragment (its L4 header is in
-//     an earlier fragment, so it cannot be hashed consistently), and an
-//     unsupported family are dropped and counted. The `next_hop_id` attribute
-//     is ignored in this mode, even if some module writes it.
+//     attribute a VIF writes; domain 0 when nothing writes it) selects the
+//     FIB. An IPv4 frame goes through the library's forwarding chain
+//     (route/forward.h, D-157), which parses the frame, looks the destination
+//     up in that domain, checks the neighbor, decrements the TTL and writes
+//     the hop's addresses. forward.h is IPv4-only: an IPv6 frame is resolved
+//     here, against the domain's IPv6 routes, with the same hop, neighbor,
+//     group and punt policy, route::DecrementHopLimit and the same address
+//     write (D-179). Link-scoped IPv6 -- a link-local or multicast destination,
+//     or a link-local source -- is never forwarded (RFC 4291 2.5.6): it goes
+//     to the local punt gate, or is dropped, and is counted either way. A
+//     packet leaves on its hop's egress gate. A route names a next hop or a
+//     next-hop group; a group route picks its member by the frame's flow hash,
+//     so a flow keeps one member in both paths. A frame whose headers do not
+//     parse, a non-initial IPv4 fragment (its L4 header is in an earlier
+//     fragment, so it cannot be hashed consistently), and a frame that is
+//     neither IPv4 nor IPv6 are dropped and counted. The `next_hop_id`
+//     attribute is ignored in this mode, even if some module writes it.
 //
 // Both modes drop a packet whose hop is unknown, or whose neighbor is not
 // resolved: what to do toward an unresolved neighbor (queue, punt, drop) is
 // the application's, and dropping is the choice that never forwards on a
 // guess. docs/routing.md is the guide: the library's pieces, the two recipes
 // and what a graph decides.
+//
+// Neighbor resolution (D-179). With `resolver_interfaces` and
+// `neighbor_bindings`, the module owns those next hops' adjacencies: a
+// route::NeighborResolver solicits (ARP, ND) from a task, learns from ARP
+// replies and Neighbor Advertisements, ages and fails neighbors, and
+// publishes each change as a next-hop update through the engine on the
+// maintenance tick. ARP requests and Neighbor Solicitations are not the
+// resolver's: they go to the local punt gate, or are dropped, and are counted.
+// docs/neighbor-resolution.md describes the state machine.
 //
 // A resolved hop that names both of its addresses has them written into the
 // frame's Ethernet header before it leaves -- through the forwarding chain in
@@ -124,13 +140,13 @@ class Router final : public Module {
   }
 
   // What destination routing dropped, by reason (relaxed, as above): a frame
-  // that is not IP, one whose headers do not parse, one that is not the first
-  // fragment of its datagram, one the FIB has no route for, one whose hop's
-  // neighbor is not resolved, one whose TTL ran out, one whose hop forwards
-  // nowhere (a blackhole route, D-160), and one the route says is this node's
-  // own address (local delivery, D-178).
-  uint64_t not_ipv4_frames() const noexcept {
-    return not_ipv4_frames_.load(std::memory_order_relaxed);
+  // that is neither IPv4 nor IPv6, one whose headers do not parse, one that
+  // is not the first fragment of its datagram, one the FIB has no route for,
+  // one whose hop's neighbor is not resolved, one whose TTL or hop limit ran
+  // out, one whose hop forwards nowhere (a blackhole route, D-160), and one
+  // the route says is this node's own address (local delivery, D-178).
+  uint64_t not_ip_frames() const noexcept {
+    return not_ip_frames_.load(std::memory_order_relaxed);
   }
   uint64_t malformed_frames() const noexcept {
     return malformed_frames_.load(std::memory_order_relaxed);
@@ -155,6 +171,29 @@ class Router final : public Module {
   uint64_t local_frames() const noexcept {
     return local_frames_.load(std::memory_order_relaxed);
   }
+  // IPv6 frames that must not be forwarded (D-179): a link-local or multicast
+  // destination, or a link-local source. Like local frames, they go to
+  // punt_local_gate or are dropped, and are counted either way.
+  uint64_t link_scope_frames() const noexcept {
+    return link_scope_frames_.load(std::memory_order_relaxed);
+  }
+  // ARP requests and Neighbor Solicitations a resolving router received: not
+  // the resolver's input, so they go to punt_local_gate or are dropped, and
+  // are counted either way.
+  uint64_t neighbor_requests() const noexcept {
+    return neighbor_requests_.load(std::memory_order_relaxed);
+  }
+  // ARP replies and Neighbor Advertisements dropped before the resolver saw
+  // them: no readable interface id, an interface the resolver does not have,
+  // or a full input ring.
+  uint64_t neighbor_input_drops() const noexcept {
+    return neighbor_input_drops_.load(std::memory_order_relaxed);
+  }
+  // Neighbor changes learned but not yet published (they wait for a later
+  // tick when the engine is busy or a tick's cap is reached).
+  size_t pending_neighbor_updates() const noexcept {
+    return pending_neighbor_updates_.size();
+  }
 
  private:
   // Mode 1 (D-155): resolve the `next_hop_id` each packet carries.
@@ -172,11 +211,39 @@ class Router final : public Module {
   // not a drop; kNoEgress is the blackhole shape (D-160), counted apart from a
   // miss because the route exists and chose that hop.
   void CountVerdict(bess::route::ForwardVerdict verdict);
+  // The gate a counted, unforwarded verdict sends its frame to (D-162,
+  // D-178): the miss, unresolved or local punt gate, else DROP_GATE.
+  gate_idx_t PuntGateOf(bess::route::ForwardVerdict verdict) const;
+  // Destination mode for one IPv6 frame (forward.h is IPv4-only): resolves,
+  // counts, and writes the hop limit and addresses. Returns the frame's gate.
+  gate_idx_t RouteIpv6(bess::PacketBatch *batch, int i,
+                       bess::route::RouteDomainId domain,
+                       const bess::conntrack::ParsedFlowPacket &parsed);
+  // Takes resolver input (ARP replies, Neighbor Advertisements) out of the
+  // batch onto the receive ring, punts or drops ARP requests and Neighbor
+  // Solicitations, and leaves everything else in the batch.
+  void DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch);
+  // Publishes at most kMaxNeighborUpdatesPerTick pending neighbor changes in
+  // one transaction; the rest wait for the next tick.
+  void PublishNeighborUpdates(uint64_t now);
   void ResolverTick(bess::framework::TickContext &ctx);
   void QueueNeighborUpdates(
       std::span<const std::pair<bess::route::NextHopId,
                                 bess::route::NextHop>> updates);
   void CleanupNeighborResolver();
+
+  // One resolver input frame on the receive ring: the packet and the
+  // interface it arrived on, read when the worker enqueued it (metadata
+  // offsets may move at the next resume; the frame's interface does not).
+  struct NeighborFrame {
+    bess::PacketHandle packet;
+    uint32_t interface;
+    uint32_t reserved;
+  };
+  static_assert(sizeof(NeighborFrame) % 4 == 0, "an rte_ring element size");
+  static constexpr size_t kMaxNeighborUpdatesPerTick = 64;
+  // At most one publication warning per this many maintenance ticks.
+  static constexpr uint64_t kNeighborWarningInterval = 1000;
 
   std::unique_ptr<bess::route::Router> router_;
   // After router_, which owns the resources they bind (D-044).
@@ -185,13 +252,17 @@ class Router final : public Module {
   bess::framework::ResourceBinding routes_binding_;
   std::unique_ptr<bess::route::NeighborResolver> neighbor_resolver_;
   bess::framework::TickEndpoint neighbor_tick_;
-  rte_ring *neighbor_rx_ring_ = nullptr;
+  rte_ring *neighbor_rx_ring_ = nullptr;  // NeighborFrame elements
   rte_ring *neighbor_tx_ring_ = nullptr;
   int neighbor_interface_attr_ = -1;
   std::string neighbor_interface_attr_name_;
+  // Fixed after Init, so workers read it without a lock.
   std::unordered_map<uint32_t, gate_idx_t> resolver_gates_;
   std::vector<std::pair<bess::route::NextHopId, bess::route::NextHop>>
       pending_neighbor_updates_;
+  // When the last publication warning was given (maintenance ticks).
+  uint64_t neighbor_warned_tick_ = 0;
+  bool neighbor_warned_ = false;
   int next_hop_id_attr_ = -1;
   // The registered names, for the log lines that name them.
   std::string next_hop_attr_name_;
@@ -215,7 +286,7 @@ class Router final : public Module {
   // default is the whole flow, so this only differs when a graph says so.
   bess::route::FlowHashFields flow_fields_ = bess::route::FlowHashFields::kL3L4;
   std::atomic<uint64_t> header_write_failures_{0};
-  std::atomic<uint64_t> not_ipv4_frames_{0};
+  std::atomic<uint64_t> not_ip_frames_{0};
   std::atomic<uint64_t> malformed_frames_{0};
   std::atomic<uint64_t> non_initial_fragments_{0};
   std::atomic<uint64_t> no_route_frames_{0};
@@ -227,6 +298,12 @@ class Router final : public Module {
   // A route said the destination is this node's address (D-178): delivery, not
   // a drop and not a miss.
   std::atomic<uint64_t> local_frames_{0};
+  // An IPv6 frame of link scope (D-179): never forwarded.
+  std::atomic<uint64_t> link_scope_frames_{0};
+  // ARP requests and Neighbor Solicitations: punted or dropped, not resolved.
+  std::atomic<uint64_t> neighbor_requests_{0};
+  // Resolver input dropped before the resolver saw it.
+  std::atomic<uint64_t> neighbor_input_drops_{0};
 };
 
 #endif  // BESS_MODULES_ROUTER_H_

@@ -12325,3 +12325,67 @@ result field is no longer an error at resume: nothing reads it, so nothing is wr
 
 **Revisit when:** a consumer needs a result field's absence to be an error (then a per-field required flag),
 or the metadata pass gains per-path offsets.
+## D-179 The Router routes IPv6 by destination and resolves its own neighbors
+
+**Status:** accepted (2026-10-22). **Code:** `core/route/route_table.{h,cc}` (`Ipv6RouteTable`,
+`Ipv6Prefix`), `core/route/router.cc` (`RouteResource` IPv6 staging), `core/route/neighbor_resolver.h`
+(aging), `core/modules/router.{h,cc}`, `protobuf/module_msg.proto` (`RouterArg` 13, 14, 22, 23),
+`docs/routing.md`, `docs/neighbor-resolution.md`.
+
+**Context.** D-176 and D-178 left IPv6 routing for "when an IPv6 FIB lands", and the Router module sent no
+ARP/ND of its own (D-153 wrote only the addresses a controller resolved). The Router now holds a per-domain
+IPv6 longest-prefix table beside the IPv4 FIB, and can own a `NeighborResolver` (D-175, D-176) for the next
+hops a `RouterArg.neighbor_bindings` entry names.
+
+**Decision.**
+- *IPv6 routes are staged, bounded and published once per transaction.* A transaction's IPv6 operations edit
+  one copy of each touched table (`Ipv6RouteTable::Stage`), and the copy is published by one pointer exchange
+  with the old snapshot retired through RCU, as the engine's retire budget declares. An aborted transaction
+  leaves the table unchanged, and the publication path allocates nothing. `max_routes` bounds the IPv6 table as
+  it bounds the IPv4 one. `Ipv6Prefix` is constructible only through its validating `Make`.
+- *IPv6 is resolved in the module, not in `forward.h`.* The shared `ResolveFrame(s)` path (R1) stays IPv4-only.
+  Destination mode routes an IPv6 frame through the domain's table with the same verdicts as IPv4 (local,
+  blackhole, unresolved, hop limit). A link-local or multicast destination, or a link-local source, is
+  link-scoped (RFC 4291 2.5.6): it is never routed, and it takes the local punt gate or is dropped, counted as
+  `link scope`.
+- *Aging keeps forwarding while it reconfirms.* A resolved neighbor whose reachable lifetime expires stays
+  resolved, with its MAC, while the resolver probes it with the normal backoff. It becomes unreachable only
+  after `max_probes` unanswered probes, and a reply during reconfirmation keeps it resolved without
+  republishing (RFC 4861 STALE/PROBE, not a drop on every expiry).
+- *Neighbor input is bounded and attributed when it arrives.* ARP replies and Neighbor Advertisements are
+  queued with the interface id read at enqueue, after it is checked against the resolver's interfaces. An
+  unknown interface or a full queue drops and counts the frame. ARP requests and Neighbor Solicitations are not
+  resolver input: they take the local punt gate (or are dropped) and are counted.
+- *Neighbor changes are published through the in-process engine, in bounded batches.* Each tick applies at
+  most 64 next-hop updates in one transaction and keeps the rest for the next tick. D-074 stands: there is no
+  public `ResourceRegistry::Apply`, and the resource registry and engine are unchanged by this decision.
+- *Resolver-owned next hops are module configuration, not resource entries.* The next-hop resource refuses
+  writes and erases of a bound id. Its codec does not enumerate one, so desired-state convergence (D-129,
+  D-148) never erases a bound hop for being unlisted, and a manifest that names one is an upsert that is
+  refused.
+- *Each mode declares only the attribute it reads.* The next-hop mode declares `next_hop_attr`; destination
+  mode declares `domain_attr`. A declared read is a requirement on every path into the module, so a
+  destination-mode Router fed by a path with no next-hop writer no longer invalidates that attribute's scope
+  for the next-hop readers sharing the graph.
+- *Explicit zero is a value.* `neighbor_reachable_lifetime` and `neighbor_unreachable_retry` are `optional`.
+  An unset field takes the default, and an explicit 0 is the library's "never age" / "never retry".
+
+**Consequences.** D-153's "the Router sends no ARP/ND" no longer holds for a Router with resolver
+interfaces. The D-176/D-178 "IPv6 FIB lands" trigger has fired for routing (route derivation stays IPv4-only).
+D-065's note that IPv6 is not built is superseded for the Router module. Neighbor changes advance the
+engine generation, so a controller that writes with `expected_generation` can see a conflict after a neighbor
+change and must re-read. A read-back of `<router>/next_hops` omits bound hops; their state is learned, not
+desired. Reaching the engine makes `core/modules/router.cc` the one module that includes
+`runtime/runtime_state.h`: `tools/check_includes.py` exempts that file by name from D-042's rule, because the
+alternative, putting transaction application on `ModuleInitContext` or `ResourceRegistry`, is the plugin-API
+widening D-074 refuses.
+
+**Evidence.** `route_route_test` (`Ipv6RouteTableTest.*`), `route_router_transaction_test` (IPv6
+atomicity, abort, `max_routes` bound, and allocation-free publication), `route_neighbor_resolver_test`
+(aging, reconfirmation, poll fault steps), `modules_router_test` (IPv6 local and link-scope gates, request
+punting, input drops, explicit-zero aging, the 64-per-tick publication cap, and mode-specific attributes) and
+`control_apply_pipeline_test` (`ResolverOwnedNextHopsAreOutsideDesiredStateConvergence`). The full suite
+(`meson test -C build/fast --no-suite live`) is the gate.
+
+**Revisit when:** a controller needs resolver state in desired-state read-back, the per-tick cap shows up as
+convergence latency, or IPv6 enters the shared `forward.h` path.

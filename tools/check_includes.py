@@ -210,8 +210,11 @@ FORBIDDEN_RULES = [
     ),
     # Modules obtain runtime facilities through Module::init_context() (D-042),
     # never by including the runtime state. Tests and benchmarks are exempt.
+    # One in-tree exception (D-179): the Router publishes its resolver's
+    # neighbor updates through the process's transaction engine, which D-074
+    # keeps off the plugin-facing context.
     (
-        re.compile(r"^core/modules/"),
+        re.compile(r"^core/modules/(?!router\.cc$)"),
         [
             ("runtime/", "modules must use Module::init_context(), not runtime"),
         ],
