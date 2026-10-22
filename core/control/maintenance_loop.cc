@@ -32,6 +32,7 @@ MaintenanceLoop::MaintenanceLoop(ControlPlane &control, framework::RequestHub &r
         1, static_cast<uint64_t>(pressure_period.count() / std::max<int64_t>(1, interval.count())));
   }
   if (interval_.count() > 0) {
+    tick_hub_.set_interval(interval_);
     thread_ = std::thread([this] { Run(); });
   }
 }
@@ -44,6 +45,7 @@ MaintenanceLoop::~MaintenanceLoop() {
   stop_cv_.notify_all();
   if (thread_.joinable()) {
     thread_.join();
+    tick_hub_.set_interval(std::chrono::microseconds(0));
   }
 }
 

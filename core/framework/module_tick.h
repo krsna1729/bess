@@ -126,6 +126,16 @@ class TickHub {
   std::vector<PendingEvent> TakeEvents();
 
   size_t size() const noexcept { return slots_.size(); }
+  // The maintenance loop's interval: how much time one tick stands for, so a
+  // module can turn a configured duration into ticks. Zero when no loop runs
+  // (the daemon's --maintenance_interval_us=0): no endpoint is ever called.
+  // The loop sets it while it runs; a test standing in for the loop sets its
+  // own.
+  std::chrono::microseconds interval() const noexcept { return interval_; }
+  void set_interval(std::chrono::microseconds interval) noexcept { interval_ = interval; }
+  // The tick count of the latest Run() (0 before the first): the clock a
+  // module started from Init should start at.
+  uint64_t current_tick() const noexcept { return current_tick_; }
   // Calls that ran past their slice, since the hub was created.
   uint64_t overruns() const noexcept { return overruns_; }
   // Calls made, since the hub was created.
@@ -142,6 +152,8 @@ class TickHub {
   std::vector<PendingEvent> events_;
   uint64_t overruns_ = 0;
   uint64_t calls_ = 0;
+  uint64_t current_tick_ = 0;
+  std::chrono::microseconds interval_{0};
 };
 
 inline void TickContext::Emit(std::string type, std::string source,

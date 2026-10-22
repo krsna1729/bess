@@ -13,6 +13,7 @@ void TickHub::Remove(detail::TickSlot *slot) noexcept {
 }
 
 size_t TickHub::Run(Clock::duration slice, uint64_t tick) {
+  current_tick_ = tick;
   size_t called = 0;
   // A callback may open endpoints and close others (a module command it
   // triggers): iterate over a copy and skip slots removed meanwhile.
