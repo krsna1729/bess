@@ -792,17 +792,17 @@ rules. Uniform records contain 1–8 four-byte fields; `mixed8` and `mixed16`
 use heterogeneous widths. The second table holds 100%, 50%, 30%, 20%, 10%,
 or 5% as many entries (mixed-width arms use 100%, 50%, and 20%).
 
-Hits use the connected gate 0 and misses drop. After each measurement the
-runner pauses workers and checks that every source packet traversed the first
-classifier, the second classifier when present, and the metadata reader.
-A failed check discards the timing and counters instead of reporting a
-successful measurement of an incomplete path.
+Hits use connected gate 0 and misses drop. At ratio R, both arms use the same
+rule→action→result mapping: rule i produces record i modulo
+max(1, floor(N×R/100)). Each direct arm therefore has its own `/rR` case;
+the two-stage arm stores the same record behind that action ID.
 
-**Earlier placement figures are invalid.** The original arms sent hits to
-unconnected gate 1 while connecting gate 0. They measured classification and
-result handling followed by a dead end, not the complete pipeline; the second
-lookup and reader were not reached. Do not use those figures or their claimed
-crossover points to choose an architecture.
+After timing, the runner pauses workers and checks every required stage's
+forwarded count. It then installs a verifier keyed by the original packet
+source and every result byte, resumes traffic briefly, and checks that none
+of that traffic was rejected. Eight-result-field cases use two verifier
+tables to respect ExactMatch's eight-key-field limit. Verifiers are absent
+from the measured graph. Failed path or byte checks discard the sample.
 
 Use the same corrected runner for both daemon builds, pinned to an isolated
 core with its SMT sibling offline. Save raw rounds with `--save`; compare
@@ -812,60 +812,81 @@ all-ones tuple in these arms: results do not establish the cost of a
 many-tuple wildcard policy. Turbo-off does not guarantee a fixed clock on a
 laptop, so record the platform power profile too.
 
-#### Corrected EM/WM placement comparison
+#### Final EM/WM placement comparison
 
-The final implementation uses inline `RecordArena` accessors. The matrix
-varies:
+The final implementation uses inline `RecordArena` accessors and the existing
+bucketed `ResultPlan` kernels. The matrix varies:
 
 - Rule-table size N: 1,024 or 65,536.
 - Uniform result size M: 1–8 four-byte fields (4–32 bytes).
 - Heterogeneous value mix: `mixed8` uses 4+2+1+1-byte fields; `mixed16`
   uses 8+4+2+1+1-byte fields.
 - Second-table ratio R: 100%, 50%, 30%, 20%, 10%, or 5%; mixed layouts use
-  100%, 50%, and 20%.
+  100%, 50%, and 20%. R is the number of distinct actions divided by N.
 
-Both direct EM/WM and two-stage EM→EM / WM→EM are measured. Packet size is
-fixed at 64 bytes and the lookup key at four bytes; there is no packet-size or
-key-width sweep. All 256 placement cases passed the path validator. Values
-below are median `cycles/packet / ns/packet` after subtracting `M.base` per run.
+All 432 placement cases passed the path and result-byte validators in both
+rounds of both builds. Each round used 1.5 s measurement and 0.3 s warmup,
+CPU 4 isolated, sibling CPU 5 offline, turbo off, and the balanced platform
+profile. Packet size was fixed at 64 bytes and the lookup key at four bytes.
+WM used one all-ones tuple, not a multi-tuple wildcard policy.
 
-| R | cases | EM inline | EM→EM | WM inline | WM→EM |
+The tables report the final build only. Each cell is `cycles/packet /
+ns/packet`, with `M.base` subtracted per round before taking the case median.
+The ratio table then takes the median across the listed geometries. This
+baseline subtraction follows the runner's module-cost convention; the values
+are not total pipeline latency.
+
+| R | geometries | EM inline | EM→EM | WM inline | WM→EM |
 |---:|---:|---:|---:|---:|---:|
-| 100% | 20 | 56.27 / 21.71 | 133.52 / 51.42 | 84.89 / 32.71 | 167.25 / 64.44 |
-| 50% | 20 | 56.27 / 21.71 | 130.06 / 50.10 | 84.89 / 32.71 | 165.56 / 63.80 |
-| 30% | 16 | 56.27 / 21.71 | 124.22 / 47.89 | 84.89 / 32.71 | 156.06 / 60.14 |
-| 20% | 20 | 56.27 / 21.71 | 127.06 / 48.96 | 84.89 / 32.71 | 158.34 / 61.02 |
-| 10% | 16 | 56.27 / 21.71 | 121.28 / 46.76 | 84.89 / 32.71 | 152.02 / 58.58 |
-| 5% | 16 | 56.27 / 21.71 | 119.91 / 46.22 | 84.89 / 32.71 | 151.23 / 58.28 |
+| 100% | 20 | 56.08 / 21.65 | 131.95 / 50.85 | 80.44 / 30.97 | 165.75 / 63.85 |
+| 50% | 20 | 56.18 / 21.68 | 129.71 / 49.97 | 80.02 / 30.80 | 162.24 / 62.51 |
+| 30% | 16 | 55.63 / 21.45 | 123.47 / 47.53 | 81.54 / 31.37 | 155.97 / 60.10 |
+| 20% | 20 | 55.71 / 21.49 | 126.97 / 48.90 | 79.39 / 30.56 | 160.07 / 61.69 |
+| 10% | 16 | 55.07 / 21.26 | 122.93 / 47.33 | 78.63 / 30.28 | 152.67 / 58.80 |
+| 5% | 16 | 56.40 / 21.76 | 119.66 / 46.10 | 80.85 / 31.13 | 152.98 / 58.93 |
 
-Direct inline is 53.1–57.9% lower-cost than EM→EM and 43.9–49.2% lower-cost
-than WM→EM across the measured ratios. No two-stage case beat direct placement:
-0/216 matched classifier/ratio/geometry cases, in either measured round.
+Table-size, result-size and field-mix sensitivity at R=20%:
 
-These are the first valid placement comparisons. The earlier claimed
-`up to 27 cycles/packet` reduction and crossover figures are withdrawn:
-their gate mismatch prevented the second classifier and reader from receiving
-the measured traffic, so those results cannot be compared with this sweep.
-Raw rounds are retained locally under `.scratch/recordarena-evidence/`.
-
-A 10-round, 3 s/round repeat at M=4, N=65,536 in the final build:
-
-| classifier | direct inline | two-stage (R=100%) |
-|---|---:|---:|
-| EM | 61.44 / 23.71 | 155.58 / 59.94 |
-| WM | 101.65 / 39.17 | 215.77 / 83.14 |
-
-Raw repeat: `.scratch/recordarena-evidence/repeat10-m4-n65536.json`.
+| N | layout | EM inline | EM→EM | WM inline | WM→EM |
+|---:|---|---:|---:|---:|---:|
+| 1,024 | m1 | 46.88 / 18.07 | 107.00 / 41.18 | 63.40 / 24.38 | 130.79 / 50.37 |
+| 1,024 | m2 | 48.03 / 18.53 | 107.90 / 41.58 | 65.44 / 25.25 | 132.17 / 50.92 |
+| 1,024 | m3 | 55.03 / 21.24 | 115.48 / 44.50 | 75.20 / 28.94 | 140.81 / 54.23 |
+| 1,024 | m4 | 48.13 / 18.60 | 109.12 / 42.04 | 66.17 / 25.48 | 134.81 / 51.91 |
+| 1,024 | m5 | 54.51 / 21.07 | 115.40 / 44.46 | 77.28 / 29.75 | 138.75 / 53.43 |
+| 1,024 | m6 | 55.59 / 21.44 | 117.25 / 45.20 | 78.90 / 30.39 | 140.22 / 54.05 |
+| 1,024 | m7 | 55.38 / 21.37 | 119.39 / 45.99 | 78.62 / 30.28 | 145.82 / 56.16 |
+| 1,024 | m8 | 49.31 / 19.02 | 112.97 / 43.51 | 68.33 / 26.30 | 135.70 / 52.27 |
+| 1,024 | mixed8 | 47.60 / 18.37 | 108.72 / 41.88 | 65.12 / 25.08 | 132.88 / 51.21 |
+| 1,024 | mixed16 | 47.65 / 18.37 | 125.81 / 48.45 | 64.49 / 24.84 | 152.12 / 58.60 |
+| 65,536 | m1 | 65.34 / 25.24 | 140.95 / 54.30 | 114.50 / 44.08 | 201.04 / 77.44 |
+| 65,536 | m2 | 55.84 / 21.53 | 129.08 / 49.71 | 86.03 / 33.11 | 181.72 / 70.01 |
+| 65,536 | m3 | 65.08 / 25.12 | 142.90 / 54.84 | 110.33 / 42.52 | 206.85 / 79.65 |
+| 65,536 | m4 | 62.68 / 24.20 | 135.75 / 52.30 | 79.88 / 30.74 | 176.08 / 67.81 |
+| 65,536 | m5 | 75.64 / 29.17 | 136.41 / 52.56 | 95.93 / 36.93 | 181.45 / 69.87 |
+| 65,536 | m6 | 70.90 / 27.41 | 147.93 / 57.00 | 110.47 / 42.55 | 199.69 / 76.93 |
+| 65,536 | m7 | 90.46 / 34.90 | 172.02 / 66.27 | 148.13 / 57.07 | 234.63 / 90.36 |
+| 65,536 | m8 | 69.18 / 26.75 | 151.36 / 58.30 | 92.93 / 35.80 | 202.73 / 78.10 |
+| 65,536 | mixed8 | 56.86 / 21.94 | 128.13 / 49.35 | 82.39 / 31.73 | 168.02 / 64.78 |
+| 65,536 | mixed16 | 69.14 / 26.66 | 164.78 / 63.47 | 115.71 / 44.54 | 236.17 / 91.00 |
 
 #### Engineering guidance
 
-Prefer direct result placement when each classifier rule already determines
-the final result metadata. It costs 53.1–57.9% less for EM and 43.9–49.2% less
-for WM across the tested ratios than EM→EM / WM→EM. Keep a second stage when
-shared action indirection is a real control-plane requirement; this benchmark
-does not measure the memory or update-cost tradeoff.
+Prefer direct final-result placement for packet-path performance. It won all
+216 matched classifier/ratio/geometry comparisons, in both measured rounds:
+there is no measured crossover. Across the ratio-table medians, direct EM
+cost 52.9–57.5% fewer cycles than EM→EM; direct WM cost 47.2–51.5% fewer than
+WM→EM. This conclusion applies to the tested matrix, not larger tables,
+different key widths, or many-tuple wildcard policies.
 
-“Inline” here means one classifier lookup produces the final result; it does
-not mean arbitrary-width data is embedded in an `rte_hash` scalar. The current
-implementation uses RecordArena for arbitrary-width records. This benchmark
-compares lookup topologies, not `rte_hash` value APIs.
+Keep a second stage only when shared action indirection is required by the
+control-plane design. Memory consumption and update fan-out were not
+measured; do not infer their tradeoffs from packet-processing timings.
+Absolute costs, especially for 65,536 rules, varied between rounds; these
+short laptop measurements do not establish a universal percentage saving.
+
+“Inline” means one classifier produces the final result, not arbitrary-width
+bytes embedded in an `rte_hash` scalar. RecordArena holds the records in both
+topologies. This is not a benchmark of alternative `rte_hash` value APIs.
+Raw rounds are retained locally under `.scratch/recordarena-evidence/matched/`.
+
