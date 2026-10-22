@@ -545,8 +545,12 @@ class Ipv6RouteTable {
   mutable std::mutex writer_mutex_;
   Rules rules_;  // ::/0 included
   std::unique_ptr<Instance> spare_;
-  // The spare's reuse token: unset from a Commit until Committed().
+  // The spare's reuse token: unset from a Commit until Committed(). Not used
+  // while the spare has never been published.
   std::optional<rcu::GracePeriod> spare_token_;
+  // The spare was built and never published: no reader has seen it, so it is
+  // editable without a grace period (an aborted stage leaves it so).
+  bool spare_unpublished_ = false;
   // Prefixes where the spare may differ from rules_.
   std::vector<Ipv6Prefix> spare_lag_;
   bool stage_open_ = false;

@@ -1709,6 +1709,38 @@ TEST(Ipv6RouteTableTest, BackToBackStagesReplayOrRebuildTheSpare) {
   domain.Drain();
 }
 
+// A spare that was built and never published is editable at once: an aborted
+// stage leaves it so, and the next stage replays it rather than waiting for a
+// grace period -- even with a reader online that never quiesces.
+TEST(Ipv6RouteTableTest, AnAbortedStageReusesANeverPublishedSpare) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  auto table = MakeTable6();
+  constexpr uint32_t kReader = 24;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+  EXPECT_EQ(1u, table->builds()) << "the first live instance";
+  for (int attempt = 0; attempt < 3; attempt++) {
+    auto stage = table->BeginStage();
+    ASSERT_TRUE(stage);
+    ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:1::", 48), 1));
+    table->Abort(**stage);
+    EXPECT_EQ(2u, table->builds()) << "attempt " << attempt << ": one spare, reused";
+  }
+  auto stage = table->BeginStage();
+  ASSERT_TRUE(stage);
+  ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:2::", 48), 2));
+  table->Commit(**stage);
+  table->Committed(domain.StartGracePeriod());
+  EXPECT_EQ(2u, table->builds());
+  const std::vector<bess::utils::Ipv6Address> addrs = {V6("2001:db8:1::1"),
+                                                       V6("2001:db8:2::1")};
+  ExpectAgrees6(*table, {{P6("2001:db8:2::", 48), 2}}, addrs);
+  domain.Quiescent(kReader);
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+  domain.Drain();
+}
+
 // Entries are 2 bytes when both the miss marker (max_value + 1) and the tbl8
 // pool fit rte_fib6's 2-byte next hop (2^15 - 1), else 4.
 TEST(Ipv6RouteTableTest, EntrySizeFollowsMaxValueAndTbl8Groups) {

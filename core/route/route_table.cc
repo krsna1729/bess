@@ -524,12 +524,14 @@ bool Ipv6RouteTable::Replay(Instance &instance) {
 }
 
 std::expected<void, RouteError> Ipv6RouteTable::PrepareSpare() {
-  if (spare_ && !spare_token_) {
+  // A spare that was never published needs no grace period: no reader has
+  // been in it. Only an instance a commit unpublished waits for one.
+  if (spare_ && !spare_unpublished_ && !spare_token_) {
     // Committed() has not been called: a grace period started now also
     // covers the exchange that unpublished the spare.
     spare_token_ = domain_.StartGracePeriod();
   }
-  if (spare_ && !domain_.IsComplete(*spare_token_)) {
+  if (spare_ && !spare_unpublished_ && !domain_.IsComplete(*spare_token_)) {
     // A reader may still be in it: it goes to the RCU domain, and a fresh
     // spare is built from the rules.
     domain_.ReserveRetirements(1);
@@ -538,7 +540,7 @@ std::expected<void, RouteError> Ipv6RouteTable::PrepareSpare() {
   }
   if (spare_ && !Replay(*spare_)) {
     // A replay may need a transient tbl8 group a fresh build does not.
-    spare_.reset();  // unpublished and past its grace period
+    spare_.reset();  // unpublished, or past its grace period
   }
   spare_lag_.clear();
   if (!spare_) {
@@ -547,7 +549,8 @@ std::expected<void, RouteError> Ipv6RouteTable::PrepareSpare() {
       return std::unexpected(built.error());
     }
     spare_ = std::move(*built);
-    spare_token_.reset();  // never published
+    spare_token_.reset();
+    spare_unpublished_ = true;
   }
   return {};
 }
@@ -586,6 +589,7 @@ void Ipv6RouteTable::CommitLocked(Stage &stage) noexcept {
   std::unique_ptr<const Instance> old = live_.Exchange(std::move(spare_));
   spare_.reset(const_cast<Instance *>(old.release()));
   spare_token_.reset();
+  spare_unpublished_ = false;
   spare_lag_.swap(stage.touched_);
   // The rules follow, with nodes made in the stage: no allocation.
   for (auto &[prefix, change] : stage.changes_) {
@@ -620,6 +624,7 @@ void Ipv6RouteTable::AbortLocked(Stage &stage) noexcept {
     spare_.reset();
     spare_lag_.clear();
     spare_token_.reset();
+    spare_unpublished_ = false;
   } else {
     spare_lag_.swap(stage.touched_);  // empty since PrepareSpare()
   }
@@ -632,7 +637,7 @@ void Ipv6RouteTable::Abort(Stage &stage) noexcept {
 
 void Ipv6RouteTable::Committed(rcu::GracePeriod token) noexcept {
   std::lock_guard<std::mutex> lock(writer_mutex_);
-  if (spare_ && !spare_token_) {
+  if (spare_ && !spare_unpublished_ && !spare_token_) {
     spare_token_ = token;
   }
 }
