@@ -489,8 +489,9 @@ class NeighborResolver {
   }
 
   // Forgets `hop`'s binding. A neighbor no next hop names any more stops
-  // being resolved here; a learned entry stays in the neighbor table but has
-  // no timers and no solicitations.
+  // being resolved and is forgotten -- its timer, its solicitations and what
+  // was learned about it -- so the table holds only bound neighbors and a
+  // later binding of the same address starts incomplete and solicits.
   void Unbind(NextHopId hop) {
     const std::optional<NeighborTable::Bound> binding =
         neighbors_.BindingOf(hop);
@@ -503,6 +504,16 @@ class NeighborResolver {
       Disarm(entry->second);
       entries_.erase(entry);
     }
+    neighbors_.Forget(binding->key);
+  }
+
+  // The neighbor `hop` is bound to, if any.
+  std::optional<Key> BindingOf(NextHopId hop) const {
+    const std::optional<NeighborTable::Bound> binding = neighbors_.BindingOf(hop);
+    if (!binding) {
+      return std::nullopt;
+    }
+    return binding->key;
   }
 
   // -- events -----------------------------------------------------------------
@@ -1066,7 +1077,8 @@ class NeighborResolver {
     entry.serial++;
   }
 
-  // The neighbor's entry is no longer named by any hop: stop resolving it.
+  // The neighbor's entry is no longer named by any hop: stop resolving it and
+  // forget it.
   void DropIfUnbound(const std::optional<NeighborTable::Bound> &previous,
                      const Key &key) {
     if (!previous || previous->key == key ||
@@ -1078,6 +1090,7 @@ class NeighborResolver {
       Disarm(stale->second);
       entries_.erase(stale);
     }
+    neighbors_.Forget(previous->key);
   }
 
   std::unique_ptr<dataplane::ExpiryWheel<TimerPayload>> wheel_;

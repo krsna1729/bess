@@ -65,6 +65,16 @@ class NeighborTable {
   // dropped). The next hop itself is the caller's to remove.
   void Unbind(NextHopId hop) { Unbind(hop, nullptr); }
 
+  // Drops what was learned about `key` once no next hop is bound to it, so a
+  // later binding starts incomplete instead of reusing an old MAC. A key that
+  // still has bindings is kept.
+  void Forget(Key key) {
+    auto n = neighbors_.find(key);
+    if (n != neighbors_.end() && n->second.hops.empty()) {
+      neighbors_.erase(n);
+    }
+  }
+
   // Records what resolution learned about `key`. Returns every bound next hop
   // with its new object (empty when nothing a next hop carries changed). The
   // list is built before the neighbor changes, so a refused allocation leaves

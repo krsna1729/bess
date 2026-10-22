@@ -531,16 +531,15 @@ TEST(NeighborResolverTest, RetainedLearningDiesWithTheInterfaceGeneration) {
                                      Mac("02:00:00:00:00:aa")));
   ASSERT_EQ(1u, progress.updates.size());
 
-  // Unbinding leaves the learned neighbor in NeighborTable (by design: a
-  // later Bind may reuse a still-valid answer). The resolver's own entry and
-  // timer are gone.
+  // Unbinding the last hop forgets the neighbor: its entry, its timer and
+  // what was learned, so the table holds only bound neighbors.
   resolver->Unbind(NextHopId(1));
-  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+  EXPECT_FALSE(resolver->Find(key).has_value());
+  EXPECT_EQ(0u, resolver->table().size());
   EXPECT_EQ(0u, resolver->size());
   EXPECT_EQ(0u, resolver->armed());
 
-  // A new interface generation must invalidate that retained learning even
-  // though no hop is bound: a rebind must not resurrect the old MAC.
+  // A new interface generation, then a rebind: nothing old is resurrected.
   progress = resolver->ConfigureInterface(
                  Iface(kIface1, "02:00:00:00:00:09", kMyIp), 20)
                  .value();
@@ -558,15 +557,15 @@ TEST(NeighborResolverTest, RetainedLearningDiesWithTheInterfaceGeneration) {
                 .value_or(ArpMessage{})
                 .sender_mac);
 
-  // Removal invalidates retained learning too, including when no hop is
-  // bound: re-adding the interface must not revive the old MAC.
+  // Removal with no hop bound leaves nothing behind either: re-adding the
+  // interface must not revive the old MAC.
   progress = resolver->OnArp(30, kIface1,
                              ReplyTo(progress.solicitations[0].frame,
                                      Mac("02:00:00:00:00:aa")));
   ASSERT_EQ(1u, progress.updates.size());
   resolver->Unbind(NextHopId(2));
   EXPECT_TRUE(resolver->RemoveInterface(kIface1).empty());
-  EXPECT_EQ(NeighborState::kUnreachable, State(*resolver, key).state);
+  EXPECT_FALSE(resolver->Find(key).has_value());
   ASSERT_TRUE(resolver->ConfigureInterface(
                   Iface(kIface1, "02:00:00:00:00:01", kMyIp), 40)
                   .has_value());
@@ -574,6 +573,50 @@ TEST(NeighborResolverTest, RetainedLearningDiesWithTheInterfaceGeneration) {
   ASSERT_TRUE(after_remove.has_value());
   EXPECT_NE(NeighborState::kResolved, after_remove->neighbor);
   EXPECT_EQ(Ethernet::Address{}, after_remove->dst_mac);
+}
+
+// Learning is bounded by the bindings: a neighbor resolved, unbound and bound
+// again starts incomplete and solicits rather than reusing its old MAC, and
+// churn through distinct addresses leaves nothing behind.
+TEST(NeighborResolverTest, ARebindAfterTheLastUnbindStartsIncomplete) {
+  NeighborResolver::Timing timing = TestConfig().timing;
+  timing.reachable_lifetime = 0;  // a kept MAC would never be reconfirmed
+  NeighborResolver::Config config = TestConfig();
+  config.timing = timing;
+  auto resolver = MakeResolver(config);
+  ASSERT_NE(nullptr, resolver);
+  ASSERT_TRUE(resolver->ConfigureInterface(Iface(kIface1, "02:00:00:00:00:01",
+                                                 kMyIp),
+                                           0)
+                  .has_value());
+  const NeighborResolver::Key key = Key(kIface1, kPeer1);
+  ASSERT_TRUE(resolver->Bind(NextHopId(1), key, 0).has_value());
+  auto progress = resolver->Poll(10, 16);
+  ASSERT_EQ(1u, progress.solicitations.size());
+  progress = resolver->OnArp(10, kIface1,
+                             ReplyTo(progress.solicitations[0].frame,
+                                     Mac("02:00:00:00:00:aa")));
+  ASSERT_EQ(1u, progress.updates.size());
+  EXPECT_EQ(NeighborState::kResolved, State(*resolver, key).state);
+
+  resolver->Unbind(NextHopId(1));
+  EXPECT_EQ(0u, resolver->table().size());
+  auto rebound = resolver->Bind(NextHopId(2), key, 20);
+  ASSERT_TRUE(rebound.has_value());
+  EXPECT_EQ(NeighborState::kIncomplete, rebound->neighbor);
+  EXPECT_EQ(Ethernet::Address{}, rebound->dst_mac);
+  progress = resolver->Poll(30, 16);
+  ASSERT_EQ(1u, progress.solicitations.size()) << "the address is asked again";
+
+  // Churn through distinct addresses: each unbind forgets its neighbor.
+  resolver->Unbind(NextHopId(2));
+  for (uint32_t i = 0; i < 8; i++) {
+    ASSERT_TRUE(resolver->Bind(NextHopId(3), Key(kIface1, 0x0a000010 + i), 40)
+                    .has_value());
+    resolver->Unbind(NextHopId(3));
+  }
+  EXPECT_EQ(0u, resolver->table().size());
+  EXPECT_EQ(0u, resolver->size());
 }
 
 TEST(NeighborResolverTest, CapacityAccountsForANeighborTheRebindReleases) {
