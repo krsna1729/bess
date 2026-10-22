@@ -292,7 +292,14 @@ TEST_F(LifecycleTest, FailureAtEveryReservePositionLeavesNoTrace) {
         } else {
           const auto r = Apply(ops);
           ASSERT_EQ(r.outcome, Outcome::kRejected);
-          EXPECT_EQ(r.ops[at - 1].error, "injected failure");
+          // Reservations run in rank order, so the at-th one is not
+          // necessarily the at-th operation; the failure is reported at
+          // whichever operation it was, and only there.
+          size_t injected = 0;
+          for (const auto &op : r.ops) {
+            injected += op.error == "injected failure" ? 1 : 0;
+          }
+          EXPECT_EQ(1u, injected);
         }
         injector_.Disarm();
         table_->ReclaimAll();

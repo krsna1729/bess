@@ -32,8 +32,11 @@ namespace dataplane {
 // transaction:
 //
 //   1. check expected_generation (optimistic concurrency);
-//   2. reserve: every operation, in request order, does all its fallible work
-//      (Resource::Reserve); then every reference the transaction leaves is
+//   2. reserve: every operation, in ascending resource rank (referents
+//      first; request order within a rank), does all its fallible work
+//      (Resource::Reserve), so the order a request lists its operations in
+//      does not change what it means; then every reference the transaction
+//      leaves is
 //      checked -- a value may only name a key that exists afterwards, and a
 //      key may only be erased if nothing references it afterwards; then each
 //      resource the transaction touched prepares once (Resource::Prepare: a
@@ -322,6 +325,7 @@ class TransactionEngine {
     std::vector<uint32_t> removals_by_op;
     std::vector<Delta> deltas;
     std::vector<size_t> order;
+    std::vector<uint32_t> reserve_order;  // operation indexes, by rank
     std::vector<Registration *> touched;
   };
 

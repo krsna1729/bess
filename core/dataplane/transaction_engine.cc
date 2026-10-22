@@ -568,6 +568,19 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   };
 
   // -- reserve: all fallible work, nothing visible ---------------------------
+  // In ascending resource rank (referents first), request order within a
+  // rank: a referrer's Reserve() sees what the transaction does to the keys
+  // it may name, wherever the request lists them -- a route listed before the
+  // binding of the next hop it names reserves as if listed after it. Results
+  // stay in request order.
+  w.reserve_order.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    w.reserve_order[i] = static_cast<uint32_t>(i);
+  }
+  std::stable_sort(w.reserve_order.begin(), w.reserve_order.end(),
+                   [&](uint32_t a, uint32_t b) {
+                     return w.reg[a]->resource->rank() < w.reg[b]->resource->rank();
+                   });
   // Room for the abort bookkeeping first: once a Reserve() has placed
   // something (a pending key), recording it for abort must not be able to
   // throw (external review: a failed push_back leaked the key).
@@ -592,7 +605,8 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   });
 
   Resource::Footprint footprint;  // summed over the transaction
-  for (size_t i = 0; i < n; i++) {
+  for (const uint32_t index : w.reserve_order) {
+    const size_t i = index;
     const Op &op = ops[i];
     Registration *reg = w.reg[i];
     if (!reg->touched) {
