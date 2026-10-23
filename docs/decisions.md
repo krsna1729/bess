@@ -12723,8 +12723,10 @@ controller) stays outside: those are producers that write the input.
 and two groups could disagree about one path. Keeping the eligible set in the group object costs 264 bytes
 per group on the control side and nothing per packet, where a per-packet availability check would add a
 load and a branch to every grouped flow. Slot dealing instead of a compacted member list is what keeps
-every other flow in place when one member goes down. Claiming groups at Reserve keeps footprints exact (the
-engine sums them there) and lets backpressure see the retires before anything is built.
+every other flow in place when one member goes down. Claiming groups at Reserve declares every retire before
+anything is built (the engine sums the footprints there), so backpressure sees them. The declaration is an
+upper bound: a claimed group that the same transaction also writes or erases is not rebuilt, and its
+declared retire goes unused.
 
 **Test.** `RouterGroupTest` (route_test.cc): `WithoutStateSelectionIsUnchanged` (n = 1..64 with weights and
 standbys, against `RangeSelect` over fixed hashes), `AnActiveGoingDownMovesOnlyItsFlows`,
