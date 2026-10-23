@@ -1689,6 +1689,11 @@ message RouterArg {
  * metadata, responds to local ARP requests for the VIF's IP address, and
  * steers traffic to designated output gates.
  *
+ * A frame shorter than an Ethernet header, or a tagged one whose first segment
+ * ends before the tag and the EtherType after it (18 bytes), leaves on the default
+ * gate unchanged. A frame whose payload is shared (a clone) is copied before the
+ * tag strip or an ARP/ND answer rewrites it (D-153); a failed copy is dropped.
+ *
  * __Input Gates__: 1
  * __Output Gates__: many
  */

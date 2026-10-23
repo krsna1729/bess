@@ -3,6 +3,7 @@
 #include "vif.h"
 
 #include <any>
+#include <cstdint>
 #include <cstring>
 #include <expected>
 #include <optional>
@@ -12,6 +13,8 @@
 #include "arch/vlan.h"
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_codec.h"
+#include "packet_mutation.h"
+#include "packet_reshape.h"
 #include "route/l3_packet.h"
 #include "utils/format.h"
 #include "utils/logging.h"
@@ -402,8 +405,26 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const bool write_vif = bess::metadata::IsValidOffset(vif_offset);
   const bool write_domain = bess::metadata::IsValidOffset(domain_offset);
 
+  // Every in-place write here -- the tag strip and the ARP and ND answers --
+  // needs the payload to be this packet's alone: a clone's bytes are seen by
+  // every holder. A shared one is copied first (D-153); the copy may replace
+  // the mbuf (EmitPacket sends whichever `pkt` names) and resegment it, so
+  // each caller re-reads the frame from the copy. False: the copy failed and
+  // the packet is unchanged.
+  const auto own = [](bess::PacketRef &pkt) {
+    if (likely(bess::packet::PayloadWriteabilityOf(pkt) ==
+               bess::packet::PayloadWriteability::kWritable)) {
+      return true;
+    }
+    bess::PacketHandle copy = pkt.handle();
+    if (!bess::packet::EnsureWritable(copy)) {
+      return false;
+    }
+    pkt = bess::PacketRef(copy);
+    return true;
+  };
+
   for (bess::PacketRef pkt : batch->packets()) {
-    char *head = pkt.head_data<char *>();
     if (unlikely(pkt.head_len() < sizeof(Ethernet))) {
       EmitPacket(ctx, pkt, default_gate_);
       continue;
@@ -411,47 +432,69 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     uint16_t vlan = 0;
     // Check for an 802.1Q / 802.1ad VLAN tag.
-    const be16_t tpid = reinterpret_cast<const Ethernet *>(head)->ether_type;
+    const be16_t tpid = pkt.head_data<const Ethernet *>()->ether_type;
 
     bool tagged = (tpid == be16_t(Ethernet::Type::kVlan)) ||
                   (tpid == be16_t(Ethernet::Type::kQinQ));
 
-    if (tagged && pkt.head_len() >= sizeof(Ethernet) + 4) {
+    if (tagged) {
+      // The strip's 16-byte move needs the tag and the EtherType after it in
+      // the first segment. A frame without them (a truncated tag, or a chain
+      // split inside it) has no VLAN to steer by: it goes to the default
+      // gate as it came, as a frame without an Ethernet header does, never
+      // steered as VLAN 0 with its tag still on.
+      constexpr size_t kTagged = sizeof(Ethernet) + sizeof(Vlan);
+      if (unlikely(pkt.head_len() < kTagged)) {
+        EmitPacket(ctx, pkt, default_gate_);
+        continue;
+      }
+      if (unlikely(!own(pkt) || pkt.head_len() < kTagged)) {
+        EmitPacket(ctx, pkt, DROP_GATE);
+        continue;
+      }
+      char *head = pkt.head_data<char *>();
       const be16_t tci =
           reinterpret_cast<const Vlan *>(head + sizeof(Ethernet))->tci;
-      vlan = tci.value() & 0x0FFF;
+      vlan = static_cast<uint16_t>(static_cast<uint32_t>(tci.value()) & 0x0FFFU);
 
-      // Strip the VLAN tag in place.
-      if (pkt.adj(4)) {
-        bess::arch::RemoveVlanTag(head);
-      }
+      // Strip the VLAN tag in place. Cannot fail: the first segment holds at
+      // least kTagged bytes.
+      pkt.adj(4);
+      bess::arch::RemoveVlanTag(head);
     }
 
-    Ethernet *eth = pkt.head_data<Ethernet *>();
+    const be16_t ether_type = pkt.head_data<const Ethernet *>()->ether_type;
 
     // Handle ARP requests for local VIF addresses: the resolution library's
     // local responder rewrites the frame into the reply (l3_packet.h,
     // AnswerArpRequest); the fields, the in-place packet and the gate are
     // unchanged.
-    if (eth->ether_type == be16_t(Ethernet::Type::kArp)) {
-      uint8_t *bytes = pkt.head_data<uint8_t *>();
-      const std::span<uint8_t> frame(bytes, pkt.head_len());
+    if (ether_type == be16_t(Ethernet::Type::kArp)) {
       const std::optional<bess::route::ArpMessage> arp =
-          bess::route::ParseArp(frame);
+          bess::route::ParseArp(std::span<const uint8_t>(
+              pkt.head_data<const uint8_t *>(), pkt.head_len()));
       if (arp && arp->opcode == bess::utils::Arp::kRequest) {
         const Interface *iface = LookupByIp(vlan, arp->target_ip);
-        if (iface != nullptr &&
-            bess::route::AnswerArpRequest(frame, iface->mac_addr,
-                                          iface->ip_addr)) {
-          if (write_vif) {
-            _set_attr_with_offset<be32_t>(vif_offset, pkt, be32_t(iface->id));
+        if (iface != nullptr) {
+          if (unlikely(!own(pkt))) {
+            EmitPacket(ctx, pkt, DROP_GATE);
+            continue;
           }
-          if (write_domain) {
-            _set_attr_with_offset<be32_t>(domain_offset, pkt,
-                                          be32_t(iface->route_domain));
+          const std::span<uint8_t> frame(pkt.head_data<uint8_t *>(),
+                                         pkt.head_len());
+          if (bess::route::AnswerArpRequest(frame, iface->mac_addr,
+                                            iface->ip_addr)) {
+            if (write_vif) {
+              _set_attr_with_offset<be32_t>(vif_offset, pkt,
+                                            be32_t(iface->id));
+            }
+            if (write_domain) {
+              _set_attr_with_offset<be32_t>(domain_offset, pkt,
+                                            be32_t(iface->route_domain));
+            }
+            EmitPacket(ctx, pkt, iface->gate);
+            continue;
           }
-          EmitPacket(ctx, pkt, iface->gate);
-          continue;
         }
       }
     }
@@ -461,13 +504,16 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // answer always carries the target link-layer option (RFC 4861 7.2.4),
     // so it is kNdFrameSize even for a DAD solicitation that had no option:
     // the packet grows into its tailroom.
-    if (eth->ether_type == be16_t(Ethernet::Type::kIpv6)) {
-      uint8_t *bytes = pkt.head_data<uint8_t *>();
-      const std::span<const uint8_t> frame(bytes, pkt.head_len());
+    if (ether_type == be16_t(Ethernet::Type::kIpv6)) {
       const std::optional<bess::route::NdMessage> nd =
-          bess::route::ParseNeighborDiscovery(frame);
+          bess::route::ParseNeighborDiscovery(std::span<const uint8_t>(
+              pkt.head_data<const uint8_t *>(), pkt.head_len()));
       if (nd && nd->type == bess::route::NdType::kNeighborSolicitation) {
         const Interface *iface = LookupByIpv6(vlan, nd->target_ip);
+        if (iface != nullptr && unlikely(!own(pkt))) {
+          EmitPacket(ctx, pkt, DROP_GATE);
+          continue;
+        }
         // The answer is always kNdFrameSize. A linear packet grows into its
         // tailroom (or shrinks) with both lengths updated; a chained packet's
         // later segments are not ours to rewrite, so only a first segment of
@@ -476,6 +522,8 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         const bool linear = pkt.is_linear();
         if (iface != nullptr &&
             (linear || pkt.head_len() == bess::route::kNdFrameSize)) {
+          uint8_t *bytes = pkt.head_data<uint8_t *>();
+          const std::span<const uint8_t> frame(bytes, pkt.head_len());
           const size_t capacity =
               pkt.head_len() + (linear ? pkt.tailroom() : 0);
           const std::span<uint8_t> out(bytes, capacity);
@@ -500,6 +548,10 @@ void Vif::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         }
       }
     }
+
+    // Read after the answers: a copy for an answer not given may have
+    // replaced the mbuf.
+    const Ethernet *eth = pkt.head_data<const Ethernet *>();
 
     // Lookup destination VIF by (vlan, dmac)
     const Interface *iface = Lookup(vlan, eth->dst_addr);
