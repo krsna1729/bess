@@ -56,6 +56,9 @@ class NatAppliance final : public Module {
   static const gate_idx_t kNumIGates = 2;
   static const gate_idx_t kNumOGates = 2;
   static const Commands cmds;
+  // The packet path updates conntrack, NAT mappings and timer wheels: one worker.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   NatAppliance() : Module() { max_allowed_workers_ = 1; }  // worker-owned state
 

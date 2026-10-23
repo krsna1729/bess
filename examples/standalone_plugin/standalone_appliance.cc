@@ -65,6 +65,9 @@ class StandaloneAppliance final : public Module {
  public:
   static const gate_idx_t kNumOGates = 2;
   static const Commands cmds;
+  // Capabilities: the packet path only reads the shared policy.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
     auto &instances = init_context().instances();

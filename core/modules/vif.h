@@ -31,6 +31,9 @@ class Vif final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Lookups and in-place ARP/ND replies only; the tables are only read.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   struct Interface {
     uint32_t id = 0;

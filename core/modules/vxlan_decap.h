@@ -10,6 +10,10 @@
 
 class VXLANDecap final : public Module {
  public:
+  // Decapsulates each packet independently; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   VXLANDecap() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
   CommandResponse Init(const bess::pb::VXLANDecapArg &arg);
 

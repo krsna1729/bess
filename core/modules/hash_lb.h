@@ -32,6 +32,9 @@ class HashLB final : public Module {
   // "settings" (HashLBSettings): mode, fields and gates, applied live by an
   // RCU swap (D-129).
   static const ResourceTables resource_tables;
+  // The packet path only reads the RCU-published configuration.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   HashLB() : Module(), config_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;

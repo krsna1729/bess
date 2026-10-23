@@ -11,6 +11,10 @@
 
 class EtherEncap final : public Module {
  public:
+  // Stateless: the header comes from per-packet metadata.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   EtherEncap() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
   CommandResponse Init(const bess::pb::EtherEncapArg &arg);

@@ -8,7 +8,7 @@
 # and everything dynamic is in the modules' tables, not in the graph: the
 # resources below are one transaction that creates the session's meter, next
 # hop and the ExactMatch rule whose result names both. The Router forwards on
-# the next-hop id the rule writes; in that mode it has no FIB (D-180).
+# the next-hop id the rule writes; in that mode it has no FIB (D-183).
 #
 # Converted from session_pipeline.bess (D-104). Rewrite templates are the packets it
 # built with scapy.

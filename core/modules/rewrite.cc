@@ -17,7 +17,7 @@
 const Commands Rewrite::cmds = {};
 
 const ResourceTables Rewrite::resource_tables = {
-    ResourceTable::Singleton<bess::pb::RewriteArg>("templates", true)};
+    ResourceTable::Singleton<bess::pb::RewriteArg>("templates", true).Rebuilds()};
 
 CommandResponse Rewrite::Init(const bess::pb::RewriteArg &arg) {
   // The init argument's templates; a refused one refuses the creation.
@@ -55,7 +55,9 @@ CommandResponse Rewrite::Init(const bess::pb::RewriteArg &arg) {
       // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
       [this](Staged &s) {
         templates_.swap(s.templates);
-        next_turn_ = 0;
+        for (const auto worker : bess::dataplane::AllWorkerIds()) {
+          next_turn_[worker] = 0;
+        }
         arg_.Swap(&s.arg);
       },
       [this] { return arg_; }, [this] { return HasRunningWorker(); });
@@ -123,8 +125,9 @@ inline void Rewrite::DoRewriteSingle(const Templates &t,
   }
 }
 
-inline void Rewrite::DoRewrite(const Templates &t, bess::PacketBatch *batch) {
-  size_t start = next_turn_;
+inline void Rewrite::DoRewrite(const Templates &t, bess::PacketBatch *batch,
+                                size_t &next_turn) {
+  size_t start = next_turn;
   const size_t cnt = batch->cnt();
 
   for (size_t i = 0; i < cnt; i++) {
@@ -135,7 +138,7 @@ inline void Rewrite::DoRewrite(const Templates &t, bess::PacketBatch *batch) {
     bess::utils::CopyInlined(ptr, t.data[start + i], size, true);
   }
 
-  next_turn_ = t.jump[start + cnt];
+  next_turn = t.jump[start + cnt];
 }
 
 void Rewrite::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
@@ -143,7 +146,7 @@ void Rewrite::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (t.num == 1) {
     DoRewriteSingle(t, batch);
   } else if (t.num > 1) {
-    DoRewrite(t, batch);
+    DoRewrite(t, batch, next_turn_[ctx->wid]);
   }
 
   RunNextModule(ctx, batch);

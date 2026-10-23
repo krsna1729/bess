@@ -10708,7 +10708,7 @@ for a millisecond and has the test thread take the control lock 200 times, findi
 the lock is held across the call. `MaintenanceLoopTest.ATicksEventsReachTheLog` reads a tick's event, with its
 type, source and fields, from the daemon's log. Fast build: suite 214/214.
 
-**Amended 2026-10-22 (D-180).** A module that turns configured time into ticks needs to know what a tick is.
+**Amended 2026-10-22 (D-183).** A module that turns configured time into ticks needs to know what a tick is.
 `TickHub` now exposes `interval()` (the loop's interval; zero when `--maintenance_interval_us=0` disables the
 loop, so no endpoint is ever called) and `current_tick()` (the tick count of the latest run, the clock a module
 started in `Init` should start at). `set_interval()` is the loop's, called as it starts, and for tests standing
@@ -12261,6 +12261,96 @@ of 10,000 rules or more (then an incremental backend, measured against this benc
 50,000 rules (or shard it by domain or direction, D-147), or a controller needs scope-snapshot consistency
 across the Firewall and another resource.
 
+## D-180 Module capability descriptors: state ownership, flow affinity, update model, consistency
+
+**Status:** accepted (2026-10-23; the roadmap item "module capability descriptors: state ownership, flow
+affinity, update model, consistency").
+**Code:** `core/commands.h` (`ModuleCapabilities`, `ResourceTable::rebuilds`/`Rebuilds()`), `core/module.{h,cc}`
+(`MODULE_CAPABILITIES_FUNC`, `ModuleBuilder::Capabilities`, `Module::max_allowed_workers()`),
+`core/control/pipeline_validator.{h,cc}`, `core/control/api_v2.cc`, `protobuf/control_v2.proto`
+(`ModuleCapabilities`, `ValidatePipelineResponse.capabilities`, `ResourceSchema.rebuilds`), every module class's
+declaration, the three SDKs' `ValidatePipeline`, `bessctl validate`/`schema`; tests in
+`core/control/api_v2_test.cc` and `core/modules/transaction_conformance_test.cc`.
+
+**Context.** Whether a module may run on several workers, and whether a flow's packets must reach one worker,
+was each module's private knowledge: `max_allowed_workers_` set in a constructor or `Init`, and one module
+(ConnTrack's `PER_WORKER`, D-080) checking its own inputs at resume. A controller compiling a graph could not
+learn either before it applied the graph, nor which tables rebuild on a change (a rule list compiled again)
+and which change in place. The transaction consistency a resource provides was already a checked capability
+(D-050), but nothing summarised it per module. Every module would otherwise invent its own affinity rules.
+
+**Decision.**
+
+- **A class declares two facts about the state its packet path changes** (statistics are not state;
+  configuration the control plane writes belongs to the resource tables): who owns it - `kNone`,
+  `kSingleWorker`, `kPerWorker`, `kShared` - and whether one flow's packets must reach one worker -
+  `kNone`, `kPreferred`, `kRequired`. `static constexpr ModuleCapabilities kCapabilities{...}`, or
+  `static ModuleCapabilities Capabilities(const Arg &)` when the init argument decides (ConnTrack's `mode`
+  and `fallback_shared`, NAT's `shared`). Undeclared is unspecified, for plugins written before this.
+- **The update model comes from the tables, not a second declaration.** A resource table gains `rebuilds`
+  (`.Rebuilds()`): a change rebuilds the structure and swaps it in, so it costs in proportion to the table. A
+  module's `updates` is its most disruptive table's: `PAUSED_WORKERS` (`requires_paused_workers`), else
+  `REBUILD`, else `LIVE`; `NONE` without tables. Its consistency is `REFERENTIAL` when it has a table.
+  The parity test verifies that for its five resource-module cases.
+- **`ValidatePipeline` answers it**, per module by name, from the class and the argument alone - before
+  anything exists, which is when a compiler needs it. Computing it unpacks the argument as the class's init
+  type, so validation now refuses an argument of the wrong type, naming the module, where creation used to.
+  `GetSchema` reports each table's `rebuilds`. The C++, Go and Python SDKs return the capabilities with the
+  normalized pipeline; `bessctl validate` prints them on stderr, `bessctl schema` marks `(rebuilds)`.
+- **Declarations are checked where they can be.** `ModuleCapabilitiesTest`: every class linked into the
+  conformance binary declares both fields; affinity other than `kNone` only with `kPerWorker`. For the five
+  resource-module cases and ConnTrack's modes, created instances have worker limit 1 for `kSingleWorker`
+  and above 1 for `kPerWorker`/`kShared`.
+- **The daemon does not enforce affinity across the graph yet.** ConnTrack keeps its own resume check
+  (`AsymmetricInputs`); the descriptor makes the requirement visible so a controller can refuse the graph
+  first.
+
+**The built-in classes**:
+
+| state | affinity | classes |
+|---|---|---|
+| none | none | ACL, ArpResponder, BPF, Bypass, EtherEncap, ExactMatch, Firewall, GenericDecap, GenericEncap, HashLB, IPChecksum, IPEncap, IPSwap, L2Forward, L4Checksum, MACSwap, Merge, MetadataTest, MPLSPop, NoOP, PortInc, QueueInc, QueueOut, Replicate, Router, SetMetadata, Sink, Source, Split, StaticNAT, Timestamp, Update, UpdateTTL, VLANPop, VLANPush, VLANSplit, VXLANDecap, VXLANEncap, Vif, WildcardMatch, WorkerSplit |
+| single worker | none | Bridge, Buffer, Dump, FlowGen, RoundRobin, UrlFilter; ConnTrack `OWNED`; NAT (not shared) |
+| shared | none | DRR, Measure, Meter, PacketStore, PortOut, Queue; ConnTrack `SHARED`; NAT `shared` |
+| per worker | none | RandomSplit, RandomUpdate, Rewrite |
+| per worker | required | ConnTrack `PER_WORKER` |
+| per worker | preferred | ConnTrack `PER_WORKER` with `fallback_shared` |
+
+Tables that rebuild: ACL `rules`, BPF `filters`, Firewall `rules`, Meter `meters` (each change builds the
+whole `MeterSet` again), PacketStore `flows` (the limits map is copied), Rewrite `templates`, UrlFilter
+`blacklist` (the trie) and Vif `interfaces` (every index is rebuilt).
+
+RandomSplit and RandomUpdate use a worker-local RNG; Rewrite keeps a round-robin cursor per worker and resets
+every cursor when its templates change with workers paused. These use `stats::WorkerLocal` cache-line-separated
+slots: workers do not race on an RNG seed or cursor, and no flow affinity is needed.
+
+Judgement calls recorded: DRR, Queue and PacketStore are `shared` because every feeding worker enqueues into one
+multi-producer ring, although only the owning task drains it. A device queue is the port's state, not the
+module's (PortInc, QueueInc, QueueOut are `none`; PortOut is `shared` for the per-queue locks it takes).
+ExactMatch's `rules` is `live`: its occasional growth copies the table, an amortised cost, not a rebuild per
+change.
+
+**Why.** The roadmap's split - worker-owned state where steering gives affinity, shared state only where the
+workload demands it - is a placement decision a controller makes, so it needs the facts before it applies a
+graph, from a pure function of class and argument rather than from a created module. Two declared fields is
+the minimum a compiler needs that the daemon cannot derive; the update model and consistency are derived from
+what the classes already declare, so they cannot drift from it.
+
+**Consequences.** A wrongly typed init argument now fails `ValidatePipeline` (`INVALID_ARGUMENT`, field
+`arg`). The three SDKs' `ValidatePipeline` return values change shape (D-173: no compatibility promise before
+1.0). A plugin compiles unchanged and reports unspecified until it declares.
+
+**Evidence.** `ApiV2ServiceTest.ValidateReportsEachModulesCapabilities` (ConnTrack's four modes, `LIVE`,
+`REBUILD`, `PAUSED_WORKERS` and `NONE`, the consistency, a wrongly typed argument refused naming the module and
+the expected type); `ModuleCapabilitiesTest.EveryClassDeclaresAndModulesAgree` (removing one class's
+declaration fails it); `ResourceParityTest` asserts referential consistency for its five resource-module cases;
+`RewriteTest.WorkersAdvanceIndependentlyAndAReplacementRestartsEveryWorker` checks independent cursors and
+reset after replacing templates; the Python SDK test reads both parts of the answer.
+
+**Revisit when:** a module provides scope-snapshot consistency from its own table (then the table declares
+it), the daemon should refuse an unsafe graph itself (then a resume check generalises ConnTrack's), or a class
+needs a state kind these four do not describe (sharded by key across workers).
+
 ## D-181 A classifier result field nothing downstream reads is compiled out, not a failure
 
 **Status:** accepted (2026-10-23).
@@ -12335,7 +12425,49 @@ result field is no longer an error at resume: nothing reads it, so nothing is wr
 **Revisit when:** a consumer needs a result field's absence to be an error (then a per-field required flag),
 or the metadata pass gains per-path offsets.
 
-## D-180 The Router routes IPv6 by destination and resolves its own neighbors
+## D-182 ConnTrack can mark each packet with its connection status
+
+**Status:** accepted (2026-10-23).
+**Code:** `core/modules/conntrack.{h,cc}`, `protobuf/module_msg.proto` (`ConnTrackStatus`,
+`ConnTrackArg.status_attr`), `core/modules/conntrack_test.cc`.
+
+**Context.** ConnTrack (D-080) gives each packet one of two gates: tracked (new, existing, related) or not
+(invalid, untracked, refused for a full table). A module downstream cannot tell a new connection from an
+existing one. A stateful policy must make that distinction, for example to admit a new connection only on
+some ports, or to count or meter new connections separately from established ones.
+
+**Decision.**
+
+- **`ConnTrackArg.status_attr`, optional.** When it names an attribute, ConnTrack writes one byte to it in
+  every packet: a `ConnTrackStatus` value (new 1, existing 2, related 3, invalid 4, untracked 5, full 6;
+  0 is unspecified and never written). The gates do not change.
+- **The library's status, plus one.** `WireStatus` adds 1 to `conntrack::TrackStatus`. A `static_assert` for
+  each value fails the build if the library's order and the wire enum disagree.
+- **Every packet that leaves is marked.** This includes packets of PER_WORKER inputs that fail closed
+  (D-080): they are not tracked, so they carry untracked. A value from an earlier module therefore cannot
+  reach a reader.
+- **The write follows the metadata contract** (D-177), as the Firewall's `action_attr` does (D-141). The
+  attribute is registered only when configured. It has an offset only when a module downstream reads it,
+  and without a reader the packet path writes nothing. A configured name with no reader is logged as a
+  warning at each resume (PreResume).
+
+**Why.** One byte from a result the tracker already computes costs a store per packet, and only when a
+reader exists. Using the library's order plus one keeps 0 free for "unset" without a lookup table. The
+compiler checks the mapping, not a test.
+
+**Test.** `ConnTrackModuleTest.StatusAttrCarriesEachPacketsResult`: ConnTrack feeds a `Split` that reads the
+attribute, and each packet leaves on the gate of its status. An inside SYN is new, its reply is existing,
+an outside SYN is invalid, and an ARP frame is untracked. All seven status values are wired gates, so a
+packet with a wrong status, or none, leaves on another gate. Live: `ConnTrackSourceFedTest.PerWorkerOnOtherInputs`
+routes on the status too. When it fails closed, every packet is untracked; when it falls back to the shared
+table, the first SYN is new and every later one is existing.
+
+**Consequences.** A pipeline that does not set `status_attr` is unchanged. The packet direction (original
+or reply) is not part of the status.
+
+**Revisit when:** a reader needs the packet direction or the TCP state, not only the status.
+
+## D-183 The Router routes IPv6 by destination and resolves its own neighbors
 
 **Status:** accepted (2026-10-22; updated 2026-10-23). **Code:** `core/route/route_table.{h,cc}`
 (`Ipv6RouteTable` on rte_fib6, `Ipv6Prefix`, the never-published spare), `core/route/router.{h,cc}`

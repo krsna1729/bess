@@ -284,6 +284,9 @@ class SessionAppliance final : public Module {
   static const Commands cmds;
   // The five resources, all changed while workers run (D-129).
   static const ResourceTables resource_tables;
+  // Decide charges each session's worker-exclusive meter: one worker.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
     auto made = SessionApp::Create(name(), init_context().rcu());

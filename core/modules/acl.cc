@@ -17,7 +17,7 @@
 const Commands ACL::cmds = {};
 
 const ResourceTables ACL::resource_tables = {
-    ResourceTable::Singleton<bess::pb::ACLArg>("rules", false)};
+    ResourceTable::Singleton<bess::pb::ACLArg>("rules", false).Rebuilds()};
 
 CommandResponse ACL::ParseRules(const bess::pb::ACLArg &arg,
                                 std::vector<ACLRule> *out) const {

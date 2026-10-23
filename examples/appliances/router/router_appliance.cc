@@ -51,6 +51,9 @@ class RouterAppliance final : public Module {
   static const gate_idx_t kNumIGates = 2;
   static const gate_idx_t kNumOGates = 4;
   static const Commands cmds;
+  // RouterApp::Process is const: the packet path only reads the FIBs and neighbors.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
     auto made = RouterApp::Create(init_context().rcu());

@@ -3,6 +3,10 @@
 #ifndef BESS_CONTROL_PIPELINE_VALIDATOR_H_
 #define BESS_CONTROL_PIPELINE_VALIDATOR_H_
 
+#include <map>
+#include <string>
+
+#include "commands.h"
 #include "control/control_error.h"
 #include "control/pipeline_spec.h"
 #include "runtime/runtime_state.h"
@@ -10,9 +14,17 @@
 namespace bess {
 namespace control {
 
+// What a module would promise (D-180): its class's answer for its init
+// argument, and the class's resource tables, which say how it changes.
+struct ModuleCapabilityReport {
+  ModuleCapabilities declared;
+  ResourceTables tables;
+};
+
 // A spec that has passed validation, in canonical form.
 struct ValidatedPipeline {
   PipelineSpec spec;
+  std::map<std::string, ModuleCapabilityReport> capabilities;  // by module name
 };
 
 // Validates a desired pipeline without touching the runtime (MODERNIZATION.md

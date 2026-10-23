@@ -9,6 +9,9 @@
 class StandalonePass final : public Module {
  public:
   static const Commands cmds;
+  // Capabilities: the packet path changes only a statistics counter.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   StandalonePass() : Module(), pkts_passed_(0) {}
 

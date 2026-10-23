@@ -21,6 +21,9 @@ class Queue : public Module {
  public:
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Upstream workers enqueue into one multi-producer ring the task drains.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Queue()
       : Module(),

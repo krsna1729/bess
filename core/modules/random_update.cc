@@ -120,6 +120,7 @@ CommandResponse RandomUpdate::ParseField(
 }
 
 void RandomUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  Random &rng = rng_[ctx->wid];
   for (size_t i = 0; i < num_vars_; i++) {
     const auto var = &vars_[i];
 
@@ -131,7 +132,7 @@ void RandomUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     for (bess::PacketRef pkt : batch->packets()) {
       be32_t *p = pkt.head_data<be32_t *>(offset);
-      uint32_t rand_val = min + rng_.GetRange(range);
+      uint32_t rand_val = min + rng.GetRange(range);
       *p = (*p & mask) | (be32_t(rand_val) << bit_shift);
     }
   }

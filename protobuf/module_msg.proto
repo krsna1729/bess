@@ -394,7 +394,7 @@ message RouterInterface {
 
 /**
  * A Router neighbor binding ("<module>/neighbors", keyed by
- * RouterNextHopIdKey, D-180): the next-hop id the key names is bound to a
+ * RouterNextHopIdKey, D-183): the next-hop id the key names is bound to a
  * neighbor on one of the router's interfaces, and the router resolves its
  * MAC (ARP for IPv4, Neighbor Discovery for IPv6). Binding publishes the hop,
  * incomplete, at once; routes and groups name it like any next hop, and an
@@ -410,7 +410,7 @@ message RouterNeighborBinding {
 
 /**
  * One binding of "<module>/neighbors" as neighbor resolution sees it (the
- * Router's get_neighbors action, D-180). A neighbor the resolver does not
+ * Router's get_neighbors action, D-183). A neighbor the resolver does not
  * know yet -- bound since the last maintenance tick -- is incomplete with no
  * probes.
  */
@@ -820,10 +820,26 @@ message MetadataTestArg {
  * __Output Gates__: 2 (same as the input gate)
  */
 /**
+ * A packet's connection-tracking result, as ConnTrack writes it to its
+ * status_attr (D-182).
+ */
+enum ConnTrackStatus {
+  CONNTRACK_STATUS_UNSPECIFIED = 0;
+  CONNTRACK_STATUS_NEW = 1;        /// this packet created the connection
+  CONNTRACK_STATUS_EXISTING = 2;   /// a packet of a tracked connection
+  CONNTRACK_STATUS_RELATED = 3;    /// an ICMP error about a tracked connection
+  CONNTRACK_STATUS_INVALID = 4;    /// may not start a connection, or refused by the TCP state machine
+  CONNTRACK_STATUS_UNTRACKED = 5;  /// not trackable, or not tracked (PER_WORKER failing closed)
+  CONNTRACK_STATUS_FULL = 6;       /// would start a connection, but the table is full
+}
+
+/**
  * Connection tracking (TP8, D-080): the conntrack library as a module.
  * igate 0 may start connections (the inside), igate 1 may not (the outside);
  * ogate 0 gets packets of tracked connections (new, existing, related),
  * ogate 1 everything else (invalid, untracked, refused for a full table).
+ * With status_attr, each packet also carries its ConnTrackStatus, so a module
+ * downstream can tell a new connection from an existing one (D-182).
  */
 message ConnTrackArg {
   enum Mode {
@@ -839,6 +855,10 @@ message ConnTrackArg {
   /// PER_WORKER on inputs that are not verified symmetric: track with one
   /// shared table instead of failing closed.
   bool fallback_shared = 4;
+  /// The metadata attribute (1 byte, a ConnTrackStatus) each packet's result
+  /// is written to; empty: none. The reader must be configured with the same
+  /// name; with no reader the packets carry no status (PreResume reports it).
+  string status_attr = 5;
 }
 
 message NATArg {
@@ -1522,7 +1542,7 @@ enum FlowHashFields {
  * hops, neighbor bindings and next-hop groups are the resources D-023
  * describes, changed together or not at all.
  *
- * Address families (D-180). In ROUTE_MODE_NEXT_HOP_ID the router has no FIB:
+ * Address families (D-183). In ROUTE_MODE_NEXT_HOP_ID the router has no FIB:
  * it forwards IPv4 and IPv6 alike, decrementing each packet's TTL or hop
  * limit by its own family, takes interface addresses and neighbor bindings of
  * either family, and refuses every field only a FIB would read
@@ -1538,7 +1558,7 @@ enum FlowHashFields {
  * bindings are refused. In both modes the neighbor protocols read (ARP,
  * Neighbor Discovery) are those of the interfaces' configured addresses.
  *
- * Neighbor resolution (D-180). With `interfaces`, the router resolves the
+ * Neighbor resolution (D-183). With `interfaces`, the router resolves the
  * next hops bound in its "<module>/neighbors" resource (RouterNeighborBinding)
  * and publishes their state; its get_neighbors action
  * (RouterCommandGetNeighborsResponse) reports each binding's state, MAC,
@@ -1558,12 +1578,12 @@ message RouterArg {
   FlowHashFields flow_hash = 10; /// Destination mode: which fields a route that names a next-hop group hashes to pick its member (default: the whole flow, D-163). A non-default value is refused in next-hop-id mode.
   string next_hop_attr = 11; /// The metadata attribute next-hop mode reads the next-hop id from (default "next_hop_id").
   string domain_attr = 12; /// Destination mode: the metadata attribute the route domain is read from (default "route_domain"). Refused in next-hop-id mode.
-  uint64 punt_local_gate = 13; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. So do link-local or multicast IPv6 frames in destination mode, which are never forwarded, and, unless punt_neighbor_gate names another gate, the ARP requests and Neighbor Solicitations a resolving router receives. The frame is counted either way (D-178, D-180).
+  uint64 punt_local_gate = 13; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. So do link-local or multicast IPv6 frames in destination mode, which are never forwarded, and, unless punt_neighbor_gate names another gate, the ARP requests and Neighbor Solicitations a resolving router receives. The frame is counted either way (D-178, D-183).
   optional uint64 max_ipv4_routes = 14; /// Destination mode: IPv4 routes per domain; setting it enables IPv4 (0 is refused). Refused in next-hop-id mode.
   optional uint64 max_ipv4_tbl8s = 15; /// Destination mode: IPv4 tbl8 groups per domain, one per /24 holding a longer route (absent: 256; 0 is refused; needs max_ipv4_routes). Refused in next-hop-id mode.
   optional uint64 max_ipv6_routes = 16; /// Destination mode: IPv6 routes per domain; setting it enables IPv6 (0 is refused). Refused in next-hop-id mode.
   optional uint64 max_ipv6_tbl8s = 17; /// Destination mode: IPv6 (rte_fib6) tbl8 groups per domain (absent: 8192; 0 is refused; needs max_ipv6_routes). A route reserves one per byte between its length and its covering route's, counted from /24. Refused in next-hop-id mode.
-  uint64 punt_neighbor_gate = 18; /// Where the ARP requests and Neighbor Solicitations a resolving router receives go, in either mode: an output gate (the responder that answers for the interfaces' addresses), DROP_GATE (8192) to drop them, or 0 (the default) to follow punt_local_gate. Counted either way (D-180).
+  uint64 punt_neighbor_gate = 18; /// Where the ARP requests and Neighbor Solicitations a resolving router receives go, in either mode: an output gate (the responder that answers for the interfaces' addresses), DROP_GATE (8192) to drop them, or 0 (the default) to follow punt_local_gate. Counted either way (D-183).
   string ingress_interface_attr = 19; /// The metadata attribute naming the RouterInterface a frame arrived on, read for ARP and Neighbor Discovery input (default "vif_id", what Vif writes).
   repeated RouterInterface interfaces = 20; /// The router's own interfaces that neighbor resolution solicits from; setting any enables neighbor resolution and the "<module>/neighbors" resource. Fixed at Init.
   uint64 max_neighbors = 21; /// Most bound next hops in "<module>/neighbors", and so most neighbors resolved (default 1024 or max_next_hops, whichever is smaller; above max_next_hops is refused).
@@ -1571,7 +1591,7 @@ message RouterArg {
   optional uint64 neighbor_probe_interval_ms = 23; /// First retry delay of an attempt; later retries double it (absent: 1000; 0 is refused).
   optional uint64 neighbor_max_probe_interval_ms = 24; /// Retry backoff ceiling (absent: 8000; 0 or below the probe interval is refused).
   optional uint64 neighbor_max_probes = 25; /// Solicitations per resolution attempt (absent: 3; 0 is refused).
-  optional uint64 neighbor_reachable_lifetime_ms = 26; /// How long a resolved neighbor goes unconfirmed before it is solicited again; it keeps forwarding while that attempt runs and fails only when the attempt does (absent: 30000; 0: never re-solicit, D-180).
+  optional uint64 neighbor_reachable_lifetime_ms = 26; /// How long a resolved neighbor goes unconfirmed before it is solicited again; it keeps forwarding while that attempt runs and fails only when the attempt does (absent: 30000; 0: never re-solicit, D-183).
   optional uint64 neighbor_unreachable_retry_ms = 27; /// How long an unreachable neighbor waits before another attempt (absent: 8000, the backoff ceiling's default; 0: no further attempt).
 }
 

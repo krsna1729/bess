@@ -15,6 +15,9 @@ class IPChecksum final : public Module {
 
   /* Gates: (0) Default, (1) Drop */
   static const gate_idx_t kNumOGates = 2;
+  // Rewrites or checks each packet's checksum; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
   CommandResponse Init(const bess::pb::IPChecksumArg &arg);
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 

@@ -10,6 +10,9 @@
 class IncompatibleProbe final : public Module {
  public:
   static const Commands cmds;
+  // Capabilities: no packet path state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
   CommandResponse Init(const bess::pb::EmptyArg &) { return CommandSuccess(); }
 };
 

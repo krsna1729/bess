@@ -13,6 +13,9 @@
 class QueueOut final : public Module {
  public:
   static const gate_idx_t kNumOGates = 0;
+  // The packet path only sends to the port's queue and counts.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   QueueOut()
       : Module(), port_(), qid_(), tx_checksum_profile_() {}

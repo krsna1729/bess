@@ -120,7 +120,7 @@ std::string MacString(const std::array<uint8_t, 6> &mac) {
 }
 
 // A destination-mode router argument with both address families enabled and
-// small FIBs (D-180): there, RouterArg enables a family only when its route
+// small FIBs (D-183): there, RouterArg enables a family only when its route
 // capacity is set.
 bess::pb::RouterArg DualStackArg() {
   bess::pb::RouterArg arg;
@@ -133,7 +133,7 @@ bess::pb::RouterArg DualStackArg() {
 }
 
 // A next-hop-id router argument: empty, since that mode has no FIB and so no
-// family setting (D-180).
+// family setting (D-183).
 bess::pb::RouterArg NextHopArg() { return bess::pb::RouterArg(); }
 
 class RouterTest : public ::testing::Test {
@@ -865,7 +865,7 @@ TEST_F(RouterTest, TheSelectorAttributesAreConfiguration) {
   arg.set_max_next_hops(64);
   arg.set_next_hop_attr("nh_id");
   // Each mode declares the attribute it reads, under its configured name, and
-  // not the other mode's (D-180): a declared read is a requirement on every
+  // not the other mode's (D-183): a declared read is a requirement on every
   // path into the module.
   const auto reads = [](const Router *rt) {
     std::vector<std::string> names;
@@ -924,7 +924,7 @@ TEST_F(RouterTest, TheMetadataIdIsIgnoredInDestinationMode) {
 }
 
 // The default mode keeps failing closed: with no writer the module drops every
-// packet; it has no FIB to route by destination with (D-155, D-180).
+// packet; it has no FIB to route by destination with (D-155, D-183).
 TEST_F(RouterTest, TheIdModeStillFailsClosedWithoutAWriter) {
   Router *rt = dynamic_cast<Router *>(h_.Create("Router", NextHopArg(), "rt"));
   ASSERT_NE(nullptr, rt);
@@ -1670,7 +1670,7 @@ TEST_F(RouterTest, LinkScopedIpv6WithoutALocalGateIsDroppedAndCounted) {
   EXPECT_NE(std::string::npos, rt->GetDesc().find("link scope: 1")) << rt->GetDesc();
 }
 
-// -- address families (D-180) -------------------------------------------------
+// -- address families (D-183) -------------------------------------------------
 
 // A destination-mode router with only the families whose route capacity is
 // set: IPv4 when `ipv4`, IPv6 when `ipv6`.
@@ -1775,7 +1775,7 @@ TEST_F(RouterTest, ADualStackRouterRoutesAMixedBurst) {
   EXPECT_EQ(1u, rt->router()->fib_counts().ipv6);
 }
 
-// The next-hop-id mode has no FIB and no family setting (D-180): an empty
+// The next-hop-id mode has no FIB and no family setting (D-183): an empty
 // RouterArg is valid, allocates no FIB in any family, forwards IPv4 and IPv6
 // on the hop the metadata names with each packet's own hop count decremented,
 // and refuses a route write with an error that names the mode.

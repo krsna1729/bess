@@ -81,7 +81,7 @@ running daemon in the test suite.
   domain, a Vif writing the domain) is the VRF shape the two IPLookups in
   that sample used to have.
 - **`RouterArg` sizes each address family on its own, in destination mode
-  only** (D-180). `max_routes` and `max_tbl8s` are removed:
+  only** (D-183). `max_routes` and `max_tbl8s` are removed:
   `max_ipv4_routes`/`max_ipv4_tbl8s` and `max_ipv6_routes`/`max_ipv6_tbl8s`
   replace them. In `ROUTE_MODE_DESTINATION` a family is enabled exactly when
   its route capacity is set, and a Router with neither is refused. In
@@ -98,7 +98,7 @@ running daemon in the test suite.
   need the capacity rename. An IPv4
   destination-mode Router that relied on the old default writes
   `max_ipv4_routes: 4096`.
-- **Transactions reserve in resource rank order** (D-180). The engine calls
+- **Transactions reserve in resource rank order** (D-183). The engine calls
   `Resource::Reserve` for every operation on a referenced resource before the
   operations on the resources that reference it, and in request order within
   a resource; results are still reported in request order. A `Reserve` that

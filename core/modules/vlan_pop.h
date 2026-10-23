@@ -9,6 +9,10 @@
 
 class VLANPop final : public Module {
  public:
+  // Strips each packet's tag; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   VLANPop() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
   CommandResponse Init(const bess::pb::VLANPopArg &) { return CommandSuccess(); }

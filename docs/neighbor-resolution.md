@@ -160,7 +160,7 @@ for the new immutable objects and returns them:
   snapshot visibility, so different hops may change one at a time;
 - the `Router` module applies resolver-owned next-hop operations through the
   in-process transaction engine, at most 64 per tick in one transaction; the
-  rest wait for the next tick (D-180). A bound next-hop id lives in
+  rest wait for the next tick (D-183). A bound next-hop id lives in
   `<router>/neighbors`, not `<router>/next_hops`: the next-hop resource
   refuses a write or erase of a bound id and does not enumerate one, so
   desired-state convergence of `<router>/next_hops` leaves bound hops alone.

@@ -268,7 +268,7 @@ struct NextHopGroup {
 // writer, the engine: the direct setters above refuse (kEnrolled), and the
 // engine's reference ledger replaces the router's own counts.
 //
-// Neighbor bindings (D-180): "<name>/neighbors" (key EncodeKey(NextHopId),
+// Neighbor bindings (D-183): "<name>/neighbors" (key EncodeKey(NextHopId),
 // value NeighborKey) binds a next-hop id to a neighbor that a resolver owns.
 // Binding publishes the id's next hop -- egress the neighbor's interface,
 // incomplete -- in the same slot table the static next hops use, so routes
@@ -970,7 +970,7 @@ class Router {
   std::unique_ptr<dataplane::Resource> groups_res_;  // holds nothing without max_groups
   std::unique_ptr<dataplane::Resource> routes_res_;
 
-  // Neighbor bindings (D-180), written by the engine's serialized
+  // Neighbor bindings (D-183), written by the engine's serialized
   // transactions and read by the control side under the same serialization.
   // Index = next-hop id, sized at construction, so publishing a binding never
   // allocates.

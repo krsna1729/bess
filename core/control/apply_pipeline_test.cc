@@ -1685,7 +1685,7 @@ PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids,
                                      const std::vector<uint32_t> &bound_ids = {1},
                                      bool route = true) {
   bess::pb::RouterArg arg;
-  arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);  // routes need a FIB (D-180)
+  arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);  // routes need a FIB (D-183)
   arg.set_max_ipv4_routes(16);
   auto *interface = arg.add_interfaces();
   interface->set_id(2);
@@ -1728,7 +1728,7 @@ PipelineSpec ResolvingRouterPipeline(const std::vector<uint32_t> &static_ids,
   return spec;
 }
 
-// Neighbor bindings are desired state of their own (D-180): a manifest lists
+// Neighbor bindings are desired state of their own (D-183): a manifest lists
 // them in rt/neighbors and the routes that name them in rt/routes, in any
 // order. The bound hops are not rt/next_hops entries, so a static list
 // neither erases nor reports them, and one that names a bound id is refused.

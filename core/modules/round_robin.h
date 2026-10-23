@@ -46,6 +46,9 @@ class RoundRobin final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // One worker advances current_gate_ per packet or batch.
+  static constexpr ModuleCapabilities kCapabilities{
+      ModuleCapabilities::State::kSingleWorker, ModuleCapabilities::FlowAffinity::kNone};
 
   RoundRobin()
       : Module(), gates_(), ngates_(), current_gate_(), per_packet_() {}

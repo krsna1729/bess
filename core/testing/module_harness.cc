@@ -45,6 +45,9 @@ class HarnessInject final : public Module {
  public:
   static const gate_idx_t kNumIGates = 0;
   static const gate_idx_t kNumOGates = 1;
+  // RunTask drains the shared `pending` queue: one worker.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   HarnessInject() { is_task_ = true; }
 
@@ -85,6 +88,9 @@ class HarnessCapture final : public Module {
  public:
   static const gate_idx_t kNumIGates = MAX_GATES;
   static const gate_idx_t kNumOGates = 0;
+  // ProcessBatch appends to the `captured` map: one worker.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) { return CommandSuccess(); }
 
@@ -224,7 +230,7 @@ void ModuleHarness::WireOutputs(Module *m, std::vector<gate_idx_t> ogates, Task 
 
 void ModuleHarness::RunOnce(Task &task) {
   Context ctx = {};
-  ctx.wid = bess::dataplane::WorkerId(0);
+  ctx.wid = worker_;
   ctx.task = &task;
   ctx.current_tsc = rdtsc();
   ctx.current_ns = tsc_to_ns(ctx.current_tsc);

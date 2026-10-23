@@ -13,6 +13,9 @@
 class VXLANEncap final : public Module {
  public:
   static const uint16_t kDefaultDstPort;
+  // Encapsulates each packet independently; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   VXLANEncap() : Module(), dstport_() {
     max_allowed_workers_ = Worker::kMaxWorkers;

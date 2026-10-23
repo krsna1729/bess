@@ -355,7 +355,7 @@ std::vector<ModuleSample> EveryResourceSample() {
          {{R"({"id": 1})", R"({"tr_tcm": {"committed_rate": 1, "committed_burst": 100,
                                           "peak_rate": 1, "peak_burst": 100}})"}}}}},
       // A next hop's canonical form omits defaults: no neighbor when resolved.
-      // Destination mode, since only it holds routes (D-180); an interface,
+      // Destination mode, since only it holds routes (D-183); an interface,
       // since a neighbor binding names one (its id is egress_gate + 1).
       {"rt", "Router",
        R"({"mode": "ROUTE_MODE_DESTINATION", "max_ipv4_routes": 64, "max_ipv4_tbl8s": 16, "max_next_hops": 64, "max_groups": 8,

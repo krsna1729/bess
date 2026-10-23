@@ -28,8 +28,8 @@ const Commands Meter::cmds = {
 };
 
 const ResourceTables Meter::resource_tables = {
-    ResourceTable::Map<bess::pb::MeterIdKey, bess::pb::MeterPolicyValue>(
-        "meters"),
+    ResourceTable::Map<bess::pb::MeterIdKey, bess::pb::MeterPolicyValue>("meters")
+        .Rebuilds(),
 };
 
 namespace {

@@ -157,6 +157,9 @@ class DRR final : public Module {
   // "settings" (DRRSettings): quantum and max flow queue size, applied live
   // (D-129).
   static const ResourceTables resource_tables;
+  // Any worker enqueues into the multi-producer ingress ring; one task drains it.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::DRRArg &arg);
   void DeInit() override;

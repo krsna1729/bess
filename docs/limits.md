@@ -82,7 +82,7 @@ Columns:
 | Bridge | domains; interface ids | 65,535; 65,535 | `MacTable::kMaxDomains`, `kMaxValue` | `max_domains` up to the bound | refused |
 | Meter | meters | default 1,024 | `MeterArg.capacity` | yes (up to the id width) | EINVAL |
 | Meter | meter ids per packet (levels) | 8 | `kMetadataAttrMaxSize / 4` | `MeterArg.levels` 1–8 | EINVAL |
-| Router | address families | destination mode: IPv4, IPv6 or both, at least one; next-hop-id mode: no FIB, both families forwarded | `RouterArg.max_ipv4_routes`, `max_ipv6_routes` (D-180) | destination mode: a family is enabled by setting its route capacity; next-hop-id mode takes no capacity | EINVAL "no address family is enabled" (destination); an explicit 0 is refused; in next-hop-id mode a capacity, a non-default `backend` or `flow_hash`, a nonzero `max_groups`, `max_domains` above 1, `domain_attr`, `punt_miss_gate` or `punt_unresolved_gate` is EINVAL "has no FIB", and route and group writes are refused |
+| Router | address families | destination mode: IPv4, IPv6 or both, at least one; next-hop-id mode: no FIB, both families forwarded | `RouterArg.max_ipv4_routes`, `max_ipv6_routes` (D-183) | destination mode: a family is enabled by setting its route capacity; next-hop-id mode takes no capacity | EINVAL "no address family is enabled" (destination); an explicit 0 is refused; in next-hop-id mode a capacity, a non-default `backend` or `flow_hash`, a nonzero `max_groups`, `max_domains` above 1, `domain_attr`, `punt_miss_gate` or `punt_unresolved_gate` is EINVAL "has no FIB", and route and group writes are refused |
 | Router | IPv4 routes; tbl8 groups per domain | 4G − 1; default 256 | `RouterArg.max_ipv4_routes`, `max_ipv4_tbl8s`, `Router::kDefaultIpv4Tbl8s` (`modules/router.h`) | yes | EINVAL "ipv4 capacity exceeds backend limits"; a full table refuses the route write (`kTableFull`) |
 | Router | IPv6 routes; tbl8 groups per domain | 1G − 1 (rte_fib6's rule pool is 2 × routes); default 8,192 | `RouterArg.max_ipv6_routes`, `max_ipv6_tbl8s`, `Router::kDefaultIpv6Tbl8s` (`modules/router.h`) | yes | a full table refuses the route write (`kTableFull`); the transaction changes nothing |
 | Router | IPv6 FIB entry width; memory per domain | 2 B while the largest value (`max_next_hops + max_groups`) and `max_ipv6_tbl8s` are at most 32,767, else 4 B; at 2 B one instance is 32 MiB + 512 B × `max_ipv6_tbl8s` plus the rib | `kMaxTwoByteValue` (`route/route_table.cc`) | follows from the capacities | — (a domain holds one instance until its first IPv6 change and two after, live and spare; double the bytes at 4 B) |
@@ -112,10 +112,10 @@ Columns:
 | VXLANEncap | UDP destination port | 4789 | `VXLANEncap::kDefaultDstPort` | `dstport` | — |
 | Dump | sampling interval | 1 s | `DEFAULT_INTERVAL_NS` (`dump.cc`) | `interval` | — |
 | Router | default route domain | 0 | `kDefaultRouteDomainId` (`route/route_domain.h`) | the route key's `domain` | — |
-| Router | neighbor next-hop updates published per tick | 64 | `Router::kMaxNeighborUpdatesPerTick` (`modules/router.h`) | No | the rest stay pending for the next tick (D-180) |
+| Router | neighbor next-hop updates published per tick | 64 | `Router::kMaxNeighborUpdatesPerTick` (`modules/router.h`) | No | the rest stay pending for the next tick (D-183) |
 | Router | neighbor interfaces | fixed at Init | `RouterArg.interfaces` | No (recreate the Router) | no runtime change; bindings are the runtime `<router>/neighbors` resource |
 | Router | neighbor bindings | default min(1,024, `max_next_hops`) | `RouterArg.max_neighbors` | up to `max_next_hops` | EINVAL above `max_next_hops`; a binding past the bound refuses its transaction |
-| Router | on-demand resolution (glean) | none | — | No | a route gateway or connected host resolves only through a bound next-hop id; every neighbor needs a binding (D-180) |
+| Router | on-demand resolution (glean) | none | — | No | a route gateway or connected host resolves only through a bound next-hop id; every neighbor needs a binding (D-183) |
 | Router | neighbor input rings | 1,024 replies/advertisements, 256 ARP request copies, 1,024 solicitations | `router.cc` | No | the frame or solicitation is dropped and counted; timers retry |
 
 ## Other fixed constants

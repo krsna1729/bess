@@ -45,7 +45,7 @@ namespace bess::route {
 //                              +--retry--> kIncomplete
 //
 // Aging does not take a resolved neighbor out of service (RFC 4861's STALE
-// and PROBE states, D-180): when its reachable lifetime ends it keeps
+// and PROBE states, D-183): when its reachable lifetime ends it keeps
 // forwarding on the MAC it has while the resolver solicits again, with the
 // same probe count and backoff as a first attempt. A reply refreshes it; only
 // an attempt that sends max_probes without one fails it to kUnreachable, which

@@ -163,7 +163,7 @@ std::vector<ModuleCase> ParityCases() {
     c.mclass = "Router";
     auto arg = Msg<pb::RouterArg>();
     // Destination mode: routes need a FIB, which the next-hop-id mode has
-    // none of (D-180).
+    // none of (D-183).
     arg->set_mode(pb::ROUTE_MODE_DESTINATION);
     arg->set_max_ipv4_routes(64);
     arg->set_max_next_hops(16);
@@ -290,6 +290,10 @@ TEST(ResourceParityTest, DeclaredTablesAreLiveTypedAndReleased) {
       EXPECT_EQ(codec->value_type(), table.value_type) << "value type";
       EXPECT_EQ(codec->requires_paused_workers(), table.requires_paused_workers)
           << "paused-worker requirement";
+      // ValidatePipeline reports a module table as referential (D-180): one
+      // that provides more must be declared so before the module exists.
+      EXPECT_EQ(resource->ProvidedConsistency(), dataplane::Consistency::kReferential)
+          << "consistency";
 
       // A message of the wrong type is refused by the type it is sent to.
       const google::protobuf::Empty empty;
@@ -343,6 +347,60 @@ TEST(ResourceParityTest, DeclaredTablesAreLiveTypedAndReleased) {
     }
     EXPECT_TRUE(RegisteredNames(engine, prefix).empty())
         << "a resource outlived its module";
+  }
+}
+
+// D-180: every module class answers what its modules promise about their
+// state, and a module created from an argument keeps that promise in the
+// worker limit it sets: one worker for state only one worker owns, several
+// for per-worker or shared state, and a flow-affinity need only where each
+// worker owns its own state.
+TEST(ModuleCapabilitiesTest, EveryClassDeclaresAndModulesAgree) {
+  using State = ModuleCapabilities::State;
+  using Affinity = ModuleCapabilities::FlowAffinity;
+  for (const auto &[mclass, builder] : ModuleBuilder::all_module_builders()) {
+    SCOPED_TRACE(mclass);
+    auto declared = builder.Capabilities(google::protobuf::Any());
+    ASSERT_TRUE(declared.has_value()) << declared.error();
+    EXPECT_NE(declared->state, State::kUnspecified) << mclass << " declares no state";
+    EXPECT_NE(declared->flow_affinity, Affinity::kUnspecified)
+        << mclass << " declares no flow affinity";
+    if (declared->flow_affinity != Affinity::kNone) {
+      EXPECT_EQ(declared->state, State::kPerWorker)
+          << "flow affinity matters only when each worker owns its state";
+    }
+  }
+
+  ModuleHarness harness;
+  auto check = [&](const std::string &mclass, const google::protobuf::Message &arg) {
+    SCOPED_TRACE(mclass);
+    google::protobuf::Any packed;
+    ASSERT_TRUE(packed.PackFrom(arg));
+    auto declared = ModuleBuilder::all_module_builders().at(mclass).Capabilities(packed);
+    ASSERT_TRUE(declared.has_value()) << declared.error();
+    Module *m = harness.Create(mclass, arg, "caps_" + mclass);
+    ASSERT_NE(m, nullptr);
+    switch (declared->state) {
+      case State::kSingleWorker:
+        EXPECT_EQ(1, m->max_allowed_workers()) << "state one worker owns";
+        break;
+      case State::kPerWorker:
+      case State::kShared:
+        EXPECT_LT(1, m->max_allowed_workers()) << "state several workers own or share";
+        break;
+      default:
+        break;
+    }
+    ModuleGraph::DestroyModule(m);
+  };
+  for (const ModuleCase &c : ParityCases()) {
+    check(c.mclass, *c.arg);
+  }
+  for (auto mode : {pb::ConnTrackArg::OWNED, pb::ConnTrackArg::PER_WORKER,
+                    pb::ConnTrackArg::SHARED}) {
+    pb::ConnTrackArg arg;
+    arg.set_mode(mode);
+    check("ConnTrack", arg);
   }
 }
 

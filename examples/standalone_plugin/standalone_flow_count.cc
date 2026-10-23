@@ -44,6 +44,9 @@ class StandaloneFlowCount final : public Module {
  public:
   static const gate_idx_t kNumOGates = 2;
   static const Commands cmds;
+  // Capabilities: the packet path writes the flow table, on its one worker.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   // One worker owns the table; the module may not run on two.
   StandaloneFlowCount() { max_allowed_workers_ = 1; }

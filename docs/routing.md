@@ -61,12 +61,12 @@ route exists and chose that hop (D-160).
 
 | file | what it is |
 |---|---|
-| `route/route_table.h` | the FIB: `LpmRouteTable` (rte_lpm or rte_fib, D-132) for IPv4 and `Ipv6RouteTable` (rte_fib6, two instances, D-180) for IPv6, lock-free lookups, the `/0` route kept beside the structure |
+| `route/route_table.h` | the FIB: `LpmRouteTable` (rte_lpm or rte_fib, D-132) for IPv4 and `Ipv6RouteTable` (rte_fib6, two instances, D-183) for IPv6, lock-free lookups, the `/0` route kept beside the structure |
 | `route/router.h` | the router: route domains, per-domain dual-stack FIBs, next hops, next-hop groups, `Resolve`/`ResolveBatch`, the direct setters and the transactional resource (`Enroll`) |
 | `route/neighbor_table.h` | neighbor state keyed by (interface, address family, address); `Bind`/`Update` return the next hops to republish |
 | `route/neighbor_resolver.h` | the IPv4/IPv6 neighbor state machine: ARP or ND solicitation, retries/backoff, aging, MAC change, failure/recovery, interface identity; returns frames and neighbor updates (`docs/neighbor-resolution.md`) |
 | `route/l3_packet.h` | packet mechanics: IPv4 TTL/checksum, IPv6 hop limit, `FlowHash`, MTU, ICMPv4 errors, ARP and IPv6 ND build/parse |
-| `route/forward.h` | the dual-stack forwarding chain both callers share (D-157, D-180): `ResolveFrame(s)` (read) and `WriteForwarded` (write), IPv4 and IPv6 through one implementation; link-local/multicast IPv6 is never routed |
+| `route/forward.h` | the dual-stack forwarding chain both callers share (D-157, D-183): `ResolveFrame(s)` (read) and `WriteForwarded` (write), IPv4 and IPv6 through one implementation; link-local/multicast IPv6 is never routed |
 | `route/connected_routes.h` | the routes an interface address implies (D-178): `DerivedRoutes::Derive` for connected + local, deterministic order and stable keys, `InstallationOps`/`EraseOps` for the controller's transaction |
 | `route/lpm_resource.h` | one IPv4 `LpmRouteTable` as a transaction resource (D-111): prefix → an opaque value whose meaning is the module's |
 | `conntrack/packet_parse.h` | the checked parse the chain starts from |
@@ -82,7 +82,7 @@ ports/vifs -> classifier (next_hop_id) -> Router -> ports
 
 The Router decrements the IPv4 TTL and fixes its checksum, or decrements the
 IPv6 hop limit, before the L2 rewrite, exactly as destination mode does (D-153,
-D-180); a frame arriving with a hop count of 0 or 1 is dropped and counted as
+D-183); a frame arriving with a hop count of 0 or 1 is dropped and counted as
 TTL expired. No FIB routes are needed: the classifier selects a hop, and the
 Router resolves it to an egress gate.
 
@@ -121,7 +121,7 @@ IPv4-only, IPv6-only and dual-stack configuration examples.
 
 ## Address families and sizing
 
-The family rules depend on the mode (D-180).
+The family rules depend on the mode (D-183).
 
 **Next-hop-id mode (`ROUTE_MODE_NEXT_HOP_ID`, the default).** The packet's
 next-hop id is the decision, so the Router has no FIB: it allocates none in
@@ -258,7 +258,7 @@ than to grow a second prefix table.
 - `docs/decisions.md` — D-046 (domains), D-111 (the LPM resource), D-132 (the FIB backends), D-153 (address
   writes), D-155 (routing by destination), D-156 (groups), D-157 (the shared chain), D-158 (lazy domains),
   D-160 (a hop that forwards nowhere), D-175 (IPv4 neighbor resolution), D-176 (IPv6 ND on the same resolver),
-  D-178 (connected/local route derivation and local delivery), D-180 (IPv6 routing, families, the Router's own
+  D-178 (connected/local route derivation and local delivery), D-183 (IPv6 routing, families, the Router's own
   neighbor resolution).
 - `examples/appliances/router/router_app.h` — R1, the reference application, and `examples/static_router` for
   the same code as a program without `bessd`.

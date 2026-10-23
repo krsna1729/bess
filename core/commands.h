@@ -5,6 +5,7 @@
 #ifndef BESS_COMMANDS_H_
 #define BESS_COMMANDS_H_
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -70,6 +71,10 @@ struct ResourceTable {
   std::string key_type;  // protobuf full names; google.protobuf.Empty for a singleton
   std::string value_type;
   bool requires_paused_workers = false;
+  // A change rebuilds the table's structure and swaps it in, so it costs in
+  // proportion to the table, not to the change (D-180). False: a change is
+  // applied in place.
+  bool rebuilds = false;
 
   template <typename KeyMsg, typename ValueMsg>
   static ResourceTable Map(std::string table, bool requires_paused_workers = false) {
@@ -81,7 +86,46 @@ struct ResourceTable {
     return {std::move(table), SINGLETON, "google.protobuf.Empty",
             std::string(ValueMsg::descriptor()->full_name()), requires_paused_workers};
   }
+
+  // Declares that a change rebuilds the table: `Map<K, V>("rules").Rebuilds()`.
+  ResourceTable Rebuilds() && {
+    rebuilds = true;
+    return std::move(*this);
+  }
 };
 using ResourceTables = std::vector<ResourceTable>;
+
+// What a module class promises about the state its packet path changes
+// (D-180), so that a controller can place it before it exists: which workers
+// may run it, and whether one flow's packets must reach one worker.
+// Statistics are not state here; configuration the control plane writes is
+// described by the class's resource tables instead.
+//
+// A class declares `static constexpr ModuleCapabilities kCapabilities{...}`,
+// or, when its init argument chooses, `static ModuleCapabilities
+// Capabilities(const Arg &)`. A class that declares neither reports both
+// fields unspecified.
+struct ModuleCapabilities {
+  // Who owns the state the packet path changes.
+  enum class State : uint8_t {
+    kUnspecified = 0,
+    kNone = 1,          // the packet path changes no module state
+    kSingleWorker = 2,  // one worker runs the module and owns its state
+    kPerWorker = 3,     // each worker running the module owns a separate state
+    kShared = 4,        // the workers running the module change one state, synchronized
+  };
+  // Whether the packets of one flow must reach one worker.
+  enum class FlowAffinity : uint8_t {
+    kUnspecified = 0,
+    kNone = 1,       // any worker may see any packet
+    kPreferred = 2,  // correct on any worker; cheaper when a flow stays on one
+    kRequired = 3,   // correct only when a flow's packets, both ways, reach one worker
+  };
+
+  State state = State::kUnspecified;
+  FlowAffinity flow_affinity = FlowAffinity::kUnspecified;
+
+  constexpr bool operator==(const ModuleCapabilities &) const = default;
+};
 
 #endif  // BESS_COMMANDS_H_

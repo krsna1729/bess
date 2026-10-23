@@ -19,6 +19,9 @@ class PortInc final : public Module {
   static const Commands cmds;
   // "settings" (PortIncSettings): burst, applied live (D-129).
   static const ResourceTables resource_tables;
+  // The packet path only receives from the port's queues and counts.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   PortInc() : Module(), port_(), prefetch_(), burst_() {
     is_task_ = true;

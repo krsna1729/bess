@@ -40,7 +40,8 @@ const Commands Vif::cmds = {};
 
 const ResourceTables Vif::resource_tables = {
     ResourceTable::Map<bess::pb::VifInterfaceKey, bess::pb::VifInterfaceValue>(
-        "interfaces", /*requires_paused_workers=*/true)};
+        "interfaces", /*requires_paused_workers=*/true)
+        .Rebuilds()};
 
 // "<module>/interfaces": key EncodeKey(id), value an Interface (its id
 // unset). Workers read the tables without synchronization, so this runs with

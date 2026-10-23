@@ -210,7 +210,7 @@ FORBIDDEN_RULES = [
     ),
     # Modules obtain runtime facilities through Module::init_context() (D-042),
     # never by including the runtime state. Tests and benchmarks are exempt.
-    # One in-tree exception (D-180): the Router publishes its resolver's
+    # One in-tree exception (D-183): the Router publishes its resolver's
     # neighbor updates through the process's transaction engine, which D-074
     # keeps off the plugin-facing context.
     (

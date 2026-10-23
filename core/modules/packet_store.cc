@@ -75,7 +75,8 @@ const Commands PacketStore::cmds = {
 const ResourceTables PacketStore::resource_tables = {
     ResourceTable::Map<bess::pb::PacketStoreFlowKey,
                        bess::pb::PacketStoreFlowValue>(
-        "flows", /*requires_paused_workers=*/false)};
+        "flows", /*requires_paused_workers=*/false)
+        .Rebuilds()};
 
 // ---------------------------------------------------------------------------
 // The owner's side: the module's task

@@ -14,6 +14,9 @@ class VLANSplit final : public Module {
   CommandResponse Init(const bess::pb::VLANSplitArg &) { return CommandSuccess(); }
 
   static const gate_idx_t kNumOGates = 4096;
+  // Strips the tag and picks the gate from the VID; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 };

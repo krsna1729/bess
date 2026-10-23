@@ -39,6 +39,11 @@ class ConnTrack final : public Module {
 
   ConnTrack() : Module() { max_allowed_workers_ = 1; }
 
+  // OWNED: one worker owns the table. SHARED: every worker changes one
+  // table, any distribution. PER_WORKER: each worker owns its table, so a
+  // connection's packets must reach one worker -- required when unverified
+  // inputs fail closed, preferred when they fall back to one shared table.
+  static ModuleCapabilities Capabilities(const bess::pb::ConnTrackArg &arg);
   CommandResponse Init(const bess::pb::ConnTrackArg &arg);
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
   int OnEvent(bess::Event event) override;
@@ -51,6 +56,12 @@ class ConnTrack final : public Module {
   void Track(T &table, Context *ctx, bess::PacketBatch *batch);
 
   std::unique_ptr<Ct> MakeTable() const;
+
+  // status_attr's offset when something reads it (D-182), else an invalid
+  // offset: the packet path writes nothing.
+  bess::metadata::mt_offset_t StatusOffset() const {
+    return status_attr_ < 0 ? bess::metadata::kMetadataOffsetNoWrite : attr_offset(status_attr_);
+  }
 
   bess::pb::ConnTrackArg::Mode mode_ = bess::pb::ConnTrackArg::OWNED;
   size_t capacity_ = 0;
@@ -66,6 +77,9 @@ class ConnTrack final : public Module {
   std::optional<std::string> refused_;
   // Connections refused because the table was full (M25, D-089).
   bess::stats::EventThrottle table_full_;
+  // The configured status attribute (D-182); -1 when none.
+  int status_attr_ = -1;
+  std::string status_attr_name_;
 };
 
 #endif  // BESS_MODULES_CONNTRACK_H_

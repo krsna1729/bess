@@ -12,6 +12,9 @@ class Sink final : public Module {
   Sink() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
   static const gate_idx_t kNumOGates = 0;
+  // The packet path only frees packets.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::SinkArg &) { return CommandSuccess(); }
 

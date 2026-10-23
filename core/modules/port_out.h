@@ -18,6 +18,9 @@ class PortOut final : public Module {
   static const gate_idx_t kNumOGates = 0;
 
   static const Commands cmds;
+  // Workers sharing a TX queue serialize on that queue's MCS lock.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   PortOut()
       : Module(),

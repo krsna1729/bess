@@ -12,6 +12,10 @@ class IPEncap final : public Module {
  public:
   IPEncap() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
+  // Prepends a header from packet metadata; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   CommandResponse Init(const bess::pb::IPEncapArg &arg);
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;

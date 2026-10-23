@@ -144,7 +144,7 @@ ExactMatch *CreateExactMatch(const std::string &name,
 }
 
 // A next-hop-id Router: it forwards on the id the rule's result writes and
-// has no FIB, so it holds no routes (D-180).
+// has no FIB, so it holds no routes (D-183).
 Router *CreateRouterModule(const std::string &name,
                            const std::string &next_hop_attr = "") {
   bess::pb::RouterArg arg;
@@ -1063,7 +1063,7 @@ class SessionPacketPathTest : public SessionPipelineTest {
 
   // One session: the meter (`burst` bytes, no refill), the next hop to
   // kEgressGate, and the rule naming both. The router forwards on the id the
-  // rule writes; it holds no routes (D-180).
+  // rule writes; it holds no routes (D-183).
   std::vector<Op> SessionOps(const char *sip, uint16_t sport, uint64_t burst) {
     return {
         Op::Upsert("mt/meters", bess::dataplane::EncodeKey(MeterId(1)),
@@ -1418,7 +1418,7 @@ TEST_F(SessionPacketPathTest, BadResourceValuesAreRefused) {
   bad_gate.set_egress_gate(DROP_GATE + 1);  // DROP_GATE itself is "no interface"
   EXPECT_NE("", h_.UpsertResource("rt/next_hops", h1, bad_gate));
 
-  // A next-hop-id router has no FIB: every route write is refused (D-180).
+  // A next-hop-id router has no FIB: every route write is refused (D-183).
   bess::pb::RouterRouteKey r1;
   r1.set_ipv4("10.0.0.0");
   r1.set_prefix_length(8);

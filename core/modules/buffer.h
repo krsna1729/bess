@@ -10,6 +10,10 @@
 /* TODO: timer-triggered flush */
 class Buffer final : public Module {
  public:
+  // The packet path accumulates packets in buf_ (one worker by default).
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   Buffer() : Module(), buf_() {}
 
   CommandResponse Init(const bess::pb::BufferArg &) { return CommandSuccess(); }

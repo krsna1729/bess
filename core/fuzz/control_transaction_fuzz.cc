@@ -642,7 +642,7 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
       return reject(i);
     }
   }
-  // Reserve in ascending resource rank, request order within a rank (D-180):
+  // Reserve in ascending resource rank, request order within a rank (D-183):
   // routes reference next hops, so they rank above the rest and reserve
   // last; the failure is reported at the first operation that fails in that
   // order.

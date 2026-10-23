@@ -280,7 +280,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   // unknown value (an arg from a newer binary) keeps that default too.
   flow_fields_ = arg.flow_hash() == bess::pb::FLOW_HASH_L3 ? route::FlowHashFields::kL3
                                                            : route::FlowHashFields::kL3L4;
-  // Address families (D-180). A next-hop-id router has no FIB: it forwards
+  // Address families (D-183). A next-hop-id router has no FIB: it forwards
   // what the id names, of either family, so it takes no family setting and
   // refuses every field that only a FIB (routes, groups, domains, the hash a
   // group route uses, the punts of a lookup) would ever read.
@@ -563,7 +563,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                                 address.error().c_str());
         }
         const bool v4 = address->address.is_ipv4();
-        // Destination mode routes only its enabled families (D-180); the
+        // Destination mode routes only its enabled families (D-183); the
         // next-hop-id mode forwards both, so it takes addresses of either.
         if (routes_by_destination() &&
             (v4 ? !router_->has_ipv4() : !router_->has_ipv6())) {
@@ -684,7 +684,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
           // The read-back is desired state (D-129): the static next hops. A
           // bound one is "<module>/neighbors"' entry (its key and its
           // binding read back there), and its state is learned, not desired
-          // (D-180), so it is not listed here: a list of static hops neither
+          // (D-183), so it is not listed here: a list of static hops neither
           // erases nor reports it, and one that names it is refused.
           [this](const auto &visit) {
             router_->ForEachNextHop(
@@ -730,7 +730,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
           [destination = routes_by_destination()](const bess::pb::RouterGroupIdKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
             // Only a route names a group, and the next-hop-id mode has no
-            // routes (D-180): a group there could never be reached.
+            // routes (D-183): a group there could never be reached.
             if (!destination) {
               return std::unexpected(
                   "groups are not used in ROUTE_MODE_NEXT_HOP_ID (only a route "
@@ -784,7 +784,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                                              bess::pb::RouterRouteValue>>(
           [destination = routes_by_destination()](const bess::pb::RouterRouteKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
-            // The next-hop-id mode holds no FIB (D-180): a route there is a
+            // The next-hop-id mode holds no FIB (D-183): a route there is a
             // configuration error, said so rather than "family disabled".
             if (!destination) {
               return std::unexpected(
@@ -883,7 +883,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                 });
           }));
 
-  // Each mode declares only the attribute it reads (D-180). A declared read is
+  // Each mode declares only the attribute it reads (D-183). A declared read is
   // a requirement on every upstream path: a destination-mode Router that
   // declared `next_hop_id` would invalidate that attribute's scope for the
   // other readers in the graph wherever its own input (ARP/ND, a VIF) has no
@@ -1065,7 +1065,7 @@ int Router::OnEvent(bess::Event event) {
 // gratuitous announcement included -- moves that neighbor to the MAC it
 // carries (RFC 826's merge, NeighborResolver::OnArp). Everything else stays in
 // the batch and is routed. A family no configured interface has an address
-// of has no neighbor protocol here (D-180): its ARP or ND frames stay in the
+// of has no neighbor protocol here (D-183): its ARP or ND frames stay in the
 // batch like any other frame of that kind.
 void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
   constexpr size_t kEth = sizeof(bess::utils::Ethernet);
@@ -1191,7 +1191,7 @@ void Router::QueueNeighborUpdates(
 }
 
 // A neighbor change is a next-hop write, applied through the process's
-// transaction engine like any other (D-180) -- the module is in-tree, so it
+// transaction engine like any other (D-183) -- the module is in-tree, so it
 // uses the engine directly; plugins keep the registry's narrower face (D-074).
 // At most kMaxNeighborUpdatesPerTick go in one transaction, so a burst of
 // changes (an interface with many bindings changing identity) is published
@@ -1268,7 +1268,7 @@ CommandResponse Router::CommandGetNeighbors(const bess::pb::EmptyArg &) {
   return CommandSuccess(response);
 }
 
-// Takes up the bindings transactions published since the last tick (D-180).
+// Takes up the bindings transactions published since the last tick (D-183).
 // Only each id's final binding matters -- several transactions may have
 // changed one id since the last tick, and one transaction publishes its binds
 // before its unbinds -- so the changes are coalesced per id first. Then, with
@@ -1510,7 +1510,7 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     // no hop count to decrement: it keeps what it arrived with and, as
     // before, still gets the hop's addresses. A header the parser cannot read
     // is dropped and counted, never forwarded. Both families are forwarded:
-    // this mode has no FIB and so no family setting (D-180), and the hop
+    // this mode has no FIB and so no family setting (D-183), and the hop
     // count written is the packet's own family's.
     bess::conntrack::ParsedFlowPacket parsed;
     const bess::conntrack::ParseStatus status = bess::conntrack::ParseFrame(
@@ -1568,7 +1568,7 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
 // One counter per verdict the chain reports (route/forward.h). kForward is not
 // a drop; kLocalDelivery is a delivery (D-178); kNoEgress is the blackhole
 // shape (D-160), counted apart from a miss because the route exists and chose
-// that hop; kLinkScope is IPv6 that is never forwarded (D-180).
+// that hop; kLinkScope is IPv6 that is never forwarded (D-183).
 void Router::CountVerdict(route::ForwardVerdict verdict) {
   switch (verdict) {
     case route::ForwardVerdict::kLocalDelivery:
@@ -1610,7 +1610,7 @@ void Router::CountVerdict(route::ForwardVerdict verdict) {
 }
 
 // A link-scoped IPv6 frame is the node's own business, as a local route's is:
-// both take the local punt gate (D-178, D-180).
+// both take the local punt gate (D-178, D-183).
 gate_idx_t Router::PuntGateOf(route::ForwardVerdict verdict) const {
   switch (verdict) {
     case route::ForwardVerdict::kNoRoute:
@@ -1771,7 +1771,7 @@ void Router::ResolveRun(bess::PacketBatch *batch, int begin, int end,
 std::string Router::GetDesc() const {
   std::string desc;
   if (!routes_by_destination()) {
-    // No FIB and no family setting (D-180): both families are forwarded.
+    // No FIB and no family setting (D-183): both families are forwarded.
     desc = bess::utils::Format(
         "%zu next hops, %zu header write failures, %zu local, ttl expired: %zu, "
         "next-hop id from metadata (no FIB)",
@@ -1779,7 +1779,7 @@ std::string Router::GetDesc() const {
         static_cast<size_t>(local_frames()),
         static_cast<size_t>(ttl_expired_frames()));
   } else {
-    // Which families the router routes (D-180): the other family's frames
+    // Which families the router routes (D-183): the other family's frames
     // are dropped and counted as family disabled.
     const char *families = router_->has_ipv4() && router_->has_ipv6() ? "IPv4+IPv6"
                            : router_->has_ipv4()                     ? "IPv4"

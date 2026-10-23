@@ -26,7 +26,7 @@ const uint64_t TIME_OUT_NS = 10ull * 1000 * 1000 * 1000;  // 10 seconds
 const Commands UrlFilter::cmds = {};
 
 const ResourceTables UrlFilter::resource_tables = {
-    ResourceTable::Singleton<bess::pb::UrlFilterConfig>("blacklist", true)};
+    ResourceTable::Singleton<bess::pb::UrlFilterConfig>("blacklist", true).Rebuilds()};
 
 // Template for generating TCP packets without data
 struct[[gnu::packed]] PacketTemplate {

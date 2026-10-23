@@ -65,6 +65,9 @@ class FlowGen final : public Module {
   // task reads them unsynchronized, so it requires
   // paused workers (D-129).
   static const ResourceTables resource_tables;
+  // The task advances the flow event queue, flow pool and RNG (one worker).
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::FlowGenArg &arg);
 

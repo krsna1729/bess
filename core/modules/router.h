@@ -44,7 +44,7 @@
 //     calls: the route domain the packet carries (a `route_domain` be32
 //     attribute a VIF writes; domain 0 when nothing writes it) selects the
 //     FIB. Every frame goes through the library's dual-stack forwarding chain
-//     (route/forward.h, D-157, D-180), which parses the frame once, looks the
+//     (route/forward.h, D-157, D-183), which parses the frame once, looks the
 //     destination up in that domain's IPv4 or IPv6 FIB (one bulk lookup per
 //     family for a run of frames), checks the neighbor, decrements the TTL or
 //     hop limit and writes the hop's addresses. Link-scoped IPv6 -- a
@@ -59,7 +59,7 @@
 //     counted. The `next_hop_id` attribute is ignored in this mode, even if
 //     some module writes it.
 //
-// Address families (D-180). In destination mode, RouterArg enables IPv4 and
+// Address families (D-183). In destination mode, RouterArg enables IPv4 and
 // IPv6 independently, each with its own route and tbl8 capacity; at least one
 // is enabled. A disabled family has no FIB in any domain: its frames are
 // dropped and counted (family_disabled_frames), and its routes, interface
@@ -74,7 +74,7 @@
 // guess. docs/routing.md is the guide: the library's pieces, the two recipes
 // and what a graph decides.
 //
-// Neighbor resolution (D-180). With `interfaces` (fixed at Init), the module
+// Neighbor resolution (D-183). With `interfaces` (fixed at Init), the module
 // owns the adjacencies of the next hops bound in `<module>/neighbors`: a
 // route::NeighborResolver solicits (ARP, ND) from a task, learns from ARP
 // replies and Neighbor Advertisements read with the ingress interface
@@ -125,6 +125,9 @@ class Router final : public Module {
   // `max_groups`) and "<module>/routes" (RouterRouteKey -> RouterRouteValue),
   // D-129.
   static const ResourceTables resource_tables;
+  // The packet path only reads the RCU-published FIB and next hops.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Router() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
 
@@ -193,13 +196,13 @@ class Router final : public Module {
   uint64_t local_frames() const noexcept {
     return local_frames_.load(std::memory_order_relaxed);
   }
-  // IPv6 frames that must not be forwarded (D-180): a link-local or multicast
+  // IPv6 frames that must not be forwarded (D-183): a link-local or multicast
   // destination, or a link-local source. Like local frames, they go to
   // punt_local_gate or are dropped, and are counted either way.
   uint64_t link_scope_frames() const noexcept {
     return link_scope_frames_.load(std::memory_order_relaxed);
   }
-  // IP frames of a family the router does not enable (D-180): no FIB, no
+  // IP frames of a family the router does not enable (D-183): no FIB, no
   // forwarding, dropped in both modes and counted here.
   uint64_t family_disabled_frames() const noexcept {
     return family_disabled_frames_.load(std::memory_order_relaxed);
@@ -225,7 +228,7 @@ class Router final : public Module {
 
  private:
   // tbl8 groups per domain when RouterArg sets a family's routes but not its
-  // groups (D-180): IPv4's rte_lpm/rte_fib default, and rte_fib6's.
+  // groups (D-183): IPv4's rte_lpm/rte_fib default, and rte_fib6's.
   static constexpr uint64_t kDefaultIpv4Tbl8s = 256;
   static constexpr uint64_t kDefaultIpv6Tbl8s = 8192;
 
@@ -330,7 +333,7 @@ class Router final : public Module {
   // exists in a dataplane graph, so the graph names the slow path (a stack
   // adapter, a control endpoint) or drops. Either way it is counted.
   gate_idx_t punt_local_gate_ = DROP_GATE;
-  // Where ARP requests and Neighbor Solicitations go (D-180): the responder's
+  // Where ARP requests and Neighbor Solicitations go (D-183): the responder's
   // gate, else punt_local_gate_ (RouterArg.punt_neighbor_gate 0), DROP_GATE
   // meaning drop. Counted either way.
   gate_idx_t punt_neighbor_gate_ = DROP_GATE;
@@ -351,9 +354,9 @@ class Router final : public Module {
   // a drop and not a miss.
   std::atomic<uint64_t> local_frames_{0};
   // An IP frame of a family a destination-mode router does not enable
-  // (D-180).
+  // (D-183).
   std::atomic<uint64_t> family_disabled_frames_{0};
-  // An IPv6 frame of link scope (D-180): never forwarded.
+  // An IPv6 frame of link scope (D-183): never forwarded.
   std::atomic<uint64_t> link_scope_frames_{0};
   // ARP requests and Neighbor Solicitations: punted or dropped, not answered
   // here (an ARP request from a bound neighbor is also read for its MAC).

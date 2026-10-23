@@ -10,6 +10,7 @@
 #include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
+#include "stats/worker_local.h"
 
 class Rewrite final : public Module {
  public:
@@ -18,6 +19,9 @@ class Rewrite final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Each worker advances its own round robin; packets need no flow affinity.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kPerWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Rewrite()
       : Module(),
@@ -55,11 +59,11 @@ class Rewrite final : public Module {
   static CommandResponse Build(const bess::pb::RewriteArg &arg,
                                Templates *out);
 
-  inline void DoRewrite(const Templates &t, bess::PacketBatch *batch);
+  inline void DoRewrite(const Templates &t, bess::PacketBatch *batch, size_t &next_turn);
   inline void DoRewriteSingle(const Templates &t, bess::PacketBatch *batch);
 
-  // For fair round robin we remember the next index in [0, num).
-  size_t next_turn_;
+  // Each worker remembers its next index in [0, num), on separate cache lines.
+  bess::stats::WorkerLocal<size_t> next_turn_;
   std::unique_ptr<Templates> templates_;  // never null
 
   // The templates as given, in order (control side): "<name>/templates"
