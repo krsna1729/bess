@@ -446,8 +446,9 @@ class NeighborResolver {
       entry->second.probes = was.probes;
       entry->second.reconfirming = was.reconfirming;
       entry->second.serial = was.serial;
-      if (saved->second.deadline) {
-        armed = ArmAt(key, entry->second, std::max(*saved->second.deadline, now));
+      if (const std::optional<uint64_t> &deadline = saved->second.deadline;
+          deadline.has_value()) {
+        armed = ArmAt(key, entry->second, std::max(*deadline, now));
       }
     } else {
       const auto learned = neighbors_.Find(key);
@@ -1120,7 +1121,10 @@ class NeighborResolver {
     if (defer_forgetting_) {
       try {
         deferred_entries_.insert_or_assign(it->first, Deferred{it->second, deadline});
-      } catch (...) {
+      } catch (const std::bad_alloc &) {
+        // No room for the record: Bind takes the neighbor up from what was
+        // learned, as outside a batch.
+        deferred_entries_.erase(it->first);
       }
     }
     entries_.erase(it);

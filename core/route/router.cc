@@ -721,8 +721,8 @@ class Router::NeighborResource final : public dataplane::Resource {
         if (!slot) {
           router_.bound_count_++;
         }
-        slot = *binding_;
-        router_.binding_changes_.push_back({id_, *binding_});  // room reserved
+        slot = binding_;
+        router_.binding_changes_.push_back({id_, binding_});  // room reserved
       }
     }
 
@@ -848,8 +848,8 @@ bool Router::IsNeighborBound(NextHopId id) const {
 void Router::ForEachNeighborBinding(
     const std::function<void(NextHopId, const NeighborKey &)> &fn) const {
   for (size_t i = 1; i < bindings_.size(); i++) {
-    if (bindings_[i]) {
-      fn(NextHopId(static_cast<uint32_t>(i)), *bindings_[i]);
+    if (const std::optional<NeighborKey> &binding = bindings_[i]; binding.has_value()) {
+      fn(NextHopId(static_cast<uint32_t>(i)), *binding);
     }
   }
 }
@@ -1053,7 +1053,7 @@ std::expected<void, RouteError> Router::CreateDomain(RouteDomainId domain,
     return std::unexpected(RouteError::kFamilyDisabled);
   }
   Config sized = config;
-  if (sized.ipv6) {
+  if (sized.ipv6.has_value() && domain_config_.ipv6.has_value()) {
     sized.ipv6->max_value = domain_config_.ipv6->max_value;
   }
   return CreateDomainLocked(domain, sized);

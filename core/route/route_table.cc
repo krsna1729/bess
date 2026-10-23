@@ -526,17 +526,20 @@ bool Ipv6RouteTable::Replay(Instance &instance) {
 std::expected<void, RouteError> Ipv6RouteTable::PrepareSpare() {
   // A spare that was never published needs no grace period: no reader has
   // been in it. Only an instance a commit unpublished waits for one.
-  if (spare_ && !spare_unpublished_ && !spare_token_) {
-    // Committed() has not been called: a grace period started now also
-    // covers the exchange that unpublished the spare.
-    spare_token_ = domain_.StartGracePeriod();
-  }
-  if (spare_ && !spare_unpublished_ && !domain_.IsComplete(*spare_token_)) {
-    // A reader may still be in it: it goes to the RCU domain, and a fresh
-    // spare is built from the rules.
-    domain_.ReserveRetirements(1);
-    domain_.Retire(*spare_token_, std::move(spare_));
-    spare_lag_.clear();
+  if (spare_ && !spare_unpublished_) {
+    if (!spare_token_.has_value()) {
+      // Committed() has not been called: a grace period started now also
+      // covers the exchange that unpublished the spare.
+      spare_token_ = domain_.StartGracePeriod();
+    }
+    const auto token = spare_token_.value();
+    if (!domain_.IsComplete(token)) {
+      // A reader may still be in it: it goes to the RCU domain, and a fresh
+      // spare is built from the rules.
+      domain_.ReserveRetirements(1);
+      domain_.Retire(token, std::move(spare_));
+      spare_lag_.clear();
+    }
   }
   if (spare_ && !Replay(*spare_)) {
     // A replay may need a transient tbl8 group a fresh build does not.
