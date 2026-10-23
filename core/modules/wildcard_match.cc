@@ -644,37 +644,35 @@ WildcardMatch::GenerationPtr WildcardMatch::Build(
     schema.value_size = result_value_size_;
     schema.bounds = bess::classifier::BoundsPolicy::kCheck;
     for (const ResultSpec &spec : result_specs_) {
+      const size_t at = ResultDestination(spec);
+      result_offsets.push_back(at);
+      if (at == kSkippedOffset) {
+        continue;  // compiled out: nothing downstream reads it
+      }
+      if (at == kInvalidOffset) {
+        *err = std::make_pair(
+            EINVAL, "result field '" + spec.attr_name +
+                        "' has no readable metadata offset");
+        return nullptr;
+      }
       bess::classifier::RuntimeResultField field;
       field.value_offset = spec.value_offset;
       field.size = spec.size;
-      if (spec.by_attr) {
-        const bess::metadata::mt_offset_t offset =
-            attr_offset(static_cast<size_t>(spec.attr_id));
-        if (!bess::metadata::IsValidOffset(offset)) {
-          *err = std::make_pair(
-              EINVAL, "result field '" + spec.attr_name +
-                          "' has no readable metadata offset");
-          return nullptr;
-        }
-        field.destination = bess::classifier::BufferKind::kMetadata;
-        field.destination_offset =
-            static_cast<size_t>(static_cast<uint8_t>(offset));
-        result_offsets.push_back(static_cast<size_t>(
-            static_cast<uint8_t>(offset)));
-      } else {
-        field.destination = bess::classifier::BufferKind::kPacket;
-        field.destination_offset = spec.offset;
-        result_offsets.push_back(spec.offset);
-      }
+      field.destination = spec.by_attr ? bess::classifier::BufferKind::kMetadata
+                                       : bess::classifier::BufferKind::kPacket;
+      field.destination_offset = at;
       schema.result_fields.push_back(std::move(field));
     }
-    auto compiled = bess::classifier::ResultPlan::Compile(schema);
-    if (!compiled) {
-      *err = std::make_pair(EINVAL, "result plan: " +
-                                        compiled.error().message);
-      return nullptr;
+    // Every field compiled out: gate-only.
+    if (!schema.result_fields.empty()) {
+      auto compiled = bess::classifier::ResultPlan::Compile(schema);
+      if (!compiled) {
+        *err = std::make_pair(EINVAL, "result plan: " +
+                                          compiled.error().message);
+        return nullptr;
+      }
+      result = std::move(*compiled);
     }
-    result = std::move(*compiled);
   }
   auto gen = std::make_unique<Generation>(
       default_gate, std::move(*plan), std::move(table), layout.key_size,
@@ -712,6 +710,20 @@ WildcardMatch::GenerationPtr WildcardMatch::BuildDegraded(
       std::vector<size_t>(result_specs_.size(), kInvalidOffset), records_);
 }
 
+size_t WildcardMatch::ResultDestination(const ResultSpec &spec) const {
+  if (!spec.by_attr) {
+    return spec.offset;
+  }
+  const bess::metadata::mt_offset_t offset =
+      attr_offset(static_cast<size_t>(spec.attr_id));
+  if (bess::metadata::IsValidOffset(offset)) {
+    return static_cast<size_t>(static_cast<uint8_t>(offset));
+  }
+  // No downstream reader: the metadata model lets the writer skip the write.
+  return offset == bess::metadata::kMetadataOffsetNoWrite ? kSkippedOffset
+                                                          : kInvalidOffset;
+}
+
 void WildcardMatch::RefreshForResume() {
   metadata_ready_ = true;
   const Generation *current = published_.Read();
@@ -720,22 +732,31 @@ void WildcardMatch::RefreshForResume() {
   }
 
   bool changed = false;
+  bool moved = false;
   for (size_t i = 0; i < result_specs_.size(); i++) {
-    const ResultSpec &spec = result_specs_[i];
-    const size_t now =
-        spec.by_attr
-            ? static_cast<size_t>(attr_offset(
-                  static_cast<size_t>(spec.attr_id)))
-            : kInvalidOffset;
-    if (i >= current->baked_result_offsets.size() ||
-        current->baked_result_offsets[i] != now) {
-      LOG(ERROR) << "WildcardMatch '" << name()
-                 << "': a result field's destination moved (another module "
-                    "replaced its attribute): results take their configured "
-                    "offset or stay zero";
-      changed = true;
-      break;
+    const size_t now = ResultDestination(result_specs_[i]);
+    const size_t baked = i < current->baked_result_offsets.size()
+                             ? current->baked_result_offsets[i]
+                             : kInvalidOffset;
+    if (baked == now) {
+      continue;
     }
+    changed = true;
+    // Moved means one resolved destination replaced another. A deferred plan
+    // (offsets not yet resolved), a degraded generation, or a field compiled
+    // out had none to move from; a field now compiled out has none to move
+    // to, and one now unusable fails the rebuild below, which says so.
+    const auto resolved = [](size_t at) {
+      return at != kInvalidOffset && at != kSkippedOffset;
+    };
+    moved = moved || (!current->result_plan_deferred && resolved(baked) &&
+                      resolved(now));
+  }
+  if (moved) {
+    LOG(ERROR) << "WildcardMatch '" << name()
+               << "': a result field's destination moved (another module "
+                  "replaced its attribute): results take their configured "
+                  "offset or stay zero";
   }
   for (size_t i = 0; i < field_specs_.size(); i++) {
     const FieldSpec &spec = field_specs_[i];
@@ -878,8 +899,8 @@ Error WildcardMatch::RuleFromPb(
 // ClassifyBatch: calls emit(i, gate) once per packet, in order. `emit` is
 // inlined into each caller.
 template <typename Emit>
-inline void WildcardMatch::Classify(bess::PacketBatch *batch, Emit &&emit,
-                                    uint64_t *out_hits) const {
+inline void WildcardMatch::Classify(bess::PacketBatch *batch, bool with_result,
+                                    Emit &&emit, uint64_t *out_hits) const {
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the generation mid-batch nor free it under this lookup.
   const Generation *gen = published_.Read();
@@ -935,11 +956,13 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch, Emit &&emit,
     }
   }
 
+  // A rule's record id lives in the rule record, so only a caller that places
+  // results (or reports their ids) reads one, and only for a winner.
+  const bool with_rule_id = with_result && records_ != nullptr;
   uint64_t hits = gen->table->LookupBatch(
       bess::classifier::ConstBytes(keys.data(),
                                    static_cast<size_t>(cnt) * key_size),
-      key_size, matches.data(), static_cast<size_t>(cnt),
-      records_ != nullptr);
+      key_size, matches.data(), static_cast<size_t>(cnt), with_rule_id);
   hits &= valid;
   if (out_hits != nullptr) {
     *out_hits = hits;
@@ -948,12 +971,10 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch, Emit &&emit,
   for (int i = 0; i < cnt; i++) {
     const bool hit = (hits & (uint64_t{1} << i)) != 0;
     const gate_idx_t gate = hit ? matches[i].gate : default_gate;
-    // A rule's record id lives in the rule record, so only a module with
-    // result fields reads one, and only for a winner. A miss reports 0.
+    // A miss reports 0.
     const uint32_t result_id =
-        hit && records_ != nullptr
-            ? gen->table->RuleAt(matches[i].rule_id).result_id
-            : 0;
+        hit && with_rule_id ? gen->table->RuleAt(matches[i].rule_id).result_id
+                            : 0;
     emit(i, gate, result_id);
   }
 }
@@ -967,7 +988,8 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
   gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   if (!gen->result) {
-    Classify(batch, [&](int i, gate_idx_t gate, uint32_t) {
+    // No plan (gate-only, or every result field compiled out): no rule ids.
+    Classify(batch, /*with_result=*/false, [&](int i, gate_idx_t gate, uint32_t) {
       gates[i] = gate;
     });
     EmitBatch(ctx, batch, gates);
@@ -979,7 +1001,7 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   uint32_t record_ids[bess::PacketBatch::kMaxBurst];
   uint64_t hits = 0;
   Classify(
-      batch,
+      batch, /*with_result=*/true,
       [&](int i, gate_idx_t gate, uint32_t result_id) {
         gates[i] = gate;
         record_ids[i] = result_id;
@@ -1040,7 +1062,8 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
 void WildcardMatch::ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
                                   uint32_t *result_ids) const {
-  Classify(batch, [&](int i, gate_idx_t gate, uint32_t result_id) {
+  Classify(batch, /*with_result=*/true,
+           [&](int i, gate_idx_t gate, uint32_t result_id) {
     gates[i] = gate;
     if (result_ids != nullptr) {
       result_ids[i] = result_id;

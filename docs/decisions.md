@@ -12251,3 +12251,77 @@ time, about 76 changes a second if they come one per transaction; batching them 
 of 10,000 rules or more (then an incremental backend, measured against this bench), a policy grows past
 50,000 rules (or shard it by domain or direction, D-147), or a controller needs scope-snapshot consistency
 across the Firewall and another resource.
+
+## D-181 A classifier result field nothing downstream reads is compiled out, not a failure
+
+**Status:** accepted (2026-10-23).
+**Code:** `core/metadata.{h,cc}` (`kMetadataOffsetInvalidScope`), `core/modules/exact_match.{h,cc}`
+(`ResultDestination`, `CompileResultPlan`, `RefreshForResume`), `core/modules/wildcard_match.{h,cc}` (the same,
+and `Classify`), `core/metadata_test.cc`, `core/modules/exact_match_test.cc`,
+`core/modules/wildcard_match_test.cc`.
+
+**Context.** The metadata model (`core/metadata.h`) gives a writer whose attribute no downstream module reads
+the offset `kMetadataOffsetNoWrite`: the write may be skipped. `ExactMatch` and `WildcardMatch` treated that
+offset, for a `result_fields` entry (D-172), like any other unusable offset: `Build` failed with "result field
+'X' has no readable metadata offset", and the first `PreResume` published the degraded generation that routes
+every packet to the default gate. A graph that consumes only some of a rule's result fields silently lost all
+classification: a classifier whose rules carry `{meter_id, next_hop_id}` in front of a next-hop Router, in a
+graph that meters nothing, has no reader of `meter_id`. `WildcardMatch` also logged "a result field's
+destination moved" on the first `PreResume` after Init deferred its plan, when no offset had been resolved yet,
+and on every resume for a packet-offset field (its comparison used a sentinel where `Build` baked the offset).
+
+`kMetadataOffsetNoWrite` was not only "no reader", though: the metadata pass gave it as well to a writer in an
+invalid scope, one whose reader is also reached by a path with no writer (the reader gets
+`kMetadataOffsetNoRead`, or its declared default). Skipping on it would have let such a classifier forward its
+hits while a defaulted reader (a Router's `route_domain`) silently used the default.
+
+**Decision.**
+
+- **`kMetadataOffsetNoWrite` means only "no reader".** A writer in an invalid scope now gets
+  `kMetadataOffsetInvalidScope` (-5). Its write is still skipped - every writer skips a negative offset
+  (`set_attr_with_offset`, or an `IsValidOffset` check before `_set_attr_with_offset`) - and the metadata report
+  no longer lists it among `writers_without_reader`; its reader is listed among `readers_without_writer`, or
+  among `defaults_applied` if it declared a default, as before.
+- **`kMetadataOffsetNoWrite` skips the field.** Each result field resolves to one destination
+  (`ResultDestination`): its packet offset, its attribute's metadata offset, `kSkippedOffset` for
+  `kMetadataOffsetNoWrite`, or `kInvalidOffset` for anything else. A skipped field is left out of the
+  `ResultPlan`; with every field skipped the generation has no plan and runs the gate-only path, which in
+  `WildcardMatch` no longer reads the winning rule's record id either. The rule's gate and the other fields
+  apply unchanged.
+- **Other invalid offsets still fail closed.** `kMetadataOffsetInvalidScope`, `kMetadataOffsetNoSpace`, and
+  `kMetadataOffsetNoRead` where it applies (e.g. a merged update attribute), keep the error and the degraded
+  generation.
+- **The baked destinations are what `PreResume` compares.** Both modules compare each field's current
+  `ResultDestination` with the one baked, so a skipped field stays unchanged across resumes, a field that
+  gains a reader rebuilds the plan with it, and one that loses its reader rebuilds the plan without it.
+- **"Moved" means one resolved destination replaced another.** `WildcardMatch` logs the error only when a
+  baked metadata or packet destination differs from a current one - not for a deferred plan, a degraded
+  generation, or a field compiled out before or after. A destination that became unusable fails the rebuild,
+  which logs its own error.
+
+**Why.** The writer is the one module that cannot know which of its outputs a graph consumes; the metadata
+pass already decides it, and skipping the write is the model's stated meaning of `kMetadataOffsetNoWrite`.
+Failing closed on it made a classifier's correctness depend on every consumer reading every field. A reader
+that exists but is not reached on every path is a different case and stays an error. Compiling the field out
+costs the packet path nothing: the plan has one op fewer, or none.
+
+**Evidence.** Tests, for each module: `UnreadResultFieldIsSkippedAndTheRuleGateApplies` (a lone unread field:
+`kMetadataOffsetNoWrite`, the hit takes its rule's gate, and a downstream match on another attribute that
+passes through sees its value intact), `ReadResultFieldIsWrittenBesideAnUnreadOne` (a downstream classifier
+matches on the field written beside an unread one, over two resumes),
+`ResultFieldFollowsItsReaderAcrossResumes` (skipped, then read by a downstream match connected between
+resumes, then skipped again; `WildcardMatch` logs no "moved"), `ResultFieldWithoutSpaceFailsClosed` (five
+32-byte fields with a reader in 128 bytes of metadata: one gets `kMetadataOffsetNoSpace` and the hit takes
+the default gate), and `ResultFieldInAnInvalidScopeFailsClosed` (a reader behind a Merge that a source with no
+writer also feeds: `kMetadataOffsetInvalidScope`, the hit takes the default gate). For `WildcardMatch`,
+`DeferredResultPlanIsNotAMove` and `PacketResultFieldIsNotAMove` (no "moved" error on the first or later
+resumes). `MetadataTest.AWriterInAnInvalidScopeIsNotUnread` checks the new sentinel and the report.
+`ExactMatchPacketTest.UnresolvedMetadataResultFailsClosedOnFirstResume`, which asserted the old behavior, is
+replaced by the first.
+
+**Consequences.** A rule's record may carry fields a graph does not read. A misspelled attribute name in a
+result field is no longer an error at resume: nothing reads it, so nothing is written; the metadata report
+(`MetadataReport::writers_without_reader`) names it.
+
+**Revisit when:** a consumer needs a result field's absence to be an error (then a per-field required flag),
+or the metadata pass gains per-path offsets.

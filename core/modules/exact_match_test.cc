@@ -649,27 +649,224 @@ TEST(ExactMatchPacketTest, EmptyDefaultWithAFieldWritesZeros) {
   EXPECT_EQ((Bytes{0, 0}), Bytes(out[0][0].begin() + 40, out[0][0].begin() + 42));
 }
 
-// A metadata result destination with no reader never gets a valid offset. The
-// first PreResume must build the deferred plan and fail closed to the default
-// gate rather than forwarding a hit with no placement.
-TEST(ExactMatchPacketTest, UnresolvedMetadataResultFailsClosedOnFirstResume) {
-  ModuleHarness h;
+// Index of `m`'s metadata attribute `name`, or all_attrs().size().
+size_t AttrIndex(const Module *m, const std::string &name) {
+  for (size_t i = 0; i < m->all_attrs().size(); i++) {
+    if (m->all_attrs()[i].name == name) {
+      return i;
+    }
+  }
+  return m->all_attrs().size();
+}
+
+// A SetMetadata writing the 4-byte attribute `name` = `value`.
+Module *SetAttr(ModuleHarness &h, const std::string &name, const std::string &value) {
+  bess::pb::SetMetadataArg tag;
+  auto *attr = tag.add_attrs();
+  attr->set_name(name);
+  attr->set_size(4);
+  attr->set_value_bin(value);
+  return h.Create("SetMetadata", tag);
+}
+
+// An ExactMatch keyed on the 4-byte attribute `name`: `value` takes gate 1,
+// anything else gate 0.
+Module *MatchAttr(ModuleHarness &h, const std::string &name, const std::string &value) {
+  ExactMatchArg arg;
+  *arg.add_fields() = AttrField(name, 4);
+  arg.set_default_gate(0);
+  Module *m = h.Create("ExactMatch", arg);
+  if (m != nullptr) {
+    EXPECT_EQ("", AddRule(h, m, BinRule({value}, 1)));
+  }
+  return m;
+}
+
+// An ExactMatch on IPv4 src 10.0.0.1 whose single result field writes the
+// 4-byte attribute `name` (record 00 00 00 07); the rule takes gate 1, a miss
+// gate 0.
+Module *ResultEm(ModuleHarness &h, const std::string &name) {
   ExactMatchArg arg;
   *arg.add_fields() = OffsetField(26, 4);
   auto *field = arg.add_result_fields();
-  field->set_attr_name("em_unread_attr");
+  field->set_attr_name(name);
   field->set_value_offset(0);
   field->set_num_bytes(4);
-  arg.set_default_gate(1);
+  arg.set_default_gate(0);
   Module *em = h.Create("ExactMatch", arg);
+  if (em != nullptr) {
+    EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 1,
+                                        std::string("\x00\x00\x00\x07", 4)}));
+  }
+  return em;
+}
+
+const std::string kProbe("\xde\xad\xbe\xef", 4);
+
+// A metadata result destination with no reader gets kMetadataOffsetNoWrite:
+// the field is compiled out of the plan and a hit still takes its rule's gate,
+// as the metadata model lets a writer skip what nothing reads. The metadata
+// slot of another attribute that passes through is left alone.
+TEST(ExactMatchPacketTest, UnreadResultFieldIsSkippedAndTheRuleGateApplies) {
+  ModuleHarness h;
+  Module *probe = SetAttr(h, "em_probe", kProbe);
+  Module *em = ResultEm(h, "em_unread_attr");
+  Module *check = MatchAttr(h, "em_probe", kProbe);
+  ASSERT_NE(nullptr, probe);
   ASSERT_NE(nullptr, em);
-  EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 0,
-                                      std::string(4, '\x07')}));
+  ASSERT_NE(nullptr, check);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(probe, 0, em, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, check, 0, true));
 
   auto rng = bess::testing::SeededRng(1);
   const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
-  auto out = h.Run(em, 0, {pkt}, {0, 1});
-  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(out));
+  auto out = h.RunPipeline(probe, 0, {pkt}, check, {0, 1});
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(out))
+      << "the rule's gate, with the probe attribute intact";
+  const size_t unread = AttrIndex(em, "em_unread_attr");
+  ASSERT_LT(unread, em->all_attrs().size());
+  EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(unread));
+}
+
+// A field that gains a reader between resumes is written from the next one
+// on, and one that loses it is compiled out again.
+TEST(ExactMatchPacketTest, ResultFieldFollowsItsReaderAcrossResumes) {
+  ModuleHarness h;
+  Module *em = ResultEm(h, "em_moving_attr");
+  Module *check = MatchAttr(h, "em_moving_attr", std::string("\x00\x00\x00\x07", 4));
+  ASSERT_NE(nullptr, em);
+  ASSERT_NE(nullptr, check);
+  const size_t id = AttrIndex(em, "em_moving_attr");
+  ASSERT_LT(id, em->all_attrs().size());
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(h.Run(em, 0, {pkt}, {0, 1})));
+  EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(id));
+
+  // Skipped -> read: the downstream match sees the record's value.
+  ModuleGraph::DisconnectModule(em, 1);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, check, 0, true));
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}),
+            Counts(h.RunPipeline(em, 0, {pkt}, check, {0, 1})));
+  EXPECT_TRUE(bess::metadata::IsValidOffset(em->attr_offset(id)));
+
+  // Read -> skipped: still the rule's gate.
+  ModuleGraph::DisconnectModule(em, 1);
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(h.Run(em, 0, {pkt}, {0, 1})));
+  EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(id));
+}
+
+// A reader also reached by a path with no writer is an invalid scope: the
+// field has a reader, so it is not skipped. The classifier fails closed and
+// the hit takes the default gate.
+TEST(ExactMatchPacketTest, ResultFieldInAnInvalidScopeFailsClosed) {
+  ModuleHarness h;
+  Module *em = ResultEm(h, "em_scope_attr");
+  Module *merge = h.Create("Merge", bess::pb::MergeArg());
+  Module *unwritten = h.Create("Merge", bess::pb::MergeArg());  // no input
+  bess::pb::MetadataTestArg read;
+  (*read.mutable_read())["em_scope_attr"] = 4;
+  Module *reader = h.Create("MetadataTest", read);
+  ASSERT_NE(nullptr, em);
+  ASSERT_NE(nullptr, merge);
+  ASSERT_NE(nullptr, unwritten);
+  ASSERT_NE(nullptr, reader);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, merge, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(unwritten, 0, merge, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(merge, 0, reader, 0, true));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  EXPECT_TRUE(Counts(h.RunPipeline(em, 0, {pkt}, reader, {0})).empty())
+      << "the hit's gate leads to the reader; the default gate is unwired";
+  const size_t id = AttrIndex(em, "em_scope_attr");
+  ASSERT_LT(id, em->all_attrs().size());
+  EXPECT_EQ(bess::metadata::kMetadataOffsetInvalidScope, em->attr_offset(id));
+}
+
+// One field read downstream, one not: the read field is written (a downstream
+// ExactMatch matches on it) and the hit takes its rule's gate.
+TEST(ExactMatchPacketTest, ReadResultFieldIsWrittenBesideAnUnreadOne) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  auto *read = arg.add_result_fields();
+  read->set_attr_name("em_read_attr");
+  read->set_value_offset(0);
+  read->set_num_bytes(4);
+  auto *unread = arg.add_result_fields();
+  unread->set_attr_name("em_unread_attr");
+  unread->set_value_offset(4);
+  unread->set_num_bytes(4);
+  arg.set_default_gate(2);
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+  const std::string record("\x00\x00\x00\x07\x00\x00\x00\x09", 8);
+  EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 1, record}));
+
+  ExactMatchArg next_arg;
+  *next_arg.add_fields() = AttrField("em_read_attr", 4);
+  next_arg.set_default_gate(0);
+  Module *next = h.Create("ExactMatch", next_arg);
+  ASSERT_NE(nullptr, next);
+  EXPECT_EQ("", AddRule(h, next, BinRule({std::string("\x00\x00\x00\x07", 4)}, 1)));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, next, 0, true));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  for (int resume = 0; resume < 2; resume++) {
+    auto out = h.RunPipeline(em, 0, {pkt}, next, {0, 1});
+    EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(out))
+        << "resume " << resume;
+  }
+  const size_t read_id = AttrIndex(em, "em_read_attr");
+  const size_t unread_id = AttrIndex(em, "em_unread_attr");
+  ASSERT_LT(read_id, em->all_attrs().size());
+  ASSERT_LT(unread_id, em->all_attrs().size());
+  EXPECT_TRUE(bess::metadata::IsValidOffset(em->attr_offset(read_id)));
+  EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(unread_id));
+}
+
+// A result field with a reader but no metadata space (five 32-byte
+// attributes in 128 bytes) has no destination: the first PreResume fails
+// closed and the hit takes the default gate.
+TEST(ExactMatchPacketTest, ResultFieldWithoutSpaceFailsClosed) {
+  ModuleHarness h;
+  ExactMatchArg arg;
+  *arg.add_fields() = OffsetField(26, 4);
+  constexpr int kFields = 5;
+  constexpr uint32_t kSize = bess::metadata::kMetadataAttrMaxSize;
+  static_assert(kFields * kSize > bess::metadata::kMetadataTotalSize);
+  bess::pb::MetadataTestArg read;
+  for (int i = 0; i < kFields; i++) {
+    const std::string name = "em_nospace" + std::to_string(i);
+    auto *field = arg.add_result_fields();
+    field->set_attr_name(name);
+    field->set_value_offset(i * kSize);
+    field->set_num_bytes(kSize);
+    (*read.mutable_read())[name] = kSize;
+  }
+  arg.set_default_gate(0);
+  Module *em = h.Create("ExactMatch", arg);
+  ASSERT_NE(nullptr, em);
+  EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 1,
+                                      std::string(kFields * kSize, '\x07')}));
+  Module *reader = h.Create("MetadataTest", read);
+  ASSERT_NE(nullptr, reader);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, reader, 0, true));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  auto out = h.RunPipeline(em, 0, {pkt}, reader, {0});
+  EXPECT_TRUE(Counts(out).empty())
+      << "the hit's gate leads to the reader; the default gate is unwired";
+  bool no_space = false;
+  for (size_t i = 0; i < em->all_attrs().size(); i++) {
+    no_space = no_space ||
+               em->attr_offset(i) == bess::metadata::kMetadataOffsetNoSpace;
+  }
+  EXPECT_TRUE(no_space);
 }
 
 // Two metadata outputs are distinct destinations once the graph resolves their

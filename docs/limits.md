@@ -23,7 +23,7 @@ Columns:
 | Packet metadata area | 128 B | `SNBUF_METADATA` (`snbuf_layout.h`) | No | attributes that do not fit get no offset; their readers fail closed |
 | Metadata attributes per module | 16 | `kMaxAttrsPerModule` (`metadata.h`) | No | ENOSPC from `AddMetadataAttr` (module init fails) |
 | Metadata attribute size | 32 B | `kMetadataAttrMaxSize` (`metadata.h`) | No | EINVAL from `AddMetadataAttr` (module init fails) |
-| Metadata default sentinel | `kMetadataOffsetDefault` (−4) | `metadata.h` | No | a provider-less reader with the default contract reads its declared value; `kMetadataOffsetNoRead` (−2) is the best-effort case, `kMetadataOffsetNoWrite` (−1) a skipped write, `kMetadataOffsetNoSpace` (−3) a full metadata area |
+| Metadata default sentinel | `kMetadataOffsetDefault` (−4) | `metadata.h` | No | a provider-less reader with the default contract reads its declared value; `kMetadataOffsetNoRead` (−2) is the best-effort case, `kMetadataOffsetNoWrite` (−1) a skipped write nothing reads, `kMetadataOffsetInvalidScope` (−5) a skipped write whose reader is also reached by a path with no writer, `kMetadataOffsetNoSpace` (−3) a full metadata area |
 | Plugin load passes (module inheritance depth) | 10 | `kInheritanceLimit` (`framework/plugin_loader.h`) | No | plugins still unresolved after 10 `dlopen` passes are logged "Failed to load plugin" and the load reports failure |
 | Packet pool default capacity | 65,535 | `PacketPool::kDefaultCapacity` (`packet_pool.h`) | pool creation argument | — |
 | Packet pool per-core cache | 512 (pools > 1,024 packets) | `PacketPool::kMaxCacheSize` | No | — |

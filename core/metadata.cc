@@ -450,13 +450,14 @@ void Pipeline::FillOffsetArrays() {
         if (get_attr_id(&attr) == id) {
           if (invalid) {
             // An update reads before it writes, so an upstream gap is a
-            // missing read; its write is skipped either way because the
-            // offset is negative.
+            // missing read. A writer is skipped (its offset is negative), but
+            // its value has a reader: kMetadataOffsetInvalidScope, not the
+            // "no reader" kMetadataOffsetNoWrite.
             if (attr.mode == Attribute::AccessMode::kRead ||
                 attr.mode == Attribute::AccessMode::kUpdate) {
               m->set_attr_offset(k, kMetadataOffsetNoRead);
             } else {
-              m->set_attr_offset(k, kMetadataOffsetNoWrite);
+              m->set_attr_offset(k, kMetadataOffsetInvalidScope);
             }
           } else {
             m->set_attr_offset(k, offset);

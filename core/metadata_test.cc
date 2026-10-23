@@ -372,6 +372,29 @@ TEST_F(MetadataTest, ReportFlagsAReaderReachedFromTwoWriterScopes) {
   EXPECT_EQ(3u, report.resolved) << "all three resolved to some packet offset";
 }
 
+// A reader also reached by a path with no writer is an invalid scope: the
+// reader gets kMetadataOffsetNoRead, and the writer, whose value does have a
+// reader, kMetadataOffsetInvalidScope - not kMetadataOffsetNoWrite, which
+// means nothing reads it. The writer is not reported as unread.
+TEST_F(MetadataTest, AWriterInAnInvalidScopeIsNotUnread) {
+  Module *reader = ::create_foo("reader");
+  ASSERT_NE(nullptr, reader);
+  ASSERT_EQ(0, m0->AddMetadataAttr("a", 2, Attribute::AccessMode::kWrite));
+  ASSERT_EQ(0, reader->AddMetadataAttr("a", 2, Attribute::AccessMode::kRead));
+  // m1 declares nothing and has no input: a path to the reader without a
+  // writer.
+  ModuleGraph::ConnectModules(m0, 0, reader, 0);
+  ModuleGraph::ConnectModules(m1, 0, reader, 0);
+
+  ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
+  EXPECT_EQ(kMetadataOffsetInvalidScope, m0->attr_offset(0));
+  EXPECT_EQ(kMetadataOffsetNoRead, reader->attr_offset(0));
+  const MetadataReport &report = default_pipeline.report();
+  EXPECT_TRUE(report.writers_without_reader.empty());
+  ASSERT_EQ(1u, report.readers_without_writer.size());
+  EXPECT_EQ("reader", report.readers_without_writer[0].module);
+}
+
 // Check that offsets are properly assigned when there are too many attributes.
 TEST_F(MetadataTest, MultipleAttrSimplePipeNoSpaceFails) {
   size_t sz = kMetadataAttrMaxSize;

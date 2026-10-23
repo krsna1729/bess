@@ -482,9 +482,23 @@ std::vector<bess::dataplane::Reference> ExactMatch::ResultReferences(
   return refs;
 }
 
-std::optional<classifier::ResultPlan> ExactMatch::CompileResultPlan(
-    size_t key_size, bool tolerate_invalid_metadata,
-    std::vector<size_t> *baked_offsets, Error *err) const {
+size_t ExactMatch::ResultDestination(const ResultSpec &spec) const {
+  if (!spec.by_attr) {
+    return spec.offset;
+  }
+  const bess::metadata::mt_offset_t offset = attr_offset(spec.attr_id);
+  if (bess::metadata::IsValidOffset(offset)) {
+    return static_cast<size_t>(static_cast<uint8_t>(offset));
+  }
+  // No downstream reader: the metadata model lets the writer skip the write.
+  return offset == bess::metadata::kMetadataOffsetNoWrite ? kSkippedOffset
+                                                          : kInvalidOffset;
+}
+
+bool ExactMatch::CompileResultPlan(size_t key_size,
+                                   std::optional<classifier::ResultPlan> *plan,
+                                   std::vector<size_t> *baked_offsets,
+                                   Error *err) const {
   classifier::RuntimeClassifierSchema schema;
   schema.key_size = key_size;
   schema.value_size = result_value_size_;
@@ -492,41 +506,35 @@ std::optional<classifier::ResultPlan> ExactMatch::CompileResultPlan(
   baked_offsets->clear();
   baked_offsets->reserve(result_specs_.size());
   for (const ResultSpec &spec : result_specs_) {
+    const size_t at = ResultDestination(spec);
+    baked_offsets->push_back(at);
+    if (at == kSkippedOffset) {
+      continue;  // compiled out: nothing downstream reads it
+    }
+    if (at == kInvalidOffset) {
+      *err = std::make_pair(EINVAL, "result field '" + spec.attr_name +
+                                        "' has no readable metadata offset");
+      return false;
+    }
     classifier::RuntimeResultField field;
     field.value_offset = spec.value_offset;
     field.size = spec.size;
-    if (spec.by_attr) {
-      const bess::metadata::mt_offset_t offset = attr_offset(spec.attr_id);
-      if (!bess::metadata::IsValidOffset(offset)) {
-        if (!tolerate_invalid_metadata) {
-          *err = std::make_pair(
-              EINVAL, "result field '" + spec.attr_name +
-                          "' has no readable metadata offset");
-          return std::nullopt;
-        }
-        baked_offsets->push_back(kInvalidOffset);
-        field.destination = classifier::BufferKind::kPacket;
-        field.destination_offset = 0;
-      } else {
-        const size_t at = static_cast<size_t>(static_cast<uint8_t>(offset));
-        baked_offsets->push_back(at);
-        field.destination = classifier::BufferKind::kMetadata;
-        field.destination_offset = at;
-      }
-    } else {
-      baked_offsets->push_back(spec.offset);
-      field.destination = classifier::BufferKind::kPacket;
-      field.destination_offset = spec.offset;
-    }
+    field.destination = spec.by_attr ? classifier::BufferKind::kMetadata
+                                     : classifier::BufferKind::kPacket;
+    field.destination_offset = at;
     schema.result_fields.push_back(std::move(field));
   }
-  auto plan = classifier::ResultPlan::Compile(schema);
-  if (!plan) {
-    *err = std::make_pair(EINVAL,
-                          "result plan: " + plan.error().message);
-    return std::nullopt;
+  plan->reset();
+  if (schema.result_fields.empty()) {
+    return true;  // every field compiled out: gate-only
   }
-  return std::move(*plan);
+  auto compiled = classifier::ResultPlan::Compile(schema);
+  if (!compiled) {
+    *err = std::make_pair(EINVAL, "result plan: " + compiled.error().message);
+    return false;
+  }
+  *plan = std::move(*compiled);
+  return true;
 }
 
 ExactMatch::GenerationPtr ExactMatch::Build(
@@ -562,10 +570,7 @@ ExactMatch::GenerationPtr ExactMatch::Build(
       // overlapping. RefreshForResume rebuilds with the resolved offsets.
       result_offsets.assign(result_specs_.size(), kInvalidOffset);
     } else {
-      result = CompileResultPlan(layout.key_size,
-                                 /*tolerate_invalid_metadata=*/false,
-                                 &result_offsets, err);
-      if (!result) {
+      if (!CompileResultPlan(layout.key_size, &result, &result_offsets, err)) {
         return nullptr;
       }
     }
@@ -660,16 +665,9 @@ void ExactMatch::RefreshForResume() {
   }
   if (!changed && !result_specs_.empty()) {
     for (size_t i = 0; i < result_specs_.size(); i++) {
-      const ResultSpec &spec = result_specs_[i];
-      size_t now = spec.offset;
-      if (spec.by_attr) {
-        const bess::metadata::mt_offset_t offset = attr_offset(spec.attr_id);
-        now = bess::metadata::IsValidOffset(offset)
-                  ? static_cast<size_t>(static_cast<uint8_t>(offset))
-                  : kInvalidOffset;
-      }
       if (i >= current->baked_result_offsets.size() ||
-          current->baked_result_offsets[i] != now) {
+          current->baked_result_offsets[i] !=
+              ResultDestination(result_specs_[i])) {
         changed = true;
         break;
       }

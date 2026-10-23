@@ -250,7 +250,13 @@ a client can do to it is an **action**.
   remains. An all-zero field references
   nothing, and the packet path never resolves a reference: it writes bytes the
   transaction already validated. With no result fields the module is gate-only
-  and pays nothing for the generality.
+  and pays nothing for the generality. A metadata field whose attribute no
+  downstream module reads (`kMetadataOffsetNoWrite`) is compiled out of the
+  plan: it is not written, and the rule's gate and other fields still apply;
+  with every field compiled out the module runs gate-only. A field with a
+  reader but no offset (out of metadata space, or a reader also reached by a
+  path with no writer: `kMetadataOffsetInvalidScope`) still fails the module
+  closed to its default gate (D-181).
 - **Actions** are the `cmds` entries: verbs that are not state (a lookup, a
   flush, a counter read, a table generator). `InvokeAction` runs them and
   `GetSchema` lists them, with `result_type` naming the message an action puts
