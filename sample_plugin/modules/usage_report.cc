@@ -37,7 +37,8 @@ const Commands UsageReport::cmds = {};
 // the daemon refuses a table and a codec that disagree.
 const ResourceTables UsageReport::resource_tables = {
     ResourceTable::Singleton<sample::usage::pb::UsageQuotas>(
-        "quotas", /*requires_paused_workers=*/false)};
+        "quotas", /*requires_paused_workers=*/false)
+        .Rebuilds()};
 
 std::expected<UsageReport::Staged, std::string> UsageReport::StageQuotas(
     const sample::usage::pb::UsageQuotas &v) {

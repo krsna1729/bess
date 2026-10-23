@@ -20,6 +20,10 @@ struct Field {
 
 class GenericEncap final : public Module {
  public:
+  // Stateless: headers come from init-time fields and per-packet metadata.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   GenericEncap() : Module(), encap_size_(), num_fields_(), fields_() {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }

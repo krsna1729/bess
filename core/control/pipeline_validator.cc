@@ -3,6 +3,7 @@
 #include "control/pipeline_validator.h"
 #include "runtime/thread_placement.h"
 #include <cerrno>
+#include <map>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -111,6 +112,7 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
   // -- modules --------------------------------------------------------------
   std::set<std::string> module_names;
   std::unordered_map<std::string, const ModuleBuilder *> builders;
+  std::map<std::string, ModuleCapabilityReport> capabilities;
   for (const ModuleSpec &module : spec.modules) {
     if (module.name.empty()) {
       return std::unexpected(
@@ -129,6 +131,15 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
           "module '" + module.name + "': no mclass '" + module.mclass + "'"));
     }
     builders[module.name] = &it->second;
+    // The class answers for its argument (D-180), which also checks that the
+    // argument is the class's init argument type.
+    auto declared = it->second.Capabilities(module.arg);
+    if (!declared) {
+      return std::unexpected(
+          Invalid(module.name, "arg", "module '" + module.name + "': " + declared.error()));
+    }
+    capabilities.emplace(module.name,
+                         ModuleCapabilityReport{*declared, it->second.resource_tables()});
   }
 
   // -- connections ----------------------------------------------------------
@@ -567,6 +578,7 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
 
   ValidatedPipeline validated;
   validated.spec = std::move(spec);
+  validated.capabilities = std::move(capabilities);
   return validated;
 }
 

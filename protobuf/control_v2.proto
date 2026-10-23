@@ -291,6 +291,44 @@ message ValidatePipelineRequest {
 }
 message ValidatePipelineResponse {
   Pipeline normalized = 1;  // canonical form (stable order, defaults filled)
+  // What each module would promise about its state, by module name (D-180):
+  // computed from its class and init argument, before anything is created.
+  map<string, ModuleCapabilities> capabilities = 2;
+}
+
+// What a module promises about the state its packet path changes, so that a
+// controller can place it and reject an unsafe graph before applying it
+// (D-180). Statistics are not state here.
+message ModuleCapabilities {
+  // Who owns the state the packet path changes.
+  enum State {
+    STATE_UNSPECIFIED = 0;    // the class declares none (a plugin may not)
+    STATE_NONE = 1;           // the packet path changes no module state
+    STATE_SINGLE_WORKER = 2;  // one worker runs the module and owns its state
+    STATE_PER_WORKER = 3;     // each worker running it owns a separate state
+    STATE_SHARED = 4;         // the workers running it change one state, synchronized
+  }
+  // Whether the packets of one flow must reach one worker.
+  enum FlowAffinity {
+    FLOW_AFFINITY_UNSPECIFIED = 0;
+    FLOW_AFFINITY_NONE = 1;       // any worker may see any packet
+    FLOW_AFFINITY_PREFERRED = 2;  // correct anywhere; cheaper when a flow stays on one worker
+    FLOW_AFFINITY_REQUIRED = 3;   // correct only when a flow's packets, both ways, reach one worker
+  }
+  // How the module's resources change (from its class's resource tables).
+  enum Updates {
+    UPDATES_UNSPECIFIED = 0;
+    UPDATES_NONE = 1;            // no resource: fixed at creation
+    UPDATES_LIVE = 2;            // every table changes in place, workers running
+    UPDATES_REBUILD = 3;         // a table rebuilds on change: the cost follows its size
+    UPDATES_PAUSED_WORKERS = 4;  // a table is written only with the workers paused
+  }
+  State state = 1;
+  FlowAffinity flow_affinity = 2;
+  Updates updates = 3;
+  // The consistency its resources provide (D-050); UNSPECIFIED when it has
+  // none.
+  ApplyTransactionRequest.Consistency consistency = 4;
 }
 
 message DiffPipelineRequest {
@@ -601,6 +639,9 @@ message ResourceSchema {
   string key_type = 3;  // google.protobuf.Empty for a singleton
   string value_type = 4;
   bool requires_paused_workers = 5;
+  // A change rebuilds the table and swaps it in: its cost follows the table's
+  // size, not the change's (D-180). False: changed in place.
+  bool rebuilds = 6;
 }
 
 // An action (InvokeAction): an operation that is not state.

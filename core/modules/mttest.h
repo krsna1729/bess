@@ -15,6 +15,9 @@ class MetadataTest final : public Module {
   MetadataTest() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
   static const gate_idx_t kNumIGates = MAX_GATES;
   static const gate_idx_t kNumOGates = MAX_GATES;
+  // Passes batches through by input gate; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::MetadataTestArg &arg);
 

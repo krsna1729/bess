@@ -18,6 +18,9 @@ class NoOP final : public Module {
 
   static const gate_idx_t kNumIGates = 0;
   static const gate_idx_t kNumOGates = 0;
+  // The task does nothing; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 };
 
 #endif  // BESS_MODULES_NOOP_H_

@@ -85,6 +85,10 @@ class UrlFilter final : public Module {
   static const ResourceTables resource_tables;
   static const gate_idx_t kNumIGates = 2;
   static const gate_idx_t kNumOGates = 2;
+  // One worker (the default limit); ProcessBatch inserts, refreshes and
+  // erases flow_cache_ entries (TCP reassembly per flow).
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::UrlFilterArg &arg);
   void DeInit() override;

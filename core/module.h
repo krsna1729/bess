@@ -8,6 +8,8 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <expected>
+#include <functional>
 #include <map>
 #include <numeric>
 #include <span>
@@ -93,6 +95,34 @@ inline std::string InitArgTypeName(CommandResponse (C::*)(const T &)) {
   return std::string(T::descriptor()->full_name());
 }
 
+// A class's capabilities for an init argument (D-180), or why the argument is
+// not the class's init argument.
+using module_capabilities_func_t =
+    std::function<std::expected<ModuleCapabilities, std::string>(const google::protobuf::Any &)>;
+
+// For class M whose Init takes a T: unpacks the argument as a T, then answers
+// `M::Capabilities(arg)` when the class declares it, `M::kCapabilities`
+// otherwise (Module's own: unspecified). DEF_MODULE passes
+// MODULE_CAPABILITIES_FUNC<M>(&M::Init).
+template <typename M, typename T, typename C>
+inline module_capabilities_func_t MODULE_CAPABILITIES_FUNC(CommandResponse (C::*)(const T &)) {
+  return [](const google::protobuf::Any &arg) -> std::expected<ModuleCapabilities, std::string> {
+    T arg_;
+    if (!UnpackTypedArgument(arg, &arg_)) {
+      return std::unexpected("the init argument is not a " +
+                             std::string(T::descriptor()->full_name()));
+    }
+    if constexpr (requires { M::Capabilities(arg_); }) {
+      return M::Capabilities(arg_);
+    } else {
+      // Member reads, not a copy: a copy odr-uses kCapabilities, and gcc emits
+      // an odr-used inline variable as STB_GNU_UNIQUE, which glibc never
+      // unloads -- a plugin's dlclose would keep its classes registered.
+      return ModuleCapabilities{M::kCapabilities.state, M::kCapabilities.flow_affinity};
+    }
+  };
+}
+
 class Module;
 
 namespace bess {
@@ -112,7 +142,8 @@ class ModuleBuilder {
       const ResourceTables &resource_tables,
       std::function<CommandResponse(Module *, const google::protobuf::Any &)>
           init_func,
-      const std::string &init_arg_type = {})
+      const std::string &init_arg_type = {},
+      module_capabilities_func_t capabilities_func = {})
       : module_generator_(module_generator),
         num_igates_(igates),
         num_ogates_(ogates),
@@ -122,13 +153,16 @@ class ModuleBuilder {
         init_arg_type_(init_arg_type),
         cmds_(cmds),
         resource_tables_(resource_tables),
-        init_func_(init_func) {}
+        init_func_(std::move(init_func)),
+        capabilities_func_(std::move(capabilities_func)) {}
 
   // `init_arg_type` is Init's argument type by full name (InitArgTypeName;
   // DEF_MODULE passes it). Empty: not declared, and schema discovery
   // (GetSchema) reports none for the class. `resource_tables`: the tables
   // every module of the class registers (D-129; DEF_MODULE passes the
-  // class's `resource_tables`).
+  // class's `resource_tables`). `capabilities_func`: the class's
+  // capabilities for an init argument (D-180; DEF_MODULE passes
+  // MODULE_CAPABILITIES_FUNC); empty: unspecified.
   static bool RegisterModuleClass(std::function<Module *()> module_generator,
                                   const std::string &class_name,
                                   const std::string &name_template,
@@ -137,7 +171,8 @@ class ModuleBuilder {
                                   const gate_idx_t ogates, const Commands &cmds,
                                   const ResourceTables &resource_tables,
                                   module_init_func_t init_func,
-                                  const std::string &init_arg_type = {});
+                                  const std::string &init_arg_type = {},
+                                  const module_capabilities_func_t &capabilities_func = {});
   static bool DeregisterModuleClass(const std::string &class_name);
 
   static std::map<std::string, ModuleBuilder> &all_module_builders_holder(
@@ -163,6 +198,11 @@ class ModuleBuilder {
   const ResourceTables &resource_tables() const { return resource_tables_; }
   const ResourceTable *FindResourceTable(std::string_view table) const;
 
+  // What a module of this class created with `arg` promises about its state
+  // (D-180); an error when `arg` is not the class's init argument type.
+  std::expected<ModuleCapabilities, std::string> Capabilities(
+      const google::protobuf::Any &arg) const;
+
   // Runs `user_cmd` (control_v2's InvokeAction; D-140: no legacy surface).
   CommandResponse RunCommand(Module *m, const std::string &user_cmd,
                              const google::protobuf::Any &arg) const;
@@ -182,6 +222,7 @@ class ModuleBuilder {
   const Commands cmds_;
   const ResourceTables resource_tables_;
   const module_init_func_t init_func_;
+  const module_capabilities_func_t capabilities_func_;
 };
 
 class Task;
@@ -254,6 +295,9 @@ class alignas(bess::arch::kCacheLineSize) Module {
   // The resource tables every module of the class registers (D-129); a class
   // with resources declares its own.
   static const ResourceTables resource_tables;
+  // Not declared (D-180): a class declares its own kCapabilities, or a
+  // static Capabilities(const Arg &) when its init argument chooses.
+  static constexpr ModuleCapabilities kCapabilities{};
 
   // -------------------------------------------------------------------------
 
@@ -397,6 +441,9 @@ class alignas(bess::arch::kCacheLineSize) Module {
   }
 
   const std::vector<bool> &active_workers() const { return active_workers_; }
+
+  // How many workers may run this module (1 unless it is thread safe).
+  int max_allowed_workers() const { return max_allowed_workers_; }
 
   // Number of active workers attached to this module.
   inline size_t num_active_workers() const {
@@ -809,7 +856,8 @@ static inline void set_attr(Module *m, int attr_id, bess::PacketRef pkt, T val) 
           std::function<Module *()>([]() { return new _MOD(); }), #_MOD, \
           _NAME_TEMPLATE, _HELP, _MOD::kNumIGates, _MOD::kNumOGates,     \
           _MOD::cmds, _MOD::resource_tables, MODULE_INIT_FUNC(&_MOD::Init), \
-          InitArgTypeName(&_MOD::Init));                                 \
+          InitArgTypeName(&_MOD::Init),                                  \
+          MODULE_CAPABILITIES_FUNC<_MOD>(&_MOD::Init));                  \
     }                                                                    \
     ~_MOD##_class() { ModuleBuilder::DeregisterModuleClass(#_MOD); }     \
   };

@@ -27,6 +27,9 @@ class L2Forward final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // The packet path only looks up the control-written MAC table (no learning).
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   L2Forward() : Module(), default_gate_() {
     max_allowed_workers_ = Worker::kMaxWorkers;

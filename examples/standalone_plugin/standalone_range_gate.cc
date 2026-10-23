@@ -23,6 +23,9 @@ class StandaloneRangeGate final : public Module {
  public:
   static const gate_idx_t kNumOGates = 2;
   static const Commands cmds;
+  // Capabilities: the packet path only reads the classifier.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
     using bess::classifier::RangeRule;

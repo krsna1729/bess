@@ -9,6 +9,7 @@
 #include "module.h"
 #include "pb/module_msg.pb.h"
 
+#include "stats/worker_local.h"
 #include "utils/endian.h"
 #include "utils/random.h"
 
@@ -18,6 +19,9 @@ class RandomUpdate final : public Module {
  public:
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Each worker advances its own RNG; packets need no flow affinity.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kPerWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   RandomUpdate() : Module(), num_vars_(), vars_(), rng_() {
     max_allowed_workers_ = Worker::kMaxWorkers;
@@ -53,7 +57,7 @@ class RandomUpdate final : public Module {
 
   Var vars_[kMaxVariable];
 
-  Random rng_;
+  bess::stats::WorkerLocal<Random> rng_;
 
   // The fields as given, in order (control side): "<name>/fields" reads it
   // back.

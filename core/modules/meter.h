@@ -65,6 +65,9 @@ class Meter final : public Module {
   static const Commands cmds;
   // "<module>/meters": MeterIdKey -> MeterPolicyValue (D-129).
   static const ResourceTables resource_tables;
+  // Any worker charges a shared meter's token buckets under the meter's lock.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Meter() : Module(), published_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;

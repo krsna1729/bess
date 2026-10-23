@@ -20,6 +20,9 @@ class WorkerSplit final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Reads the worker -> gate map; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::WorkerSplitArg &);
   void DeInit() override;

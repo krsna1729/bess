@@ -415,6 +415,78 @@ TEST_F(ApiV2ServiceTest, ValidateDiffPlanApplyGet) {
   }
 }
 
+// D-180: validation answers what each module would promise, from its class
+// and its init argument, before anything exists; an argument of the wrong
+// type is refused there rather than at creation.
+TEST_F(ApiV2ServiceTest, ValidateReportsEachModulesCapabilities) {
+  using Caps = v2::ModuleCapabilities;
+  v2::Pipeline desired;
+  auto add = [&](const std::string &name, const std::string &mclass,
+                 const google::protobuf::Message *arg) {
+    auto *m = desired.add_modules();
+    m->set_name(name);
+    m->set_mclass(mclass);
+    if (arg != nullptr) {
+      EXPECT_TRUE(m->mutable_arg()->PackFrom(*arg));
+    }
+  };
+  bess::pb::ConnTrackArg owned;
+  bess::pb::ConnTrackArg per_worker;
+  per_worker.set_mode(bess::pb::ConnTrackArg::PER_WORKER);
+  bess::pb::ConnTrackArg per_worker_fallback = per_worker;
+  per_worker_fallback.set_fallback_shared(true);
+  bess::pb::ConnTrackArg shared;
+  shared.set_mode(bess::pb::ConnTrackArg::SHARED);
+  add("ct_owned", "ConnTrack", &owned);
+  add("ct_per_worker", "ConnTrack", &per_worker);
+  add("ct_fallback", "ConnTrack", &per_worker_fallback);
+  add("ct_shared", "ConnTrack", &shared);
+  add("em", "ExactMatch", nullptr);
+  add("acl", "ACL", nullptr);
+  add("bpf", "BPF", nullptr);
+  add("bypass", "Bypass", nullptr);
+
+  grpc::ClientContext ctx;
+  v2::ValidatePipelineRequest req;
+  *req.mutable_pipeline() = desired;
+  v2::ValidatePipelineResponse resp;
+  ASSERT_TRUE(stub_->ValidatePipeline(&ctx, req, &resp).ok());
+  const auto &caps = resp.capabilities();
+  ASSERT_EQ(8u, caps.size());
+
+  // The init argument chooses ConnTrack's ownership, and with it whether a
+  // connection must stay on one worker.
+  EXPECT_EQ(Caps::STATE_SINGLE_WORKER, caps.at("ct_owned").state());
+  EXPECT_EQ(Caps::FLOW_AFFINITY_NONE, caps.at("ct_owned").flow_affinity());
+  EXPECT_EQ(Caps::STATE_PER_WORKER, caps.at("ct_per_worker").state());
+  EXPECT_EQ(Caps::FLOW_AFFINITY_REQUIRED, caps.at("ct_per_worker").flow_affinity());
+  EXPECT_EQ(Caps::STATE_PER_WORKER, caps.at("ct_fallback").state());
+  EXPECT_EQ(Caps::FLOW_AFFINITY_PREFERRED, caps.at("ct_fallback").flow_affinity());
+  EXPECT_EQ(Caps::STATE_SHARED, caps.at("ct_shared").state());
+  EXPECT_EQ(Caps::FLOW_AFFINITY_NONE, caps.at("ct_shared").flow_affinity());
+
+  // How a module changes comes from its class's tables: the most disruptive
+  // one decides.
+  EXPECT_EQ(Caps::UPDATES_LIVE, caps.at("em").updates());
+  EXPECT_EQ(Caps::UPDATES_REBUILD, caps.at("acl").updates());
+  EXPECT_EQ(Caps::UPDATES_PAUSED_WORKERS, caps.at("bpf").updates());
+  EXPECT_EQ(Caps::UPDATES_NONE, caps.at("bypass").updates());
+  EXPECT_EQ(v2::ApplyTransactionRequest::CONSISTENCY_REFERENTIAL, caps.at("em").consistency());
+  EXPECT_EQ(v2::ApplyTransactionRequest::CONSISTENCY_UNSPECIFIED,
+            caps.at("bypass").consistency());
+
+  // A ConnTrack given an ExactMatch argument is refused, naming the module.
+  bess::pb::ExactMatchArg wrong;
+  ASSERT_TRUE(desired.mutable_modules(0)->mutable_arg()->PackFrom(wrong));
+  grpc::ClientContext bad_ctx;
+  *req.mutable_pipeline() = desired;
+  const grpc::Status st = stub_->ValidatePipeline(&bad_ctx, req, &resp);
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, st.error_code());
+  EXPECT_NE(std::string::npos, st.error_message().find("ct_owned")) << st.error_message();
+  EXPECT_NE(std::string::npos, st.error_message().find("bess.pb.ConnTrackArg"))
+      << st.error_message();
+}
+
 // D-123: a worker applied without a core gets one; GetPipeline names it in
 // the pipeline and reports where it runs (node, cross-NUMA, shared core,
 // control CPU); re-applying the desired state without a core is a no-op; and

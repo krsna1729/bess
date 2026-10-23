@@ -33,6 +33,9 @@ class NAT final : public Module {
   NAT() : Module() { max_allowed_workers_ = 1; }
   ~NAT() override;
 
+  // Shared: every worker changes one synchronized binding table. Otherwise one
+  // worker owns the bindings.
+  static ModuleCapabilities Capabilities(const bess::pb::NATArg &arg);
   CommandResponse Init(const bess::pb::NATArg &arg);
   // Usage (TP7, D-083): ask for an interim record of every mapping; drain
   // the records (interim and final) the packet path has logged.

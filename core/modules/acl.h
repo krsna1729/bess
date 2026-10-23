@@ -35,6 +35,9 @@ class ACL final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // The packet path only reads the RCU-published rule list.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   ACL() : Module(), rules_(init_context().rcu()) {
     max_allowed_workers_ = Worker::kMaxWorkers;

@@ -369,10 +369,65 @@ class ValidatePipelineRequest(_message.Message):
     def __init__(self, pipeline: _Optional[_Union[Pipeline, _Mapping]] = ...) -> None: ...
 
 class ValidatePipelineResponse(_message.Message):
-    __slots__ = ("normalized",)
+    __slots__ = ("normalized", "capabilities")
+    class CapabilitiesEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: ModuleCapabilities
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[ModuleCapabilities, _Mapping]] = ...) -> None: ...
     NORMALIZED_FIELD_NUMBER: _ClassVar[int]
+    CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
     normalized: Pipeline
-    def __init__(self, normalized: _Optional[_Union[Pipeline, _Mapping]] = ...) -> None: ...
+    capabilities: _containers.MessageMap[str, ModuleCapabilities]
+    def __init__(self, normalized: _Optional[_Union[Pipeline, _Mapping]] = ..., capabilities: _Optional[_Mapping[str, ModuleCapabilities]] = ...) -> None: ...
+
+class ModuleCapabilities(_message.Message):
+    __slots__ = ("state", "flow_affinity", "updates", "consistency")
+    class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        STATE_UNSPECIFIED: _ClassVar[ModuleCapabilities.State]
+        STATE_NONE: _ClassVar[ModuleCapabilities.State]
+        STATE_SINGLE_WORKER: _ClassVar[ModuleCapabilities.State]
+        STATE_PER_WORKER: _ClassVar[ModuleCapabilities.State]
+        STATE_SHARED: _ClassVar[ModuleCapabilities.State]
+    STATE_UNSPECIFIED: ModuleCapabilities.State
+    STATE_NONE: ModuleCapabilities.State
+    STATE_SINGLE_WORKER: ModuleCapabilities.State
+    STATE_PER_WORKER: ModuleCapabilities.State
+    STATE_SHARED: ModuleCapabilities.State
+    class FlowAffinity(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        FLOW_AFFINITY_UNSPECIFIED: _ClassVar[ModuleCapabilities.FlowAffinity]
+        FLOW_AFFINITY_NONE: _ClassVar[ModuleCapabilities.FlowAffinity]
+        FLOW_AFFINITY_PREFERRED: _ClassVar[ModuleCapabilities.FlowAffinity]
+        FLOW_AFFINITY_REQUIRED: _ClassVar[ModuleCapabilities.FlowAffinity]
+    FLOW_AFFINITY_UNSPECIFIED: ModuleCapabilities.FlowAffinity
+    FLOW_AFFINITY_NONE: ModuleCapabilities.FlowAffinity
+    FLOW_AFFINITY_PREFERRED: ModuleCapabilities.FlowAffinity
+    FLOW_AFFINITY_REQUIRED: ModuleCapabilities.FlowAffinity
+    class Updates(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        UPDATES_UNSPECIFIED: _ClassVar[ModuleCapabilities.Updates]
+        UPDATES_NONE: _ClassVar[ModuleCapabilities.Updates]
+        UPDATES_LIVE: _ClassVar[ModuleCapabilities.Updates]
+        UPDATES_REBUILD: _ClassVar[ModuleCapabilities.Updates]
+        UPDATES_PAUSED_WORKERS: _ClassVar[ModuleCapabilities.Updates]
+    UPDATES_UNSPECIFIED: ModuleCapabilities.Updates
+    UPDATES_NONE: ModuleCapabilities.Updates
+    UPDATES_LIVE: ModuleCapabilities.Updates
+    UPDATES_REBUILD: ModuleCapabilities.Updates
+    UPDATES_PAUSED_WORKERS: ModuleCapabilities.Updates
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    FLOW_AFFINITY_FIELD_NUMBER: _ClassVar[int]
+    UPDATES_FIELD_NUMBER: _ClassVar[int]
+    CONSISTENCY_FIELD_NUMBER: _ClassVar[int]
+    state: ModuleCapabilities.State
+    flow_affinity: ModuleCapabilities.FlowAffinity
+    updates: ModuleCapabilities.Updates
+    consistency: ApplyTransactionRequest.Consistency
+    def __init__(self, state: _Optional[_Union[ModuleCapabilities.State, str]] = ..., flow_affinity: _Optional[_Union[ModuleCapabilities.FlowAffinity, str]] = ..., updates: _Optional[_Union[ModuleCapabilities.Updates, str]] = ..., consistency: _Optional[_Union[ApplyTransactionRequest.Consistency, str]] = ...) -> None: ...
 
 class DiffPipelineRequest(_message.Message):
     __slots__ = ("pipeline",)
@@ -713,18 +768,20 @@ class GetSchemaRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class ResourceSchema(_message.Message):
-    __slots__ = ("table", "kind", "key_type", "value_type", "requires_paused_workers")
+    __slots__ = ("table", "kind", "key_type", "value_type", "requires_paused_workers", "rebuilds")
     TABLE_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     KEY_TYPE_FIELD_NUMBER: _ClassVar[int]
     VALUE_TYPE_FIELD_NUMBER: _ClassVar[int]
     REQUIRES_PAUSED_WORKERS_FIELD_NUMBER: _ClassVar[int]
+    REBUILDS_FIELD_NUMBER: _ClassVar[int]
     table: str
     kind: TransactionResource.Kind
     key_type: str
     value_type: str
     requires_paused_workers: bool
-    def __init__(self, table: _Optional[str] = ..., kind: _Optional[_Union[TransactionResource.Kind, str]] = ..., key_type: _Optional[str] = ..., value_type: _Optional[str] = ..., requires_paused_workers: _Optional[bool] = ...) -> None: ...
+    rebuilds: bool
+    def __init__(self, table: _Optional[str] = ..., kind: _Optional[_Union[TransactionResource.Kind, str]] = ..., key_type: _Optional[str] = ..., value_type: _Optional[str] = ..., requires_paused_workers: _Optional[bool] = ..., rebuilds: _Optional[bool] = ...) -> None: ...
 
 class ActionSchema(_message.Message):
     __slots__ = ("name", "arg_type", "result_type", "thread_safe")

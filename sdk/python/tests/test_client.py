@@ -314,12 +314,14 @@ class ScriptedTest(unittest.TestCase):
         self.assertEqual(3, epoch)
         self.assertEqual("", record.request_id)
 
-    def test_validate_reads_the_normalized_pipeline(self):
+    def test_validate_reads_the_pipeline_and_capabilities(self):
         response = v2.ValidatePipelineResponse()
         response.normalized.modules.add().name = "em0"
+        response.capabilities["em0"].state = v2.ModuleCapabilities.STATE_NONE
         client, _ = self.make_client([response])
-        normalized = client.validate_pipeline(v2.Pipeline())
+        normalized, capabilities = client.validate_pipeline(v2.Pipeline())
         self.assertEqual(["em0"], [m.name for m in normalized.modules])
+        self.assertEqual(v2.ModuleCapabilities.STATE_NONE, capabilities["em0"].state)
 
     def test_admin_calls_send_the_epoch_of_the_last_answer(self):
         """Admin requests carry an epoch; the daemon refuses them without one."""

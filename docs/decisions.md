@@ -12252,6 +12252,96 @@ of 10,000 rules or more (then an incremental backend, measured against this benc
 50,000 rules (or shard it by domain or direction, D-147), or a controller needs scope-snapshot consistency
 across the Firewall and another resource.
 
+## D-180 Module capability descriptors: state ownership, flow affinity, update model, consistency
+
+**Status:** accepted (2026-10-23; the roadmap item "module capability descriptors: state ownership, flow
+affinity, update model, consistency").
+**Code:** `core/commands.h` (`ModuleCapabilities`, `ResourceTable::rebuilds`/`Rebuilds()`), `core/module.{h,cc}`
+(`MODULE_CAPABILITIES_FUNC`, `ModuleBuilder::Capabilities`, `Module::max_allowed_workers()`),
+`core/control/pipeline_validator.{h,cc}`, `core/control/api_v2.cc`, `protobuf/control_v2.proto`
+(`ModuleCapabilities`, `ValidatePipelineResponse.capabilities`, `ResourceSchema.rebuilds`), every module class's
+declaration, the three SDKs' `ValidatePipeline`, `bessctl validate`/`schema`; tests in
+`core/control/api_v2_test.cc` and `core/modules/transaction_conformance_test.cc`.
+
+**Context.** Whether a module may run on several workers, and whether a flow's packets must reach one worker,
+was each module's private knowledge: `max_allowed_workers_` set in a constructor or `Init`, and one module
+(ConnTrack's `PER_WORKER`, D-080) checking its own inputs at resume. A controller compiling a graph could not
+learn either before it applied the graph, nor which tables rebuild on a change (a rule list compiled again)
+and which change in place. The transaction consistency a resource provides was already a checked capability
+(D-050), but nothing summarised it per module. Every module would otherwise invent its own affinity rules.
+
+**Decision.**
+
+- **A class declares two facts about the state its packet path changes** (statistics are not state;
+  configuration the control plane writes belongs to the resource tables): who owns it - `kNone`,
+  `kSingleWorker`, `kPerWorker`, `kShared` - and whether one flow's packets must reach one worker -
+  `kNone`, `kPreferred`, `kRequired`. `static constexpr ModuleCapabilities kCapabilities{...}`, or
+  `static ModuleCapabilities Capabilities(const Arg &)` when the init argument decides (ConnTrack's `mode`
+  and `fallback_shared`, NAT's `shared`). Undeclared is unspecified, for plugins written before this.
+- **The update model comes from the tables, not a second declaration.** A resource table gains `rebuilds`
+  (`.Rebuilds()`): a change rebuilds the structure and swaps it in, so it costs in proportion to the table. A
+  module's `updates` is its most disruptive table's: `PAUSED_WORKERS` (`requires_paused_workers`), else
+  `REBUILD`, else `LIVE`; `NONE` without tables. Its consistency is `REFERENTIAL` when it has a table.
+  The parity test verifies that for its five resource-module cases.
+- **`ValidatePipeline` answers it**, per module by name, from the class and the argument alone - before
+  anything exists, which is when a compiler needs it. Computing it unpacks the argument as the class's init
+  type, so validation now refuses an argument of the wrong type, naming the module, where creation used to.
+  `GetSchema` reports each table's `rebuilds`. The C++, Go and Python SDKs return the capabilities with the
+  normalized pipeline; `bessctl validate` prints them on stderr, `bessctl schema` marks `(rebuilds)`.
+- **Declarations are checked where they can be.** `ModuleCapabilitiesTest`: every class linked into the
+  conformance binary declares both fields; affinity other than `kNone` only with `kPerWorker`. For the five
+  resource-module cases and ConnTrack's modes, created instances have worker limit 1 for `kSingleWorker`
+  and above 1 for `kPerWorker`/`kShared`.
+- **The daemon does not enforce affinity across the graph yet.** ConnTrack keeps its own resume check
+  (`AsymmetricInputs`); the descriptor makes the requirement visible so a controller can refuse the graph
+  first.
+
+**The built-in classes**:
+
+| state | affinity | classes |
+|---|---|---|
+| none | none | ACL, ArpResponder, BPF, Bypass, EtherEncap, ExactMatch, Firewall, GenericDecap, GenericEncap, HashLB, IPChecksum, IPEncap, IPSwap, L2Forward, L4Checksum, MACSwap, Merge, MetadataTest, MPLSPop, NoOP, PortInc, QueueInc, QueueOut, Replicate, Router, SetMetadata, Sink, Source, Split, StaticNAT, Timestamp, Update, UpdateTTL, VLANPop, VLANPush, VLANSplit, VXLANDecap, VXLANEncap, Vif, WildcardMatch, WorkerSplit |
+| single worker | none | Bridge, Buffer, Dump, FlowGen, RoundRobin, UrlFilter; ConnTrack `OWNED`; NAT (not shared) |
+| shared | none | DRR, Measure, Meter, PacketStore, PortOut, Queue; ConnTrack `SHARED`; NAT `shared` |
+| per worker | none | RandomSplit, RandomUpdate, Rewrite |
+| per worker | required | ConnTrack `PER_WORKER` |
+| per worker | preferred | ConnTrack `PER_WORKER` with `fallback_shared` |
+
+Tables that rebuild: ACL `rules`, BPF `filters`, Firewall `rules`, Meter `meters` (each change builds the
+whole `MeterSet` again), PacketStore `flows` (the limits map is copied), Rewrite `templates`, UrlFilter
+`blacklist` (the trie) and Vif `interfaces` (every index is rebuilt).
+
+RandomSplit and RandomUpdate use a worker-local RNG; Rewrite keeps a round-robin cursor per worker and resets
+every cursor when its templates change with workers paused. These use `stats::WorkerLocal` cache-line-separated
+slots: workers do not race on an RNG seed or cursor, and no flow affinity is needed.
+
+Judgement calls recorded: DRR, Queue and PacketStore are `shared` because every feeding worker enqueues into one
+multi-producer ring, although only the owning task drains it. A device queue is the port's state, not the
+module's (PortInc, QueueInc, QueueOut are `none`; PortOut is `shared` for the per-queue locks it takes).
+ExactMatch's `rules` is `live`: its occasional growth copies the table, an amortised cost, not a rebuild per
+change.
+
+**Why.** The roadmap's split - worker-owned state where steering gives affinity, shared state only where the
+workload demands it - is a placement decision a controller makes, so it needs the facts before it applies a
+graph, from a pure function of class and argument rather than from a created module. Two declared fields is
+the minimum a compiler needs that the daemon cannot derive; the update model and consistency are derived from
+what the classes already declare, so they cannot drift from it.
+
+**Consequences.** A wrongly typed init argument now fails `ValidatePipeline` (`INVALID_ARGUMENT`, field
+`arg`). The three SDKs' `ValidatePipeline` return values change shape (D-173: no compatibility promise before
+1.0). A plugin compiles unchanged and reports unspecified until it declares.
+
+**Evidence.** `ApiV2ServiceTest.ValidateReportsEachModulesCapabilities` (ConnTrack's four modes, `LIVE`,
+`REBUILD`, `PAUSED_WORKERS` and `NONE`, the consistency, a wrongly typed argument refused naming the module and
+the expected type); `ModuleCapabilitiesTest.EveryClassDeclaresAndModulesAgree` (removing one class's
+declaration fails it); `ResourceParityTest` asserts referential consistency for its five resource-module cases;
+`RewriteTest.WorkersAdvanceIndependentlyAndAReplacementRestartsEveryWorker` checks independent cursors and
+reset after replacing templates; the Python SDK test reads both parts of the answer.
+
+**Revisit when:** a module provides scope-snapshot consistency from its own table (then the table declares
+it), the daemon should refuse an unsafe graph itself (then a resume check generalises ConnTrack's), or a class
+needs a state kind these four do not describe (sharded by key across workers).
+
 ## D-181 A classifier result field nothing downstream reads is compiled out, not a failure
 
 **Status:** accepted (2026-10-23).

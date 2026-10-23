@@ -31,6 +31,9 @@ struct Attr {
 class SetMetadata final : public Module {
  public:
   static const Commands cmds;
+  // The packet path only reads the ops compiled at resume.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   SetMetadata() : Module(), attrs_() {
     max_allowed_workers_ = Worker::kMaxWorkers;

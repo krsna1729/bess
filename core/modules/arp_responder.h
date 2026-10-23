@@ -40,6 +40,9 @@ class ArpResponder final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // The packet path only reads the control-written ARP cache.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::ArpResponderArg &arg);
   void DeInit() override;

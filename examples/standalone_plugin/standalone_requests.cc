@@ -25,6 +25,9 @@ class StandaloneRequests final : public Module {
  public:
   static const gate_idx_t kNumOGates = 2;
   static const Commands cmds;
+  // Capabilities: the packet path posts a request (sets its pending flag), on one worker.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
     switch_ = bess::framework::RequestEndpoint<Switch>(

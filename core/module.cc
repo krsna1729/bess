@@ -25,12 +25,12 @@ bool ModuleBuilder::RegisterModuleClass(
     const std::string &name_template, const std::string &help_text,
     const gate_idx_t igates, const gate_idx_t ogates, const Commands &cmds,
     const ResourceTables &resource_tables, module_init_func_t init_func,
-    const std::string &init_arg_type) {
+    const std::string &init_arg_type, const module_capabilities_func_t &capabilities_func) {
   all_module_builders_holder().emplace(
       std::piecewise_construct, std::forward_as_tuple(class_name),
       std::forward_as_tuple(module_generator, class_name, name_template,
                             help_text, igates, ogates, cmds, resource_tables,
-                            init_func, init_arg_type));
+                            init_func, init_arg_type, capabilities_func));
   return true;
 }
 
@@ -75,6 +75,14 @@ const ResourceTable *ModuleBuilder::FindResourceTable(std::string_view table) co
     }
   }
   return nullptr;
+}
+
+std::expected<ModuleCapabilities, std::string> ModuleBuilder::Capabilities(
+    const google::protobuf::Any &arg) const {
+  if (!capabilities_func_) {
+    return ModuleCapabilities{};
+  }
+  return capabilities_func_(arg);
 }
 
 CommandResponse ModuleBuilder::RunCommand(Module *m, const std::string &user_cmd,

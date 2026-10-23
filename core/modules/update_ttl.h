@@ -11,6 +11,10 @@
 // <= 1
 class UpdateTTL final : public Module {
  public:
+  // Decrements each packet's TTL; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   UpdateTTL() : Module() { max_allowed_workers_ = Worker::kMaxWorkers; }
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 };

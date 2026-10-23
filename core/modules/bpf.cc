@@ -58,7 +58,7 @@
 const Commands BPF::cmds = {};
 
 const ResourceTables BPF::resource_tables = {
-    ResourceTable::Singleton<bess::pb::BPFArg>("filters", true)};
+    ResourceTable::Singleton<bess::pb::BPFArg>("filters", true).Rebuilds()};
 
 CommandResponse BPF::Init(const bess::pb::BPFArg &arg) {
   if (arg.has_default_gate()) {

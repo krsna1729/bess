@@ -50,6 +50,9 @@ class ExactMatch final : public Module {
   // "rules" (ExactMatchRuleKey -> ExactMatchRuleValue) and "settings"
   // (ExactMatchSettings), both changed while workers run (D-129).
   static const ResourceTables resource_tables;
+  // The packet path only reads the published generation and its rule table.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   // Module-level limits, preserved from the legacy ExactMatchTable-based
   // implementation for protobuf API compatibility. The classifier library

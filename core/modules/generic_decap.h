@@ -10,6 +10,10 @@
 
 class GenericDecap final : public Module {
  public:
+  // Stateless: strips a configured number of bytes.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
+
   GenericDecap() : Module(), decap_size_() {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }

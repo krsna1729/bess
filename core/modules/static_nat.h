@@ -26,6 +26,9 @@ class StaticNAT : public Module {
   static const gate_idx_t kNumOGates = 2;
 
   static const Commands cmds;
+  // Stateless address mapping: the pairs are fixed at Init and only read.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::StaticNATArg &arg);
 

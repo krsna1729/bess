@@ -11,6 +11,9 @@
 class Split final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
+  // Reads packet bytes or metadata to pick a gate; keeps no state.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Split() : Module(), mask_(), attr_id_(), offset_(), size_() {
     max_allowed_workers_ = Worker::kMaxWorkers;

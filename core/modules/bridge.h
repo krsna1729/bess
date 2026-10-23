@@ -33,6 +33,9 @@ class Bridge final : public Module {
   static const gate_idx_t kNumOGates = MAX_GATES;
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // Learning and aging write the worker-owned FDB on the packet path.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   // Static entries beyond the learning limit (`size`).
   static constexpr size_t kStaticReserve = 1024;

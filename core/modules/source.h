@@ -18,6 +18,9 @@ class Source final : public Module {
   static const Commands cmds;
   // "settings" (SourceSettings): pkt_size and burst, applied live (D-129).
   static const ResourceTables resource_tables;
+  // The task only allocates from the worker's pool with the configured settings.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   Source() : Module(), pkt_size_(), burst_() { is_task_ = true; }
 

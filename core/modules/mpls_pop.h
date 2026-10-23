@@ -22,6 +22,9 @@ class MPLSPop final : public Module {
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
+  // The packet path only reads the control-written settings.
+  static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
+                                                    ModuleCapabilities::FlowAffinity::kNone};
 
   MPLSPop();  // constructor
 
