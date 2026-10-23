@@ -62,6 +62,19 @@ struct PmdCapabilities {
   std::string driver_name;
 };
 
+// PMDPortArg.rx_mark (D-185): what rte_eth_rx_metadata_negotiate()'s return
+// value and the features it hands back for RTE_ETH_RX_METADATA_USER_MARK mean.
+enum class RxMarkNegotiation : uint8_t {
+  kGranted,  // 0 with the bit kept: the PMD guarantees MARK delivery
+  kAssumed,  // -ENOTSUP: the PMD does not negotiate; DPDK says assume it works
+  kRefused,  // 0 with the bit cleared: the device cannot deliver MARK
+  kFailed,   // any other error (-EBUSY: the device was configured before)
+};
+RxMarkNegotiation ClassifyRxMarkNegotiation(int ret, uint64_t features);
+// RTE_ETH_RX_METADATA_USER_MARK. RTE_BIT64 shifts by an int literal, which
+// clang-tidy's bugprone-signed-bitwise reports wherever the macro expands.
+inline constexpr uint64_t kRxMetadataUserMark =
+    RTE_ETH_RX_METADATA_USER_MARK;  // NOLINT(bugprone-signed-bitwise)
 
 /*!
  * This driver binds a port to a device using DPDK.

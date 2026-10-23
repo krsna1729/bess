@@ -26,6 +26,15 @@ message PMDPortArg {
   /// symmetric Toeplitz hash where the device offers it, else the Toeplitz
   /// hash with a symmetric key. Refused when the device can do neither.
   bool symmetric_rss = 8;
+
+  /// Negotiates RX MARK delivery (D-185): RTE_ETH_RX_METADATA_USER_MARK is
+  /// requested before the device is configured, as DPDK's contract asks.
+  /// Refused when the PMD answers without it; a PMD that has no negotiation
+  /// (-ENOTSUP) is assumed to deliver it, as DPDK specifies. Some PMDs need it
+  /// (sfc refuses MARK rules without it); others deliver a rule's MARK either
+  /// way (mlx5 enables delivery when a MARK rule is created). PortInc/QueueInc
+  /// `mark_attr` hands the MARK to modules downstream.
+  bool rx_mark = 9;
 }
 
 message UnixSocketPortArg {

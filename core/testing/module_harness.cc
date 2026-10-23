@@ -269,17 +269,22 @@ std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunPipeline(
 
 std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunTask(Module *m,
                                                                 std::vector<gate_idx_t> ogates) {
+  return RunTaskPipeline(m, m, std::move(ogates));
+}
+
+std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunTaskPipeline(
+    Module *first, Module *last, std::vector<gate_idx_t> ogates) {
   std::map<gate_idx_t, std::vector<Bytes>> out;
-  if (m == nullptr || capture_ == nullptr) {
+  if (first == nullptr || last == nullptr || capture_ == nullptr) {
     ADD_FAILURE() << "no module to run";
     return out;
   }
-  if (m->tasks().empty()) {
-    ADD_FAILURE() << m->name() << " registered no task";
+  if (first->tasks().empty()) {
+    ADD_FAILURE() << first->name() << " registered no task";
     return out;
   }
-  Task task(m, m->tasks()[0]->arg());
-  WireOutputs(m, std::move(ogates), task);
+  Task task(first, first->tasks()[0]->arg());
+  WireOutputs(last, std::move(ogates), task);
   captured = &out;
   RunOnce(task);
   captured = nullptr;

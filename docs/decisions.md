@@ -12751,3 +12751,90 @@ so path health reaches traffic through group routes only.
 
 **Revisit when:** a producer needs weights by quality rather than availability, or a group needs more than
 64 slots.
+
+## D-185 The NIC's rte_flow MARK reaches modules as a metadata attribute
+
+**Status:** accepted (2026-10-23); hardware validation pending.
+**Code:** `core/drivers/pmd.{h,cc}` (`PMDPortArg.rx_mark`, `ClassifyRxMarkNegotiation`),
+`core/modules/rx_mark.h` (`WriteRxMarks`), `core/modules/port_inc.{h,cc}`, `core/modules/queue_inc.{h,cc}`,
+`protobuf/ports/port_msg.proto` (`PMDPortArg.rx_mark`), `protobuf/module_msg.proto` (`PortIncArg.mark_attr`,
+`QueueIncArg.mark_attr`), `core/testing/marked_rx_port.h`, `core/testing/module_harness.{h,cc}`
+(`RunTaskPipeline`).
+
+**Context.** FlowRuleOwner (M20, D-070) installs rte_flow rules with a MARK action, allocates MARK values and maps
+them back to cookies (`MarkCookie`). Nothing on the receive side read the MARK, and PMDPort never asked the device
+to deliver it. What DPDK 25.11 says (local source, `.scratch/deps/dpdk-25.11.3`):
+
+- `lib/mbuf/rte_mbuf_core.h:109-110`: `RTE_MBUF_F_RX_FDIR_ID` means "FD id reported"; `:587-590`: `hash.fdir.hi`
+  holds the FD ID depending on the `RTE_MBUF_F_RX_FDIR_*` flags. `RTE_MBUF_F_RX_FDIR` alone (`:57`) is a match
+  without an ID.
+- `lib/ethdev/rte_ethdev.h:5817-5856`: `rte_eth_rx_metadata_negotiate()` goes before the first
+  `rte_eth_dev_configure()`; the PMD answers with the subset it guarantees; the result takes effect at configure
+  and start; `-ENOTSUP` "does not necessarily mean that the requested features are unsupported", and the
+  application should assume they work without negotiation. `lib/ethdev/rte_ethdev.c:7128-7133`: once the port is
+  configured the call is `-EBUSY`; `:7144-7145`: a PMD without the callback is `-ENOTSUP`.
+- mlx5: `drivers/net/mlx5/mlx5_flow.c:1836-1863` (`mlx5_flow_rx_metadata_negotiate`) only masks the answer
+  (`USER_FLAG` and `USER_MARK` unless tunnel offload is active) and sets `tunnel_enabled`; it enables nothing.
+  MARK delivery is enabled by `mlx5_flow_rxq_mark_flag_set` (`mlx5_flow.c:1659`) when a flow with MARK is created
+  (`flow_rxq_flags_set`, `:1715`), when steering is disabled (`rte_pmd_mlx5_disable_steering`, `:12560`), or at
+  start with steering disabled (`drivers/net/mlx5/mlx5_trigger.c:1454`). `drivers/net/mlx5/mlx5_rx.c:979-984`
+  sets `RX_FDIR`, and the MARK flag with `hash.fdir.hi` unless the value is the default;
+  `drivers/common/mlx5/mlx5_prm.h:258,261`: the largest MARK is `0xfffff0`, `0xffffff` is the default (no MARK).
+- sfc is the PMD that acts on a negotiated `USER_MARK`: `drivers/net/sfc/sfc_flow.c:1707-1712` refuses a MARK
+  action ("mark delivery has not been negotiated") without it, and `drivers/net/sfc/sfc_rx.c:1201-1203` enables
+  the queues' user mark only with it (or with flow tunnels active).
+- ice (E810): no negotiation callback (`-ENOTSUP`); `drivers/net/intel/ice/ice_rxtx.c:91,109,139,183` set
+  `RX_FDIR|RX_FDIR_ID` and `hash.fdir.hi = flow_id` when the flex descriptor's `flow_id != 0xFFFFFFFF`, with
+  32-byte descriptors (not `RTE_NET_INTEL_USE_16BYTE_DESC`); the vector paths (`ice_rxtx_vec_*.c`) do the same.
+- net_null and net_ring have no negotiation callback: `-ENOTSUP`.
+
+**Decision.**
+
+- **`PMDPortArg.rx_mark` negotiates.** Init calls `rte_eth_rx_metadata_negotiate()` with
+  `RTE_ETH_RX_METADATA_USER_MARK` before the first configure. An answer without the bit is refused (ENOTSUP, "the
+  device cannot deliver MARK", naming the driver). `-ENOTSUP` is accepted and logged once at Init, as DPDK
+  specifies. Any other error fails Init; `-EBUSY` says the device was configured before (a `port_id` or `pci`
+  device a previous port configured: only a fresh device can negotiate). Without `rx_mark` nothing changes. The
+  outcome is not reported in a port field: no existing one fits, and adding one would change control_v2.
+- **`PortIncArg.mark_attr` and `QueueIncArg.mark_attr` hand the MARK over.** When set, the module registers a
+  4-byte big-endian write attribute and writes, for every received packet, `hash.fdir.hi` when
+  `RTE_MBUF_F_RX_FDIR_ID` is set, else 0. The write follows the metadata contract (D-177), as ConnTrack's
+  `status_attr` does (D-182): the attribute exists only when configured, has an offset only when a module
+  downstream reads it, and a configured name nothing reads is a warning at each resume (PreResume). The offset is
+  tested once per batch; without a reader, or without `mark_attr`, the packet path is as before. QueueInc takes
+  the same option because its receive path is PortInc's for one queue: the same helper, the same few lines.
+- **0 is "no mark".** FlowRuleOwner hands out `[mark_base, mark_base + marks)` with `mark_base` 1 by default, so
+  it never hands out 0. A controller that installs rules for a reader of `mark_attr` must keep `mark_base >= 1`;
+  a rule with MARK 0 is indistinguishable from no rule.
+- **The boundary.** BESS delivers the MARK value; it does not interpret it. Mapping a MARK to a result (through
+  `FlowRuleOwner::MarkCookie` or the application's own table), and the equivalence and precedence between a
+  hardware rule and the software classifier it shortcuts, are the application's. Installing rules stays with
+  FlowRuleOwner (D-070).
+
+**Why.** The mark is already in the mbuf; one flag test and one 4-byte store per packet, only when a reader
+exists, is the cheapest handoff, and an attribute lets any reader (Split, a classifier, a plugin) use it without
+a new interface. Negotiating follows DPDK's contract: sfc requires it (no MARK rule without it); on mlx5 it only
+refuses the bit while tunnel offload is active, and a MARK rule enables delivery either way; ice, net_null and
+net_ring have no callback (`-ENOTSUP`). Refusing a cleared bit makes a device that says it cannot deliver fail at
+Init instead of silently writing 0 forever.
+
+**Test.** `drivers_pmd_test`: `RxMarkNegotiationTest.ClassifiesTheAnswer` (granted, cleared, `-ENOTSUP`,
+`-EBUSY`, `-EIO`), and `PMDPortRxMarkTest.NullVdevAnswersEnotsupAndThePortStarts`: on a net_null vdev the
+negotiation answers `-ENOTSUP` and a port with `rx_mark` starts; after it is configured a second `rx_mark` port
+on the device is refused with EBUSY and the reason, and one without `rx_mark` starts.
+`modules_port_inc_test` (`PortIncMarkTest.MarkAttrCarriesEachPacketsMark`, `NoMarkAttrRegistersNothing`) and
+`modules_queue_inc_test` (`QueueIncMarkTest.MarkAttrCarriesEachPacketsMark`): a port hands out packets with
+`RX_FDIR|RX_FDIR_ID` and MARKs 1, 258 and 4097, and packets with no flags or with a value in `hash.fdir.hi` but
+no `RX_FDIR_ID`; a Split on the 4-byte attribute sends each to the gate of its MARK, the others to 0. Every
+packet's metadata starts as `0xa5` bytes, so a packet the module skips reads `0xa5a5a5a5`, not 0. 258 and 4097
+catch a byte-order slip; a write removed, the flag ignored, or the write skipped for unmarked packets fails
+the test.
+
+**Hardware validation is pending.** No mlx5 or E810 run has shown a rule's MARK in the attribute; until one has,
+this is DPDK's contract as read in its source, not an observed behaviour.
+
+**Consequences.** A pipeline that sets neither option is unchanged. ice needs 32-byte descriptors to report the
+MARK, which is DPDK's build default.
+
+**Revisit when:** hardware validation runs, a PMD reports the MARK some other way (a dynamic mbuf field), or a
+reader needs `USER_FLAG` or the tunnel ID.

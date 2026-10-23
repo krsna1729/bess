@@ -6,6 +6,7 @@
 #define BESS_MODULES_PORTINC_H_
 
 #include <atomic>
+#include <string>
 
 #include "framework/singleton_resource.h"
 #include "module.h"
@@ -19,7 +20,8 @@ class PortInc final : public Module {
   static const Commands cmds;
   // "settings" (PortIncSettings): burst, applied live (D-129).
   static const ResourceTables resource_tables;
-  // The packet path only receives from the port's queues and counts.
+  // The packet path only receives from the port's queues, counts, and writes
+  // each packet's MARK when mark_attr is read; it keeps no state.
   static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
@@ -34,6 +36,7 @@ class PortInc final : public Module {
   const Port *port() const { return port_; }
 
   void DeInit() override;
+  int OnEvent(bess::Event event) override;
 
   struct task_result RunTask(Context *ctx, bess::PacketBatch *batch,
                              void *arg) override;
@@ -41,10 +44,19 @@ class PortInc final : public Module {
   std::string GetDesc() const override;
 
  private:
+  // mark_attr's offset when something reads it (D-185), else an invalid
+  // offset: the packet path writes nothing.
+  bess::metadata::mt_offset_t MarkOffset() const {
+    return mark_attr_ < 0 ? bess::metadata::kMetadataOffsetNoWrite : attr_offset(mark_attr_);
+  }
+
   Port *port_;
   int prefetch_;
   // Set by the settings resource while workers read it.
   std::atomic<int> burst_;
+  // The configured MARK attribute (D-185); -1 when none.
+  int mark_attr_ = -1;
+  std::string mark_attr_name_;
 
   // "<name>/settings" (the burst); after the state it sets.
   bess::framework::Singleton<bess::pb::PortIncSettings, int> settings_;

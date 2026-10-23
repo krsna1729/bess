@@ -4,7 +4,14 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
+#include <string>
 #include <utility>
+
+#include <rte_dev.h>
+
+#include "packet_pool.h"
+#include "runtime/opts.h"
 
 namespace {
 
@@ -506,4 +513,84 @@ TEST(PmdCapabilitiesTest, UnknownDeviceOverheadUsesEthernetFallback) {
       MakeDeviceInfo(576, UINT16_MAX, true, UINT32_MAX));
 
   EXPECT_EQ(kEtherOverhead, capabilities.rx_frame_overhead);
+}
+
+// D-185: rte_eth_rx_metadata_negotiate()'s answer. -ENOTSUP means the PMD has
+// no negotiation, which DPDK says to treat as usable; a success that clears
+// USER_MARK is a refusal; any other error fails.
+TEST(RxMarkNegotiationTest, ClassifiesTheAnswer) {
+  constexpr uint64_t kMark = kRxMetadataUserMark;
+  constexpr uint64_t kFlag = RTE_ETH_RX_METADATA_USER_FLAG;  // NOLINT(bugprone-signed-bitwise)
+  EXPECT_EQ(RxMarkNegotiation::kGranted, ClassifyRxMarkNegotiation(0, kMark));
+  EXPECT_EQ(RxMarkNegotiation::kGranted, ClassifyRxMarkNegotiation(0, kMark | kFlag));
+  EXPECT_EQ(RxMarkNegotiation::kRefused, ClassifyRxMarkNegotiation(0, 0));
+  EXPECT_EQ(RxMarkNegotiation::kRefused, ClassifyRxMarkNegotiation(0, kFlag));
+  EXPECT_EQ(RxMarkNegotiation::kAssumed, ClassifyRxMarkNegotiation(-ENOTSUP, 0));
+  EXPECT_EQ(RxMarkNegotiation::kAssumed, ClassifyRxMarkNegotiation(-ENOTSUP, kMark));
+  EXPECT_EQ(RxMarkNegotiation::kFailed, ClassifyRxMarkNegotiation(-EBUSY, kMark));
+  EXPECT_EQ(RxMarkNegotiation::kFailed, ClassifyRxMarkNegotiation(-EIO, kMark));
+}
+
+namespace {
+
+// EAL as `bessd -m 0` brings it up (--no-huge, malloc-backed pools), once per
+// process.
+void InitEalOnce() {
+  static const bool initialized = [] {
+    FLAGS_m = 0;
+    bess::PacketPool::CreateDefaultPools(32767);
+    return true;
+  }();
+  (void)initialized;
+}
+
+void OneQueueEachWay(PMDPort &port) {
+  port.num_queues[PACKET_DIR_INC] = 1;
+  port.num_queues[PACKET_DIR_OUT] = 1;
+  port.queue_size[PACKET_DIR_INC] = 1024;
+  port.queue_size[PACKET_DIR_OUT] = 1024;
+}
+
+}  // namespace
+
+// D-185 on a vdev: net_null has no rx_metadata_negotiate, so DPDK answers
+// -ENOTSUP and a port with rx_mark starts. Once the device is configured,
+// negotiation is -EBUSY, and a port asking for rx_mark on it is refused with
+// the reason; one without rx_mark still starts.
+TEST(PMDPortRxMarkTest, NullVdevAnswersEnotsupAndThePortStarts) {
+  InitEalOnce();
+  const char *kVdev = "net_null_rx_mark0";
+  ASSERT_EQ(0, rte_dev_probe(kVdev));
+  uint16_t port_id = 0;
+  ASSERT_EQ(0, rte_eth_dev_get_port_by_name(kVdev, &port_id));
+  uint64_t features = kRxMetadataUserMark;
+  EXPECT_EQ(-ENOTSUP, rte_eth_rx_metadata_negotiate(port_id, &features));
+
+  bess::pb::PMDPortArg arg;
+  arg.set_port_id(port_id);
+  arg.set_rx_mark(true);
+  {
+    PMDPort port;
+    OneQueueEachWay(port);
+    const CommandResponse resp = port.Init(arg);
+    EXPECT_EQ(0, resp.error().code()) << resp.error().errmsg();
+    port.DeInit();
+  }
+  {
+    PMDPort port;
+    OneQueueEachWay(port);
+    const CommandResponse resp = port.Init(arg);
+    EXPECT_EQ(EBUSY, resp.error().code());
+    EXPECT_NE(std::string::npos, resp.error().errmsg().find("configured before"))
+        << resp.error().errmsg();
+  }
+  arg.set_rx_mark(false);
+  {
+    PMDPort port;
+    OneQueueEachWay(port);
+    const CommandResponse resp = port.Init(arg);
+    EXPECT_EQ(0, resp.error().code()) << resp.error().errmsg();
+    port.DeInit();
+  }
+  EXPECT_EQ(0, rte_eal_hotplug_remove("vdev", kVdev));
 }
