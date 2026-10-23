@@ -21,8 +21,8 @@
 #include <vector>
 
 #include "conntrack/conntrack.h"
-#include "conntrack/packet_parse.h"
 #include "nat/nat.h"
+#include "packet_parse.h"
 
 namespace appliance {
 
@@ -59,8 +59,8 @@ class NatApp {
   // only as part of a connection started inside. `frame` is the packet's
   // first segment, `total_len` the packet's length (0: the span's).
   Verdict Process(std::span<uint8_t> frame, bool outbound, Tick now, size_t total_len = 0) noexcept {
-    bess::conntrack::ParsedFlowPacket p;
-    if (bess::conntrack::ParseFrame(frame, p, total_len) != bess::conntrack::ParseStatus::kOk) {
+    bess::packet::ParsedFrame p;
+    if (bess::packet::ParseFrame(frame, p, total_len) != bess::packet::ParseStatus::kOk) {
       return Verdict::kNotTranslated;
     }
     if (outbound) {
@@ -77,7 +77,7 @@ class NatApp {
       return Verdict::kNotTranslated;  // no mapping: dropped
     }
     // Re-parse: the rewrite changed the destination the firewall keys on.
-    if (bess::conntrack::ParseFrame(frame, p, total_len) != bess::conntrack::ParseStatus::kOk ||
+    if (bess::packet::ParseFrame(frame, p, total_len) != bess::packet::ParseStatus::kOk ||
         !Admitted(frame, p, now, /*may_create=*/false)) {
       return Verdict::kRefused;
     }
@@ -101,7 +101,7 @@ class NatApp {
   NatApp(std::unique_ptr<bess::nat::Nat> nat, std::unique_ptr<Ct> ct)
       : nat_(std::move(nat)), ct_(std::move(ct)) {}
 
-  bool Admitted(std::span<const uint8_t> frame, const bess::conntrack::ParsedFlowPacket &p,
+  bool Admitted(std::span<const uint8_t> frame, const bess::packet::ParsedFrame &p,
                 Tick now, bool may_create) noexcept {
     const auto r = ct_->Track(frame, p, now, 0, may_create);
     return r.status == bess::conntrack::TrackStatus::kNew ||

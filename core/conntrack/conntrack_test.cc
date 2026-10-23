@@ -14,8 +14,16 @@
 #include <utility>
 #include <vector>
 
+#include "packet_parse.h"
+
 namespace bess::conntrack {
 namespace {
+
+using packet::L3Kind;
+using packet::L4Kind;
+using packet::ParsedFrame;
+using packet::ParseFrame;
+using packet::ParseStatus;
 
 // -- frame builders ---------------------------------------------------------------
 
@@ -82,8 +90,8 @@ std::vector<uint8_t> Icmp(Ep s, Ep d, uint8_t type, uint16_t id, std::vector<uin
   return Ipv4Frame(s, d, 1, l4);
 }
 
-ParsedFlowPacket Parse(const std::vector<uint8_t> &f) {
-  ParsedFlowPacket p;
+ParsedFrame Parse(const std::vector<uint8_t> &f) {
+  ParsedFrame p;
   EXPECT_EQ(ParseStatus::kOk, ParseFrame(f, p));
   return p;
 }
@@ -98,7 +106,7 @@ std::unique_ptr<Ct> Make(TimeoutPolicy policy = {}, size_t capacity = 64) {
 
 // Tracks a packet built by the caller; returns the result.
 Ct::Result Send(Ct &ct, const std::vector<uint8_t> &f, uint64_t now, bool may_create = true) {
-  ParsedFlowPacket p = Parse(f);
+  ParsedFrame p = Parse(f);
   return ct.Track(f, p, now, 0, may_create);
 }
 
@@ -111,7 +119,7 @@ TEST(PacketParseTest, VlanTagsOptionsAndPorts) {
       l4[12] = 5 << 4;
       l4[13] = kSA;
       const auto f = Ipv4Frame(kClient, kServer, 6, l4, vlans, options);
-      ParsedFlowPacket p;
+      ParsedFrame p;
       ASSERT_EQ(ParseStatus::kOk, ParseFrame(f, p)) << vlans << " " << options;
       EXPECT_EQ(L3Kind::kIpv4, p.l3);
       EXPECT_EQ(L4Kind::kTcp, p.l4);
@@ -148,7 +156,7 @@ TEST(PacketParseTest, Ipv6ExtensionHeadersAndFragments) {
   // Hop-by-hop (8 bytes) -> destination options (16 bytes) -> UDP.
   std::vector<uint8_t> chain = {60, 0, 0, 0, 0, 0, 0, 0, 17, 1};
   chain.resize(8 + 16, 0);
-  ParsedFlowPacket p;
+  ParsedFrame p;
   auto f = v6(chain, 0, 17);
   ASSERT_EQ(ParseStatus::kOk, ParseFrame(f, p));
   EXPECT_EQ(L3Kind::kIpv6, p.l3);
@@ -186,7 +194,7 @@ TEST(PacketParseTest, Ipv6ExtensionHeadersAndFragments) {
 // protocol, then each with one byte changed and each truncated, and with a
 // total length smaller and larger than the bytes.
 TEST(PacketParseTest, FastPathAgreesWithTheGeneralPath) {
-  auto same = [](const ParsedFlowPacket &a, const ParsedFlowPacket &b) {
+  auto same = [](const ParsedFrame &a, const ParsedFrame &b) {
     return a.l3 == b.l3 && a.l4 == b.l4 && a.protocol == b.protocol && a.tcp_flags == b.tcp_flags &&
            a.l3_offset == b.l3_offset && a.l4_offset == b.l4_offset && a.l4_length == b.l4_length &&
            a.src == b.src && a.dst == b.dst && a.src_port == b.src_port && a.dst_port == b.dst_port &&
@@ -213,11 +221,11 @@ TEST(PacketParseTest, FastPathAgreesWithTheGeneralPath) {
     }
     for (const auto &v : variants) {
       for (size_t total : {size_t{0}, v.size() + 9, v.size() > 3 ? v.size() - 3 : 0}) {
-        ParsedFlowPacket a, b;
+        ParsedFrame a, b;
         const ParseStatus sa = ParseFrame(v, a, total);
-        b = ParsedFlowPacket{};
+        b = ParsedFrame{};
         const ParseStatus sb =
-            parse_internal::ParseFrameGeneral(v, b, std::max(total, v.size()));
+            packet::parse_internal::ParseFrameGeneral(v, b, std::max(total, v.size()));
         ASSERT_EQ(sa, sb) << compared;
         ASSERT_TRUE(same(a, b)) << compared;
         fast += v.size() >= 34 && v[12] == 0x08 && v[13] == 0 && v[14] == 0x45;
@@ -232,11 +240,11 @@ TEST(PacketParseTest, TruncationsAndLiesAreMalformed) {
   const auto full = Tcp(kClient, kServer, kSA);
   for (size_t n = 0; n < full.size(); n++) {
     std::vector<uint8_t> cut(full.begin(), full.begin() + n);
-    ParsedFlowPacket p;
+    ParsedFrame p;
     const ParseStatus s = ParseFrame(cut, p);
     ASSERT_NE(ParseStatus::kOk, s) << "truncated to " << n;
   }
-  ParsedFlowPacket p;
+  ParsedFrame p;
   auto f = Tcp(kClient, kServer, kA);
   f[14] = 0x44;  // IHL 4
   EXPECT_EQ(ParseStatus::kMalformed, ParseFrame(f, p));
@@ -271,7 +279,7 @@ TEST(PacketParseTest, FirstFragmentsAreParsed) {
   std::vector<uint8_t> udp(8 + 92, 0);
   Put16(udp, 4, 3000);  // the whole datagram's length
   auto f = Ipv4Frame(kClient, kServer, 17, udp, 0, 0, 0x2000);  // MF, offset 0
-  ParsedFlowPacket p;
+  ParsedFrame p;
   ASSERT_EQ(ParseStatus::kOk, ParseFrame(f, p));
   EXPECT_TRUE(p.first_fragment);
   EXPECT_EQ(40000, p.src_port);
@@ -369,7 +377,7 @@ TEST(ConntrackTest, TcpReopenAfterTimeWaitOrClose) {
   };
   auto ct = Conntrack<Mark>::Create(64).value();
   auto send = [&](const std::vector<uint8_t> &f, uint64_t now) {
-    ParsedFlowPacket p = Parse(f);
+    ParsedFrame p = Parse(f);
     return ct->Track(f, p, now);
   };
   auto close = [&](uint64_t now) {
@@ -513,7 +521,7 @@ TEST(ConntrackTest, BothDirectionsShareOneKeyAndZonesSeparate) {
   // IPv6 endpoints that differ only in their low 8 address bytes, with equal
   // ports: the order must look at the whole address.
   for (int i = 0; i < 200; i++) {
-    ParsedFlowPacket x{};
+    ParsedFrame x{};
     x.l3 = L3Kind::kIpv6;
     x.l4 = L4Kind::kUdp;
     x.protocol = 17;
@@ -523,7 +531,7 @@ TEST(ConntrackTest, BothDirectionsShareOneKeyAndZonesSeparate) {
     x.src[9] = static_cast<uint8_t>(rng());
     x.dst[9] = static_cast<uint8_t>(rng());
     x.src_port = x.dst_port = 4789;
-    ParsedFlowPacket y = x;
+    ParsedFrame y = x;
     std::swap(y.src, y.dst);
     const auto fwd = MakeKey(x, 0), rev = MakeKey(y, 0);
     ASSERT_EQ(0, std::memcmp(&fwd.key, &rev.key, sizeof(CtKey)));
@@ -536,7 +544,7 @@ TEST(ConntrackTest, BothDirectionsShareOneKeyAndZonesSeparate) {
   EXPECT_EQ(2u, ct->size());
   ct = Make();
   const auto f = Udp(kClient, kServer);
-  ParsedFlowPacket p = Parse(f);
+  ParsedFrame p = Parse(f);
   EXPECT_EQ(TrackStatus::kNew, ct->Track(f, p, 0, /*zone=*/1).status);
   EXPECT_EQ(TrackStatus::kNew, ct->Track(f, p, 0, /*zone=*/2).status);
   EXPECT_EQ(TrackStatus::kExisting, ct->Track(f, p, 0, /*zone=*/1).status);
@@ -559,7 +567,7 @@ TEST(ConntrackTest, PolicyRefusalCapacityAndControl) {
   EXPECT_EQ(0u, ct->Expire(2000, ~size_t{0}));
   EXPECT_EQ(0u, ct->size());
   // An unparsed packet is untracked.
-  EXPECT_EQ(TrackStatus::kUntracked, ct->Track({}, ParsedFlowPacket{}, 0).status);
+  EXPECT_EQ(TrackStatus::kUntracked, ct->Track({}, ParsedFrame{}, 0).status);
 }
 
 
@@ -582,7 +590,7 @@ TEST(ConntrackTest, TrackBatchMatchesTrackPacketByPacket) {
     for (int round = 0; round < 400; round++) {
       const size_t n = 1 + rng() % Conntrack<>::kMaxBatch;
       std::vector<std::vector<uint8_t>> frames;
-      std::vector<ParsedFlowPacket> parsed(n);
+      std::vector<ParsedFrame> parsed(n);
       for (size_t i = 0; i < n; i++) {
         const Ep a{static_cast<uint32_t>(0x0a000000u + rng() % 6), static_cast<uint16_t>(1000 + rng() % 4)};
         const Ep b{static_cast<uint32_t>(0xc0a80000u + rng() % 3), static_cast<uint16_t>(80 + rng() % 2)};
@@ -602,11 +610,11 @@ TEST(ConntrackTest, TrackBatchMatchesTrackPacketByPacket) {
           default: frames.push_back(Icmp(s, d, 13, 1)); break;  // untracked
         }
         if (ParseFrame(frames.back(), parsed[i]) != ParseStatus::kOk) {
-          parsed[i] = ParsedFlowPacket{};
+          parsed[i] = ParsedFrame{};
         }
       }
       if (rng() % 5 == 0) {
-        parsed[rng() % n] = ParsedFlowPacket{};  // an unparsed packet
+        parsed[rng() % n] = ParsedFrame{};  // an unparsed packet
       }
       std::vector<std::span<const uint8_t>> spans(frames.begin(), frames.end());
       std::vector<Conntrack<>::Result> got(n);

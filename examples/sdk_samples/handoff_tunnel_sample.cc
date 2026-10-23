@@ -20,8 +20,8 @@
 
 #include <rte_mbuf.h>
 
-#include "conntrack/packet_parse.h"
 #include "dataplane/handoff.h"
+#include "packet_parse.h"
 #include "tunnel/tunnel.h"
 
 namespace sample {
@@ -60,7 +60,7 @@ bool HandoffSample(bess::PacketHandle &packet) {
 }
 
 bool TunnelSample(std::span<const uint8_t> frame) {
-  bess::conntrack::ParsedFlowPacket outer;
+  bess::packet::ParsedFrame outer;
   bess::tunnel::Decapsulated inner;
   const bess::tunnel::DecapError error = bess::tunnel::DecapVxlan(frame, outer, inner);
   if (error != bess::tunnel::DecapError::kOk) {

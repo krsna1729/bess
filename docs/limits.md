@@ -97,7 +97,7 @@ Columns:
 | NAT | flows | default 65,536 | `NATArg.capacity`, `max_capacity` | yes | the table grows up to `max_capacity`; past it a new flow's packet is dropped and `bess.table_full` is raised |
 | NAT | idle timeout | 300 s | `kDefaultNatTimeout` (`nat/nat.h`), `BasicNat::kDefaultTimeout` | No | — |
 | Conntrack | flows | default 65,536 | `ConntrackArg.capacity` | yes | a new connection's packet leaves on gate 1 (not tracked) and `bess.table_full` is raised |
-| Conntrack | IPv6 extension headers parsed | 8 | `kMaxExtensionHeaders` (`conntrack/packet_parse.h`) | No | packet treated as malformed |
+| Conntrack, NAT, tunnel decaps, Router | IPv6 extension headers parsed | 8 | `kMaxExtensionHeaders` (`packet_parse.h`) | No | packet treated as malformed |
 | DRR | flows | default 4,096; max 16M | `DRR::kDefaultNumFlows`, `kMaxNumFlows` | `num_flows` | EINVAL |
 | Queue | size | default 1,024; 4–16,384, a power of 2 | `DEFAULT_QUEUE_SIZE` (`queue.cc`); the bounds are literals in `Queue::SetSize` | `size` | EINVAL "must be in [4, 16384]" / "must be a power of 2" |
 | Measure | histogram | 100 ns buckets to 100 ms | `kDefaultNsPerBucket`, `kDefaultMaxNs` | `latency_ns_resolution`, `latency_ns_max` | values above the range are counted in the last bucket |

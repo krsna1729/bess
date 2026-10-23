@@ -17,9 +17,9 @@
 namespace bess::nat {
 namespace {
 
-using conntrack::ParsedFlowPacket;
-using conntrack::ParseFrame;
-using conntrack::ParseStatus;
+using packet::ParsedFrame;
+using packet::ParseFrame;
+using packet::ParseStatus;
 
 constexpr uint32_t kPublic = 0xc6336401, kRemote = 0x08080808;
 
@@ -61,7 +61,7 @@ typename N::Config Config(size_t capacity, size_t log = 64, rcu::RcuDomain *doma
 
 template <typename N>
 Verdict Send(N &nat, std::vector<uint8_t> &f, Direction dir, uint64_t now) {
-  ParsedFlowPacket p;
+  ParsedFrame p;
   EXPECT_EQ(ParseStatus::kOk, ParseFrame(f, p));
   return nat.Translate(f, p, dir, now);
 }
@@ -206,7 +206,7 @@ TEST(NatUsageTest, SharedCountsAddUpAcrossWorkersAndGrowth) {
           Verdict v;
           do {
             auto out = Udp(0x0a000004, static_cast<uint16_t>(7000 + flow), kRemote, 53);
-            ParsedFlowPacket p;
+            ParsedFrame p;
             if (ParseFrame(out, p) != ParseStatus::kOk) std::abort();
             v = nat->Translate(out, p, Direction::kForward, 1);
             domain.Quiescent(reader);

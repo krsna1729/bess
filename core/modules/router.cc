@@ -1557,13 +1557,13 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     // is dropped and counted, never forwarded. Both families are forwarded:
     // this mode has no FIB and so no family setting (D-183), and the hop
     // count written is the packet's own family's.
-    bess::conntrack::ParsedFlowPacket parsed;
-    const bess::conntrack::ParseStatus status = bess::conntrack::ParseFrame(
+    bess::packet::ParsedFrame parsed;
+    const bess::packet::ParseStatus status = bess::packet::ParseFrame(
         std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), parsed,
         pkt.total_len());
-    if (status != bess::conntrack::ParseStatus::kOk &&
-        status != bess::conntrack::ParseStatus::kNotIp &&
-        status != bess::conntrack::ParseStatus::kFragment) {
+    if (status != bess::packet::ParseStatus::kOk &&
+        status != bess::packet::ParseStatus::kNotIp &&
+        status != bess::packet::ParseStatus::kFragment) {
       gates[i] = DROP_GATE;
       header_write_failures_.fetch_add(1, std::memory_order_relaxed);
       continue;
@@ -1573,8 +1573,8 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     // the destination mode drops a fragment because its group hash needs
     // ports, while this mode routes by id and forwards it with the hop count
     // written.
-    const bool ip = status != bess::conntrack::ParseStatus::kNotIp;
-    const route::L3Family family = parsed.l3 == bess::conntrack::L3Kind::kIpv6
+    const bool ip = status != bess::packet::ParseStatus::kNotIp;
+    const route::L3Family family = parsed.l3 == bess::packet::L3Kind::kIpv6
                                        ? route::L3Family::kIpv6
                                        : route::L3Family::kIpv4;
     bess::PacketHandle handle = pkt.handle();

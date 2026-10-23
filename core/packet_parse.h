@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_CONNTRACK_PACKET_PARSE_H_
-#define BESS_CONNTRACK_PACKET_PARSE_H_
+#ifndef BESS_PACKET_PARSE_H_
+#define BESS_PACKET_PARSE_H_
 
 #include <algorithm>
 #include <array>
@@ -10,15 +10,15 @@
 #include <cstring>
 #include <span>
 
-namespace bess::conntrack {
+namespace bess::packet {
 
-// A narrow parse result for flow tracking (M17, D-067): where the L3 and L4
-// headers are, the L4 ports or ICMP identity, and the TCP flags -- nothing a
-// tracker does not use. Every offset is checked against the frame before it
-// is recorded: a frame whose headers do not fit, or that lies about its
-// lengths, is kMalformed, never read past. No fixed Ethernet header, no
-// untagged-IPv4 assumption: up to two VLAN tags, IPv4 with options, IPv6 with
-// its extension-header chain.
+// The checked packet parse (M17, D-067), one for every module that reads a
+// frame's flow fields (ConnTrack, NAT, the tunnel decaps, Router): where the
+// L3 and L4 headers are, the L4 ports or ICMP identity, and the TCP flags.
+// Every offset is checked against the frame before it is recorded: a frame
+// whose headers do not fit, or that lies about its lengths, is kMalformed,
+// never read past. No fixed Ethernet header, no untagged-IPv4 assumption: up
+// to two VLAN tags, IPv4 with options, IPv6 with its extension-header chain.
 
 enum class L3Kind : uint8_t { kNone, kIpv4, kIpv6 };
 enum class L4Kind : uint8_t { kNone, kTcp, kUdp, kIcmp, kIcmpv6, kOther };
@@ -30,13 +30,7 @@ enum class ParseStatus : uint8_t {
   kFragment,        // a non-initial IP fragment: no L4 header to read
 };
 
-// TCP flag bits as on the wire (byte 13).
-inline constexpr uint8_t kTcpFin = 0x01;
-inline constexpr uint8_t kTcpSyn = 0x02;
-inline constexpr uint8_t kTcpRst = 0x04;
-inline constexpr uint8_t kTcpAck = 0x10;
-
-struct ParsedFlowPacket {
+struct ParsedFrame {
   L3Kind l3 = L3Kind::kNone;
   L4Kind l4 = L4Kind::kNone;
   uint8_t protocol = 0;  // the IP protocol / final next header
@@ -68,7 +62,7 @@ inline constexpr size_t kMaxExtensionHeaders = 8;
 // (headers must lie there), `total` is its stated length (which the length
 // checks use; for a chained packet the rest lies in later segments).
 inline ParseStatus ParseL4(const uint8_t *ip, size_t present, size_t total, size_t off,
-                           size_t frame_base, ParsedFlowPacket &out) noexcept {
+                           size_t frame_base, ParsedFrame &out) noexcept {
   out.l4_offset = static_cast<uint16_t>(frame_base + off);
   out.l4_length = static_cast<uint16_t>(total - off);
   const uint8_t *l4 = ip + off;
@@ -121,7 +115,7 @@ inline ParseStatus ParseL4(const uint8_t *ip, size_t present, size_t total, size
 // a chained packet). Headers must be present; lengths are checked against
 // `limit`.
 inline ParseStatus ParseIp(const uint8_t *ip, size_t present, size_t limit, size_t base,
-                           ParsedFlowPacket &out) noexcept {
+                           ParsedFrame &out) noexcept {
   if (present < 1) {
     return ParseStatus::kMalformed;
   }
@@ -202,7 +196,7 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t present, size_t limit, size
 
 // The general path: any of up to two VLAN tags, IPv4 with options, IPv6 with
 // extension headers. `out` is cleared and `total_len` settled by the caller.
-inline ParseStatus ParseFrameGeneral(std::span<const uint8_t> frame, ParsedFlowPacket &out,
+inline ParseStatus ParseFrameGeneral(std::span<const uint8_t> frame, ParsedFrame &out,
                                      size_t total_len) noexcept {
   size_t off = 12;
   if (frame.size() < 14) {
@@ -232,12 +226,12 @@ inline ParseStatus ParseFrameGeneral(std::span<const uint8_t> frame, ParsedFlowP
 // `frame` is the readable bytes (for a chained packet, its first segment) and
 // `total_len` the packet's length (default: the span's): the headers must be
 // in `frame`, and the IP and L4 lengths are checked against `total_len`.
-inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFlowPacket &out,
+inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFrame &out,
                               size_t total_len = 0) noexcept {
   if (total_len < frame.size()) {
     total_len = frame.size();
   }
-  out = ParsedFlowPacket{};
+  out = ParsedFrame{};
   // The common frame first, validated in one place: untagged Ethernet, IPv4
   // without options. The same checks as the general path below, in the order
   // that decides fastest (the tunnel review's "validate once, execute fast";
@@ -265,11 +259,11 @@ inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFlowPacket &
 }
 
 // Parses a packet that starts at its IP header.
-inline ParseStatus ParseIpPacket(std::span<const uint8_t> packet, ParsedFlowPacket &out) noexcept {
-  out = ParsedFlowPacket{};
+inline ParseStatus ParseIpPacket(std::span<const uint8_t> packet, ParsedFrame &out) noexcept {
+  out = ParsedFrame{};
   return parse_internal::ParseIp(packet.data(), packet.size(), packet.size(), 0, out);
 }
 
-}  // namespace bess::conntrack
+}  // namespace bess::packet
 
-#endif  // BESS_CONNTRACK_PACKET_PARSE_H_
+#endif  // BESS_PACKET_PARSE_H_

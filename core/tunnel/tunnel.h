@@ -13,7 +13,7 @@
 #include <optional>
 #include <span>
 
-#include "conntrack/packet_parse.h"
+#include "packet_parse.h"
 #include "utils/checksum.h"
 #include "utils/ip.h"
 
@@ -136,14 +136,14 @@ inline void WriteUdp(uint8_t *udp, uint16_t src_port, uint16_t dst_port, uint16_
 
 enum class DecapError : uint8_t {
   kOk,             // decapsulated; the out-parameter is filled
-  kMalformed,      // the outer headers do not parse (conntrack::ParseFrame)
+  kMalformed,      // the outer headers do not parse (packet::ParseFrame)
   kNotTunnel,      // not UDP to the tunnel's port / not the GRE protocol
   kBadHeader,      // the tunnel header is short, a reserved version, or a flag missing
   kNoInner,        // too short for the inner header the tunnel carries
 };
 
 // What a decapsulation found. Results are written through out-parameters
-// (the outer parse into the caller's ParsedFlowPacket, this into the
+// (the outer parse into the caller's ParsedFrame, this into the
 // caller's Decapsulated) and the function returns a status: returning them
 // by value, in a std::expected, made the caller copy fields just written
 // with narrow stores, which defeated store forwarding (measured, unisolated:
@@ -162,8 +162,8 @@ struct Decapsulated {
 namespace detail {
 // Parses the outer headers; `end` is the end of the outer L4 payload.
 inline DecapError Outer(std::span<const uint8_t> frame, size_t total_len,
-                        conntrack::ParsedFlowPacket &outer, size_t &end) noexcept {
-  if (conntrack::ParseFrame(frame, outer, total_len) != conntrack::ParseStatus::kOk ||
+                        packet::ParsedFrame &outer, size_t &end) noexcept {
+  if (packet::ParseFrame(frame, outer, total_len) != packet::ParseStatus::kOk ||
       outer.first_fragment) {
     // A fragmented outer packet (even its first fragment, whose L4 header the
     // parser accepts) carries a cut inner packet: reassemble before decap.
@@ -192,14 +192,14 @@ inline void WriteVxlanUdp(uint8_t *hdr, uint32_t vni, uint16_t src_port, uint16_
 // port, for a caller that has already classified the packet as VXLAN) and
 // finds the inner Ethernet frame: the I flag set, the inner frame at least an
 // Ethernet header.
-inline DecapError DecapVxlan(std::span<const uint8_t> frame, conntrack::ParsedFlowPacket &outer,
+inline DecapError DecapVxlan(std::span<const uint8_t> frame, packet::ParsedFrame &outer,
                              Decapsulated &out, std::optional<uint16_t> port = kVxlanPort,
                              size_t total_len = 0) noexcept {
   size_t end;
   if (const DecapError e = detail::Outer(frame, total_len, outer, end); e != DecapError::kOk) {
     return e;
   }
-  if (outer.l4 != conntrack::L4Kind::kUdp || (port && outer.dst_port != *port)) {
+  if (outer.l4 != packet::L4Kind::kUdp || (port && outer.dst_port != *port)) {
     return DecapError::kNotTunnel;
   }
   const size_t vx = size_t{outer.l4_offset} + kUdpBytes;
@@ -243,14 +243,14 @@ struct GeneveInfo {
                   // understand the options must drop (RFC 8926 3.5)
 };
 
-inline DecapError DecapGeneve(std::span<const uint8_t> frame, conntrack::ParsedFlowPacket &outer,
+inline DecapError DecapGeneve(std::span<const uint8_t> frame, packet::ParsedFrame &outer,
                               GeneveInfo &info, uint16_t port = kGenevePort,
                               size_t total_len = 0) noexcept {
   size_t end;
   if (const DecapError e = detail::Outer(frame, total_len, outer, end); e != DecapError::kOk) {
     return e;
   }
-  if (outer.l4 != conntrack::L4Kind::kUdp || outer.dst_port != port) {
+  if (outer.l4 != packet::L4Kind::kUdp || outer.dst_port != port) {
     return DecapError::kNotTunnel;
   }
   const size_t g = size_t{outer.l4_offset} + kUdpBytes;
@@ -372,7 +372,7 @@ inline DecapError ParseGre(std::span<const uint8_t> bytes, size_t offset, GreInf
 
 // Checks an outer Ethernet/IP/GRE frame and finds the payload. A GRE
 // checksum is verified only when the whole packet is in `frame`.
-inline DecapError DecapGre(std::span<const uint8_t> frame, conntrack::ParsedFlowPacket &outer,
+inline DecapError DecapGre(std::span<const uint8_t> frame, packet::ParsedFrame &outer,
                            Decapsulated &out, size_t total_len = 0) noexcept {
   size_t end;
   if (const DecapError e = detail::Outer(frame, total_len, outer, end); e != DecapError::kOk) {
@@ -426,14 +426,14 @@ struct GtpuInfo {
 // Checks an outer Ethernet/IP/UDP/GTP-U frame to `port` and finds the T-PDU.
 // Only G-PDUs (type 255) carry a payload; other messages return kNotTunnel
 // (echo, error indication: the application's control path).
-inline DecapError DecapGtpu(std::span<const uint8_t> frame, conntrack::ParsedFlowPacket &outer,
+inline DecapError DecapGtpu(std::span<const uint8_t> frame, packet::ParsedFrame &outer,
                             GtpuInfo &info, uint16_t port = kGtpuPort,
                             size_t total_len = 0) noexcept {
   size_t end;
   if (const DecapError e = detail::Outer(frame, total_len, outer, end); e != DecapError::kOk) {
     return e;
   }
-  if (outer.l4 != conntrack::L4Kind::kUdp || outer.dst_port != port) {
+  if (outer.l4 != packet::L4Kind::kUdp || outer.dst_port != port) {
     return DecapError::kNotTunnel;
   }
   info.sequence.reset();

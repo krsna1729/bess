@@ -9,8 +9,8 @@
 #include <memory>
 #include <span>
 
-#include "conntrack/packet_parse.h"
 #include "dataplane/interface_id.h"
+#include "packet_parse.h"
 #include "route/l3_packet.h"
 #include "route/route_domain.h"
 #include "route/router.h"
@@ -74,33 +74,33 @@ namespace forward_internal {
 
 // The parse verdicts, and the family for an IP frame. Returns true when the
 // frame has a destination to resolve (`out` then holds its family only).
-inline bool ParseVerdict(conntrack::ParseStatus parsed,
-                         const conntrack::ParsedFlowPacket &p,
+inline bool ParseVerdict(packet::ParseStatus parsed,
+                         const packet::ParsedFrame &p,
                          FrameRoute &out) noexcept {
   out = {};
-  if (p.l3 == conntrack::L3Kind::kIpv6) {
+  if (p.l3 == packet::L3Kind::kIpv6) {
     out.family = L3Family::kIpv6;
   }
   switch (parsed) {
-    case conntrack::ParseStatus::kOk:
+    case packet::ParseStatus::kOk:
       break;
-    case conntrack::ParseStatus::kNotIp:
+    case packet::ParseStatus::kNotIp:
       return false;
-    case conntrack::ParseStatus::kFragment:
+    case packet::ParseStatus::kFragment:
       out.verdict = ForwardVerdict::kNonInitialFragment;
       return false;
     default:
       out.verdict = ForwardVerdict::kMalformed;
       return false;
   }
-  if (p.l3 != conntrack::L3Kind::kIpv4 && p.l3 != conntrack::L3Kind::kIpv6) {
+  if (p.l3 != packet::L3Kind::kIpv4 && p.l3 != packet::L3Kind::kIpv6) {
     return false;  // kNotIp
   }
   return true;
 }
 
 // The family and link-scope checks: true when the frame goes on to a lookup.
-inline bool Routable(const Router &router, const conntrack::ParsedFlowPacket &p,
+inline bool Routable(const Router &router, const packet::ParsedFrame &p,
                      FrameRoute &out) noexcept {
   if (out.family == L3Family::kIpv4 ? !router.has_ipv4() : !router.has_ipv6()) {
     out.verdict = ForwardVerdict::kFamilyDisabled;
@@ -125,7 +125,7 @@ inline bool Routable(const Router &router, const conntrack::ParsedFlowPacket &p,
 // The flow hash a group route picks a member with: the address words are
 // opaque, so both callers pass the header's bytes as they are; IPv6 folds its
 // four words of each address.
-inline uint32_t FrameHash(const conntrack::ParsedFlowPacket &p, L3Family family,
+inline uint32_t FrameHash(const packet::ParsedFrame &p, L3Family family,
                           FlowHashFields fields) noexcept {
   uint32_t src_words[4];
   uint32_t dst_words[4];
@@ -196,8 +196,8 @@ inline void Settle(const NextHop *hop, std::span<const uint8_t> frame,
 inline FrameRoute ResolveFrame(const Router &router, RouteDomainId domain,
                                std::span<const uint8_t> frame, size_t total_len,
                                FlowHashFields fields = FlowHashFields::kL3L4) noexcept {
-  conntrack::ParsedFlowPacket p;
-  const conntrack::ParseStatus parsed = conntrack::ParseFrame(frame, p, total_len);
+  packet::ParsedFrame p;
+  const packet::ParseStatus parsed = packet::ParseFrame(frame, p, total_len);
   FrameRoute out;
   if (!forward_internal::ParseVerdict(parsed, p, out) ||
       !forward_internal::Routable(router, p, out)) {
@@ -288,9 +288,9 @@ inline void ResolveFrames(const Router &router, RouteDomainId domain,
   size_t n4 = 0;
   size_t n6 = 0;
   for (size_t i = 0; i < frames.size(); i++) {
-    conntrack::ParsedFlowPacket p;
-    const conntrack::ParseStatus parsed =
-        conntrack::ParseFrame(frames[i], p, total_lens[i]);
+    packet::ParsedFrame p;
+    const packet::ParseStatus parsed =
+        packet::ParseFrame(frames[i], p, total_lens[i]);
     if (!forward_internal::ParseVerdict(parsed, p, out[i]) ||
         !forward_internal::Routable(router, p, out[i])) {
       continue;

@@ -39,9 +39,9 @@
 #include <string>
 #include <vector>
 
-#include "conntrack/packet_parse.h"
 #include "flow/decision_cache.h"
 #include "flow/worker_flow_table.h"
+#include "packet_parse.h"
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
 #include "utils/checksum.h"
@@ -135,10 +135,10 @@ class VswitchApp {
   // decision (allow false: drop). A DSCP mark rewrites the IPv4 TOS in place.
   // `frame` is the packet's first segment, `total_len` its length (0: the span's).
   CompiledDecision Process(size_t tenant, std::span<uint8_t> frame, size_t total_len = 0) noexcept {
-    bess::conntrack::ParsedFlowPacket p;
+    bess::packet::ParsedFrame p;
     if (tenant >= kTenants ||
-        bess::conntrack::ParseFrame(frame, p, total_len) != bess::conntrack::ParseStatus::kOk ||
-        p.l3 != bess::conntrack::L3Kind::kIpv4) {
+        bess::packet::ParseFrame(frame, p, total_len) != bess::packet::ParseStatus::kOk ||
+        p.l3 != bess::packet::L3Kind::kIpv4) {
       return {};
     }
     VswitchKey key{};

@@ -3,7 +3,7 @@
 // Stateful batteries on one parsed packet: connection tracking
 // (conntrack/conntrack.h) and NAT (nat/nat.h). Both are worker-owned
 // libraries: one worker creates, tracks and expires; nothing is shared or
-// locked. Packets are parsed once (conntrack::ParseFrame) and the parse is
+// locked. Packets are parsed once (bess::packet::ParseFrame) and the parse is
 // handed to each library. Failures are values: a create error, a parse status,
 // a track status, a NAT verdict.
 
@@ -13,8 +13,8 @@
 #include <span>
 
 #include "conntrack/conntrack.h"
-#include "conntrack/packet_parse.h"
 #include "nat/nat.h"
+#include "packet_parse.h"
 
 namespace sample {
 
@@ -39,8 +39,8 @@ std::array<uint8_t, 60> UdpFrame() {
 
 bool StatefulSample(uint64_t now) {
   std::array<uint8_t, 60> frame = UdpFrame();
-  ct::ParsedFlowPacket parsed;
-  if (ct::ParseFrame(frame, parsed) != ct::ParseStatus::kOk) {
+  bess::packet::ParsedFrame parsed;
+  if (bess::packet::ParseFrame(frame, parsed) != bess::packet::ParseStatus::kOk) {
     return false;
   }
 

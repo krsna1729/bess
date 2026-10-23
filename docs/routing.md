@@ -78,7 +78,7 @@ route exists and chose that hop (D-160).
 | `route/forward.h` | the dual-stack forwarding chain both callers share (D-157, D-183): `ResolveFrame(s)` (read) and `WriteForwarded` (write), IPv4 and IPv6 through one implementation; link-local/multicast IPv6 is never routed |
 | `route/connected_routes.h` | the routes an interface address implies (D-178): `DerivedRoutes::Derive` for connected + local, deterministic order and stable keys, `InstallationOps`/`EraseOps` for the controller's transaction |
 | `route/lpm_resource.h` | one IPv4 `LpmRouteTable` as a transaction resource (D-111): prefix → an opaque value whose meaning is the module's |
-| `conntrack/packet_parse.h` | the checked parse the chain starts from |
+| `packet_parse.h` | the checked parse the chain starts from (`packet::ParseFrame`) |
 
 ## Two recipes
 

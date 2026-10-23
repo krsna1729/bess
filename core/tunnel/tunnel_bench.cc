@@ -137,7 +137,7 @@ void BM_Decap(benchmark::State &st) {
     }
   }
   size_t sink = 0;
-  bess::conntrack::ParsedFlowPacket outer;
+  bess::packet::ParsedFrame outer;
   for (auto _ : st) {
     switch (st.range(0)) {
       case 0: {

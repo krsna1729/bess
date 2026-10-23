@@ -25,10 +25,13 @@
 #include <vector>
 
 #include "conntrack/conntrack.h"
+#include "packet_parse.h"
 
 namespace {
 
 using namespace bess::conntrack;
+using bess::packet::ParsedFrame;
+using bess::packet::ParseFrame;
 
 void Put16(std::vector<uint8_t> &f, size_t off, uint16_t v) {
   f[off] = static_cast<uint8_t>(v >> 8);
@@ -91,7 +94,7 @@ void BM_Parse(benchmark::State &state) {
     case 2: f = V6Ext(); break;
     default: f = V4(1, 1000, 2, 80, 6, kTcpAck); f.resize(40); break;
   }
-  ParsedFlowPacket p;
+  ParsedFrame p;
   for (auto _ : state) {
     benchmark::DoNotOptimize(ParseFrame(f, p));
     benchmark::DoNotOptimize(p);
@@ -100,7 +103,7 @@ void BM_Parse(benchmark::State &state) {
 
 struct Stream {
   std::vector<std::vector<uint8_t>> frames;
-  std::vector<ParsedFlowPacket> parsed;
+  std::vector<ParsedFrame> parsed;
 };
 
 // Cases 0-2: `conns` established connections, and a stream of one packet
@@ -113,7 +116,7 @@ Stream Established(Conntrack<> &ct, int kase, uint32_t conns, uint64_t now) {
   std::mt19937 rng(0x17);
   Stream s;
   auto add = [&](std::vector<uint8_t> f) {
-    ParsedFlowPacket p;
+    ParsedFrame p;
     (void)ParseFrame(f, p);
     s.frames.push_back(std::move(f));
     s.parsed.push_back(p);
@@ -128,7 +131,7 @@ Stream Established(Conntrack<> &ct, int kase, uint32_t conns, uint64_t now) {
         (void)s2;
         auto f = from_client ? V4(client(i), port, kServer, 80, 6, s1)
                              : V4(kServer, 80, client(i), port, 6, s1);
-        ParsedFlowPacket p;
+        ParsedFrame p;
         (void)ParseFrame(f, p);
         (void)ct.Track(f, p, now);
       }
@@ -156,7 +159,7 @@ void BM_Track(benchmark::State &state) {
   uint64_t now = 1;
   Stream s;
   auto add = [&](std::vector<uint8_t> f) {
-    ParsedFlowPacket p;
+    ParsedFrame p;
     (void)ParseFrame(f, p);
     s.frames.push_back(std::move(f));
     s.parsed.push_back(p);
@@ -213,7 +216,7 @@ void BM_Expire(benchmark::State &state) {
     ct = Conntrack<>::Create(conns + 64).value();
     for (uint32_t i = 0; i < conns; i++) {
       auto f = V4(0x0a000000u + i, static_cast<uint16_t>(1024 + i % 60000), 0xc0a80001, 53, 17, 0);
-      ParsedFlowPacket p;
+      ParsedFrame p;
       (void)ParseFrame(f, p);
       (void)ct->Track(f, p, i % 7);
     }

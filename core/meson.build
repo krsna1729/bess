@@ -542,6 +542,7 @@ core_public_headers = files(
   'packet_handle.h',
   'packet_edit_plan.h',
   'packet_mutation.h',
+  'packet_parse.h',
   'packet_pool.h',
   'packet_reshape.h',
   'packet_tx_checksum.h',
@@ -639,7 +640,6 @@ core_public_subdir_headers = {
   ),
   'conntrack': files(
     'conntrack/conntrack.h',
-    'conntrack/packet_parse.h',
   ),
   'offload': files(
     'offload/fake_flow_backend.h',

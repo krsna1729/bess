@@ -98,7 +98,7 @@ class SharedConntrack {
   }
 
   // As Conntrack::Track.
-  Result Track(std::span<const uint8_t> frame, const ParsedFlowPacket &p, Tick now,
+  Result Track(std::span<const uint8_t> frame, const packet::ParsedFrame &p, Tick now,
                uint16_t zone = 0, bool may_create = true) noexcept {
     if (!ct_internal::Keyed(p)) {
       return Unkeyed(frame, p, zone);
@@ -115,7 +115,7 @@ class SharedConntrack {
 
   // Track for each packet of a batch, in order.
   void TrackBatch(std::span<const std::span<const uint8_t>> frames,
-                  std::span<const ParsedFlowPacket> parsed, Tick now, std::span<Result> out,
+                  std::span<const packet::ParsedFrame> parsed, Tick now, std::span<Result> out,
                   uint16_t zone = 0, bool may_create = true) noexcept {
     for (size_t i = 0; i < frames.size(); i++) {
       out[i] = Track(frames[i], parsed[i], now, zone, may_create);
@@ -184,7 +184,7 @@ class SharedConntrack {
   }
   static void UnlockEntry(Entry &e) noexcept { e.lock.store(0, std::memory_order_release); }
 
-  Result Existing(const ParsedFlowPacket &p, const CanonicalKey &c, flow::FlowHandle h, Entry &e,
+  Result Existing(const packet::ParsedFrame &p, const CanonicalKey &c, flow::FlowHandle h, Entry &e,
                   Tick now, bool may_create) noexcept {
     LockEntry(e);
     Direction dir = c.src_is_a == e.initiator_is_a ? Direction::kOriginal : Direction::kReply;
@@ -220,10 +220,10 @@ class SharedConntrack {
     return {status, dir, h, &e};
   }
 
-  Result Create(const ParsedFlowPacket &p, const CanonicalKey &c, Tick now,
+  Result Create(const packet::ParsedFrame &p, const CanonicalKey &c, Tick now,
                 bool may_create) noexcept {
     TcpState tcp = TcpState::kNone;
-    if (p.l4 == L4Kind::kTcp) {
+    if (p.l4 == packet::L4Kind::kTcp) {
       const auto cls = ct_internal::ClassOf(p.tcp_flags);
       if (!ct_internal::ValidFlags(p.tcp_flags)) {
         return {TrackStatus::kInvalid};
@@ -235,7 +235,7 @@ class SharedConntrack {
       } else {
         return {TrackStatus::kInvalid};
       }
-    } else if ((p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) &&
+    } else if ((p.l4 == packet::L4Kind::kIcmp || p.l4 == packet::L4Kind::kIcmpv6) &&
                !ct_internal::IsEchoRequest(p.l4, p.icmp_type)) {
       return {TrackStatus::kInvalid};
     }
@@ -272,10 +272,10 @@ class SharedConntrack {
     return {TrackStatus::kNew, Direction::kOriginal, made.handle, made.state};
   }
 
-  Result Unkeyed(std::span<const uint8_t> frame, const ParsedFlowPacket &p,
+  Result Unkeyed(std::span<const uint8_t> frame, const packet::ParsedFrame &p,
                  uint16_t zone) noexcept {
-    if (p.l3 != L3Kind::kNone && p.l4 != L4Kind::kNone &&
-        (p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) &&
+    if (p.l3 != packet::L3Kind::kNone && p.l4 != packet::L4Kind::kNone &&
+        (p.l4 == packet::L4Kind::kIcmp || p.l4 == packet::L4Kind::kIcmpv6) &&
         ct_internal::IsIcmpError(p.l4, p.icmp_type)) {
       CanonicalKey c;
       if (!ct_internal::QuotedKey(frame, p, zone, &c)) {
