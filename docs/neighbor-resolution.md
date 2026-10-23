@@ -244,8 +244,11 @@ other resource:
   is refused.
 - **Refused while referenced.** Routes and groups name a bound id like any
   next hop and hold a reference to its binding, so an unbind is refused while
-  any route or group names it. Remove (or repoint) them in the same or an
-  earlier transaction.
+  any route or group names it. So does another module's value that declares
+  `<router>/next_hops` (a classifier result field): that resource hands a
+  bound id's reference to `<router>/neighbors` (D-187), so a column of ids
+  may mix static and bound hops, and each is protected where it is held.
+  Remove (or repoint) them in the same or an earlier transaction.
 - **Abort leaves nothing.** An aborted transaction leaves no binding, hop or
   pending resolver change behind.
 - **Order does not matter.** The transaction engine reserves operations in
