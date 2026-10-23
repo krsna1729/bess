@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include <rte_malloc.h>
 
+#include <algorithm>
 #include <any>
 #include <atomic>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -691,8 +693,14 @@ std::string LiveState(const Router &r) {
   for (uint32_t g = 1; g <= 3; g++) {
     const NextHopGroup *group = r.LookupNextHopGroup(NextHopGroupId(g));
     s += " g" + std::to_string(r.GroupReferences(NextHopGroupId(g))) + "," +
-         (group == nullptr ? std::string("-") : std::to_string(group->size));
+         (group == nullptr ? std::string("-")
+                           : std::to_string(group->size) + "+" +
+                                 std::to_string(group->standby_size) + ":" +
+                                 std::to_string(group->eligible_size));
   }
+  r.ForEachNextHopState([&](NextHopId id, const NextHopState &state) {
+    s += " s" + std::to_string(id.value()) + (state.down ? "d" : "u");
+  });
   return s;
 }
 
@@ -753,6 +761,16 @@ TEST_P(RouterLiveUpdateFaultTest, FailureAtEveryAllocationLeavesNoTrace) {
          const NextHopId m[] = {NextHopId(2), NextHopId(3), NextHopId(3)};
          return r.SetNextHopGroup(NextHopGroupId(1), m);
        }},
+      {"add a group with a standby",
+       [](Router &r) {
+         const NextHopId m[] = {NextHopId(2), NextHopId(4)};
+         const NextHopId s[] = {NextHopId(3)};
+         return r.SetNextHopGroup(NextHopGroupId(2), m, s);
+       }},
+      {"mark a group member down",
+       [](Router &r) { return r.SetNextHopDown(NextHopId(1), true); }},
+      {"mark a next hop in no group down",
+       [](Router &r) { return r.SetNextHopDown(NextHopId(4), true); }},
       {"remove a group", [](Router &r) { return r.RemoveNextHopGroup(NextHopGroupId(3)); }},
       {"create a domain", [&](Router &r) { return r.CreateDomain(RouteDomainId(2), config); }},
       {"remove a domain", [](Router &r) { return r.RemoveDomain(RouteDomainId(3)); }},
@@ -958,6 +976,9 @@ TEST_P(RouterTransactionTest, RoutersWithoutGroupsRegisterAnEmptyGroupsResource)
   EXPECT_NE(route.ops[0].error.find("configured capacity"), std::string::npos)
       << route.ops[0].error;
   EXPECT_EQ(EgressOf(*router, Ip(10, 0, 0, 1)), -1) << "nothing resolved through a group";
+  EXPECT_EQ(Apply({router->SetNextHopStateOp(NextHopId(1), NextHopState{true})}).outcome,
+            Outcome::kApplied)
+      << "availability is per next hop: it needs no groups";
 }
 
 // A reader resolving through groups while transactions replace members, move
@@ -1570,6 +1591,533 @@ TEST_F(RouterFamilyTest, Ipv6EntriesFollowTheRouterCapacity) {
   ASSERT_TRUE(router.SetRoute(kDefaultRouteDomainId, P6("2001:db8::", 32), NextHopGroupId(4)));
   EXPECT_EQ(Egress6Of(router, "2001:db8::1"), 2) << "the largest value, 8 + 4, fits";
   ASSERT_TRUE(router.RemoveRoute(kDefaultRouteDomainId, P6("2001:db8::", 32)));
+}
+
+// -- path health through transactions (D-184) ---------------------------------
+
+// The next hops with a state entry, and whether each says down.
+std::vector<std::pair<uint32_t, bool>> StatesOf(const Router &router) {
+  std::vector<std::pair<uint32_t, bool>> states;
+  router.ForEachNextHopState(
+      [&](NextHopId id, const NextHopState &state) { states.emplace_back(id.value(), state.down); });
+  return states;
+}
+
+NextHopState Down(bool down = true) { return NextHopState{down}; }
+
+// "<rt>/next_hop_state" is desired state that references its next hop: state
+// for a next hop that does not exist is refused, a next hop with an entry
+// cannot leave alone, and an entry reads back as written -- one that says
+// available too. A change of availability fails the group over.
+TEST_P(RouterTransactionTest, NextHopStateIsAResourceThatReferencesItsNextHop) {
+  auto router = MakeRouter(64, 64, 1, /*groups=*/4);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  EXPECT_EQ(router->next_hop_state_resource(), "rt/next_hop_state");
+  ASSERT_NE(router->next_hop_state_resource_object(), nullptr);
+  const NextHopId ab[] = {NextHopId(1), NextHopId(2)};
+  const NextHopId c[] = {NextHopId(3)};
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                   router->SetNextHopOp(NextHopId(2), Hop(2)),
+                   router->SetNextHopOp(NextHopId(3), Hop(3)),
+                   router->SetNextHopGroupOp(NextHopGroupId(1), ab, c),
+                   router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                      NextHopGroupId(1))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(router->GroupMemberships(NextHopId(3)), 1u) << "a standby is a member";
+  const auto rejected = [&](std::vector<Op> ops, const std::string &error, const char *why) {
+    const auto gen = engine_.generation();
+    const auto res = Apply(std::move(ops));
+    EXPECT_NE(res.outcome, Outcome::kApplied) << why;
+    EXPECT_EQ(engine_.generation(), gen) << why << ": nothing applied";
+    bool named = false;
+    for (const auto &op : res.ops) {
+      named |= op.error.find(error) != std::string::npos;
+    }
+    EXPECT_TRUE(named) << why << ": want '" << error << "'";
+    EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{1, 2})) << why;
+  };
+  rejected({router->SetNextHopStateOp(NextHopId(9), Down())}, "references missing",
+           "state for a next hop that does not exist");
+  rejected({router->SetNextHopStateOp(NextHopId(0), Down())}, "configured capacity",
+           "next hop id 0");
+  rejected({router->SetNextHopStateOp(NextHopId(65), Down())}, "configured capacity",
+           "an id past max_next_hops");
+  rejected({router->RemoveNextHopStateOp(NextHopId(1))}, "not found", "no entry to erase");
+  rejected({Op::Upsert(router->next_hop_state_resource(), dataplane::EncodeKey(NextHopId(1)),
+                       std::any(true))},
+           "wrong value type", "a value that is not a NextHopState");
+  const NextHopId both[] = {NextHopId(3)};
+  rejected({router->SetNextHopGroupOp(NextHopGroupId(2), both, both)},
+           "both an active and a standby", "a next hop in both lists");
+
+  // A next hop and its state arrive together; the hop cannot leave without
+  // its entry, and both leave together.
+  ASSERT_EQ(Apply({router->SetNextHopStateOp(NextHopId(4), Down()),
+                   router->SetNextHopOp(NextHopId(4), Hop(4))})
+                .outcome,
+            Outcome::kApplied);
+  rejected({router->RemoveNextHopOp(NextHopId(4))}, "still referenced",
+           "a next hop with a state entry");
+  ASSERT_EQ(Apply({router->RemoveNextHopOp(NextHopId(4)), router->RemoveNextHopStateOp(NextHopId(4))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_TRUE(StatesOf(*router).empty());
+
+  ASSERT_EQ(Apply({router->SetNextHopStateOp(NextHopId(1), Down()),
+                   router->SetNextHopStateOp(NextHopId(2), Down(false))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(StatesOf(*router), (std::vector<std::pair<uint32_t, bool>>{{1, true}, {2, false}}));
+  EXPECT_EQ(router->next_hop_state_resource_object()->LiveCount(), 2u);
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{2}));
+  ASSERT_EQ(Apply({router->SetNextHopStateOp(NextHopId(2), Down())}).outcome, Outcome::kApplied);
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{3})) << "the standby";
+  ASSERT_EQ(Apply({router->RemoveNextHopStateOp(NextHopId(1)),
+                   router->RemoveNextHopStateOp(NextHopId(2))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{1, 2})) << "no entries";
+  EXPECT_EQ(router->SetNextHopDown(NextHopId(1), true).error(), RouteError::kEnrolled);
+
+  // State set directly cannot be carried into a ledger: enroll first.
+  TransactionEngine other{bess::runtime::runtime().rcu()};
+  const Router::Config config{.ipv4 = bess::testing::TestRouteConfig()};
+  auto direct = Router::Create("rt_direct", config, 8, bess::runtime::runtime().rcu());
+  ASSERT_TRUE(direct.has_value());
+  ASSERT_TRUE((*direct)->SetNextHop(NextHopId(1), Hop(1)));
+  ASSERT_TRUE((*direct)->SetNextHopDown(NextHopId(1), true));
+  const auto enrolled = (*direct)->Enroll(other.registry());
+  ASSERT_FALSE(enrolled);
+  EXPECT_NE(enrolled.error().find("marking next hops down"), std::string::npos);
+  ASSERT_TRUE((*direct)->SetNextHopDown(NextHopId(1), false));
+  EXPECT_TRUE((*direct)->Enroll(other.registry()));
+}
+
+// One transaction that changes groups and member state together publishes
+// every group from the staged state of both, whatever the request order: a
+// group it writes computes its eligible set with the transaction's state
+// changes, a group it does not write is republished for them, and a group it
+// erases is never republished (its id is retiring, and publishing over it is
+// fatal).
+TEST_P(RouterTransactionTest, GroupsAndMemberStateChangeInOneTransaction) {
+  for (const bool state_first : {true, false}) {
+    SCOPED_TRACE(state_first ? "state ops first" : "group ops first");
+    auto router = MakeRouter(64, 64, 1, /*groups=*/4);
+    ASSERT_TRUE(router->Enroll(engine_.registry()));
+    std::vector<Op> setup;
+    for (uint32_t i = 1; i <= 6; i++) {
+      setup.push_back(router->SetNextHopOp(NextHopId(i), Hop(i)));
+    }
+    const NextHopId g1[] = {NextHopId(1), NextHopId(2)};
+    const NextHopId g1_standby[] = {NextHopId(3)};
+    const NextHopId g2[] = {NextHopId(2), NextHopId(4)};
+    const NextHopId g3[] = {NextHopId(2)};
+    const NextHopId g3_standby[] = {NextHopId(5)};
+    setup.push_back(router->SetNextHopGroupOp(NextHopGroupId(1), g1, g1_standby));
+    setup.push_back(router->SetNextHopGroupOp(NextHopGroupId(2), g2));
+    setup.push_back(router->SetNextHopGroupOp(NextHopGroupId(3), g3, g3_standby));
+    setup.push_back(
+        router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(1)));
+    setup.push_back(
+        router->SetRouteOp(kDefaultRouteDomainId, P(Ip(20, 0, 0, 0), 8), NextHopGroupId(2)));
+    setup.push_back(
+        router->SetRouteOp(kDefaultRouteDomainId, P(Ip(30, 0, 0, 0), 8), NextHopGroupId(3)));
+    ASSERT_EQ(Apply(setup).outcome, Outcome::kApplied);
+    const auto apply = [&](std::vector<Op> state, std::vector<Op> groups) {
+      std::vector<Op> ops = state_first ? state : groups;
+      for (Op &op : state_first ? groups : state) {
+        ops.push_back(std::move(op));
+      }
+      return Apply(std::move(ops)).outcome;
+    };
+
+    // Next hop 2 goes down while group 1 gains next hop 6 and group 3 goes.
+    const NextHopId g1_wider[] = {NextHopId(1), NextHopId(2), NextHopId(6)};
+    ASSERT_EQ(apply({router->SetNextHopStateOp(NextHopId(2), Down())},
+                    {router->SetNextHopGroupOp(NextHopGroupId(1), g1_wider, g1_standby),
+                     router->SetRouteOp(P(Ip(30, 0, 0, 0), 8), NextHopId(5)),
+                     router->RemoveNextHopGroupOp(NextHopGroupId(3))}),
+              Outcome::kApplied);
+    EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{1, 6}))
+        << "the written group is computed with the staged state";
+    EXPECT_EQ(EgressesOf(*router, Ip(20, 1, 1, 1)), (std::set<int>{4}))
+        << "the group not written is republished for the state change";
+    EXPECT_EQ(EgressOf(*router, Ip(30, 1, 1, 1)), 5);
+    Settle();
+
+    // Next hop 2 comes back (its entry is erased), 1 and 6 go down, group 2
+    // goes and group 4 arrives with its actives down.
+    const NextHopId g4[] = {NextHopId(1), NextHopId(6)};
+    const NextHopId g4_standby[] = {NextHopId(2)};
+    ASSERT_EQ(apply({router->RemoveNextHopStateOp(NextHopId(2)),
+                     router->SetNextHopStateOp(NextHopId(1), Down()),
+                     router->SetNextHopStateOp(NextHopId(6), Down())},
+                    {router->SetRouteOp(P(Ip(20, 0, 0, 0), 8), NextHopId(4)),
+                     router->RemoveNextHopGroupOp(NextHopGroupId(2)),
+                     router->SetNextHopGroupOp(NextHopGroupId(4), g4, g4_standby),
+                     router->SetRouteOp(kDefaultRouteDomainId, P(Ip(40, 0, 0, 0), 8),
+                                        NextHopGroupId(4))}),
+              Outcome::kApplied);
+    EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{2}));
+    EXPECT_EQ(EgressOf(*router, Ip(20, 1, 1, 1)), 4);
+    EXPECT_EQ(EgressesOf(*router, Ip(40, 1, 1, 1)), (std::set<int>{2})) << "the new group's standby";
+    EXPECT_EQ(StatesOf(*router), (std::vector<std::pair<uint32_t, bool>>{{1, true}, {6, true}}));
+    Settle();
+  }
+}
+
+// Publishing state changes, the group republications they cause, and group
+// changes beside them allocates nothing: every object and every reverse index
+// slot was made before.
+std::optional<fault_injection::AllocationFaults> g_publish_window;
+size_t g_publish_allocations = 0;
+
+TEST_P(RouterTransactionTest, PathHealthPublicationDoesNotAllocate) {
+  auto router = MakeRouter(64, 64, 1, /*groups=*/4);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  g_publish_allocations = 0;
+  dataplane::internal::g_publish_window_hook = [](bool entering) {
+    if (entering) {
+      g_publish_window.emplace();
+    } else if (g_publish_window) {
+      g_publish_allocations += g_publish_window->allocations();
+      g_publish_window.reset();
+    }
+  };
+  const NextHopId ab[] = {NextHopId(1), NextHopId(2)};
+  const NextHopId c[] = {NextHopId(3)};
+  const NextHopId bd[] = {NextHopId(2), NextHopId(4)};
+  std::vector<Op> setup;
+  for (uint32_t i = 1; i <= 5; i++) {
+    setup.push_back(router->SetNextHopOp(NextHopId(i), Hop(i)));
+  }
+  setup.push_back(router->SetNextHopStateOp(NextHopId(1), Down()));
+  setup.push_back(router->SetNextHopGroupOp(NextHopGroupId(1), ab, c));
+  setup.push_back(router->SetNextHopGroupOp(NextHopGroupId(2), bd));
+  EXPECT_EQ(Apply(setup).outcome, Outcome::kApplied);
+  // A state change republishing two groups; an entry for a hop in no group.
+  EXPECT_EQ(Apply({router->SetNextHopStateOp(NextHopId(2), Down()),
+                   router->SetNextHopStateOp(NextHopId(5), Down())})
+                .outcome,
+            Outcome::kApplied);
+  // A group rewritten (members joining and leaving) with a state change.
+  const NextHopId ae[] = {NextHopId(1), NextHopId(5)};
+  EXPECT_EQ(Apply({router->SetNextHopGroupOp(NextHopGroupId(1), ae, c),
+                   router->RemoveNextHopStateOp(NextHopId(1))})
+                .outcome,
+            Outcome::kApplied);
+  // A group erased with its member's entry erased.
+  EXPECT_EQ(Apply({router->RemoveNextHopGroupOp(NextHopGroupId(2)),
+                   router->RemoveNextHopStateOp(NextHopId(2))})
+                .outcome,
+            Outcome::kApplied);
+  dataplane::internal::g_publish_window_hook = nullptr;
+  EXPECT_EQ(g_publish_allocations, 0u) << "the publication phase allocated";
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{-1})) << "no route yet";
+  ASSERT_EQ(Apply({router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                      NextHopGroupId(1))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{1})) << "5 is down";
+}
+
+// A reader resolving through active/standby groups while transactions flip
+// member state, sometimes with a group rewrite in the same transaction: every
+// answer is a configured member, and every group object it sees is whole --
+// its eligible set is drawn from one tier of its own configuration.
+TEST_P(RouterTransactionTest, ReadersResolveThroughGroupsWhileStateFlips) {
+  auto router = MakeRouter(64, 64, 1, /*groups=*/4);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  std::vector<Op> setup;
+  for (uint32_t i = 1; i <= 7; i++) {
+    setup.push_back(router->SetNextHopOp(NextHopId(i), Hop(i)));
+  }
+  const NextHopId g1[] = {NextHopId(1), NextHopId(2), NextHopId(3)};
+  const NextHopId g1_standby[] = {NextHopId(4)};
+  const NextHopId g2[] = {NextHopId(3), NextHopId(5)};
+  const NextHopId g2_standby[] = {NextHopId(6)};
+  setup.push_back(router->SetNextHopGroupOp(NextHopGroupId(1), g1, g1_standby));
+  setup.push_back(router->SetNextHopGroupOp(NextHopGroupId(2), g2, g2_standby));
+  setup.push_back(router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                     NextHopGroupId(1)));
+  setup.push_back(router->SetRouteOp(kDefaultRouteDomainId, P(Ip(20, 0, 0, 0), 8),
+                                     NextHopGroupId(2)));
+  ASSERT_EQ(Apply(setup).outcome, Outcome::kApplied);
+
+  // Whether `g`'s eligible set is drawn from one tier of its configuration.
+  const auto whole = [](const NextHopGroup &g) {
+    if (g.eligible_size == 0 || g.eligible_size > NextHopGroup::kMaxMembers) {
+      return false;
+    }
+    const auto in = [&](std::span<const NextHopId> tier) {
+      for (uint32_t s = 0; s < g.eligible_size; s++) {
+        if (std::find(tier.begin(), tier.end(), g.eligible[s]) == tier.end()) {
+          return false;
+        }
+      }
+      return true;
+    };
+    return in(g.actives()) || in(g.standbys());
+  };
+  rcu::RcuDomain &rcu = bess::runtime::runtime().rcu();
+  const rcu::ReaderId reader_id = 60;
+  ASSERT_TRUE(rcu.Register(reader_id).has_value());
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> bad{0}, torn{0}, reads{0};
+  std::thread reader([&] {
+    rcu.Online(reader_id);
+    uint32_t h = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      const uint32_t hash = h++ * 0x9E3779B9u;
+      const int one = EgressOfHashed(*router, Ip(10, 2, 3, 4), hash);
+      const int two = EgressOfHashed(*router, Ip(20, 2, 3, 4), hash);
+      if (one < 1 || one > 4 || (two != 3 && two != 5 && two != 6)) {
+        bad++;
+      }
+      for (uint32_t g : {1u, 2u}) {
+        const NextHopGroup *group = router->LookupNextHopGroup(NextHopGroupId(g));
+        if (group == nullptr || !whole(*group)) {
+          torn++;
+        }
+      }
+      reads++;
+      rcu.Quiescent(reader_id);
+    }
+    rcu.Offline(reader_id);
+  });
+  uint32_t draws = 183;  // xorshift32: a fixed, repeatable sequence of changes
+  const auto draw = [&draws] {
+    draws ^= draws << 13u;
+    draws ^= draws >> 17u;
+    draws ^= draws << 5u;
+    return draws;
+  };
+  size_t applied = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+  const auto hard = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  std::set<uint32_t> with_entry;  // the next hops that have a state entry
+  while ((std::chrono::steady_clock::now() < deadline || applied < 200) &&
+         std::chrono::steady_clock::now() < hard) {
+    std::vector<Op> ops;
+    std::set<uint32_t> next = with_entry;
+    for (uint32_t n = 1 + draw() % 3, k = 0; k < n; k++) {
+      const uint32_t hop = 1 + draw() % 6;
+      if (std::any_of(ops.begin(), ops.end(), [&](const Op &op) {
+            return op.key == dataplane::EncodeKey(NextHopId(hop));
+          })) {
+        continue;
+      }
+      if (next.contains(hop) && draw() % 2 == 0) {
+        ops.push_back(router->RemoveNextHopStateOp(NextHopId(hop)));
+        next.erase(hop);
+      } else {
+        ops.push_back(router->SetNextHopStateOp(NextHopId(hop), Down(draw() % 3 != 0)));
+        next.insert(hop);
+      }
+    }
+    if (draw() % 4 == 0) {  // group 1's actives in another order, or fewer
+      std::vector<NextHopId> actives = {NextHopId(1), NextHopId(2), NextHopId(3)};
+      std::rotate(actives.begin(), actives.begin() + draw() % 3, actives.end());
+      actives.resize(1 + draw() % 3);
+      ops.push_back(router->SetNextHopGroupOp(NextHopGroupId(1), actives, g1_standby));
+    }
+    const auto r = Apply(ops);
+    if (r.outcome == Outcome::kApplied) {
+      applied++;
+      with_entry = std::move(next);
+    } else {
+      ASSERT_EQ(r.outcome, Outcome::kBusy) << "only backpressure may refuse";
+      engine_.ReclaimRetired();
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+  }
+  stop = true;
+  reader.join();
+  rcu.Unregister(reader_id);
+  EXPECT_EQ(bad.load(), 0u) << "of " << reads.load();
+  EXPECT_EQ(torn.load(), 0u) << "of " << reads.load();
+  EXPECT_GE(applied, 200u);
+  EXPECT_GT(reads.load(), 0u);
+}
+
+// Every allocation a transaction that changes state and groups together makes,
+// failed in turn: lookups, state, references and the reverse index stay as
+// they were (a later state change behaves as on a router that never saw the
+// failure), and the transaction then applies as without the failure.
+TEST_P(RouterTransactionTest, PathHealthFailureAtEveryAllocationLeavesNoTrace) {
+  struct Run {
+    TransactionEngine engine{bess::runtime::runtime().rcu()};
+    std::unique_ptr<Router> router;
+    std::vector<Op> ops;
+    std::vector<Op> later;  // a state change that reads the reverse index
+    std::string State() const {
+      std::string s = std::to_string(router->next_hop_count()) + "/" +
+                      std::to_string(router->next_hop_group_count()) + "/g" +
+                      std::to_string(engine.generation());
+      for (uint32_t dst : {Ip(10, 0, 0, 1), Ip(20, 0, 0, 1), Ip(30, 0, 0, 1)}) {
+        for (uint32_t h = 0; h < 16; h++) {
+          s += " " + std::to_string(EgressOfHashed(*router, dst, h * 0x9E3779B9u));
+        }
+      }
+      for (const auto &[id, down] : StatesOf(*router)) {
+        s += " s" + std::to_string(id) + (down ? "d" : "u");
+      }
+      for (uint32_t id = 1; id <= 5; id++) {
+        s += " m" + std::to_string(router->GroupMemberships(NextHopId(id)));
+      }
+      return s;
+    }
+  };
+  const std::vector<NextHopId> ab = {NextHopId(1), NextHopId(2)};
+  const std::vector<NextHopId> c = {NextHopId(3)};
+  const std::vector<NextHopId> bd = {NextHopId(2), NextHopId(4)};
+  const std::vector<NextHopId> abd = {NextHopId(1), NextHopId(2), NextHopId(4)};
+  const std::vector<NextHopId> e = {NextHopId(5)};
+  const auto prepare = [&](Run &run) {
+    run.router = MakeRouter(64, 64, 1, /*groups=*/4);
+    Router &router = *run.router;
+    ASSERT_TRUE(router.Enroll(run.engine.registry()));
+    std::vector<Op> setup;
+    for (uint32_t i = 1; i <= 4; i++) {
+      setup.push_back(router.SetNextHopOp(NextHopId(i), Hop(i)));
+    }
+    setup.push_back(router.SetNextHopGroupOp(NextHopGroupId(1), ab, c));
+    setup.push_back(router.SetNextHopGroupOp(NextHopGroupId(2), bd));
+    setup.push_back(router.SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                      NextHopGroupId(1)));
+    setup.push_back(router.SetRouteOp(kDefaultRouteDomainId, P(Ip(20, 0, 0, 0), 8),
+                                      NextHopGroupId(2)));
+    setup.push_back(router.SetNextHopStateOp(NextHopId(4), Down()));
+    ASSERT_EQ(run.engine.Apply(setup).outcome, Outcome::kApplied);
+    run.ops = {router.SetNextHopStateOp(NextHopId(2), Down()),
+               router.RemoveNextHopStateOp(NextHopId(4)),
+               router.SetNextHopGroupOp(NextHopGroupId(1), abd, c),
+               router.SetNextHopOp(NextHopId(5), Hop(5)),
+               router.SetNextHopGroupOp(NextHopGroupId(3), e, ab),
+               router.SetRouteOp(kDefaultRouteDomainId, P(Ip(30, 0, 0, 0), 8),
+                                 NextHopGroupId(3))};
+    run.later = {router.SetNextHopStateOp(NextHopId(5), Down()),
+                 router.SetNextHopStateOp(NextHopId(1), Down())};
+  };
+  std::string applied;
+  {
+    Run reference;
+    prepare(reference);
+    ASSERT_EQ(reference.engine.Apply(reference.ops).outcome, Outcome::kApplied);
+    ASSERT_EQ(reference.engine.Apply(reference.later).outcome, Outcome::kApplied);
+    applied = reference.State();
+  }
+  const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
+    SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
+    Run run;
+    prepare(run);
+    ASSERT_FALSE(::testing::Test::HasFailure());
+    const std::string before = run.State();
+    bool threw = false;
+    TransactionEngine::Result result;
+    {
+      const fault_injection::AllocationFaults window(k);
+      try {
+        result = run.engine.Apply(run.ops);
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
+    }
+    if (!threw) {
+      ASSERT_EQ(result.outcome, Outcome::kApplied);
+    } else {
+      ASSERT_EQ(run.State(), before) << "a failed allocation left a trace";
+      ASSERT_EQ(run.engine.Apply(run.ops).outcome, Outcome::kApplied);
+    }
+    ASSERT_EQ(run.engine.Apply(run.later).outcome, Outcome::kApplied);
+    ASSERT_EQ(applied, run.State());
+  });
+  std::printf("[router path health] %zu failure points\n", points);
+  EXPECT_GT(points, 10u);
+}
+
+// The egresses an IPv6 group route spreads over, by sampling hashes.
+std::set<int> Egresses6Of(const Router &router, const char *dst) {
+  std::set<int> seen;
+  const auto address = bess::utils::ParseIpv6Address(dst);
+  if (!address) {
+    ADD_FAILURE() << "not an IPv6 address: " << dst;
+    return seen;
+  }
+  for (uint32_t h = 0; h < 4096; h++) {
+    const NextHop *hop = router.Resolve(kDefaultRouteDomainId, *address, h * 0x9E3779B9u);
+    seen.insert(hop == nullptr ? -1 : static_cast<int>(hop->egress.value()));
+  }
+  return seen;
+}
+
+// Every lookup that picks a group member picks from the eligible set: an IPv6
+// group route fails over with the IPv4 one, through the same group object.
+TEST_P(RouterTransactionTest, PathHealthAppliesToIpv6GroupRoutes) {
+  auto router = MakeRouter(64, 64, 1, /*groups=*/4, /*ipv6=*/true);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  const NextHopId ab[] = {NextHopId(1), NextHopId(2)};
+  const NextHopId c[] = {NextHopId(3)};
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                   router->SetNextHopOp(NextHopId(2), Hop(2)),
+                   router->SetNextHopOp(NextHopId(3), Hop(3)),
+                   router->SetNextHopGroupOp(NextHopGroupId(1), ab, c),
+                   router->SetRouteOp(kDefaultRouteDomainId, P6("2001:db8::", 32),
+                                      NextHopGroupId(1)),
+                   router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                      NextHopGroupId(1))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(Egresses6Of(*router, "2001:db8::1"), (std::set<int>{1, 2}));
+  ASSERT_EQ(Apply({router->SetNextHopStateOp(NextHopId(1), Down())}).outcome, Outcome::kApplied);
+  EXPECT_EQ(Egresses6Of(*router, "2001:db8::1"), (std::set<int>{2}));
+  ASSERT_EQ(Apply({router->SetNextHopStateOp(NextHopId(2), Down())}).outcome, Outcome::kApplied);
+  EXPECT_EQ(Egresses6Of(*router, "2001:db8::1"), (std::set<int>{3})) << "the standby";
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{3})) << "IPv4 alike";
+  ASSERT_EQ(Apply({router->RemoveNextHopStateOp(NextHopId(1)),
+                   router->RemoveNextHopStateOp(NextHopId(2))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(Egresses6Of(*router, "2001:db8::1"), (std::set<int>{1, 2}));
+  Settle();
+}
+
+// A next hop bound to a neighbor (D-183) has availability like a static one:
+// its entry references "<rt>/neighbors", so the binding cannot be removed
+// while the entry names it, and marking it down fails its groups over.
+TEST_P(RouterTransactionTest, StateOfABoundNextHopReferencesItsBinding) {
+  auto router = MakeRouter(64, 64, 1, /*groups=*/4);
+  ASSERT_TRUE(router->SetNeighborBindingPolicy(
+      {.capacity = 8,
+       .validate = [](const NeighborKey &) -> std::expected<void, std::string> { return {}; }}));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  const NeighborKey neighbor(dataplane::InterfaceId(7), Ip(192, 0, 2, 7));
+  const NextHopId members[] = {NextHopId(1), NextHopId(5)};
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                   router->BindNeighborOp(NextHopId(5), neighbor),
+                   router->SetNextHopStateOp(NextHopId(5), Down()),
+                   router->SetNextHopGroupOp(NextHopGroupId(1), members),
+                   router->SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                      NextHopGroupId(1))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(EgressesOf(*router, Ip(10, 1, 1, 1)), (std::set<int>{1})) << "the bound member is down";
+  EXPECT_EQ(engine_.ReferenceCount(router->neighbors_resource(), dataplane::EncodeKey(NextHopId(5))),
+            2u)
+      << "the group and the state entry";
+  ASSERT_EQ(Apply({router->RemoveRouteOp(P(Ip(10, 0, 0, 0), 8)),
+                   router->RemoveNextHopGroupOp(NextHopGroupId(1))})
+                .outcome,
+            Outcome::kApplied);
+  const auto unbind = Apply({router->UnbindNeighborOp(NextHopId(5))});
+  EXPECT_NE(unbind.outcome, Outcome::kApplied) << "the state entry names the binding";
+  ASSERT_EQ(Apply({router->UnbindNeighborOp(NextHopId(5)),
+                   router->RemoveNextHopStateOp(NextHopId(5))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_TRUE(StatesOf(*router).empty());
+  Settle();
 }
 
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouterTransactionTest);

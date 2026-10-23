@@ -17,6 +17,8 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -158,19 +160,60 @@ inline std::expected<void, packet::MutationError> RewriteL2(
   return {};
 }
 
-// An ECMP group (M15, D-065): 1..kMaxMembers next hops, immutable once
-// published. A flow picks a member by its hash, so one flow keeps one path
-// while the membership is unchanged; how the hash is made (which fields, which
-// algorithm) is the application's (dataplane/member_select.h, D-066).
+// An ECMP group (M15, D-065) with active and standby members (D-184):
+// 1..kMaxMembers next hops in all, immutable once published. A flow picks a
+// member by its hash, so one flow keeps one path while the group and its
+// members' availability are unchanged; how the hash is made (which fields,
+// which algorithm) is the application's (dataplane/member_select.h, D-066).
+//
+// The configuration is `members`: `size` active members, then `standby_size`
+// standby members, each list in selection order, a repeated member a weight. A
+// next hop is in at most one of the two lists, and there is at least one
+// active member.
+//
+// What Select() reads is the eligible set, which the Router computes from the
+// configuration and its members' availability (Router::SetNextHopDown,
+// "<name>/next_hop_state") before it publishes the group:
+//
+//  - the available active members, if any;
+//  - else the available standby members, if any;
+//  - else every active member: fail open, so the neighbor state decides, as it
+//    does with no availability input at all.
+//
+// The chosen list's n positions get kMaxMembers / n consecutive slots each,
+// and an unavailable position's slots are dealt round-robin to the available
+// positions' members. So with every active member available a hash picks the
+// member it picked before availability existed, and a member that goes down
+// moves only its own flows, spread over the others.
 struct NextHopGroup {
   static constexpr size_t kMaxMembers = 64;
-  uint32_t size = 0;
+  // Read by Select(), and first, so the packet path reads the same leading
+  // bytes as when a group held only its members.
+  uint32_t eligible_size = 0;
+  std::array<NextHopId, kMaxMembers> eligible{};
+  // The configuration, read on the control side.
+  uint32_t size = 0;          // active members, members[0, size)
+  uint32_t standby_size = 0;  // standby members, members[size, size + standby_size)
   std::array<NextHopId, kMaxMembers> members{};
 
-  // Uniform over the members for a uniform 32-bit hash, no division.
-  NextHopId Select(uint32_t flow_hash) const noexcept {
-    return members[dataplane::RangeSelect(flow_hash, size)];
+  std::span<const NextHopId> actives() const noexcept {
+    return std::span(members).first(size);
   }
+  std::span<const NextHopId> standbys() const noexcept {
+    return std::span(members).subspan(size, standby_size);
+  }
+
+  // Uniform over the eligible slots for a uniform 32-bit hash, no division.
+  NextHopId Select(uint32_t flow_hash) const noexcept {
+    return eligible[dataplane::RangeSelect(flow_hash, eligible_size)];
+  }
+};
+
+// A next hop's availability (D-184), the value of "<name>/next_hop_state": a
+// next hop with no entry is available. It is an input: a producer outside the
+// Router (BFD, ICMP or application probes, a controller) decides it.
+struct NextHopState {
+  bool down = false;
 };
 
 // Route domains plus next hops (K7, K7.1, M6), dual-stack:
@@ -246,7 +289,7 @@ struct NextHopGroup {
 //
 // Next-hop groups (M15, D-065): a route names a next hop or a group of
 // them, and the reader picks a group member by the flow hash it passes
-// (Resolve without a hash uses 0: the group's first member for any group).
+// (Resolve without a hash uses 0: the group's first eligible member).
 // A group is one immutable SlotTable object: changing its members publishes a
 // new object (O(1), no FIB change), changing a member's neighbor is the
 // member's next-hop update, and a group in use (routes name it) cannot be
@@ -259,13 +302,26 @@ struct NextHopGroup {
 // id is invalid. A route may name a group, a group references its members,
 // and the direct group setters refuse (kEnrolled).
 //
+// Path health (D-184): availability is an input per next hop, not per group
+// -- a path is down once, and every group holding it follows. A group has
+// active and standby members and selects from its eligible set (see
+// NextHopGroup), which is part of the immutable group object: a change of a
+// next hop's availability publishes a new object for every group holding it
+// (one SlotTable store each, the old object retired), so a reader sees the
+// old group or the new one, and the packet path reads nothing it did not read
+// before. This holds for every lookup that picks a group member, IPv4 and
+// IPv6. The Router keeps the reverse index from a next hop to the groups
+// holding it for this. Enrolled, "<name>/next_hop_state" is the input; direct
+// users call SetNextHopDown. Availability applies to static and bound next
+// hops alike.
+//
 // Transactions (G1.2b, D-023): Enroll() registers the next hops, the neighbor
-// bindings, the groups and the routes as four resources of a
-// TransactionEngine, so that one transaction can change them together with
-// other modules' tables (a rule, the action it names, the route that action
-// forwards to). The routes resource holds every domain's routes under one
-// resource; the key carries the domain (RouteKey). An enrolled router has one
-// writer, the engine: the direct setters above refuse (kEnrolled), and the
+// bindings, the next-hop state, the groups and the routes as five resources
+// of a TransactionEngine, so that one transaction can change them together
+// with other modules' tables (a rule, the action it names, the route that
+// action forwards to). The routes resource holds every domain's routes under
+// one resource; the key carries the domain (RouteKey). An enrolled router has
+// one writer, the engine: the direct setters above refuse (kEnrolled), and the
 // engine's reference ledger replaces the router's own counts.
 //
 // Neighbor bindings (D-183): "<name>/neighbors" (key EncodeKey(NextHopId),
@@ -275,7 +331,7 @@ struct NextHopGroup {
 // and groups name it like any next hop; its later states arrive as
 // NeighborManagedNextHop upserts on the same key. An id is either static
 // ("<name>/next_hops") or bound, never both: each resource refuses the
-// other's ids. A route or group that names a bound id references
+// other's ids. A route, group or state entry that names a bound id references
 // "<name>/neighbors", so the engine refuses to unbind it while it is named.
 // Which resource a new value references is decided from the bindings as the
 // transaction has them: the engine reserves the referenced resources (next
@@ -352,12 +408,16 @@ class Router {
 
   // -- next-hop groups (M15, D-065) ------------------------------------------------
 
-  // Adds group `id` or replaces its members (1..NextHopGroup::kMaxMembers
-  // existing next hops; a next hop may appear more than once, as a weight).
-  // kInvalidId (id, or member count), kUnknownNextHop, kNextHopRetiring (the id
-  // was removed and readers may still hold it), kEnrolled.
+  // Adds group `id` or replaces its configuration: `members` are the active
+  // members and `standby` the standby ones (NextHopGroup), 1..kMaxMembers
+  // existing next hops in all, at least one active; a next hop may appear more
+  // than once in its list, as a weight, and in only one of the two lists.
+  // kInvalidId (id, member counts, a next hop in both lists), kUnknownNextHop,
+  // kNextHopRetiring (the id was removed and readers may still hold it),
+  // kEnrolled.
   std::expected<void, RouteError> SetNextHopGroup(NextHopGroupId id,
-                                                  std::span<const NextHopId> members);
+                                                  std::span<const NextHopId> members,
+                                                  std::span<const NextHopId> standby = {});
   // Removes a group no route names (kNextHopInUse otherwise). Like a next
   // hop, it stays readable until a grace period passes; its members stay
   // referenced until then.
@@ -377,6 +437,20 @@ class Router {
   size_t GroupReferences(NextHopGroupId id) const;
   // Groups naming next hop `id` (counted once per member position).
   size_t GroupMemberships(NextHopId id) const;
+
+  // -- path health (D-184) ----------------------------------------------------
+
+  // Marks next hop `id` unavailable (`down`) or available again, and
+  // republishes every group it is a member of with its new eligible set; all
+  // of them are built before the first is published. A next hop marked down
+  // cannot be removed (kNextHopInUse) until it is marked available, as the
+  // resource's entry pins it enrolled. kInvalidId, kUnknownNextHop, kEnrolled.
+  std::expected<void, RouteError> SetNextHopDown(NextHopId id, bool down);
+  // Every next hop with a state entry, in id order: enrolled, the entries of
+  // "<name>/next_hop_state" (an entry may say available); direct, the next
+  // hops marked down. Same locking rule as ForEachNextHop.
+  void ForEachNextHopState(
+      const std::function<void(NextHopId, const NextHopState &)> &fn) const;
 
   // -- domains ----------------------------------------------------------------
 
@@ -480,15 +554,17 @@ class Router {
 
   // Registers "<name>/next_hops" (key: EncodeKey(NextHopId), value: NextHop),
   // "<name>/neighbors" (key: EncodeKey(NextHopId), value: NeighborKey or
-  // NeighborManagedNextHop; see the class comment), "<name>/groups" (key:
-  // EncodeKey(NextHopGroupId), value: NextHopGroup; each group references its
-  // distinct members), and "<name>/routes" (key: RouteKey(domain, prefix),
-  // value: NextHopId or NextHopGroupId; each route references what it names)
-  // with `engine`, which
-  // must outlive the router or its enrollment. Refused once any route or group
-  // exists or a removed next hop or group is still retiring (the ledger must
-  // start from what it can see). Freezes the set of domains. Destroying an
-  // enrolled router unregisters them (with workers paused).
+  // NeighborManagedNextHop; see the class comment), "<name>/next_hop_state"
+  // (key: EncodeKey(NextHopId), value: NextHopState; each entry references its
+  // next hop, D-184), "<name>/groups" (key: EncodeKey(NextHopGroupId), value:
+  // NextHopGroup, the configuration only; each group references its distinct
+  // members), and "<name>/routes" (key: RouteKey(domain, prefix), value:
+  // NextHopId or NextHopGroupId; each route references what it names) with
+  // `engine`, which must outlive the router or its enrollment. Refused once any
+  // route, group or next-hop state exists or a removed next hop or group is
+  // still retiring (the ledger must start from what it can see). Freezes the
+  // set of domains. Destroying an enrolled router unregisters them (with
+  // workers paused).
   std::expected<void, std::string> Enroll(dataplane::ResourceRegistry &engine);
   bool enrolled() const noexcept { return engine_ != nullptr; }
 
@@ -501,6 +577,7 @@ class Router {
 
   const std::string &next_hops_resource() const { return next_hops_name_; }
   const std::string &neighbors_resource() const { return neighbors_name_; }
+  const std::string &next_hop_state_resource() const { return next_hop_state_name_; }
   const std::string &routes_resource() const { return routes_name_; }
   const std::string &groups_resource() const { return groups_name_; }
   // The registered resources while enrolled (null otherwise), so the owning
@@ -516,6 +593,9 @@ class Router {
   }
   dataplane::Resource *groups_resource_object() const noexcept {
     return groups_res_.get();
+  }
+  dataplane::Resource *next_hop_state_resource_object() const noexcept {
+    return state_res_.get();
   }
 
   // The routes resource's key: bits 40..63 the domain, 8..39 the address, 0..7
@@ -598,21 +678,33 @@ class Router {
     return dataplane::Op::Upsert(routes_name_, RouteKey(domain, prefix),
                                  std::any(group));
   }
-  // Adds group `id` or replaces its members (1..NextHopGroup::kMaxMembers; a
-  // member may repeat, as a weight). Members past kMaxMembers are dropped by
-  // the caller's span; an empty or oversized span is rejected at Reserve.
-  dataplane::Op SetNextHopGroupOp(NextHopGroupId id,
-                                  std::span<const NextHopId> members) const {
+  // Adds group `id` or replaces its configuration, under SetNextHopGroup's
+  // rules, checked at Reserve (lists too long for a group are refused there).
+  dataplane::Op SetNextHopGroupOp(NextHopGroupId id, std::span<const NextHopId> members,
+                                  std::span<const NextHopId> standby = {}) const {
     NextHopGroup group;
-    group.size = static_cast<uint32_t>(std::min(members.size(), NextHopGroup::kMaxMembers + 1));
-    for (size_t i = 0; i < members.size() && i < NextHopGroup::kMaxMembers; i++) {
-      group.members[i] = members[i];
+    if (members.size() + standby.size() > NextHopGroup::kMaxMembers) {
+      group.size = NextHopGroup::kMaxMembers + 1;  // refused at Reserve
+    } else {
+      group.size = static_cast<uint32_t>(members.size());
+      group.standby_size = static_cast<uint32_t>(standby.size());
+      const auto standbys = std::ranges::copy(members, group.members.begin()).out;
+      std::ranges::copy(standby, standbys);
     }
     return dataplane::Op::Upsert(groups_name_, dataplane::EncodeKey(id),
                                  std::any(group));
   }
   dataplane::Op RemoveNextHopGroupOp(NextHopGroupId id) const {
     return dataplane::Op::Erase(groups_name_, dataplane::EncodeKey(id));
+  }
+  // Sets next hop `id`'s availability entry (D-184), or removes it (the next
+  // hop is then available).
+  dataplane::Op SetNextHopStateOp(NextHopId id, NextHopState state) const {
+    return dataplane::Op::Upsert(next_hop_state_name_, dataplane::EncodeKey(id),
+                                 std::any(state));
+  }
+  dataplane::Op RemoveNextHopStateOp(NextHopId id) const {
+    return dataplane::Op::Erase(next_hop_state_name_, dataplane::EncodeKey(id));
   }
   dataplane::Op RemoveRouteOp(Ipv4Prefix prefix) const {
     return RemoveRouteOp(kDefaultRouteDomainId, prefix);
@@ -802,6 +894,7 @@ class Router {
   class NextHopResource;
   class NeighborResource;
   class GroupResource;
+  class NextHopStateResource;
 
   // The resource a value naming next hop `id` references: "<name>/neighbors"
   // for a bound id, else "<name>/next_hops". `in_transaction` reads the
@@ -914,6 +1007,30 @@ class Router {
   // ReclaimRetired() with mutex_ held.
   size_t CompleteRetirementsLocked();
 
+  // A next hop's availability entry (D-184), control side. A direct user's
+  // entries are only kDown (SetNextHopDown(id, false) removes the entry);
+  // enrolled, an entry may also say available.
+  enum class HopState : uint8_t { kNone, kUp, kDown };
+  bool IsDown(NextHopId id) const noexcept {
+    return hop_states_[id.value()] == HopState::kDown;
+  }
+  void SetHopState(NextHopId id, HopState state) noexcept;
+  // A transaction's staged availability: SortStagedStates orders
+  // staged_states_ (each Prepare does, before it asks), and StagedDown says
+  // whether `id` is down once the transaction commits -- its staged state,
+  // else its committed one.
+  void SortStagedStates() noexcept;
+  bool StagedDown(NextHopId id) const noexcept;
+
+  // The reverse index (D-184). ReserveMemberships makes room for one more
+  // membership per element of `hops` (a next hop listed twice, two), and may
+  // allocate; Add/RemoveMemberships stay within that room and never allocate;
+  // EraseEmptyMemberships drops the entries of `hops` left with no group.
+  void ReserveMemberships(std::vector<NextHopId> hops);
+  void AddMemberships(NextHopGroupId group, std::span<const NextHopId> hops) noexcept;
+  void RemoveMemberships(NextHopGroupId group, std::span<const NextHopId> hops) noexcept;
+  void EraseEmptyMemberships(std::span<const NextHopId> hops) noexcept;
+
   const std::string name_;
   rcu::RcuDomain &rcu_;
   const size_t max_domains_;
@@ -951,6 +1068,21 @@ class Router {
   };
   std::vector<RetiringGroup> retiring_groups_;
 
+  // Path health (D-184), control side: one entry per next hop id, and how
+  // many are not kNone.
+  std::vector<HopState> hop_states_;
+  size_t hop_state_count_ = 0;
+  // The groups each next hop is a member of, active or standby: live groups
+  // only, so a change of availability never republishes a retiring id. An
+  // entry may be empty while a change that reserved room for it is pending.
+  std::unordered_map<NextHopId, std::vector<NextHopGroupId>, dataplane::StrongIdHash<NextHopId>>
+      memberships_;
+  // The transaction being applied: the state changes the state resource
+  // reserved, and the groups the groups resource publishes or erases. Each
+  // resource clears its own at EndTransaction.
+  std::vector<std::pair<NextHopId, HopState>> staged_states_;
+  std::vector<NextHopGroupId> staged_groups_;
+
   // CreateDomain()'s body without the engine guard: the route resource creates
   // a domain a transaction writes into (D-158). Under mutex_.
   std::expected<void, RouteError> CreateDomainLocked(RouteDomainId domain,
@@ -962,11 +1094,13 @@ class Router {
   // Set by Enroll(); the resources exist while enrolled.
   const std::string next_hops_name_;
   const std::string neighbors_name_;
+  const std::string next_hop_state_name_;
   const std::string routes_name_;
   const std::string groups_name_;
   dataplane::ResourceRegistry *engine_ = nullptr;
   std::unique_ptr<dataplane::Resource> next_hops_res_;
   std::unique_ptr<dataplane::Resource> neighbors_res_;
+  std::unique_ptr<dataplane::Resource> state_res_;
   std::unique_ptr<dataplane::Resource> groups_res_;  // holds nothing without max_groups
   std::unique_ptr<dataplane::Resource> routes_res_;
 
