@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <new>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -63,12 +64,17 @@ using MakeRouterFn = std::function<std::unique_ptr<Router>()>;
 
 class RouterTransactionTest : public bess::testing::RouteBackendTest {
  protected:
+  // IPv4 only unless `ipv6`: a test that writes IPv6 routes asks for them.
   std::unique_ptr<Router> MakeRouter(uint32_t tbl8_groups = 64,
                                      size_t next_hops = 64,
-                                     size_t domains = 1, size_t groups = 0) {
-    LpmRouteTable::Config config = bess::testing::TestRouteConfig();
-    config.max_routes = 4096;
-    config.tbl8_groups = tbl8_groups;
+                                     size_t domains = 1, size_t groups = 0,
+                                     bool ipv6 = false) {
+    Router::Config config{.ipv4 = bess::testing::TestRouteConfig()};
+    config.ipv4->max_routes = 4096;
+    config.ipv4->tbl8_groups = tbl8_groups;
+    if (ipv6) {
+      config.ipv6 = Ipv6RouteTable::Config{.max_routes = 4096, .tbl8_groups = 256};
+    }
     auto router = Router::Create("rt", config, next_hops,
                                  bess::runtime::runtime().rcu(), domains, groups);
     EXPECT_TRUE(router.has_value());
@@ -133,7 +139,7 @@ TEST_P(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
 TEST_P(RouterTransactionTest, ATransactionCreatesTheDomainItFirstWritesInto) {
   LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = 4096;
-  auto made = Router::Create("rtlazy", config, /*max_next_hops=*/8,
+  auto made = Router::Create("rtlazy", Router::Config{.ipv4 = config}, /*max_next_hops=*/8,
                              bess::runtime::runtime().rcu(), /*max_domains=*/4,
                              /*max_groups=*/0);
   ASSERT_TRUE(made.has_value());
@@ -178,7 +184,7 @@ TEST_P(RouterTransactionTest, ATransactionCreatesTheDomainItFirstWritesInto) {
 // through transactions.
 TEST_P(RouterTransactionTest, DirectGroupsAndEnrollmentExcludeEachOther) {
   LpmRouteTable::Config config = bess::testing::TestRouteConfig();
-  auto made = Router::Create("rtg", config, 8, bess::runtime::runtime().rcu(),
+  auto made = Router::Create("rtg", Router::Config{.ipv4 = config}, 8, bess::runtime::runtime().rcu(),
                              /*max_domains=*/1, /*max_groups=*/4);
   ASSERT_TRUE(made.has_value());
   auto router = std::move(made).value();
@@ -695,9 +701,10 @@ class RouterLiveUpdateFaultTest : public bess::testing::RouteBackendTest {};
 // A router with two extra domains, four next hops, two groups and routes in
 // both domains, every retirement completed.
 std::unique_ptr<Router> LiveRouter() {
-  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
-  config.max_routes = 64;
-  config.tbl8_groups = 16;
+  const Router::Config config{
+      .ipv4 = LpmRouteTable::Config{.max_routes = 64,
+                                    .tbl8_groups = 16,
+                                    .backend = bess::testing::TestRouteBackend()}};
   auto made = Router::Create("live", config, 16, bess::runtime::runtime().rcu(), 4, 4);
   EXPECT_TRUE(made.has_value());
   Router &r = **made;
@@ -727,9 +734,10 @@ std::unique_ptr<Router> LiveRouter() {
 // and the same update then succeeds and leaves the router as an undisturbed
 // update would.
 TEST_P(RouterLiveUpdateFaultTest, FailureAtEveryAllocationLeavesNoTrace) {
-  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
-  config.max_routes = 64;
-  config.tbl8_groups = 16;
+  const Router::Config config{
+      .ipv4 = LpmRouteTable::Config{.max_routes = 64,
+                                    .tbl8_groups = 16,
+                                    .backend = bess::testing::TestRouteBackend()}};
   using Update = std::function<std::expected<void, RouteError>(Router &)>;
   const std::pair<const char *, Update> updates[] = {
       {"add a next hop", [](Router &r) { return r.SetNextHop(NextHopId(5), Hop(5)); }},
@@ -1129,6 +1137,439 @@ TEST_P(RouterTransactionTest, GroupTransactionFailureAtEveryAllocationLeavesNoTr
   });
   std::printf("[router groups] %zu failure points\n", points);
   EXPECT_GT(points, 10u);
+}
+
+Ipv6Prefix P6(const char *text, uint8_t length) {
+  return Ipv6Prefix::Make(bess::utils::ParseIpv6Address(text).value(), length)
+      .value();
+}
+
+// The egress an IPv6 `dst` resolves to in `domain`, or -1.
+int Egress6Of(const Router &router, RouteDomainId domain, const char *dst) {
+  const NextHop *hop =
+      router.Resolve(domain, bess::utils::ParseIpv6Address(dst).value(), 0);
+  return hop == nullptr ? -1 : static_cast<int>(hop->egress.value());
+}
+int Egress6Of(const Router &router, const char *dst) {
+  return Egress6Of(router, kDefaultRouteDomainId, dst);
+}
+
+// Several IPv6 operations on one table in one transaction compose: each edits
+// the same unpublished spare, so all of them are visible after the commit,
+// whatever mix of upserts and erases they are, and the footprint the stage
+// declares is exact (the engine's Retirer is fatal on excess).
+TEST_P(RouterTransactionTest, Ipv6OperationsInOneTransactionAllTakeEffect) {
+  auto router = MakeRouter(64, 64, 1, 0, /*ipv6=*/true);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                   router->SetNextHopOp(NextHopId(2), Hop(2)),
+                   router->SetRouteOp(kDefaultRouteDomainId,
+                                      P6("2001:db8:1::", 48), NextHopId(1)),
+                   router->SetRouteOp(kDefaultRouteDomainId,
+                                      P6("2001:db8:2::", 48), NextHopId(2))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:1::1"), 1);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:2::1"), 2);
+  EXPECT_EQ(router->RouteReferences(NextHopId(1)), 1u);
+  EXPECT_EQ(router->RouteReferences(NextHopId(2)), 1u);
+
+  // An erase, a re-point, a new prefix and the default together, in an order
+  // that puts the erase first: the engine publishes erases after upserts, and
+  // the table's single commit carries all of them.
+  for (int round = 0; round < 3; round++) {
+    SCOPED_TRACE(round);
+    const bool even = round % 2 == 0;
+    ASSERT_EQ(Apply({even ? router->RemoveRouteOp(kDefaultRouteDomainId,
+                                                  P6("2001:db8:1::", 48))
+                          : router->SetRouteOp(kDefaultRouteDomainId,
+                                               P6("2001:db8:1::", 48), NextHopId(1)),
+                     router->SetRouteOp(kDefaultRouteDomainId,
+                                        P6("2001:db8:2::", 48),
+                                        NextHopId(even ? 1 : 2)),
+                     even ? router->SetRouteOp(kDefaultRouteDomainId,
+                                               P6("2001:db8:3::", 48), NextHopId(2))
+                          : router->RemoveRouteOp(kDefaultRouteDomainId,
+                                                  P6("2001:db8:3::", 48)),
+                     even ? router->SetRouteOp(kDefaultRouteDomainId, P6("::", 0),
+                                               NextHopId(2))
+                          : router->RemoveRouteOp(kDefaultRouteDomainId, P6("::", 0))})
+                  .outcome,
+              Outcome::kApplied);
+    EXPECT_EQ(Egress6Of(*router, "2001:db8:1::1"), even ? 2 : 1);
+    EXPECT_EQ(Egress6Of(*router, "2001:db8:2::1"), even ? 1 : 2);
+    EXPECT_EQ(Egress6Of(*router, "2001:db8:3::1"), even ? 2 : -1);
+    EXPECT_EQ(Egress6Of(*router, "3000::1"), even ? 2 : -1);
+    EXPECT_EQ(router->route_count(), even ? 3u : 2u);
+  }
+  Settle();
+}
+
+// One transaction writes IPv6 routes into two domains -- one of them created
+// by the write (D-158) -- and IPv4 routes beside them: each table's stage is
+// committed once, every domain sees exactly its own routes, and the next
+// transaction on the same tables works.
+TEST_P(RouterTransactionTest, Ipv6OperationsAcrossDomainsInOneTransaction) {
+  auto router = MakeRouter(64, 64, /*domains=*/2, 0, /*ipv6=*/true);
+  const RouteDomainId d0 = kDefaultRouteDomainId;
+  const RouteDomainId d1(1);
+  ASSERT_TRUE(router->RemoveDomain(d1));  // so the transaction creates it
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                   router->SetNextHopOp(NextHopId(2), Hop(2)),
+                   router->SetRouteOp(d0, P6("2001:db8:1::", 48), NextHopId(1)),
+                   router->SetRouteOp(d1, P6("2001:db8:1::", 48), NextHopId(2)),
+                   router->SetRouteOp(d0, P6("2001:db8:2::", 48), NextHopId(2)),
+                   router->SetRouteOp(d1, P6("2001:db8::", 32), NextHopId(1)),
+                   router->SetRouteOp(d0, P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
+                   router->SetRouteOp(d1, P(Ip(10, 0, 0, 0), 8), NextHopId(2))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_TRUE(router->HasDomain(d1));
+  EXPECT_EQ(Egress6Of(*router, d0, "2001:db8:1::1"), 1);
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:1::1"), 2);
+  EXPECT_EQ(Egress6Of(*router, d0, "2001:db8:2::1"), 2);
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:2::1"), 1) << "d1's /32";
+  EXPECT_EQ(Egress6Of(*router, d0, "2001:db8:9::1"), -1);
+  EXPECT_EQ(router->Resolve(d1, Ip(10, 1, 1, 1))->egress.value(), 2);
+  EXPECT_EQ(router->route_count(), 6u);
+  EXPECT_EQ(router->route_count(d1), 3u);
+
+  ASSERT_EQ(Apply({router->RemoveRouteOp(d1, P6("2001:db8:1::", 48)),
+                   router->SetRouteOp(d0, P6("2001:db8:1::", 48), NextHopId(2)),
+                   router->RemoveRouteOp(d0, P6("2001:db8:2::", 48)),
+                   router->SetRouteOp(d1, P6("2001:db8:3::", 48), NextHopId(2))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(Egress6Of(*router, d0, "2001:db8:1::1"), 2);
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:1::1"), 1) << "back to d1's /32";
+  EXPECT_EQ(Egress6Of(*router, d0, "2001:db8:2::1"), -1);
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:3::1"), 2);
+  EXPECT_EQ(router->RouteReferences(NextHopId(1)), 2u);  // d0 10/8, d1 /32
+  EXPECT_EQ(router->RouteReferences(NextHopId(2)), 3u);
+  Settle();
+}
+
+// A transaction refused after its IPv6 operations were staged leaves every
+// table as it was: readers never saw the spares, and each stage is aborted
+// once -- whether the refusal is a later operation of the same table or of
+// another resource.
+TEST_P(RouterTransactionTest, AnAbortedIpv6TransactionLeavesTheTableUnchanged) {
+  auto router = MakeRouter(64, 64, 1, 0, /*ipv6=*/true);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                   router->SetRouteOp(kDefaultRouteDomainId,
+                                      P6("2001:db8:1::", 48), NextHopId(1))})
+                .outcome,
+            Outcome::kApplied);
+  const auto generation = engine_.generation();
+  auto unchanged = [&] {
+    EXPECT_EQ(engine_.generation(), generation);
+    EXPECT_EQ(Egress6Of(*router, "2001:db8:1::1"), 1);
+    EXPECT_EQ(Egress6Of(*router, "2001:db8:2::1"), -1);
+    EXPECT_EQ(Egress6Of(*router, "2001:db8:3::1"), -1);
+    EXPECT_EQ(router->route_count(), 1u);
+    EXPECT_EQ(router->RouteReferences(NextHopId(1)), 1u);
+  };
+  // The last operation names a next hop that does not exist.
+  auto r = Apply({router->SetRouteOp(kDefaultRouteDomainId,
+                                     P6("2001:db8:2::", 48), NextHopId(1)),
+                  router->RemoveRouteOp(kDefaultRouteDomainId,
+                                        P6("2001:db8:1::", 48)),
+                  router->SetRouteOp(kDefaultRouteDomainId,
+                                     P6("2001:db8:3::", 48), NextHopId(9))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  unchanged();
+  // An operation of another resource is refused after the routes.
+  r = Apply({router->SetRouteOp(kDefaultRouteDomainId, P6("2001:db8:2::", 48),
+                                NextHopId(1)),
+             router->RemoveNextHopOp(NextHopId(7))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  unchanged();
+
+  // And the same operations without the bad one still apply.
+  ASSERT_EQ(Apply({router->SetRouteOp(kDefaultRouteDomainId,
+                                      P6("2001:db8:2::", 48), NextHopId(1)),
+                   router->RemoveRouteOp(kDefaultRouteDomainId,
+                                         P6("2001:db8:1::", 48))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:1::1"), -1);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:2::1"), 1);
+  Settle();
+}
+
+// A domain's IPv6 routes are bounded by max_routes, as its IPv4 rules are: a
+// transaction that would pass it is refused whole, including when the
+// refused edit is the one that began the table's stage.
+TEST_P(RouterTransactionTest, Ipv6RoutesAreBoundedByMaxRoutes) {
+  const Router::Config config{
+      .ipv6 = Ipv6RouteTable::Config{.max_routes = 2, .tbl8_groups = 64}};
+  auto made = Router::Create("rt", config, 8, bess::runtime::runtime().rcu());
+  ASSERT_TRUE(made);
+  auto router = std::move(*made);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1))}).outcome,
+            Outcome::kApplied);
+  auto r = Apply({router->SetRouteOp(kDefaultRouteDomainId,
+                                     P6("2001:db8:1::", 48), NextHopId(1)),
+                  router->SetRouteOp(kDefaultRouteDomainId,
+                                     P6("2001:db8:2::", 48), NextHopId(1)),
+                  router->SetRouteOp(kDefaultRouteDomainId,
+                                     P6("2001:db8:3::", 48), NextHopId(1))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_EQ(r.ops[2].status, TransactionEngine::OpStatus::kFailed);
+  EXPECT_EQ(router->route_count(), 0u);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:1::1"), -1);
+  ASSERT_EQ(Apply({router->SetRouteOp(kDefaultRouteDomainId,
+                                      P6("2001:db8:1::", 48), NextHopId(1)),
+                   router->SetRouteOp(kDefaultRouteDomainId,
+                                      P6("2001:db8:2::", 48), NextHopId(1))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(router->route_count(), 2u);
+  // Full: the first (and only) IPv6 edit of the next transaction is refused.
+  r = Apply({router->SetRouteOp(kDefaultRouteDomainId, P6("2001:db8:3::", 48),
+                                NextHopId(1))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:3::1"), -1);
+  ASSERT_EQ(Apply({router->RemoveRouteOp(kDefaultRouteDomainId,
+                                         P6("2001:db8:2::", 48)),
+                   router->SetRouteOp(kDefaultRouteDomainId,
+                                      P6("2001:db8:3::", 48), NextHopId(1))})
+                .outcome,
+            Outcome::kApplied)
+      << "an erase makes room within the same transaction";
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:3::1"), 1);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:2::1"), -1);
+  Settle();
+}
+
+std::optional<fault_injection::AllocationFaults> g_ipv6_publish_window;
+size_t g_ipv6_publish_allocations = 0;
+
+void CountIpv6PublishAllocations(bool entering) {
+  if (entering) {
+    g_ipv6_publish_window.emplace();
+  } else if (g_ipv6_publish_window) {
+    g_ipv6_publish_allocations += g_ipv6_publish_window->allocations();
+    g_ipv6_publish_window.reset();
+  }
+}
+
+// The StagedOp contract (resource.h): an IPv6 route's publication allocates
+// nothing -- the spare was edited in Reserve(), Commit() is a pointer
+// exchange, and the rules' nodes were made in the stage. Multi-operation
+// transactions on two domains' tables, and IPv4 beside them.
+TEST_P(RouterTransactionTest, Ipv6PublicationDoesNotAllocate) {
+  auto router = MakeRouter(64, 64, /*domains=*/2, 0, /*ipv6=*/true);
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  const RouteDomainId d1(1);
+  ASSERT_EQ(Apply({router->SetNextHopOp(NextHopId(1), Hop(1)),
+                   router->SetNextHopOp(NextHopId(2), Hop(2))})
+                .outcome,
+            Outcome::kApplied);
+  g_ipv6_publish_allocations = 0;
+  dataplane::internal::g_publish_window_hook = CountIpv6PublishAllocations;
+  const auto added = Apply({router->SetRouteOp(kDefaultRouteDomainId,
+                                               P6("2001:db8:1::", 48), NextHopId(1)),
+                            router->SetRouteOp(kDefaultRouteDomainId,
+                                               P6("2001:db8:2::", 48), NextHopId(2)),
+                            router->SetRouteOp(d1, P6("2001:db8:1::", 48), NextHopId(2)),
+                            router->SetRouteOp(d1, P6("::", 0), NextHopId(1)),
+                            router->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1))});
+  const auto changed = Apply({router->SetRouteOp(kDefaultRouteDomainId,
+                                                 P6("2001:db8:1::", 48), NextHopId(2)),
+                              router->RemoveRouteOp(kDefaultRouteDomainId,
+                                                    P6("2001:db8:2::", 48)),
+                              router->SetRouteOp(kDefaultRouteDomainId,
+                                                 P6("2001:db8:3::", 48), NextHopId(1)),
+                              router->RemoveRouteOp(d1, P6("::", 0))});
+  dataplane::internal::g_publish_window_hook = nullptr;
+  ASSERT_EQ(added.outcome, Outcome::kApplied);
+  ASSERT_EQ(changed.outcome, Outcome::kApplied);
+  EXPECT_EQ(g_ipv6_publish_allocations, 0u) << "the publication phase allocated";
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:1::1"), 2);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:2::1"), -1);
+  EXPECT_EQ(Egress6Of(*router, "2001:db8:3::1"), 1);
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:1::1"), 2);
+  EXPECT_EQ(Egress6Of(*router, d1, "3000::1"), -1);
+  Settle();
+}
+
+// -- address families ----------------------------------------------------------
+
+// IPv4-only, IPv6-only and dual-stack routers: a family is served iff its
+// config is set, and a disabled family has no FIB in any domain -- the
+// default one, one CreateDomain() makes, or one a transaction creates -- its
+// writes are refused (kFamilyDisabled) directly and through the engine, and
+// its readers miss.
+class RouterFamilyTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kDomains = 3;
+
+  static Router::Config Families(bool ipv4, bool ipv6) {
+    Router::Config config;
+    if (ipv4) {
+      config.ipv4 = LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 16};
+    }
+    if (ipv6) {
+      config.ipv6 = Ipv6RouteTable::Config{.max_routes = 64, .tbl8_groups = 64};
+    }
+    return config;
+  }
+
+  void TearDown() override { bess::runtime::runtime().rcu().Drain(); }
+
+  // Creates a router with the families and checks every rule above.
+  void Check(bool ipv4, bool ipv6) {
+    SCOPED_TRACE(std::string(ipv4 ? "ipv4 " : "") + (ipv6 ? "ipv6" : ""));
+    // Outlives the router enrolled in it (declared first).
+    TransactionEngine engine{bess::runtime::runtime().rcu()};
+    const Router::Config config = Families(ipv4, ipv6);
+    auto made = Router::Create("fam", config, 8, bess::runtime::runtime().rcu(), kDomains);
+    ASSERT_TRUE(made) << RouteErrorName(made.error());
+    Router &router = **made;
+    EXPECT_EQ(router.has_ipv4(), ipv4);
+    EXPECT_EQ(router.has_ipv6(), ipv6);
+    auto expect_fibs = [&](size_t domains) {
+      const Router::FibCounts counts = router.fib_counts();
+      EXPECT_EQ(counts.ipv4, ipv4 ? domains : 0u);
+      EXPECT_EQ(counts.ipv6, ipv6 ? domains : 0u);
+    };
+    expect_fibs(1);
+
+    // A domain must name exactly the router's families.
+    EXPECT_EQ(RouteError::kFamilyDisabled,
+              router.CreateDomain(RouteDomainId(1), Families(!ipv4, ipv6)).error());
+    EXPECT_EQ(RouteError::kFamilyDisabled,
+              router.CreateDomain(RouteDomainId(1), Families(ipv4, !ipv6)).error());
+    EXPECT_EQ(RouteError::kFamilyDisabled, router.CreateDomain(RouteDomainId(1), {}).error());
+    EXPECT_FALSE(router.HasDomain(RouteDomainId(1)));
+    ASSERT_TRUE(router.CreateDomain(RouteDomainId(1), config));
+    expect_fibs(2);
+
+    // Direct writes.
+    ASSERT_TRUE(router.SetNextHop(NextHopId(1), Hop(1)));
+    const auto v4 = router.SetRoute(RouteDomainId(1), P(Ip(10, 0, 0, 0), 8), NextHopId(1));
+    const auto v6 = router.SetRoute(RouteDomainId(1), P6("2001:db8::", 32), NextHopId(1));
+    EXPECT_EQ(v4.has_value(), ipv4);
+    EXPECT_EQ(v6.has_value(), ipv6);
+    if (!ipv4) {
+      EXPECT_EQ(RouteError::kFamilyDisabled, v4.error());
+      EXPECT_EQ(RouteError::kFamilyDisabled,
+                router.RemoveRoute(RouteDomainId(1), P(Ip(10, 0, 0, 0), 8)).error());
+      EXPECT_EQ(RouteError::kFamilyDisabled,
+                router.ReplaceRouteSetAtomic(RouteDomainId(1), {}).error());
+    }
+    if (!ipv6) {
+      EXPECT_EQ(RouteError::kFamilyDisabled, v6.error());
+      EXPECT_EQ(RouteError::kFamilyDisabled,
+                router.RemoveRoute(RouteDomainId(1), P6("2001:db8::", 32)).error());
+    }
+    // Readers: the served family resolves, the other misses (no table to
+    // read, not a crash), on every overload.
+    const auto v6_dst = bess::utils::ParseIpv6Address("2001:db8::1").value();
+    EXPECT_EQ(router.Resolve(RouteDomainId(1), Ip(10, 1, 2, 3)) != nullptr, ipv4);
+    EXPECT_EQ(router.LookupRoute(RouteDomainId(1), Ip(10, 1, 2, 3)).value(), ipv4 ? 1u : 0u);
+    EXPECT_EQ(router.Resolve(RouteDomainId(1), v6_dst) != nullptr, ipv6);
+    EXPECT_EQ(router.Resolve(Ip(10, 1, 2, 3)), nullptr) << "nothing in the default domain";
+    const uint32_t dst4[] = {Ip(10, 1, 2, 3)};
+    const uint32_t hashes[] = {0};
+    const NextHop *hops[1] = {};
+    EXPECT_EQ(router.ResolveBatch(RouteDomainId(1), dst4, hashes, hops), ipv4 ? 1u : 0u);
+    EXPECT_EQ(router.ResolveBatch(dst4, hops), 0u);
+    const bess::utils::Ipv6Address dst6[] = {v6_dst};
+    EXPECT_EQ(router.ResolveBatch6(RouteDomainId(1), dst6, hashes, hops), ipv6 ? 1u : 0u);
+    EXPECT_EQ(router.route_count(), size_t{ipv4} + size_t{ipv6});
+    if (ipv4) {
+      ASSERT_TRUE(router.RemoveRoute(RouteDomainId(1), P(Ip(10, 0, 0, 0), 8)));
+    }
+    if (ipv6) {
+      ASSERT_TRUE(router.RemoveRoute(RouteDomainId(1), P6("2001:db8::", 32)));
+    }
+
+    // Transactions: a disabled family's key is refused at Reserve; a served
+    // one creates its domain with the router's families only.
+    ASSERT_TRUE(router.Enroll(engine.registry()));
+    const RouteDomainId d2(2);
+    for (const bool family6 : {false, true}) {
+      const Op op = family6 ? router.SetRouteOp(d2, P6("2001:db8::", 32), NextHopId(1))
+                            : router.SetRouteOp(d2, P(Ip(10, 0, 0, 0), 8), NextHopId(1));
+      const auto r = engine.Apply(std::span(&op, 1));
+      const bool served = family6 ? ipv6 : ipv4;
+      ASSERT_EQ(r.outcome, served ? Outcome::kApplied : Outcome::kRejected);
+      if (!served) {
+        EXPECT_NE(r.ops[0].error.find(RouteErrorName(RouteError::kFamilyDisabled)),
+                  std::string::npos)
+            << r.ops[0].error;
+      }
+    }
+    EXPECT_TRUE(router.HasDomain(d2)) << "created by the served family's write";
+    expect_fibs(3);
+    std::vector<Op> erase;
+    if (ipv4) {
+      erase.push_back(router.RemoveRouteOp(d2, P(Ip(10, 0, 0, 0), 8)));
+    }
+    if (ipv6) {
+      erase.push_back(router.RemoveRouteOp(d2, P6("2001:db8::", 32)));
+    }
+    ASSERT_EQ(engine.Apply(erase).outcome, Outcome::kApplied);
+    while (engine.ReclaimRetired() != 0) {
+    }
+  }
+};
+
+TEST_F(RouterFamilyTest, Ipv4Only) { Check(true, false); }
+TEST_F(RouterFamilyTest, Ipv6Only) { Check(false, true); }
+TEST_F(RouterFamilyTest, DualStack) { Check(true, true); }
+
+// A router with neither family is a next-hop-only router: no FIB in any
+// domain, next hops resolved by id, and every route write refused.
+TEST_F(RouterFamilyTest, ARouterWithNoFamilyHoldsNextHopsAndNoFib) {
+  TransactionEngine engine{bess::runtime::runtime().rcu()};
+  auto made = Router::Create("none", {}, 8, bess::runtime::runtime().rcu());
+  ASSERT_TRUE(made) << RouteErrorName(made.error());
+  Router &router = **made;
+  EXPECT_FALSE(router.has_ipv4());
+  EXPECT_FALSE(router.has_ipv6());
+  EXPECT_EQ(0u, router.fib_counts().ipv4);
+  EXPECT_EQ(0u, router.fib_counts().ipv6);
+  ASSERT_TRUE(router.Enroll(engine.registry()));
+  const Op hop = router.SetNextHopOp(NextHopId(1), Hop(1));
+  ASSERT_EQ(engine.Apply(std::span(&hop, 1)).outcome, Outcome::kApplied);
+  EXPECT_NE(nullptr, router.LookupNextHop(NextHopId(1)));
+  for (const Op &route : {router.SetRouteOp(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8),
+                                            NextHopId(1)),
+                          router.SetRouteOp(kDefaultRouteDomainId, P6("2001:db8::", 32),
+                                            NextHopId(1))}) {
+    const auto r = engine.Apply(std::span(&route, 1));
+    ASSERT_EQ(r.outcome, Outcome::kRejected);
+    EXPECT_NE(r.ops[0].error.find("no FIB"), std::string::npos) << r.ops[0].error;
+  }
+  EXPECT_EQ(0u, router.fib_counts().ipv4 + router.fib_counts().ipv6);
+  EXPECT_EQ(router.Resolve(Ip(10, 1, 2, 3)), nullptr);
+  const Op erase = router.RemoveNextHopOp(NextHopId(1));
+  ASSERT_EQ(engine.Apply(std::span(&erase, 1)).outcome, Outcome::kApplied);
+  while (engine.ReclaimRetired() != 0) {
+  }
+}
+
+// The router sizes its IPv6 entries from its own capacity: a small router's
+// largest route value (a group's) works whatever max_value the caller set.
+TEST_F(RouterFamilyTest, Ipv6EntriesFollowTheRouterCapacity) {
+  Router::Config config = Families(false, true);
+  config.ipv6->max_value = 1;  // overridden by the router: 8 + 4
+  auto made = Router::Create("fam6", config, 8, bess::runtime::runtime().rcu(), 1, 4);
+  ASSERT_TRUE(made);
+  Router &router = **made;
+  ASSERT_TRUE(router.SetNextHop(NextHopId(1), Hop(1)));
+  ASSERT_TRUE(router.SetNextHop(NextHopId(2), Hop(2)));
+  const NextHopId members[] = {NextHopId(2)};
+  ASSERT_TRUE(router.SetNextHopGroup(NextHopGroupId(4), members));
+  ASSERT_TRUE(router.SetRoute(kDefaultRouteDomainId, P6("2001:db8::", 32), NextHopGroupId(4)));
+  EXPECT_EQ(Egress6Of(router, "2001:db8::1"), 2) << "the largest value, 8 + 4, fits";
+  ASSERT_TRUE(router.RemoveRoute(kDefaultRouteDomainId, P6("2001:db8::", 32)));
 }
 
 BESS_INSTANTIATE_ROUTE_BACKENDS(RouterTransactionTest);

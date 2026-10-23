@@ -65,8 +65,9 @@ constexpr size_t kBatch = 32;
 
 Router::Config ConfigFor(size_t routes) {
   Router::Config config;
-  config.max_routes = static_cast<uint32_t>(routes * 2 + 16);
-  config.tbl8_groups = 256;
+  config.ipv4.emplace();
+  config.ipv4->max_routes = static_cast<uint32_t>(routes * 2 + 16);
+  config.ipv4->tbl8_groups = 256;
   return config;
 }
 

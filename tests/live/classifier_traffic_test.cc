@@ -240,7 +240,7 @@ class ClassifierTrafficTest : public LiveTest {
 // the packet leaves.
 TEST_F(ClassifierTrafficTest, RouterRoutesChangeWhileForwarding) {
   auto arg = Arg("RouterArg",
-                 R"({"mode": "ROUTE_MODE_DESTINATION", "max_routes": 512, "max_next_hops": 2})");
+                 R"({"mode": "ROUTE_MODE_DESTINATION", "max_ipv4_routes": 512, "max_next_hops": 2})");
   Apply(Traffic("rt", "Router", arg.get(), {0, 1}, kTwoSubnetIpv4Addresses)
             .Entry("rt/next_hops", *Arg("RouterNextHopIdKey", R"({"id": 1})"),
                    *Arg("RouterNextHopValue",

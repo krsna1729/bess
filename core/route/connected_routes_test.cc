@@ -69,7 +69,7 @@ class ConnectedRoutesTest : public bess::testing::RouteBackendTest {
     LpmRouteTable::Config config = bess::testing::TestRouteConfig();
     config.max_routes = max_routes;
     config.tbl8_groups = 32;
-    auto router = Router::Create("derived", config, next_hops,
+    auto router = Router::Create("derived", Router::Config{.ipv4 = config}, next_hops,
                                  bess::runtime::runtime().rcu(), domains);
     EXPECT_TRUE(router.has_value()) << RouteErrorName(router.error());
     return std::move(router).value();

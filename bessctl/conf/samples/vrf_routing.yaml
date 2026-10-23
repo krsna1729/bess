@@ -30,7 +30,7 @@ modules:
       default_gate: 3
   - name: router0
     mclass: Router
-    arg: {mode: ROUTE_MODE_DESTINATION, max_routes: 16, max_next_hops: 4, max_domains: 3}
+    arg: {mode: ROUTE_MODE_DESTINATION, max_ipv4_routes: 16, max_next_hops: 4, max_domains: 3}
   - name: rewrite0
     mclass: Rewrite
     arg:

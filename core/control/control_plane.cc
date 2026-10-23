@@ -1707,6 +1707,29 @@ ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
   if (ops.empty()) {
     return size_t{0};
   }
+  // The spec lists resources by name, not by what refers to what. Reserve
+  // follows the operation order, and a resource may decide what an entry
+  // refers to from entries written earlier in the same transaction (a
+  // Router route names a neighbor binding or a static next hop), and
+  // ApplyBatched may split the list: so the referenced come first. Upserts
+  // in ascending rank (a referent before its referrers), then erases in
+  // descending rank (a referrer before its referent), the order the engine
+  // publishes in.
+  {
+    auto rank_of = [&engine](const dataplane::Op &op) {
+      const dataplane::Resource *resource = engine.FindResource(op.resource);
+      return resource != nullptr ? resource->rank() : 0;
+    };
+    std::stable_sort(ops.begin(), ops.end(),
+                     [&rank_of](const dataplane::Op &a, const dataplane::Op &b) {
+                       const bool au = a.kind == dataplane::OpKind::kUpsert;
+                       const bool bu = b.kind == dataplane::OpKind::kUpsert;
+                       if (au != bu) {
+                         return au;
+                       }
+                       return au ? rank_of(a) < rank_of(b) : rank_of(a) > rank_of(b);
+                     });
+  }
   // A resource whose values workers read unsynchronized changes only with
   // the workers paused (they may be paused for the commit already).
   std::optional<WorkerPauser> pauser;

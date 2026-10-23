@@ -90,16 +90,17 @@ class ReaderGroup {
   std::vector<uint32_t> ids_;
 };
 
-LpmRouteTable::Config Cfg(uint32_t routes = 256, uint32_t tbl8 = 16) {
+// An IPv4-only router config: these tests write IPv4 routes.
+Router::Config Cfg(uint32_t routes = 256, uint32_t tbl8 = 16) {
   LpmRouteTable::Config config = bess::testing::TestRouteConfig();
   config.max_routes = routes;
   config.tbl8_groups = tbl8;
-  return config;
+  return Router::Config{.ipv4 = config};
 }
 
 // A router with `domains` domains (0..domains-1) all created, `next_hops` ids.
 std::unique_ptr<Router> MakeRouter(size_t domains, size_t next_hops = 64,
-                                   LpmRouteTable::Config config = Cfg()) {
+                                   Router::Config config = Cfg()) {
   auto router = Router::Create("domain_test", config, next_hops,
                                bess::runtime::runtime().rcu(), domains);
   EXPECT_TRUE(router.has_value());

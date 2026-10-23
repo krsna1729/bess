@@ -10708,6 +10708,15 @@ for a millisecond and has the test thread take the control lock 200 times, findi
 the lock is held across the call. `MaintenanceLoopTest.ATicksEventsReachTheLog` reads a tick's event, with its
 type, source and fields, from the daemon's log. Fast build: suite 214/214.
 
+**Amended 2026-10-22 (D-183).** A module that turns configured time into ticks needs to know what a tick is.
+`TickHub` now exposes `interval()` (the loop's interval; zero when `--maintenance_interval_us=0` disables the
+loop, so no endpoint is ever called) and `current_tick()` (the tick count of the latest run, the clock a module
+started in `Init` should start at). `set_interval()` is the loop's, called as it starts, and for tests standing
+in for it; a module only reads. The interval is atomic, the one field read outside the loop's ordering; the
+tick count is read under the control-plane lock that both `Run()` and `Init` hold. The daemon now starts the
+maintenance loop before it starts serving RPCs (`ApiServer::Run`), so a module created by the first RPC never
+reads a zero interval while a loop runs. `docs/plugin-api.md`'s `ticks()` row describes the three.
+
 ## D-151 Armed counter limits are a library a module's tick uses
 
 **Status:** accepted (2026-10-18).
@@ -12457,3 +12466,191 @@ table, the first SYN is new and every later one is existing.
 or reply) is not part of the status.
 
 **Revisit when:** a reader needs the packet direction or the TCP state, not only the status.
+
+## D-183 The Router routes IPv6 by destination and resolves its own neighbors
+
+**Status:** accepted (2026-10-22; updated 2026-10-23). **Code:** `core/route/route_table.{h,cc}`
+(`Ipv6RouteTable` on rte_fib6, `Ipv6Prefix`, the never-published spare), `core/route/router.{h,cc}`
+(per-family tables, a router with no family, `RouteResource` IPv6 staging, the neighbor-binding resource),
+`core/route/forward.h` (the dual-stack chain), `core/route/neighbor_resolver.h` (aging, `CheckBind`, multiple
+CIDR addresses, the ARP merge, forgetting on the last unbind), `core/route/neighbor_table.h` (`Forget`),
+`core/dataplane/transaction_engine.{h,cc}` (rank-ordered reservation), `core/framework/module_tick.h`
+(`TickHub::interval`, `current_tick`; D-150 amendment), `core/control/control_plane.cc` (rank-ordered
+desired-state apply), `core/modules/router.{h,cc}`, `protobuf/module_msg.proto` (`RouterArg`,
+`RouterInterface`, `RouterNeighborBinding`, `RouterNeighborStatus`, `RouterCommandGetNeighborsResponse`),
+`docs/routing.md`, `docs/neighbor-resolution.md`, `docs/limits.md`, `docs/compatibility.md`.
+
+**Context.** D-176 and D-178 left IPv6 routing for "when an IPv6 FIB lands", and the Router module sent no
+ARP/ND of its own (D-153 wrote only the addresses a controller resolved). The Router now holds a per-domain
+IPv6 table beside the IPv4 FIB, enables each family on its own, and can own a `NeighborResolver` (D-175,
+D-176) for the next hops bound in its `<router>/neighbors` resource.
+
+**Decision.**
+- *The next-hop-id mode has no FIB.* Its decision is the packet's next-hop id, so it never consults a FIB and
+  allocates none: `route::Router` accepts a `Config` with neither family (a next-hop-only router, every route
+  write refused, `max_next_hops` bounded by the 32-bit id instead of the 24-bit route value), and the module
+  builds one in that mode. It takes no family setting and refuses at Init every field only a FIB reads, with
+  the same "has no FIB" error: the four capacity fields, a non-default `backend`, a nonzero `max_groups`,
+  `max_domains` above 1, a non-default `flow_hash`, `domain_attr`, `punt_miss_gate` and
+  `punt_unresolved_gate`. It refuses every route and group write with an error that names the mode (only a
+  route names a group), forwards IPv4 and IPv6 alike with each packet's own TTL or hop limit decremented, and
+  takes interface addresses and bindings of either family. An empty `RouterArg` is a valid next-hop-id Router.
+- *In destination mode each family is enabled and sized on its own.* `max_ipv4_routes`/`max_ipv4_tbl8s` and
+  `max_ipv6_routes`/`max_ipv6_tbl8s` replace the shared `max_routes`/`max_tbl8s`. A family is on exactly when
+  its route capacity is set, and at least one must be; an explicit 0, a tbl8 count without its family's route
+  capacity, or a non-default IPv4 `backend` without IPv4 is refused. A disabled family has no FIB in any
+  domain, its frames are dropped and counted (`family_disabled_frames`), and its routes, interface addresses
+  and bindings are refused.
+- *The neighbor protocols read are the interfaces'.* In both modes the Router diverts ARP when an interface
+  has an IPv4 address and Neighbor Discovery when one has an IPv6 address; FIB families do not decide it.
+- *IPv6 is rte_fib6 with a live and a spare instance.* rte_fib6's trie may allocate when a rule is rewritten
+  (a transient tbl8 group, or groups a rule added with its parent's value takes on a later change), so a change
+  or delete applied at publication could fail half written. Each domain's `Ipv6RouteTable` keeps a `live`
+  instance readers use through RCU and a `spare` a transaction edits, where every allocation and capacity check
+  happens; commit is one pointer exchange, an abort leaves the table unchanged, and publication allocates
+  nothing. The old live becomes the spare after a grace period and replays what it lags by. A spare built and
+  never published needs no grace period, and the table tracks that apart from "unpublished by a commit,
+  awaiting its grace token": an aborted transaction leaves such a spare editable, and the next stage replays
+  it instead of retiring it and building another instance. The cost is memory: one instance is 2^24 entries
+  plus `max_ipv6_tbl8s` x 256 entries (2-byte entries while the values and tbl8 count fit 32,767, else 4),
+  plus the rib, and a written domain holds two. At 2 bytes that is about 2 x (32 MiB + 512 B x
+  `max_ipv6_tbl8s`) per domain; `max_ipv6_tbl8s` defaults to 8192.
+- *One forwarding chain for both families.* `route/forward.h`'s `ResolveFrame(s)` routes IPv4 and IPv6 with
+  the same verdicts (local, blackhole, unresolved, TTL/hop limit), one bulk lookup per family for a run of
+  frames. A link-local or multicast destination, or a link-local source, is link-scoped (RFC 4291 2.5.6): it
+  is never routed, and it takes the local punt gate or is dropped, counted as `link scope`.
+- *Aging keeps forwarding while it reconfirms.* A resolved neighbor whose reachable lifetime expires stays
+  resolved, with its MAC, while the resolver probes it with the normal backoff. It becomes unreachable only
+  after `max_probes` unanswered probes, and a reply during reconfirmation keeps it resolved without
+  republishing (RFC 4861 STALE/PROBE, not a drop on every expiry).
+- *Neighbor input is bounded and attributed when it arrives.* ARP replies and Neighbor Advertisements are
+  queued with the interface id read at enqueue, after it is checked against the resolver's interfaces. An
+  unknown interface or a full queue drops and counts the frame. ARP requests and Neighbor Solicitations are
+  answered elsewhere: they go to `punt_neighbor_gate` (0 follows `punt_local_gate`, 8192 drops, any other
+  invalid gate is refused), in either mode, and are counted. An ARP request is also copied to the resolver on
+  its own 256-entry ring, so requests cannot take the room replies need.
+- *ARP follows RFC 826's merge.* A reply whose target is one of the interface's addresses, unicast or
+  broadcast, answers a solicitation. A request (gratuitous ones included) or a broadcast reply naming another
+  target, from a bound neighbor, moves it to the announced MAC at once, published as resolved, and has it
+  reconfirmed on the next poll. A unicast reply naming another target is ignored, and no ARP frame creates a
+  neighbor. ARP is unauthenticated: the MAC, source and interface checks bind a frame to a bound neighbor's
+  address, not to its owner, so any on-link sender can announce a bound address with its own MAC and redirect
+  that neighbor's traffic at once, before reconfirmation. The merge is RFC 826 behaviour, not spoof
+  prevention; a segment that needs it uses link-layer controls (port security, dynamic ARP inspection) or
+  static next hops.
+- *Interfaces carry CIDR addresses.* `RouterInterface.addresses` lists any number of addresses with their
+  prefix lengths, at least one (in destination mode, of the enabled families). A solicitation leaves from the
+  address whose prefix holds the neighbor, else from the first address of its family.
+- *Bindings are a runtime resource.* `<router>/neighbors` (`RouterNextHopIdKey` -> `RouterNeighborBinding`)
+  replaces the Init-time binding list. A committed binding publishes its hop incomplete; the resolver takes it
+  up on the next tick. `NeighborResolver::CheckBind` validates it before staging, so the tick never refuses one.
+  The tick coalesces the changes published since the last one to each id's final binding. With forgetting
+  deferred (a neighbor whose last binding goes frees its timer and room at once and keeps what was learned,
+  with its resolver entry and timer deadline set aside), it installs the final bindings whose neighbor the
+  resolver knows and releases every resolver binding that is gone or replaced; it then forgets every neighbor
+  no id names and installs the rest. A neighbor still named after the tick therefore continues exactly where it
+  was -- its learned MAC published at once, and a reconfirmation keeping its probe count and next deadline --
+  however the ids move (a move, a chain, a swap or a rotation, in any id order); a transaction that unbinds one id and binds
+  another at `max_neighbors` still finds room; several transactions on one id before a tick install only the
+  last binding. Routes and groups that
+  name a bound id hold a reference to it, so an unbind is refused while any does; an id is static
+  (`<router>/next_hops`) or bound, never both; an abort leaves nothing behind. `max_neighbors` bounds the
+  bindings (default min(1024, `max_next_hops`); larger than `max_next_hops` is refused).
+- *Ownership does not depend on request order.* Which resource a route or group references for a hop
+  (`<router>/neighbors` for a bound id, `<router>/next_hops` otherwise) is read from the bindings as the
+  transaction has them. The engine reserves operations in ascending resource rank -- next hops and bindings
+  before the groups and routes that name them -- and in request order within a resource, reporting results in
+  request order, so a route listed before the binding it names is accepted. Desired-state apply also upserts
+  by ascending rank and erases by descending rank.
+- *Learning is bounded by the bindings.* The last unbind of a neighbor forgets it: its entry, timer and learned
+  MAC (`NeighborTable::Forget`). The resolver's table holds only bound neighbors however many distinct
+  addresses churn through, and binding an old address again starts incomplete and solicits, rather than
+  republishing an old MAC (with `neighbor_reachable_lifetime_ms: 0`, never to be reconfirmed).
+- *Neighbor state is readable.* `get_neighbors` returns every binding in id order with its state, learned MAC,
+  whether it is reconfirming, and its probe count, read under the control-plane lock while workers run.
+- *Neighbor changes are published through the in-process engine, in bounded batches.* Each tick applies at
+  most 64 next-hop updates in one transaction and keeps the rest for the next tick. D-074 stands: there is no
+  public `ResourceRegistry::Apply`.
+- *Each mode declares only the attribute it reads.* The next-hop mode declares `next_hop_attr`; destination
+  mode declares `domain_attr`. A declared read is a requirement on every path into the module, so a
+  destination-mode Router fed by a path with no next-hop writer no longer invalidates that attribute's scope
+  for the next-hop readers sharing the graph.
+- *Timings are time, counted in ticks, and zero has one meaning per field.* The `neighbor_*_ms` fields are
+  milliseconds, all `optional`, converted at Init to ticks from the maintenance loop's interval
+  (`TickHub::interval`) by rounding up, so each is at least the configured time, and counted from the tick
+  current at Init (or, for a binding's first probe, from the tick that takes the binding up). An unset field
+  takes the default; an explicit 0 is "never" for the reachable lifetime and the unreachable retry, "at once"
+  for the first probe, and refused for the probe interval, its ceiling and the probe count. Init refuses a
+  resolver when the loop is disabled, since no neighbor would ever be solicited. The unreachable retry
+  defaults to the backoff ceiling (8 s).
+- *Next-hop mode writes the IPv6 hop limit.* It decrements the IPv6 hop limit as destination mode does, so the
+  two modes agree on every hop-count boundary (D-153). An interface `id` of 0 is derived as
+  `egress_gate + 1`; `ingress_interface_attr` defaults to `vif_id`, what Vif writes.
+- *Released field numbers stand (D-173).* Every `RouterArg` field `develop` released keeps its number
+  (`max_next_hops` 3, `max_domains` 4, `backend` 5, `mode` 6, `max_groups` 7, `punt_miss_gate` 8,
+  `punt_unresolved_gate` 9, `flow_hash` 10, `next_hop_attr` 11, `domain_attr` 12, `punt_local_gate` 13), so an
+  older client's message is never read as a different field. The removed `max_routes` (1) and `max_tbl8s` (2)
+  are deleted outright, per D-173, and their numbers are not reused. The new fields take fresh numbers: the
+  per-family capacities 14-17, `punt_neighbor_gate` 18, `ingress_interface_attr` 19, `interfaces` 20,
+  `max_neighbors` 21 and the neighbor timings 22-27. `RouterInterface` is new (1-4), and `RouterRouteKey`
+  adds `ipv6` as 4.
+
+**Consequences.** D-153's "the Router sends no ARP/ND" no longer holds for a Router with configured
+interfaces. The D-176/D-178 "IPv6 FIB lands" trigger has fired for routing (route derivation stays IPv4-only).
+D-065's note that IPv6 is not built is superseded for the Router module. Neighbor changes advance the
+engine generation, so a controller that writes with `expected_generation` can see a conflict after a neighbor
+change and must re-read. A read-back of `<router>/next_hops` omits bound hops; they are read back from
+`<router>/neighbors`, and their learned state from `get_neighbors`. Reaching the engine makes
+`core/modules/router.cc` the one module that includes `runtime/runtime_state.h`: `tools/check_includes.py`
+exempts that file by name from D-042's rule, because the alternative, putting transaction application on
+`ModuleInitContext` or `ResourceRegistry`, is the plugin-API widening D-074 refuses.
+
+What an existing Router user sees:
+- `max_routes` (default 4096) and `max_tbl8s` are gone. In destination mode set `max_ipv4_routes` (and
+  `max_ipv4_tbl8s`) for the old IPv4 behaviour; a destination Router with neither family's routes set is
+  refused. In next-hop mode drop the capacity fields, the routes and groups, and any destination-only setting
+  (`max_groups`, `max_domains` above 1, `flow_hash`, `domain_attr`, `punt_miss_gate`,
+  `punt_unresolved_gate`): the Router has no FIB, refuses them, and forwards IPv6 as well as IPv4.
+- `max_routes` (1) and `max_tbl8s` (2) are removed; every other released `RouterArg` field keeps its number,
+  and the new fields are 14-27. A binary `RouterArg` that set 1 or 2 must drop them; nothing else changes on
+  the wire.
+- The transaction engine reserves in resource rank order; results stay in request order.
+- GetDesc reads `not ip:` where it read `not ipv4:`, and the accessor `not_ipv4_frames` is `not_ip_frames`.
+- In destination mode with IPv6 enabled, IPv6 frames, once dropped as non-IPv4, are routed through the
+  domain's IPv6 table, and go to `punt_miss_gate` (or are dropped and counted) when it has no route; with IPv6
+  disabled they are dropped and counted as `family disabled`.
+- Link-local and multicast IPv6 goes to `punt_local_gate` when one is configured.
+- In next-hop mode, an IPv6 frame's hop limit is decremented, and one arriving with 0 or 1 is dropped and
+  counted as TTL expired.
+- Each mode declares only its own metadata attribute: next-hop mode no longer declares `domain_attr`, and
+  destination mode no longer declares `next_hop_attr`.
+
+Limits: interfaces are fixed at Init; there is no glean, so route gateways and connected hosts are not
+resolved on demand and every neighbor needs a binding. Resolving from traffic would let any sender create
+neighbor entries and would put a control handoff on the miss path; explicit bindings keep the table bounded
+and owned by the controller.
+
+**Evidence.** `route_route_test` (`Ipv6RouteTableTest.*`, `AnAbortedStageReusesANeverPublishedSpare`),
+`route_router_transaction_test` (IPv6 atomicity, abort, per-family bounds, allocation-free publication,
+`ARouterWithNoFamilyHoldsNextHopsAndNoFib`), `route_neighbor_resolver_test` (aging, reconfirmation, poll fault
+steps, CIDR addresses and source selection, the ARP merge, `ARebindAfterTheLastUnbindStartsIncomplete`),
+`dataplane_transaction_lifecycle_test` (a failure at every reservation reported at its own operation),
+`modules_router_test` (family enablement and refusals, IPv6 local and link-scope gates, `punt_neighbor_gate`,
+input drops, explicit-zero aging, the 64-per-tick publication cap, mode-specific attributes, millisecond
+timings from Init, refusal without the maintenance loop, derived interface ids, the next-hop-mode IPv6 hop
+limit, `AnEmptyArgNextHopRouterForwardsBothFamiliesWithoutAFib`, `TheNextHopModeRefusesFibCapacities`,
+`TheNextHopModeReadsTheInterfacesFamilies`, `NeighborBindingsComeAndGoAtRuntime`,
+`AnUnbindIsRefusedWhileARouteOrGroupNamesTheHop`, `StaticAndBoundNextHopIdsAreDisjoint`,
+`ABindingInAnAbortedTransactionLeavesNothing`, `NeighborBindingCapacityIsBounded`,
+`GetNeighborsReportsEachBindingsResolution`,
+`AnUnbindAndABindInOneTransactionAtCapacityResolveTheNewNeighbor`,
+`SeveralTransactionsBeforeATickApplyTheFinalBinding`, `ARebindOfAForgottenNeighborStartsIncompleteAndSolicits`,
+`ANeighborMovedToAnotherIdStaysResolved`, `AChainOfMovesInOneTickKeepsEveryNeighborResolved`,
+`ASwapOfTwoNeighborsKeepsBothResolved`, `ARenumberedReconfirmingNeighborKeepsItsProbeSchedule`,
+`TheRouteValueBoundIsTheFibs`,
+`ARouteOrGroupListedBeforeItsBindingNamesTheBinding`) and `control_apply_pipeline_test`
+(`ResolverOwnedNextHopsAreOutsideDesiredStateConvergence`, `NeighborBindingsConvergeAsTheirOwnResource`). The
+full suite (`meson test -C build/fast --no-suite live`) is the gate.
+
+**Revisit when:** a deployment needs glean (on-demand resolution of route gateways or connected hosts),
+interfaces must change at runtime, or the per-tick cap shows up as convergence latency.

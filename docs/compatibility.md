@@ -80,6 +80,30 @@ running daemon in the test suite.
   `bessctl/conf/samples/vrf_routing.yaml` (one Router, one FIB per route
   domain, a Vif writing the domain) is the VRF shape the two IPLookups in
   that sample used to have.
+- **`RouterArg` sizes each address family on its own, in destination mode
+  only** (D-183). `max_routes` and `max_tbl8s` are removed:
+  `max_ipv4_routes`/`max_ipv4_tbl8s` and `max_ipv6_routes`/`max_ipv6_tbl8s`
+  replace them. In `ROUTE_MODE_DESTINATION` a family is enabled exactly when
+  its route capacity is set, and a Router with neither is refused. In
+  `ROUTE_MODE_NEXT_HOP_ID` (the default) the Router has no FIB: it forwards
+  IPv4 and IPv6, refuses the four capacity fields, a non-default `backend`
+  or `flow_hash`, a nonzero `max_groups`, `max_domains` above 1,
+  `domain_attr`, `punt_miss_gate` and `punt_unresolved_gate`, and refuses
+  every route and group write, so a next-hop-id configuration drops those
+  fields, its routes and its groups (an empty `RouterArg` is valid).
+  `max_routes` (field 1) and `max_tbl8s` (field 2) are deleted and their
+  numbers left unused; every other `RouterArg` field keeps the number
+  `develop` released (3-13), and the new fields take 14-27, so an older
+  binary `RouterArg` is never misread. Text and YAML that name fields only
+  need the capacity rename. An IPv4
+  destination-mode Router that relied on the old default writes
+  `max_ipv4_routes: 4096`.
+- **Transactions reserve in resource rank order** (D-183). The engine calls
+  `Resource::Reserve` for every operation on a referenced resource before the
+  operations on the resources that reference it, and in request order within
+  a resource; results are still reported in request order. A `Reserve` that
+  reads another resource's staged state therefore sees every operation on
+  lower-rank resources, wherever the request lists them.
 
 ## What a build is made of
 

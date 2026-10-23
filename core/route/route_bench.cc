@@ -251,7 +251,7 @@ BENCHMARK(BM_LookupRouteTableFib)->ArgsProduct({{1024, 16384, 65536}, {0, 1}});
 
 std::unique_ptr<Router> RouterFor(size_t n, RouteBackend backend,
                                   std::vector<uint32_t> *keys) {
-  auto router = Router::Create("route_bench_rt", ConfigFor(n, backend), 1024,
+  auto router = Router::Create("route_bench_rt", Router::Config{.ipv4 = ConfigFor(n, backend)}, 1024,
                                bess::runtime::runtime().rcu())
                     .value();
   for (uint32_t id = 1; id <= 1023; id++) {
@@ -448,7 +448,7 @@ BENCHMARK(BM_UpdateByRebuild)
 // A neighbor update: publish one next-hop object (routes untouched).
 void BM_NextHopUpdate(benchmark::State &state) {
   const size_t hops = static_cast<size_t>(state.range(0));
-  auto router = Router::Create("route_bench_nh", ConfigFor(1024), hops,
+  auto router = Router::Create("route_bench_nh", Router::Config{.ipv4 = ConfigFor(1024)}, hops,
                                bess::runtime::runtime().rcu())
                     .value();
   NextHop hop;
@@ -477,7 +477,7 @@ void BM_RouterChange(benchmark::State &state) {
   // The engine outlives the router enrolled in it (declared first).
   bess::dataplane::TransactionEngine engine(domain);
   auto router =
-      Router::Create("route_bench_tx", ConfigFor(1024), 64, domain).value();
+      Router::Create("route_bench_tx", Router::Config{.ipv4 = ConfigFor(1024)}, 64, domain).value();
   if (enrolled && !router->Enroll(engine.registry())) {
     state.SkipWithError("enroll failed");
     return;

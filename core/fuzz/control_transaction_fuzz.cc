@@ -642,9 +642,19 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
       return reject(i);
     }
   }
-  // Reserve, in request order.
-  size_t may_retire = 0;
+  // Reserve in ascending resource rank, request order within a rank (D-183):
+  // routes reference next hops, so they rank above the rest and reserve
+  // last; the failure is reported at the first operation that fails in that
+  // order.
+  std::vector<int> order(static_cast<size_t>(n));
   for (int i = 0; i < n; i++) {
+    order[static_cast<size_t>(i)] = i;
+  }
+  std::stable_sort(order.begin(), order.end(), [&ops](int a, int b) {
+    return (ops[a].resource == kRoutes) < (ops[b].resource == kRoutes);
+  });
+  size_t may_retire = 0;
+  for (const int i : order) {
     const State &s = model.state.at(ops[i].resource);
     const bool exists = s.contains(ops[i].key);
     if (ops[i].erase) {

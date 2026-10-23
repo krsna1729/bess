@@ -668,6 +668,7 @@ core_public_subdir_headers = {
     'route/route_domain.h',
     'route/router.h',
     'route/l3_packet.h',
+    'route/neighbor_key.h',
     'route/neighbor_table.h',
     'route/neighbor_resolver.h',
     'route/forward.h',

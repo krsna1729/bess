@@ -11,11 +11,12 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,7 @@
 #include "dataplane/slot_table.h"
 #include "packet.h"
 #include "packet_mutation.h"
+#include "route/neighbor_key.h"
 #include "route/next_hop_id.h"
 #include "route/route_domain.h"
 #include "route/route_table.h"
@@ -81,6 +83,30 @@ struct NextHop {
   NextHopKind kind = NextHopKind::kForward;
   utils::Ethernet::Address dst_mac{};
   utils::Ethernet::Address src_mac{};
+};
+// A neighbor's update to the next hop bound to it ("<router>/neighbors"): the
+// state and addresses a resolver learned. Accepted only for a bound id, by
+// the neighbors resource; the hop keeps its binding's interface as egress.
+struct NeighborManagedNextHop {
+  NextHop value;
+};
+
+// One change to the neighbor bindings, in the order transactions published
+// them: `neighbor` is the key `id` is now bound to, or empty for an unbind.
+// The owner reads them (TakeNeighborBindingChanges) to start or stop
+// resolving; the next hop itself was already published, incomplete.
+struct NeighborBindingChange {
+  NextHopId id;
+  std::optional<NeighborKey> neighbor;
+};
+
+// What the owner of neighbor resolution accepts as bindings: how many next
+// hops may be bound at once, and a check of each neighbor key (its interface
+// exists, the router has an address of its family there, it is not one of
+// the router's own) before a transaction may bind it.
+struct NeighborBindingPolicy {
+  size_t capacity = 0;
+  std::function<std::expected<void, std::string>(const NeighborKey &)> validate;
 };
 
 // Every resolved packet loads one; at 16 bytes four fill a cache line and none
@@ -147,16 +173,24 @@ struct NextHopGroup {
   }
 };
 
-// Route domains plus next hops (K7, K7.1, M6):
+// Route domains plus next hops (K7, K7.1, M6), dual-stack:
 //
-//   (domain, IPv4 dst) --LPM--> NextHopId --SlotTable--> NextHop
+//   (domain, IPv4 dst) --rte_lpm/rte_fib--> NextHopId --SlotTable--> NextHop
+//   (domain, IPv6 dst) --rte_fib6-------/
 //
 // One Router owns both halves: the per-domain FIBs and the next hops every
 // domain's routes share. Many routes share a next hop, so a neighbor change
 // (a new MAC, an unresolved neighbor) publishes one next-hop object (a
 // SlotTable pointer store, O(1)) and never touches a FIB; a route change is
-// one in-place rte_lpm update and never copies next hops. A next hop is named
-// by routes in any domain, and the reference counts below span all of them.
+// one FIB update and never copies next hops. A next hop is named by routes of
+// either family in any domain, and the reference counts below span all of
+// them. Each family is optional and sized on its own (Config): a router
+// without one has no FIB of it in any domain.
+//
+// An IPv4 route change is applied in place to the domain's rte_lpm/rte_fib;
+// an IPv6 one is applied to the domain's Ipv6RouteTable spare and published
+// by a pointer exchange (route_table.h), so even a sequence of IPv6 changes
+// in one transaction reaches readers at once.
 //
 // Domains. A Router is created with `max_domains` (default 1: just the
 // default domain 0, with the cost and behaviour of a router that has no
@@ -225,25 +259,70 @@ struct NextHopGroup {
 // id is invalid. A route may name a group, a group references its members,
 // and the direct group setters refuse (kEnrolled).
 //
-// Transactions (G1.2b, D-023): Enroll() registers the next hops, the groups
-// and the routes as three resources of a TransactionEngine, so that one
-// transaction can change them together with other modules' tables (a rule,
-// the action it names, the route that action forwards to). The routes
-// resource holds every domain's routes under one resource; the key carries
-// the domain (RouteKey). An enrolled router has one writer, the engine: the
-// direct setters above refuse (kEnrolled), and the engine's reference ledger
-// replaces the router's own counts.
+// Transactions (G1.2b, D-023): Enroll() registers the next hops, the neighbor
+// bindings, the groups and the routes as four resources of a
+// TransactionEngine, so that one transaction can change them together with
+// other modules' tables (a rule, the action it names, the route that action
+// forwards to). The routes resource holds every domain's routes under one
+// resource; the key carries the domain (RouteKey). An enrolled router has one
+// writer, the engine: the direct setters above refuse (kEnrolled), and the
+// engine's reference ledger replaces the router's own counts.
+//
+// Neighbor bindings (D-183): "<name>/neighbors" (key EncodeKey(NextHopId),
+// value NeighborKey) binds a next-hop id to a neighbor that a resolver owns.
+// Binding publishes the id's next hop -- egress the neighbor's interface,
+// incomplete -- in the same slot table the static next hops use, so routes
+// and groups name it like any next hop; its later states arrive as
+// NeighborManagedNextHop upserts on the same key. An id is either static
+// ("<name>/next_hops") or bound, never both: each resource refuses the
+// other's ids. A route or group that names a bound id references
+// "<name>/neighbors", so the engine refuses to unbind it while it is named.
+// Which resource a new value references is decided from the bindings as the
+// transaction has them: the engine reserves the referenced resources (next
+// hops, neighbors) before the routes and groups that name them, so a route
+// listed before the binding it names in one request still finds it. Without
+// a NeighborBindingPolicy the resource exists and binds nothing.
 class Router {
  public:
-  using Config = LpmRouteTable::Config;
+  // The address families a router serves and how each domain's table of each
+  // is sized: a family is enabled iff its config is set, and every domain
+  // (the default one, CreateDomain's, and those a transaction creates) has a
+  // table for exactly the enabled families. A disabled family has no FIB
+  // anywhere: its route writes are refused (kFamilyDisabled) and its lookups
+  // miss. `ipv6->max_value` is the router's own (max_next_hops + max_groups,
+  // the largest route value), whatever the caller sets, so the IPv6 entry
+  // size follows from the router's capacity. A Config with neither family is
+  // a next-hop-only router: no FIB in any domain, every route write refused,
+  // next hops (static and bound) resolved by id as usual.
+  struct Config {
+    std::optional<LpmRouteTable::Config> ipv4;
+    std::optional<Ipv6RouteTable::Config> ipv6;
+  };
 
-  // `config` sizes the default domain's FIB; CreateDomain() takes the others'.
+  // The most next hops (plus groups) a router with no FIB holds: an id is a
+  // one-based 32-bit value, and the bound keeps max + 1 within 32 bits.
+  static constexpr size_t kMaxNextHopsWithoutFib = 0xfffffffeu;
+
+  // `config` sizes the default domain's FIBs and those created on demand;
+  // CreateDomain() takes the others'.
   // `max_domains` (1..kMaxRouteDomains) bounds the domain ids: 0..max_domains-1.
   // `max_groups` bounds the next-hop group ids: 1..max_groups (0: none);
-  // max_next_hops + max_groups must fit a route value (24 bits).
+  // with a family, max_next_hops + max_groups must fit a route value (24
+  // bits); with neither, kMaxNextHopsWithoutFib.
   static std::expected<std::unique_ptr<Router>, RouteError> Create(
       std::string name, const Config &config, size_t max_next_hops,
       rcu::RcuDomain &domain, size_t max_domains = 1, size_t max_groups = 0);
+
+  bool has_ipv4() const noexcept { return domain_config_.ipv4.has_value(); }
+  bool has_ipv6() const noexcept { return domain_config_.ipv6.has_value(); }
+
+  // The FIBs that exist across all domains, per family (an IPv6 table counts
+  // once, however many rte_fib6 instances it holds).
+  struct FibCounts {
+    size_t ipv4 = 0;
+    size_t ipv6 = 0;
+  };
+  FibCounts fib_counts() const;
 
   ~Router();
 
@@ -254,6 +333,17 @@ class Router {
 
   // Adds next hop `id`, or replaces it (a neighbor update).
   std::expected<void, RouteError> SetNextHop(NextHopId id, const NextHop &hop);
+  // Neighbor bindings (see the class comment). Set before Enroll(): the
+  // policy every binding must pass; without it no binding is accepted.
+  std::expected<void, RouteError> SetNeighborBindingPolicy(
+      NeighborBindingPolicy policy);
+  // Whether `id` is bound to a neighbor (control side, committed state).
+  bool IsNeighborBound(NextHopId id) const;
+  // Every binding, in id order (control side, committed state).
+  void ForEachNeighborBinding(
+      const std::function<void(NextHopId, const NeighborKey &)> &fn) const;
+  // The binding changes published since the last call, oldest first.
+  std::vector<NeighborBindingChange> TakeNeighborBindingChanges();
   std::expected<void, RouteError> RemoveNextHop(NextHopId id);
 
   // Drops retiring next hops and groups whose grace period has completed, and
@@ -273,7 +363,11 @@ class Router {
   // referenced until then.
   std::expected<void, RouteError> RemoveNextHopGroup(NextHopGroupId id);
   // Points a route at a group (the next-hop overload's semantics otherwise).
-  std::expected<void, RouteError> SetRoute(RouteDomainId domain, Ipv4Prefix prefix,
+  std::expected<void, RouteError> SetRoute(RouteDomainId domain,
+                                           Ipv4Prefix prefix,
+                                           NextHopGroupId group);
+  std::expected<void, RouteError> SetRoute(RouteDomainId domain,
+                                           Ipv6Prefix prefix,
                                            NextHopGroupId group);
   size_t next_hop_group_count() const;
   // Routes naming group `id`, across all domains. Takes the engine's lock
@@ -292,8 +386,10 @@ class Router {
   // network instances pays for the ones that hold routes. A domain created on
   // demand is sized like the default one.
   //
-  // Adds domain `domain` (0 < domain < max_domains) with its own FIB sized by
-  // `config`. kInvalidId beyond max_domains, kDomainExists, kEnrolled.
+  // Adds domain `domain` (0 < domain < max_domains) with its own FIBs sized by
+  // `config`, which must enable exactly the router's families
+  // (kFamilyDisabled otherwise). kInvalidId beyond max_domains,
+  // kDomainExists, kEnrolled.
   std::expected<void, RouteError> CreateDomain(RouteDomainId domain,
                                                const Config &config);
   // Removes an empty domain other than the default; its FIB is freed after a
@@ -303,7 +399,7 @@ class Router {
   std::expected<void, RouteError> RemoveDomain(RouteDomainId domain);
 
   bool HasDomain(RouteDomainId domain) const noexcept {
-    return TableOf(domain) != nullptr;
+    return domains_.Lookup(SlotOf(domain)) != nullptr;
   }
   size_t domain_count() const;
   size_t max_domains() const noexcept { return max_domains_; }
@@ -311,26 +407,38 @@ class Router {
   // -- routes -----------------------------------------------------------------
 
   // Adds or re-points a route in `domain`; /0 is the domain's default route.
-  // Ordinary live update (see above). kUnknownDomain for a domain that does
-  // not exist; the overloads without a domain act on the default domain.
+  // Ordinary live update (see above). kFamilyDisabled for a family the router
+  // does not serve, kUnknownDomain for a domain that does not exist; the
+  // overloads without a domain act on the default domain.
   std::expected<void, RouteError> SetRoute(RouteDomainId domain,
                                            Ipv4Prefix prefix, NextHopId hop);
   std::expected<void, RouteError> RemoveRoute(RouteDomainId domain,
                                               Ipv4Prefix prefix);
+  std::expected<void, RouteError> SetRoute(RouteDomainId domain,
+                                           Ipv6Prefix prefix, NextHopId hop);
+  std::expected<void, RouteError> RemoveRoute(RouteDomainId domain,
+                                              Ipv6Prefix prefix);
   std::expected<void, RouteError> SetRoute(Ipv4Prefix prefix, NextHopId hop) {
     return SetRoute(kDefaultRouteDomainId, prefix, hop);
   }
   std::expected<void, RouteError> RemoveRoute(Ipv4Prefix prefix) {
     return RemoveRoute(kDefaultRouteDomainId, prefix);
   }
+  std::expected<void, RouteError> SetRoute(Ipv6Prefix prefix, NextHopId hop) {
+    return SetRoute(kDefaultRouteDomainId, prefix, hop);
+  }
+  std::expected<void, RouteError> RemoveRoute(Ipv6Prefix prefix) {
+    return RemoveRoute(kDefaultRouteDomainId, prefix);
+  }
 
-  // Replaces every route of `domain` with `routes` (a prefix named twice takes
-  // its last entry), published as one pointer store. All validation happens
-  // before anything is visible: every next hop must exist (kInvalidId,
-  // kUnknownNextHop) and the FIB built off to the side must hold the whole set
-  // (kTableFull for rules or tbl8 groups). On any error the previous set
-  // stays published and the next-hop reference counts are unchanged. An empty
-  // set empties the domain. kEnrolled when written through transactions.
+  // Replaces every IPv4 route of `domain` with `routes` (a prefix named twice
+  // takes its last entry), published as one pointer store. All validation
+  // happens before anything is visible: every next hop must exist
+  // (kInvalidId, kUnknownNextHop) and the FIB built off to the side must hold
+  // the whole set (kTableFull for rules or tbl8 groups). On any error the
+  // previous set stays published and the next-hop reference counts are
+  // unchanged. An empty set empties the domain. kEnrolled when written
+  // through transactions; kFamilyDisabled without IPv4.
   std::expected<void, RouteError> ReplaceRouteSetAtomic(
       RouteDomainId domain, const RouteSet &routes);
 
@@ -364,14 +472,19 @@ class Router {
   // grace period ends.
   void ForEachNextHopGroup(
       const std::function<void(NextHopGroupId, const NextHopGroup &)> &fn) const;
+  void ForEachIpv6Route(
+      const std::function<void(RouteDomainId, Ipv6Prefix, NextHopId,
+                               NextHopGroupId)> &fn) const;
 
   // -- transactions (D-023) ---------------------------------------------------
 
   // Registers "<name>/next_hops" (key: EncodeKey(NextHopId), value: NextHop),
-  // "<name>/groups" (key: EncodeKey(NextHopGroupId), value: NextHopGroup;
-  // each group references its distinct members), and
-  // "<name>/routes" (key: RouteKey(domain, prefix), value: NextHopId or
-  // NextHopGroupId; each route references what it names) with `engine`, which
+  // "<name>/neighbors" (key: EncodeKey(NextHopId), value: NeighborKey or
+  // NeighborManagedNextHop; see the class comment), "<name>/groups" (key:
+  // EncodeKey(NextHopGroupId), value: NextHopGroup; each group references its
+  // distinct members), and "<name>/routes" (key: RouteKey(domain, prefix),
+  // value: NextHopId or NextHopGroupId; each route references what it names)
+  // with `engine`, which
   // must outlive the router or its enrollment. Refused once any route or group
   // exists or a removed next hop or group is still retiring (the ledger must
   // start from what it can see). Freezes the set of domains. Destroying an
@@ -379,7 +492,7 @@ class Router {
   std::expected<void, std::string> Enroll(dataplane::ResourceRegistry &engine);
   bool enrolled() const noexcept { return engine_ != nullptr; }
 
-  // Releases both resources for teardown, tolerating a referrer that is still
+  // Releases the resources for teardown, tolerating a referrer that is still
   // registered and live keys (the graph is being disconnected around the
   // router): the owning module calls this from DeInit(), because the order
   // modules are destroyed in must not decide whether a pipeline can be torn
@@ -387,12 +500,16 @@ class Router {
   std::expected<void, std::string> Release();
 
   const std::string &next_hops_resource() const { return next_hops_name_; }
+  const std::string &neighbors_resource() const { return neighbors_name_; }
   const std::string &routes_resource() const { return routes_name_; }
   const std::string &groups_resource() const { return groups_name_; }
   // The registered resources while enrolled (null otherwise), so the owning
   // module can attach the RPC's typed codecs to them (D-025).
   dataplane::Resource *next_hops_resource_object() const noexcept {
     return next_hops_res_.get();
+  }
+  dataplane::Resource *neighbors_resource_object() const noexcept {
+    return neighbors_res_.get();
   }
   dataplane::Resource *routes_resource_object() const noexcept {
     return routes_res_.get();
@@ -410,6 +527,16 @@ class Router {
     return dataplane::EncodeKey(uint64_t{domain.value()} << 40 |
                                 uint64_t{prefix.addr()} << 8 | prefix.length());
   }
+  static dataplane::ResourceKey RouteKey(RouteDomainId domain,
+                                         Ipv6Prefix prefix) {
+    DCHECK_LT(domain.value(), kMaxRouteDomains);
+    dataplane::ResourceKey key(1, '\6');
+    const uint32_t domain_id = domain.value();
+    key.append(reinterpret_cast<const char *>(&domain_id), sizeof(domain_id));
+    key.append(reinterpret_cast<const char *>(prefix.addr().bytes), 16);
+    key.push_back(static_cast<char>(prefix.length()));
+    return key;
+  }
   static dataplane::ResourceKey RouteKey(Ipv4Prefix prefix) {
     return RouteKey(kDefaultRouteDomainId, prefix);
   }
@@ -422,6 +549,22 @@ class Router {
     return dataplane::Op::Upsert(next_hops_name_, dataplane::EncodeKey(id),
                                  std::any(hop));
   }
+  // Binds next hop `id` to `neighbor`, or unbinds it ("<name>/neighbors").
+  dataplane::Op BindNeighborOp(NextHopId id, const NeighborKey &neighbor) const {
+    return dataplane::Op::Upsert(neighbors_name_, dataplane::EncodeKey(id),
+                                 std::any(neighbor));
+  }
+  dataplane::Op UnbindNeighborOp(NextHopId id) const {
+    return dataplane::Op::Erase(neighbors_name_, dataplane::EncodeKey(id));
+  }
+  // A resolver's update to the next hop bound at `id`: its state and
+  // addresses (the egress stays the binding's interface).
+  dataplane::Op SetNeighborManagedNextHopOp(NextHopId id,
+                                            const NextHop &hop) const {
+    return dataplane::Op::Upsert(
+        neighbors_name_, dataplane::EncodeKey(id),
+        std::any(NeighborManagedNextHop{hop}));
+  }
   dataplane::Op RemoveNextHopOp(NextHopId id) const {
     return dataplane::Op::Erase(next_hops_name_, dataplane::EncodeKey(id));
   }
@@ -433,11 +576,24 @@ class Router {
   dataplane::Op RemoveRouteOp(RouteDomainId domain, Ipv4Prefix prefix) const {
     return dataplane::Op::Erase(routes_name_, RouteKey(domain, prefix));
   }
+  dataplane::Op SetRouteOp(RouteDomainId domain, Ipv6Prefix prefix,
+                           NextHopId hop) const {
+    return dataplane::Op::Upsert(routes_name_, RouteKey(domain, prefix),
+                                 std::any(hop));
+  }
+  dataplane::Op RemoveRouteOp(RouteDomainId domain, Ipv6Prefix prefix) const {
+    return dataplane::Op::Erase(routes_name_, RouteKey(domain, prefix));
+  }
   dataplane::Op SetRouteOp(Ipv4Prefix prefix, NextHopId hop) const {
     return SetRouteOp(kDefaultRouteDomainId, prefix, hop);
   }
   // A route to a group.
   dataplane::Op SetRouteOp(RouteDomainId domain, Ipv4Prefix prefix,
+                           NextHopGroupId group) const {
+    return dataplane::Op::Upsert(routes_name_, RouteKey(domain, prefix),
+                                 std::any(group));
+  }
+  dataplane::Op SetRouteOp(RouteDomainId domain, Ipv6Prefix prefix,
                            NextHopGroupId group) const {
     return dataplane::Op::Upsert(routes_name_, RouteKey(domain, prefix),
                                  std::any(group));
@@ -465,10 +621,12 @@ class Router {
   // -- reader -----------------------------------------------------------------
 
   static constexpr size_t kMaxBatch = LpmRouteTable::kMaxBatch;
+  static_assert(Ipv6RouteTable::kMaxBatch == kMaxBatch);
 
   // Resolves each destination (host order) in `domain` to its next hop.
   // Returns a mask with bit i set where `hops[i]` was written; other positions
-  // untouched. A domain that does not exist resolves nothing (mask 0).
+  // untouched. A domain that does not exist, or a router without IPv4,
+  // resolves nothing (mask 0).
   uint64_t ResolveBatch(RouteDomainId domain, std::span<const uint32_t> dst,
                         std::span<const NextHop *> hops) const noexcept {
     const LpmRouteTable *routes = TableOf(domain);
@@ -480,6 +638,9 @@ class Router {
   // The default domain.
   uint64_t ResolveBatch(std::span<const uint32_t> dst,
                         std::span<const NextHop *> hops) const noexcept {
+    if (unlikely(default_routes_ == nullptr)) {
+      return 0;
+    }
     return ResolveBatchIn<false>(*default_routes_, dst, {}, hops);
   }
   // With each packet's flow hash, which picks the member of a group route.
@@ -493,20 +654,50 @@ class Router {
     }
     return ResolveBatchIn<true>(*routes, dst, flow_hashes, hops);
   }
+  // The IPv6 batch: one rte_fib6_lookup_bulk for the batch, then as above.
+  // A domain that does not exist, or a router without IPv6, resolves nothing.
+  uint64_t ResolveBatch6(RouteDomainId domain,
+                         std::span<const utils::Ipv6Address> dst,
+                         std::span<const uint32_t> flow_hashes,
+                         std::span<const NextHop *> hops) const noexcept {
+    promise(flow_hashes.size() == dst.size() && dst.size() == hops.size() &&
+            dst.size() <= kMaxBatch);
+    const Ipv6RouteTable *routes = Table6Of(domain);
+    if (unlikely(routes == nullptr)) {
+      return 0;
+    }
+    uint32_t ids[kMaxBatch];
+    const uint64_t mask =
+        routes->Read().LookupBatch(dst, std::span(ids, dst.size()));
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return HopsOf<true>(mask, ids, flow_hashes, hops);
+  }
 
-  // The next hop `dst` resolves to in `domain`, or nullptr for a miss or an
-  // unknown domain. Valid until the calling worker's next quiescent state.
-  // `flow_hash` picks the member of a group route.
+  // The next hop `dst` resolves to in `domain`, or nullptr for a miss, an
+  // unknown domain or a family the router does not serve. Valid until the
+  // calling worker's next quiescent state. `flow_hash` picks the member of a
+  // group route.
+  const NextHop *Resolve(RouteDomainId domain, const utils::Ipv6Address &dst,
+                         uint32_t flow_hash = 0) const noexcept {
+    const Ipv6RouteTable *routes = Table6Of(domain);
+    if (unlikely(routes == nullptr)) {
+      return nullptr;
+    }
+    return HopOf(routes->Read().LookupOrMiss(dst), flow_hash);
+  }
   const NextHop *Resolve(RouteDomainId domain, uint32_t dst,
                          uint32_t flow_hash = 0) const noexcept {
     const LpmRouteTable *routes = TableOf(domain);
     if (unlikely(routes == nullptr)) {
       return nullptr;
     }
-    return ResolveIn(*routes, dst, flow_hash);
+    return HopOf(routes->Read().LookupOrMiss(dst), flow_hash);
   }
   const NextHop *Resolve(uint32_t dst) const noexcept {
-    return ResolveIn(*default_routes_, dst, 0);
+    if (unlikely(default_routes_ == nullptr)) {
+      return nullptr;
+    }
+    return HopOf(default_routes_->Read().LookupOrMiss(dst), 0);
   }
 
   // Only the route lookup: the next-hop id `dst` matches in `domain`, or
@@ -569,18 +760,26 @@ class Router {
   }
 
  private:
-  // A domain's FIB. Immutable once published, like every SlotTable object:
-  // the FIB inside synchronizes itself (rte_lpm or rte_fib in-place updates,
-  // the RcuPtr generation ReplaceAll publishes), so it is reached through a
-  // const Domain.
+  // A domain's FIBs, one per enabled family (null for a disabled one).
+  // Immutable once published, like every SlotTable object: each FIB
+  // synchronizes itself (rte_lpm or rte_fib in-place updates, the RcuPtr
+  // generations ReplaceAll and the IPv6 table publish), so it is reached
+  // through a const Domain.
   class Domain {
    public:
-    explicit Domain(std::unique_ptr<LpmRouteTable> table)
-        : table_(std::move(table)) {}
-    LpmRouteTable &table() const noexcept { return *table_; }
+    Domain(std::unique_ptr<LpmRouteTable> table,
+           std::unique_ptr<Ipv6RouteTable> table6)
+        : table_(std::move(table)), table6_(std::move(table6)) {}
+    LpmRouteTable *table() const noexcept { return table_.get(); }
+    Ipv6RouteTable *table6() const noexcept { return table6_.get(); }
+    // Routes in both tables.
+    size_t size() const {
+      return (table_ ? table_->size() : 0) + (table6_ ? table6_->size() : 0);
+    }
 
    private:
     std::unique_ptr<LpmRouteTable> table_;
+    std::unique_ptr<Ipv6RouteTable> table6_;
   };
 
   // SlotTable ids are one-based; a domain's slot is its id + 1.
@@ -592,16 +791,34 @@ class Router {
   }
 
   Router(const std::string &name, const Config &config,
-         std::unique_ptr<LpmRouteTable> default_routes, size_t max_next_hops,
+         std::unique_ptr<const Domain> default_domain, size_t max_next_hops,
          size_t max_domains, size_t max_groups, rcu::RcuDomain &rcu);
 
+  // A domain's FIBs for the router's families, named after `name`.
+  static std::expected<std::unique_ptr<const Domain>, RouteError> MakeDomain(
+      const std::string &name, const Config &config, rcu::RcuDomain &rcu);
+
   class RouteResource;
+  class NextHopResource;
+  class NeighborResource;
   class GroupResource;
 
-  // The domain's FIB, or nullptr for a domain that does not exist.
+  // The resource a value naming next hop `id` references: "<name>/neighbors"
+  // for a bound id, else "<name>/next_hops". `in_transaction` reads the
+  // bindings as the transaction in progress has them so far (a new value);
+  // otherwise the committed ones (a stored value). Engine-serialized.
+  dataplane::Reference HopReference(NextHopId id, bool in_transaction) const;
+  bool BoundInTransaction(NextHopId id) const;
+
+  // The domain's IPv4 / IPv6 FIB, or null for a domain that does not exist
+  // or a family the router does not serve.
   LpmRouteTable *TableOf(RouteDomainId domain) const noexcept {
     const Domain *d = domains_.Lookup(SlotOf(domain));
-    return d != nullptr ? &d->table() : nullptr;
+    return d != nullptr ? d->table() : nullptr;
+  }
+  Ipv6RouteTable *Table6Of(RouteDomainId domain) const noexcept {
+    const Domain *d = domains_.Lookup(SlotOf(domain));
+    return d != nullptr ? d->table6() : nullptr;
   }
 
   // Control-side walk over the existing domains, in id order. The caller holds
@@ -611,7 +828,7 @@ class Router {
   template <typename Fn>
   void ForEachDomain(Fn &&fn) const {
     for (const RouteDomainId id : domain_ids_) {
-      fn(id, *TableOf(id));
+      fn(id, *domains_.Lookup(SlotOf(id)));
     }
   }
   size_t CountRoutes() const;
@@ -644,9 +861,10 @@ class Router {
     return next_hops_.Lookup(NextHopId(MemberOf(value, flow_hash)));
   }
 
-  const NextHop *ResolveIn(const LpmRouteTable &routes, uint32_t dst,
-                           uint32_t flow_hash) const noexcept {
-    const uint32_t id = routes.Read().LookupOrMiss(dst);
+  // The next hop a looked-up route value names (a next hop or a group
+  // member), or nullptr for a miss. The acquire fence pairs with the release
+  // a route write puts after its next hop.
+  const NextHop *HopOf(uint32_t id, uint32_t flow_hash) const noexcept {
     std::atomic_thread_fence(std::memory_order_acquire);
     const NextHop *hop = next_hops_.Lookup(NextHopId(id));
     if (unlikely(hop == nullptr)) {
@@ -664,8 +882,18 @@ class Router {
                           std::span<const NextHop *> hops) const noexcept {
     promise(dst.size() == hops.size() && dst.size() <= kMaxBatch);
     uint32_t ids[kMaxBatch];
-    uint64_t mask = routes.Read().LookupBatch(dst, std::span(ids, dst.size()));
+    const uint64_t mask =
+        routes.Read().LookupBatch(dst, std::span(ids, dst.size()));
     std::atomic_thread_fence(std::memory_order_acquire);
+    return HopsOf<kHashed>(mask, ids, flow_hashes, hops);
+  }
+
+  // The hops for the looked-up values in `mask`, after the caller's acquire
+  // fence; clears the bits that name nothing.
+  template <bool kHashed>
+  uint64_t HopsOf(uint64_t mask, const uint32_t *ids,
+                  std::span<const uint32_t> flow_hashes,
+                  std::span<const NextHop *> hops) const noexcept {
     for (uint64_t m = mask; m != 0; m &= m - 1) {
       const size_t i = static_cast<size_t>(__builtin_ctzll(m));
       const NextHop *hop = next_hops_.Lookup(NextHopId(ids[i]));
@@ -690,15 +918,15 @@ class Router {
   rcu::RcuDomain &rcu_;
   const size_t max_domains_;
   const uint32_t max_next_hops_;  // route values above it name groups
-  // What a domain created on demand is sized with: the default domain's
-  // config (D-158).
+  // The families and what a domain created on demand is sized with: the
+  // default domain's config (D-158), `ipv6->max_value` set by Create().
   const Config domain_config_;
   // Slot = domain id + 1. Read lock-free by workers and the engine; written
   // under mutex_ -- by CreateDomain, and by the route resource for a domain a
   // transaction first writes into (D-158).
   dataplane::SlotTable<DomainSlot, Domain> domains_;
-  // Domain 0's FIB: it is never removed, so the default-domain readers skip
-  // the slot lookup.
+  // Domain 0's IPv4 FIB (null without IPv4): it is never removed, so the
+  // default-domain readers skip the slot lookup.
   LpmRouteTable *const default_routes_;
   std::vector<RouteDomainId> domain_ids_;  // existing domains, ascending
   // One immutable NextHop per id, changed one at a time (mode C): a neighbor
@@ -733,12 +961,29 @@ class Router {
 
   // Set by Enroll(); the resources exist while enrolled.
   const std::string next_hops_name_;
+  const std::string neighbors_name_;
   const std::string routes_name_;
   const std::string groups_name_;
   dataplane::ResourceRegistry *engine_ = nullptr;
   std::unique_ptr<dataplane::Resource> next_hops_res_;
+  std::unique_ptr<dataplane::Resource> neighbors_res_;
   std::unique_ptr<dataplane::Resource> groups_res_;  // holds nothing without max_groups
   std::unique_ptr<dataplane::Resource> routes_res_;
+
+  // Neighbor bindings (D-183), written by the engine's serialized
+  // transactions and read by the control side under the same serialization.
+  // Index = next-hop id, sized at construction, so publishing a binding never
+  // allocates.
+  std::vector<std::optional<NeighborKey>> bindings_;
+  size_t bound_count_ = 0;
+  NeighborBindingPolicy neighbor_policy_;
+  // The transaction in progress: the ids it binds (with their keys) or unbinds
+  // (empty), and the static ids it upserts. Cleared when it ends.
+  std::map<NextHopId, std::optional<NeighborKey>> staged_bindings_;
+  std::set<NextHopId> staged_static_;
+  // Published changes the owner has not taken yet; room for every staged one
+  // is reserved before anything publishes.
+  std::vector<NeighborBindingChange> binding_changes_;
 };
 
 }  // namespace bess::route

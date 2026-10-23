@@ -16,8 +16,10 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <rte_fib.h>
+#include <rte_fib6.h>
 #include <rte_lpm.h>
 #include <rte_memory.h>
 
@@ -26,6 +28,7 @@
 #include "rcu/rcu_ptr.h"
 #include "utils/common.h"
 #include "utils/dpdk_memory.h"
+#include "utils/ip.h"
 
 namespace bess::route {
 
@@ -49,6 +52,7 @@ enum class RouteError : uint8_t {
   kDomainExists,         // creating a route domain that already exists
   kDomainInUse,          // removing the default domain, or one with routes
   kUnsupportedBackend,   // the backend is not safe on this CPU (D-132)
+  kFamilyDisabled,       // the address family is not enabled on the router
 };
 
 const char *RouteErrorName(RouteError error);
@@ -72,6 +76,8 @@ inline int RouteErrno(RouteError error) {
       return EBUSY;
     case RouteError::kUnsupportedBackend:
       return ENOTSUP;
+    case RouteError::kFamilyDisabled:
+      return EAFNOSUPPORT;
     default:
       return EINVAL;
   }
@@ -92,6 +98,26 @@ class Ipv4Prefix {
   Ipv4Prefix(uint32_t addr, uint8_t length) : addr_(addr), length_(length) {}
 
   uint32_t addr_;
+  uint8_t length_;
+};
+
+// A validated IPv6 prefix, stored as network-order bytes. Like Ipv4Prefix,
+// only Make() builds one, so every prefix a table sees has length <= 128 and
+// no host bits set.
+class Ipv6Prefix {
+ public:
+  static std::expected<Ipv6Prefix, RouteError> Make(
+      utils::Ipv6Address addr, uint8_t length);
+
+  const utils::Ipv6Address &addr() const noexcept { return addr_; }
+  uint8_t length() const noexcept { return length_; }
+  friend auto operator<=>(const Ipv6Prefix &, const Ipv6Prefix &) = default;
+
+ private:
+  Ipv6Prefix(utils::Ipv6Address addr, uint8_t length)
+      : addr_(addr), length_(length) {}
+
+  utils::Ipv6Address addr_;
   uint8_t length_;
 };
 
@@ -360,6 +386,278 @@ inline uint64_t LpmRouteTable::View::LookupBatchFib(
 }
 
 inline LpmRouteTable::View LpmRouteTable::Read() const noexcept {
+  return View(live_.Read());
+}
+
+// One route domain's IPv6 routes on DPDK rte_fib6 (TRIE), mapping a prefix to
+// a value no larger than Config::max_value. Lookups are lock-free and batch
+// through one rte_fib6_lookup_bulk(); ::/0 is kept beside the trie as each
+// instance's default value, as LpmRouteTable keeps it.
+//
+// Why two instances and not in-place updates. rte_fib6's trie (unpatched DPDK)
+// cannot change a rule in place without possibly allocating: rewriting a rule
+// takes a transient tbl8 group (a byte-aligned prefix descends one level past
+// itself, a prefix of /24 or shorter one level on each edge) and folds it back,
+// and a rule added with its parent's value takes its groups on a later change
+// -- when the pool may be empty while freed groups wait for a grace period. A
+// change or a delete at publication could then fail half written. So a table
+// owns two instances: `live`, which readers use through RCU and nobody edits,
+// and a `spare`, never visible while it is edited. A change edits the spare
+// (all allocation and every capacity check happen there) and publication is
+// one pointer exchange: the spare becomes live, and the old live becomes the
+// spare once a grace period has passed, remembering which prefixes it lags
+// behind the rules by; the next change replays those (or rebuilds the spare
+// from the rules when its grace period has not completed, retiring it, or a
+// replay fails). No QSBR is attached to the instances: one is edited only
+// while unpublished and after its grace period, so the trie may recycle tbl8
+// groups at once. Readers see the whole old table or the whole new one.
+//
+// Entries are 2 bytes when both `max_value` + 1 (the miss marker) and
+// `tbl8_groups` fit rte_fib6's 2-byte next hop (2^15 - 1: entries hold value
+// << 1, and trie_create refuses more tbl8 groups than a next hop can name),
+// else 4 bytes. Memory per instance: tbl24 is 2^24 entries (32 MiB at 2 bytes,
+// 64 MiB at 4) plus `tbl8_groups` x 256 entries (4 MiB / 8 MiB for the default
+// 8192 groups) plus the rib's 2 x max_routes nodes. A table holds one instance
+// until its first change and two after; a spare retired before its grace
+// period ended lives until the grace period does.
+//
+// Two ways to write. Upsert()/Erase() are one-change transactions (the direct
+// API). A Stage composes several: BeginStage() readies the spare, the Stage's
+// own Upsert()/Erase() edit it, and Commit() publishes it -- no allocation,
+// cannot fail -- or Abort() drops the edits. Writers are serialized
+// internally and only one stage is open at a time. Readers call Read() once
+// per batch and must be RcuDomain readers (workers are).
+class Ipv6RouteTable {
+ public:
+  struct Config {
+    uint32_t max_routes = 1024;  // prefixes other than ::/0
+    uint32_t tbl8_groups = 8192;  // per instance; see the class comment
+    // The largest value the owner stores (at most LpmRouteTable::kMaxValue):
+    // it decides the entry size.
+    uint32_t max_value = LpmRouteTable::kMaxValue;
+    int socket = bess::utils::MemoryNode();  // DPDK socket id (D-123)
+  };
+
+  static constexpr size_t kMaxBatch = LpmRouteTable::kMaxBatch;
+
+  // The bytes per trie entry `config` gets: 2 or 4 (see the class comment).
+  static size_t EntryBytes(const Config &config) noexcept;
+
+  class Stage;
+  class View;
+
+  // kValueOutOfRange for a max_value past LpmRouteTable::kMaxValue;
+  // kTableFull when DPDK has no memory for the instance.
+  static std::expected<std::unique_ptr<Ipv6RouteTable>, RouteError> Create(
+      std::string name, const Config &config, rcu::RcuDomain &domain);
+
+  // The owner guarantees no reader still uses the table and no stage is open.
+  ~Ipv6RouteTable();
+
+  Ipv6RouteTable(const Ipv6RouteTable &) = delete;
+  Ipv6RouteTable &operator=(const Ipv6RouteTable &) = delete;
+
+  // -- direct writer (control threads) ---------------------------------------
+
+  // Adds `prefix` or changes its value, published at once. kValueOutOfRange
+  // past max_value; kTableFull for a new prefix past max_routes or tbl8
+  // groups the spare lacks (the live table is then unchanged).
+  std::expected<void, RouteError> Upsert(Ipv6Prefix prefix, uint32_t value);
+  std::expected<void, RouteError> Erase(Ipv6Prefix prefix);
+
+  // Control-side reads of the committed rules (::/0 included).
+  std::optional<uint32_t> Find(Ipv6Prefix prefix) const;
+  size_t size() const;
+  template <typename Fn>
+  void ForEach(Fn &&fn) const {
+    std::lock_guard<std::mutex> lock(writer_mutex_);
+    for (const auto &[prefix, value] : rules_) {
+      fn(prefix, value);
+    }
+  }
+  const Config &config() const noexcept { return config_; }
+  size_t entry_bytes() const noexcept { return entry_bytes_; }
+  // rte_fib6 instances built so far: the first live one, then a spare
+  // whenever none could be reused (see the class comment).
+  size_t builds() const;
+
+  // -- transactions ------------------------------------------------------------
+
+  // Readies the spare and opens a stage on it. All allocation and capacity
+  // work happens here and in the Stage's edits; nothing is visible until
+  // Commit(). One stage at a time.
+  std::expected<std::unique_ptr<Stage>, RouteError> BeginStage();
+  // Publishes `stage`: one pointer exchange. Does not allocate and cannot
+  // fail. The replaced instance is not edited again until Committed() hands
+  // the grace period that covers it.
+  void Commit(Stage &stage) noexcept;
+  // Drops `stage`'s edits; readers never saw them.
+  void Abort(Stage &stage) noexcept;
+  // The grace period started after the last Commit(); called once per
+  // Commit, before the next BeginStage (Retirer::AfterGracePeriodStarts). A
+  // BeginStage that comes first starts one itself.
+  void Committed(rcu::GracePeriod token) noexcept;
+
+  // -- reader ------------------------------------------------------------------
+
+  // One acquire load; valid until the calling worker's next quiescent state.
+  View Read() const noexcept;
+
+ private:
+  using Rules = std::map<Ipv6Prefix, uint32_t>;
+
+  // One rte_fib6 and the default route that goes with it. Readers see it
+  // only while it is live, and it is edited only while it is not.
+  struct Instance {
+    ~Instance();
+    struct rte_fib6 *fib = nullptr;
+    uint32_t default_value = LpmRouteTable::kNoDefault;
+    uint32_t miss = 0;  // rte_fib6's answer where no rule matches
+  };
+
+  Ipv6RouteTable(std::string name, const Config &config, rcu::RcuDomain &domain)
+      : name_(std::move(name)),
+        config_(config),
+        entry_bytes_(EntryBytes(config)),
+        domain_(domain),
+        live_(domain) {}
+
+  // With writer_mutex_ held.
+  std::expected<std::unique_ptr<Instance>, RouteError> NewInstance();
+  std::expected<std::unique_ptr<Instance>, RouteError> Build();
+  bool Replay(Instance &instance);
+  std::expected<void, RouteError> PrepareSpare();
+  std::expected<std::unique_ptr<Stage>, RouteError> BeginStageLocked();
+  void CommitLocked(Stage &stage) noexcept;
+  void AbortLocked(Stage &stage) noexcept;
+  size_t RoutesLocked() const noexcept;
+  // rte_fib6_add (a value) or rte_fib6_delete (none), or the default for
+  // ::/0. 0 or -errno; deleting an absent rule is 0.
+  static int Apply(Instance &instance, Ipv6Prefix prefix,
+                   std::optional<uint32_t> value);
+
+  const std::string name_;
+  const Config config_;
+  const size_t entry_bytes_;
+  rcu::RcuDomain &domain_;
+  rcu::RcuPtr<Instance> live_;
+
+  mutable std::mutex writer_mutex_;
+  Rules rules_;  // ::/0 included
+  std::unique_ptr<Instance> spare_;
+  // The spare's reuse token: unset from a Commit until Committed(). Not used
+  // while the spare has never been published.
+  std::optional<rcu::GracePeriod> spare_token_;
+  // The spare was built and never published: no reader has seen it, so it is
+  // editable without a grace period (an aborted stage leaves it so).
+  bool spare_unpublished_ = false;
+  // Prefixes where the spare may differ from rules_.
+  std::vector<Ipv6Prefix> spare_lag_;
+  bool stage_open_ = false;
+  size_t builds_ = 0;
+};
+
+class Ipv6RouteTable::Stage {
+ public:
+  // Aborts a stage neither committed nor aborted.
+  ~Stage();
+  Stage(const Stage &) = delete;
+  Stage &operator=(const Stage &) = delete;
+
+  // kValueOutOfRange past max_value; kTableFull for a new prefix past
+  // max_routes or tbl8 groups the spare lacks. A refused DPDK edit leaves the
+  // stage unusable (kBackendFailure for every later edit): abort it.
+  std::expected<void, RouteError> Upsert(Ipv6Prefix prefix, uint32_t value);
+  // kNotFound for a prefix the staged table does not hold.
+  std::expected<void, RouteError> Erase(Ipv6Prefix prefix);
+  // The staged table's value for `prefix`.
+  std::optional<uint32_t> Find(Ipv6Prefix prefix) const;
+
+ private:
+  friend class Ipv6RouteTable;
+
+  struct Change {
+    std::optional<uint32_t> value;  // none: erased
+    // For a prefix the committed rules lack: its rules node, made here so
+    // Commit() only links it.
+    Rules::node_type node;
+  };
+
+  explicit Stage(Ipv6RouteTable &table) : table_(table) {}
+
+  // With the table's writer_mutex_ held.
+  std::expected<void, RouteError> UpsertLocked(Ipv6Prefix prefix,
+                                               uint32_t value);
+  std::expected<void, RouteError> EraseLocked(Ipv6Prefix prefix);
+  std::optional<uint32_t> FindLocked(Ipv6Prefix prefix) const;
+
+  Ipv6RouteTable &table_;
+  std::map<Ipv6Prefix, Change> changes_;
+  std::vector<Ipv6Prefix> touched_;  // changes_' keys: the spare's next lag
+  // Room for the committed nodes Commit() unlinks; freed with the stage.
+  std::vector<Rules::node_type> erased_;
+  size_t routes_ = 0;  // prefixes other than ::/0 in the staged table
+  bool broken_ = false;  // a DPDK edit failed: the spare is unusable
+  bool done_ = true;  // committed, aborted, or not yet opened
+};
+
+class Ipv6RouteTable::View {
+ public:
+  // The value for `addr`, falling back to the default route, or
+  // LpmRouteTable::kNoDefault for a miss.
+  uint32_t LookupOrMiss(const utils::Ipv6Address &addr) const noexcept {
+    uint64_t nh;
+    rte_fib6_lookup_bulk(instance_->fib, AsDpdk(&addr), &nh, 1);
+    return nh != instance_->miss ? static_cast<uint32_t>(nh)
+                                 : instance_->default_value;
+  }
+
+  std::optional<uint32_t> Lookup(const utils::Ipv6Address &addr) const noexcept {
+    const uint32_t value = LookupOrMiss(addr);
+    return value == LpmRouteTable::kNoDefault ? std::nullopt
+                                              : std::optional<uint32_t>(value);
+  }
+
+  // One rte_fib6_lookup_bulk() for the batch (the lookup is reached through a
+  // function pointer, AVX-512 where the CPU has it). Writes `values[i]` and
+  // returns a mask with bit i set where a route (or the default) matched;
+  // other positions are unspecified. Equal sizes, at most kMaxBatch.
+  uint64_t LookupBatch(std::span<const utils::Ipv6Address> addrs,
+                       std::span<uint32_t> values) const noexcept {
+    promise(addrs.size() == values.size() && addrs.size() <= kMaxBatch);
+    uint64_t nh[kMaxBatch];
+    rte_fib6_lookup_bulk(instance_->fib, AsDpdk(addrs.data()), nh,
+                         static_cast<int>(addrs.size()));
+    const uint32_t def = instance_->default_value;
+    uint64_t hits = 0;
+    for (size_t i = 0; i < addrs.size(); i++) {
+      const bool hit = nh[i] != instance_->miss;
+      hits |= uint64_t{hit} << i;
+      values[i] = hit ? static_cast<uint32_t>(nh[i]) : def;
+    }
+    if (def != LpmRouteTable::kNoDefault) {
+      hits = addrs.size() == 64 ? ~uint64_t{0}
+                                : (uint64_t{1} << addrs.size()) - 1;
+    }
+    return hits;
+  }
+
+ private:
+  friend class Ipv6RouteTable;
+  explicit View(const Instance *instance) : instance_(instance) {}
+
+  // The same 16 network-order bytes.
+  static_assert(sizeof(utils::Ipv6Address) == sizeof(struct rte_ipv6_addr) &&
+                alignof(utils::Ipv6Address) == alignof(struct rte_ipv6_addr));
+  static const struct rte_ipv6_addr *AsDpdk(
+      const utils::Ipv6Address *addr) noexcept {
+    return reinterpret_cast<const struct rte_ipv6_addr *>(addr);
+  }
+
+  const Instance *instance_;
+};
+
+inline Ipv6RouteTable::View Ipv6RouteTable::Read() const noexcept {
   return View(live_.Read());
 }
 

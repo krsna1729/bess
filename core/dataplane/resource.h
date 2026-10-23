@@ -299,9 +299,11 @@ class Resource {
 
 
   // Validates `op` and does all its fallible work (decoding, allocation,
-  // capacity), leaving nothing visible. Called once per operation, in
-  // request order; a resource that reserves capacity must account for the
-  // earlier reservations of the same transaction.
+  // capacity), leaving nothing visible. Called once per operation: resources
+  // in ascending rank (every operation on a resource's referents first), and
+  // a resource's own operations in request order; a resource that reserves
+  // capacity must account for the earlier reservations of the same
+  // transaction.
   virtual std::expected<Reservation, std::string> Reserve(const Op &op) = 0;
 
   // Called once per transaction that reserved an operation here, after every

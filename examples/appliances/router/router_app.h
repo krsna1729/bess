@@ -61,13 +61,18 @@ class RouterApp {
   // the Router module name the same outcomes, and a decision adds only where
   // the frame was headed.
   struct Decision {
-    bess::route::ForwardVerdict verdict = bess::route::ForwardVerdict::kNotIpv4;
+    bess::route::ForwardVerdict verdict = bess::route::ForwardVerdict::kNotIp;
     InterfaceId egress{};
   };
 
   static std::expected<std::unique_ptr<RouterApp>, std::string> Create(bess::rcu::RcuDomain &rcu) {
+    // IPv4 only: the static policy routes IPv4, so IPv6 frames are
+    // kFamilyDisabled and no IPv6 FIB is allocated.
     auto router = bess::route::Router::Create(
-        "r1_appliance", bess::route::Router::Config{.max_routes = 64, .tbl8_groups = 8},
+        "r1_appliance",
+        bess::route::Router::Config{
+            .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 8},
+            .ipv6 = std::nullopt},
         /*max_next_hops=*/16, rcu, /*max_domains=*/3, /*max_groups=*/4);
     if (!router) {
       return std::unexpected(std::string("router: ") + bess::route::RouteErrorName(router.error()));
@@ -103,7 +108,7 @@ class RouterApp {
     if (resolved.verdict != bess::route::ForwardVerdict::kForward) {
       return {resolved.verdict, resolved.egress};
     }
-    if (bess::route::WriteForwarded(frame, resolved.l3_offset, *resolved.hop) !=
+    if (bess::route::WriteForwarded(frame, resolved.family, resolved.l3_offset, *resolved.hop) !=
         bess::route::TtlResult::kForward) {
       // ResolveFrame refuses a TTL of 0 or 1, so this needs the header to have
       // changed between the two calls; naming it keeps the boundary honest.
@@ -155,7 +160,10 @@ class RouterApp {
                    Interface{InterfaceId{uint16_t{3}}, Mac(3), kVrf2, 0xc63364fe, 24},
                    Interface{InterfaceId{uint16_t{4}}, Mac(4), kVrf2, 0xcb0071fe, 24}};
     for (const RouteDomainId vrf : {kVrf1, kVrf2}) {
-      if (!router_->CreateDomain(vrf, bess::route::Router::Config{.max_routes = 16, .tbl8_groups = 4})) {
+      if (!router_->CreateDomain(
+              vrf, bess::route::Router::Config{
+                       .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 16, .tbl8_groups = 4},
+                       .ipv6 = std::nullopt})) {
         return "create VRF";
       }
     }

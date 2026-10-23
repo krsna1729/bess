@@ -25,8 +25,11 @@ using bess::route::RouteErrorName;
 // `domain` is the reclamation domain the router retires replaced tables to;
 // in a module it comes from the init context.
 bool RouteSample(bess::rcu::RcuDomain &domain) {
-  auto router = Router::Create("sample", Router::Config{.max_routes = 64, .tbl8_groups = 4},
-                               /*max_next_hops=*/16, domain);
+  auto router = Router::Create(
+      "sample",
+      Router::Config{.ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 4},
+                     .ipv6 = std::nullopt},
+      /*max_next_hops=*/16, domain);
   if (!router) {
     std::fprintf(stderr, "create: %s\n", RouteErrorName(router.error()));
     return false;

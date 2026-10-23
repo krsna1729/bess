@@ -14,7 +14,7 @@
 modules:
   - name: ipfwd
     mclass: Router
-    arg: {mode: ROUTE_MODE_DESTINATION, max_routes: 16, max_next_hops: 8}
+    arg: {mode: ROUTE_MODE_DESTINATION, max_ipv4_routes: 16, max_next_hops: 8}
   - name: rewrite0
     mclass: Rewrite
     arg:

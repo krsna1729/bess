@@ -29,16 +29,28 @@
 
 namespace bess::route {
 
-// IPv4 neighbor resolution over Ethernet (ARP): solicitation with retries and
-// backoff, learning, aging, MAC changes, failure and recovery (M15, D-175).
+// IPv4 neighbor resolution over Ethernet (ARP) and IPv6 Neighbor Discovery:
+// solicitation with retries and backoff, learning, aging, MAC changes,
+// failure and recovery (M15, D-175).
 //
 // The resolver is the event source for the neighbor table
-// (`neighbor_table.h`): it owns one neighbor entry per (interface, IPv4
-// address), created by Bind, and moves it through
+// (`neighbor_table.h`): it owns one neighbor entry per (interface, address),
+// created by Bind, and moves it through
 //
-//   kIncomplete --reply--> kResolved --aging--> kIncomplete (re-solicit)
-//        |                                   |
-//        +--max probes--> kUnreachable --retry--> kIncomplete
+//   kIncomplete --reply--> kResolved --aging--> kResolved, reconfirming
+//        |                    ^   (keeps its MAC; solicits)  |      |
+//        |                    +-----------reply--------------+      |
+//        +--max probes--> kUnreachable <------max probes------------+
+//                              |
+//                              +--retry--> kIncomplete
+//
+// Aging does not take a resolved neighbor out of service (RFC 4861's STALE
+// and PROBE states, D-183): when its reachable lifetime ends it keeps
+// forwarding on the MAC it has while the resolver solicits again, with the
+// same probe count and backoff as a first attempt. A reply refreshes it; only
+// an attempt that sends max_probes without one fails it to kUnreachable, which
+// clears the MAC. So a live neighbor never drops traffic for being re-checked,
+// and a dead one is out of service after at most the probe budget.
 //
 // Every transition calls NeighborTable::Update and returns the next hops to
 // republish, so the caller still publishes adjacency with the existing
@@ -47,23 +59,25 @@ namespace bess::route {
 // packet and no route: the caller owns the graph, the gates, the buffers and
 // the policy for a frame whose next hop is unresolved.
 //
-// Identity. A neighbor is named by (dataplane::InterfaceId, IPv4 address), the
+// Identity. A neighbor is named by (dataplane::InterfaceId, address), the
 // same key as NeighborTable. The interface also has an identity of its own --
-// its MAC and its own address -- and every entry remembers the interface
-// generation it was created under. A reply is accepted only when all of these
-// hold:
+// its MAC and its addresses, any number of each family with their prefixes --
+// and every entry remembers the interface generation it was created under. A
+// solicited reply is accepted only when all of these hold:
 //   - the frame arrives on the interface the entry belongs to;
 //   - the entry's interface generation is still current;
 //   - the reply's Ethernet source and ARP sender match, and the frame is
-//     addressed to the interface's MAC;
+//     addressed to the interface's MAC (or, for ARP, broadcast);
 //   - the reply's sender address is the entry's address;
-//   - the reply's target address is the interface's current own address;
+//   - the reply's target address is one of the interface's current addresses;
 //   - the sender's MAC is a usable unicast address.
 // A stale reply -- one in flight when the interface's address moved, one that
 // arrives on another interface, or one for a neighbor that was unbound and
-// rebound -- is ignored rather than applied to a newer entry. A reply never
-// creates a neighbor: only Bind does, so an unsolicited frame cannot populate
-// the table.
+// rebound -- is ignored rather than applied to a newer entry. ARP that
+// answers nothing (a request, a gratuitous announcement) still moves a bound
+// neighbor to the MAC it announces, as RFC 826's merge does, and has it
+// reconfirmed (OnArp). Nothing ever creates a neighbor: only Bind does, so an
+// unsolicited frame cannot populate the table.
 //
 // Timers. The resolver reuses the worker-owned ExpiryWheel
 // (`dataplane/expiry_wheel.h`) instead of keeping a second timer wheel. Each
@@ -87,9 +101,8 @@ namespace bess::route {
 // knows no rate. Timing values are therefore ticks too, and zero has the
 // documented meaning at each field.
 //
-// IPv6 ND is not implemented yet; the state machine and the key are ready for
-// another address family over the same entries, and the packet helpers are
-// address-family specific.
+// IPv4 ARP and IPv6 Neighbor Discovery use the same address-family-tagged
+// entries; packet helpers remain family-specific.
 class NeighborResolver {
  public:
   using Key = NeighborTable::Key;
@@ -107,14 +120,17 @@ class NeighborResolver {
     // Solicitations per resolution attempt (1..). The attempt fails after the
     // last one, when its retry timer fires.
     uint32_t max_probes = 3;
-    // How long a resolved neighbor stays usable before it is solicited again.
-    // Zero disables aging: a resolved neighbor stays resolved until a reply
-    // changes it or it is unbound.
+    // How long a resolved neighbor goes unconfirmed before it is solicited
+    // again. It keeps forwarding on its MAC while that attempt runs and fails
+    // only when the attempt does (max_probes without a reply). Zero disables
+    // aging: a resolved neighbor stays resolved until a reply changes it or it
+    // is unbound.
     uint64_t reachable_lifetime = 30000;
-    // How long an unreachable neighbor waits before another attempt. Zero
-    // means no further attempt: it stays unreachable until a reply arrives or
-    // the caller removes and rebinds it.
-    uint64_t unreachable_retry = 60000;
+    // How long an unreachable neighbor waits before another attempt; the
+    // default is the backoff ceiling, so a failed neighbor keeps being probed
+    // at that rate. Zero means no further attempt: it stays unreachable until
+    // a reply arrives or the caller removes and rebinds it.
+    uint64_t unreachable_retry = 8000;
   };
 
   struct Config {
@@ -126,15 +142,43 @@ class NeighborResolver {
     Timing timing;
   };
 
-  // The identity of an interface for resolution: what it sends from (MAC and
-  // own addresses) and how it is named. The IPv4 address is host order, as the
-  // key stores it; IPv6 is the 16-byte address (unspecified :: means none).
-  // The packet helpers convert at the wire boundary.
+  // One address an interface holds, with its on-link prefix length: the
+  // prefix picks which address a solicitation for a neighbor in it leaves
+  // from. A host address is /32 or /128.
+  struct InterfaceAddress {
+    NeighborAddress address;
+    uint8_t prefix_length = 0;
+
+    // Whether `other` is in this address's prefix (same family only).
+    bool Contains(const NeighborAddress &other) const noexcept {
+      if (other.family != address.family) {
+        return false;
+      }
+      const unsigned whole = prefix_length / 8u;
+      if (std::memcmp(address.bytes, other.bytes, whole) != 0) {
+        return false;
+      }
+      const unsigned rest = prefix_length % 8u;
+      if (rest == 0) {
+        return true;
+      }
+      const auto mask = static_cast<uint8_t>(0xffu << (8u - rest));
+      return (address.bytes[whole] & mask) == (other.bytes[whole] & mask);
+    }
+
+    friend bool operator==(const InterfaceAddress &,
+                           const InterfaceAddress &) = default;
+  };
+
+  // The identity of an interface for resolution: what it sends from (its MAC
+  // and addresses) and how it is named. Addresses of both families, in
+  // configuration order: a solicitation leaves from the address whose prefix
+  // holds the neighbor, else from the first address of the neighbor's family;
+  // an interface with no address of a family sends no solicitation for it.
   struct Interface {
     dataplane::InterfaceId id;
     utils::Ethernet::Address mac;
-    uint32_t ipv4 = 0;  // zero: no IPv4 address, cannot send ARP
-    utils::Ipv6Address ipv6{};  // :: means none, cannot send NS
+    std::vector<InterfaceAddress> addresses;
   };
 
   // One solicitation to put on the wire: an ARP request or a Neighbor
@@ -185,22 +229,44 @@ class NeighborResolver {
 
   // -- control side -----------------------------------------------------------
 
-  // Adds an interface or replaces its identity. A changed MAC or address
+  // Adds an interface or replaces its identity. A changed MAC or address list
   // starts a new interface generation: every neighbor on it is marked
   // incomplete, its pending solicitation is cancelled, and resolution starts
   // again from the new identity. The same identity again returns an empty
-  // Progress. `now` is the clock for the new first probes.
+  // Progress. `now` is the clock for the new first probes. An address that
+  // cannot be an interface's (unspecified, broadcast, multicast, a prefix
+  // longer than its family) or a repeated one is refused.
   std::expected<Progress, std::string> ConfigureInterface(const Interface &iface,
                                                           uint64_t now) {
+    for (size_t i = 0; i < iface.addresses.size(); i++) {
+      const InterfaceAddress &entry = iface.addresses[i];
+      if (entry.address.is_ipv4()) {
+        const uint32_t v4 = entry.address.ipv4();
+        if (v4 == 0 || v4 == 0xffffffffu || entry.prefix_length > 32) {
+          return std::unexpected("invalid interface address");
+        }
+      } else {
+        const utils::Ipv6Address v6 = entry.address.ipv6();
+        if (v6.IsUnspecified() || v6.IsMulticast() || entry.prefix_length > 128) {
+          return std::unexpected("invalid interface address");
+        }
+      }
+      for (size_t j = 0; j < i; j++) {
+        if (iface.addresses[j].address == entry.address) {
+          return std::unexpected("repeated interface address");
+        }
+      }
+    }
     auto it = interfaces_.find(iface.id);
     if (it != interfaces_.end() && it->second.mac == iface.mac &&
-        it->second.ipv4 == iface.ipv4 && it->second.ipv6 == iface.ipv6) {
+        it->second.addresses == iface.addresses) {
       return Progress{};
     }
     uint32_t epoch = it == interfaces_.end() ? 1 : it->second.epoch + 1;
     if (epoch == 0) {
       epoch = 1;  // wrapped: no entry can still name the old generation
     }
+    StoredInterface stored{iface.mac, iface.addresses, epoch};
 
     // Stage every neighbor key on the interface -- bound or not, so retained
     // learning is invalidated -- before committing the identity or touching
@@ -220,10 +286,10 @@ class NeighborResolver {
     out.updates.reserve(update_count);
 
     // Commit. insert_or_assign may allocate only for an interface id not seen
-    // before, and only before any neighbor is committed; if it throws, nothing
-    // else has changed and the same call retried converges.
-    interfaces_.insert_or_assign(
-        iface.id, StoredInterface{iface.mac, iface.ipv4, iface.ipv6, epoch});
+    // before (the address list was copied above), and only before any
+    // neighbor is committed; if it throws, nothing else has changed and the
+    // same call retried converges.
+    interfaces_.insert_or_assign(iface.id, std::move(stored));
     for (NeighborTable::Prepared &update : prepared) {
       neighbors_.Commit(update);
       AppendUpdates(std::move(update.updates), out);
@@ -232,6 +298,7 @@ class NeighborResolver {
         entry->second.epoch = epoch;
         entry->second.state = NeighborState::kIncomplete;
         entry->second.probes = 0;
+        entry->second.reconfirming = false;
         if (!Arm(update.key, entry->second, now, timing_.first_probe)) {
           // No usable timer node: forget the entry rather than keep a
           // neighbor that can never solicit. The committed update already
@@ -277,12 +344,12 @@ class NeighborResolver {
     return out;
   }
 
-  // Binds next hop `hop` to neighbor `key` and starts resolving it. Returns
-  // the next hop as it should be published now (the neighbor's current state
-  // if it is already known, incomplete otherwise). Rebinding a hop moves it;
-  // it does not restart an existing neighbor's resolution.
-  std::expected<NextHop, std::string> Bind(NextHopId hop, Key key,
-                                            uint64_t now) {
+  // Whether `key` can be bound: its interface is configured and holds an
+  // address of the neighbor's family to solicit from, and the address is a
+  // usable unicast neighbor that is not one of the interface's own. Bind
+  // refuses exactly what this refuses (and, beyond it, only a full table or
+  // timer wheel), so an owner can check a binding before committing to it.
+  std::expected<void, std::string> CheckBind(Key key) const {
     auto iface = interfaces_.find(key.interface);
     if (iface == interfaces_.end()) {
       return std::unexpected("unknown interface");
@@ -291,18 +358,33 @@ class NeighborResolver {
       if (key.address.ipv4() == 0 || key.address.ipv4() == 0xffffffffu) {
         return std::unexpected("invalid neighbor address");
       }
-      if (key.address.ipv4() == iface->second.ipv4) {
-        return std::unexpected("an interface cannot be its own neighbor");
-      }
     } else {
       const utils::Ipv6Address address = key.address.ipv6();
       if (address.IsUnspecified() || address.IsMulticast()) {
         return std::unexpected("invalid neighbor address");
       }
-      if (address == iface->second.ipv6) {
-        return std::unexpected("an interface cannot be its own neighbor");
-      }
     }
+    if (Owns(iface->second, key.address)) {
+      return std::unexpected("an interface cannot be its own neighbor");
+    }
+    if (SourceFor(iface->second, key.address) == nullptr) {
+      return std::unexpected(key.address.is_ipv4()
+                                 ? "the interface has no IPv4 address to solicit from"
+                                 : "the interface has no IPv6 address to solicit from");
+    }
+    return {};
+  }
+
+  // Binds next hop `hop` to neighbor `key` and starts resolving it. Returns
+  // the next hop as it should be published now (the neighbor's current state
+  // if it is already known, incomplete otherwise). Rebinding a hop moves it;
+  // it does not restart an existing neighbor's resolution.
+  std::expected<NextHop, std::string> Bind(NextHopId hop, Key key,
+                                            uint64_t now) {
+    if (auto valid = CheckBind(key); !valid) {
+      return std::unexpected(valid.error());
+    }
+    auto iface = interfaces_.find(key.interface);
     const bool key_exists = entries_.contains(key);
     const std::optional<NeighborTable::Bound> previous =
         neighbors_.BindingOf(hop);
@@ -349,29 +431,44 @@ class NeighborResolver {
     if (released_key) {
       auto stale = entries_.find(*released_key);
       if (stale != entries_.end()) {
-        Disarm(stale->second);
-        entries_.erase(stale);
+        Release(stale);
       }
     }
 
     entry->second.epoch = iface->second.epoch;
-    const auto learned = neighbors_.Find(key);
-    const NeighborState state =
-        learned ? learned->state : NeighborState::kIncomplete;
-    entry->second.state = state;
-    entry->second.probes = 0;
-    // A neighbor that is already known continues from that state; a fresh
-    // one solicits. The two "no timer" configurations (aging and retry
-    // disabled) leave the entry in its current state.
     bool armed = true;
-    if (state == NeighborState::kResolved) {
-      armed = timing_.reachable_lifetime == 0 ||
-              Arm(key, entry->second, now, timing_.reachable_lifetime);
-    } else if (state == NeighborState::kUnreachable) {
-      armed = timing_.unreachable_retry == 0 ||
-              Arm(key, entry->second, now, timing_.unreachable_retry);
+    const auto saved = deferred_entries_.find(key);
+    if (saved != deferred_entries_.end()) {
+      // Released earlier in this batch (DeferForgetting): it continues as if
+      // it had never been, with its reconfirmation, probe count and deadline.
+      const Entry &was = saved->second.entry;
+      entry->second.state = was.state;
+      entry->second.probes = was.probes;
+      entry->second.reconfirming = was.reconfirming;
+      entry->second.serial = was.serial;
+      if (const std::optional<uint64_t> &deadline = saved->second.deadline;
+          deadline.has_value()) {
+        armed = ArmAt(key, entry->second, std::max(*deadline, now));
+      }
     } else {
-      armed = Arm(key, entry->second, now, timing_.first_probe);
+      const auto learned = neighbors_.Find(key);
+      const NeighborState state =
+          learned ? learned->state : NeighborState::kIncomplete;
+      entry->second.state = state;
+      entry->second.probes = 0;
+      entry->second.reconfirming = false;
+      // A neighbor that is already known continues from that state; a fresh
+      // one solicits. The two "no timer" configurations (aging and retry
+      // disabled) leave the entry in its current state.
+      if (state == NeighborState::kResolved) {
+        armed = timing_.reachable_lifetime == 0 ||
+                Arm(key, entry->second, now, timing_.reachable_lifetime);
+      } else if (state == NeighborState::kUnreachable) {
+        armed = timing_.unreachable_retry == 0 ||
+                Arm(key, entry->second, now, timing_.unreachable_retry);
+      } else {
+        armed = Arm(key, entry->second, now, timing_.first_probe);
+      }
     }
     if (!armed) {
       // The wheel refused the new timer. Put the hop back where it was (a
@@ -401,13 +498,19 @@ class NeighborResolver {
       }
       return std::unexpected("timer capacity exhausted");
     }
+    if (saved != deferred_entries_.end()) {
+      deferred_entries_.erase(saved);
+    }
     DropIfUnbound(previous, key);
     return initial;
   }
 
   // Forgets `hop`'s binding. A neighbor no next hop names any more stops
-  // being resolved here; a learned entry stays in the neighbor table but has
-  // no timers and no solicitations.
+  // being resolved and is forgotten -- its timer, its solicitations and what
+  // was learned about it -- so the table holds only bound neighbors and a
+  // later binding of the same address starts incomplete and solicits. Inside
+  // DeferForgetting() only its timer and capacity go at once; what was learned
+  // waits for ForgetUnbound().
   void Unbind(NextHopId hop) {
     const std::optional<NeighborTable::Bound> binding =
         neighbors_.BindingOf(hop);
@@ -417,17 +520,61 @@ class NeighborResolver {
     }
     auto entry = entries_.find(binding->key);
     if (entry != entries_.end()) {
-      Disarm(entry->second);
-      entries_.erase(entry);
+      Release(entry);
     }
+    if (!defer_forgetting_) {
+      neighbors_.Forget(binding->key);
+    }
+  }
+
+  // Starts a batch of Bind and Unbind calls that moves bindings between next
+  // hops. Until ForgetUnbound(), a neighbor whose last binding goes releases
+  // its timer and its room at once but keeps what was learned and where its
+  // resolution stood (reconfirming, probes sent, the timer's deadline), so a
+  // Bind later in the batch takes it up exactly where it was, whatever order
+  // the batch runs in.
+  void DeferForgetting() noexcept { defer_forgetting_ = true; }
+  // Ends the batch: forgets every neighbor no next hop is bound to.
+  void ForgetUnbound() noexcept {
+    defer_forgetting_ = false;
+    deferred_entries_.clear();
+    neighbors_.ForgetUnbound();
+  }
+
+  // The neighbor `hop` is bound to, if any.
+  std::optional<Key> BindingOf(NextHopId hop) const {
+    const std::optional<NeighborTable::Bound> binding = neighbors_.BindingOf(hop);
+    if (!binding) {
+      return std::nullopt;
+    }
+    return binding->key;
   }
 
   // -- events -----------------------------------------------------------------
 
-  // Feeds one ARP frame received on `ingress` to the resolver. Only replies
-  // are acted on; requests are the local responder's (see AnswerArpRequest in
-  // l3_packet.h). Returns the neighbor changes the reply caused (empty for a
-  // frame that is not a valid reply for a neighbor of this interface).
+  // Feeds one ARP frame received on `ingress` to the resolver. Returns the
+  // neighbor changes it caused (empty for a frame that changes nothing).
+  //
+  // A reply whose target is one of the interface's addresses -- unicast to
+  // the interface's MAC, or broadcast -- answers a solicitation: the neighbor
+  // is resolved on the sender's MAC and its reachable lifetime restarts.
+  //
+  // Any other ARP frame from a bound neighbor is RFC 826's merge: a request
+  // (for any target, gratuitous ones included) or a broadcast reply naming
+  // another target says where the sender is now. (A unicast reply naming
+  // another target answers nothing we asked, and is ignored.) A sender that
+  // is already resolved on that MAC changes nothing. Otherwise the new MAC is
+  // published as resolved at once -- so a moved neighbor, a failed-over
+  // address, is followed without waiting for aging -- and the neighbor is
+  // reconfirmed on the next Poll: it is solicited, and fails to kUnreachable
+  // if it does not answer. Answering requests stays the local responder's
+  // (AnswerArpRequest in l3_packet.h).
+  //
+  // Neither ever creates a neighbor: a sender no Bind named is ignored, so
+  // unsolicited ARP cannot populate the table. Both need the Ethernet source
+  // to match the ARP sender, a usable unicast sender MAC that is not the
+  // interface's own, an Ethernet destination that is the interface's MAC or
+  // broadcast, and the interface generation the entry was bound under.
   Progress OnArp(uint64_t now, dataplane::InterfaceId ingress,
                  std::span<const uint8_t> frame) {
     Progress out = NewProgress();
@@ -436,37 +583,58 @@ class NeighborResolver {
       return out;
     }
     const std::optional<ArpMessage> arp = ParseArp(frame);
-    if (!arp || arp->opcode != utils::Arp::kReply) {
+    if (!arp || (arp->opcode != utils::Arp::kReply &&
+                 arp->opcode != utils::Arp::kRequest)) {
       return out;
     }
     utils::Ethernet eth;
     std::memcpy(&eth, frame.data(), sizeof(eth));
-    if (eth.dst_addr != iface->second.mac ||
+    if ((eth.dst_addr != iface->second.mac && !eth.dst_addr.IsBroadcast()) ||
         eth.src_addr != arp->sender_mac) {
+      return out;
+    }
+    const utils::Ethernet::Address &mac = arp->sender_mac;
+    if (mac.IsZero() || mac.IsBroadcast() ||
+        (mac.bytes[0] & uint8_t{0x01}) != 0 || mac == iface->second.mac) {
       return out;
     }
     const Key key{ingress, arp->sender_ip.value()};
     auto entry = entries_.find(key);
-    if (entry == entries_.end()) {
+    if (entry == entries_.end() ||
+        entry->second.epoch != iface->second.epoch) {
       return out;
     }
-    if (entry->second.epoch != iface->second.epoch ||
-        arp->target_ip.value() != iface->second.ipv4 ||
-        arp->sender_mac.IsZero() || arp->sender_mac.IsBroadcast() ||
-        (arp->sender_mac.bytes[0] & uint8_t{0x01}) != 0 ||
-        arp->sender_mac == iface->second.mac) {
+    const bool reply = arp->opcode == utils::Arp::kReply;
+    const bool answer =
+        reply &&
+        Owns(iface->second, NeighborAddress::Ipv4(arp->target_ip.value()));
+    if (reply && !answer && !eth.dst_addr.IsBroadcast()) {
+      // A reply sent to us for an address that is not ours -- one in flight
+      // when the interface's address moved -- answers nothing we asked.
       return out;
+    }
+    if (!answer) {
+      const auto current = neighbors_.Find(key);
+      if (current && current->state == NeighborState::kResolved &&
+          current->mac == mac) {
+        return out;  // nothing new: the neighbor is where it was
+      }
     }
     // Stage every fallible allocation first: the table update and the output
-    // space. The resolved state is then committed only with its aging timer in
+    // space. The resolved state is then committed only with its timer in
     // place: a live timer is rescheduled in place, and a refused arming (the
     // wheel has no usable node left) leaves the entry, its timer and the table
-    // as they were and the reply is ignored. A lifetime of zero means "do not
-    // age".
+    // as they were and the frame is ignored. An answer's timer is the
+    // reachable lifetime (zero: do not age); a merge's is due at once, which
+    // starts its reconfirmation on the next Poll.
     NeighborTable::Prepared prepared =
-        neighbors_.Prepare(key, NeighborState::kResolved, arp->sender_mac);
+        neighbors_.Prepare(key, NeighborState::kResolved, mac);
     out.updates.reserve(prepared.updates.size());
-    if (timing_.reachable_lifetime != 0) {
+    if (!answer) {
+      if (!Arm(key, entry->second, now, 0)) {
+        return out;
+      }
+    } else if (timing_.reachable_lifetime != 0) {
       if (!Arm(key, entry->second, now, timing_.reachable_lifetime)) {
         return out;
       }
@@ -476,6 +644,7 @@ class NeighborResolver {
     neighbors_.Commit(prepared);
     entry->second.state = NeighborState::kResolved;
     entry->second.probes = 0;
+    entry->second.reconfirming = false;
     AppendUpdates(std::move(prepared.updates), out);
     return out;
   }
@@ -508,9 +677,9 @@ class NeighborResolver {
     // an unsolicited one (RFC 4861's MAC-change notification) goes to
     // all-nodes. Anything else -- an old own address, another group, another
     // interface's MAC -- is not this generation's neighbor.
-    const bool to_us = !iface->second.ipv6.IsUnspecified() &&
-                       eth.dst_addr == iface->second.mac &&
-                       advertisement->destination_ip == iface->second.ipv6;
+    const bool to_us =
+        eth.dst_addr == iface->second.mac &&
+        Owns(iface->second, NeighborAddress::Ipv6(advertisement->destination_ip));
     const bool to_all_nodes =
         eth.dst_addr == AllNodesMac() &&
         advertisement->destination_ip == AllNodesAddress();
@@ -558,6 +727,7 @@ class NeighborResolver {
     neighbors_.Commit(prepared);
     entry->second.state = NeighborState::kResolved;
     entry->second.probes = 0;
+    entry->second.reconfirming = false;
     AppendUpdates(std::move(prepared.updates), out);
     return out;
   }
@@ -605,7 +775,8 @@ class NeighborResolver {
           continue;
         }
         PlanDue(plan, entry->second, now);
-        update_count += plan.prepared.updates.size();
+        update_count +=
+            plan.prepared.updates.size() + plan.fail_closed.updates.size();
       }
       out.updates.reserve(update_count);
     } catch (...) {
@@ -631,6 +802,7 @@ class NeighborResolver {
       }
       entry->second.state = plan.state;
       entry->second.probes = plan.probes;
+      entry->second.reconfirming = plan.reconfirming;
       AppendUpdates(std::move(plan.prepared.updates), out);
       if (plan.solicit) {
         auto iface = interfaces_.find(plan.key.interface);
@@ -638,16 +810,18 @@ class NeighborResolver {
           Solicitation solicitation;
           solicitation.egress = plan.key.interface;
           size_t wrote = 0;
-          if (plan.key.address.is_ipv4()) {
-            if (iface->second.ipv4 != 0) {
-              wrote = BuildArpRequest(iface->second.mac,
-                                      utils::be32_t(iface->second.ipv4),
-                                      utils::be32_t(plan.key.address.ipv4()),
-                                      solicitation.frame);
-            }
-          } else if (!iface->second.ipv6.IsUnspecified()) {
+          const NeighborAddress *source =
+              SourceFor(iface->second, plan.key.address);
+          if (source == nullptr) {
+            // No address of the neighbor's family: nothing to send from.
+          } else if (plan.key.address.is_ipv4()) {
+            wrote = BuildArpRequest(iface->second.mac,
+                                    utils::be32_t(source->ipv4()),
+                                    utils::be32_t(plan.key.address.ipv4()),
+                                    solicitation.frame);
+          } else {
             wrote = BuildNeighborSolicitation(
-                iface->second.mac, iface->second.ipv6,
+                iface->second.mac, source->ipv6(),
                 plan.key.address.ipv6(), solicitation.frame);
           }
           if (wrote != 0) {
@@ -660,8 +834,13 @@ class NeighborResolver {
         if (!ArmAt(plan.key, entry->second, plan.deadline)) {
           // The wheel refused a new node for a timer the entry needs: forget
           // the entry rather than keep a neighbor that nothing will age,
-          // retry or recover. The committed plan state (incomplete or
-          // unreachable) already took the MAC out of service.
+          // retry or recover. An incomplete or unreachable plan state already
+          // took the MAC out of service; a reconfirming neighbor still has
+          // it, so it fails closed with the transition planned for that.
+          if (plan.fail_closed.changed) {
+            neighbors_.Commit(plan.fail_closed);
+            AppendUpdates(std::move(plan.fail_closed.updates), out);
+          }
           Disarm(entry->second);
           entries_.erase(entry);
         }
@@ -686,6 +865,31 @@ class NeighborResolver {
     return it == interfaces_.end() ? 0 : it->second.epoch;
   }
 
+  // What the resolver knows about one neighbor, for a state view: the table's
+  // state and MAC, whether a resolved neighbor is being reconfirmed, and the
+  // solicitations sent in the current attempt. Empty for a key no Bind named.
+  struct Status {
+    NeighborState state = NeighborState::kIncomplete;
+    bool reconfirming = false;
+    uint32_t probes = 0;
+    utils::Ethernet::Address mac;
+  };
+  std::optional<Status> StatusOf(Key key) const {
+    const auto neighbor = neighbors_.Find(key);
+    if (!neighbor) {
+      return std::nullopt;
+    }
+    Status status;
+    status.state = neighbor->state;
+    status.mac = neighbor->mac;
+    auto entry = entries_.find(key);
+    if (entry != entries_.end()) {
+      status.reconfirming = entry->second.reconfirming;
+      status.probes = entry->second.probes;
+    }
+    return status;
+  }
+
  private:
   // The ExpiryWheel payload. The serial names one arming of one entry: a due
   // record is acted on only if the entry still carries it. The deadline lets
@@ -702,16 +906,48 @@ class NeighborResolver {
     uint32_t epoch = 0;
     NeighborState state = NeighborState::kIncomplete;
     uint32_t probes = 0;  // solicitations sent in the current attempt
+    // Resolved, its reachable lifetime over, and being solicited again: it
+    // keeps its MAC until the attempt fails (PlanDue).
+    bool reconfirming = false;
     uint32_t serial = 0;  // this entry's current arming
     dataplane::ExpiryHandle timer = dataplane::kNoExpiry;
   };
 
   struct StoredInterface {
     utils::Ethernet::Address mac;
-    uint32_t ipv4;
-    utils::Ipv6Address ipv6;
+    std::vector<InterfaceAddress> addresses;
     uint32_t epoch;
   };
+
+  // Whether `address` is one of the interface's own.
+  static bool Owns(const StoredInterface &iface, const NeighborAddress &address) {
+    for (const InterfaceAddress &own : iface.addresses) {
+      if (own.address == address) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // The address a solicitation for `target` leaves from: the first whose
+  // prefix holds it, else the first of its family; null when the interface
+  // has no address of that family.
+  static const NeighborAddress *SourceFor(const StoredInterface &iface,
+                                          const NeighborAddress &target) {
+    const NeighborAddress *first = nullptr;
+    for (const InterfaceAddress &own : iface.addresses) {
+      if (own.address.family != target.family) {
+        continue;
+      }
+      if (own.Contains(target)) {
+        return &own.address;
+      }
+      if (first == nullptr) {
+        first = &own.address;
+      }
+    }
+    return first;
+  }
 
   NeighborResolver(const Config &config,
                    std::unique_ptr<dataplane::ExpiryWheel<TimerPayload>> wheel)
@@ -791,30 +1027,38 @@ class NeighborResolver {
     bool remove = false;
     NeighborState state = NeighborState::kIncomplete;
     uint32_t probes = 0;
+    bool reconfirming = false;
     bool solicit = false;
     bool arm = false;
     uint64_t deadline = 0;
     NeighborTable::Prepared prepared;
+    // For a reconfirming plan: the unreachable transition to commit instead
+    // if its timer cannot be armed (Poll), staged here so that commit does
+    // not allocate.
+    NeighborTable::Prepared fail_closed;
   };
 
   // What firing `entry`'s timer means, without changing anything. A resolved
-  // or unreachable neighbor is solicited again from kIncomplete; an attempt
-  // that has sent max_probes fails into kUnreachable; otherwise the next
-  // solicitation is fired. The plan's table transition is prepared here.
+  // neighbor whose lifetime ran out starts reconfirming: it stays resolved,
+  // MAC included, and is solicited again. An unreachable neighbor's retry
+  // solicits again from kIncomplete. An attempt that has sent max_probes fails
+  // into kUnreachable (from reconfirming too); otherwise the next solicitation
+  // is fired. The plan's table transition is prepared here.
   void PlanDue(Plan &plan, const Entry &entry, uint64_t now) {
     NeighborState state = entry.state;
     uint32_t probes = entry.probes;
-    if (state == NeighborState::kResolved ||
-        state == NeighborState::kUnreachable) {
-      // Aging or the retry of a failed attempt: solicit again. A resolved
-      // neighbor loses its MAC until a reply arrives (NeighborTable::Make
-      // clears it for an incomplete state).
-      state = NeighborState::kIncomplete;
+    bool reconfirming = entry.reconfirming;
+    if (state == NeighborState::kResolved && !reconfirming) {
+      reconfirming = true;  // aging: keep the MAC, solicit again
+      probes = 0;
+    } else if (state == NeighborState::kUnreachable) {
+      state = NeighborState::kIncomplete;  // the retry of a failed attempt
       probes = 0;
     }
     if (probes >= timing_.max_probes) {
       state = NeighborState::kUnreachable;
       probes = 0;
+      reconfirming = false;
       plan.arm = timing_.unreachable_retry != 0;
       plan.deadline = dataplane::ExpiryWheel<TimerPayload>::After(
           now, timing_.unreachable_retry);
@@ -827,9 +1071,14 @@ class NeighborResolver {
     }
     plan.state = state;
     plan.probes = probes;
+    plan.reconfirming = reconfirming;
     if (state != entry.state) {
       plan.prepared =
           neighbors_.Prepare(plan.key, state, utils::Ethernet::Address{});
+    }
+    if (reconfirming) {
+      plan.fail_closed = neighbors_.Prepare(
+          plan.key, NeighborState::kUnreachable, utils::Ethernet::Address{});
     }
   }
 
@@ -862,7 +1111,27 @@ class NeighborResolver {
     entry.serial++;
   }
 
-  // The neighbor's entry is no longer named by any hop: stop resolving it.
+  // Stops resolving the neighbor `it` names and frees its room. Inside
+  // DeferForgetting() the entry and its deadline are kept aside for a Bind
+  // later in the batch; if that record cannot be allocated, the neighbor is
+  // taken up from what was learned instead, as outside a batch.
+  void Release(std::map<Key, Entry>::iterator it) {
+    const std::optional<uint64_t> deadline = wheel_->DeadlineOf(it->second.timer);
+    Disarm(it->second);
+    if (defer_forgetting_) {
+      try {
+        deferred_entries_.insert_or_assign(it->first, Deferred{it->second, deadline});
+      } catch (const std::bad_alloc &) {
+        // No room for the record: Bind takes the neighbor up from what was
+        // learned, as outside a batch.
+        deferred_entries_.erase(it->first);
+      }
+    }
+    entries_.erase(it);
+  }
+
+  // The neighbor's entry is no longer named by any hop: stop resolving it and
+  // forget it.
   void DropIfUnbound(const std::optional<NeighborTable::Bound> &previous,
                      const Key &key) {
     if (!previous || previous->key == key ||
@@ -871,8 +1140,10 @@ class NeighborResolver {
     }
     auto stale = entries_.find(previous->key);
     if (stale != entries_.end()) {
-      Disarm(stale->second);
-      entries_.erase(stale);
+      Release(stale);
+    }
+    if (!defer_forgetting_) {
+      neighbors_.Forget(previous->key);
     }
   }
 
@@ -881,6 +1152,15 @@ class NeighborResolver {
   Timing timing_;
   NeighborTable neighbors_;
   std::map<Key, Entry> entries_;
+  // Inside DeferForgetting(): an unbound neighbor keeps what was learned.
+  bool defer_forgetting_ = false;
+  // Inside DeferForgetting(): the entries released in the batch, with their
+  // timers' deadlines (none when unarmed), for a later Bind to resume.
+  struct Deferred {
+    Entry entry;
+    std::optional<uint64_t> deadline;
+  };
+  std::map<Key, Deferred> deferred_entries_;
   std::map<dataplane::InterfaceId, StoredInterface> interfaces_;
   // Poll's collection of due records. Pre-sized in Create so the wheel
   // callback never allocates.

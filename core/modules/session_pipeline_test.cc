@@ -143,15 +143,25 @@ ExactMatch *CreateExactMatch(const std::string &name,
   return static_cast<ExactMatch *>(Create("ExactMatch", name, Pack(arg)));
 }
 
+// A next-hop-id Router: it forwards on the id the rule's result writes and
+// has no FIB, so it holds no routes (D-183).
 Router *CreateRouterModule(const std::string &name,
                            const std::string &next_hop_attr = "") {
   bess::pb::RouterArg arg;
-  arg.set_max_routes(64);
-  arg.set_max_tbl8s(16);
   arg.set_max_next_hops(64);
   if (!next_hop_attr.empty()) {
     arg.set_next_hop_attr(next_hop_attr);
   }
+  return static_cast<Router *>(Create("Router", name, Pack(arg)));
+}
+
+// A destination-mode Router with an IPv4 FIB, for the tests about routes.
+Router *CreateRoutingRouterModule(const std::string &name) {
+  bess::pb::RouterArg arg;
+  arg.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
+  arg.set_max_ipv4_routes(64);
+  arg.set_max_ipv4_tbl8s(16);
+  arg.set_max_next_hops(64);
   return static_cast<Router *>(Create("Router", name, Pack(arg)));
 }
 
@@ -277,7 +287,7 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
   ASSERT_NE(nullptr, em);
   Meter *mt = CreateMeterModule("mt", 64);
   ASSERT_NE(nullptr, mt);
-  Router *rt = CreateRouterModule("rt");
+  Router *rt = CreateRoutingRouterModule("rt");
   ASSERT_NE(nullptr, rt);
 
   const uint32_t session_addr = Ip(10, 1, 2, 3);
@@ -450,7 +460,7 @@ TEST_F(SessionPipelineTest, RejectionsLeaveNothingChanged) {
 // quiescence holds off.
 TEST_F(SessionPipelineTest, RemovalCascadeAndIdReuse) {
   Meter *mt = CreateMeterModule("mt", 64);
-  Router *rt = CreateRouterModule("rt");
+  Router *rt = CreateRoutingRouterModule("rt");
   ExactMatch *em = CreateExactMatch("em", "mt/meters", "rt/next_hops");
   ASSERT_NE(nullptr, em);
   ASSERT_NE(nullptr, mt);
@@ -606,7 +616,7 @@ TEST_F(SessionPipelineTest, WildcardResultReferencesReleaseAtTeardown) {
 }
 
 TEST_F(SessionPipelineTest, RouterCodecRejectsOutOfRangePrefix) {
-  Router *rt = CreateRouterModule("rt");
+  Router *rt = CreateRoutingRouterModule("rt");
   ASSERT_NE(nullptr, rt);
   const auto *codec = Bindings().Find(*rt->router()->routes_resource_object());
   bess::pb::RouterRouteKey key;
@@ -620,7 +630,7 @@ TEST_F(SessionPipelineTest, RouterCodecRejectsOutOfRangePrefix) {
 }
 
 TEST_F(SessionPipelineTest, ResourceCodecUnpacksTypedWireMessages) {
-  Router *rt = CreateRouterModule("rt");
+  Router *rt = CreateRoutingRouterModule("rt");
   ASSERT_NE(nullptr, rt);
   const auto *codec = Bindings().Find(*rt->router()->routes_resource_object());
   bess::pb::RouterRouteKey key;
@@ -959,7 +969,8 @@ TEST_F(SessionPipelineTest, ModuleCapacitiesRejectNarrowing) {
   meter.set_capacity(~uint64_t{0});
   rejected("Meter", meter);
   bess::pb::RouterArg router;
-  router.set_max_routes(uint64_t{1} << 32);
+  router.set_mode(bess::pb::ROUTE_MODE_DESTINATION);
+  router.set_max_ipv4_routes(uint64_t{1} << 32);
   rejected("Router", router);
 }
 TEST_F(SessionPipelineTest, CodecsRejectMismatchedFieldsAndUnknownEnums) {
@@ -1051,14 +1062,14 @@ class SessionPacketPathTest : public SessionPipelineTest {
   }
 
   // One session: the meter (`burst` bytes, no refill), the next hop to
-  // kEgressGate, the route to it, and the rule naming both.
+  // kEgressGate, and the rule naming both. The router forwards on the id the
+  // rule writes; it holds no routes (D-183).
   std::vector<Op> SessionOps(const char *sip, uint16_t sport, uint64_t burst) {
     return {
         Op::Upsert("mt/meters", bess::dataplane::EncodeKey(MeterId(1)),
                    std::any(bess::meter::MeterProfileSpec{SlowMeter(burst)})),
         rt_->router()->SetNextHopOp(
             NextHopId(1), HopWithEgress(bess::modules::router::InterfaceOf(kEgressGate).value())),
-        rt_->router()->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
         Op::Upsert("em/rules", WireKey(sip, sport), Rule(0, 1, 1)),
     };
   }
@@ -1109,9 +1120,9 @@ TEST_F(SessionPacketPathTest, OtherSessionsAndMissesAreDropped) {
   EXPECT_EQ((std::vector<bess::testing::Bytes>{Forwarded(own)}), Egress({own}));
 }
 
-// Removing the session -- the rule, the route, the next hop and the meter in
-// one transaction -- stops its packets. (That the meter alone may not go while
-// the rule names it is RejectionsLeaveNothingChanged.)
+// Removing the session -- the rule, the next hop and the meter in one
+// transaction -- stops its packets. (That the meter alone may not go while the
+// rule names it is RejectionsLeaveNothingChanged.)
 TEST_F(SessionPacketPathTest, RemovedSessionIsDropped) {
   // 1000-byte buckets: the meter would pass both packets.
   auto r = Apply(SessionOps("10.1.2.3", 1234, 1000));
@@ -1121,7 +1132,6 @@ TEST_F(SessionPacketPathTest, RemovedSessionIsDropped) {
 
   r = Apply({
       Op::Erase("em/rules", WireKey("10.1.2.3", 1234)),
-      rt_->router()->RemoveRouteOp(P(Ip(10, 0, 0, 0), 8)),
       rt_->router()->RemoveNextHopOp(NextHopId(1)),
       Op::Erase("mt/meters", bess::dataplane::EncodeKey(MeterId(1))),
   });
@@ -1220,15 +1230,12 @@ TEST_F(SessionPipelineTest, AClassFieldComposesTwoClassifiers) {
 // -- D-129: the resources as a client writes and reads them --------------------
 
 // One session as wire messages: the meter (`burst` bytes, no refill), the
-// next hop to kEgressGate, the route to it, and the rule whose result record
-// names both.
+// next hop to kEgressGate, and the rule whose result record names both.
 struct WireSession {
   bess::pb::MeterIdKey meter_key;
   bess::pb::MeterPolicyValue meter;
   bess::pb::RouterNextHopIdKey hop_key;
   bess::pb::RouterNextHopValue hop;
-  bess::pb::RouterRouteKey route_key;
-  bess::pb::RouterRouteValue route;
   bess::pb::ExactMatchRuleKey rule_key;
   bess::pb::ExactMatchRuleValue rule;
 };
@@ -1246,9 +1253,6 @@ WireSession MakeWireSession(const char *sip, uint16_t sport, uint64_t burst) {
   // Resolved: no neighbor, the canonical form (defaults omitted).
   s.hop.set_dst_mac(std::string("\x02\x00\x00\x00\x00\x01", 6));
   s.hop.set_src_mac(std::string("\x02\x00\x00\x00\x00\x02", 6));
-  s.route_key.set_ipv4("10.0.0.0");
-  s.route_key.set_prefix_length(8);
-  s.route.set_next_hop_id(1);
   const std::string key = WireKey(sip, sport);
   s.rule_key.add_fields()->set_value_bin(key.substr(0, 4));
   s.rule_key.add_fields()->set_value_bin(key.substr(4));
@@ -1258,14 +1262,13 @@ WireSession MakeWireSession(const char *sip, uint16_t sport, uint64_t burst) {
 
 // The session written as a client writes it steers and polices its packets
 // as the internal operations do, and every resource reads back exactly what
-// was upserted -- the rule's references to the meter and the next hop, and
-// the route's to the next hop, included.
+// was upserted -- the rule's references to the meter and the next hop
+// included.
 TEST_F(SessionPacketPathTest, WireSessionSteersPolicesAndReadsBack) {
   const WireSession s = MakeWireSession("10.1.2.3", 1234, 100);
   // Referents first: each call is its own transaction.
   ASSERT_EQ("", h_.UpsertResource("mt/meters", s.meter_key, s.meter));
   ASSERT_EQ("", h_.UpsertResource("rt/next_hops", s.hop_key, s.hop));
-  ASSERT_EQ("", h_.UpsertResource("rt/routes", s.route_key, s.route));
   ASSERT_EQ("", h_.UpsertResource("em/rules", s.rule_key, s.rule));
 
   const auto pkt1 = SessionPacket("10.1.2.3", 1234, rng_);
@@ -1281,13 +1284,12 @@ TEST_F(SessionPacketPathTest, WireSessionSteersPolicesAndReadsBack) {
 
   EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&s.meter_key, &s.meter}}));
   EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&s.hop_key, &s.hop}}));
-  EXPECT_EQ("", h_.ReadBackDiffers("rt/routes", {{&s.route_key, &s.route}}));
 }
 
 // Every meter profile, neighbor state and the default route read back as
 // written; a reconfiguration reads back the new value, and an erased entry is
 // gone from the read-back at once -- also a meter, whose removal stage has not
-// run yet.
+// run yet. Routes live in a destination-mode router's FIB.
 TEST_F(SessionPacketPathTest, ReadBackFollowsUpsertsAndErases) {
   bess::pb::MeterIdKey m1, m2, m3;
   m1.set_id(1);
@@ -1323,6 +1325,11 @@ TEST_F(SessionPacketPathTest, ReadBackFollowsUpsertsAndErases) {
   ASSERT_EQ("", h_.UpsertResource("rt/next_hops", h1, resolved));
   ASSERT_EQ("", h_.UpsertResource("rt/next_hops", h2, incomplete));
   ASSERT_EQ("", h_.UpsertResource("rt/next_hops", h3, unreachable));
+  Router *dst = CreateRoutingRouterModule("rt_dst");
+  ASSERT_NE(nullptr, dst);
+  ASSERT_EQ("", h_.UpsertResource("rt_dst/next_hops", h1, resolved));
+  ASSERT_EQ("", h_.UpsertResource("rt_dst/next_hops", h2, incomplete));
+  ASSERT_EQ("", h_.UpsertResource("rt_dst/next_hops", h3, unreachable));
 
   bess::pb::RouterRouteKey r1, r2, r3;
   r1.set_ipv4("10.0.0.0");
@@ -1334,14 +1341,14 @@ TEST_F(SessionPacketPathTest, ReadBackFollowsUpsertsAndErases) {
   via1.set_next_hop_id(1);
   via2.set_next_hop_id(2);
   via3.set_next_hop_id(3);
-  ASSERT_EQ("", h_.UpsertResource("rt/routes", r1, via1));
-  ASSERT_EQ("", h_.UpsertResource("rt/routes", r2, via2));
-  ASSERT_EQ("", h_.UpsertResource("rt/routes", r3, via3));
+  ASSERT_EQ("", h_.UpsertResource("rt_dst/routes", r1, via1));
+  ASSERT_EQ("", h_.UpsertResource("rt_dst/routes", r2, via2));
+  ASSERT_EQ("", h_.UpsertResource("rt_dst/routes", r3, via3));
 
   EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&m1, &sr}, {&m2, &tr}, {&m3, &rfc}}));
   EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops",
                                    {{&h1, &resolved}, {&h2, &incomplete}, {&h3, &unreachable}}));
-  EXPECT_EQ("", h_.ReadBackDiffers("rt/routes", {{&r1, &via1}, {&r2, &via2}, {&r3, &via3}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt_dst/routes", {{&r1, &via1}, {&r2, &via2}, {&r3, &via3}}));
 
   // A reconfiguration reads back the new value.
   ASSERT_EQ("", h_.UpsertResource("mt/meters", m1, rfc));
@@ -1349,11 +1356,11 @@ TEST_F(SessionPacketPathTest, ReadBackFollowsUpsertsAndErases) {
 
   // Erases, before any removal stage runs.
   ASSERT_EQ("", h_.EraseResource("mt/meters", m3));
-  ASSERT_EQ("", h_.EraseResource("rt/routes", r3));
+  ASSERT_EQ("", h_.EraseResource("rt_dst/routes", r3));
   ASSERT_EQ("", h_.EraseResource("rt/next_hops", h3));
   EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&m1, &rfc}, {&m2, &tr}}));
   EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&h1, &resolved}, {&h2, &incomplete}}));
-  EXPECT_EQ("", h_.ReadBackDiffers("rt/routes", {{&r1, &via1}, {&r2, &via2}}));
+  EXPECT_EQ("", h_.ReadBackDiffers("rt_dst/routes", {{&r1, &via1}, {&r2, &via2}}));
   Settle();
   EXPECT_EQ("", h_.ReadBackDiffers("mt/meters", {{&m1, &rfc}, {&m2, &tr}}));
   EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hops", {{&h1, &resolved}, {&h2, &incomplete}}));
@@ -1411,13 +1418,14 @@ TEST_F(SessionPacketPathTest, BadResourceValuesAreRefused) {
   bad_gate.set_egress_gate(DROP_GATE + 1);  // DROP_GATE itself is "no interface"
   EXPECT_NE("", h_.UpsertResource("rt/next_hops", h1, bad_gate));
 
+  // A next-hop-id router has no FIB: every route write is refused (D-183).
   bess::pb::RouterRouteKey r1;
   r1.set_ipv4("10.0.0.0");
   r1.set_prefix_length(8);
   EXPECT_NE("", h_.UpsertResource("rt/routes", r1, bess::pb::RouterRouteValue{}));
-  bess::pb::RouterRouteValue dangling_route;
-  dangling_route.set_next_hop_id(9);
-  EXPECT_NE("", h_.UpsertResource("rt/routes", r1, dangling_route));
+  bess::pb::RouterRouteValue route;
+  route.set_next_hop_id(1);
+  EXPECT_NE("", h_.UpsertResource("rt/routes", r1, route));
 
   for (const char *name : {"mt/meters", "rt/next_hops", "rt/routes"}) {
     EXPECT_TRUE(h_.ReadResource(name).empty()) << name;
@@ -1454,7 +1462,8 @@ TEST_F(SessionPacketPathTest, DeclaredTablesMatchTheBoundCodecs) {
     EXPECT_FALSE(declared->requires_paused_workers) << t.resource;
     EXPECT_FALSE(codec->requires_paused_workers()) << t.resource;
   }
-  EXPECT_EQ(3u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size());
+  EXPECT_EQ(4u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size())
+      << "next_hops, neighbors, groups and routes";
 }
 
 // The configured names are the contract, not the registration: the graph
@@ -1477,7 +1486,6 @@ TEST_F(SessionPipelineTest, ConfiguredNamesResolveToOneOffset) {
       rt->router()->SetNextHopOp(
           NextHopId(1),
           HopWithEgress(bess::modules::router::InterfaceOf(kEgressGate).value())),
-      rt->router()->SetRouteOp(P(Ip(10, 0, 0, 0), 8), NextHopId(1)),
       Op::Upsert("em_cfg/rules", WireKey("10.1.2.3", 1234),
                  Rule(0, 1, 1)),
   });

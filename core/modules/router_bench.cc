@@ -39,8 +39,9 @@ void BM_HopToGate(benchmark::State &state) {
   const bool mapped = state.range(0) == 1;
   const auto hops_n = static_cast<uint32_t>(state.range(1));
   Router::Config config;
-  config.max_routes = 64;
-  config.tbl8_groups = 16;
+  config.ipv4.emplace();
+  config.ipv4->max_routes = 64;
+  config.ipv4->tbl8_groups = 16;
   auto router =
       Router::Create("router_bench_rt", config, hops_n + 1, bess::runtime::runtime().rcu())
           .value();

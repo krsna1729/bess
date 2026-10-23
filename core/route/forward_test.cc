@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <vector>
@@ -70,12 +71,48 @@ std::array<uint8_t, 60> Frame(uint32_t dst, uint8_t ttl = 64) {
   return frame;
 }
 
-std::unique_ptr<Router> MakeRouter() {
-  LpmRouteTable::Config config = bess::testing::TestRouteConfig();
-  config.max_routes = 64;
-  config.tbl8_groups = 8;
+// Ethernet + IPv6 + UDP, 14 + 40 + 16 = 70 bytes, from `src` to `dst` with
+// the hop limit given and the same ports as Frame().
+std::array<uint8_t, 70> Frame6(const char *dst, uint8_t hop_limit = 64,
+                               const char *src = "2001:db8:ffff::2",
+                               uint16_t src_port = 1234) {
+  std::array<uint8_t, 70> frame{};
+  auto *eth = reinterpret_cast<Ethernet *>(frame.data());
+  eth->ether_type = be16_t(0x86dd);
+  uint8_t *ip = frame.data() + sizeof(Ethernet);
+  ip[0] = 0x60;  // version 6
+  ip[5] = 16;    // payload length
+  ip[6] = Ipv4::kUdp;
+  ip[7] = hop_limit;
+  std::memcpy(ip + 8, utils::ParseIpv6Address(src).value().bytes, 16);
+  std::memcpy(ip + 24, utils::ParseIpv6Address(dst).value().bytes, 16);
+  uint8_t *udp = ip + 40;
+  udp[0] = static_cast<uint8_t>(src_port >> 8);
+  udp[1] = static_cast<uint8_t>(src_port);
+  udp[2] = 0x16;  // dst port 5678
+  udp[3] = 0x2e;
+  udp[5] = 16;  // length
+  return frame;
+}
+
+Ipv6Prefix P6(const char *addr, uint8_t len) {
+  return Ipv6Prefix::Make(utils::ParseIpv6Address(addr).value(), len).value();
+}
+
+// IPv4 only unless asked: the IPv6 tests ask for the families they need.
+std::unique_ptr<Router> MakeRouter(bool ipv4 = true, bool ipv6 = false,
+                                   size_t max_groups = 0) {
+  Router::Config config;
+  if (ipv4) {
+    config.ipv4 = bess::testing::TestRouteConfig();
+    config.ipv4->max_routes = 64;
+    config.ipv4->tbl8_groups = 8;
+  }
+  if (ipv6) {
+    config.ipv6 = Ipv6RouteTable::Config{.max_routes = 64, .tbl8_groups = 64};
+  }
   auto router = Router::Create("forward_test", config, /*max_next_hops=*/8,
-                               bess::runtime::runtime().rcu());
+                               bess::runtime::runtime().rcu(), 1, max_groups);
   EXPECT_TRUE(router.has_value()) << RouteErrorName(router.error());
   return std::move(router).value();
 }
@@ -90,7 +127,10 @@ void RouteThrough(Router &router, NextHopId id, const NextHop &hop, uint32_t pre
 
 // The chain is backend-agnostic, but the Router it resolves in is not: the
 // suite runs once per backend like the rest of the route tests (D-132).
-class ForwardChainTest : public bess::testing::RouteBackendTest {};
+class ForwardChainTest : public bess::testing::RouteBackendTest {
+ protected:
+  void TearDown() override { bess::runtime::runtime().rcu().Drain(); }
+};
 
 TEST_P(ForwardChainTest, EgressIsReadBeforeTheNeighborState) {
   auto router = MakeRouter();
@@ -240,7 +280,7 @@ TEST_P(ForwardChainTest, TheBatchPathAgreesWithTheScalarPathFrameByFrame) {
   EXPECT_EQ(ForwardVerdict::kTtlExpired, batch[4].verdict);
   EXPECT_EQ(ForwardVerdict::kNonInitialFragment, batch[5].verdict);
   EXPECT_EQ(ForwardVerdict::kMalformed, batch[6].verdict);
-  EXPECT_EQ(ForwardVerdict::kNotIpv4, batch[7].verdict);
+  EXPECT_EQ(ForwardVerdict::kNotIp, batch[7].verdict);
 }
 
 // The two bodies' real risk is not the verdict list but the order of the checks
@@ -312,6 +352,252 @@ TEST_P(ForwardChainTest, TheBatchPathAgreesWithTheScalarPathOnEveryCombination) 
       EXPECT_EQ(one.l3_offset, batch[k].l3_offset) << "combination " << i;
     }
   }
+}
+
+// A resolved hop with both addresses, a hop whose neighbor is unresolved, a
+// blackhole, the node's own address, and IPv6 routes to each.
+void RouteIpv6Kinds(Router &router) {
+  NextHop forward_hop;
+  forward_hop.egress = dataplane::InterfaceId(2);
+  forward_hop.neighbor = NeighborState::kResolved;
+  forward_hop.dst_mac.bytes[5] = 0x11;
+  forward_hop.src_mac.bytes[5] = 0x22;
+  NextHop unresolved_hop;
+  unresolved_hop.egress = dataplane::InterfaceId(3);
+  unresolved_hop.neighbor = NeighborState::kIncomplete;
+  ASSERT_TRUE(router.SetNextHop(NextHopId(1), forward_hop));
+  ASSERT_TRUE(router.SetNextHop(NextHopId(2), unresolved_hop));
+  ASSERT_TRUE(router.SetNextHop(NextHopId(3), BlackholeNextHop()));
+  ASSERT_TRUE(router.SetNextHop(NextHopId(4), LocalNextHop()));
+  ASSERT_TRUE(router.SetRoute(kDefaultRouteDomainId, P6("2001:db8:1::", 48), NextHopId(1)));
+  ASSERT_TRUE(router.SetRoute(kDefaultRouteDomainId, P6("2001:db8:2::", 48), NextHopId(2)));
+  ASSERT_TRUE(router.SetRoute(kDefaultRouteDomainId, P6("2001:db8:3::", 48), NextHopId(3)));
+  ASSERT_TRUE(router.SetRoute(kDefaultRouteDomainId, P6("2001:db8:4::1", 128), NextHopId(4)));
+}
+
+// IPv6 runs the same chain as IPv4, with the hop limit where the TTL is.
+TEST_P(ForwardChainTest, Ipv6VerdictsFollowTheSameChain) {
+  auto router = MakeRouter(/*ipv4=*/false, /*ipv6=*/true);
+  RouteIpv6Kinds(*router);
+  auto resolve = [&](const std::array<uint8_t, 70> &frame) {
+    return ResolveFrame(*router, kDefaultRouteDomainId, frame, frame.size());
+  };
+
+  FrameRoute route = resolve(Frame6("2001:db8:1::7"));
+  EXPECT_EQ(ForwardVerdict::kForward, route.verdict);
+  EXPECT_EQ(L3Family::kIpv6, route.family);
+  EXPECT_EQ(dataplane::InterfaceId(2), route.egress);
+  ASSERT_NE(nullptr, route.hop);
+  EXPECT_EQ(0x11, route.hop->dst_mac.bytes[5]);
+  EXPECT_EQ(sizeof(Ethernet), route.l3_offset);
+
+  route = resolve(Frame6("2001:db8:2::7"));
+  EXPECT_EQ(ForwardVerdict::kUnresolved, route.verdict);
+  EXPECT_EQ(dataplane::InterfaceId(3), route.egress);
+  EXPECT_EQ(nullptr, route.hop);
+
+  route = resolve(Frame6("2001:db8:3::7"));
+  EXPECT_EQ(ForwardVerdict::kNoEgress, route.verdict);
+  EXPECT_EQ(dataplane::kInvalidInterfaceId, route.egress);
+
+  EXPECT_EQ(ForwardVerdict::kLocalDelivery, resolve(Frame6("2001:db8:4::1")).verdict);
+  EXPECT_EQ(ForwardVerdict::kNoRoute, resolve(Frame6("2001:db8:4::2")).verdict)
+      << "a /128 is the address only";
+  EXPECT_EQ(ForwardVerdict::kNoRoute, resolve(Frame6("2001:db8:9::7")).verdict);
+
+  for (uint8_t hop_limit : {0, 1}) {
+    route = resolve(Frame6("2001:db8:1::7", hop_limit));
+    EXPECT_EQ(ForwardVerdict::kTtlExpired, route.verdict) << int(hop_limit);
+    EXPECT_EQ(dataplane::InterfaceId(2), route.egress);
+    EXPECT_EQ(nullptr, route.hop) << "nothing to write";
+  }
+  EXPECT_EQ(ForwardVerdict::kForward, resolve(Frame6("2001:db8:1::7", 2)).verdict);
+}
+
+// Link-scoped traffic is never routed (RFC 4291 2.5.6), whatever the table
+// says -- even a default route that would carry it -- and the check runs
+// before the lookup.
+TEST_P(ForwardChainTest, Ipv6LinkScopedFramesAreNeverRouted) {
+  auto router = MakeRouter(/*ipv4=*/false, /*ipv6=*/true);
+  RouteIpv6Kinds(*router);
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P6("::", 0), NextHopId(1)));
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P6("fe80::", 10), NextHopId(1)));
+  for (const auto &frame : {Frame6("fe80::1"), Frame6("febf::1"), Frame6("ff02::1"),
+                            Frame6("ff0e::1"), Frame6("2001:db8:1::7", 64, "fe80::2")}) {
+    const FrameRoute route =
+        ResolveFrame(*router, kDefaultRouteDomainId, frame, frame.size());
+    EXPECT_EQ(ForwardVerdict::kLinkScope, route.verdict);
+    EXPECT_EQ(L3Family::kIpv6, route.family);
+    EXPECT_EQ(nullptr, route.hop);
+  }
+  // Just outside fe80::/10, and a global source: routed.
+  for (const auto &frame : {Frame6("fec0::1"), Frame6("2001:db8:1::7", 64, "fec0::2")}) {
+    EXPECT_EQ(ForwardVerdict::kForward,
+              ResolveFrame(*router, kDefaultRouteDomainId, frame, frame.size()).verdict);
+  }
+}
+
+// A frame of a family the router does not serve is refused before anything
+// else is read, on either path.
+TEST_P(ForwardChainTest, AFamilyTheRouterDoesNotServeIsRefused) {
+  const auto frame4 = Frame(Ip(203, 0, 113, 7));
+  const auto frame6 = Frame6("2001:db8:1::7");
+  for (const bool ipv4 : {true, false}) {
+    SCOPED_TRACE(ipv4 ? "IPv4 only" : "IPv6 only");
+    auto router = MakeRouter(ipv4, !ipv4);
+    const FrameRoute route4 =
+        ResolveFrame(*router, kDefaultRouteDomainId, frame4, frame4.size());
+    const FrameRoute route6 =
+        ResolveFrame(*router, kDefaultRouteDomainId, frame6, frame6.size());
+    EXPECT_EQ(ipv4 ? ForwardVerdict::kNoRoute : ForwardVerdict::kFamilyDisabled,
+              route4.verdict);
+    EXPECT_EQ(L3Family::kIpv4, route4.family);
+    EXPECT_EQ(ipv4 ? ForwardVerdict::kFamilyDisabled : ForwardVerdict::kNoRoute,
+              route6.verdict);
+    EXPECT_EQ(L3Family::kIpv6, route6.family);
+
+    const std::span<const uint8_t> frames[] = {frame4, frame6};
+    const size_t lens[] = {frame4.size(), frame6.size()};
+    FrameRoute batch[2];
+    ResolveFrames(*router, kDefaultRouteDomainId, frames, lens, batch);
+    EXPECT_EQ(route4.verdict, batch[0].verdict);
+    EXPECT_EQ(route6.verdict, batch[1].verdict);
+    router.reset();
+    bess::runtime::runtime().rcu().Drain();
+  }
+}
+
+// The write half decrements the hop limit once -- IPv6 has no header checksum
+// -- writes both addresses and touches nothing else; at the boundary it
+// writes nothing. IPv4 beside it decrements the TTL with a valid checksum.
+TEST_P(ForwardChainTest, WriteForwardedDecrementsTheHopLimitOnceAndWritesTheAddresses) {
+  auto router = MakeRouter(/*ipv4=*/true, /*ipv6=*/true);
+  RouteIpv6Kinds(*router);
+  ASSERT_TRUE(router->SetRoute(P(Ip(203, 0, 113, 0), 24), NextHopId(1)));
+
+  auto frame6 = Frame6("2001:db8:1::7");
+  const auto before6 = frame6;
+  const FrameRoute route6 =
+      ResolveFrame(*router, kDefaultRouteDomainId, frame6, frame6.size());
+  ASSERT_EQ(ForwardVerdict::kForward, route6.verdict);
+  EXPECT_EQ(TtlResult::kForward,
+            WriteForwarded(frame6, route6.family, route6.l3_offset, *route6.hop));
+  const auto *eth = reinterpret_cast<const Ethernet *>(frame6.data());
+  EXPECT_EQ(route6.hop->dst_mac, eth->dst_addr);
+  EXPECT_EQ(route6.hop->src_mac, eth->src_addr);
+  EXPECT_EQ(63, frame6[sizeof(Ethernet) + 7]);
+  for (size_t i = 12; i < frame6.size(); i++) {
+    if (i != sizeof(Ethernet) + 7) {
+      EXPECT_EQ(before6[i], frame6[i]) << "byte " << i;
+    }
+  }
+  auto edge6 = Frame6("2001:db8:1::7", 1);
+  const auto edge6_before = edge6;
+  EXPECT_EQ(TtlResult::kExpired,
+            WriteForwarded(edge6, L3Family::kIpv6, sizeof(Ethernet), *route6.hop));
+  EXPECT_EQ(edge6_before, edge6);
+
+  auto frame4 = Frame(Ip(203, 0, 113, 7));
+  const FrameRoute route4 =
+      ResolveFrame(*router, kDefaultRouteDomainId, frame4, frame4.size());
+  ASSERT_EQ(ForwardVerdict::kForward, route4.verdict);
+  EXPECT_EQ(L3Family::kIpv4, route4.family);
+  EXPECT_EQ(TtlResult::kForward,
+            WriteForwarded(frame4, route4.family, route4.l3_offset, *route4.hop));
+  const auto *ip = reinterpret_cast<const Ipv4 *>(frame4.data() + sizeof(Ethernet));
+  EXPECT_EQ(63, ip->ttl);
+  EXPECT_TRUE(utils::VerifyIpv4NoOptChecksum(*ip));
+  EXPECT_EQ(route4.hop->dst_mac, reinterpret_cast<const Ethernet *>(frame4.data())->dst_addr);
+}
+
+// One batch of interleaved IPv4 and IPv6 frames -- one IPv4 bulk lookup and
+// one IPv6 bulk lookup -- agrees with the scalar path frame by frame, for
+// every verdict and for a group route's member choice, which rests on the
+// IPv6 flow hash (the xor of each address's four words).
+TEST_P(ForwardChainTest, TheBatchPathAgreesWithTheScalarPathForMixedFamilies) {
+  auto router = MakeRouter(/*ipv4=*/true, /*ipv6=*/true, /*max_groups=*/2);
+  RouteIpv6Kinds(*router);
+  NextHop other_hop;
+  other_hop.egress = dataplane::InterfaceId(5);
+  other_hop.neighbor = NeighborState::kResolved;
+  ASSERT_TRUE(router->SetNextHop(NextHopId(5), other_hop));
+  const NextHopId members[] = {NextHopId(1), NextHopId(5)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), members));
+  ASSERT_TRUE(router->SetRoute(kDefaultRouteDomainId, P6("2001:db8:5::", 48),
+                               NextHopGroupId(1)));
+  ASSERT_TRUE(router->SetRoute(P(Ip(203, 0, 113, 0), 24), NextHopId(1)));
+  ASSERT_TRUE(router->SetRoute(P(Ip(198, 51, 100, 0), 24), NextHopId(2)));
+
+  std::vector<std::vector<uint8_t>> storage;
+  auto add = [&](const auto &frame) { storage.emplace_back(frame.begin(), frame.end()); };
+  add(Frame(Ip(203, 0, 113, 7)));          // IPv4 forward
+  add(Frame6("2001:db8:1::7"));            // IPv6 forward
+  add(Frame6("fe80::7"));                  // link scope
+  add(Frame(Ip(203, 0, 114, 7)));          // IPv4 miss
+  add(Frame6("2001:db8:9::7"));            // IPv6 miss
+  add(Frame6("2001:db8:1::7", 1));         // hop limit
+  add(Frame6("2001:db8:2::7"));            // unresolved
+  add(Frame(Ip(198, 51, 100, 7)));         // IPv4 unresolved
+  add(Frame6("2001:db8:3::7"));            // blackhole
+  add(Frame6("2001:db8:4::1"));            // local
+  add(Frame(Ip(203, 0, 113, 7), 1));       // TTL
+  auto truncated = Frame6("2001:db8:1::7");
+  truncated[sizeof(Ethernet) + 5] = 200;   // a payload length past the frame
+  add(truncated);                          // malformed
+  constexpr size_t kGroupFrames = 16;
+  for (uint16_t port = 0; port < kGroupFrames; port++) {
+    add(Frame6("2001:db8:5::7", 64, "2001:db8:ffff::2", static_cast<uint16_t>(1000 + port)));
+  }
+  const size_t n = storage.size();
+  ASSERT_LE(n, Router::kMaxBatch);
+
+  std::vector<std::span<const uint8_t>> frames(n);
+  std::vector<size_t> lens(n);
+  std::vector<FrameRoute> batch(n);
+  for (size_t i = 0; i < n; i++) {
+    frames[i] = storage[i];
+    lens[i] = storage[i].size();
+  }
+  ResolveFrames(*router, kDefaultRouteDomainId, frames, lens, batch);
+  for (size_t i = 0; i < n; i++) {
+    const FrameRoute one =
+        ResolveFrame(*router, kDefaultRouteDomainId, storage[i], storage[i].size());
+    EXPECT_EQ(one.verdict, batch[i].verdict) << "frame " << i;
+    EXPECT_EQ(one.family, batch[i].family) << "frame " << i;
+    EXPECT_EQ(one.egress, batch[i].egress) << "frame " << i;
+    EXPECT_EQ(one.hop, batch[i].hop) << "frame " << i;
+    EXPECT_EQ(one.l3_offset, batch[i].l3_offset) << "frame " << i;
+  }
+  const ForwardVerdict expected[] = {
+      ForwardVerdict::kForward,      ForwardVerdict::kForward,   ForwardVerdict::kLinkScope,
+      ForwardVerdict::kNoRoute,      ForwardVerdict::kNoRoute,   ForwardVerdict::kTtlExpired,
+      ForwardVerdict::kUnresolved,   ForwardVerdict::kUnresolved, ForwardVerdict::kNoEgress,
+      ForwardVerdict::kLocalDelivery, ForwardVerdict::kTtlExpired, ForwardVerdict::kMalformed};
+  for (size_t i = 0; i < std::size(expected); i++) {
+    EXPECT_EQ(expected[i], batch[i].verdict) << "frame " << i;
+  }
+  EXPECT_EQ(L3Family::kIpv4, batch[0].family);
+  EXPECT_EQ(L3Family::kIpv6, batch[1].family);
+
+  // The group frames: each picks the member the documented hash picks, and
+  // the ports spread them over both members.
+  const auto src = utils::ParseIpv6Address("2001:db8:ffff::2").value();
+  const auto dst = utils::ParseIpv6Address("2001:db8:5::7").value();
+  auto fold = [](const utils::Ipv6Address &a) {
+    uint32_t words[4];
+    std::memcpy(words, a.bytes, sizeof(words));
+    return words[0] ^ words[1] ^ words[2] ^ words[3];
+  };
+  bool seen[2] = {false, false};
+  for (size_t k = 0; k < kGroupFrames; k++) {
+    const FrameRoute &route = batch[n - kGroupFrames + k];
+    ASSERT_EQ(ForwardVerdict::kForward, route.verdict) << k;
+    const uint32_t hash =
+        FlowHash(fold(src), fold(dst), static_cast<uint16_t>(1000 + k), 5678, Ipv4::kUdp);
+    EXPECT_EQ(router->Resolve(kDefaultRouteDomainId, dst, hash), route.hop) << k;
+    seen[route.egress == dataplane::InterfaceId(2) ? 0 : 1] = true;
+  }
+  EXPECT_TRUE(seen[0] && seen[1]) << "both members chosen";
 }
 
 BESS_INSTANTIATE_ROUTE_BACKENDS(ForwardChainTest);
