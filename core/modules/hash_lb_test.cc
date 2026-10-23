@@ -501,6 +501,7 @@ Bytes Tcp6(const std::string &src, const std::string &dst, uint16_t sport, uint1
 // The gate of each packet, run one at a time (DROP_GATE: dropped).
 std::vector<gate_idx_t> Gates(ModuleHarness &h, Module *lb, const std::vector<Bytes> &pkts) {
   std::vector<gate_idx_t> gates;
+  gates.reserve(pkts.size());
   for (const Bytes &pkt : pkts) {
     gates.push_back(GateOf(h.Run(lb, 0, {pkt}, kGates), pkt));
   }
@@ -589,7 +590,7 @@ TEST(HashLbParsedTest, OneDatagramsFragmentsShareAGate) {
 
     // IPv6: a fragment header (44) in front of UDP, then a later fragment.
     auto fragment6 = [&](uint8_t offset_lo, bool udp_header) {
-      Bytes frag_header = {17, 0, 0, static_cast<uint8_t>(offset_lo | 1), 0, 0, 0,
+      Bytes frag_header = {17, 0, 0, static_cast<uint8_t>(unsigned{offset_lo} | 1u), 0, 0, 0,
                            static_cast<uint8_t>(i)};
       PacketBuilder b = Tagged(0);
       b.Add(PacketBuilder::IPv6Hdr{.src = Ip6("2001:db8::" + std::to_string(i + 1)),

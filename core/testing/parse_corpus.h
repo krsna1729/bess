@@ -72,7 +72,7 @@ inline std::vector<ParseCorpusFrame> ParseCorpus(uint32_t seed = 1) {
     out.push_back({base, base.size()});
     out.push_back({base, base.size() + 100});  // the head of a chained packet
     for (size_t len = 0; len < base.size(); len++) {
-      out.push_back({Bytes(base.begin(), base.begin() + len), len});
+      out.push_back({Bytes(base.begin(), base.begin() + static_cast<std::ptrdiff_t>(len)), len});
     }
     for (size_t i = 0; i < base.size() && i < 64; i++) {
       for (const uint8_t v : {uint8_t{0x00}, uint8_t{0xff}, byte()}) {

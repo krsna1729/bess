@@ -127,7 +127,7 @@ Bytes Ports(uint16_t sport, uint16_t dport) {
   out[1] = static_cast<uint8_t>(sport & 0xff);
   out[2] = static_cast<uint8_t>(dport >> 8);
   out[3] = static_cast<uint8_t>(dport & 0xff);
-  out[12] = 5 << 4;
+  out[12] = 0x50;  // TCP data offset 5
   return out;
 }
 

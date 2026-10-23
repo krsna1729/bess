@@ -56,7 +56,7 @@ struct ParsedFrame {
 
 namespace parse_internal {
 inline uint16_t Be16(const uint8_t *p) noexcept {
-  return static_cast<uint16_t>(p[0] << 8 | p[1]);
+  return static_cast<uint16_t>(unsigned{p[0]} << 8u | unsigned{p[1]});
 }
 
 inline constexpr size_t kMaxExtensionHeaders = 8;
@@ -154,8 +154,8 @@ inline ParseStatus CheckL4(uint8_t protocol, const uint8_t *l4, size_t have, siz
                            bool first_fragment, ParsedFrame *out) noexcept {
   switch (protocol) {
     case 6:  // TCP
-      if (have < 20 || (l4[12] >> 4) < 5 ||
-          (!first_fragment && static_cast<size_t>(l4[12] >> 4) * 4 > room)) {
+      if (have < 20 || (unsigned{l4[12]} >> 4u) < 5 ||
+          (!first_fragment && static_cast<size_t>(unsigned{l4[12]} >> 4u) * 4 > room)) {
         return ParseStatus::kMalformed;
       }
       if constexpr (kFill) {
@@ -216,9 +216,9 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t present, size_t limit, size
     return ParseStatus::kMalformed;
   }
   out.l3_offset = static_cast<uint16_t>(base);
-  const unsigned version = ip[0] >> 4;
+  const unsigned version = unsigned{ip[0]} >> 4u;
   if (version == 4) {
-    const size_t ihl = static_cast<size_t>(ip[0] & 0x0f) * 4;
+    const size_t ihl = static_cast<size_t>(unsigned{ip[0]} & 0x0fu) * 4;
     if (present < 20 || ihl < 20 || ihl > present) {
       return ParseStatus::kMalformed;
     }
@@ -230,10 +230,10 @@ inline ParseStatus ParseIp(const uint8_t *ip, size_t present, size_t limit, size
     out.protocol = ip[9];
     std::memcpy(out.src.data(), ip + 12, 4);
     std::memcpy(out.dst.data(), ip + 16, 4);
-    if ((Be16(ip + 6) & 0x1fff) != 0) {
+    if ((Be16(ip + 6) & 0x1fffu) != 0) {
       return ParseStatus::kFragment;
     }
-    out.first_fragment = (Be16(ip + 6) & 0x2000) != 0;  // MF set, offset 0
+    out.first_fragment = (Be16(ip + 6) & 0x2000u) != 0;  // MF set, offset 0
     return ParseL4(ip, std::min(present, total), total, ihl, base, out);
   }
   if (version == 6) {
@@ -342,11 +342,11 @@ inline FastIpv4 FastFrame(std::span<const uint8_t> frame, size_t total_len,
     std::memcpy(out->dst.data(), ip + 16, 4);
   }
   const uint16_t frag = Be16(ip + 6);
-  if ((frag & 0x1fff) != 0) {
+  if ((frag & 0x1fffu) != 0) {
     f.status = ParseStatus::kFragment;
     return f;
   }
-  f.first_fragment = (frag & 0x2000) != 0;
+  f.first_fragment = (frag & 0x2000u) != 0;
   if constexpr (kFill) {
     out->first_fragment = f.first_fragment;
     out->l4_offset = 34;
