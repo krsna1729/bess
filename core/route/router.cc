@@ -631,14 +631,19 @@ class Router::RouteResource final : public dataplane::Resource {
 // "<router>/next_hops": the static next hops. A bound id ("<router>/neighbors")
 // shares the slot table but is not this resource's: it is absent here, and a
 // write or an erase of it is refused. The ids this transaction upserts are
-// recorded, so the neighbors resource can refuse to bind them.
+// recorded, so the neighbors resource can refuse to bind them. The neighbors
+// resource is its key holder (D-187): a reference from outside the router that
+// names a bound id here is held there, as the router's own values reference it
+// there (HopReference), so a column of ids may mix static and bound hops.
 class Router::NextHopResource final
     : public dataplane::SlotResource<NextHopId, NextHop> {
  public:
   using Base = dataplane::SlotResource<NextHopId, NextHop>;
 
   explicit NextHopResource(Router &router)
-      : Base(router.next_hops_name_, router.next_hops_), router_(router) {}
+      : Base(router.next_hops_name_, router.next_hops_), router_(router) {
+    DeclareKeyHolder(router.neighbors_name_);
+  }
 
   size_t LiveCount() const override {
     return Base::LiveCount() - router_.bound_count_;
@@ -648,6 +653,13 @@ class Router::NextHopResource final
     NextHopId id;
     return dataplane::DecodeKey(key, &id) && !router_.IsNeighborBound(id) &&
            Base::Contains(key);
+  }
+
+  bool HeldByKeyHolder(const dataplane::ResourceKey &key,
+                       bool in_transaction) const override {
+    NextHopId id;
+    return dataplane::DecodeKey(key, &id) &&
+           (in_transaction ? router_.BoundInTransaction(id) : router_.IsNeighborBound(id));
   }
 
   std::expected<Reservation, std::string> Reserve(
@@ -1265,21 +1277,22 @@ std::expected<void, std::string> Router::Enroll(
     return r;
   }
   if (auto r = engine.Register(state.get()); !r) {
-    CHECK(engine.Unregister(neighbors_name_));
+    // next_hops first: it names neighbors as its key holder (D-187).
     CHECK(engine.Unregister(next_hops_name_));
+    CHECK(engine.Unregister(neighbors_name_));
     return r;
   }
   if (auto r = engine.Register(groups.get()); !r) {
     CHECK(engine.Unregister(next_hop_state_name_));
-    CHECK(engine.Unregister(neighbors_name_));
     CHECK(engine.Unregister(next_hops_name_));
+    CHECK(engine.Unregister(neighbors_name_));
     return r;
   }
   if (auto r = engine.Register(routes.get()); !r) {
     CHECK(engine.Unregister(groups_name_));
     CHECK(engine.Unregister(next_hop_state_name_));
-    CHECK(engine.Unregister(neighbors_name_));
     CHECK(engine.Unregister(next_hops_name_));
+    CHECK(engine.Unregister(neighbors_name_));
     return r;
   }
   engine_ = &engine;

@@ -490,6 +490,91 @@ TEST_P(RouterTransactionTest, OtherResourcesReferenceNextHops) {
   ASSERT_TRUE(engine_.Unregister("actions"));
 }
 
+// A resource that declares only "<rt>/next_hops" may name a bound id too
+// (D-187): the reference is held by "<rt>/neighbors", as a route's is, so the
+// binding cannot go while it is named -- and a static id stays protected in
+// "<rt>/next_hops". An id unbound and named in one transaction is missing.
+TEST_P(RouterTransactionTest, OtherResourcesReferenceBoundNextHopsThroughNextHops) {
+  auto router = MakeRouter();
+  ASSERT_TRUE(router->SetNeighborBindingPolicy(
+      {.capacity = 8,
+       .validate = [](const NeighborKey &) -> std::expected<void, std::string> { return {}; }}));
+  ASSERT_TRUE(router->Enroll(engine_.registry()));
+  dataplane::SlotTable<ActionId, Action> actions(16);
+  const std::string hops = router->next_hops_resource();
+  const std::string neighbors = router->neighbors_resource();
+  dataplane::SlotResource<ActionId, Action> actions_res(
+      "actions", actions,
+      [hops](const Action &a) {
+        return std::vector<dataplane::Reference>{
+            {hops, dataplane::EncodeKey(a.via)}};
+      },
+      {hops});
+  ASSERT_TRUE(engine_.Register(&actions_res));
+  // A failed assertion returns early: "actions" must not outlive this scope in
+  // the engine, or the router's teardown refuses (it may reference the router).
+  struct ReleaseActions {
+    TransactionEngine &engine;
+    ~ReleaseActions() {
+      while (engine.ReclaimRetired() != 0) {
+      }
+      bess::runtime::runtime().rcu().Drain();
+      EXPECT_TRUE(engine.ReleaseForTeardown(std::vector<std::string>{"actions"}));
+    }
+  } release_actions{engine_};
+  const auto use = [](uint32_t action, uint32_t hop) {
+    return Op::Upsert("actions", dataplane::EncodeKey(ActionId(action)),
+                      std::any(Action{NextHopId(hop)}));
+  };
+  const auto drop = [](uint32_t action) {
+    return Op::Erase("actions", dataplane::EncodeKey(ActionId(action)));
+  };
+  const auto key = [](uint32_t hop) { return dataplane::EncodeKey(NextHopId(hop)); };
+  const NeighborKey neighbor(dataplane::InterfaceId(7), Ip(192, 0, 2, 7));
+
+  // The referrers first: the engine reserves the hop and the binding first.
+  auto r = Apply({use(1, 4), use(2, 5), router->SetNextHopOp(NextHopId(4), Hop(4)),
+                  router->BindNeighborOp(NextHopId(5), neighbor)});
+  ASSERT_EQ(r.outcome, Outcome::kApplied) << r.ops[0].error << "|" << r.ops[1].error;
+  EXPECT_EQ(engine_.ReferenceCount(hops, key(4)), 1u);
+  EXPECT_EQ(engine_.ReferenceCount(neighbors, key(5)), 1u) << "held by the binding";
+  EXPECT_EQ(engine_.ReferenceCount(hops, key(5)), 0u);
+
+  r = Apply({router->UnbindNeighborOp(NextHopId(5))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("still referenced"), std::string::npos) << r.ops[0].error;
+  EXPECT_TRUE(router->IsNeighborBound(NextHopId(5)));
+  r = Apply({router->RemoveNextHopOp(NextHopId(4))});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("still referenced"), std::string::npos) << r.ops[0].error;
+
+  // Unbound in the transaction that names it: missing.
+  r = Apply({drop(2), router->UnbindNeighborOp(NextHopId(5)), use(3, 5)});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[2].error.find("references missing " + hops), std::string::npos)
+      << r.ops[2].error;
+  EXPECT_TRUE(router->IsNeighborBound(NextHopId(5)));
+  EXPECT_EQ(engine_.ReferenceCount(neighbors, key(5)), 1u) << "nothing of it applied";
+
+  // The referrer and the binding go together; an id that changes kind while
+  // nothing names it is counted where it is held now.
+  ASSERT_EQ(Apply({drop(2), router->UnbindNeighborOp(NextHopId(5))}).outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(engine_.ReferenceCount(neighbors, key(5)), 0u);
+  ASSERT_EQ(Apply({drop(1), router->RemoveNextHopOp(NextHopId(4))}).outcome,
+            Outcome::kApplied);
+  Settle();
+  ASSERT_EQ(Apply({router->BindNeighborOp(NextHopId(4), neighbor), use(1, 4)}).outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(engine_.ReferenceCount(neighbors, key(4)), 1u);
+  EXPECT_EQ(engine_.ReferenceCount(hops, key(4)), 0u);
+  EXPECT_NE(Apply({router->UnbindNeighborOp(NextHopId(4))}).outcome, Outcome::kApplied);
+  ASSERT_EQ(Apply({drop(1), router->UnbindNeighborOp(NextHopId(4))}).outcome,
+            Outcome::kApplied);
+  Settle();
+  ASSERT_TRUE(engine_.Unregister("actions"));
+}
+
 // Readers resolve through the router while transactions add a next hop and a
 // route per session, and remove an older session's route and next hop. A
 // resolved address only ever reaches its own session's next hop.

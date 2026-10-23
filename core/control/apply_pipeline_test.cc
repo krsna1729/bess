@@ -14,6 +14,8 @@
 #include <google/protobuf/util/json_util.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -35,6 +37,7 @@
 #include "pb/port_msg.pb.h"
 #include "runtime/opts.h"
 #include "packet_pool.h"
+#include "utils/endian.h"
 #include "port.h"
 #include "worker.h"
 
@@ -1789,6 +1792,63 @@ TEST_F(ApplyPipelineTest, NeighborBindingsConvergeAsTheirOwnResource) {
   ASSERT_EQ(1u, neighbors->entries.size());
   ASSERT_TRUE(neighbors->entries[0].key.UnpackTo(&listed));
   EXPECT_EQ(4u, listed.id());
+}
+
+// The resolving router's pipeline with an ExactMatch whose result column names
+// "rt/next_hops" (D-187): a rule per id in `rule_hops` (source 10.0.0.<id>),
+// listed before the router's resources.
+PipelineSpec ClassifiedResolvingRouterPipeline(const std::vector<uint32_t> &rule_hops,
+                                               const std::vector<uint32_t> &static_ids,
+                                               const std::vector<uint32_t> &bound_ids) {
+  PipelineSpec spec = ResolvingRouterPipeline(static_ids, bound_ids, /*route=*/false);
+  bess::pb::ExactMatchArg arg;
+  bess::pb::Field *field = arg.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  auto *hop = arg.add_result_fields();
+  hop->set_attr_name("next_hop_id");
+  hop->set_value_offset(0);
+  hop->set_num_bytes(4);
+  hop->set_reference("rt/next_hops");
+  hop->set_reference_key(bess::pb::ResultField::BE32);
+  spec.modules.push_back({"em", "ExactMatch", Packed(arg)});
+  bess::control::ResourceSpec rules{"em/rules", {}};
+  for (uint32_t id : rule_hops) {
+    bess::pb::ExactMatchRuleKey key;
+    key.add_fields()->set_value_bin(std::string("\x0a\x00\x00", 3) + static_cast<char>(id));
+    bess::pb::ExactMatchRuleValue value;
+    value.set_gate(1);
+    const bess::utils::be32_t be(id);
+    value.set_result(std::string(reinterpret_cast<const char *>(&be), sizeof(be)));
+    rules.entries.push_back({Packed(key), Packed(value)});
+  }
+  spec.resources.insert(spec.resources.begin(), std::move(rules));
+  return spec;
+}
+
+// A manifest whose classifier rules name static hop 2 and bound hop 1 through
+// the one column (D-187) converges, in the manifest's order or not; neither
+// the binding nor the static hop can be dropped while a rule names it, and
+// each goes with the rule that names it.
+TEST_F(ApplyPipelineTest, AClassifierColumnNamesStaticAndBoundNextHops) {
+  bess::runtime::runtime().ticks().set_interval(std::chrono::milliseconds(1));
+  auto applied =
+      control_plane_->ApplyPipeline(ClassifiedResolvingRouterPipeline({1, 2}, {2}, {1}), {});
+  ASSERT_TRUE(applied) << applied.error().message;
+  EXPECT_EQ(4u, applied->resource_ops) << "two rules, hop 2 and the binding of hop 1";
+  auto again =
+      control_plane_->ApplyPipeline(ClassifiedResolvingRouterPipeline({1, 2}, {2}, {1}), {});
+  ASSERT_TRUE(again) << again.error().message;
+  EXPECT_EQ(0u, again->resource_ops);
+
+  EXPECT_FALSE(control_plane_->ApplyPipeline(ClassifiedResolvingRouterPipeline({1, 2}, {2}, {}), {}))
+      << "a rule names bound hop 1";
+  EXPECT_FALSE(control_plane_->ApplyPipeline(ClassifiedResolvingRouterPipeline({1, 2}, {}, {1}), {}))
+      << "a rule names static hop 2";
+
+  auto dropped = control_plane_->ApplyPipeline(ClassifiedResolvingRouterPipeline({}, {}, {}), {});
+  ASSERT_TRUE(dropped) << dropped.error().message;
+  EXPECT_EQ(4u, dropped->resource_ops);
 }
 
 // A listed resource of a module the apply creates is reported, unchecked,

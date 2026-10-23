@@ -11,7 +11,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <any>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -21,6 +23,7 @@
 #include <chrono>
 #include <vector>
 
+#include "classifier/masked_rule_resource.h"
 #include "dataplane/transaction_engine.h"
 #include "gate.h"
 #include "module.h"
@@ -30,6 +33,7 @@
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 #include "runtime/runtime_state.h"
+#include "utils/endian.h"
 #include "utils/ether.h"
 
 namespace {
@@ -2865,6 +2869,74 @@ TEST_F(RouterTest, ARouteOrGroupListedBeforeItsBindingNamesTheBinding) {
   EXPECT_TRUE(result.ops[0].error.empty()) << result.ops[0].error;
   EXPECT_FALSE(result.ops[1].error.empty());
   EXPECT_FALSE(router.IsNeighborBound(bess::route::NextHopId(7)));
+}
+
+// A classifier result column declared against "rt/next_hops" names static
+// and bound hops alike (D-187): rules naming bound hop 1, a hop bound in the
+// same transaction (listed after the rule) and static hop 3 all apply; each
+// reference is held where its id is, so neither the bindings nor the static
+// hop can go while a rule names them.
+TEST_F(RouterTest, AClassifierResultColumnNamesStaticAndBoundNextHops) {
+  bess::pb::WildcardMatchArg wm_arg;
+  auto *wf = wm_arg.add_fields();
+  wf->set_offset(26);
+  wf->set_num_bytes(4);
+  auto *field = wm_arg.add_result_fields();
+  field->set_attr_name("next_hop_id");
+  field->set_value_offset(0);
+  field->set_num_bytes(4);
+  field->set_reference("rt/next_hops");
+  field->set_reference_key(bess::pb::ResultField::BE32);
+  ASSERT_NE(nullptr, h_.Create("WildcardMatch", wm_arg, "wm"));
+  auto *rt = CreateResolver(ResolverArg(0));  // id 1 bound
+  ASSERT_NE(nullptr, rt);
+  const bess::route::Router &router = *rt->router();
+  bess::pb::RouterNextHopIdKey static_key;
+  static_key.set_id(3);
+  bess::pb::RouterNextHopValue static_hop;
+  static_hop.set_egress_gate(1);
+  ASSERT_EQ("", h_.UpsertResource("rt/next_hops", static_key, static_hop));
+
+  const auto rule = [](const char *net, uint32_t hop) {
+    const auto mask = bess::testing::Ip4("255.255.255.0");
+    const auto value = bess::testing::Ip4(net);
+    const bess::utils::be32_t id(hop);
+    const std::vector<std::byte> record(reinterpret_cast<const std::byte *>(&id),
+                                        reinterpret_cast<const std::byte *>(&id) + sizeof(id));
+    return bess::dataplane::Op::Upsert(
+        "wm/rules",
+        std::string(mask.begin(), mask.end()) + std::string(value.begin(), value.end()),
+        std::any(bess::classifier::MaskedRuleResource::Value{1, 0, record}));
+  };
+  ASSERT_EQ("", h_.Apply({rule("10.1.0.0", 1), rule("10.3.0.0", 3), rule("10.4.0.0", 4),
+                          router.BindNeighborOp(bess::route::NextHopId(4),
+                                                bess::route::NeighborKey(
+                                                    bess::dataplane::InterfaceId(2), 0xc0000204))}));
+  const auto &engine = bess::runtime::runtime().transactions();
+  const auto key = [](uint32_t id) { return bess::dataplane::EncodeKey(bess::route::NextHopId(id)); };
+  EXPECT_EQ(1u, engine.ReferenceCount("rt/neighbors", key(1)));
+  EXPECT_EQ(1u, engine.ReferenceCount("rt/neighbors", key(4)));
+  EXPECT_EQ(1u, engine.ReferenceCount("rt/next_hops", key(3)));
+  EXPECT_EQ(0u, engine.ReferenceCount("rt/next_hops", key(1)));
+  // The holder publishes before the rules and is erased after them.
+  EXPECT_LT(engine.FindResource("rt/neighbors")->rank(), engine.FindResource("wm/rules")->rank());
+
+  EXPECT_NE("", UnbindNeighbor("rt", 1)) << "a rule names bound hop 1";
+  EXPECT_NE("", UnbindNeighbor("rt", 4)) << "a rule names bound hop 4";
+  EXPECT_NE("", h_.EraseResource("rt/next_hops", static_key)) << "a rule names static hop 3";
+  EXPECT_TRUE(router.IsNeighborBound(bess::route::NextHopId(1)));
+
+  const auto erase = [](const char *net) {
+    const auto mask = bess::testing::Ip4("255.255.255.0");
+    const auto value = bess::testing::Ip4(net);
+    return bess::dataplane::Op::Erase(
+        "wm/rules",
+        std::string(mask.begin(), mask.end()) + std::string(value.begin(), value.end()));
+  };
+  ASSERT_EQ("", h_.Apply({erase("10.1.0.0"), erase("10.3.0.0")}));
+  EXPECT_EQ("", UnbindNeighbor("rt", 1));
+  EXPECT_EQ("", h_.EraseResource("rt/next_hops", static_key));
+  EXPECT_NE("", UnbindNeighbor("rt", 4)) << "still named";
 }
 
 // Path health through the module (D-184): "rt/next_hop_state" fails an
