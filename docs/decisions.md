@@ -12280,8 +12280,8 @@ hits while a defaulted reader (a Router's `route_domain`) silently used the defa
 - **`kMetadataOffsetNoWrite` means only "no reader".** A writer in an invalid scope now gets
   `kMetadataOffsetInvalidScope` (-5). Its write is still skipped - every writer skips a negative offset
   (`set_attr_with_offset`, or an `IsValidOffset` check before `_set_attr_with_offset`) - and the metadata report
-  no longer lists it among `writers_without_reader`; its reader is listed among `readers_without_writer`, as
-  before.
+  no longer lists it among `writers_without_reader`; its reader is listed among `readers_without_writer`, or
+  among `defaults_applied` if it declared a default, as before.
 - **`kMetadataOffsetNoWrite` skips the field.** Each result field resolves to one destination
   (`ResultDestination`): its packet offset, its attribute's metadata offset, `kSkippedOffset` for
   `kMetadataOffsetNoWrite`, or `kInvalidOffset` for anything else. A skipped field is left out of the
