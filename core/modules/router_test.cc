@@ -2770,7 +2770,8 @@ TEST_F(RouterTest, ARenumberedReconfirmingNeighborKeepsItsProbeSchedule) {
   // Tick 7 takes the moves up, then sends both second probes on schedule.
   (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 7);
   std::set<std::string> targets;
-  for (const Bytes &probe : h_.RunTask(rt, {0, 1})[1]) {
+  const auto second_probes = h_.RunTask(rt, {0, 1});
+  for (const Bytes &probe : second_probes.at(1)) {
     targets.insert(ArpTarget(probe));
   }
   EXPECT_EQ((std::set<std::string>{"192.0.2.2", "192.0.2.3"}), targets);
