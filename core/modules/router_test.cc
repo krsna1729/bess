@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <chrono>
@@ -274,15 +275,35 @@ class RouterTest : public ::testing::Test {
   }
 
   // One next-hop group (D-156), written as a client writes it: the members in
-  // selection order, a repeated member a weight.
-  void MakeGroup(Router *rt, uint32_t id, const std::vector<uint32_t> &members) {
+  // selection order, a repeated member a weight, and the standby members
+  // (D-184).
+  void MakeGroup(Router *rt, uint32_t id, const std::vector<uint32_t> &members,
+                 const std::vector<uint32_t> &standby = {}) {
     bess::pb::RouterGroupIdKey key;
     key.set_id(id);
     bess::pb::RouterGroupValue value;
     for (const uint32_t member : members) {
       value.add_member_ids(member);
     }
+    for (const uint32_t member : standby) {
+      value.add_standby_member_ids(member);
+    }
     EXPECT_EQ("", h_.UpsertResource("rt/groups", key, value));
+  }
+
+  // Next hop `id`'s availability entry (D-184), as a path-health producer
+  // writes it; "" when it applied, the error otherwise.
+  std::string SetHopState(uint32_t id, bool down) {
+    bess::pb::RouterNextHopIdKey key;
+    key.set_id(id);
+    bess::pb::RouterNextHopState value;
+    value.set_down(down);
+    return h_.UpsertResource("rt/next_hop_state", key, value);
+  }
+  std::string EraseHopState(uint32_t id) {
+    bess::pb::RouterNextHopIdKey key;
+    key.set_id(id);
+    return h_.EraseResource("rt/next_hop_state", key);
   }
 
   // One route naming a group instead of a hop (D-156).
@@ -2844,6 +2865,164 @@ TEST_F(RouterTest, ARouteOrGroupListedBeforeItsBindingNamesTheBinding) {
   EXPECT_TRUE(result.ops[0].error.empty()) << result.ops[0].error;
   EXPECT_FALSE(result.ops[1].error.empty());
   EXPECT_FALSE(router.IsNeighborBound(bess::route::NextHopId(7)));
+}
+
+// Path health through the module (D-184): "rt/next_hop_state" fails an
+// active/standby group over. With both actives down the standby carries every
+// flow; an active marked available again takes them back; with the entries
+// erased the group spreads over its actives as before.
+TEST_F(RouterTest, AnActiveStandbyGroupFailsOverThroughTheStateResource) {
+  Router *rt = MakeDestinationRouter(1, 1);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeHop(rt, 2, 2, "02:00:00:00:00:cc", "02:00:00:00:00:aa");
+  MakeHop(rt, 3, 3, "02:00:00:00:00:dd", "02:00:00:00:00:aa");
+  MakeGroup(rt, 1, {1, 2}, {3});
+  MakeGroupRoute(rt, "198.51.100.0", 24, 0, 1);
+
+  // The gates 64 flows to the group's prefix leave on.
+  const auto served = [&] {
+    std::set<gate_idx_t> gates;
+    for (uint16_t port = 1; port <= 64; port++) {
+      auto out = RunToDestination(rt, FlowFrame("198.51.100.9", 4000, port), 0, {0, 1, 2, 3});
+      for (const auto &[gate, frames] : out) {
+        if (!frames.empty()) {
+          gates.insert(gate);
+        }
+      }
+    }
+    return gates;
+  };
+  EXPECT_EQ((std::set<gate_idx_t>{1, 2}), served()) << "the actives";
+  ASSERT_EQ("", SetHopState(1, true));
+  EXPECT_EQ((std::set<gate_idx_t>{2}), served()) << "one active down";
+  ASSERT_EQ("", SetHopState(2, true));
+  EXPECT_EQ((std::set<gate_idx_t>{3}), served()) << "both actives down: the standby";
+  ASSERT_EQ("", SetHopState(1, false));
+  EXPECT_EQ((std::set<gate_idx_t>{1}), served()) << "an active is available again";
+  ASSERT_EQ("", EraseHopState(1));
+  ASSERT_EQ("", EraseHopState(2));
+  EXPECT_EQ((std::set<gate_idx_t>{1, 2}), served()) << "no entries: as before";
+}
+
+// The same through an IPv6 group route: the eligible set belongs to the
+// group, whichever family's route names it (D-184).
+TEST_F(RouterTest, AnIpv6GroupRouteFailsOverThroughTheStateResource) {
+  Router *rt = MakeDestinationRouter(1, 1);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
+  MakeHop(rt, 2, 2, "02:00:00:00:00:cc", "02:00:00:00:00:aa");
+  MakeHop(rt, 3, 3, "02:00:00:00:00:dd", "02:00:00:00:00:aa");
+  MakeGroup(rt, 1, {1, 2}, {3});
+  bess::pb::RouterRouteKey route_key;
+  route_key.set_ipv6("2001:db8:1::");
+  route_key.set_prefix_length(64);
+  bess::pb::RouterRouteValue route_value;
+  route_value.set_group_id(1);
+  ASSERT_EQ("", h_.UpsertResource("rt/routes", route_key, route_value));
+
+  // The gates 64 IPv6 flows to the group's prefix leave on.
+  const auto served = [&] {
+    std::set<gate_idx_t> gates;
+    for (uint16_t port = 1; port <= 64; port++) {
+      PacketBuilder b;
+      b.Ether("02:00:00:00:00:0a", "02:00:00:00:00:0b")
+          .IPv6("2001:db8::1", "2001:db8:1::9")
+          .Udp(4000, port)
+          .Payload("payload");
+      for (const auto &[gate, frames] : RunToDestination(rt, b.Build(), 0, {0, 1, 2, 3})) {
+        if (!frames.empty()) {
+          gates.insert(gate);
+        }
+      }
+    }
+    return gates;
+  };
+  EXPECT_EQ((std::set<gate_idx_t>{1, 2}), served()) << "the actives";
+  ASSERT_EQ("", SetHopState(1, true));
+  ASSERT_EQ("", SetHopState(2, true));
+  EXPECT_EQ((std::set<gate_idx_t>{3}), served()) << "both actives down: the standby";
+  ASSERT_EQ("", EraseHopState(1));
+  ASSERT_EQ("", EraseHopState(2));
+  EXPECT_EQ((std::set<gate_idx_t>{1, 2}), served()) << "no entries: as before";
+}
+
+// Standby members and state entries read back in the form a client sends
+// (D-129): the two member lists in their stored order, and every entry as
+// written, one that says available included.
+TEST_F(RouterTest, StandbyMembersAndNextHopStateReadBack) {
+  Router *rt = MakeDestinationRouter(1, 1);
+  ASSERT_NE(nullptr, rt);
+  for (uint32_t id = 1; id <= 4; id++) {
+    MakeHop(rt, id, id, nullptr, nullptr);
+  }
+  MakeGroup(rt, 1, {1, 2, 1}, {4, 3});
+  ASSERT_EQ("", SetHopState(2, true));
+  ASSERT_EQ("", SetHopState(4, false));
+
+  bess::pb::RouterGroupIdKey group_key;
+  group_key.set_id(1);
+  bess::pb::RouterGroupValue group;
+  for (const uint32_t member : {1u, 2u, 1u}) {
+    group.add_member_ids(member);
+  }
+  for (const uint32_t member : {4u, 3u}) {
+    group.add_standby_member_ids(member);
+  }
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/groups", {{&group_key, &group}}));
+
+  bess::pb::RouterNextHopIdKey two;
+  two.set_id(2);
+  bess::pb::RouterNextHopState down;
+  down.set_down(true);
+  bess::pb::RouterNextHopIdKey four;
+  four.set_id(4);
+  const bess::pb::RouterNextHopState available;
+  EXPECT_EQ("", h_.ReadBackDiffers("rt/next_hop_state", {{&two, &down}, {&four, &available}}));
+}
+
+// The codecs refuse malformed values by name, and the engine refuses state
+// for a next hop that does not exist; a next hop with an entry leaves only
+// after the entry.
+TEST_F(RouterTest, PathHealthValuesAreChecked) {
+  Router *rt = MakeDestinationRouter(1, 2);
+  ASSERT_NE(nullptr, rt);
+  MakeHop(rt, 1, 1, nullptr, nullptr);
+  MakeHop(rt, 2, 2, nullptr, nullptr);
+  const auto refused = [&](const std::string &error, const std::string &want) {
+    EXPECT_NE(std::string::npos, error.find(want)) << "want '" << want << "', got '" << error
+                                                   << "'";
+  };
+  refused(SetHopState(0, true), "next hop id 0 is invalid");
+  EXPECT_NE("", SetHopState(9, true)) << "next hop 9 does not exist";
+
+  bess::pb::RouterGroupIdKey key;
+  key.set_id(1);
+  bess::pb::RouterGroupValue both;
+  both.add_member_ids(1);
+  both.add_standby_member_ids(1);
+  refused(h_.UpsertResource("rt/groups", key, both), "both an active and a standby");
+  bess::pb::RouterGroupValue zero;
+  zero.add_member_ids(1);
+  zero.add_standby_member_ids(0);
+  refused(h_.UpsertResource("rt/groups", key, zero), "standby member id 0 is invalid");
+  bess::pb::RouterGroupValue standby_only;
+  standby_only.add_standby_member_ids(1);
+  refused(h_.UpsertResource("rt/groups", key, standby_only), "at least one active");
+  bess::pb::RouterGroupValue too_many;
+  for (size_t i = 0; i < bess::route::NextHopGroup::kMaxMembers; i++) {
+    too_many.add_member_ids(1);
+  }
+  too_many.add_standby_member_ids(2);
+  refused(h_.UpsertResource("rt/groups", key, too_many), "active and standby together");
+  EXPECT_EQ(0u, rt->router()->next_hop_group_count());
+
+  ASSERT_EQ("", SetHopState(2, true));
+  bess::pb::RouterNextHopIdKey hop;
+  hop.set_id(2);
+  EXPECT_NE("", h_.EraseResource("rt/next_hops", hop)) << "its state entry names it";
+  EXPECT_EQ("", EraseHopState(2));
+  EXPECT_EQ("", h_.EraseResource("rt/next_hops", hop));
 }
 
 }  // namespace

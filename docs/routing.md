@@ -51,6 +51,15 @@ is the same shape one level up: the FIB names the group, and the group's member 
 flow hash (`route::FlowHash`), so a flow keeps one member (D-156); which fields that hash reads is the graph's
 choice -- the whole flow by default, the address pair alone with `FLOW_HASH_L3` (D-163).
 
+A group's members are **active** or **standby**, and each next hop has an **availability** input
+(`<router>/next_hop_state`, or `Router::SetNextHopDown` directly; D-184), a static next hop and one bound to a
+neighbor alike. Availability belongs to the next hop: a path is down once, and every group holding it follows,
+behind IPv4 and IPv6 routes alike. A group selects among its available actives; with every
+active down, among its available standbys; with everything down, among all its actives (fail open, so the neighbor
+state decides, as it does with no availability input). A member that goes down loses only its own flows, spread
+over the others, and gets them back when it comes up. Deciding availability is not the Router's job: BFD, ICMP or
+application probes, or a controller, write it.
+
 A next hop whose egress interface is absent (`kInvalidInterfaceId`; on the module's wire, `egress_gate =
 DROP_GATE`) forwards nowhere: the chain reports `kNoEgress` and the packet ends there. That is the blackhole
 shape -- `0.0.0.0/0` to such a hop is the domain's default that drops, and a local `/32` uses it for the
@@ -97,8 +106,9 @@ The chain decrements the IPv4 TTL and fixes its checksum, or decrements the IPv6
 (D-155). The Router module's configured NeighborResolver processes ARP/ND input and timers on its control
 maintenance path, publishes whole next-hop objects through transactions, and emits solicitation frames from
 its task on the configured output gate. An unresolved neighbor remains fail-closed until a valid reply or
-advertisement updates it. Routes, next hops, neighbor bindings and groups use the module resources
-(`<router>/routes`, `/next_hops`, `/neighbors`, `/groups`) in transactions, or direct library APIs.
+advertisement updates it. Routes, next hops, neighbor bindings, next-hop availability and groups use the
+module resources (`<router>/routes`, `/next_hops`, `/neighbors`, `/next_hop_state`, `/groups`) in
+transactions, or direct library APIs.
 For IPv4, `route::ConnectedRouteFor(address, length, egress)` returns an
 interface prefix with an unresolved next hop (D-164). IPv6 routes are
 configured with `RouterRouteKey.ipv6` and an `Ipv6Prefix`; they share the
@@ -259,6 +269,6 @@ than to grow a second prefix table.
   writes), D-155 (routing by destination), D-156 (groups), D-157 (the shared chain), D-158 (lazy domains),
   D-160 (a hop that forwards nowhere), D-175 (IPv4 neighbor resolution), D-176 (IPv6 ND on the same resolver),
   D-178 (connected/local route derivation and local delivery), D-183 (IPv6 routing, families, the Router's own
-  neighbor resolution).
+  neighbor resolution), D-184 (path health: availability, active/standby).
 - `examples/appliances/router/router_app.h` — R1, the reference application, and `examples/static_router` for
   the same code as a program without `bessd`.

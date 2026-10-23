@@ -55,6 +55,8 @@ const ResourceTables Router::resource_tables = {
                        bess::pb::RouterNextHopValue>("next_hops"),
     ResourceTable::Map<bess::pb::RouterNextHopIdKey,
                        bess::pb::RouterNeighborBinding>("neighbors"),
+    ResourceTable::Map<bess::pb::RouterNextHopIdKey, bess::pb::RouterNextHopState>(
+        "next_hop_state"),
     ResourceTable::Map<bess::pb::RouterGroupIdKey, bess::pb::RouterGroupValue>(
         "groups"),
     ResourceTable::Map<bess::pb::RouterRouteKey, bess::pb::RouterRouteValue>(
@@ -618,6 +620,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       !enrolled) {
     next_hops_binding_.Reset();
     neighbors_binding_.Reset();
+    next_hop_state_binding_.Reset();
     groups_binding_.Reset();
     routes_binding_.Reset();
     router_.reset();
@@ -723,6 +726,31 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                   visit(key, NeighborKeyToPb(neighbor));
                 });
           }));
+  next_hop_state_binding_ = init_context().codecs().Bind(
+      *router_->next_hop_state_resource_object(),
+      std::make_shared<bess::framework::TypedCodec<bess::pb::RouterNextHopIdKey,
+                                             bess::pb::RouterNextHopState>>(
+          [](const bess::pb::RouterNextHopIdKey &key)
+              -> std::expected<dataplane::ResourceKey, std::string> {
+            if (key.id() == 0) {
+              return std::unexpected("next hop id 0 is invalid");
+            }
+            return dataplane::EncodeKey(route::NextHopId(key.id()));
+          },
+          [](const bess::pb::RouterNextHopState &value)
+              -> std::expected<std::any, std::string> {
+            return std::any(route::NextHopState{value.down()});
+          },
+          [this](const auto &visit) {
+            router_->ForEachNextHopState(
+                [&visit](route::NextHopId id, const route::NextHopState &state) {
+                  bess::pb::RouterNextHopIdKey key;
+                  key.set_id(id.value());
+                  bess::pb::RouterNextHopState value;
+                  value.set_down(state.down);
+                  visit(key, value);
+                });
+          }));
   groups_binding_ = init_context().codecs().Bind(
       *router_->groups_resource_object(),
       std::make_shared<bess::framework::TypedCodec<bess::pb::RouterGroupIdKey,
@@ -745,23 +773,34 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
           [](const bess::pb::RouterGroupValue &value)
               -> std::expected<std::any, std::string> {
             const int members = value.member_ids_size();
-            if (members == 0 ||
-                static_cast<size_t>(members) > route::NextHopGroup::kMaxMembers) {
+            const int standbys = value.standby_member_ids_size();
+            if (members == 0 || static_cast<size_t>(members) + static_cast<size_t>(standbys) >
+                                    route::NextHopGroup::kMaxMembers) {
               return std::unexpected(
                   "a group has 1 to " +
                   std::to_string(route::NextHopGroup::kMaxMembers) +
-                  " members");
+                  " members, active and standby together, and at least one active");
             }
             // A repeated member is a weight: it takes that many selection
             // slots (D-065), so the order is the group's meaning and is kept.
+            // The library refuses a next hop in both lists (D-184).
             route::NextHopGroup group;
             group.size = static_cast<uint32_t>(members);
+            group.standby_size = static_cast<uint32_t>(standbys);
             for (int i = 0; i < members; i++) {
               const uint32_t member = value.member_ids(i);
               if (member == 0) {
                 return std::unexpected("group member id 0 is invalid");
               }
               group.members[static_cast<size_t>(i)] = route::NextHopId(member);
+            }
+            for (int i = 0; i < standbys; i++) {
+              const uint32_t member = value.standby_member_ids(i);
+              if (member == 0) {
+                return std::unexpected("group standby member id 0 is invalid");
+              }
+              group.members[static_cast<size_t>(members) + static_cast<size_t>(i)] =
+                  route::NextHopId(member);
             }
             return std::any(group);
           },
@@ -772,8 +811,11 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                   bess::pb::RouterGroupIdKey key;
                   key.set_id(id.value());
                   bess::pb::RouterGroupValue value;
-                  for (uint32_t i = 0; i < group.size; i++) {
-                    value.add_member_ids(group.members[i].value());
+                  for (const route::NextHopId member : group.actives()) {
+                    value.add_member_ids(member.value());
+                  }
+                  for (const route::NextHopId member : group.standbys()) {
+                    value.add_standby_member_ids(member.value());
                   }
                   visit(key, value);
                 });
@@ -899,6 +941,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       CHECK(released) << released.error();
       next_hops_binding_.Reset();
       neighbors_binding_.Reset();
+      next_hop_state_binding_.Reset();
       groups_binding_.Reset();
       routes_binding_.Reset();
       router_.reset();
@@ -922,6 +965,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       CHECK(released) << released.error();
       next_hops_binding_.Reset();
       neighbors_binding_.Reset();
+      next_hop_state_binding_.Reset();
       groups_binding_.Reset();
       routes_binding_.Reset();
       router_.reset();
@@ -1008,6 +1052,7 @@ void Router::DeInit() {
   CHECK(released) << released.error();
   next_hops_binding_.Reset();
   neighbors_binding_.Reset();
+  next_hop_state_binding_.Reset();
   groups_binding_.Reset();
   routes_binding_.Reset();
   router_.reset();

@@ -342,6 +342,22 @@ message RouterNextHopValue {
 }
 
 /**
+ * A Router next hop's availability ("<module>/next_hop_state", D-184), keyed
+ * by RouterNextHopIdKey: the input a path-health producer (BFD, ICMP or
+ * application probes, a controller) writes, for a static next hop or one bound
+ * to a neighbor alike. A next hop with no entry is available. An entry
+ * references its next hop (a bound one's binding in "<module>/neighbors"):
+ * state for a next hop that does not exist is refused, and a next hop with an
+ * entry cannot be erased or unbound without it. Marking a next hop down
+ * republishes every group it is a member of, so routes through those groups,
+ * IPv4 and IPv6, move to their other members. Reads back as written (D-129),
+ * an entry that says available included.
+ */
+message RouterNextHopState {
+  bool down = 1;
+}
+
+/**
  * The key of a Router's "<module>/groups" resource (D-129, D-156): a next-hop
  * group id, 1..max_groups.
  */
@@ -350,15 +366,20 @@ message RouterGroupIdKey {
 }
 
 /**
- * A Router next-hop group ("<module>/groups", D-065, D-156): the member next
- * hops a route naming the group selects among. Members are in selection
- * order, 1..64 of them, and a repeated member is a weight (it takes that many
- * selection slots). A member must exist and a route naming the group
- * references it: the engine refuses a member or a group still in use. Reads
- * back in exactly this form (D-129), members in their stored order.
+ * A Router next-hop group ("<module>/groups", D-065, D-156, D-184): the
+ * member next hops a route naming the group selects among. `member_ids` are
+ * the active members and `standby_member_ids` the standby ones, each list in
+ * selection order: 1..64 next hops in all, at least one active, a repeated
+ * member a weight (it takes that many selection slots), and no next hop in
+ * both lists. A flow uses the available actives; with every active down
+ * ("<module>/next_hop_state") the available standbys; with everything down
+ * the actives. A member must exist and a route naming the group references
+ * it: the engine refuses a member or a group still in use. Reads back in
+ * exactly this form (D-129), members in their stored order.
  */
 message RouterGroupValue {
   repeated uint32 member_ids = 1;
+  repeated uint32 standby_member_ids = 2;
 }
 
 /** A route's prefix. Exactly one of ipv4 or ipv6 is set. */

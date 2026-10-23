@@ -194,6 +194,13 @@ std::vector<ModuleCase> ParityCases() {
     group->add_member_ids(1);
     c.samples.push_back({"groups", group_key, group});
 
+    // After the group: marking its member down republishes it (D-184).
+    auto state_key = Msg<pb::RouterNextHopIdKey>();
+    state_key->set_id(1);
+    auto state = Msg<pb::RouterNextHopState>();
+    state->set_down(true);
+    c.samples.push_back({"next_hop_state", state_key, state});
+
     auto route_key = Msg<pb::RouterRouteKey>();
     route_key->set_ipv4("10.0.0.0");
     route_key->set_prefix_length(8);

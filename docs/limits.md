@@ -89,7 +89,8 @@ Columns:
 | Router | next hops | destination mode: 16M − 1; next-hop-id mode: 4G − 2 | `LpmRouteTable::kMaxValue` (the FIB's 24-bit route value); `Router::kMaxNextHopsWithoutFib` (the 32-bit id) | `max_next_hops` up to the bound | EINVAL "router capacity exceeds backend limits" |
 | Router | next-hop groups | destination mode: 16M − 1 − `max_next_hops`; next-hop-id mode: none | `LpmRouteTable::kMaxValue` (shares the bound with `max_next_hops`) | `max_groups` up to the bound in destination mode; 0 (the default) registers the empty resource | EINVAL "router capacity exceeds backend limits"; a nonzero value in next-hop-id mode is EINVAL |
 | Router | route domains | destination mode: 16M; next-hop-id mode: 1 | `route::kMaxRouteDomains` | `max_domains` up to the bound in destination mode | EINVAL |
-| Router | members per next-hop group | 64 | `NextHopGroup::kMaxMembers` | No | refused |
+| Router | members per next-hop group | 64, active and standby together (D-184) | `NextHopGroup::kMaxMembers` | No | refused |
+| Router | next-hop state entries | one per next hop (`max_next_hops`), static or bound | `<router>/next_hop_state` (D-184) | with `max_next_hops` | refused (an unknown next hop is a missing reference) |
 | Router | neighbor solicitation frame | 86 B (ARP 42 B) | `kMaxNeighborFrameSize` (`route/l3_packet.h`) | No | a caller's output buffer must fit the family's frame |
 | Router | IPv6 ND hop limit | 255 | `kNdHopLimit` (`route/l3_packet.h`) | No | a solicitation or advertisement with another value is not parsed |
 | Router | DPDK table instance name | 20 characters (the module name, cut, plus `_r<N>`) | `kMaxInstanceName` (`route/route_table.cc`) | No | never: the name is cut (DPDK's ring and `rte_fib` RIB mempool names, D-132) |

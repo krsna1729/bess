@@ -985,6 +985,261 @@ TEST_P(RouterGroupTest, GroupRemovalIsDeferredAndPinsMembers) {
   domain.Unregister(kReader);
 }
 
+// -- path health: availability, active/standby, the eligible set (D-184) -----
+
+// The next hop a flow hash picks through the group route to 10/8.
+uint32_t PickOf(const Router &router, uint32_t hash) {
+  return router.LookupRoute(kDefaultRouteDomainId, Ip(10, 1, 2, 3), hash).value();
+}
+
+// MurmurHash3's finalizer: a fixed spread of 32-bit values.
+constexpr uint32_t Mix(uint32_t x) {
+  x ^= x >> 16u;
+  x *= 0x85ebca6bu;
+  x ^= x >> 13u;
+  x *= 0xc2b2ae35u;
+  x ^= x >> 16u;
+  return x;
+}
+
+// A fixed set of flow hashes: the ends and the middle of the range, and a
+// spread.
+std::vector<uint32_t> FixedHashes() {
+  std::vector<uint32_t> hashes = {0u, 1u, 0x7fffffffu, 0x80000000u, 0xfffffffeu, 0xffffffffu};
+  for (uint32_t i = 0; i < 4096; i++) {
+    hashes.push_back(Mix(i));
+  }
+  return hashes;
+}
+
+// What each fixed hash picks now.
+std::vector<uint32_t> Picks(const Router &router) {
+  std::vector<uint32_t> picks;
+  for (const uint32_t hash : FixedHashes()) {
+    picks.push_back(PickOf(router, hash));
+  }
+  return picks;
+}
+
+// A router with next hops 1..`hops` and group 1, `actives` then `standby`,
+// routed at 10/8.
+std::unique_ptr<Router> MakeHealthRouter(std::span<const NextHopId> actives,
+                                         std::span<const NextHopId> standby,
+                                         uint32_t hops = 8) {
+  auto router = MakeGroupRouter(/*next_hops=*/hops, /*groups=*/4);
+  for (uint32_t i = 1; i <= hops; i++) {
+    EXPECT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, static_cast<uint8_t>(i))));
+  }
+  EXPECT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), actives, standby));
+  EXPECT_TRUE(router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(1)));
+  return router;
+}
+
+// With no availability state a group selects exactly as before path health:
+// the active member RangeSelect(hash, n) picks, for every group size, with
+// repeated members (weights) and with standby members configured. Marking a
+// member down and up again returns to it.
+TEST_P(RouterGroupTest, WithoutStateSelectionIsUnchanged) {
+  constexpr uint32_t kHops = NextHopGroup::kMaxMembers + 16;
+  auto router = MakeGroupRouter(kHops, /*groups=*/1);
+  for (uint32_t i = 1; i <= kHops; i++) {
+    ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, 1)));
+  }
+  const std::vector<uint32_t> hashes = FixedHashes();
+  std::vector<NextHopId> actives;
+  for (uint32_t n = 1; n <= NextHopGroup::kMaxMembers; n++) {
+    SCOPED_TRACE(::testing::Message() << n << " active positions");
+    // Hops 1..n, some of them repeated; standbys from the hops past 64.
+    actives.clear();
+    for (uint32_t p = 0; p < n; p++) {
+      actives.push_back(NextHopId(1 + Mix(n * 100u + p) % n));
+    }
+    std::vector<NextHopId> standby;
+    for (uint32_t s = 0; s < std::min<uint32_t>(16, NextHopGroup::kMaxMembers - n); s++) {
+      standby.push_back(NextHopId(NextHopGroup::kMaxMembers + 1 + s));
+    }
+    ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), actives, standby));
+    if (n == 1) {
+      ASSERT_TRUE(
+          router->SetRoute(kDefaultRouteDomainId, P(Ip(10, 0, 0, 0), 8), NextHopGroupId(1)));
+    }
+    for (const uint32_t hash : hashes) {
+      ASSERT_EQ(actives[dataplane::RangeSelect(hash, n)].value(), PickOf(*router, hash))
+          << "hash " << hash;
+    }
+  }
+  const std::vector<uint32_t> before = Picks(*router);
+  ASSERT_TRUE(router->SetNextHopDown(actives[0], true));
+  EXPECT_NE(before, Picks(*router));
+  ASSERT_TRUE(router->SetNextHopDown(actives[0], false));
+  EXPECT_EQ(before, Picks(*router)) << "marked up again, as if never marked";
+}
+
+// An active member that goes down loses exactly its own flows, and they spread
+// over the other actives, never to a standby; when it comes back every flow
+// returns to where it was.
+TEST_P(RouterGroupTest, AnActiveGoingDownMovesOnlyItsFlows) {
+  const NextHopId actives[] = {NextHopId(1), NextHopId(2), NextHopId(3), NextHopId(4)};
+  const NextHopId standby[] = {NextHopId(5)};
+  auto router = MakeHealthRouter(actives, standby);
+  const std::vector<uint32_t> before = Picks(*router);
+
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(2), true));
+  const std::vector<uint32_t> after = Picks(*router);
+  std::set<uint32_t> moved_to;
+  for (size_t i = 0; i < before.size(); i++) {
+    if (before[i] != 2) {
+      ASSERT_EQ(before[i], after[i]) << "a flow of an available member moved";
+    } else {
+      moved_to.insert(after[i]);
+    }
+  }
+  EXPECT_EQ((std::set<uint32_t>{1, 3, 4}), moved_to)
+      << "the down member's flows spread over every other active, and only those";
+
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(2), false));
+  EXPECT_EQ(before, Picks(*router)) << "back up: every flow returned";
+}
+
+// With every active down the standbys carry the flows; one active coming back
+// takes them all back; with that one down again and a standby down too, the
+// remaining standby carries everything.
+TEST_P(RouterGroupTest, AllActivesDownFailOverToStandbysAndBack) {
+  const NextHopId actives[] = {NextHopId(1), NextHopId(2)};
+  const NextHopId standby[] = {NextHopId(3), NextHopId(4)};
+  auto router = MakeHealthRouter(actives, standby);
+  const auto served = [&] {
+    const std::vector<uint32_t> picks = Picks(*router);
+    return std::set<uint32_t>(picks.begin(), picks.end());
+  };
+  EXPECT_EQ((std::set<uint32_t>{1, 2}), served());
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(1), true));
+  EXPECT_EQ((std::set<uint32_t>{2}), served()) << "one active left";
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(2), true));
+  EXPECT_EQ((std::set<uint32_t>{3, 4}), served()) << "every active down: the standbys";
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(1), false));
+  EXPECT_EQ((std::set<uint32_t>{1}), served()) << "an active is back: the flows return";
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(1), true));
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(3), true));
+  EXPECT_EQ((std::set<uint32_t>{4}), served()) << "the one available standby";
+}
+
+// Everything down: the group fails open to its active members, selecting
+// exactly as with no state, so the neighbor state decides as before.
+TEST_P(RouterGroupTest, EverythingDownFailsOpenToTheActives) {
+  const NextHopId actives[] = {NextHopId(1), NextHopId(2), NextHopId(1)};
+  const NextHopId standby[] = {NextHopId(3)};
+  auto router = MakeHealthRouter(actives, standby);
+  const std::vector<uint32_t> before = Picks(*router);
+  for (uint32_t id : {1u, 2u, 3u}) {
+    ASSERT_TRUE(router->SetNextHopDown(NextHopId(id), true));
+  }
+  EXPECT_EQ(before, Picks(*router));
+}
+
+// Availability is per next hop: marking one down publishes a new object for
+// every group holding it, active or standby, and for no other group; a group
+// that no longer holds it, or that is being removed, is not republished.
+TEST_P(RouterGroupTest, AStateChangeRepublishesEveryGroupHoldingTheNextHop) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  auto router = MakeGroupRouter(/*next_hops=*/8, /*groups=*/4);
+  for (uint32_t i = 1; i <= 6; i++) {
+    ASSERT_TRUE(router->SetNextHop(NextHopId(i), Hop(i, 1)));
+  }
+  const NextHopId g1[] = {NextHopId(1), NextHopId(2)};
+  const NextHopId g2[] = {NextHopId(3)};
+  const NextHopId g2_standby[] = {NextHopId(2)};
+  const NextHopId g3[] = {NextHopId(4), NextHopId(5)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), g1));
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(2), g2, g2_standby));
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(3), g3));
+  EXPECT_EQ(1u, router->GroupMemberships(NextHopId(3)));
+  EXPECT_EQ(2u, router->GroupMemberships(NextHopId(2))) << "a standby is a member";
+  EXPECT_EQ(RouteError::kNextHopInUse, router->RemoveNextHop(NextHopId(2)).error());
+  const auto object = [&](uint32_t g) { return router->LookupNextHopGroup(NextHopGroupId(g)); };
+
+  const NextHopGroup *one = object(1), *two = object(2), *three = object(3);
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(2), true));
+  EXPECT_NE(one, object(1));
+  EXPECT_NE(two, object(2));
+  EXPECT_EQ(three, object(3)) << "a group without the next hop is untouched";
+  EXPECT_EQ(NextHopGroup::kMaxMembers, object(1)->eligible_size);
+  for (uint32_t s = 0; s < object(1)->eligible_size; s++) {
+    ASSERT_EQ(NextHopId(1), object(1)->eligible[s]) << "slot " << s;
+  }
+
+  // Group 1 no longer holds next hop 2: changing 2 leaves it alone.
+  const NextHopId g1_without[] = {NextHopId(1), NextHopId(6)};
+  ASSERT_TRUE(router->SetNextHopGroup(NextHopGroupId(1), g1_without));
+  one = object(1);
+  two = object(2);
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(2), false));
+  EXPECT_EQ(one, object(1));
+  EXPECT_NE(two, object(2));
+
+  // Group 2 is removed while a reader may still hold it: its id is retiring,
+  // and a change of its former member must not publish over it.
+  constexpr uint32_t kReader = 26;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+  ASSERT_TRUE(router->RemoveNextHopGroup(NextHopGroupId(2)));
+  const NextHopGroup *retiring = object(2);
+  ASSERT_NE(nullptr, retiring);
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(2), true));
+  EXPECT_EQ(retiring, object(2)) << "a retiring group is not republished";
+  EXPECT_EQ(2u, router->next_hop_group_count());
+  domain.Quiescent(kReader);
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+  EXPECT_EQ(0u, router->ReclaimRetired());
+  EXPECT_EQ(nullptr, object(2));
+}
+
+// State names an existing next hop, and a next hop marked down stays until it
+// is marked available again. The configuration rules for standbys.
+TEST_P(RouterGroupTest, StateAndStandbysAreChecked) {
+  auto router = MakeGroupRouter(/*next_hops=*/8, /*groups=*/2);
+  ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
+  ASSERT_TRUE(router->SetNextHop(NextHopId(2), Hop(2, 2)));
+  EXPECT_EQ(RouteError::kInvalidId, router->SetNextHopDown(NextHopId(0), true).error());
+  EXPECT_EQ(RouteError::kInvalidId, router->SetNextHopDown(NextHopId(9), true).error());
+  EXPECT_EQ(RouteError::kUnknownNextHop, router->SetNextHopDown(NextHopId(3), true).error());
+
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(1), true));
+  EXPECT_TRUE(router->SetNextHopDown(NextHopId(1), true)) << "again: no change";
+  std::vector<std::pair<uint32_t, bool>> states;
+  router->ForEachNextHopState(
+      [&](NextHopId id, const NextHopState &state) { states.emplace_back(id.value(), state.down); });
+  EXPECT_EQ((std::vector<std::pair<uint32_t, bool>>{{1, true}}), states);
+  EXPECT_EQ(RouteError::kNextHopInUse, router->RemoveNextHop(NextHopId(1)).error())
+      << "a next hop marked down is pinned by its state";
+  ASSERT_TRUE(router->SetNextHopDown(NextHopId(1), false));
+  states.clear();
+  router->ForEachNextHopState(
+      [&](NextHopId id, const NextHopState &state) { states.emplace_back(id.value(), state.down); });
+  EXPECT_TRUE(states.empty());
+  EXPECT_TRUE(router->RemoveNextHop(NextHopId(1)));
+
+  const NextHopId two[] = {NextHopId(2)};
+  const NextHopId missing[] = {NextHopId(3)};
+  const NextHopId out_of_range[] = {NextHopId(9)};
+  std::vector<NextHopId> half(NextHopGroup::kMaxMembers / 2 + 1, NextHopId(2));
+  EXPECT_EQ(RouteError::kInvalidId,
+            router->SetNextHopGroup(NextHopGroupId(1), two, two).error())
+      << "a next hop in both lists";
+  EXPECT_EQ(RouteError::kInvalidId, router->SetNextHopGroup(NextHopGroupId(1), {}, two).error())
+      << "standbys without an active";
+  EXPECT_EQ(RouteError::kInvalidId,
+            router->SetNextHopGroup(NextHopGroupId(1), half, half).error())
+      << "more than kMaxMembers together";
+  EXPECT_EQ(RouteError::kUnknownNextHop,
+            router->SetNextHopGroup(NextHopGroupId(1), two, missing).error());
+  EXPECT_EQ(RouteError::kInvalidId,
+            router->SetNextHopGroup(NextHopGroupId(1), two, out_of_range).error());
+  EXPECT_EQ(0u, router->next_hop_group_count());
+  EXPECT_EQ(0u, router->GroupMemberships(NextHopId(2))) << "a refused group pins nothing";
+}
+
 TEST(NextHopRewriteTest, RewriteL2) {
   PlainPacketPool pool(8, -1, 128);
   PacketHandle pkt = pool.Alloc(64);

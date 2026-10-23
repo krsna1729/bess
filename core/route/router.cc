@@ -3,10 +3,14 @@
 #include "route/router.h"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <cstring>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "utils/logging.h"
@@ -24,6 +28,96 @@ template <typename T>
 void ReserveOneMore(std::vector<T> &v) {
   if (v.size() == v.capacity()) {
     v.reserve(v.empty() ? 4 : 2 * v.capacity());
+  }
+}
+
+// A group's member positions, active then standby: one per selection weight.
+std::span<const NextHopId> Configured(const NextHopGroup &group) noexcept {
+  return std::span(group.members).first(group.size + group.standby_size);
+}
+
+// A group configuration's next hops, active and standby, each once, sorted.
+std::vector<NextHopId> DistinctMembers(const NextHopGroup &group) {
+  const std::span<const NextHopId> configured = Configured(group);
+  std::vector<NextHopId> members(configured.begin(), configured.end());
+  std::sort(members.begin(), members.end());
+  members.erase(std::unique(members.begin(), members.end()), members.end());
+  return members;
+}
+
+// What sorted `a` holds that sorted `b` does not.
+std::vector<NextHopId> Difference(const std::vector<NextHopId> &a,
+                                  const std::vector<NextHopId> &b) {
+  std::vector<NextHopId> out;
+  std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(out));
+  return out;
+}
+
+// Why a group cannot hold this configuration, or nullopt when it can: 1 to
+// kMaxMembers next hops in all, at least one of them active, and no next hop
+// in both lists (NextHopGroup).
+std::optional<std::string> ConfigurationError(const NextHopGroup &group) {
+  if (group.size == 0 || size_t{group.size} + group.standby_size > NextHopGroup::kMaxMembers) {
+    return "a group has 1 to " + std::to_string(NextHopGroup::kMaxMembers) +
+           " members, active and standby together, and at least one active";
+  }
+  const std::span<const NextHopId> actives = group.actives();
+  for (const NextHopId standby : group.standbys()) {
+    if (std::ranges::find(actives, standby) != actives.end()) {
+      return "next hop " + std::to_string(standby.value()) +
+             " is both an active and a standby member";
+    }
+  }
+  return std::nullopt;
+}
+
+// Fills `group.eligible` from its configuration (NextHopGroup, D-184): the
+// available actives, else the available standbys, else every active (fail
+// open). The chosen list's n positions take kMaxMembers / n consecutive slots
+// each, so with all of them available slot s / (kMaxMembers / n) is position
+// RangeSelect(hash, n) picked before; an unavailable position's slots are
+// dealt round-robin to the available positions. `down(id)` says whether next
+// hop `id` is unavailable. Allocates nothing.
+template <typename Down>
+void Elect(NextHopGroup &group, const Down &down) noexcept {
+  constexpr uint32_t kMax = NextHopGroup::kMaxMembers;
+  // Bit p: position p of members[first, first + n) is available.
+  const auto available = [&](uint32_t first, uint32_t n) {
+    uint64_t up = 0;
+    for (uint32_t p = 0; p < n; p++) {
+      if (!down(group.members[first + p])) {
+        up |= uint64_t{1} << p;
+      }
+    }
+    return up;
+  };
+  uint32_t first = 0;
+  uint32_t n = group.size;
+  uint64_t up = available(0, n);
+  if (up == 0) {
+    if (const uint64_t standby = available(group.size, group.standby_size); standby != 0) {
+      first = group.size;
+      n = group.standby_size;
+      up = standby;
+    } else {
+      up = n == kMax ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
+    }
+  }
+  const uint32_t slots = kMax / n;
+  group.eligible_size = n * slots;
+  uint64_t deal = up;  // the available positions still due an unavailable slot
+  for (uint32_t p = 0, s = 0; p < n; p++) {
+    for (uint32_t j = 0; j < slots; j++, s++) {
+      uint32_t pick = p;
+      if (((up >> p) & uint64_t{1}) == 0) {
+        if (deal == 0) {
+          deal = up;
+        }
+        pick = static_cast<uint32_t>(__builtin_ctzll(deal));
+        deal &= deal - 1;
+      }
+      group.eligible[s] = group.members[first + pick];
+    }
   }
 }
 
@@ -99,8 +193,10 @@ Router::Router(const std::string &name, const Config &config,
       groups_(std::max<size_t>(max_groups, 1)),
       group_references_(max_groups + 1, 0),
       member_references_(max_next_hops + 1, 0),
+      hop_states_(max_next_hops + 1, HopState::kNone),
       next_hops_name_(name + "/next_hops"),
       neighbors_name_(name + "/neighbors"),
+      next_hop_state_name_(name + "/next_hop_state"),
       routes_name_(name + "/routes"),
       groups_name_(name + "/groups"),
       bindings_(max_next_hops + 1) {
@@ -113,11 +209,11 @@ Router::Router(const std::string &name, const Config &config,
 // no reader can use it.
 Router::~Router() {
   if (engine_ != nullptr) {
-    // Routes reference groups, bindings and next hops, groups reference
-    // bindings and next hops: they leave together with their contents; with
-    // readers gone, pending removals complete in the call.
-    std::vector<std::string> names = {routes_name_, groups_name_, neighbors_name_,
-                                      next_hops_name_};
+    // Routes reference groups, bindings and next hops, groups and state
+    // entries reference bindings and next hops: they leave together with their
+    // contents; with readers gone, pending removals complete in the call.
+    std::vector<std::string> names = {routes_name_, groups_name_, next_hop_state_name_,
+                                      neighbors_name_, next_hops_name_};
     auto unregistered = engine_->Unregister(names);
     CHECK(unregistered) << unregistered.error();
   }
@@ -756,15 +852,12 @@ class Router::NeighborResource final : public dataplane::Resource {
 
 namespace {
 
-// A group's references: each distinct member once (a repeated member, a
-// weight, is one reference), in the resource that holds it.
+// The references a value naming `members` (distinct) holds: one per next
+// hop, in the resource that holds it. A group names each distinct member once
+// (a repeated member, a weight, is one reference).
 template <typename HopReferenceFn>
-std::vector<dataplane::Reference> MemberReferences(const NextHopGroup &group,
+std::vector<dataplane::Reference> MemberReferences(const std::vector<NextHopId> &members,
                                                    HopReferenceFn &&reference) {
-  std::vector<NextHopId> members(group.members.begin(),
-                                 group.members.begin() + std::min<size_t>(group.size, NextHopGroup::kMaxMembers));
-  std::sort(members.begin(), members.end());
-  members.erase(std::unique(members.begin(), members.end()), members.end());
   std::vector<dataplane::Reference> refs;
   refs.reserve(members.size());
   for (const NextHopId m : members) {
@@ -775,20 +868,23 @@ std::vector<dataplane::Reference> MemberReferences(const NextHopGroup &group,
 
 }  // namespace
 
-// "<router>/groups": a SlotResource of immutable groups, each referencing its
-// distinct members (a repeated member, a weight, is one reference) -- in
-// "<router>/next_hops", or "<router>/neighbors" for a bound one -- so a group
-// cannot name a next hop that does not exist and a member cannot be removed
-// while a group names it. Reserve also checks the id and the member count,
-// before the base reads the members, and reports a replaced group's
-// references as they were committed.
+// "<router>/groups": immutable groups in a SlotTable, each referencing its
+// distinct members, active and standby (a repeated member, a weight, is one
+// reference) -- in "<router>/next_hops", or "<router>/neighbors" for a bound
+// one -- so a group cannot name a next hop that does not exist and a member
+// cannot be removed while a group names it. Reserve checks the id and the
+// configuration, stages the object, and reports a replaced group's references
+// as they were committed; Prepare computes each staged group's eligible set
+// from the availability the transaction leaves, its own state changes
+// included (D-184), and makes room in the reverse index; Publish stores the
+// object and updates the index without allocating.
 class Router::GroupResource final
     : public dataplane::SlotResource<NextHopGroupId, NextHopGroup> {
  public:
   explicit GroupResource(Router &router)
       : SlotResource(router.groups_name_, router.groups_,
                      [&router](const NextHopGroup &group) {
-                       return MemberReferences(group, [&router](NextHopId m) {
+                       return MemberReferences(DistinctMembers(group), [&router](NextHopId m) {
                          return router.HopReference(m, /*in_transaction=*/true);
                        });
                      },
@@ -797,33 +893,296 @@ class Router::GroupResource final
 
   std::expected<Reservation, std::string> Reserve(const dataplane::Op &op) override {
     NextHopGroupId id;
-    if (op.kind == dataplane::OpKind::kUpsert) {
-      if (!dataplane::DecodeKey(op.key, &id) || !router_.ValidGroupId(id)) {
-        return std::unexpected(RouteErrorName(RouteError::kInvalidId));
+    // A stored value's references are read against the committed bindings, a
+    // new one's against the bindings as this transaction has them.
+    const auto committed = [this](NextHopId m) {
+      return router_.HopReference(m, /*in_transaction=*/false);
+    };
+    const auto staged_reference = [this](NextHopId m) {
+      return router_.HopReference(m, /*in_transaction=*/true);
+    };
+    if (op.kind == dataplane::OpKind::kErase) {
+      if (!dataplane::DecodeKey(op.key, &id) || !router_.groups_.ValidId(id)) {
+        return std::unexpected("invalid id");
       }
-      const NextHopGroup *group = std::any_cast<NextHopGroup>(&op.value);
-      if (group == nullptr) {
-        return std::unexpected("wrong value type (want NextHopGroup)");
+      const NextHopGroup *current = router_.groups_.Current(id);
+      if (current == nullptr) {
+        return std::unexpected("not found");
       }
-      if (group->size == 0 || group->size > NextHopGroup::kMaxMembers) {
-        return std::unexpected("a group has 1 to " + std::to_string(NextHopGroup::kMaxMembers) +
-                               " members");
-      }
+      std::vector<NextHopId> members = DistinctMembers(*current);
+      Reservation erase{nullptr, {}, Footprint{.removals = 1}};
+      erase.existed = true;
+      erase.previous_references = MemberReferences(members, committed);
+      Stage(id);
+      Touch(members);
+      erase.staged = std::make_unique<EraseOp>(router_, id, std::move(members));
+      return erase;
     }
-    auto reserved = SlotResource::Reserve(op);
-    if (reserved && reserved->existed && dataplane::DecodeKey(op.key, &id)) {
-      if (const NextHopGroup *previous = router_.groups_.Current(id)) {
-        reserved->previous_references =
-            MemberReferences(*previous, [this](NextHopId m) {
-              return router_.HopReference(m, /*in_transaction=*/false);
-            });
-      }
+    if (!dataplane::DecodeKey(op.key, &id) || !router_.ValidGroupId(id)) {
+      return std::unexpected(RouteErrorName(RouteError::kInvalidId));
     }
-    return reserved;
+    const NextHopGroup *group = std::any_cast<NextHopGroup>(&op.value);
+    if (group == nullptr) {
+      return std::unexpected("wrong value type (want NextHopGroup)");
+    }
+    if (auto refused = ConfigurationError(*group)) {
+      return std::unexpected(std::move(*refused));
+    }
+    if (!router_.groups_.CanPublish(id)) {
+      return std::unexpected("id is still retiring (removed less than a grace period ago)");
+    }
+    const NextHopGroup *previous = router_.groups_.Current(id);
+    const std::vector<NextHopId> now = DistinctMembers(*group);
+    const std::vector<NextHopId> before =
+        previous != nullptr ? DistinctMembers(*previous) : std::vector<NextHopId>{};
+    Reservation upsert{nullptr, MemberReferences(now, staged_reference),
+                       // The object it replaces, if any, is retired.
+                       Footprint{.retires = previous != nullptr ? 1u : 0u}};
+    upsert.existed = previous != nullptr;
+    upsert.previous_references = MemberReferences(before, committed);
+    auto staged = std::make_unique<PublishOp>(router_, id, std::make_unique<NextHopGroup>(*group),
+                                              Difference(now, before), Difference(before, now));
+    Stage(id);
+    Touch(staged->added());
+    Touch(staged->removed());
+    upserts_.push_back(staged.get());
+    upsert.staged = std::move(staged);
+    return upsert;
+  }
+
+  // Once per transaction, after every reservation: the staged state changes
+  // are all known.
+  std::expected<void, std::string> Prepare() override {
+    router_.SortStagedStates();
+    std::vector<NextHopId> added;
+    for (PublishOp *op : upserts_) {
+      Elect(op->group(), [this](NextHopId hop) { return router_.StagedDown(hop); });
+      added.insert(added.end(), op->added().begin(), op->added().end());
+    }
+    router_.ReserveMemberships(std::move(added));
+    return {};
+  }
+
+  void EndTransaction() noexcept override {
+    // An entry Prepare made room in that no group joined, or one the
+    // transaction emptied.
+    router_.EraseEmptyMemberships(touched_);
+    touched_.clear();
+    upserts_.clear();
+    router_.staged_groups_.clear();
   }
 
  private:
+  class PublishOp final : public dataplane::StagedOp {
+   public:
+    PublishOp(Router &router, NextHopGroupId id, std::unique_ptr<NextHopGroup> group,
+              std::vector<NextHopId> added, std::vector<NextHopId> removed)
+        : router_(router),
+          id_(id),
+          group_(std::move(group)),
+          added_(std::move(added)),
+          removed_(std::move(removed)) {}
+    NextHopGroup &group() noexcept { return *group_; }
+    const std::vector<NextHopId> &added() const noexcept { return added_; }
+    const std::vector<NextHopId> &removed() const noexcept { return removed_; }
+    void Publish(dataplane::Retirer &retirer) noexcept override {
+      retirer.Retire(router_.groups_.Publish(id_, std::move(group_)));
+      router_.AddMemberships(id_, added_);
+      router_.RemoveMemberships(id_, removed_);
+    }
+
+   private:
+    Router &router_;
+    NextHopGroupId id_;
+    std::unique_ptr<NextHopGroup> group_;
+    std::vector<NextHopId> added_;    // next hops that become members
+    std::vector<NextHopId> removed_;  // next hops that stop being members
+  };
+
+  class EraseOp final : public dataplane::StagedOp {
+   public:
+    EraseOp(Router &router, NextHopGroupId id, std::vector<NextHopId> members)
+        : router_(router), id_(id), members_(std::move(members)) {}
+    void Publish(dataplane::Retirer &retirer) noexcept override {
+      router_.groups_.Retire(id_);  // absent now, readable until the cascade
+      retirer.RemoveLater([&table = router_.groups_, id = id_](dataplane::Retirer &later) {
+        later.Retire(table.Unpublish(id));
+      });
+      // A retiring group is no longer anyone's to republish.
+      router_.RemoveMemberships(id_, members_);
+    }
+
+   private:
+    Router &router_;
+    NextHopGroupId id_;
+    std::vector<NextHopId> members_;
+  };
+
+  // Records that this transaction publishes or erases group `id`.
+  void Stage(NextHopGroupId id) { router_.staged_groups_.push_back(id); }
+  // Records reverse index entries the transaction may change.
+  void Touch(const std::vector<NextHopId> &hops) {
+    touched_.insert(touched_.end(), hops.begin(), hops.end());
+  }
+
   Router &router_;
+  std::vector<PublishOp *> upserts_;  // this transaction's, owned by the engine
+  std::vector<NextHopId> touched_;
+};
+
+// "<router>/next_hop_state" (D-184): key EncodeKey(NextHopId), value
+// NextHopState, desired state read back as written (D-129). An entry
+// references its next hop -- in "<router>/next_hops", or "<router>/neighbors"
+// for a bound one, as a group member does -- so state for a next hop that does
+// not exist is refused, and a next hop with an entry cannot be removed or
+// unbound until the entry is (in the same transaction or before).
+//
+// An operation that changes a next hop's availability republishes every group
+// holding it, each group once per transaction. Reserve claims them from the
+// reverse index and declares one retire each; Prepare builds their objects
+// from the availability the whole transaction leaves; the claiming
+// operation's Publish stores them. A group the transaction also writes or
+// erases is left to its own operation, which computes its eligible set from
+// the same staged state -- so nothing republishes a group being erased.
+class Router::NextHopStateResource final : public dataplane::Resource {
+ public:
+  explicit NextHopStateResource(Router &router)
+      : Resource(router.next_hop_state_name_,
+                 std::vector<std::string>{router.next_hops_name_, router.neighbors_name_}),
+        router_(router) {}
+
+  size_t LiveCount() const override { return router_.hop_state_count_; }
+  // One entry per next hop.
+  std::optional<uint64_t> Capacity() const override { return router_.max_next_hops_; }
+
+  bool Contains(const dataplane::ResourceKey &key) const override {
+    NextHopId id;
+    return dataplane::DecodeKey(key, &id) && router_.ValidId(id) &&
+           router_.hop_states_[id.value()] != HopState::kNone;
+  }
+  std::vector<dataplane::Reference> ReferencesOf(
+      const dataplane::ResourceKey &key) const override {
+    if (!Contains(key)) {
+      return {};
+    }
+    NextHopId id;
+    (void)dataplane::DecodeKey(key, &id);
+    return {router_.HopReference(id, /*in_transaction=*/false)};
+  }
+  void VisitReferences(
+      const std::function<void(const dataplane::Reference &)> &visit) const override {
+    for (uint32_t i = 1; i < router_.hop_states_.size(); i++) {
+      if (router_.hop_states_[i] != HopState::kNone) {
+        visit(router_.HopReference(NextHopId(i), /*in_transaction=*/false));
+      }
+    }
+  }
+
+  std::expected<Reservation, std::string> Reserve(const dataplane::Op &op) override {
+    NextHopId id;
+    if (!dataplane::DecodeKey(op.key, &id) || !router_.ValidId(id)) {
+      return std::unexpected(RouteErrorName(RouteError::kInvalidId));
+    }
+    const HopState before = router_.hop_states_[id.value()];
+    HopState after = HopState::kNone;
+    if (op.kind == dataplane::OpKind::kErase) {
+      if (before == HopState::kNone) {
+        return std::unexpected("not found");
+      }
+    } else {
+      const NextHopState *state = std::any_cast<NextHopState>(&op.value);
+      if (state == nullptr) {
+        return std::unexpected("wrong value type (want NextHopState)");
+      }
+      after = state->down ? HopState::kDown : HopState::kUp;
+    }
+    auto staged = std::make_unique<StateOp>(router_, id, after);
+    // An entry that says available, written or removed, is not a change of
+    // availability; only a change republishes the groups.
+    if ((before == HopState::kDown) != (after == HopState::kDown)) {
+      if (auto it = router_.memberships_.find(id); it != router_.memberships_.end()) {
+        for (const NextHopGroupId group : it->second) {
+          if (claimed_.insert(group).second) {
+            staged->Claim(group);
+          }
+        }
+      }
+    }
+    Reservation reservation{nullptr, {}, Footprint{.retires = staged->claims()}};
+    if (op.kind == dataplane::OpKind::kUpsert) {
+      // Against the bindings as this transaction has them, like a new group.
+      reservation.references = {router_.HopReference(id, /*in_transaction=*/true)};
+    }
+    reservation.existed = before != HopState::kNone;
+    if (reservation.existed) {
+      reservation.previous_references = {router_.HopReference(id, /*in_transaction=*/false)};
+    }
+    router_.staged_states_.emplace_back(id, after);
+    states_.push_back(staged.get());
+    reservation.staged = std::move(staged);
+    return reservation;
+  }
+
+  std::expected<void, std::string> Prepare() override {
+    router_.SortStagedStates();
+    std::vector<NextHopGroupId> &written = router_.staged_groups_;
+    std::sort(written.begin(), written.end());
+    for (StateOp *op : states_) {
+      op->Build(router_, written);
+    }
+    return {};
+  }
+
+  void EndTransaction() noexcept override {
+    states_.clear();
+    claimed_.clear();
+    router_.staged_states_.clear();
+  }
+
+ private:
+  class StateOp final : public dataplane::StagedOp {
+   public:
+    StateOp(Router &router, NextHopId id, HopState state)
+        : router_(router), id_(id), state_(state) {}
+    void Claim(NextHopGroupId group) { rebuilds_.push_back({group, nullptr}); }
+    uint32_t claims() const noexcept { return static_cast<uint32_t>(rebuilds_.size()); }
+    // The claimed groups' new objects, except those in `written` (sorted):
+    // the groups the transaction writes or erases itself.
+    void Build(const Router &router, const std::vector<NextHopGroupId> &written) {
+      for (Rebuild &rebuild : rebuilds_) {
+        if (std::binary_search(written.begin(), written.end(), rebuild.id)) {
+          continue;
+        }
+        const NextHopGroup *current = router.groups_.Current(rebuild.id);
+        CHECK(current != nullptr) << "the reverse index names a group that is not live";
+        rebuild.group = std::make_unique<NextHopGroup>(*current);
+        Elect(*rebuild.group, [&router](NextHopId hop) { return router.StagedDown(hop); });
+      }
+    }
+    void Publish(dataplane::Retirer &retirer) noexcept override {
+      router_.SetHopState(id_, state_);
+      for (Rebuild &rebuild : rebuilds_) {
+        if (rebuild.group != nullptr) {
+          retirer.Retire(router_.groups_.Publish(rebuild.id, std::move(rebuild.group)));
+        }
+      }
+    }
+
+   private:
+    struct Rebuild {
+      NextHopGroupId id;
+      std::unique_ptr<NextHopGroup> group;  // null: its own operation publishes it
+    };
+    Router &router_;
+    NextHopId id_;
+    HopState state_;
+    std::vector<Rebuild> rebuilds_;
+  };
+
+  Router &router_;
+  std::vector<StateOp *> states_;  // this transaction's, owned by the engine
+  // The groups an operation of this transaction has claimed.
+  std::unordered_set<NextHopGroupId, dataplane::StrongIdHash<NextHopGroupId>> claimed_;
 };
 
 dataplane::Reference Router::HopReference(NextHopId id, bool in_transaction) const {
@@ -885,13 +1244,17 @@ std::expected<void, std::string> Router::Enroll(
   if (groups_.size() != 0 || !retiring_groups_.empty()) {
     return std::unexpected("enroll before adding next-hop groups");
   }
+  if (hop_state_count_ != 0) {
+    return std::unexpected("enroll before marking next hops down");
+  }
   auto hops = std::make_unique<NextHopResource>(*this);
   // The neighbors resource is registered whether or not a binding policy is
   // set, and so is the groups resource whether or not max_groups is: the
   // control plane refuses a class that registers fewer tables than it
   // declares (CheckDeclaredResources), and the Router module declares all
-  // four (D-156, D-183). Without its policy or bound it holds nothing.
+  // five (D-156, D-183, D-184). Without its policy or bound it holds nothing.
   auto neighbors = std::make_unique<NeighborResource>(*this);
+  auto state = std::make_unique<NextHopStateResource>(*this);
   auto groups = std::make_unique<GroupResource>(*this);
   auto routes = std::make_unique<RouteResource>(*this);
   if (auto r = engine.Register(hops.get()); !r) {
@@ -901,13 +1264,20 @@ std::expected<void, std::string> Router::Enroll(
     CHECK(engine.Unregister(next_hops_name_));
     return r;
   }
+  if (auto r = engine.Register(state.get()); !r) {
+    CHECK(engine.Unregister(neighbors_name_));
+    CHECK(engine.Unregister(next_hops_name_));
+    return r;
+  }
   if (auto r = engine.Register(groups.get()); !r) {
+    CHECK(engine.Unregister(next_hop_state_name_));
     CHECK(engine.Unregister(neighbors_name_));
     CHECK(engine.Unregister(next_hops_name_));
     return r;
   }
   if (auto r = engine.Register(routes.get()); !r) {
     CHECK(engine.Unregister(groups_name_));
+    CHECK(engine.Unregister(next_hop_state_name_));
     CHECK(engine.Unregister(neighbors_name_));
     CHECK(engine.Unregister(next_hops_name_));
     return r;
@@ -915,6 +1285,7 @@ std::expected<void, std::string> Router::Enroll(
   engine_ = &engine;
   next_hops_res_ = std::move(hops);
   neighbors_res_ = std::move(neighbors);
+  state_res_ = std::move(state);
   groups_res_ = std::move(groups);
   routes_res_ = std::move(routes);
   return {};
@@ -925,8 +1296,8 @@ std::expected<void, std::string> Router::Release() {
   if (engine_ == nullptr) {
     return {};  // not enrolled, or already released
   }
-  std::vector<std::string> names = {routes_name_, groups_name_, neighbors_name_,
-                                    next_hops_name_};
+  std::vector<std::string> names = {routes_name_, groups_name_, next_hop_state_name_,
+                                    neighbors_name_, next_hops_name_};
   auto released = engine_->ReleaseForTeardown(names);
   if (!released) {
     return released;
@@ -934,6 +1305,7 @@ std::expected<void, std::string> Router::Release() {
   engine_ = nullptr;
   next_hops_res_.reset();
   neighbors_res_.reset();
+  state_res_.reset();
   groups_res_.reset();
   routes_res_.reset();
   return {};
@@ -954,8 +1326,8 @@ size_t Router::CompleteRetirementsLocked() {
       return false;
     }
     auto group = groups_.Unpublish(r.id);
-    for (uint32_t i = 0; i < group->size; i++) {
-      member_references_[group->members[i].value()]--;
+    for (const NextHopId m : Configured(*group)) {
+      member_references_[m.value()]--;
     }
     emptied_groups.push_back(std::move(group));
     return true;
@@ -1028,7 +1400,10 @@ std::expected<void, RouteError> Router::RemoveNextHop(NextHopId id) {
   if (!next_hops_.Contains(id)) {
     return std::unexpected(RouteError::kUnknownNextHop);
   }
-  if (references_[id.value()] != 0 || member_references_[id.value()] != 0) {
+  // A group member, a route's next hop, and one marked down (its state entry
+  // names it, as the resource's does when enrolled) all stay.
+  if (references_[id.value()] != 0 || member_references_[id.value()] != 0 ||
+      hop_states_[id.value()] != HopState::kNone) {
     return std::unexpected(RouteError::kNextHopInUse);
   }
   // No route names `id` any more, but a reader may have looked one up just
@@ -1204,14 +1579,14 @@ void Router::Unreference(uint32_t value) noexcept {
 }
 
 std::expected<void, RouteError> Router::SetNextHopGroup(
-    NextHopGroupId id, std::span<const NextHopId> members) {
+    NextHopGroupId id, std::span<const NextHopId> members, std::span<const NextHopId> standby) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (engine_ != nullptr) {
     return std::unexpected(RouteError::kEnrolled);
   }
   CompleteRetirementsLocked();
   if (!groups_.ValidId(id) || id.value() >= group_references_.size() ||
-      members.empty() || members.size() > NextHopGroup::kMaxMembers) {
+      members.empty() || members.size() + standby.size() > NextHopGroup::kMaxMembers) {
     return std::unexpected(RouteError::kInvalidId);
   }
   if (!groups_.CanPublish(id)) {
@@ -1219,29 +1594,51 @@ std::expected<void, RouteError> Router::SetNextHopGroup(
   }
   auto group = std::make_unique<NextHopGroup>();
   group->size = static_cast<uint32_t>(members.size());
-  for (size_t i = 0; i < members.size(); i++) {
-    if (!ValidId(members[i])) {
+  group->standby_size = static_cast<uint32_t>(standby.size());
+  const auto standbys = std::ranges::copy(members, group->members.begin()).out;
+  std::ranges::copy(standby, standbys);
+  for (const NextHopId m : Configured(*group)) {
+    if (!ValidId(m)) {
       return std::unexpected(RouteError::kInvalidId);
     }
-    if (!next_hops_.Contains(members[i])) {
+    if (!next_hops_.Contains(m)) {
       return std::unexpected(RouteError::kUnknownNextHop);
     }
-    group->members[i] = members[i];
   }
-  rcu_.ReserveRetirements(1);  // for the group this one may replace
-  for (const NextHopId m : members) {
+  if (ConfigurationError(*group)) {
+    return std::unexpected(RouteError::kInvalidId);  // a next hop in both lists
+  }
+  Elect(*group, [this](NextHopId hop) { return IsDown(hop); });
+  const NextHopGroup *previous = groups_.Current(id);
+  const std::vector<NextHopId> now = DistinctMembers(*group);
+  const std::vector<NextHopId> before =
+      previous != nullptr ? DistinctMembers(*previous) : std::vector<NextHopId>{};
+  const std::vector<NextHopId> added = Difference(now, before);
+  const std::vector<NextHopId> removed = Difference(before, now);
+  try {
+    ReserveMemberships(added);
+    rcu_.ReserveRetirements(1);  // for the group this one may replace
+  } catch (...) {
+    // No trace in the reverse index: drop the entries the reservation added.
+    EraseEmptyMemberships(added);
+    throw;
+  }
+  for (const NextHopId m : Configured(*group)) {
     member_references_[m.value()]++;
   }
   // One pointer store; the members were published before.
   auto replaced = groups_.Publish(id, std::unique_ptr<const NextHopGroup>(std::move(group)));
+  AddMemberships(id, added);
+  RemoveMemberships(id, removed);
+  EraseEmptyMemberships(removed);
   if (replaced) {
     // The old members are released now. A reader may still select from the
     // old object until its quiescent state, but a member removed after this
     // retires with a grace period that starts later, so it stays published
     // until such readers are gone (the argument that lets RemoveRoute release
     // its next hop at once).
-    for (uint32_t i = 0; i < replaced->size; i++) {
-      member_references_[replaced->members[i].value()]--;
+    for (const NextHopId m : Configured(*replaced)) {
+      member_references_[m.value()]--;
     }
     rcu_.Retire(rcu_.StartGracePeriod(), std::move(replaced));
     rcu_.ReclaimReady();
@@ -1264,11 +1661,129 @@ std::expected<void, RouteError> Router::RemoveNextHopGroup(NextHopGroupId id) {
   if (group_references_[id.value()] != 0) {
     return std::unexpected(RouteError::kNextHopInUse);
   }
+  const std::vector<NextHopId> members = DistinctMembers(*groups_.Current(id));
   // As RemoveNextHop: readable until a grace period passes.
   ReserveOneMore(retiring_groups_);
   groups_.Retire(id);
   retiring_groups_.push_back({id, rcu_.StartGracePeriod()});
+  // A retiring group is no longer anyone's to republish.
+  RemoveMemberships(id, members);
+  EraseEmptyMemberships(members);
   return {};
+}
+
+std::expected<void, RouteError> Router::SetNextHopDown(NextHopId id, bool down) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (engine_ != nullptr) {
+    return std::unexpected(RouteError::kEnrolled);
+  }
+  CompleteRetirementsLocked();
+  if (!ValidId(id)) {
+    return std::unexpected(RouteError::kInvalidId);
+  }
+  if (!next_hops_.Contains(id)) {
+    return std::unexpected(RouteError::kUnknownNextHop);
+  }
+  if (IsDown(id) == down) {
+    return {};
+  }
+  // Every group holding the next hop, built before the first is visible: an
+  // allocation that fails changes nothing.
+  std::vector<std::pair<NextHopGroupId, std::unique_ptr<NextHopGroup>>> rebuilt;
+  std::vector<std::unique_ptr<const NextHopGroup>> replaced;
+  if (auto it = memberships_.find(id); it != memberships_.end()) {
+    rebuilt.reserve(it->second.size());
+    replaced.reserve(it->second.size());
+    for (const NextHopGroupId group : it->second) {
+      auto object = std::make_unique<NextHopGroup>(*groups_.Current(group));
+      Elect(*object, [&](NextHopId hop) { return hop == id ? down : IsDown(hop); });
+      rebuilt.emplace_back(group, std::move(object));
+    }
+  }
+  rcu_.ReserveRetirements(rebuilt.size());
+  SetHopState(id, down ? HopState::kDown : HopState::kNone);
+  // One pointer store per group; a reader sees each group's old object or its
+  // new one.
+  for (auto &[group, object] : rebuilt) {
+    replaced.push_back(groups_.Publish(group, std::move(object)));
+  }
+  if (!replaced.empty()) {
+    const rcu::GracePeriod token = rcu_.StartGracePeriod();
+    for (auto &old : replaced) {
+      rcu_.Retire(token, std::move(old));
+    }
+    rcu_.ReclaimReady();
+  }
+  return {};
+}
+
+void Router::ForEachNextHopState(
+    const std::function<void(NextHopId, const NextHopState &)> &fn) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (size_t i = 1; i < hop_states_.size(); i++) {
+    if (hop_states_[i] != HopState::kNone) {
+      fn(NextHopId(static_cast<uint32_t>(i)), NextHopState{hop_states_[i] == HopState::kDown});
+    }
+  }
+}
+
+void Router::SetHopState(NextHopId id, HopState state) noexcept {
+  HopState &entry = hop_states_[id.value()];
+  if (entry == HopState::kNone && state != HopState::kNone) {
+    hop_state_count_++;
+  } else if (entry != HopState::kNone && state == HopState::kNone) {
+    hop_state_count_--;
+  }
+  entry = state;
+}
+
+void Router::SortStagedStates() noexcept {
+  std::sort(staged_states_.begin(), staged_states_.end(),
+            [](const auto &a, const auto &b) { return a.first < b.first; });
+}
+
+bool Router::StagedDown(NextHopId id) const noexcept {
+  const auto it = std::lower_bound(staged_states_.begin(), staged_states_.end(), id,
+                                   [](const auto &entry, NextHopId v) { return entry.first < v; });
+  if (it != staged_states_.end() && it->first == id) {
+    return it->second == HopState::kDown;
+  }
+  return IsDown(id);
+}
+
+void Router::ReserveMemberships(std::vector<NextHopId> hops) {
+  std::sort(hops.begin(), hops.end());
+  for (auto run = hops.begin(); run != hops.end();) {
+    const auto end = std::upper_bound(run, hops.end(), *run);
+    std::vector<NextHopGroupId> &groups = memberships_[*run];
+    groups.reserve(groups.size() + static_cast<size_t>(end - run));
+    run = end;
+  }
+}
+
+void Router::AddMemberships(NextHopGroupId group, std::span<const NextHopId> hops) noexcept {
+  for (const NextHopId hop : hops) {
+    const auto it = memberships_.find(hop);
+    CHECK(it != memberships_.end() && it->second.size() < it->second.capacity())
+        << "a membership added without room reserved for it";
+    it->second.push_back(group);
+  }
+}
+
+void Router::RemoveMemberships(NextHopGroupId group, std::span<const NextHopId> hops) noexcept {
+  for (const NextHopId hop : hops) {
+    const auto it = memberships_.find(hop);
+    CHECK(it != memberships_.end()) << "a membership removed that was never added";
+    std::erase(it->second, group);
+  }
+}
+
+void Router::EraseEmptyMemberships(std::span<const NextHopId> hops) noexcept {
+  for (const NextHopId hop : hops) {
+    if (const auto it = memberships_.find(hop); it != memberships_.end() && it->second.empty()) {
+      memberships_.erase(it);
+    }
+  }
 }
 
 size_t Router::next_hop_group_count() const {
