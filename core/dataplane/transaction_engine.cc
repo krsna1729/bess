@@ -88,13 +88,11 @@ std::expected<void, std::string> TransactionEngine::Register(
                            "existing references are unknown to the engine");
   }
   resource->registration_ = reg.get();
-  Registration *const registered = reg.get();
   resources_.emplace(resource->name(), std::move(reg));
-  // Everything that declared this name binds to it now.
+  // Everything that declared this name binds to it now (and this resource to
+  // its key holder, if that registered first).
   for (auto &[name, other] : resources_) {
-    if (other.get() != registered) {
-      RebindDependenciesLocked(*other);
-    }
+    RebindDependenciesLocked(*other);
   }
   RebuildIncomingLocked();
   ranks_dirty_ = true;
@@ -116,6 +114,12 @@ void TransactionEngine::RebindDependenciesLocked(Registration &reg) {
     reg.unresolved.erase(reg.unresolved.begin() +
                          static_cast<std::ptrdiff_t>(i));
   }
+  if (reg.key_holder == nullptr && !reg.resource->key_holder_.empty()) {
+    auto it = resources_.find(std::string_view(reg.resource->key_holder_));
+    if (it != resources_.end()) {
+      reg.key_holder = it->second.get();
+    }
+  }
 }
 
 void TransactionEngine::RebuildIncomingLocked() {
@@ -125,8 +129,11 @@ void TransactionEngine::RebuildIncomingLocked() {
   for (const auto &[name, reg] : resources_) {
     reg->resource->VisitReferences([&](const Reference &ref) {
       Registration *target = Resolve(*reg, ref.resource);
-      if (target != nullptr) {
-        ++target->incoming[ref.key];
+      Registration *holder =
+          target == nullptr ? nullptr
+                            : Holder(target, ref.key, /*in_transaction=*/false);
+      if (holder != nullptr) {
+        ++holder->incoming[ref.key];
       }
     });
   }
@@ -149,6 +156,11 @@ void TransactionEngine::RecomputeRanksLocked() {
       int rank = 0;
       for (const auto &[dep_name, dep] : reg->deps) {
         rank = std::max(rank, dep->resource->rank_ + 1);
+        // A reference to `dep` may be counted on its key holder, which must
+        // publish first too (D-187).
+        if (dep->key_holder != nullptr) {
+          rank = std::max(rank, dep->key_holder->resource->rank_ + 1);
+        }
       }
       if (rank != reg->resource->rank_) {
         reg->resource->rank_ = rank;
@@ -195,11 +207,14 @@ std::expected<void, std::string> TransactionEngine::Unregister(
     const std::string &name = reg->resource->name();
     // Nothing outside the group may reference it. A resource that declares
     // the name but has not bound it (its resource was never registered)
-    // counts: the declaration is what the ledger would use.
+    // counts: the declaration is what the ledger would use. So does one that
+    // declares it as its key holder (D-187): references to that resource are
+    // counted here.
     bool referenced_in_group = false;
     for (const auto &[other_name, other] : resources_) {
+      const bool holds_for = other->resource->key_holder_ == name;
       const bool declares =
-          Resolve(*other, name) != nullptr ||
+          holds_for || Resolve(*other, name) != nullptr ||
           std::find(other->unresolved.begin(), other->unresolved.end(),
                     name) != other->unresolved.end();
       if (!declares) {
@@ -207,8 +222,9 @@ std::expected<void, std::string> TransactionEngine::Unregister(
       }
       if (!in_group(other.get())) {
         return std::unexpected("resource '" + other_name +
-                               "' may reference '" + name +
-                               "' (unregister it first, or with it)");
+                               (holds_for ? "' hands keys to '"
+                                          : "' may reference '") +
+                               name + "' (unregister it first, or with it)");
       }
       referenced_in_group = true;
     }
@@ -317,6 +333,9 @@ std::expected<void, std::string> TransactionEngine::ReleaseForTeardown(
           std::find(other->unresolved.begin(), other->unresolved.end(),
                     name) == other->unresolved.end()) {
         other->unresolved.push_back(name);
+      }
+      if (other->key_holder == reg) {
+        other->key_holder = nullptr;  // bound again by a replacement
       }
     }
   }
@@ -634,9 +653,15 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
         Registration *target = Resolve(*reg, ref.resource);
         // A teardown release can leave a live referrer naming an unbound
         // resource. Erasing that referrer is allowed; its old reference has
-        // no registered target whose incoming count needs decrementing.
-        if (target != nullptr) {
-          w.deltas.push_back(Delta{target, ref.key, -1, kNone});
+        // no registered target whose incoming count needs decrementing. It
+        // was counted on its committed holder, which cannot have changed
+        // while the reference held the key (D-187).
+        Registration *holder =
+            target == nullptr
+                ? nullptr
+                : Holder(target, ref.key, /*in_transaction=*/false);
+        if (holder != nullptr) {
+          w.deltas.push_back(Delta{holder, ref.key, -1, kNone});
         }
       }
     }
@@ -652,17 +677,29 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
                             "' may not reference '" + ref.resource +
                             "' (declare it when constructing the resource)");
         }
-        // Holds by construction (declared references are registered first
-        // and rank below); checked because publication order depends on it.
-        DCHECK_LT(target->resource->rank(), reg->resource->rank());
-        if (!target->resource->DefersErase()) {
+        // The key's holder as this transaction leaves it (D-187): every
+        // resource ranking below the referrer, the holder included, has
+        // reserved its operations.
+        Registration *holder = Holder(target, ref.key, /*in_transaction=*/true);
+        if (holder == nullptr) {
           return Reject(n, i,
-                        "resource '" + ref.resource +
+                        "references missing " + Describe(ref.resource, ref.key) +
+                            " (its key holder '" +
+                            target->resource->key_holder() +
+                            "' is not registered)");
+        }
+        // Holds by construction (declared references and key holders are
+        // registered first and rank below); checked because publication
+        // order depends on it.
+        DCHECK_LT(holder->resource->rank(), reg->resource->rank());
+        if (!holder->resource->DefersErase()) {
+          return Reject(n, i,
+                        "resource '" + holder->resource->name() +
                             "' cannot be referenced: its erases take effect "
                             "at once (Resource::DefersErase)");
         }
         w.deltas.push_back(
-            Delta{target, ref.key, +1, static_cast<uint32_t>(i)});
+            Delta{holder, ref.key, +1, static_cast<uint32_t>(i)});
       }
     }
     footprint.retires += r.footprint.retires;
