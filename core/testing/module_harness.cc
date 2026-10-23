@@ -7,8 +7,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <expected>
+#include <functional>
 #include <map>
 #include <span>
 #include <string>
@@ -35,8 +37,31 @@ namespace {
 
 // What the injector sends next and what the capture saw, for the one Run()
 // in progress (tests are single-threaded).
-std::vector<Bytes> pending;
+std::vector<bess::PacketHandle> pending;
 std::map<gate_idx_t, std::vector<Bytes>> *captured = nullptr;
+
+// One segment holding `len` bytes from `data`, or nullptr (and a failure).
+bess::PacketHandle Segment(const uint8_t *data, size_t len) {
+  if (len > UINT16_MAX) {
+    ADD_FAILURE() << "a test packet of " << len << " bytes does not fit an mbuf";
+    return nullptr;
+  }
+  bess::PacketHandle h = current_worker.packet_pool()->Alloc(0);
+  if (h == nullptr) {
+    ADD_FAILURE() << "packet pool exhausted";
+    return nullptr;
+  }
+  void *room = bess::PacketRef(h).append(static_cast<uint16_t>(len));
+  if (room == nullptr) {
+    ADD_FAILURE() << "a test packet of " << len << " bytes does not fit an mbuf";
+    bess::PacketFree(h);
+    return nullptr;
+  }
+  if (len != 0) {
+    std::memcpy(room, data, len);
+  }
+  return h;
+}
 
 }  // namespace
 
@@ -59,21 +84,8 @@ class HarnessInject final : public Module {
 
   struct task_result RunTask(Context *ctx, bess::PacketBatch *batch, void *) override {
     batch->clear();
-    for (const Bytes &bytes : pending) {
-      bess::PacketHandle h = current_worker.packet_pool()->Alloc(0);
-      if (h == nullptr) {
-        ADD_FAILURE() << "packet pool exhausted";
-        break;
-      }
-      bess::PacketRef ref(h);
-      void *data = ref.append(static_cast<uint16_t>(bytes.size()));
-      if (data == nullptr) {
-        ADD_FAILURE() << "a test packet of " << bytes.size() << " bytes does not fit an mbuf";
-        bess::PacketFree(h);
-        break;
-      }
-      std::memcpy(data, bytes.data(), bytes.size());
-      batch->add(ref);
+    for (bess::PacketHandle h : pending) {
+      batch->add(bess::PacketRef(h));
     }
     pending.clear();
     const uint32_t cnt = static_cast<uint32_t>(batch->cnt());
@@ -81,6 +93,19 @@ class HarnessInject final : public Module {
     return {.block = false, .packets = cnt, .bits = 0};
   }
 };
+
+Bytes PacketBytes(bess::PacketHandle packet) {
+  Bytes bytes;
+  if (packet != nullptr) {
+    bytes.reserve(bess::PacketRef(packet).total_len());
+  }
+  for (bess::PacketHandle h = packet; h != nullptr; h = h->next) {
+    const bess::PacketRef seg(h);
+    const auto *p = seg.head_data<const uint8_t *>();
+    bytes.insert(bytes.end(), p, p + seg.head_len());
+  }
+  return bytes;
+}
 
 // Records each packet under the input gate it arrived on (the output gate of
 // the module under test it is connected to), then frees it.
@@ -97,13 +122,7 @@ class HarnessCapture final : public Module {
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override {
     for (bess::PacketRef ref : batch->packets()) {
       // Linearize: a module may have built a chained packet.
-      Bytes bytes;
-      bytes.reserve(ref.total_len());
-      for (bess::PacketHandle h = ref.handle(); h != nullptr; h = h->next) {
-        const bess::PacketRef seg(h);
-        const auto *p = seg.head_data<const uint8_t *>();
-        bytes.insert(bytes.end(), p, p + seg.head_len());
-      }
+      Bytes bytes = PacketBytes(ref.handle());
       if (captured != nullptr) {
         (*captured)[ctx->current_igate].push_back(std::move(bytes));
       }
@@ -114,6 +133,25 @@ class HarnessCapture final : public Module {
 
 ADD_MODULE(HarnessInject, "harness_inject", "test harness: injects queued packets")
 ADD_MODULE(HarnessCapture, "harness_capture", "test harness: records packets per input gate")
+
+bess::PacketHandle MakePacket(const Bytes &bytes, size_t split) {
+  if (split == 0) {
+    return Segment(bytes.data(), bytes.size());
+  }
+  if (split >= bytes.size()) {
+    ADD_FAILURE() << "split " << split << " is not inside a " << bytes.size() << "-byte packet";
+    return nullptr;
+  }
+  bess::PacketHandle head = Segment(bytes.data(), split);
+  bess::PacketHandle tail = Segment(bytes.data() + split, bytes.size() - split);
+  if (head == nullptr || tail == nullptr || rte_pktmbuf_chain(head, tail) != 0) {
+    ADD_FAILURE() << "cannot chain a test packet";
+    bess::PacketFree(head);
+    bess::PacketFree(tail);
+    return nullptr;
+  }
+  return head;
+}
 
 void InitModuleTests() {
   static const bool done = [] {
@@ -246,8 +284,33 @@ std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::Run(Module *m, gate_idx_
 std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunPipeline(
     Module *first, gate_idx_t igate, const std::vector<Bytes> &in, Module *last,
     std::vector<gate_idx_t> ogates) {
+  return RunQueued(first, igate, last, std::move(ogates), in.size(),
+                   [&in](size_t i) { return MakePacket(in[i]); });
+}
+
+std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunPackets(
+    Module *first, gate_idx_t igate, const std::vector<bess::PacketHandle> &in, Module *last,
+    std::vector<gate_idx_t> ogates) {
+  if (!CanRun(first, last)) {
+    // The harness owns `in` either way: nothing will run them, so they are
+    // freed here (RunQueued reports the failure).
+    for (bess::PacketHandle h : in) {
+      bess::PacketFree(h);
+    }
+  }
+  return RunQueued(first, igate, last, std::move(ogates), in.size(),
+                   [&in](size_t i) { return in[i]; });
+}
+
+bool ModuleHarness::CanRun(const Module *first, const Module *last) const {
+  return first != nullptr && last != nullptr && injector_ != nullptr && capture_ != nullptr;
+}
+
+std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunQueued(
+    Module *first, gate_idx_t igate, Module *last, std::vector<gate_idx_t> ogates, size_t count,
+    const std::function<bess::PacketHandle(size_t)> &packet) {
   std::map<gate_idx_t, std::vector<Bytes>> out;
-  if (first == nullptr || last == nullptr || injector_ == nullptr || capture_ == nullptr) {
+  if (!CanRun(first, last)) {
     ADD_FAILURE() << "no module to run";
     return out;
   }
@@ -257,10 +320,15 @@ std::map<gate_idx_t, std::vector<Bytes>> ModuleHarness::RunPipeline(
   WireOutputs(last, std::move(ogates), task);
   captured = &out;
   // One task run per burst: a batch holds kMaxBurst packets.
-  for (size_t at = 0; at < in.size(); at += bess::PacketBatch::kMaxBurst) {
-    const size_t n = std::min<size_t>(bess::PacketBatch::kMaxBurst, in.size() - at);
-    pending.assign(in.begin() + static_cast<ptrdiff_t>(at),
-                   in.begin() + static_cast<ptrdiff_t>(at + n));
+  for (size_t at = 0; at < count; at += bess::PacketBatch::kMaxBurst) {
+    const size_t end = std::min<size_t>(at + bess::PacketBatch::kMaxBurst, count);
+    pending.clear();
+    for (size_t i = at; i < end; i++) {
+      bess::PacketHandle h = packet(i);
+      if (h != nullptr) {
+        pending.push_back(h);
+      }
+    }
     RunOnce(task);
   }
   captured = nullptr;
