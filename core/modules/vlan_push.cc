@@ -4,9 +4,12 @@
 
 #include "vlan_push.h"
 
+#include <cstdint>
 #include <cstring>
 
 #include "arch/vlan.h"
+#include "packet_mutation.h"
+#include "packet_reshape.h"
 #include "utils/ether.h"
 #include "utils/format.h"
 
@@ -68,10 +71,25 @@ void VLANPush::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       EmitPacket(ctx, pkt, DROP_GATE);
       continue;
     }
+    // The tag goes into the headroom and the addresses move in place, so the
+    // payload must be this packet's alone: a shared one is copied first
+    // (D-153), and the copy may replace and resegment the mbuf, so its
+    // length is checked again.
+    if (unlikely(bess::packet::PayloadWriteabilityOf(pkt) !=
+                 bess::packet::PayloadWriteability::kWritable)) {
+      bess::PacketHandle copy = pkt.handle();
+      if (!bess::packet::EnsureWritable(copy) ||
+          bess::PacketRef(copy).head_len() < sizeof(Ethernet)) {
+        EmitPacket(ctx, bess::PacketRef(copy), DROP_GATE);
+        continue;
+      }
+      pkt = bess::PacketRef(copy);
+    }
+    const uint16_t len = pkt.head_len();
     char *new_head = static_cast<char *>(pkt.prepend(4));
     if (unlikely(new_head == nullptr)) {
-      // No headroom: the frame cannot carry the tag the graph asked for, so it
-      // is dropped rather than forwarded bare.
+      // No headroom: the frame cannot carry the tag the graph asked for, so
+      // it is dropped rather than forwarded bare.
       EmitPacket(ctx, pkt, DROP_GATE);
       continue;
     }
@@ -79,7 +97,16 @@ void VLANPush::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         reinterpret_cast<const Ethernet *>(new_head + 4)->ether_type;
     const be32_t tag =
         (tpid == be16_t(Ethernet::Type::kVlan)) ? qinq_tag : vlan_tag;
-    bess::arch::InsertVlanTag(new_head, tag.raw_value());
+    // The 16-byte insert reads the frame's first 16 bytes. A 14- or 15-byte
+    // first segment (a bare header, or a chain split just after it) has
+    // fewer; there only the 12 address bytes move.
+    if (likely(len >= 16)) {
+      bess::arch::InsertVlanTag(new_head, tag.raw_value());
+    } else {
+      const uint32_t tag_raw = tag.raw_value();
+      std::memmove(new_head, new_head + 4, 12);
+      std::memcpy(new_head + 12, &tag_raw, sizeof(tag_raw));
+    }
     batch->handles()[out_cnt++] = pkt.handle();
   }
   batch->set_cnt(out_cnt);
