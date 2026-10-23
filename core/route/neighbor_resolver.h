@@ -431,30 +431,43 @@ class NeighborResolver {
     if (released_key) {
       auto stale = entries_.find(*released_key);
       if (stale != entries_.end()) {
-        Disarm(stale->second);
-        entries_.erase(stale);
+        Release(stale);
       }
     }
 
     entry->second.epoch = iface->second.epoch;
-    const auto learned = neighbors_.Find(key);
-    const NeighborState state =
-        learned ? learned->state : NeighborState::kIncomplete;
-    entry->second.state = state;
-    entry->second.probes = 0;
-    entry->second.reconfirming = false;
-    // A neighbor that is already known continues from that state; a fresh
-    // one solicits. The two "no timer" configurations (aging and retry
-    // disabled) leave the entry in its current state.
     bool armed = true;
-    if (state == NeighborState::kResolved) {
-      armed = timing_.reachable_lifetime == 0 ||
-              Arm(key, entry->second, now, timing_.reachable_lifetime);
-    } else if (state == NeighborState::kUnreachable) {
-      armed = timing_.unreachable_retry == 0 ||
-              Arm(key, entry->second, now, timing_.unreachable_retry);
+    const auto saved = deferred_entries_.find(key);
+    if (saved != deferred_entries_.end()) {
+      // Released earlier in this batch (DeferForgetting): it continues as if
+      // it had never been, with its reconfirmation, probe count and deadline.
+      const Entry &was = saved->second.entry;
+      entry->second.state = was.state;
+      entry->second.probes = was.probes;
+      entry->second.reconfirming = was.reconfirming;
+      entry->second.serial = was.serial;
+      if (saved->second.deadline) {
+        armed = ArmAt(key, entry->second, std::max(*saved->second.deadline, now));
+      }
     } else {
-      armed = Arm(key, entry->second, now, timing_.first_probe);
+      const auto learned = neighbors_.Find(key);
+      const NeighborState state =
+          learned ? learned->state : NeighborState::kIncomplete;
+      entry->second.state = state;
+      entry->second.probes = 0;
+      entry->second.reconfirming = false;
+      // A neighbor that is already known continues from that state; a fresh
+      // one solicits. The two "no timer" configurations (aging and retry
+      // disabled) leave the entry in its current state.
+      if (state == NeighborState::kResolved) {
+        armed = timing_.reachable_lifetime == 0 ||
+                Arm(key, entry->second, now, timing_.reachable_lifetime);
+      } else if (state == NeighborState::kUnreachable) {
+        armed = timing_.unreachable_retry == 0 ||
+                Arm(key, entry->second, now, timing_.unreachable_retry);
+      } else {
+        armed = Arm(key, entry->second, now, timing_.first_probe);
+      }
     }
     if (!armed) {
       // The wheel refused the new timer. Put the hop back where it was (a
@@ -484,6 +497,9 @@ class NeighborResolver {
       }
       return std::unexpected("timer capacity exhausted");
     }
+    if (saved != deferred_entries_.end()) {
+      deferred_entries_.erase(saved);
+    }
     DropIfUnbound(previous, key);
     return initial;
   }
@@ -503,8 +519,7 @@ class NeighborResolver {
     }
     auto entry = entries_.find(binding->key);
     if (entry != entries_.end()) {
-      Disarm(entry->second);
-      entries_.erase(entry);
+      Release(entry);
     }
     if (!defer_forgetting_) {
       neighbors_.Forget(binding->key);
@@ -513,13 +528,15 @@ class NeighborResolver {
 
   // Starts a batch of Bind and Unbind calls that moves bindings between next
   // hops. Until ForgetUnbound(), a neighbor whose last binding goes releases
-  // its timer and its room at once but keeps what was learned, so a Bind
-  // later in the batch takes it up where it was (resolved, with its MAC)
-  // whatever order the batch runs in.
+  // its timer and its room at once but keeps what was learned and where its
+  // resolution stood (reconfirming, probes sent, the timer's deadline), so a
+  // Bind later in the batch takes it up exactly where it was, whatever order
+  // the batch runs in.
   void DeferForgetting() noexcept { defer_forgetting_ = true; }
   // Ends the batch: forgets every neighbor no next hop is bound to.
   void ForgetUnbound() noexcept {
     defer_forgetting_ = false;
+    deferred_entries_.clear();
     neighbors_.ForgetUnbound();
   }
 
@@ -1093,6 +1110,22 @@ class NeighborResolver {
     entry.serial++;
   }
 
+  // Stops resolving the neighbor `it` names and frees its room. Inside
+  // DeferForgetting() the entry and its deadline are kept aside for a Bind
+  // later in the batch; if that record cannot be allocated, the neighbor is
+  // taken up from what was learned instead, as outside a batch.
+  void Release(std::map<Key, Entry>::iterator it) {
+    const std::optional<uint64_t> deadline = wheel_->DeadlineOf(it->second.timer);
+    Disarm(it->second);
+    if (defer_forgetting_) {
+      try {
+        deferred_entries_.insert_or_assign(it->first, Deferred{it->second, deadline});
+      } catch (...) {
+      }
+    }
+    entries_.erase(it);
+  }
+
   // The neighbor's entry is no longer named by any hop: stop resolving it and
   // forget it.
   void DropIfUnbound(const std::optional<NeighborTable::Bound> &previous,
@@ -1103,8 +1136,7 @@ class NeighborResolver {
     }
     auto stale = entries_.find(previous->key);
     if (stale != entries_.end()) {
-      Disarm(stale->second);
-      entries_.erase(stale);
+      Release(stale);
     }
     if (!defer_forgetting_) {
       neighbors_.Forget(previous->key);
@@ -1118,6 +1150,13 @@ class NeighborResolver {
   std::map<Key, Entry> entries_;
   // Inside DeferForgetting(): an unbound neighbor keeps what was learned.
   bool defer_forgetting_ = false;
+  // Inside DeferForgetting(): the entries released in the batch, with their
+  // timers' deadlines (none when unarmed), for a later Bind to resume.
+  struct Deferred {
+    Entry entry;
+    std::optional<uint64_t> deadline;
+  };
+  std::map<Key, Deferred> deferred_entries_;
   std::map<dataplane::InterfaceId, StoredInterface> interfaces_;
   // Poll's collection of due records. Pre-sized in Create so the wheel
   // callback never allocates.

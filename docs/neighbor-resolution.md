@@ -256,13 +256,16 @@ other resource:
 - **The final binding wins.** The maintenance tick coalesces the binding
   changes committed since the last tick per id. With forgetting deferred
   (`NeighborResolver::DeferForgetting`: a neighbor whose last binding goes
-  frees its timer and room at once but keeps what was learned), it installs
-  the final bindings of neighbors the resolver knows and releases removed or
-  replaced bindings; it then forgets every neighbor no id names
+  frees its timer and room at once but keeps what was learned and where its
+  resolution stood -- reconfirming, probes sent, its timer's deadline), it
+  installs the final bindings of neighbors the resolver knows and releases
+  removed or replaced bindings; it then forgets every neighbor no id names
   (`ForgetUnbound`) and installs the rest. A neighbor that is still named
-  after the tick keeps what was learned and stays resolved without a probe,
-  however the ids move: a move to another id, a chain, a swap or a rotation,
-  in any id order. An unbind and a bind in one transaction at
+  after the tick continues exactly where it was -- resolved without a probe,
+  or, if it was being reconfirmed, with its next probe on schedule and its
+  remaining probe budget -- however the ids move: a move to another id, a
+  chain, a swap or a rotation, in any id order. An unbind and a bind in one
+  transaction at
   `max_neighbors` resolve the new neighbor, and several transactions on one
   id before a tick install only the last binding.
 - **Capacity.** `max_neighbors` bounds the bindings (and so the neighbors

@@ -2743,6 +2743,60 @@ TEST_F(RouterTest, ASwapOfTwoNeighborsKeepsBothResolved) {
   EXPECT_NE(std::string::npos, rt->GetDesc().find(", 2 neighbors")) << rt->GetDesc();
 }
 
+// A neighbor released and taken back up in one tick resumes where its
+// resolution stood: renumbered in a chain while it is being reconfirmed, it
+// sends its next probe on schedule, reports its reconfirmation, and still
+// fails closed once the probe budget runs out.
+TEST_F(RouterTest, ARenumberedReconfirmingNeighborKeepsItsProbeSchedule) {
+  bess::pb::RouterArg arg = ResolverArg(0);
+  arg.set_neighbor_probe_interval_ms(1);
+  arg.set_neighbor_max_probe_interval_ms(1);
+  arg.set_neighbor_max_probes(2);
+  arg.set_neighbor_reachable_lifetime_ms(4);
+  arg.set_neighbor_unreachable_retry_ms(0);
+  Router *rt = CreateTwoResolvedNeighbors(arg);  // both resolved at tick 2
+  ASSERT_NE(nullptr, rt);
+  // Tick 6: both lifetimes are over; each is reconfirmed, its first probe out.
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 6);
+  ASSERT_EQ(2u, h_.RunTask(rt, {0, 1})[1].size());
+
+  const bess::route::Router &router = *rt->router();
+  const bess::route::NeighborKey a(bess::dataplane::InterfaceId(2), 0xc0000202);
+  const bess::route::NeighborKey b(bess::dataplane::InterfaceId(2), 0xc0000203);
+  ASSERT_EQ("", h_.Apply({
+                    router.BindNeighborOp(bess::route::NextHopId(1), b),
+                    router.BindNeighborOp(bess::route::NextHopId(3), a),
+                }));
+  // Tick 7 takes the moves up, then sends both second probes on schedule.
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 7);
+  std::set<std::string> targets;
+  for (const Bytes &probe : h_.RunTask(rt, {0, 1})[1]) {
+    targets.insert(ArpTarget(probe));
+  }
+  EXPECT_EQ((std::set<std::string>{"192.0.2.2", "192.0.2.3"}), targets);
+  ExpectResolved(rt, 3, "02:00:00:00:00:aa");
+  CommandResponse got = h_.Action(rt, "get_neighbors", bess::pb::EmptyArg());
+  bess::pb::RouterCommandGetNeighborsResponse response;
+  ASSERT_TRUE(got.data().UnpackTo(&response));
+  bool saw_a = false;
+  for (const auto &n : response.neighbors()) {
+    if (n.next_hop_id() == 3) {
+      saw_a = true;
+      EXPECT_TRUE(n.reconfirming());
+      EXPECT_EQ(2u, n.probes());
+    }
+  }
+  EXPECT_TRUE(saw_a);
+  // Tick 8: both probes unanswered, so the moved neighbor fails closed with
+  // the other, not a whole reachable lifetime later.
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 8);
+  for (uint32_t id : {1u, 2u, 3u}) {
+    const auto *hop = rt->router()->LookupNextHop(bess::route::NextHopId(id));
+    ASSERT_NE(nullptr, hop);
+    EXPECT_EQ(bess::route::NeighborState::kUnreachable, hop->neighbor) << "id " << id;
+  }
+}
+
 // Ownership does not depend on request order: a route or a group listed
 // before the new binding it names references that binding (so the unbind is
 // refused while it does), and results stay in request order.

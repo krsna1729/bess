@@ -91,9 +91,11 @@ running daemon in the test suite.
   `domain_attr`, `punt_miss_gate` and `punt_unresolved_gate`, and refuses
   every route and group write, so a next-hop-id configuration drops those
   fields, its routes and its groups (an empty `RouterArg` is valid).
-  All `RouterArg` fields are renumbered (1-25, no reserved slots) and
-  `RouterInterface` keeps 1-4, so a binary `RouterArg` must be re-encoded;
-  text and YAML that name fields only need the capacity rename. An IPv4
+  `max_routes` (field 1) and `max_tbl8s` (field 2) are deleted and their
+  numbers left unused; every other `RouterArg` field keeps the number
+  `develop` released (3-13), and the new fields take 14-27, so an older
+  binary `RouterArg` is never misread. Text and YAML that name fields only
+  need the capacity rename. An IPv4
   destination-mode Router that relied on the old default writes
   `max_ipv4_routes: 4096`.
 - **Transactions reserve in resource rank order** (D-180). The engine calls

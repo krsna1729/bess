@@ -12413,11 +12413,12 @@ D-176) for the next hops bound in its `<router>/neighbors` resource.
   replaces the Init-time binding list. A committed binding publishes its hop incomplete; the resolver takes it
   up on the next tick. `NeighborResolver::CheckBind` validates it before staging, so the tick never refuses one.
   The tick coalesces the changes published since the last one to each id's final binding. With forgetting
-  deferred (a neighbor whose last binding goes frees its timer and room at once and keeps what was learned),
-  it installs the final bindings whose neighbor the resolver knows and releases every resolver binding that
-  is gone or replaced; it then forgets every neighbor no id names and installs the rest. A neighbor still
-  named after the tick therefore keeps its learned MAC and publishes resolved at once however the ids move
-  (a move, a chain, a swap or a rotation, in any id order); a transaction that unbinds one id and binds
+  deferred (a neighbor whose last binding goes frees its timer and room at once and keeps what was learned,
+  with its resolver entry and timer deadline set aside), it installs the final bindings whose neighbor the
+  resolver knows and releases every resolver binding that is gone or replaced; it then forgets every neighbor
+  no id names and installs the rest. A neighbor still named after the tick therefore continues exactly where it
+  was -- its learned MAC published at once, and a reconfirmation keeping its probe count and next deadline --
+  however the ids move (a move, a chain, a swap or a rotation, in any id order); a transaction that unbinds one id and binds
   another at `max_neighbors` still finds room; several transactions on one id before a tick install only the
   last binding. Routes and groups that
   name a bound id hold a reference to it, so an unbind is refused while any does; an id is static
@@ -12453,9 +12454,14 @@ D-176) for the next hops bound in its `<router>/neighbors` resource.
 - *Next-hop mode writes the IPv6 hop limit.* It decrements the IPv6 hop limit as destination mode does, so the
   two modes agree on every hop-count boundary (D-153). An interface `id` of 0 is derived as
   `egress_gate + 1`; `ingress_interface_attr` defaults to `vif_id`, what Vif writes.
-- *The protobuf carries no development history.* `RouterArg` is numbered 1-25 with no reserved slot: the FIB
-  fields, then the module's own (next hops, groups, domains, mode, hash, attributes), the four punt gates
-  together (13-16), then the resolver's (17-25). `RouterInterface` is 1-4.
+- *Released field numbers stand (D-173).* Every `RouterArg` field `develop` released keeps its number
+  (`max_next_hops` 3, `max_domains` 4, `backend` 5, `mode` 6, `max_groups` 7, `punt_miss_gate` 8,
+  `punt_unresolved_gate` 9, `flow_hash` 10, `next_hop_attr` 11, `domain_attr` 12, `punt_local_gate` 13), so an
+  older client's message is never read as a different field. The removed `max_routes` (1) and `max_tbl8s` (2)
+  are deleted outright, per D-173, and their numbers are not reused. The new fields take fresh numbers: the
+  per-family capacities 14-17, `punt_neighbor_gate` 18, `ingress_interface_attr` 19, `interfaces` 20,
+  `max_neighbors` 21 and the neighbor timings 22-27. `RouterInterface` is new (1-4), and `RouterRouteKey`
+  adds `ipv6` as 4.
 
 **Consequences.** D-153's "the Router sends no ARP/ND" no longer holds for a Router with configured
 interfaces. The D-176/D-178 "IPv6 FIB lands" trigger has fired for routing (route derivation stays IPv4-only).
@@ -12473,9 +12479,9 @@ What an existing Router user sees:
   refused. In next-hop mode drop the capacity fields, the routes and groups, and any destination-only setting
   (`max_groups`, `max_domains` above 1, `flow_hash`, `domain_attr`, `punt_miss_gate`,
   `punt_unresolved_gate`): the Router has no FIB, refuses them, and forwards IPv6 as well as IPv4.
-- `RouterArg` is renumbered (the per-family capacities take fields 1-4, `max_next_hops` is 6, `max_domains` 8,
-  `mode` 9, the punt gates 13-16, the resolver's fields 17-25): text and YAML configurations that name fields
-  are unaffected, but a binary `RouterArg` encoded against the old numbering must be re-encoded.
+- `max_routes` (1) and `max_tbl8s` (2) are removed; every other released `RouterArg` field keeps its number,
+  and the new fields are 14-27. A binary `RouterArg` that set 1 or 2 must drop them; nothing else changes on
+  the wire.
 - The transaction engine reserves in resource rank order; results stay in request order.
 - GetDesc reads `not ip:` where it read `not ipv4:`, and the accessor `not_ipv4_frames` is `not_ip_frames`.
 - In destination mode with IPv6 enabled, IPv6 frames, once dropped as non-IPv4, are routed through the
@@ -12508,7 +12514,8 @@ limit, `AnEmptyArgNextHopRouterForwardsBothFamiliesWithoutAFib`, `TheNextHopMode
 `AnUnbindAndABindInOneTransactionAtCapacityResolveTheNewNeighbor`,
 `SeveralTransactionsBeforeATickApplyTheFinalBinding`, `ARebindOfAForgottenNeighborStartsIncompleteAndSolicits`,
 `ANeighborMovedToAnotherIdStaysResolved`, `AChainOfMovesInOneTickKeepsEveryNeighborResolved`,
-`ASwapOfTwoNeighborsKeepsBothResolved`, `TheRouteValueBoundIsTheFibs`,
+`ASwapOfTwoNeighborsKeepsBothResolved`, `ARenumberedReconfirmingNeighborKeepsItsProbeSchedule`,
+`TheRouteValueBoundIsTheFibs`,
 `ARouteOrGroupListedBeforeItsBindingNamesTheBinding`) and `control_apply_pipeline_test`
 (`ResolverOwnedNextHopsAreOutsideDesiredStateConvergence`, `NeighborBindingsConvergeAsTheirOwnResource`). The
 full suite (`meson test -C build/fast --no-suite live`) is the gate.
