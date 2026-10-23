@@ -90,6 +90,30 @@ std::vector<uint8_t> Icmp(Ep s, Ep d, uint8_t type, uint16_t id, std::vector<uin
   return Ipv4Frame(s, d, 1, l4);
 }
 
+// Ethernet + IPv6 ::1 -> ::2 + `ext_chain` (its first header `first_next`),
+// then, for `l4proto` 17, UDP 5000 -> 53 with 4 bytes of payload.
+std::vector<uint8_t> Ipv6Frame(const std::vector<uint8_t> &ext_chain, uint8_t first_next,
+                               uint8_t l4proto) {
+  std::vector<uint8_t> f(12, 0);
+  f.push_back(0x86);
+  f.push_back(0xdd);
+  const size_t ip = f.size();
+  f.resize(ip + 40, 0);
+  f[ip] = 0x60;
+  f[ip + 6] = first_next;
+  f[ip + 23] = 1;  // src ::1
+  f[ip + 39] = 2;  // dst ::2
+  f.insert(f.end(), ext_chain.begin(), ext_chain.end());
+  std::vector<uint8_t> udp(12, 0);
+  udp[0] = 0x13;
+  udp[1] = 0x88;  // 5000
+  udp[3] = 53;
+  udp[5] = 12;
+  if (l4proto == 17) f.insert(f.end(), udp.begin(), udp.end());
+  Put16(f, ip + 4, static_cast<uint16_t>(f.size() - ip - 40));
+  return f;
+}
+
 ParsedFrame Parse(const std::vector<uint8_t> &f) {
   ParsedFrame p;
   EXPECT_EQ(ParseStatus::kOk, ParseFrame(f, p));
@@ -133,26 +157,7 @@ TEST(PacketParseTest, VlanTagsOptionsAndPorts) {
 }
 
 TEST(PacketParseTest, Ipv6ExtensionHeadersAndFragments) {
-  auto v6 = [](std::vector<uint8_t> ext_chain, uint8_t first_next, uint8_t l4proto) {
-    std::vector<uint8_t> f(12, 0);
-    f.push_back(0x86);
-    f.push_back(0xdd);
-    const size_t ip = f.size();
-    f.resize(ip + 40, 0);
-    f[ip] = 0x60;
-    f[ip + 6] = first_next;
-    f[ip + 23] = 1;  // src ::1
-    f[ip + 39] = 2;  // dst ::2
-    f.insert(f.end(), ext_chain.begin(), ext_chain.end());
-    std::vector<uint8_t> udp(12, 0);
-    udp[0] = 0x13;
-    udp[1] = 0x88;  // 5000
-    udp[3] = 53;
-    udp[5] = 12;
-    if (l4proto == 17) f.insert(f.end(), udp.begin(), udp.end());
-    Put16(f, ip + 4, static_cast<uint16_t>(f.size() - ip - 40));
-    return f;
-  };
+  const auto v6 = Ipv6Frame;
   // Hop-by-hop (8 bytes) -> destination options (16 bytes) -> UDP.
   std::vector<uint8_t> chain = {60, 0, 0, 0, 0, 0, 0, 0, 17, 1};
   chain.resize(8 + 16, 0);
@@ -185,6 +190,57 @@ TEST(PacketParseTest, Ipv6ExtensionHeadersAndFragments) {
   f[12] = 0x08;
   f[13] = 0x00;
   EXPECT_EQ(ParseStatus::kMalformed, ParseFrame(f, p));
+}
+
+// AH (51) is stepped over as Linux's ipv6_skip_exthdr does, its length in
+// 4-byte units ((hdrlen + 2) * 4), so an IPv6 packet under AH is keyed by its
+// transport. ESP (50) ends the walk; IPv4's AH is not walked (nor is it in
+// Linux).
+TEST(PacketParseTest, Ipv6AuthenticationHeaderIsWalked) {
+  // AH of 12 bytes (hdrlen 1) -> UDP.
+  std::vector<uint8_t> ah = {17, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7};
+  ParsedFrame p;
+  auto f = Ipv6Frame(ah, 51, 17);
+  ASSERT_EQ(ParseStatus::kOk, ParseFrame(f, p));
+  EXPECT_EQ(L4Kind::kUdp, p.l4);
+  EXPECT_EQ(17, p.protocol);
+  EXPECT_EQ(14u + 40u + 12u, p.l4_offset);
+  EXPECT_EQ(5000, p.src_port);
+  EXPECT_EQ(53, p.dst_port);
+  // Behind another extension header: hop-by-hop -> AH of 24 bytes -> UDP.
+  std::vector<uint8_t> chain = {51, 0, 0, 0, 0, 0, 0, 0, 17, 4};
+  chain.resize(8 + 24, 0);
+  f = Ipv6Frame(chain, 0, 17);
+  ASSERT_EQ(ParseStatus::kOk, ParseFrame(f, p));
+  EXPECT_EQ(14u + 40u + 32u, p.l4_offset);
+  EXPECT_EQ(53, p.dst_port);
+  // An AH longer than the packet, or cut short, is malformed.
+  ah[1] = 200;
+  f = Ipv6Frame(ah, 51, 17);
+  EXPECT_EQ(ParseStatus::kMalformed, ParseFrame(f, p));
+  ah[1] = 1;
+  f = Ipv6Frame(ah, 51, 17);
+  f.resize(14 + 40 + 7);
+  Put16(f, 14 + 4, 7);
+  EXPECT_EQ(ParseStatus::kMalformed, ParseFrame(f, p));
+  // ESP ends the walk: the packet's protocol is ESP, with no ports.
+  f = Ipv6Frame(std::vector<uint8_t>(16, 0), 50, 0);
+  ASSERT_EQ(ParseStatus::kOk, ParseFrame(f, p));
+  EXPECT_EQ(L4Kind::kOther, p.l4);
+  EXPECT_EQ(50, p.protocol);
+  EXPECT_EQ(14u + 40u, p.l4_offset);
+  EXPECT_EQ(0, p.src_port);
+  // IPv4's AH is the protocol, as in Linux.
+  f = Ipv4Frame(kClient, kServer, 51, {17, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7});
+  ASSERT_EQ(ParseStatus::kOk, ParseFrame(f, p));
+  EXPECT_EQ(L4Kind::kOther, p.l4);
+  EXPECT_EQ(51, p.protocol);
+  // The tracker keys an IPv6 packet under AH by its transport: it belongs to
+  // the same connection as the packet without AH.
+  auto ct = Make();
+  EXPECT_EQ(TrackStatus::kNew, Send(*ct, Ipv6Frame({}, 17, 17), 0).status);
+  EXPECT_EQ(TrackStatus::kExisting, Send(*ct, Ipv6Frame(ah, 51, 17), 0).status);
+  EXPECT_EQ(1u, ct->size());
 }
 
 // Every truncation of a valid frame is rejected or parsed within bounds: never
@@ -502,6 +558,69 @@ TEST(ConntrackTest, IcmpEchoAndErrorsAboutTrackedConnections) {
   echo.erase(echo.begin(), echo.begin() + 14);
   echo.resize(28);
   EXPECT_EQ(TrackStatus::kRelated, Send(*ct, Icmp(host, kClient, 11, 0, echo), 4).status);
+}
+
+// An ICMPv6 error's quote is walked through its extension headers as the
+// packet itself was, so an error about a connection under AH or options
+// headers (keyed by its transport) is related: PMTUD works for it.
+TEST(ConntrackTest, Icmpv6ErrorsQuotingExtensionHeadersAreRelated) {
+  // ICMPv6 `type` from a router (::9) to ::1, quoting `quote` (an IP packet).
+  auto error6 = [](uint8_t type, const std::vector<uint8_t> &quote) {
+    std::vector<uint8_t> f(12, 0);
+    f.push_back(0x86);
+    f.push_back(0xdd);
+    const size_t ip = f.size();
+    f.resize(ip + 40, 0);
+    f[ip] = 0x60;
+    f[ip + 6] = 58;
+    f[ip + 7] = 64;
+    f[ip + 23] = 9;
+    f[ip + 39] = 1;
+    std::vector<uint8_t> icmp(8, 0);
+    icmp[0] = type;
+    Put16(icmp, 6, 1280);  // Packet Too Big: the MTU
+    f.insert(f.end(), icmp.begin(), icmp.end());
+    f.insert(f.end(), quote.begin(), quote.end());
+    Put16(f, ip + 4, static_cast<uint16_t>(f.size() - ip - 40));
+    return f;
+  };
+  auto ip_packet = [](std::vector<uint8_t> frame) {
+    frame.erase(frame.begin(), frame.begin() + 14);
+    return frame;
+  };
+  auto ct = Make();
+  // ::1 -> ::2 UDP 5000 -> 53 under a 12-byte AH: keyed by its transport.
+  const std::vector<uint8_t> ah = {17, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7};
+  auto conn = Send(*ct, Ipv6Frame(ah, 51, 17), 0);
+  ASSERT_EQ(TrackStatus::kNew, conn.status);
+  const std::vector<uint8_t> quoted = ip_packet(Ipv6Frame(ah, 51, 17));
+  for (const uint8_t type : {uint8_t{2}, uint8_t{1}}) {  // Packet Too Big, Unreachable
+    auto err = Send(*ct, error6(type, quoted), 1);
+    EXPECT_EQ(TrackStatus::kRelated, err.status) << int{type};
+    EXPECT_EQ(conn.handle, err.handle) << int{type};
+  }
+  // Behind hop-by-hop, and AH behind hop-by-hop: the same connection.
+  std::vector<uint8_t> hbh = {17, 0, 0, 0, 0, 0, 0, 0};
+  EXPECT_EQ(TrackStatus::kRelated,
+            Send(*ct, error6(2, ip_packet(Ipv6Frame(hbh, 0, 17))), 1).status);
+  std::vector<uint8_t> chain = {51, 0, 0, 0, 0, 0, 0, 0};
+  chain.insert(chain.end(), ah.begin(), ah.end());
+  EXPECT_EQ(TrackStatus::kRelated,
+            Send(*ct, error6(2, ip_packet(Ipv6Frame(chain, 0, 17))), 1).status);
+  // A quote cut after the ports is enough; one cut inside AH, or before the
+  // ports, names nothing.
+  std::vector<uint8_t> cut = quoted;
+  cut.resize(40 + 12 + 4);
+  EXPECT_EQ(TrackStatus::kRelated, Send(*ct, error6(2, cut), 1).status);
+  cut.resize(40 + 6);
+  EXPECT_EQ(TrackStatus::kInvalid, Send(*ct, error6(2, cut), 1).status);
+  cut = quoted;
+  cut.resize(40 + 12 + 2);
+  EXPECT_EQ(TrackStatus::kInvalid, Send(*ct, error6(2, cut), 1).status);
+  // A quoted non-initial fragment has no ports.
+  const std::vector<uint8_t> later = {17, 0, 0x00, 0x08, 0, 0, 0, 1};  // offset 1
+  std::vector<uint8_t> frag = ip_packet(Ipv6Frame(later, 44, 17));
+  EXPECT_EQ(TrackStatus::kInvalid, Send(*ct, error6(2, frag), 1).status);
 }
 
 // -- keys, zones, policy hooks, capacity --------------------------------------------

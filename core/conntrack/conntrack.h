@@ -218,7 +218,11 @@ inline bool IsEchoReply(packet::L4Kind k, uint8_t type) noexcept {
 
 // The tuple quoted in an ICMP error (header plus the first 8 bytes of its L4,
 // so the parse is lenient about the quoted packet's stated length), written
-// as a ParsedFrame. False if the quote is too short.
+// as a ParsedFrame. An IPv6 quote's extension headers are walked as the
+// packet's own were (packet::parse_internal::WalkIpv6Chain, bounded by the
+// quote), so a connection keyed by its transport behind them is found. False
+// if the quote is too short (a header cut short included) or names no ports
+// (a non-initial fragment).
 inline bool ParseQuoted(std::span<const uint8_t> q, bool v6, packet::ParsedFrame &out) noexcept {
   out = packet::ParsedFrame{};
   size_t off;
@@ -235,9 +239,11 @@ inline bool ParseQuoted(std::span<const uint8_t> q, bool v6, packet::ParsedFrame
     }
   } else {
     if (q.size() < 40 || (q[0] >> 4) != 6) return false;
-    off = 40;
     out.l3 = packet::L3Kind::kIpv6;
-    out.protocol = q[6];  // extension headers in a quote are not followed
+    if (packet::parse_internal::WalkIpv6Chain(q.data(), q.size(), off, out) !=
+        packet::ParseStatus::kOk) {
+      return false;  // cut short by the quote, too many, or a non-initial fragment
+    }
     std::memcpy(out.src.data(), q.data() + 8, 16);
     std::memcpy(out.dst.data(), q.data() + 24, 16);
   }

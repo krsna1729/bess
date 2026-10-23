@@ -53,6 +53,9 @@ def stage_a():
     frag_later = bytes([17, 0, 0x05, 0xC8, 0, 0, 0, 9])  # offset 185
     ext = v6_with_ext(hbh + dopt + frag_first, 0, P.udp(b"z" * 8, src=v6src, dst=v6dst))
     later6 = v6_with_ext(frag_later, 44, b"\x5a" * 16)
+    ah = bytes([6, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7])  # AH, 12 bytes -> TCP
+    ah6 = v6_with_ext(ah, 51, P.tcp(b"", src=v6src, dst=v6dst, flags=SYN))
+    esp6 = v6_with_ext(b"", 50, b"\0" * 16)            # ESP ends the walk
     frag4_first = P.eth(P.ipv4(P.udp(b"y" * 8), 17, flags_frag=0x2000))
     frag4_later = P.eth(P.ipv4(b"\x5a" * 16, 17, flags_frag=0x00B9))
     arp = P.eth(b"\x00\x01\x08\x00\x06\x04\x00\x01" + b"\0" * 20, 0x0806)
@@ -77,6 +80,8 @@ def stage_a():
         "a_gre4_other": parse(gre4),
         "a_ipv6_ext_first_fragment": parse(ext),
         "a_ipv6_later_fragment": parse(later6),
+        "a_ipv6_ah_tcp": parse(ah6),
+        "a_ipv6_esp": parse(esp6),
         "a_ipv4_first_fragment": parse(frag4_first, 3, 200),
         "a_ipv4_later_fragment": parse(frag4_later),
         "a_arp_not_ip": parse(arp),

@@ -134,7 +134,19 @@ void CheckAccepted(std::span<const uint8_t> frame, size_t total, const ParsedFra
     FUZZ_CHECK(p.l3 == L3Kind::kIpv6);
     FUZZ_CHECK(type == 0x86dd && l2 + 40 <= frame.size() && (ip[0] >> 4) == 6);
     ip_total = 40 + size_t{Be16(ip + 4)};
-    FUZZ_CHECK(p.l4_offset >= l2 + 40 && (p.l4_offset - l2 - 40) % 8 == 0);
+    // The chain walked here independently: hop-by-hop, routing and
+    // destination options in 8-byte units, AH in 4-byte units, an initial
+    // fragment header; the transport is where it ends.
+    uint8_t next = ip[6];
+    size_t off = 40;
+    while (next == 0 || next == 43 || next == 60 || next == 44 || next == 51) {
+      FUZZ_CHECK(l2 + off + 8 <= frame.size());
+      const size_t units = ip[off + 1];
+      const size_t len = next == 44 ? 8 : next == 51 ? (units + 2) * 4 : (units + 1) * 8;
+      next = ip[off];
+      off += len;
+    }
+    FUZZ_CHECK(p.l4_offset == l2 + off && p.protocol == next);
     FUZZ_CHECK(std::memcmp(p.src.data(), ip + 8, 16) == 0 &&
                std::memcmp(p.dst.data(), ip + 24, 16) == 0);
   }
@@ -638,8 +650,10 @@ class Tracker {
   }
 
   // The quote of an ICMP error, read from the definition: an IP header
-  // (IPv4: options allowed, not a non-initial fragment) and the first 8 bytes
-  // of its L4 (TCP/UDP ports; for ICMP only an echo's identifier).
+  // (IPv4: options allowed, not a non-initial fragment; IPv6: its extension
+  // headers, at most eight, each within the quote, not a non-initial
+  // fragment) and the first 8 bytes of its L4 (TCP/UDP ports; for ICMP only
+  // an echo's identifier).
   static bool Quote(std::span<const uint8_t> q, bool v6, std::array<uint8_t, 16> &src,
                     std::array<uint8_t, 16> &dst, uint16_t &sport, uint16_t &dport,
                     uint8_t &proto) {
@@ -658,6 +672,16 @@ class Tracker {
       if (q.size() < 40 || (q[0] >> 4) != 6) return false;
       hdr = 40;
       proto = q[6];
+      for (int n = 0; proto == 0 || proto == 43 || proto == 60 || proto == 44 || proto == 51;
+           n++) {
+        if (n == 8 || hdr + 8 > q.size()) return false;
+        if (proto == 44 && (Be16(q.data() + hdr + 2) & 0xfff8u) != 0) return false;
+        const size_t units = q[hdr + 1];
+        const size_t len = proto == 44 ? 8 : proto == 51 ? (units + 2) * 4 : (units + 1) * 8;
+        if (hdr + len > q.size()) return false;
+        proto = q[hdr];
+        hdr += len;
+      }
       std::memcpy(src.data(), q.data() + 8, 16);
       std::memcpy(dst.data(), q.data() + 24, 16);
     }
