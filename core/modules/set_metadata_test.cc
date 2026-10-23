@@ -21,6 +21,7 @@
 namespace {
 
 using bess::testing::Bytes;
+using bess::testing::MakePacket;
 using bess::testing::ModuleHarness;
 using bess::testing::PacketBuilder;
 
@@ -205,6 +206,45 @@ TEST(SetMetadataTest, APacketShorterThanTheExtractionIsDropped) {
 
   out = h.RunPipeline(md, 0, {Bytes(12)}, meter, {0});
   EXPECT_EQ(1u, out[0].size()) << "12 bytes hold the whole extraction";
+}
+
+// The bound is the first segment's, not the packet's: a chain whose first
+// segment ends inside the extraction is dropped, never read across the
+// segment boundary, and one whose first segment holds it is read from there.
+// Both the specialized width (4) and the run-time one (3).
+TEST(SetMetadataTest, AChainSplitInsideTheExtractionIsDropped) {
+  const Bytes frame = Packets()[0];  // source address 10.0.0.1 at 26
+  for (size_t size : {4u, 3u}) {
+    bess::pb::SetMetadataArg md_arg;
+    auto *a = md_arg.add_attrs();
+    a->set_name("src");
+    a->set_size(size);
+    a->set_offset(26);
+    bess::pb::GenericEncapArg encap_arg;
+    auto *f = encap_arg.add_fields();
+    f->set_size(size);
+    f->set_attribute("src");
+
+    ModuleHarness h;
+    Module *md = h.Create("SetMetadata", md_arg);
+    Module *encap = h.Create("GenericEncap", encap_arg);
+    ASSERT_NE(nullptr, md);
+    ASSERT_NE(nullptr, encap);
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(md, 0, encap, 0, true));
+
+    const size_t end = 26 + size;
+    auto out = h.RunPackets(md, 0, {MakePacket(frame, end - 1)}, encap, {0});
+    EXPECT_TRUE(out[0].empty()) << "size " << size << ": first segment ends one byte short";
+
+    // The source address's first `size` bytes, then the frame.
+    Bytes want(frame.begin() + 26, frame.begin() + static_cast<ptrdiff_t>(end));
+    want.insert(want.end(), frame.begin(), frame.end());
+    for (size_t split : {end, end + 1}) {
+      out = h.RunPackets(md, 0, {MakePacket(frame, split)}, encap, {0});
+      ASSERT_EQ(1u, out[0].size()) << "size " << size << ", split " << split;
+      EXPECT_EQ(want, out[0][0]) << "size " << size << ", split " << split;
+    }
+  }
 }
 
 }  // namespace
