@@ -356,15 +356,18 @@ std::vector<ModuleSample> EveryResourceSample() {
                                           "peak_rate": 1, "peak_burst": 100}})"}}}}},
       // A next hop's canonical form omits defaults: no neighbor when resolved.
       // Destination mode, since only it holds routes (D-183); an interface,
-      // since a neighbor binding names one (its id is egress_gate + 1).
+      // since a neighbor binding names one (its id is egress_gate + 1). The
+      // bound next hop's state entry says available, the default (D-184).
       {"rt", "Router",
        R"({"mode": "ROUTE_MODE_DESTINATION", "max_ipv4_routes": 64, "max_ipv4_tbl8s": 16, "max_next_hops": 64, "max_groups": 8,
            "interfaces": [{"egress_gate": 7, "mac_addr": "02:00:00:00:00:02", "addresses": ["192.0.2.1/24"]}]})", false,
        {{"next_hops",
          {{R"({"id": 1})",
-           R"({"egress_gate": 7, "dst_mac": "AgAAAAAB", "src_mac": "AgAAAAAC"})"}}},
-        {"groups", {{R"({"id": 1})", R"({"member_ids": [1]})"}}},
+           R"({"egress_gate": 7, "dst_mac": "AgAAAAAB", "src_mac": "AgAAAAAC"})"},
+          {R"({"id": 3})", R"({"egress_gate": 6})"}}},
         {"neighbors", {{R"({"id": 2})", R"({"interface_id": 8, "ipv4": "192.0.2.2"})"}}},
+        {"next_hop_state", {{R"({"id": 1})", R"({"down": true})"}, {R"({"id": 2})", "{}"}}},
+        {"groups", {{R"({"id": 1})", R"({"member_ids": [1], "standby_member_ids": [3]})"}}},
         {"routes", {{R"({"ipv4": "10.0.0.0", "prefix_length": 8})", R"({"next_hop_id": 1})"}}}}},
       {"src", "Source", "", true, {{"settings", setting(R"({"pkt_size": 128, "burst": 7})")}}},
       {"pi", "PortInc", R"({"port": "pa"})", true, {{"settings", setting(R"({"burst": 9})")}}},

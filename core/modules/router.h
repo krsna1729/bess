@@ -294,6 +294,7 @@ class Router final : public Module {
   // After router_, which owns the resources they bind (D-044).
   bess::framework::ResourceBinding next_hops_binding_;
   bess::framework::ResourceBinding neighbors_binding_;
+  bess::framework::ResourceBinding next_hop_state_binding_;
   bess::framework::ResourceBinding groups_binding_;
   bess::framework::ResourceBinding routes_binding_;
   std::unique_ptr<bess::route::NeighborResolver> neighbor_resolver_;
