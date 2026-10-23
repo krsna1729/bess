@@ -6028,7 +6028,8 @@ should scale with membership by default.
 
 ## D-067 Connection tracking: a library over the flow table and the expiry wheel (M17)
 
-**Status:** accepted (2026-10-04), experimental API.
+**Status:** accepted (2026-10-04), experimental API; the parser is amended by D-188 (moved to
+`core/packet_parse.h` as `bess::packet::ParseFrame` → `ParsedFrame`; the IPv6 walk steps over AH).
 **Code:** `core/conntrack/packet_parse.h`, `core/conntrack/conntrack.h` (new, header-only, installed
 experimental), `core/conntrack/conntrack_test.cc`, `core/conntrack/conntrack_bench.cc`, `core/meson.build`,
 `tools/check_includes.py`, `tools/api_classes.json`.
@@ -7260,6 +7261,8 @@ module that posts nothing runs no event code).
 ## D-085 Packet parse: the common frame validated on one path ("validate once, execute fast"; tunnel clawback)
 
 **Status:** accepted (2026-10-05). Consolidation review (paste-3) section 15 and the tunnel clawback; D-067's parser.
+Amended by D-188: the fast path's checks are `CheckFastIpv4` in `core/packet_parse.h`, which Firewall and HashLB
+also run.
 **Code:** `core/conntrack/packet_parse.h` (`ParseFrame`'s fast path; `parse_internal::ParseFrameGeneral`),
 `core/conntrack/conntrack_test.cc` (`FastPathAgreesWithTheGeneralPath`).
 
@@ -10451,7 +10454,8 @@ layout change: cut `sdk/go/v0.1.0` on a green commit, then repin the consumers f
 ## D-147 The firewall table: a port range costs no tuple
 
 **Status:** accepted (2026-10-18); the module's `<name>/rules` singleton is superseded by D-179 (one keyed,
-priority-ordered entry per rule).
+priority-ordered entry per rule); the module's own header walk (IPv6 bounded at four headers) is superseded by
+D-188 (the shared checked parse).
 **Code:** `core/classifier/firewall_table.{h,cc}`, `core/modules/firewall.{h,cc}`,
 `core/arch/masked_addr.h`, `protobuf/module_msg.proto` (`FirewallArg`),
 `core/classifier/firewall_table_test.cc`, `core/modules/firewall_test.cc`,
@@ -13010,3 +13014,99 @@ up to +4-5% wall time in the same benches.
 
 **Revisit when:** a resource needs more than one key holder, or a key must change holders while referenced
 (that would need the engine to move counts).
+
+## D-188 One checked packet parse for Firewall, ConnTrack, Router and HashLB
+
+**Status:** accepted (2026-10-24), experimental API. Amends D-067 and D-085 (the parser's place, name and IPv6
+walk); supersedes D-147's own header walk.
+**Code:** `core/packet_parse.h` (moved from `core/conntrack/`; `bess::packet::ParseFrame` → `ParsedFrame`,
+`CheckFastIpv4`, `kFastIpv4Src`/`kFastIpv4Dst`/`kFastIpv4L4`, `parse_internal::WalkIpv6Chain`),
+`core/conntrack/conntrack.h` (the TCP flag constants, `ParseQuoted`), `core/modules/firewall.{h,cc}` (`KeyOf`),
+`core/modules/hash_lb.{h,cc}` (`FrameHash`),
+`core/testing/parse_corpus.h`, `core/conntrack/conntrack_test.cc`, `core/modules/firewall_test.cc`,
+`core/modules/hash_lb_test.cc`, `core/fuzz/conntrack_fuzz.cc`, `core/meson.build`, `tools/api_classes.json`.
+
+**Context.** ConnTrack, NAT, the tunnel decaps and the Router read one checked parse (D-067, D-085), but
+Firewall kept its own raw-pointer walk (untagged only, IPv6 through four extension headers, lengths
+unchecked) and HashLB's L3 and L4 modes read fixed untagged-IPv4 offsets (an IPv6 or tagged frame hashed
+whatever bytes sat there, L4 dropped IPv6, and L3 hashed ARP). The same packet could be one flow to the
+tracker and another to the policy or the balancer.
+
+**Decision.**
+- **One parser, in a neutral place.** `core/packet_parse.h`, namespace `bess::packet` beside
+  `packet_cursor.h` and `packet_checksum.h`, installed experimental. A pure move and rename
+  (`ParsedFlowPacket` → `ParsedFrame`); the TCP flag constants are the tracker's vocabulary and live in
+  `conntrack.h`. No aliases are left behind.
+- **The IPv6 walk steps over AH** (51, `(hdrlen + 2) * 4` bytes), as Linux's `ipv6_skip_exthdr` does and
+  as Firewall's walk did; ESP ends the walk and IPv4's AH stays the protocol. AH counts toward the eight
+  headers. For ConnTrack, NAT and the Router this changes only IPv6 packets that carry AH: they key by their
+  transport instead of as protocol 51. The tunnel decaps read their outer headers through the parse
+  (`tunnel::detail::Outer`), so `DecapVxlan`, `DecapGeneve`, `DecapGtpu` and `DecapGre` now decapsulate an
+  IPv6 outer → AH → UDP/GRE packet (as the handoff_tunnel_sample does), stripping the AH with the outer
+  headers unverified, as any outer extension header was; the VXLANDecap module takes IPv4 outers only and is
+  unaffected.
+- **An ICMP error's quote is walked the same way.** The walk is one function
+  (`parse_internal::WalkIpv6Chain`) that ConnTrack's quote parse (`ParseQuoted`) runs too, within the quoted
+  bytes: it read a quoted IPv6 packet's protocol from the fixed header, so an ICMPv6 error (Packet Too Big,
+  Destination Unreachable) about a connection keyed through AH or options headers found no connection and
+  was kInvalid, breaking PMTUD for it. A header cut short by the quote, too many headers or a non-initial
+  fragment names no connection; the quote may still end right after the ports. NAT has no ICMP-error
+  translation and translates IPv4 only.
+- **Firewall's `KeyOf` reads the parse.** VLAN and QinQ frames are judged; a malformed packet (lengths that
+  lie, EtherType and version disagreeing, a bad TCP data offset or UDP length, more than eight extension
+  headers) is dropped as unjudgeable, as non-IP packets already were; a later fragment, ICMP and protocols
+  other than TCP and UDP are judged with both ports 0. The table is unchanged.
+- **HashLB's L3 and L4 modes hash the parse**, through the mix they always used (CRC32C of the XORed
+  addresses; in L4 also both ports as on the wire and the protocol). IPv6 folds its four address words. The
+  mix is kept rather than `route::FlowHash` because it is symmetric (a flow's two directions share a gate)
+  and every untagged IPv4 TCP/UDP flow keeps its gate. In L4 a fragment hashes on its addresses (so one
+  datagram's fragments share a gate), ICMP and other protocols add only the protocol. Non-IP and malformed
+  frames are dropped. The one-time remap: IPv6, tagged, fragmented, ICMP and non-TCP/UDP flows in L4, and the
+  frames now dropped. L2 and custom-field modes are unchanged.
+- **The common frame's checks are one public function.** `CheckFastIpv4` holds D-085's fast path (untagged,
+  EtherType IPv4, version/IHL 0x45, total-length bounds, fragment fields, the L4 header checks) and
+  `ParseFrame` runs it (`parse_internal::FastFrame<true>`, which also fills the descriptor). Firewall and
+  HashLB call it first and, when it takes the frame, read addresses and ports at the fixed offsets without
+  building a `ParsedFrame`; anything else falls back to `ParseFrame`. The L4 checks are one switch
+  (`parse_internal::CheckL4<kFill>`) for both.
+
+**Test.** `PacketParseTest.Ipv6AuthenticationHeaderIsWalked` (AH alone and behind hop-by-hop, AH longer than
+the packet or cut short, ESP, IPv4 AH, and an AH packet joining its flow's connection); `conntrack_fuzz`
+walks the IPv6 chain independently and checks the L4 offset and protocol, with AH and ESP seeds, and walks an
+ICMP error's quoted chain independently too. `ConntrackTest.Icmpv6ErrorsQuotingExtensionHeadersAreRelated`
+(Packet Too Big and Unreachable quoting IPv6 → AH → UDP, through hop-by-hop and hop-by-hop → AH, a quote cut
+after the ports: related; cut inside AH or before the ports, or a non-initial fragment: not).
+`FirewallTest`: up to eight extension headers, AH, tagged frames, ten malformed cases against a catch-all,
+ICMP with ports 0. `HashLbParsedTest`: a tagged flow keeps its gate, IPv6 spreads, one datagram's fragments
+share a gate, non-IP and malformed frames drop, and untagged IPv4 TCP matches the legacy formula in both
+directions. `FirewallTest.KeyOfDecidesEveryFrameAsTheParse` and
+`HashLbParsedTest.TheFastReadHashesEveryFrameAsTheParse` compare the fast read plus fallback with a key or hash
+built from `ParseFrame` alone over `ParseCorpus` (valid, truncated, byte-corrupted, chained, fragmented,
+IHL > 5, VLAN, IPv6 and random frames). Mutations: AH removed from the walk; `ParseQuoted` reading the
+quoted protocol from the fixed header again; the old `KeyOf` or the old
+L3/L4 code restored; ICMP keeping its echo identifier as ports; the fast path accepting an L4-malformed
+frame (Firewall) or hashing a first fragment's ports (HashLB); `CheckFastIpv4` without its minimum total
+length (fails `FastPathAgreesWithTheGeneralPath`): each fails these tests.
+
+**Evidence.** Release, `-march=x86-64-v3`, GCC 14, turbo off, isolated CPUs, against develop (9b68a07f).
+`conntrack_bench BM_Parse` (CPU 2, 8 ABBA rounds, ns; develop 4.64, 5.99, 7.35, 1.55): untagged IPv4 TCP
+4.44 (-4%), two 802.1Q tags and UDP 6.18 (+3%), IPv6 with two extension headers 8.12 (+10%), truncated 1.55
+(no difference). Per parse (`perf stat`, instructions / branches; develop 91 / 20 and 122 / 30): the tagged
+frame runs 93 / 21, the one extra compare and branch because GCC now tests the first tag for 802.1ad before
+802.1Q (an 802.1ad outer tag saves the same compare; neither order is in the source, and `[[likely]]` on
+802.1Q only moves the swap to the second tag). The IPv6 frame runs 130 / 35: the AH test at each header of
+the walk (126 / 33 in the AH commit) and the shared L4 switch (the rest). The first cut of the shared walk
+returned the protocol and the fragment flag through out-parameters, and ParseIp dispatched on its status;
+GCC laid the inlined parse out differently for every path (tagged 95 / 22, 6.38 ns, +6.5%). The walk now
+writes the frame as the loop it replaced did, and ParseIp returns any status but kOk at once.
+`live_perf` (workers on CPUs 4 and 6, control on 2, 8 rounds, ns per packet
+above M.base, two runs): M.firewall 47.2-47.8 (+6-7%), M.firewall/miss 28.0-28.1 (+10%), M.hashlb (l3)
+26.4-26.7 (+10-14%; four runs of equivalent builds ranged +6% to +20%). The remaining cost on the common
+frame is the checks the old readers skipped (total length, fragment field, the UDP length and TCP data
+offset): 2.5-3.5 ns per packet.
+
+**Consequences.** One answer to "what flow is this packet" across the tracker, the router, the policy and the
+balancer. A packet the old readers misread is now judged, hashed or dropped by the same rules everywhere.
+
+**Revisit when:** a deployment needs HashLB or Firewall to pass malformed traffic, or the common frame's
+remaining checks show up in a profile that matters.

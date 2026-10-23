@@ -97,7 +97,7 @@ Columns:
 | NAT | flows | default 65,536 | `NATArg.capacity`, `max_capacity` | yes | the table grows up to `max_capacity`; past it a new flow's packet is dropped and `bess.table_full` is raised |
 | NAT | idle timeout | 300 s | `kDefaultNatTimeout` (`nat/nat.h`), `BasicNat::kDefaultTimeout` | No | — |
 | Conntrack | flows | default 65,536 | `ConntrackArg.capacity` | yes | a new connection's packet leaves on gate 1 (not tracked) and `bess.table_full` is raised |
-| Conntrack, NAT, tunnel decaps, Router | IPv6 extension headers parsed | 8 | `kMaxExtensionHeaders` (`packet_parse.h`) | No | packet treated as malformed |
+| Conntrack, NAT, tunnel decaps, Router, Firewall, HashLB (L3/L4) | IPv6 extension headers parsed (hop-by-hop, routing, destination options, fragment, AH) | 8 | `kMaxExtensionHeaders` (`packet_parse.h`) | No | packet treated as malformed: Firewall and HashLB drop it (D-188) |
 | DRR | flows | default 4,096; max 16M | `DRR::kDefaultNumFlows`, `kMaxNumFlows` | `num_flows` | EINVAL |
 | Queue | size | default 1,024; 4–16,384, a power of 2 | `DEFAULT_QUEUE_SIZE` (`queue.cc`); the bounds are literals in `Queue::SetSize` | `size` | EINVAL "must be in [4, 16384]" / "must be a power of 2" |
 | Measure | histogram | 100 ns buckets to 100 ms | `kDefaultNsPerBucket`, `kDefaultMaxNs` | `latency_ns_resolution`, `latency_ns_max` | values above the range are counted in the last bucket |
@@ -141,7 +141,6 @@ Not reachable as a configuration error, but each one changes behavior.
 | `MAX_TRACE_DEPTH`, `MAX_TRACE_BUFSIZE` | 32, 4,096 B | `module.cc` | module call tracing, compiled only with `SN_TRACE_MODULES` |
 | `kPackedPriorityLow`, `kPackedPriorityHigh` | -32,767, 32,766 | `classifier/concurrent_masked.h` | WildcardMatch priorities in this range are packed into the table value and compared there; outside it the rule's record supplies the rank (same result). 32,767 is outside it: its packed form is the chain tag (D-186) |
 | `kMaskedMaxKeyBytes` | 64 B | `classifier/masked_exact.h` | widest masked key; sizes the packet path's stack scratch |
-| `kMaxIpv6ExtHeaders` | 4 | `modules/firewall.cc` | IPv6 extension headers a rule is judged through; a transport behind more of them is judged with both ports 0, so only a rule whose port range starts at 0 matches (D-147) |
 
 ## Internal batch bounds (not reachable from configuration)
 
