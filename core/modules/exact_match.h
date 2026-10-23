@@ -291,7 +291,8 @@ class ExactMatch final : public Module {
   // A result field's destination under the current metadata offsets: its
   // packet offset, its attribute's metadata offset, kSkippedOffset when no
   // downstream module reads the attribute, or kInvalidOffset when the
-  // attribute has no usable offset (out of space, unresolved update).
+  // attribute has no usable offset (out of space, a reader also reached by a
+  // path with no writer, an unresolved update).
   size_t ResultDestination(const ResultSpec &spec) const;
   // Distinct resource names the result fields reference, for the resource's
   // declaration (D-172).

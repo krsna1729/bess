@@ -742,10 +742,15 @@ void WildcardMatch::RefreshForResume() {
       continue;
     }
     changed = true;
-    // A deferred plan (offsets not yet resolved), a degraded generation, or
-    // a field compiled out had no destination to move from.
-    moved = moved || (!current->result_plan_deferred &&
-                      baked != kInvalidOffset && baked != kSkippedOffset);
+    // Moved means one resolved destination replaced another. A deferred plan
+    // (offsets not yet resolved), a degraded generation, or a field compiled
+    // out had none to move from; a field now compiled out has none to move
+    // to, and one now unusable fails the rebuild below, which says so.
+    const auto resolved = [](size_t at) {
+      return at != kInvalidOffset && at != kSkippedOffset;
+    };
+    moved = moved || (!current->result_plan_deferred && resolved(baked) &&
+                      resolved(now));
   }
   if (moved) {
     LOG(ERROR) << "WildcardMatch '" << name()
@@ -894,8 +899,8 @@ Error WildcardMatch::RuleFromPb(
 // ClassifyBatch: calls emit(i, gate) once per packet, in order. `emit` is
 // inlined into each caller.
 template <typename Emit>
-inline void WildcardMatch::Classify(bess::PacketBatch *batch, Emit &&emit,
-                                    uint64_t *out_hits) const {
+inline void WildcardMatch::Classify(bess::PacketBatch *batch, bool with_result,
+                                    Emit &&emit, uint64_t *out_hits) const {
   // One snapshot for the whole batch: a concurrent command can neither swap
   // the generation mid-batch nor free it under this lookup.
   const Generation *gen = published_.Read();
@@ -951,11 +956,13 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch, Emit &&emit,
     }
   }
 
+  // A rule's record id lives in the rule record, so only a caller that places
+  // results (or reports their ids) reads one, and only for a winner.
+  const bool with_rule_id = with_result && records_ != nullptr;
   uint64_t hits = gen->table->LookupBatch(
       bess::classifier::ConstBytes(keys.data(),
                                    static_cast<size_t>(cnt) * key_size),
-      key_size, matches.data(), static_cast<size_t>(cnt),
-      records_ != nullptr);
+      key_size, matches.data(), static_cast<size_t>(cnt), with_rule_id);
   hits &= valid;
   if (out_hits != nullptr) {
     *out_hits = hits;
@@ -964,12 +971,10 @@ inline void WildcardMatch::Classify(bess::PacketBatch *batch, Emit &&emit,
   for (int i = 0; i < cnt; i++) {
     const bool hit = (hits & (uint64_t{1} << i)) != 0;
     const gate_idx_t gate = hit ? matches[i].gate : default_gate;
-    // A rule's record id lives in the rule record, so only a module with
-    // result fields reads one, and only for a winner. A miss reports 0.
+    // A miss reports 0.
     const uint32_t result_id =
-        hit && records_ != nullptr
-            ? gen->table->RuleAt(matches[i].rule_id).result_id
-            : 0;
+        hit && with_rule_id ? gen->table->RuleAt(matches[i].rule_id).result_id
+                            : 0;
     emit(i, gate, result_id);
   }
 }
@@ -983,7 +988,8 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
   gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   if (!gen->result) {
-    Classify(batch, [&](int i, gate_idx_t gate, uint32_t) {
+    // No plan (gate-only, or every result field compiled out): no rule ids.
+    Classify(batch, /*with_result=*/false, [&](int i, gate_idx_t gate, uint32_t) {
       gates[i] = gate;
     });
     EmitBatch(ctx, batch, gates);
@@ -995,7 +1001,7 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   uint32_t record_ids[bess::PacketBatch::kMaxBurst];
   uint64_t hits = 0;
   Classify(
-      batch,
+      batch, /*with_result=*/true,
       [&](int i, gate_idx_t gate, uint32_t result_id) {
         gates[i] = gate;
         record_ids[i] = result_id;
@@ -1056,7 +1062,8 @@ void WildcardMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
 void WildcardMatch::ClassifyBatch(bess::PacketBatch *batch, gate_idx_t *gates,
                                   uint32_t *result_ids) const {
-  Classify(batch, [&](int i, gate_idx_t gate, uint32_t result_id) {
+  Classify(batch, /*with_result=*/true,
+           [&](int i, gate_idx_t gate, uint32_t result_id) {
     gates[i] = gate;
     if (result_ids != nullptr) {
       result_ids[i] = result_id;

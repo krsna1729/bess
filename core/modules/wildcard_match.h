@@ -175,8 +175,11 @@ class WildcardMatch final : public Module {
     bool metadata_valid = true;
   };
 
+  // Calls emit(i, gate, result_id) once per packet, in order. With
+  // `with_result` (and result fields configured) a hit's record id is read
+  // from its rule; otherwise result_id is 0 and no rule record is touched.
   template <typename Emit>
-  void Classify(bess::PacketBatch *batch, Emit &&emit,
+  void Classify(bess::PacketBatch *batch, bool with_result, Emit &&emit,
                 uint64_t *out_hits = nullptr) const;
 
   CommandResponse AddFieldOne(const bess::pb::Field &field, int idx);
@@ -247,7 +250,8 @@ class WildcardMatch final : public Module {
   // A result field's destination under the current metadata offsets: its
   // packet offset, its attribute's metadata offset, kSkippedOffset when no
   // downstream module reads the attribute, or kInvalidOffset when the
-  // attribute has no usable offset (out of space, unresolved update).
+  // attribute has no usable offset (out of space, a reader also reached by a
+  // path with no writer, an unresolved update).
   size_t ResultDestination(const ResultSpec &spec) const;
   std::vector<std::string> result_reference_names_;
   bool metadata_ready_ = false;

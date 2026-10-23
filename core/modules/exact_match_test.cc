@@ -659,31 +659,130 @@ size_t AttrIndex(const Module *m, const std::string &name) {
   return m->all_attrs().size();
 }
 
-// A metadata result destination with no reader gets kMetadataOffsetNoWrite:
-// the field is compiled out of the plan and a hit still takes its rule's gate,
-// as the metadata model lets a writer skip what nothing reads.
-TEST(ExactMatchPacketTest, UnreadResultFieldIsSkippedAndTheRuleGateApplies) {
-  ModuleHarness h;
+// A SetMetadata writing the 4-byte attribute `name` = `value`.
+Module *SetAttr(ModuleHarness &h, const std::string &name, const std::string &value) {
+  bess::pb::SetMetadataArg tag;
+  auto *attr = tag.add_attrs();
+  attr->set_name(name);
+  attr->set_size(4);
+  attr->set_value_bin(value);
+  return h.Create("SetMetadata", tag);
+}
+
+// An ExactMatch keyed on the 4-byte attribute `name`: `value` takes gate 1,
+// anything else gate 0.
+Module *MatchAttr(ModuleHarness &h, const std::string &name, const std::string &value) {
+  ExactMatchArg arg;
+  *arg.add_fields() = AttrField(name, 4);
+  arg.set_default_gate(0);
+  Module *m = h.Create("ExactMatch", arg);
+  if (m != nullptr) {
+    EXPECT_EQ("", AddRule(h, m, BinRule({value}, 1)));
+  }
+  return m;
+}
+
+// An ExactMatch on IPv4 src 10.0.0.1 whose single result field writes the
+// 4-byte attribute `name` (record 00 00 00 07); the rule takes gate 1, a miss
+// gate 0.
+Module *ResultEm(ModuleHarness &h, const std::string &name) {
   ExactMatchArg arg;
   *arg.add_fields() = OffsetField(26, 4);
   auto *field = arg.add_result_fields();
-  field->set_attr_name("em_unread_attr");
+  field->set_attr_name(name);
   field->set_value_offset(0);
   field->set_num_bytes(4);
-  arg.set_default_gate(1);
+  arg.set_default_gate(0);
   Module *em = h.Create("ExactMatch", arg);
+  if (em != nullptr) {
+    EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 1,
+                                        std::string("\x00\x00\x00\x07", 4)}));
+  }
+  return em;
+}
+
+const std::string kProbe("\xde\xad\xbe\xef", 4);
+
+// A metadata result destination with no reader gets kMetadataOffsetNoWrite:
+// the field is compiled out of the plan and a hit still takes its rule's gate,
+// as the metadata model lets a writer skip what nothing reads. The metadata
+// slot of another attribute that passes through is left alone.
+TEST(ExactMatchPacketTest, UnreadResultFieldIsSkippedAndTheRuleGateApplies) {
+  ModuleHarness h;
+  Module *probe = SetAttr(h, "em_probe", kProbe);
+  Module *em = ResultEm(h, "em_unread_attr");
+  Module *check = MatchAttr(h, "em_probe", kProbe);
+  ASSERT_NE(nullptr, probe);
   ASSERT_NE(nullptr, em);
-  EXPECT_EQ("", AddRule(h, em, EmRule{BinKey({Ip("10.0.0.1")}), 0,
-                                      std::string(4, '\x07')}));
+  ASSERT_NE(nullptr, check);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(probe, 0, em, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, check, 0, true));
 
   auto rng = bess::testing::SeededRng(1);
   const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
-  auto out = h.Run(em, 0, {pkt}, {0, 1});
-  EXPECT_EQ((std::map<gate_idx_t, size_t>{{0, 1}}), Counts(out));
-  EXPECT_EQ((std::vector<Bytes>{pkt}), out[0]) << "nothing is written";
+  auto out = h.RunPipeline(probe, 0, {pkt}, check, {0, 1});
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(out))
+      << "the rule's gate, with the probe attribute intact";
   const size_t unread = AttrIndex(em, "em_unread_attr");
   ASSERT_LT(unread, em->all_attrs().size());
   EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(unread));
+}
+
+// A field that gains a reader between resumes is written from the next one
+// on, and one that loses it is compiled out again.
+TEST(ExactMatchPacketTest, ResultFieldFollowsItsReaderAcrossResumes) {
+  ModuleHarness h;
+  Module *em = ResultEm(h, "em_moving_attr");
+  Module *check = MatchAttr(h, "em_moving_attr", std::string("\x00\x00\x00\x07", 4));
+  ASSERT_NE(nullptr, em);
+  ASSERT_NE(nullptr, check);
+  const size_t id = AttrIndex(em, "em_moving_attr");
+  ASSERT_LT(id, em->all_attrs().size());
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(h.Run(em, 0, {pkt}, {0, 1})));
+  EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(id));
+
+  // Skipped -> read: the downstream match sees the record's value.
+  ModuleGraph::DisconnectModule(em, 1);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, check, 0, true));
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}),
+            Counts(h.RunPipeline(em, 0, {pkt}, check, {0, 1})));
+  EXPECT_TRUE(bess::metadata::IsValidOffset(em->attr_offset(id)));
+
+  // Read -> skipped: still the rule's gate.
+  ModuleGraph::DisconnectModule(em, 1);
+  EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(h.Run(em, 0, {pkt}, {0, 1})));
+  EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(id));
+}
+
+// A reader also reached by a path with no writer is an invalid scope: the
+// field has a reader, so it is not skipped. The classifier fails closed and
+// the hit takes the default gate.
+TEST(ExactMatchPacketTest, ResultFieldInAnInvalidScopeFailsClosed) {
+  ModuleHarness h;
+  Module *em = ResultEm(h, "em_scope_attr");
+  Module *merge = h.Create("Merge", bess::pb::MergeArg());
+  Module *unwritten = h.Create("Merge", bess::pb::MergeArg());  // no input
+  bess::pb::MetadataTestArg read;
+  (*read.mutable_read())["em_scope_attr"] = 4;
+  Module *reader = h.Create("MetadataTest", read);
+  ASSERT_NE(nullptr, em);
+  ASSERT_NE(nullptr, merge);
+  ASSERT_NE(nullptr, unwritten);
+  ASSERT_NE(nullptr, reader);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 1, merge, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(unwritten, 0, merge, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(merge, 0, reader, 0, true));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  EXPECT_TRUE(Counts(h.RunPipeline(em, 0, {pkt}, reader, {0})).empty())
+      << "the hit's gate leads to the reader; the default gate is unwired";
+  const size_t id = AttrIndex(em, "em_scope_attr");
+  ASSERT_LT(id, em->all_attrs().size());
+  EXPECT_EQ(bess::metadata::kMetadataOffsetInvalidScope, em->attr_offset(id));
 }
 
 // One field read downstream, one not: the read field is written (a downstream

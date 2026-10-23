@@ -58,6 +58,13 @@ static const mt_offset_t kMetadataOffsetNoSpace = -3;
 // default. Like the other negative values, IsValidOffset() is false.
 static const mt_offset_t kMetadataOffsetDefault = -4;
 
+// A writer whose attribute is read downstream, but whose reader is also
+// reachable from a path with no writer (an invalid scope): the reader gets
+// kMetadataOffsetNoRead (or its default), so this write is skipped too. Unlike
+// kMetadataOffsetNoWrite, a reader exists: a writer that must place the value
+// for its reader (a classifier's result field) fails closed on it.
+static const mt_offset_t kMetadataOffsetInvalidScope = -5;
+
 static inline int IsValidOffset(mt_offset_t offset) {
   return (offset >= 0);
 }
