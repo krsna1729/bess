@@ -320,25 +320,41 @@ refused. An unset port bound is 65535, not 0, because the proto field is
   `docs/routing.md`.
 - **Used by:** the `Router` module.
 
-- **Next-hop groups** (M15, D-065): `SetNextHopGroup(id, members)` and
-  `SetRoute(domain, prefix, NextHopGroupId)`; `Resolve`/`ResolveBatch`/
-  `LookupRoute` take a flow hash that picks the member. Transactional when
-  enrolled: `Enroll` registers `<router>/groups` beside next hops and routes
-  -- always, because a class must register every table it declares (D-156);
-  without `max_groups` the resource exists, holds nothing, and every group id
-  is invalid. `SetNextHopGroupOp`, `RemoveNextHopGroupOp` and
-  `SetRouteOp(domain, prefix, NextHopGroupId)` commit together with next-hop
-  and route changes. A group references its distinct members and a route the
-  group it names: the engine refuses a member or group still in use. The
-  direct group setters belong to an unenrolled router (`kEnrolled`). The
-  `Router` module exposes groups as `<router>/groups` with `max_groups`
-  (D-156): `RouterGroupIdKey -> RouterGroupValue` is a member list of 1..64
-  next-hop ids in selection order, a repeated id a weight; a route's value
-  names a next hop or a group, exactly one (`RouterRouteValue`, D-156), and a
-  group route picks its member with `route::FlowHash` over the frame's
-  addresses and ports, the one function the appliance hashes with too.
-  Neighbor state lives in `NeighborTable` (control side), whose updates are
-  next-hop updates; TTL, MTU, ICMP and ARP mechanics are in `l3_packet.h`.
+- **Next-hop groups** (M15, D-065, D-184): `SetNextHopGroup(id, members,
+  standby)` and `SetRoute(domain, prefix, NextHopGroupId)`; `Resolve`/
+  `ResolveBatch`/`LookupRoute` take a flow hash that picks the member. A
+  group has active members and optional standby members, 1..64 next hops in
+  all, a repeated one a weight, none in both lists. Each next hop has an
+  availability input (`SetNextHopDown`, or `<router>/next_hop_state` when
+  enrolled): a group selects among its available actives, else its available
+  standbys, else every active (fail open, so the neighbor state decides). The
+  eligible set is part of the immutable group object, so a change of a next
+  hop's availability publishes a new object for every group holding it; with
+  no availability entries selection is what it was before path health, and a
+  member that goes down moves only its own flows. Transactional when
+  enrolled: `Enroll` registers `<router>/next_hop_state` and
+  `<router>/groups` beside next hops, neighbor bindings and routes --
+  always, because a class must register every table it declares (D-156);
+  without `max_groups` the groups resource exists, holds nothing, and every
+  group id is invalid.
+  `SetNextHopGroupOp`, `RemoveNextHopGroupOp`, `SetNextHopStateOp`,
+  `RemoveNextHopStateOp` and `SetRouteOp(domain, prefix, NextHopGroupId)`
+  commit together with next-hop and route changes. A group references its
+  distinct members, a state entry its next hop (a bound one's binding in
+  `<router>/neighbors`, D-183), and a route the group it names: the engine
+  refuses a member, a next hop with state, or a group still in use. Every
+  member pick, IPv4 or IPv6, reads the eligible set. The direct setters
+  belong to an unenrolled router (`kEnrolled`).
+  The `Router` module exposes groups as `<router>/groups` with `max_groups`
+  (D-156): `RouterGroupIdKey -> RouterGroupValue` holds `member_ids` (the
+  actives) and `standby_member_ids`, each in selection order; it exposes
+  availability as `<router>/next_hop_state` (`RouterNextHopIdKey ->
+  RouterNextHopState`, D-184). A route's value names a next hop or a group,
+  exactly one (`RouterRouteValue`, D-156), and a group route picks its member
+  with `route::FlowHash` over the frame's addresses and ports, the one
+  function the appliance hashes with too. Neighbor state lives in
+  `NeighborTable` (control side), whose updates are next-hop updates; TTL,
+  MTU, ICMP and ARP mechanics are in `l3_packet.h`.
 
 ### `ObjectTable<Id, T>` (id → object, mode G)
 
@@ -471,10 +487,13 @@ reference to something missing.
   `Prepare()`; the first of its operations to publish swaps the policy in
   whole, so the workers are never paused. D-147, D-179.
 - **Router** (opt-in, `Router::Enroll(engine)`): next hops as
-  `<router>/next_hops`, groups as `<router>/groups` (a member list, D-156),
-  routes as `<router>/routes` (each route references the next hop or the
-  group it names). An enrolled router is written only through the engine
-  (the direct setters refuse, `kEnrolled`). New routes are placed during
+  `<router>/next_hops`, their availability as `<router>/next_hop_state`
+  (each entry references its next hop, D-184), groups as `<router>/groups`
+  (active and standby member lists, D-156, D-184), routes as
+  `<router>/routes` (each route references the next hop or the group it
+  names). A state change republishes every group holding the next hop, in
+  the same transaction. An enrolled router is written only through the
+  engine (the direct setters refuse, `kEnrolled`). New routes are placed during
   prepare with the value their addresses already resolve to, so rte_lpm
   capacity is settled before anything is visible. A change costs
   ~0.2-0.6 µs as a transaction against 0.06-0.2 µs direct. D-023. The

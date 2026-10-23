@@ -85,8 +85,8 @@ file is the reasoning.
 | D-062 | Decision cache: a typed flow cache with O(1) generation invalidation (M12) | accepted |
 | D-063 | Bounded packet edit plan: experimental and opt-in, not adopted for typed rewrites (M13) | accepted |
 | D-064 | L2 forwarding database: a graph-independent FDB on a MAC-specialised table (M14) | accepted |
-| D-065 | L3 batteries: next-hop groups in the Router, neighbor table, L3 packet helpers (M15) | accepted |
-| D-066 | Member selection: shared algorithms, no shared group object (M16) | accepted |
+| D-065 | L3 batteries: next-hop groups in the Router, neighbor table, L3 packet helpers (M15) | accepted; superseded in part by D-184 |
+| D-066 | Member selection: shared algorithms, no shared group object (M16) | accepted; superseded in part by D-184 |
 | D-067 | Connection tracking: a library over the flow table and the expiry wheel (M17) | accepted |
 | D-068 | NAT as a library: bindings on the flow table, a bitmap port pool, generic expiry (M18) | accepted |
 | D-069 | Tunnel packet mechanics: VXLAN, Geneve, GRE and a GTP-U header codec (M19) | accepted |
@@ -5828,7 +5828,8 @@ hugetlbfs allocation, or a smaller slot).
 
 ## D-065 L3 batteries: next-hop groups in the Router, neighbor table, L3 packet helpers (M15)
 
-**Status:** accepted (2026-10-04), experimental API. **Needs review (user):** groups live inside `Router` (one code
+**Status:** accepted (2026-10-04), experimental API; superseded in part by D-184 (member availability and
+standby members). **Needs review (user):** groups live inside `Router` (one code
 path for every router) rather than in a separate wrapper; measured effect below.
 **Code:** `core/route/next_hop_id.h`, `core/route/router.{h,cc}`, `core/route/l3_packet.h` and
 `core/route/neighbor_table.h` (new, header-only, installed experimental), `core/route/route_test.cc`,
@@ -5942,7 +5943,8 @@ interrupts on CPU 2.
 
 ## D-066 Member selection: shared algorithms, no shared group object (M16)
 
-**Status:** accepted (2026-10-04), experimental API.
+**Status:** accepted (2026-10-04), experimental API; superseded in part by D-184 (member health is an input
+the Router takes, not only the application's).
 **Code:** `core/dataplane/member_select.h` (new, header-only, installed experimental),
 `core/dataplane/member_select_test.cc`, `core/dataplane/member_select_bench.cc`, `core/modules/hash_lb.cc`,
 `core/route/router.h`, `core/meson.build`, `tools/api_classes.json`.
@@ -12654,3 +12656,96 @@ full suite (`meson test -C build/fast --no-suite live`) is the gate.
 
 **Revisit when:** a deployment needs glean (on-demand resolution of route gateways or connected hosts),
 interfaces must change at runtime, or the per-tick cap shows up as convergence latency.
+
+## D-184 Path health: next-hop availability and active/standby groups in the Router
+
+**Status:** accepted (2026-10-23). Supersedes in part D-065 and D-066: member health is no longer only the
+application's.
+**Code:** `core/route/router.{h,cc}` (`NextHopGroup` eligible set and standby members, `NextHopState`,
+`SetNextHopDown`, `ForEachNextHopState`, `SetNextHopStateOp`/`RemoveNextHopStateOp`, the
+`<router>/next_hop_state` resource, the reverse index), `core/modules/router.{h,cc}` (the table, its codec and
+read-back, `standby_member_ids`), `protobuf/module_msg.proto` (`RouterNextHopState`,
+`RouterGroupValue.standby_member_ids`), `core/route/route_test.cc`, `core/route/router_transaction_test.cc`,
+`core/modules/router_test.cc`, `core/modules/session_pipeline_test.cc`,
+`core/modules/transaction_conformance_test.cc`, `tests/live/control_sdk_test.cc`.
+
+**Context.** A next-hop group (D-065, D-156) spread flows over its members and nothing else: a member whose
+path was down kept its share of the flows until a controller rewrote every group that held it. D-066 left
+health to the application. The architecture review puts a generic health input with failover, and the safe
+publication of the changed group, in BESS. What decides health (BFD, ICMP or application probes, a PMF, a
+controller) stays outside: those are producers that write the input.
+
+**Decision.**
+
+- **Availability is per next hop, not per group.** A path is down once, and every group holding it follows.
+  Enrolled, the input is `<router>/next_hop_state` (key `EncodeKey(NextHopId)`, value
+  `NextHopState{down}`; on the wire `RouterNextHopIdKey -> RouterNextHopState`). No entry, or `down =
+  false`, is available; entries read back as written (D-129). Direct, `SetNextHopDown(id, down)`. A next hop
+  bound to a neighbor (D-183) has availability like a static one.
+- **The removal rule is the reference rule.** An entry references its next hop: state for a next hop that
+  does not exist is refused, and a next hop with an entry is erased together with the entry or after it.
+  Like a group member, the reference is to `<router>/neighbors` for a bound next hop and to
+  `<router>/next_hops` otherwise (a new entry against the transaction's bindings, a stored one against the
+  committed ones), so a binding is not removed while an entry names it. Direct, `RemoveNextHop` refuses a
+  next hop marked down (`kNextHopInUse`). `Enroll` refuses a router with direct state, as it refuses one with
+  routes or groups, and registers the resource after next hops and neighbor bindings, before groups and
+  routes.
+- **Active and standby members.** A group holds `size` active members, then `standby_size` standby members,
+  each list in selection order with a repeat a weight: 1..64 next hops in all (`kMaxMembers`, one limit for
+  both lists), at least one active, and none in both lists. On the wire, `member_ids` and
+  `standby_member_ids`.
+- **The eligible set:** the available actives; else the available standbys; else every active (fail open,
+  so the neighbor state decides, as with no input at all). The chosen list's n positions get 64/n
+  consecutive slots each, and a down position's slots are dealt round-robin to the available positions.
+  With no state, slot `⌊h·T/2³²⌋ / (64/n)` is position `⌊h·n/2³²⌋`, so every hash picks the member it
+  picked before (T = n·⌊64/n⌋); a member that goes down moves only its own flows, spread over the others,
+  and gets them back when it comes up.
+- **The packet path reads the same object.** The eligible set is computed on the control side and stored in
+  the immutable group object, first, so `Select` is `eligible[RangeSelect(hash, eligible_size)]` at the
+  offsets `members[RangeSelect(hash, size)]` used: the same two loads, no new branch, allocation, lock or
+  atomic. The group path stays cold and out of line (D-065). Every member pick goes through `Select` (the
+  IPv4 and IPv6 lookups, single and batched, and `LookupRoute`), so IPv4 and IPv6 group routes fail over
+  alike.
+- **Publication.** A change of availability publishes a new object for every group holding the next hop,
+  one SlotTable store each, the old object retired: a reader sees the old group or the new one (D-050). The
+  Router keeps a reverse index from a next hop to the live groups holding it. In a transaction, a state
+  operation's Reserve claims those groups (each once per transaction, only when availability changes) and
+  declares one retire each; the state resource's Prepare builds them from the state the whole transaction
+  leaves, skipping groups the transaction writes or erases itself; the groups resource's Prepare computes
+  the eligible sets of the groups it writes from that same state and reserves index room. Publish only
+  stores. A group erase leaves the index when it publishes, so a retiring id is never republished (the
+  SlotTable CHECK). Direct, `SetNextHopDown` builds every object before it publishes the first, under the
+  router's mutex.
+- **Capabilities are unchanged.** The resource is not `.Rebuilds()`: its cost is the affected groups, not a
+  table, and the update model stays live.
+
+**Why.** A per-group health flag would make a controller find and rewrite every group a failed path is in,
+and two groups could disagree about one path. Keeping the eligible set in the group object costs 264 bytes
+per group on the control side and nothing per packet, where a per-packet availability check would add a
+load and a branch to every grouped flow. Slot dealing instead of a compacted member list is what keeps
+every other flow in place when one member goes down. Claiming groups at Reserve keeps footprints exact (the
+engine sums them there) and lets backpressure see the retires before anything is built.
+
+**Test.** `RouterGroupTest` (route_test.cc): `WithoutStateSelectionIsUnchanged` (n = 1..64 with weights and
+standbys, against `RangeSelect` over fixed hashes), `AnActiveGoingDownMovesOnlyItsFlows`,
+`AllActivesDownFailOverToStandbysAndBack`, `EverythingDownFailsOpenToTheActives`,
+`AStateChangeRepublishesEveryGroupHoldingTheNextHop`, `StateAndStandbysAreChecked`. `RouterTransactionTest`:
+`NextHopStateIsAResourceThatReferencesItsNextHop`, `GroupsAndMemberStateChangeInOneTransaction` (both request
+orders, with a group erased beside the state change), `PathHealthPublicationDoesNotAllocate`,
+`ReadersResolveThroughGroupsWhileStateFlips` (every group object a reader sees is whole),
+`PathHealthFailureAtEveryAllocationLeavesNoTrace`, `PathHealthAppliesToIpv6GroupRoutes`,
+`StateOfABoundNextHopReferencesItsBinding`; the live-update fault test covers `SetNextHopDown`.
+Module: `RouterTest.AnActiveStandbyGroupFailsOverThroughTheStateResource`,
+`AnIpv6GroupRouteFailsOverThroughTheStateResource`, `StandbyMembersAndNextHopStateReadBack`,
+`PathHealthValuesAreChecked`; the parity case gains a `next_hop_state` sample, and the live round trip a
+down entry and an available one for a bound next hop. Mutations of the slot dealing, the standby tier, the
+fail-open rule, the reverse index (never added to, never removed from), the staged state in either
+Prepare, the exclusion of written groups and the binding-aware reference each fail these tests.
+
+**Consequences.** A pipeline that writes no state selects exactly as before. A producer writes one entry per
+path, not one per group. A `NextHopGroup` is 524 bytes. Delay or quality steering, hysteresis, in-band
+probing and neighbor-derived availability are not in BESS, and actions still name single next hops (D-156),
+so path health reaches traffic through group routes only.
+
+**Revisit when:** a producer needs weights by quality rather than availability, or a group needs more than
+64 slots.

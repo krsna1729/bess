@@ -103,15 +103,19 @@
 // forwarding it with the addresses it arrived with would put it on the wire as
 // someone else's.
 //
-// Control path: `<module>/next_hops`, `<module>/neighbors`, `<module>/groups`
-// (sized by `max_groups`; a route names a next hop or a group) and
-// `<module>/routes` are resources, so one transaction can create a next hop
-// (static or bound to a neighbor), the route to it and the rule whose result
-// names the hop. An enrolled router has one writer, the engine: the direct
-// setters refuse with kEnrolled, and the engine's ledger replaces the
-// router's own reference counts. New routes are placed during prepare with
-// the value their addresses already resolve to, so rte_lpm capacity is
-// settled before anything is visible.
+// Control path: `<module>/next_hops`, `<module>/neighbors`,
+// `<module>/next_hop_state` (each next hop's availability, D-184),
+// `<module>/groups` (sized by `max_groups`; active and standby members; a
+// route names a next hop or a group) and `<module>/routes` are resources, so
+// one transaction can create a next hop (static or bound to a neighbor), the
+// route to it and the rule whose result names the hop. Marking a next hop
+// down republishes every group it is a member of: the group's flows, IPv4 and
+// IPv6, move to its other available actives, else to its available standbys,
+// else stay on its actives (fail open). An enrolled router has one writer,
+// the engine: the direct setters refuse with kEnrolled, and the engine's
+// ledger replaces the router's own reference counts. New routes are placed
+// during prepare with the value their addresses already resolve to, so
+// rte_lpm capacity is settled before anything is visible.
 class Router final : public Module {
  public:
   static const gate_idx_t kNumOGates = MAX_GATES;
@@ -121,6 +125,7 @@ class Router final : public Module {
   static const Commands cmds;
   // "<module>/next_hops" (RouterNextHopIdKey -> RouterNextHopValue),
   // "<module>/neighbors" (RouterNextHopIdKey -> RouterNeighborBinding),
+  // "<module>/next_hop_state" (RouterNextHopIdKey -> RouterNextHopState),
   // "<module>/groups" (RouterGroupIdKey -> RouterGroupValue, with
   // `max_groups`) and "<module>/routes" (RouterRouteKey -> RouterRouteValue),
   // D-129.
