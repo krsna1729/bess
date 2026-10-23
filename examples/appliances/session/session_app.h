@@ -97,7 +97,8 @@ class SessionApp {
     auto router = bess::route::Router::Create(
         name,
         bess::route::Router::Config{
-            .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 4}},
+            .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 4},
+            .ipv6 = std::nullopt},
         kMaxNextHops, rcu);
     if (!router) {
       return std::unexpected(std::string("router: ") + bess::route::RouteErrorName(router.error()));

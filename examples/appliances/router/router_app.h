@@ -71,7 +71,8 @@ class RouterApp {
     auto router = bess::route::Router::Create(
         "r1_appliance",
         bess::route::Router::Config{
-            .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 8}},
+            .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 8},
+            .ipv6 = std::nullopt},
         /*max_next_hops=*/16, rcu, /*max_domains=*/3, /*max_groups=*/4);
     if (!router) {
       return std::unexpected(std::string("router: ") + bess::route::RouteErrorName(router.error()));
@@ -160,8 +161,9 @@ class RouterApp {
                    Interface{InterfaceId{uint16_t{4}}, Mac(4), kVrf2, 0xcb0071fe, 24}};
     for (const RouteDomainId vrf : {kVrf1, kVrf2}) {
       if (!router_->CreateDomain(
-              vrf, bess::route::Router::Config{.ipv4 = bess::route::LpmRouteTable::Config{
-                                                   .max_routes = 16, .tbl8_groups = 4}})) {
+              vrf, bess::route::Router::Config{
+                       .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 16, .tbl8_groups = 4},
+                       .ipv6 = std::nullopt})) {
         return "create VRF";
       }
     }
