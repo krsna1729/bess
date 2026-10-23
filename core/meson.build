@@ -1120,6 +1120,7 @@ if get_option('build_benchmarks')
     'modules_firewall_update_bench': ['modules/firewall_update_bench.cc', benchmark_main_dep],
     'modules_wildcard_match_bench': ['modules/wildcard_match_bench.cc', benchmark_main_dep],
     'modules_wildcard_match_update_bench': ['modules/wildcard_match_update_bench.cc', benchmark_main_dep],
+    'modules_match_path_bench': ['modules/match_path_bench.cc', benchmark_main_dep],
     'modules_table_scale_bench': ['modules/table_scale_bench.cc', benchmark_main_dep],
     'modules_router_bench': ['modules/router_bench.cc', benchmark_main_dep],
     'utils_checksum_bench': ['utils/checksum_bench.cc', benchmark_main_dep],
