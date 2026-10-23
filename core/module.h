@@ -115,7 +115,10 @@ inline module_capabilities_func_t MODULE_CAPABILITIES_FUNC(CommandResponse (C::*
     if constexpr (requires { M::Capabilities(arg_); }) {
       return M::Capabilities(arg_);
     } else {
-      return M::kCapabilities;
+      // Member reads, not a copy: a copy odr-uses kCapabilities, and gcc emits
+      // an odr-used inline variable as STB_GNU_UNIQUE, which glibc never
+      // unloads -- a plugin's dlclose would keep its classes registered.
+      return ModuleCapabilities{M::kCapabilities.state, M::kCapabilities.flow_affinity};
     }
   };
 }

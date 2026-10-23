@@ -250,6 +250,10 @@ a client can do to it is an **action**.
   nothing reports both unspecified; every built-in class declares.
   `ModuleCapabilitiesTest` checks declarations for every linked class and
   worker limits for the five resource-module cases and ConnTrack's modes.
+  Read `kCapabilities` only by value in a plugin (`kCapabilities.state`), never
+  by address or reference: gcc emits an inline variable used that way as a
+  `STB_GNU_UNIQUE` symbol, and glibc never unloads a library that defines
+  one, so the plugin could not unload. The framework reads only its members.
 - **Stating a bound (D-149).** `GetResourceStatus` reports each resource's
   live entries and, when the resource states one, its capacity, so a
   controller sees the ceiling it can plan against before it writes. The
