@@ -280,7 +280,11 @@ a client can do to it is an **action**.
   32-bit big-endian id (the metadata convention) and builds the host-order
   key, the rule resource declares the names with the engine, and the engine
   orders a rule after the entries it names and refuses their erase while it
-  remains. An all-zero field references
+  remains. A referenced resource may declare a key holder that holds some of
+  its keys (`Resource::DeclareKeyHolder`, D-187): `<router>/next_hops`
+  declares `<router>/neighbors`, which holds the neighbor-bound ids, so one
+  column naming `<router>/next_hops` may hold static and bound hops alike, and
+  an unbind is refused while a rule names the id. An all-zero field references
   nothing, and the packet path never resolves a reference: it writes bytes the
   transaction already validated. With no result fields the module is gate-only
   and pays nothing for the generality. A metadata field whose attribute no

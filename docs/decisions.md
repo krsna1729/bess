@@ -12932,3 +12932,81 @@ its parser follows, and for small policies, where it is faster and much smaller.
 
 **Revisit when:** a policy puts hundreds of ranged rules on one (mask, value) (index the chain), or a caller
 needs ranges on a field wider than 8 bytes.
+
+## D-187 A referenced resource may declare a key holder
+
+**Status:** accepted (2026-10-24).
+**Code:** `core/dataplane/resource.h` (`Resource::DeclareKeyHolder`, `key_holder`, `HeldByKeyHolder`),
+`core/dataplane/transaction_engine.{h,cc}` (`Registration::key_holder`, `Holder`), `core/route/router.{h,cc}`
+(`NextHopResource`), `core/dataplane/transaction_engine_test.cc` (`KeyHolderTest`),
+`core/route/router_transaction_test.cc` (`OtherResourcesReferenceBoundNextHopsThroughNextHops`),
+`core/modules/router_test.cc` (`AClassifierResultColumnNamesStaticAndBoundNextHops`),
+`core/control/apply_pipeline_test.cc` (`AClassifierColumnNamesStaticAndBoundNextHops`).
+
+**Context.** Since D-183 a Router's next-hop id is static (`<router>/next_hops`) or neighbor-bound
+(`<router>/neighbors`), never both, and `<router>/next_hops` does not contain a bound id. The router's own
+values follow that: a route, group or state entry references the resource that holds its hop
+(`Router::HopReference`, read from the transaction's bindings for a new value and the committed ones for a
+stored value; D-183 "Ownership does not depend on request order", D-184 "The removal rule is the reference
+rule"). A reference from outside the router cannot: a classifier result field (D-172) is declared against one
+resource name, so a column whose ids mix static and bound hops was refused for every bound id ("references
+missing `<router>/next_hops/...`"), and a pipeline whose classifier picks among both kinds could not be
+written. Declaring both names on the field would not help: the field's bytes are an id, not a resource
+choice, and the module that owns the column cannot know which kind each id is -- only the router can.
+
+**Decision.**
+- **A resource declares the resource that holds some of its keys.** `Resource::DeclareKeyHolder(name)`, called
+  before registration, names it; `HeldByKeyHolder(key, in_transaction)` says, per key, whether the holder holds
+  it. `<router>/next_hops` declares `<router>/neighbors` and answers with the same rule as `HopReference`: an
+  id bound in the transaction so far, or committed. The engine counts, checks and orders a reference to a
+  held key against the holder, under the same key, everywhere it resolves a reference target: the committed
+  references recounted when registrations change and the references a replaced or erased value held (both
+  `in_transaction` false: stored values are read against committed state), and the references a new value
+  holds (true).
+- **The holder is part of the declared graph, not a per-call answer.** The engine binds the name as it binds
+  declared references (it may register later; until it does, a reference to a key it holds is refused as
+  missing), and derives ranks with it: a resource ranks above every resource it may reference and above each
+  one's key holder. So a holder always publishes before every referrer and erases after it, by construction,
+  with no per-reference rank check; desired-state apply, which orders by rank (D-183), needs nothing new. A
+  resource that declared a holder cannot be unregistered without it ("hands keys to"), and a teardown release
+  of the holder unbinds it until a replacement registers.
+- **Why the transaction's view is complete when it is asked.** The engine reserves in ascending rank (D-183), so
+  when a referrer's reservation reports a new reference, every operation on resources ranking below it -- the
+  referenced resource and its holder among them -- is already reserved. A rule listed before the binding of the
+  hop it names is counted on the binding.
+- **Counting stays balanced.** An increment and its later decrement land on the same holder because a key's
+  holder cannot change while anything references it: an unbind is refused while the binding is referenced, a
+  static erase while the hop is, and an id cannot become the other kind without leaving its holder first
+  (D-183's disjointness). The registration recount reads committed holders, which are where committed values
+  were counted.
+- **Abort.** A refused transaction changes no ledger entry (the existing delta rollback), and the router's staged
+  bindings are cleared in `EndTransaction` as before, so the next transaction resolves holders from committed
+  state only.
+- **Cost is paid only where declared.** For a target that declared no holder the engine tests one empty string
+  and goes on; only a resource with a holder is asked, per reference, through one virtual call. An earlier
+  draft had every resource name its holder per call (a virtual returning a name, looked up per reference, with
+  a per-reference rank refusal): it made every reference of every resource pay, and left ordering to a runtime
+  check instead of the graph.
+- **Rejected: a second reference per field, or a resource that is both.** Letting a result field name two
+  resources and choose by membership would put the router's ownership rule in every classifier; making
+  `<router>/next_hops` contain bound ids would undo D-183's disjointness that keeps desired-state convergence of
+  static hops from erasing bindings. The key holder keeps both resources as they are and makes the reference
+  follow the id.
+
+**Consequences.** A classifier column declared against `<router>/next_hops` accepts static and bound ids; a
+bound id's references are reported under `<router>/neighbors` by `ReferenceCount`, and an unbind is refused
+while a rule names it, exactly as for a route. `Router::Enroll`'s failure path unregisters `<router>/next_hops`
+before `<router>/neighbors`.
+
+**Measured.** Release, `-Dcpu=x86-64-v3`, base origin/develop 9b68a07f. Instructions per iteration (`perf stat`
+user-mode P-core counter, (I(3n) - I(n)) / 2n, under tcmalloc so glibc's heap state does not move the count;
+run-to-run spread about +/-16): `transaction_bench` `BM_SessionEstablishRelease/1024` (eight references per
+session, none to a resource with a holder) 40,716 -> 40,696, `BM_SingleRule/1` 8,688 -> 8,677;
+`route_bench` `BM_RouterChange/1/0` (a next-hop write, no reference) 3,683 -> 3,671, `/1/1` (a route
+re-pointed: a new and a replaced reference to `<router>/next_hops`, each asked `HeldByKeyHolder`) 9,875 ->
+9,910, `/1/2` 24,952 -> 25,031. `tools/ab_bench.py`, 8 ABBA rounds, `taskset -c 2`: every case "no clear
+difference" (paired B/A medians 0.980-1.003). The per-call draft measured +607 instructions per session and
+up to +4-5% wall time in the same benches.
+
+**Revisit when:** a resource needs more than one key holder, or a key must change holders while referenced
+(that would need the engine to move counts).

@@ -336,8 +336,12 @@ struct NextHopState {
 // Which resource a new value references is decided from the bindings as the
 // transaction has them: the engine reserves the referenced resources (next
 // hops, neighbors) before the routes and groups that name them, so a route
-// listed before the binding it names in one request still finds it. Without
-// a NeighborBindingPolicy the resource exists and binds nothing.
+// listed before the binding it names in one request still finds it. Another
+// module's value that declares "<name>/next_hops" (a classifier result field)
+// may name either kind: "<name>/neighbors" is the key holder of
+// "<name>/next_hops" (Resource::DeclareKeyHolder, D-187), so a bound id's
+// references are counted and checked there, the same as a route's. Without a
+// NeighborBindingPolicy the resource exists and binds nothing.
 class Router {
  public:
   // The address families a router serves and how each domain's table of each

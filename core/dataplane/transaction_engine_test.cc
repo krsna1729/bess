@@ -1348,6 +1348,222 @@ TEST(TransactionEngineRegistrationTest, ReferenceCyclesAreRefused) {
   domain.Drain();
 }
 
+// Two resources over one id space (D-187): "held" takes some ids, recording
+// what the transaction in progress does to them; "shared" holds every other
+// id and declares "held" its key holder (Resource::DeclareKeyHolder).
+class HeldMeters final : public SlotResource<MeterId, Meter> {
+ public:
+  HeldMeters(std::string name, SlotTable<MeterId, Meter> &table,
+             std::vector<std::string> may_reference = {})
+      : SlotResource(std::move(name), table, {}, std::move(may_reference)) {}
+  std::expected<Reservation, std::string> Reserve(const Op &op) override {
+    auto reserved = SlotResource::Reserve(op);
+    if (reserved) {
+      staged_[op.key] = op.kind == OpKind::kUpsert;
+    }
+    return reserved;
+  }
+  void EndTransaction() noexcept override { staged_.clear(); }
+  bool Holds(const ResourceKey &key, bool in_transaction) const {
+    if (auto it = staged_.find(key); in_transaction && it != staged_.end()) {
+      return it->second;
+    }
+    return Contains(key);
+  }
+
+ private:
+  std::map<ResourceKey, bool> staged_;
+};
+
+class SharedMeters final : public SlotResource<MeterId, Meter> {
+ public:
+  SharedMeters(std::string name, SlotTable<MeterId, Meter> &table,
+               const HeldMeters &held)
+      : SlotResource(std::move(name), table), held_(held) {
+    DeclareKeyHolder(held.name());
+  }
+  bool HeldByKeyHolder(const ResourceKey &key,
+                       bool in_transaction) const override {
+    return held_.Holds(key, in_transaction);
+  }
+
+ private:
+  const HeldMeters &held_;
+};
+
+// "actions" declares only "shared"; its values name ids of either kind.
+class KeyHolderTest : public ::testing::Test {
+ protected:
+  void Register() {
+    ASSERT_TRUE(engine_.Register(&actions_res_));
+    ASSERT_TRUE(engine_.Register(&shared_res_));
+    ASSERT_TRUE(engine_.Register(&held_res_));
+  }
+  void TearDown() override {
+    while (engine_.ReclaimRetired() != 0) {
+    }
+    domain_.Drain();
+    EXPECT_TRUE(engine_.ReleaseForTeardown(
+        std::vector<std::string>{"actions", "shared", "held"}));
+  }
+  static Op Use(uint32_t action, uint32_t meter) {
+    return Op::Upsert("actions", EncodeKey(ActionId(action)),
+                      std::any(Action{1, MeterId(meter)}));
+  }
+  static Op Put(const char *resource, uint32_t meter) {
+    return Op::Upsert(resource, EncodeKey(MeterId(meter)), std::any(Meter(1)));
+  }
+  static Op Drop(const char *resource, uint32_t id) {
+    return Op::Erase(resource, EncodeKey(MeterId(id)));
+  }
+  size_t Count(const char *resource, uint32_t meter) const {
+    return engine_.ReferenceCount(resource, EncodeKey(MeterId(meter)));
+  }
+  TransactionEngine::Result Apply(std::vector<Op> ops) {
+    return engine_.Apply(ops);
+  }
+
+  rcu::RcuDomain &domain_ = bess::runtime::runtime().rcu();
+  TransactionEngine engine_{domain_};
+  SlotTable<MeterId, Meter> shared_{8};
+  SlotTable<MeterId, Meter> held_{8};
+  SlotTable<ActionId, Action> actions_{8};
+  HeldMeters held_res_{"held", held_};
+  SharedMeters shared_res_{"shared", shared_, held_res_};
+  SlotResource<ActionId, Action> actions_res_{
+      "actions", actions_,
+      [](const Action &a) {
+        return std::vector<Reference>{{"shared", EncodeKey(a.meter)}};
+      },
+      {"shared"}};
+};
+
+// A reference naming "shared" is counted on the id's holder: "held" for a held
+// id -- also one the same transaction adds, listed after the referrer -- and
+// "shared" for the rest. The holder refuses to remove a referenced id; moving
+// or dropping the reference releases it from the holder it was counted on.
+TEST_F(KeyHolderTest, ReferencesAreCountedOnTheKeysHolder) {
+  Register();
+  EXPECT_LT(held_res_.rank(), actions_res_.rank());
+  auto r = Apply({Use(1, 5), Use(2, 6), Put("held", 5), Put("shared", 6)});
+  ASSERT_EQ(r.outcome, Outcome::kApplied)
+      << r.ops[0].error << "|" << r.ops[1].error;
+  EXPECT_EQ(Count("held", 5), 1u);
+  EXPECT_EQ(Count("shared", 5), 0u);
+  EXPECT_EQ(Count("shared", 6), 1u);
+
+  r = Apply({Drop("held", 5)});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("still referenced 1 time"), std::string::npos)
+      << r.ops[0].error;
+  r = Apply({Drop("shared", 6)});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+
+  // A registration recounts every committed reference: still on the holder.
+  SlotTable<MeterId, Meter> other(4);
+  SlotResource<MeterId, Meter> other_res("other", other);
+  ASSERT_TRUE(engine_.Register(&other_res));
+  EXPECT_EQ(Count("held", 5), 1u);
+  EXPECT_EQ(Count("shared", 5), 0u);
+  EXPECT_EQ(Apply({Drop("held", 5)}).outcome, Outcome::kRejected);
+  ASSERT_TRUE(engine_.Unregister("other"));
+
+  // Re-pointing the referrer moves the count off the holder it was on.
+  ASSERT_EQ(Apply({Use(1, 6)}).outcome, Outcome::kApplied);
+  EXPECT_EQ(Count("held", 5), 0u);
+  EXPECT_EQ(Count("shared", 6), 2u);
+  ASSERT_EQ(Apply({Drop("held", 5)}).outcome, Outcome::kApplied);
+
+  // An id the transaction takes from "held" is no longer held: naming it is a
+  // reference to an id "shared" does not have.
+  ASSERT_EQ(Apply({Put("held", 7), Use(3, 7)}).outcome, Outcome::kApplied);
+  r = Apply({Op::Erase("actions", EncodeKey(ActionId(3))), Drop("held", 7),
+             Use(4, 7)});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[2].error.find("references missing shared/"),
+            std::string::npos)
+      << r.ops[2].error;
+  EXPECT_EQ(Count("held", 7), 1u);
+  // The referrer and the id it names go together, in any order.
+  ASSERT_EQ(Apply({Drop("held", 7),
+                   Op::Erase("actions", EncodeKey(ActionId(3)))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(Count("held", 7), 0u);
+}
+
+// A refused transaction leaves no count on a holder and no view of the ids
+// it would have added: the next transaction sees only committed holders.
+TEST_F(KeyHolderTest, ARefusedTransactionLeavesNoHeldReference) {
+  Register();
+  auto r = Apply({Put("held", 5), Use(1, 5), Use(2, 9)});  // 9 is nowhere
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[2].error.find("references missing shared/"),
+            std::string::npos)
+      << r.ops[2].error;
+  EXPECT_EQ(Count("held", 5), 0u);
+  EXPECT_FALSE(held_res_.Contains(EncodeKey(MeterId(5))));
+  r = Apply({Use(1, 5)});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("references missing shared/"),
+            std::string::npos)
+      << r.ops[0].error;
+}
+
+// The key holder is part of the declared graph: it binds when it registers,
+// every referrer of the resource that declared it ranks above it (so it
+// publishes first), a reference to a key it holds is refused while it is not
+// registered, and it cannot leave without that resource.
+TEST_F(KeyHolderTest, TheKeyHolderRanksBelowEveryReferrer) {
+  SlotTable<MeterId, Meter> base(4);
+  SlotTable<MeterId, Meter> held(8);
+  SlotResource<MeterId, Meter> base_res("base", base);
+  HeldMeters ranked_res("held", held, {"base"});  // ranks 1
+  SharedMeters shared_res("shared", shared_, ranked_res);
+  SlotResource<ActionId, Action> actions_res(
+      "actions", actions_,
+      [](const Action &a) {
+        return std::vector<Reference>{{"shared", EncodeKey(a.meter)}};
+      },
+      {"shared"});
+  // Its own engine, declared after the resources it holds: it goes first.
+  TransactionEngine engine(domain_);
+  const auto apply = [&engine](std::vector<Op> ops) { return engine.Apply(ops); };
+  ASSERT_TRUE(engine.Register(&actions_res));
+  ASSERT_TRUE(engine.Register(&shared_res));
+  EXPECT_EQ(actions_res.rank(), 1);
+
+  // A key the unregistered holder holds cannot be counted anywhere.
+  const std::unique_ptr<const Meter> none =
+      held.Publish(MeterId(5), std::make_unique<const Meter>(1));
+  auto r = apply({Use(1, 5)});
+  ASSERT_EQ(r.outcome, Outcome::kRejected);
+  EXPECT_NE(r.ops[0].error.find("key holder 'held' is not registered"),
+            std::string::npos)
+      << r.ops[0].error;
+  held.Retire(MeterId(5));
+  const std::unique_ptr<const Meter> gone = held.Unpublish(MeterId(5));
+
+  ASSERT_TRUE(engine.Register(&base_res));
+  ASSERT_TRUE(engine.Register(&ranked_res));
+  EXPECT_EQ(ranked_res.rank(), 1);
+  EXPECT_EQ(actions_res.rank(), 2) << "above the holder, not only above shared";
+  r = apply({Use(1, 5), Put("held", 5)});
+  ASSERT_EQ(r.outcome, Outcome::kApplied) << r.ops[0].error;
+  EXPECT_EQ(engine.ReferenceCount("held", EncodeKey(MeterId(5))), 1u);
+
+  auto un = engine.Unregister("held");
+  ASSERT_FALSE(un);
+  EXPECT_NE(un.error().find("'shared' hands keys to 'held'"), std::string::npos)
+      << un.error();
+  ASSERT_EQ(apply({Op::Erase("actions", EncodeKey(ActionId(1))), Drop("held", 5)})
+                .outcome,
+            Outcome::kApplied);
+  while (engine.ReclaimRetired() != 0) {
+  }
+  domain_.Drain();
+}
+
 // A clear of a map with many keys is one op per entry, and a transaction retires
 // what its operations remove, so past retire_high_water()/2 the engine refuses
 // the whole set with "split it" and applies nothing. ApplyBatched() splits it

@@ -273,9 +273,13 @@ class Resource {
   const std::vector<std::string> &declared_references() const {
     return declared_;
   }
+  // The resource that holds some of this one's keys for the references that
+  // name them, or empty (DeclareKeyHolder, D-187).
+  const std::string &key_holder() const { return key_holder_; }
   // Publication rank, derived by the engine at registration: 0 for a
   // resource that references nothing, else 1 + the highest rank it may
-  // reference. Upserts publish in ascending rank, erases in descending rank.
+  // reference, counting the key holder of each resource it may reference.
+  // Upserts publish in ascending rank, erases in descending rank.
   int rank() const { return rank_; }
 
   // -- control side, called by the engine with its lock held ------------------
@@ -297,6 +301,20 @@ class Resource {
         << "a populated resource with dependencies must visit its references";
   }
 
+  // Whether key_holder() holds `key` for a reference naming it in this
+  // resource (D-187); asked only of a resource that declared a holder. The
+  // engine counts, checks and orders such a reference against the holder,
+  // under the same key, so the key cannot be removed from the holder while
+  // anything names it. `in_transaction`: as the transaction in progress has it
+  // so far (a reference a new value holds, asked after every operation on
+  // resources ranking below the referrer was reserved); otherwise as committed
+  // (a reference a stored value holds). A key may change hands only while
+  // nothing references it, which is what makes an increment and its later
+  // decrement land on the same resource.
+  virtual bool HeldByKeyHolder(const ResourceKey &,
+                               bool /*in_transaction*/) const {
+    return false;
+  }
 
   // Validates `op` and does all its fallible work (decoding, allocation,
   // capacity), leaving nothing visible. Called once per operation: resources
@@ -362,11 +380,23 @@ class Resource {
   // ceiling to be meaningful. Most resources inherit this and state nothing.
   virtual std::optional<uint64_t> FillLevel() const { return std::nullopt; }
 
+ protected:
+  // Declares, before registration, the resource that holds some of this one's
+  // keys for the references naming them (D-187): a key space shared a key at
+  // a time, as a Router's next-hop ids are each either static
+  // ("<router>/next_hops") or bound to a neighbor ("<router>/neighbors").
+  // HeldByKeyHolder() says which keys. The engine binds the name as it binds
+  // references (it may register later), ranks every referrer of this resource
+  // above the holder, and refuses a reference to a held key while the holder
+  // is not registered.
+  void DeclareKeyHolder(std::string holder) { key_holder_ = std::move(holder); }
+
  private:
   friend class TransactionEngine;
 
   std::string name_;
   std::vector<std::string> declared_;
+  std::string key_holder_;
   int rank_ = 0;
   void *registration_ = nullptr;  // the engine's record for it
 };

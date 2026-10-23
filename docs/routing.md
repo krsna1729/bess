@@ -123,7 +123,9 @@ prefix_length: 32}`. The ingress interface attribute (`ingress_interface_attr`,
 default `vif_id`, what Vif writes) is independent of the route domain. A
 binding in `<router>/neighbors` owns its next-hop id: routes and groups name
 it, a static `<router>/next_hops` entry for the same id is refused, and an
-unbind is refused while a route or group names it. The interface id is
+unbind is refused while anything names it: a route, a group, or another
+module's value naming it through `<router>/next_hops` (a classifier result
+field, D-187). The interface id is
 the Router's logical `InterfaceId` (`egress_gate + 1`), not a queue id or any
 other ingress tag; the graph must tag ARP/ND input with that id.
 docs/neighbor-resolution.md has the resource's rules, `get_neighbors`, and

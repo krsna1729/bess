@@ -272,6 +272,8 @@ class TransactionEngine {
     std::vector<std::pair<std::string, Registration *>> deps;
     // Declared references whose resource has not registered yet.
     std::vector<std::string> unresolved;
+    // Its declared key holder (Resource::key_holder), once registered.
+    Registration *key_holder = nullptr;
     // References to its keys held by other resources' values: key -> count.
     StringMap<size_t> incoming;
     // Retired objects of it handed to RCU and not yet destroyed.
@@ -286,6 +288,17 @@ class TransactionEngine {
   // The registration a reference from `from` names, if `from` declared it.
   static Registration *Resolve(const Registration &from,
                                std::string_view resource);
+  // The registration a reference to `key` of `target` is counted on (D-187):
+  // `target`, or its key holder for a key the holder holds -- null while the
+  // holder is not registered.
+  static Registration *Holder(Registration *target, const ResourceKey &key,
+                              bool in_transaction) {
+    const Resource &resource = *target->resource;
+    return resource.key_holder_.empty() ||
+                   !resource.HeldByKeyHolder(key, in_transaction)
+               ? target
+               : target->key_holder;
+  }
 
   // One transaction's removals, stage by stage (ranks, highest first); the
   // next stage runs once `token` completes.
