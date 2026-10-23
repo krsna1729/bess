@@ -75,6 +75,12 @@ class NeighborTable {
     }
   }
 
+  // Forget() for every neighbor no next hop is bound to. Only erases: it
+  // cannot fail.
+  void ForgetUnbound() noexcept {
+    std::erase_if(neighbors_, [](const auto &n) { return n.second.hops.empty(); });
+  }
+
   // Records what resolution learned about `key`. Returns every bound next hop
   // with its new object (empty when nothing a next hop carries changed). The
   // list is built before the neighbor changes, so a refused allocation leaves

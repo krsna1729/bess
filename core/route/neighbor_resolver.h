@@ -491,7 +491,9 @@ class NeighborResolver {
   // Forgets `hop`'s binding. A neighbor no next hop names any more stops
   // being resolved and is forgotten -- its timer, its solicitations and what
   // was learned about it -- so the table holds only bound neighbors and a
-  // later binding of the same address starts incomplete and solicits.
+  // later binding of the same address starts incomplete and solicits. Inside
+  // DeferForgetting() only its timer and capacity go at once; what was learned
+  // waits for ForgetUnbound().
   void Unbind(NextHopId hop) {
     const std::optional<NeighborTable::Bound> binding =
         neighbors_.BindingOf(hop);
@@ -504,7 +506,21 @@ class NeighborResolver {
       Disarm(entry->second);
       entries_.erase(entry);
     }
-    neighbors_.Forget(binding->key);
+    if (!defer_forgetting_) {
+      neighbors_.Forget(binding->key);
+    }
+  }
+
+  // Starts a batch of Bind and Unbind calls that moves bindings between next
+  // hops. Until ForgetUnbound(), a neighbor whose last binding goes releases
+  // its timer and its room at once but keeps what was learned, so a Bind
+  // later in the batch takes it up where it was (resolved, with its MAC)
+  // whatever order the batch runs in.
+  void DeferForgetting() noexcept { defer_forgetting_ = true; }
+  // Ends the batch: forgets every neighbor no next hop is bound to.
+  void ForgetUnbound() noexcept {
+    defer_forgetting_ = false;
+    neighbors_.ForgetUnbound();
   }
 
   // The neighbor `hop` is bound to, if any.
@@ -1090,7 +1106,9 @@ class NeighborResolver {
       Disarm(stale->second);
       entries_.erase(stale);
     }
-    neighbors_.Forget(previous->key);
+    if (!defer_forgetting_) {
+      neighbors_.Forget(previous->key);
+    }
   }
 
   std::unique_ptr<dataplane::ExpiryWheel<TimerPayload>> wheel_;
@@ -1098,6 +1116,8 @@ class NeighborResolver {
   Timing timing_;
   NeighborTable neighbors_;
   std::map<Key, Entry> entries_;
+  // Inside DeferForgetting(): an unbound neighbor keeps what was learned.
+  bool defer_forgetting_ = false;
   std::map<dataplane::InterfaceId, StoredInterface> interfaces_;
   // Poll's collection of due records. Pre-sized in Create so the wheel
   // callback never allocates.

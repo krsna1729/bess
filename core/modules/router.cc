@@ -1271,22 +1271,22 @@ CommandResponse Router::CommandGetNeighbors(const bess::pb::EmptyArg &) {
 // Takes up the bindings transactions published since the last tick (D-180).
 // Only each id's final binding matters -- several transactions may have
 // changed one id since the last tick, and one transaction publishes its binds
-// before its unbinds -- so the changes are coalesced per id first. Then, in
-// three passes:
-//   1. a final binding whose neighbor the resolver already tracks is
-//      installed: it needs no capacity, and it keeps that neighbor (and what
-//      was learned about it) alive while its old id is released, so a
-//      neighbor moved to another id stays resolved;
-//   2. every resolver binding that is gone or replaced is released, which
-//      forgets a neighbor no id names any more;
-//   3. the remaining bindings are installed, into the capacity pass 2 freed
-//      (an unbind next to a bind at max_neighbors).
-// A bound id is published as the resolver has it (already resolved, if
-// another binding knows the neighbor); an unbound one stops, and any of its
-// updates still pending are dropped, since its key is gone. The policy
-// checked each binding when it was reserved, so Bind refuses only for a full
-// timer wheel or table, which max_neighbors sizes; such a binding stays
-// incomplete and is logged.
+// before its unbinds -- so the changes are coalesced per id first. Then, with
+// forgetting deferred (a neighbor whose last binding goes releases its timer
+// and room at once but keeps what was learned):
+//   1. a final binding whose neighbor the resolver knows is installed, so a
+//      neighbor moved to another id -- in a chain, a swap or a rotation, in
+//      any id order -- is taken up resolved, with its MAC, and not probed;
+//   2. every resolver binding that is gone or replaced is released;
+// then every neighbor no id names any more is forgotten, which frees the
+// room for
+//   3. the remaining bindings, installed fresh (an unbind next to a bind at
+//      max_neighbors finds the room the unbind freed).
+// A bound id is published as the resolver has it; an unbound one stops, and
+// any of its updates still pending are dropped, since its key is gone. The
+// policy checked each binding when it was reserved, so Bind refuses only for
+// a full timer wheel or table, which max_neighbors sizes; such a binding
+// stays incomplete and is logged.
 void Router::ApplyNeighborBindingChanges(uint64_t now) {
   std::vector<route::NeighborBindingChange> changes =
       router_->TakeNeighborBindingChanges();
@@ -1324,15 +1324,24 @@ void Router::ApplyNeighborBindingChanges(uint64_t now) {
     return true;
   };
   std::vector<bool> installed(changes.size(), false);
-  for (size_t i = 0; i < changes.size(); i++) {
-    const route::NeighborBindingChange &change = changes[i];
-    if (change.neighbor && neighbor_resolver_->StatusOf(*change.neighbor)) {
-      installed[i] = install(change, false);
+  {
+    // Ends the deferral however the passes leave (Bind may throw).
+    struct Deferred {
+      route::NeighborResolver &resolver;
+      ~Deferred() { resolver.ForgetUnbound(); }
+    } deferred{*neighbor_resolver_};
+    neighbor_resolver_->DeferForgetting();
+    for (size_t i = 0; i < changes.size(); i++) {
+      const route::NeighborBindingChange &change = changes[i];
+      if (change.neighbor && neighbor_resolver_->StatusOf(*change.neighbor)) {
+        installed[i] = install(change, false);
+      }
     }
-  }
-  for (size_t i = 0; i < changes.size(); i++) {
-    if (!installed[i] && neighbor_resolver_->BindingOf(changes[i].id) != changes[i].neighbor) {
-      neighbor_resolver_->Unbind(changes[i].id);
+    for (size_t i = 0; i < changes.size(); i++) {
+      if (!installed[i] &&
+          neighbor_resolver_->BindingOf(changes[i].id) != changes[i].neighbor) {
+        neighbor_resolver_->Unbind(changes[i].id);
+      }
     }
   }
   for (size_t i = 0; i < changes.size(); i++) {

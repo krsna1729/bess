@@ -254,15 +254,17 @@ other resource:
   binding it names in the same transaction. Desired-state apply also upserts
   by ascending rank and erases by descending rank.
 - **The final binding wins.** The maintenance tick coalesces the binding
-  changes committed since the last tick per id, then installs the final
-  bindings of neighbors the resolver already tracks, releases removed or
-  replaced bindings, and installs the rest. A neighbor moved from one id to
-  another keeps what was learned and stays resolved without a probe; an
-  unbind and a bind in one transaction at `max_neighbors` resolve the new
-  neighbor; several transactions on one id before a tick install only the
-  last binding. Two ids that swap neighbors (A↔B) in one tick re-resolve
-  both: each neighbor is momentarily unbound while its new id still holds the
-  other, so it is forgotten and solicited again.
+  changes committed since the last tick per id. With forgetting deferred
+  (`NeighborResolver::DeferForgetting`: a neighbor whose last binding goes
+  frees its timer and room at once but keeps what was learned), it installs
+  the final bindings of neighbors the resolver knows and releases removed or
+  replaced bindings; it then forgets every neighbor no id names
+  (`ForgetUnbound`) and installs the rest. A neighbor that is still named
+  after the tick keeps what was learned and stays resolved without a probe,
+  however the ids move: a move to another id, a chain, a swap or a rotation,
+  in any id order. An unbind and a bind in one transaction at
+  `max_neighbors` resolve the new neighbor, and several transactions on one
+  id before a tick install only the last binding.
 - **Capacity.** `max_neighbors` bounds the bindings (and so the neighbors
   resolved). It defaults to 1024 or `max_next_hops`, whichever is smaller;
   a value above `max_next_hops` is refused. A binding past it refuses the

@@ -12412,13 +12412,14 @@ D-176) for the next hops bound in its `<router>/neighbors` resource.
 - *Bindings are a runtime resource.* `<router>/neighbors` (`RouterNextHopIdKey` -> `RouterNeighborBinding`)
   replaces the Init-time binding list. A committed binding publishes its hop incomplete; the resolver takes it
   up on the next tick. `NeighborResolver::CheckBind` validates it before staging, so the tick never refuses one.
-  The tick coalesces the changes published since the last one to each id's final binding, then works in
-  three passes: it installs the final bindings whose neighbor the resolver already tracks (no capacity
-  needed), releases every resolver binding that is gone or replaced, and installs the rest. A resolved
-  neighbor moved to another id therefore keeps its learned MAC and publishes resolved at once; a transaction
-  that unbinds one id and binds another at `max_neighbors` still finds room; several transactions on one id
-  before a tick install only the last binding. Two ids swapping neighbors (A↔B) in one tick re-resolve both,
-  since each is briefly unbound. Routes and groups that
+  The tick coalesces the changes published since the last one to each id's final binding. With forgetting
+  deferred (a neighbor whose last binding goes frees its timer and room at once and keeps what was learned),
+  it installs the final bindings whose neighbor the resolver knows and releases every resolver binding that
+  is gone or replaced; it then forgets every neighbor no id names and installs the rest. A neighbor still
+  named after the tick therefore keeps its learned MAC and publishes resolved at once however the ids move
+  (a move, a chain, a swap or a rotation, in any id order); a transaction that unbinds one id and binds
+  another at `max_neighbors` still finds room; several transactions on one id before a tick install only the
+  last binding. Routes and groups that
   name a bound id hold a reference to it, so an unbind is refused while any does; an id is static
   (`<router>/next_hops`) or bound, never both; an abort leaves nothing behind. `max_neighbors` bounds the
   bindings (default min(1024, `max_next_hops`); larger than `max_next_hops` is refused).
@@ -12506,7 +12507,8 @@ limit, `AnEmptyArgNextHopRouterForwardsBothFamiliesWithoutAFib`, `TheNextHopMode
 `GetNeighborsReportsEachBindingsResolution`,
 `AnUnbindAndABindInOneTransactionAtCapacityResolveTheNewNeighbor`,
 `SeveralTransactionsBeforeATickApplyTheFinalBinding`, `ARebindOfAForgottenNeighborStartsIncompleteAndSolicits`,
-`ANeighborMovedToAnotherIdStaysResolved`, `TheRouteValueBoundIsTheFibs`,
+`ANeighborMovedToAnotherIdStaysResolved`, `AChainOfMovesInOneTickKeepsEveryNeighborResolved`,
+`ASwapOfTwoNeighborsKeepsBothResolved`, `TheRouteValueBoundIsTheFibs`,
 `ARouteOrGroupListedBeforeItsBindingNamesTheBinding`) and `control_apply_pipeline_test`
 (`ResolverOwnedNextHopsAreOutsideDesiredStateConvergence`, `NeighborBindingsConvergeAsTheirOwnResource`). The
 full suite (`meson test -C build/fast --no-suite live`) is the gate.

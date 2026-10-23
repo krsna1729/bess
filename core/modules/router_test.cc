@@ -367,6 +367,48 @@ class RouterTest : public ::testing::Test {
     return rt;
   }
 
+  // A resolving Router from `arg` (ResolverArg's interfaces) with two
+  // resolved neighbors on interface 2: id 1 -> A (192.0.2.2 at
+  // 02:00:00:00:00:aa) and id 2 -> B (192.0.2.3 at 02:00:00:00:00:bb), their
+  // solicitations drained. Ticks 1 and 2 are used.
+  Router *CreateTwoResolvedNeighbors(const bess::pb::RouterArg &arg) {
+    auto *rt = CreateResolver(arg);
+    if (rt == nullptr) {
+      return nullptr;
+    }
+    EXPECT_EQ("", BindNeighbor("rt", 2, 2, "192.0.2.3"));
+    Module *writer = MakeNeighborInterfaceWriter(2);
+    EXPECT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+    (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+    EXPECT_EQ(2u, h_.RunTask(rt, {0, 1})[1].size());
+    const auto reply = [](const char *mac, const char *ip) {
+      return PacketBuilder()
+          .Ether("02:00:00:00:00:01", mac)
+          .Arp(2, mac, ip, "02:00:00:00:00:01", "192.0.2.1")
+          .PadTo(60)
+          .Build();
+    };
+    (void)h_.RunPipeline(writer, 0,
+                         {reply("02:00:00:00:00:aa", "192.0.2.2"),
+                          reply("02:00:00:00:00:bb", "192.0.2.3")},
+                         rt, {0});
+    (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 2);
+    for (uint32_t id : {1u, 2u}) {
+      const auto *hop = rt->router()->LookupNextHop(bess::route::NextHopId(id));
+      EXPECT_TRUE(hop != nullptr && hop->neighbor == bess::route::NeighborState::kResolved)
+          << "id " << id;
+    }
+    return rt;
+  }
+
+  // Next hop `id` is resolved on `mac`.
+  void ExpectResolved(Router *rt, uint32_t id, const char *mac) {
+    const auto *hop = rt->router()->LookupNextHop(bess::route::NextHopId(id));
+    ASSERT_NE(nullptr, hop) << "id " << id;
+    EXPECT_EQ(bess::route::NeighborState::kResolved, hop->neighbor) << "id " << id;
+    EXPECT_EQ(mac, hop->dst_mac.ToString()) << "id " << id;
+  }
+
   // Names for the metadata writers, one per call (see MakeWriter).
   int next_writer_ = 0;
   ModuleHarness h_;
@@ -2658,6 +2700,47 @@ TEST_F(RouterTest, ANeighborMovedToAnotherIdStaysResolved) {
   EXPECT_EQ("02:00:00:00:00:aa", moved->dst_mac.ToString());
   EXPECT_TRUE(h_.RunTask(rt, {0, 1})[1].empty()) << "a moved neighbor is not probed";
   EXPECT_NE(std::string::npos, rt->GetDesc().find(", 1 neighbors")) << rt->GetDesc();
+}
+
+// Renumbering in one tick keeps every neighbor that is still named, whatever
+// the id order: id 1 moves from A to B (leaving A unbound for a moment) while
+// a higher id 3 takes A. Forgetting waits until every move is installed, so
+// A and B both stay resolved, on their MACs, and neither is probed.
+TEST_F(RouterTest, AChainOfMovesInOneTickKeepsEveryNeighborResolved) {
+  Router *rt = CreateTwoResolvedNeighbors(ResolverArg(0));
+  ASSERT_NE(nullptr, rt);
+  const bess::route::Router &router = *rt->router();
+  const bess::route::NeighborKey a(bess::dataplane::InterfaceId(2), 0xc0000202);
+  const bess::route::NeighborKey b(bess::dataplane::InterfaceId(2), 0xc0000203);
+  ASSERT_EQ("", h_.Apply({
+                    router.BindNeighborOp(bess::route::NextHopId(1), b),
+                    router.BindNeighborOp(bess::route::NextHopId(3), a),
+                }));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 3);
+  ExpectResolved(rt, 1, "02:00:00:00:00:bb");
+  ExpectResolved(rt, 2, "02:00:00:00:00:bb");
+  ExpectResolved(rt, 3, "02:00:00:00:00:aa");
+  EXPECT_TRUE(h_.RunTask(rt, {0, 1})[1].empty()) << "no neighbor is probed again";
+  EXPECT_NE(std::string::npos, rt->GetDesc().find(", 2 neighbors")) << rt->GetDesc();
+}
+
+// Two ids swap their neighbors in one transaction: both neighbors stay
+// resolved on their MACs and neither is probed.
+TEST_F(RouterTest, ASwapOfTwoNeighborsKeepsBothResolved) {
+  Router *rt = CreateTwoResolvedNeighbors(ResolverArg(0));
+  ASSERT_NE(nullptr, rt);
+  const bess::route::Router &router = *rt->router();
+  const bess::route::NeighborKey a(bess::dataplane::InterfaceId(2), 0xc0000202);
+  const bess::route::NeighborKey b(bess::dataplane::InterfaceId(2), 0xc0000203);
+  ASSERT_EQ("", h_.Apply({
+                    router.BindNeighborOp(bess::route::NextHopId(1), b),
+                    router.BindNeighborOp(bess::route::NextHopId(2), a),
+                }));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 3);
+  ExpectResolved(rt, 1, "02:00:00:00:00:bb");
+  ExpectResolved(rt, 2, "02:00:00:00:00:aa");
+  EXPECT_TRUE(h_.RunTask(rt, {0, 1})[1].empty()) << "no neighbor is probed again";
+  EXPECT_NE(std::string::npos, rt->GetDesc().find(", 2 neighbors")) << rt->GetDesc();
 }
 
 // Ownership does not depend on request order: a route or a group listed
