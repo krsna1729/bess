@@ -622,6 +622,7 @@ TEST_P(ConnTrackSourceFedTest, PerWorkerOnOtherInputs) {
     EXPECT_EQ(sent, Packets("ct", 0)) << "tracked in the shared table";
     EXPECT_EQ(0, Packets("ct", 1));
     EXPECT_EQ(1, Packets("status", kNew)) << "the first SYN starts the one connection";
+    EXPECT_EQ(sent - 1, Packets("status", kExisting)) << "and every later SYN is existing";
     EXPECT_EQ(0, Packets("status", kUntracked));
   } else {
     EXPECT_EQ(0, Packets("ct", 0));

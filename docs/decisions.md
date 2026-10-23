@@ -12439,8 +12439,8 @@ some ports, or to count or meter new connections separately from established one
   reach a reader.
 - **The write follows the metadata contract** (D-177), as the Firewall's `action_attr` does (D-141). The
   attribute is registered only when configured. It has an offset only when a module downstream reads it,
-  and without a reader the packet path writes nothing. A configured name with no reader is reported once,
-  at PreResume.
+  and without a reader the packet path writes nothing. A configured name with no reader is logged as a
+  warning at each resume (PreResume).
 
 **Why.** One byte from a result the tracker already computes costs a store per packet, and only when a
 reader exists. Using the library's order plus one keeps 0 free for "unset" without a lookup table. The
@@ -12451,7 +12451,7 @@ attribute, and each packet leaves on the gate of its status. An inside SYN is ne
 an outside SYN is invalid, and an ARP frame is untracked. All seven status values are wired gates, so a
 packet with a wrong status, or none, leaves on another gate. Live: `ConnTrackSourceFedTest.PerWorkerOnOtherInputs`
 routes on the status too. When it fails closed, every packet is untracked; when it falls back to the shared
-table, exactly one packet is new.
+table, the first SYN is new and every later one is existing.
 
 **Consequences.** A pipeline that does not set `status_attr` is unchanged. The packet direction (original
 or reply) is not part of the status.
