@@ -127,11 +127,15 @@ The family rules depend on the mode (D-180).
 next-hop id is the decision, so the Router has no FIB: it allocates none in
 any family, takes no family setting, and forwards IPv4 and IPv6 alike,
 decrementing each packet's TTL or hop limit by the packet's own family. Init
-refuses the four FIB sizing fields below and a non-default `backend` ("a
-ROUTE_MODE_NEXT_HOP_ID router has no FIB"); every `<router>/routes` write is
-refused with an error that names the mode. Interface addresses and neighbor
-bindings of either family are accepted. An empty `RouterArg` is a valid
-next-hop-id Router.
+refuses every field only a FIB would read, each with "a
+ROUTE_MODE_NEXT_HOP_ID router has no FIB": the four FIB sizing fields below,
+a non-default `backend`, a nonzero `max_groups` (only a route names a group),
+`max_domains` above 1, a non-default `flow_hash`, `domain_attr`, and
+`punt_miss_gate` or `punt_unresolved_gate` (even an explicit 8192). Every
+`<router>/routes` and `<router>/groups` write is refused with an error that
+names the mode. `max_next_hops` is bounded by the 32-bit id rather than the
+FIB's 24-bit route value. Interface addresses and neighbor bindings of either
+family are accepted. An empty `RouterArg` is a valid next-hop-id Router.
 
 **Destination mode (`ROUTE_MODE_DESTINATION`).** `RouterArg` enables each
 family on its own: a family is on exactly when its route capacity is set.
@@ -199,9 +203,9 @@ where a local packet goes. The Router module's destination mode sends it to `pun
 and counts it as `local`, apart from a miss, an unresolved neighbor and a blackhole. That is the local
 delivery path in a dataplane graph: there is no kernel stack to hand the packet to, so the graph names the slow
 path. A local hop behind a `next_hop_id` is not forwarded either; the id mode has no punt gates for forwarded
-traffic (D-162). The one gate it uses is `punt_neighbor_gate`: a resolving router sends the ARP requests and
-Neighbor Solicitations it receives there in either mode (0, the default, follows `punt_local_gate`; 8192
-drops them).
+traffic (D-162), and refuses `punt_miss_gate` and `punt_unresolved_gate`. The one gate it uses is
+`punt_neighbor_gate`: a resolving router sends the ARP requests and Neighbor Solicitations it receives there in
+either mode (0, the default, follows `punt_local_gate`; 8192 drops them).
 
 The two recipes meet in one module. Which one runs is **configuration**, not a per-packet test: the `mode` arg
 (`ROUTE_MODE_NEXT_HOP_ID`, the default, or `ROUTE_MODE_DESTINATION`, D-155). A module decides; it does not

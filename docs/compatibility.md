@@ -86,9 +86,11 @@ running daemon in the test suite.
   replace them. In `ROUTE_MODE_DESTINATION` a family is enabled exactly when
   its route capacity is set, and a Router with neither is refused. In
   `ROUTE_MODE_NEXT_HOP_ID` (the default) the Router has no FIB: it forwards
-  IPv4 and IPv6, refuses the four capacity fields and a non-default
-  `backend`, and refuses every route write, so a next-hop-id configuration
-  drops its capacity fields and its routes (an empty `RouterArg` is valid).
+  IPv4 and IPv6, refuses the four capacity fields, a non-default `backend`
+  or `flow_hash`, a nonzero `max_groups`, `max_domains` above 1,
+  `domain_attr`, `punt_miss_gate` and `punt_unresolved_gate`, and refuses
+  every route and group write, so a next-hop-id configuration drops those
+  fields, its routes and its groups (an empty `RouterArg` is valid).
   All `RouterArg` fields are renumbered (1-25, no reserved slots) and
   `RouterInterface` keeps 1-4, so a binary `RouterArg` must be re-encoded;
   text and YAML that name fields only need the capacity rename. An IPv4

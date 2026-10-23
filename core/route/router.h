@@ -299,11 +299,16 @@ class Router {
     std::optional<Ipv6RouteTable::Config> ipv6;
   };
 
+  // The most next hops (plus groups) a router with no FIB holds: an id is a
+  // one-based 32-bit value, and the bound keeps max + 1 within 32 bits.
+  static constexpr size_t kMaxNextHopsWithoutFib = 0xfffffffeu;
+
   // `config` sizes the default domain's FIBs and those created on demand;
   // CreateDomain() takes the others'.
   // `max_domains` (1..kMaxRouteDomains) bounds the domain ids: 0..max_domains-1.
   // `max_groups` bounds the next-hop group ids: 1..max_groups (0: none);
-  // max_next_hops + max_groups must fit a route value (24 bits).
+  // with a family, max_next_hops + max_groups must fit a route value (24
+  // bits); with neither, kMaxNextHopsWithoutFib.
   static std::expected<std::unique_ptr<Router>, RouteError> Create(
       std::string name, const Config &config, size_t max_next_hops,
       rcu::RcuDomain &domain, size_t max_domains = 1, size_t max_groups = 0);

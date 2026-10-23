@@ -242,9 +242,6 @@ using bess::modules::router::GateOf;
 using bess::modules::router::InterfaceOf;
 
 CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
-  if (arg.max_next_hops() > route::LpmRouteTable::kMaxValue) {
-    return CommandFailure(EINVAL, "router capacity exceeds backend limits");
-  }
   // The packet path's mode is configuration (D-155): an unknown value is
   // refused rather than silently treated as the default.
   if (arg.mode() != bess::pb::ROUTE_MODE_NEXT_HOP_ID &&
@@ -285,22 +282,58 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                                                            : route::FlowHashFields::kL3L4;
   // Address families (D-180). A next-hop-id router has no FIB: it forwards
   // what the id names, of either family, so it takes no family setting and
-  // refuses the fields that would size a FIB it never consults.
+  // refuses every field that only a FIB (routes, groups, domains, the hash a
+  // group route uses, the punts of a lookup) would ever read.
   route::Router::Config config;
   if (!routes_by_destination()) {
+    constexpr char kNoFib[] =
+        "%s: a ROUTE_MODE_NEXT_HOP_ID router has no FIB";
     if (arg.has_max_ipv4_routes() || arg.has_max_ipv4_tbl8s() ||
         arg.has_max_ipv6_routes() || arg.has_max_ipv6_tbl8s()) {
-      return CommandFailure(EINVAL,
+      return CommandFailure(EINVAL, kNoFib,
                             "max_ipv4_routes, max_ipv4_tbl8s, max_ipv6_routes and "
-                            "max_ipv6_tbl8s size the FIBs of ROUTE_MODE_DESTINATION; "
-                            "a ROUTE_MODE_NEXT_HOP_ID router has no FIB");
+                            "max_ipv6_tbl8s size the FIBs of ROUTE_MODE_DESTINATION");
     }
     if (arg.backend() != bess::pb::ROUTE_BACKEND_LPM) {
-      return CommandFailure(EINVAL,
-                            "backend selects the IPv4 FIB of ROUTE_MODE_DESTINATION; "
-                            "a ROUTE_MODE_NEXT_HOP_ID router has no FIB");
+      return CommandFailure(EINVAL, kNoFib,
+                            "backend selects the IPv4 FIB of ROUTE_MODE_DESTINATION");
+    }
+    if (arg.max_groups() != 0) {
+      return CommandFailure(EINVAL, kNoFib,
+                            "max_groups sizes the groups routes name in "
+                            "ROUTE_MODE_DESTINATION");
+    }
+    if (arg.max_domains() > 1) {
+      return CommandFailure(EINVAL, kNoFib,
+                            "max_domains sizes the route domains of "
+                            "ROUTE_MODE_DESTINATION");
+    }
+    if (arg.flow_hash() != bess::pb::FLOW_HASH_L3_L4) {
+      return CommandFailure(EINVAL, kNoFib,
+                            "flow_hash picks a group member for a route in "
+                            "ROUTE_MODE_DESTINATION");
+    }
+    if (!arg.domain_attr().empty()) {
+      return CommandFailure(EINVAL, kNoFib,
+                            "domain_attr names the route domain "
+                            "ROUTE_MODE_DESTINATION looks up");
+    }
+    if (arg.punt_miss_gate() != 0 || arg.punt_unresolved_gate() != 0) {
+      return CommandFailure(EINVAL, kNoFib,
+                            "punt_miss_gate and punt_unresolved_gate take what a "
+                            "ROUTE_MODE_DESTINATION lookup cannot forward");
+    }
+    // No route value to fit: the id is the 32-bit metadata value.
+    if (arg.max_next_hops() > route::Router::kMaxNextHopsWithoutFib) {
+      return CommandFailure(EINVAL, "router capacity exceeds backend limits");
     }
   } else {
+    // A FIB value is 24 bits and holds max_next_hops + group id (D-065).
+    if (arg.max_next_hops() > route::LpmRouteTable::kMaxValue ||
+        arg.max_groups() > route::LpmRouteTable::kMaxValue -
+                               (arg.max_next_hops() ? arg.max_next_hops() : 4096)) {
+      return CommandFailure(EINVAL, "router capacity exceeds backend limits");
+    }
     // A family is enabled exactly when its route capacity is set, and sized
     // independently of the other. A disabled family has no FIB in any
     // domain, so it costs nothing.
@@ -376,10 +409,6 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       arg.max_next_hops() ? static_cast<size_t>(arg.max_next_hops()) : 4096;
   const size_t max_groups =
       arg.max_groups() ? static_cast<size_t>(arg.max_groups()) : 0;
-  // A FIB value is 24 bits and holds max_next_hops + group id (D-065).
-  if (max_groups > route::LpmRouteTable::kMaxValue - max_next_hops) {
-    return CommandFailure(EINVAL, "router capacity exceeds backend limits");
-  }
 
   const size_t max_domains =
       arg.max_domains() ? static_cast<size_t>(arg.max_domains()) : 1;
@@ -698,8 +727,16 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       *router_->groups_resource_object(),
       std::make_shared<bess::framework::TypedCodec<bess::pb::RouterGroupIdKey,
                                              bess::pb::RouterGroupValue>>(
-          [](const bess::pb::RouterGroupIdKey &key)
+          [destination = routes_by_destination()](const bess::pb::RouterGroupIdKey &key)
               -> std::expected<dataplane::ResourceKey, std::string> {
+            // Only a route names a group, and the next-hop-id mode has no
+            // routes (D-180): a group there could never be reached.
+            if (!destination) {
+              return std::unexpected(
+                  "groups are not used in ROUTE_MODE_NEXT_HOP_ID (only a route "
+                  "names a group, and the router has no FIB); use "
+                  "ROUTE_MODE_DESTINATION");
+            }
             if (key.id() == 0) {
               return std::unexpected("group id 0 is invalid");
             }
@@ -1234,16 +1271,22 @@ CommandResponse Router::CommandGetNeighbors(const bess::pb::EmptyArg &) {
 // Takes up the bindings transactions published since the last tick (D-180).
 // Only each id's final binding matters -- several transactions may have
 // changed one id since the last tick, and one transaction publishes its binds
-// before its unbinds -- so the changes are coalesced per id first. Then every
-// resolver binding that is gone or replaced is released, and only then are
-// the new ones installed: capacity a transaction freed (an unbind next to a
-// bind at max_neighbors) is free before the bind needs it. A bound id starts
-// resolving from now, its hop published as the resolver has it (already
-// resolved, if another binding knows the neighbor); an unbound one stops, and
-// any of its updates still pending are dropped, since its key is gone. The
-// policy checked each binding when it was reserved, so Bind refuses only for
-// a full timer wheel or table, which max_neighbors sizes; such a binding
-// stays incomplete and is logged.
+// before its unbinds -- so the changes are coalesced per id first. Then, in
+// three passes:
+//   1. a final binding whose neighbor the resolver already tracks is
+//      installed: it needs no capacity, and it keeps that neighbor (and what
+//      was learned about it) alive while its old id is released, so a
+//      neighbor moved to another id stays resolved;
+//   2. every resolver binding that is gone or replaced is released, which
+//      forgets a neighbor no id names any more;
+//   3. the remaining bindings are installed, into the capacity pass 2 freed
+//      (an unbind next to a bind at max_neighbors).
+// A bound id is published as the resolver has it (already resolved, if
+// another binding knows the neighbor); an unbound one stops, and any of its
+// updates still pending are dropped, since its key is gone. The policy
+// checked each binding when it was reserved, so Bind refuses only for a full
+// timer wheel or table, which max_neighbors sizes; such a binding stays
+// incomplete and is logged.
 void Router::ApplyNeighborBindingChanges(uint64_t now) {
   std::vector<route::NeighborBindingChange> changes =
       router_->TakeNeighborBindingChanges();
@@ -1267,23 +1310,35 @@ void Router::ApplyNeighborBindingChanges(uint64_t now) {
         changes.begin(), changes.end(), route::NeighborBindingChange{pending.first, {}},
         [](const auto &a, const auto &b) { return a.id < b.id; });
   });
-  for (const route::NeighborBindingChange &change : changes) {
-    if (neighbor_resolver_->BindingOf(change.id) != change.neighbor) {
-      neighbor_resolver_->Unbind(change.id);
-    }
-  }
-  for (const route::NeighborBindingChange &change : changes) {
-    if (!change.neighbor) {
-      continue;
-    }
+  const auto install = [&](const route::NeighborBindingChange &change, bool log) {
     auto hop = neighbor_resolver_->Bind(change.id, *change.neighbor, now);
     if (!hop) {
-      LOG(ERROR) << "Router '" << name() << "': next hop " << change.id.value()
-                 << " stays unresolved: " << hop.error();
-      continue;
+      if (log) {
+        LOG(ERROR) << "Router '" << name() << "': next hop " << change.id.value()
+                   << " stays unresolved: " << hop.error();
+      }
+      return false;
     }
     const std::pair<route::NextHopId, route::NextHop> update{change.id, *hop};
     QueueNeighborUpdates(std::span(&update, 1));
+    return true;
+  };
+  std::vector<bool> installed(changes.size(), false);
+  for (size_t i = 0; i < changes.size(); i++) {
+    const route::NeighborBindingChange &change = changes[i];
+    if (change.neighbor && neighbor_resolver_->StatusOf(*change.neighbor)) {
+      installed[i] = install(change, false);
+    }
+  }
+  for (size_t i = 0; i < changes.size(); i++) {
+    if (!installed[i] && neighbor_resolver_->BindingOf(changes[i].id) != changes[i].neighbor) {
+      neighbor_resolver_->Unbind(changes[i].id);
+    }
+  }
+  for (size_t i = 0; i < changes.size(); i++) {
+    if (!installed[i] && changes[i].neighbor) {
+      install(changes[i], true);
+    }
   }
 }
 

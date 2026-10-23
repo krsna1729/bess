@@ -822,7 +822,6 @@ TEST_F(RouterTest, TheSelectorAttributesAreConfiguration) {
   bess::pb::RouterArg arg = NextHopArg();
   arg.set_max_next_hops(64);
   arg.set_next_hop_attr("nh_id");
-  arg.set_domain_attr("vrf");
   // Each mode declares the attribute it reads, under its configured name, and
   // not the other mode's (D-180): a declared read is a requirement on every
   // path into the module.
@@ -839,6 +838,7 @@ TEST_F(RouterTest, TheSelectorAttributesAreConfiguration) {
   EXPECT_EQ(std::vector<std::string>{"nh_id"}, reads(by_id));
 
   arg.MergeFrom(DualStackArg());
+  arg.set_domain_attr("vrf");
   auto *by_destination =
       dynamic_cast<Router *>(h_.Create("Router", arg, "rt_dest"));
   ASSERT_NE(nullptr, by_destination);
@@ -1017,20 +1017,6 @@ TEST_F(RouterTest, ABlackholeHopIsNotAnUnresolvedNeighbor) {
   EXPECT_EQ(1u, rt->blackholed_frames());
   EXPECT_EQ(0u, rt->unresolved_frames()) << "a hop that forwards nowhere resolves nothing";
   EXPECT_EQ(0u, rt->no_route_frames());
-}
-
-// D-162: only the destination path has punt gates. A next-hop-id router armed
-// with them forwards what the attribute names and drops everything else, so
-// its desc must not advertise a punt a reader would look for.
-TEST_F(RouterTest, ANextHopIdRouterDoesNotAdvertisePuntGates) {
-  bess::pb::RouterArg arg = NextHopArg();
-  arg.set_punt_miss_gate(2);
-  arg.set_punt_unresolved_gate(3);
-  Router *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
-  ASSERT_NE(nullptr, rt);
-  EXPECT_EQ(std::string::npos, rt->GetDesc().find("punts to gate")) << rt->GetDesc();
-  EXPECT_NE(std::string::npos, rt->GetDesc().find("next-hop id from metadata"))
-      << rt->GetDesc();
 }
 
 // D-162: a punt gate sends what the destination path cannot forward to a slow
@@ -1780,13 +1766,13 @@ TEST_F(RouterTest, AnEmptyArgNextHopRouterForwardsBothFamiliesWithoutAFib) {
   EXPECT_NE(std::string::npos, rt->GetDesc().find("no FIB")) << rt->GetDesc();
 }
 
-// The FIB fields size destination mode only: a next-hop-id router refuses
-// them (and a non-default backend) rather than allocating a FIB it never
-// consults.
+// Destination-only fields configure a FIB, its groups, its domains and what
+// its lookups punt; a next-hop-id router has none of those, so it refuses
+// each rather than accept a setting that can never take effect.
 TEST_F(RouterTest, TheNextHopModeRefusesFibCapacities) {
   const auto refused = [this](const bess::pb::RouterArg &arg, const char *what) {
     const std::string error = h_.CreateError("Router", arg);
-    EXPECT_NE(std::string::npos, error.find("no FIB")) << what << ": " << error;
+    EXPECT_NE(std::string::npos, error.find("has no FIB")) << what << ": " << error;
   };
   bess::pb::RouterArg arg;
   arg.set_max_ipv4_routes(16);
@@ -1803,6 +1789,67 @@ TEST_F(RouterTest, TheNextHopModeRefusesFibCapacities) {
   arg = NextHopArg();
   arg.set_backend(bess::pb::ROUTE_BACKEND_FIB);
   refused(arg, "backend");
+  arg = NextHopArg();
+  arg.set_max_groups(1);
+  refused(arg, "max_groups");
+  arg = NextHopArg();
+  arg.set_max_domains(2);
+  refused(arg, "max_domains");
+  arg = NextHopArg();
+  arg.set_flow_hash(bess::pb::FLOW_HASH_L3);
+  refused(arg, "flow_hash");
+  arg = NextHopArg();
+  arg.set_domain_attr("route_domain");
+  refused(arg, "domain_attr, even its default name");
+  arg = NextHopArg();
+  arg.set_punt_miss_gate(2);
+  refused(arg, "punt_miss_gate");
+  arg = NextHopArg();
+  arg.set_punt_unresolved_gate(DROP_GATE);
+  refused(arg, "punt_unresolved_gate, even an explicit drop");
+
+  // What the mode does read is still accepted: one domain spelled out, the
+  // default hash, and the gates that serve its own traffic.
+  arg = NextHopArg();
+  arg.set_max_domains(1);
+  arg.set_flow_hash(bess::pb::FLOW_HASH_L3_L4);
+  arg.set_punt_local_gate(2);
+  arg.set_punt_neighbor_gate(3);
+  EXPECT_EQ("", h_.CreateError("Router", arg));
+}
+
+// The 24-bit route-value bound on max_next_hops + max_groups is the FIB's: a
+// destination router is held to it, a next-hop-id router only to the 32-bit
+// id, and a group write to a next-hop-id router is refused with the mode.
+TEST_F(RouterTest, TheRouteValueBoundIsTheFibs) {
+  bess::pb::RouterArg arg = DualStackArg();
+  arg.set_max_next_hops(bess::route::LpmRouteTable::kMaxValue + 1);
+  EXPECT_NE(std::string::npos,
+            h_.CreateError("Router", arg).find("exceeds backend limits"));
+  arg = DualStackArg();
+  arg.set_max_next_hops(bess::route::LpmRouteTable::kMaxValue);
+  arg.set_max_groups(1);
+  EXPECT_NE(std::string::npos,
+            h_.CreateError("Router", arg).find("exceeds backend limits"));
+
+  arg = NextHopArg();
+  arg.set_max_next_hops(uint64_t{bess::route::Router::kMaxNextHopsWithoutFib} + 1);
+  EXPECT_NE(std::string::npos,
+            h_.CreateError("Router", arg).find("exceeds backend limits"));
+  // The library holds a router with a FIB to the same bound (it refuses
+  // before allocating anything).
+  EXPECT_FALSE(bess::route::Router::Create("fibbed", {.ipv4 = bess::route::LpmRouteTable::Config{}},
+                                           bess::route::LpmRouteTable::kMaxValue + 1,
+                                           bess::runtime::runtime().rcu()));
+
+  Router *rt = dynamic_cast<Router *>(h_.Create("Router", NextHopArg(), "rt"));
+  ASSERT_NE(nullptr, rt);
+  bess::pb::RouterGroupIdKey group_key;
+  group_key.set_id(1);
+  bess::pb::RouterGroupValue group_value;
+  group_value.add_member_ids(1);
+  const std::string error = h_.UpsertResource("rt/groups", group_key, group_value);
+  EXPECT_NE(std::string::npos, error.find("ROUTE_MODE_NEXT_HOP_ID")) << error;
 }
 
 // Sizing is per family in destination mode: a family is on when its route
@@ -2576,6 +2623,41 @@ TEST_F(RouterTest, ARebindOfAForgottenNeighborStartsIncompleteAndSolicits) {
   const auto probes = h_.RunTask(rt, {0, 1});
   ASSERT_EQ(1u, probes.at(1).size());
   EXPECT_EQ("192.0.2.2", ArpTarget(probes.at(1)[0]));
+}
+
+// A resolved neighbor moved to another id in one transaction keeps what was
+// learned: the new id is installed before the old one is released, so the
+// neighbor is never forgotten, and it publishes resolved without a probe.
+TEST_F(RouterTest, ANeighborMovedToAnotherIdStaysResolved) {
+  auto *rt = CreateResolver(ResolverArg(0));  // id 1 bound to 192.0.2.2
+  ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
+  ASSERT_EQ(1u, h_.RunTask(rt, {0, 1})[1].size());
+  (void)h_.RunPipeline(writer, 0,
+                       {ArpFrom(2, "02:00:00:00:00:aa", "02:00:00:00:00:01",
+                                "192.0.2.1")},
+                       rt, {0});
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 2);
+  ASSERT_EQ(bess::route::NeighborState::kResolved,
+            rt->router()->LookupNextHop(bess::route::NextHopId(1))->neighbor);
+
+  const bess::route::Router &router = *rt->router();
+  const std::vector<bess::dataplane::Op> ops = {
+      router.UnbindNeighborOp(bess::route::NextHopId(1)),
+      router.BindNeighborOp(
+          bess::route::NextHopId(2),
+          bess::route::NeighborKey(bess::dataplane::InterfaceId(2), 0xc0000202)),
+  };
+  ASSERT_EQ("", h_.Apply(ops));
+  (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 3);
+  const auto *moved = rt->router()->LookupNextHop(bess::route::NextHopId(2));
+  ASSERT_NE(nullptr, moved);
+  EXPECT_EQ(bess::route::NeighborState::kResolved, moved->neighbor);
+  EXPECT_EQ("02:00:00:00:00:aa", moved->dst_mac.ToString());
+  EXPECT_TRUE(h_.RunTask(rt, {0, 1})[1].empty()) << "a moved neighbor is not probed";
+  EXPECT_NE(std::string::npos, rt->GetDesc().find(", 1 neighbors")) << rt->GetDesc();
 }
 
 // Ownership does not depend on request order: a route or a group listed

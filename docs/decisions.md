@@ -12356,10 +12356,13 @@ D-176) for the next hops bound in its `<router>/neighbors` resource.
 **Decision.**
 - *The next-hop-id mode has no FIB.* Its decision is the packet's next-hop id, so it never consults a FIB and
   allocates none: `route::Router` accepts a `Config` with neither family (a next-hop-only router, every route
-  write refused), and the module builds one in that mode. It takes no family setting: it refuses the four
-  capacity fields and a non-default `backend` at Init, refuses every route write with an error that names the
-  mode, forwards IPv4 and IPv6 alike with each packet's own TTL or hop limit decremented, and takes interface
-  addresses and bindings of either family. An empty `RouterArg` is a valid next-hop-id Router.
+  write refused, `max_next_hops` bounded by the 32-bit id instead of the 24-bit route value), and the module
+  builds one in that mode. It takes no family setting and refuses at Init every field only a FIB reads, with
+  the same "has no FIB" error: the four capacity fields, a non-default `backend`, a nonzero `max_groups`,
+  `max_domains` above 1, a non-default `flow_hash`, `domain_attr`, `punt_miss_gate` and
+  `punt_unresolved_gate`. It refuses every route and group write with an error that names the mode (only a
+  route names a group), forwards IPv4 and IPv6 alike with each packet's own TTL or hop limit decremented, and
+  takes interface addresses and bindings of either family. An empty `RouterArg` is a valid next-hop-id Router.
 - *In destination mode each family is enabled and sized on its own.* `max_ipv4_routes`/`max_ipv4_tbl8s` and
   `max_ipv6_routes`/`max_ipv6_tbl8s` replace the shared `max_routes`/`max_tbl8s`. A family is on exactly when
   its route capacity is set, and at least one must be; an explicit 0, a tbl8 count without its family's route
@@ -12409,10 +12412,13 @@ D-176) for the next hops bound in its `<router>/neighbors` resource.
 - *Bindings are a runtime resource.* `<router>/neighbors` (`RouterNextHopIdKey` -> `RouterNeighborBinding`)
   replaces the Init-time binding list. A committed binding publishes its hop incomplete; the resolver takes it
   up on the next tick. `NeighborResolver::CheckBind` validates it before staging, so the tick never refuses one.
-  The tick coalesces the changes published since the last one to each id's final binding, releases every
-  resolver binding that is gone or replaced, and only then installs the new ones: a transaction that unbinds
-  one id and binds another at `max_neighbors` publishes the bind first, and the resolver still has room for
-  it, and several transactions on one id before a tick install only the last binding. Routes and groups that
+  The tick coalesces the changes published since the last one to each id's final binding, then works in
+  three passes: it installs the final bindings whose neighbor the resolver already tracks (no capacity
+  needed), releases every resolver binding that is gone or replaced, and installs the rest. A resolved
+  neighbor moved to another id therefore keeps its learned MAC and publishes resolved at once; a transaction
+  that unbinds one id and binds another at `max_neighbors` still finds room; several transactions on one id
+  before a tick install only the last binding. Two ids swapping neighbors (A↔B) in one tick re-resolve both,
+  since each is briefly unbound. Routes and groups that
   name a bound id hold a reference to it, so an unbind is refused while any does; an id is static
   (`<router>/next_hops`) or bound, never both; an abort leaves nothing behind. `max_neighbors` bounds the
   bindings (default min(1024, `max_next_hops`); larger than `max_next_hops` is refused).
@@ -12463,8 +12469,9 @@ exempts that file by name from D-042's rule, because the alternative, putting tr
 What an existing Router user sees:
 - `max_routes` (default 4096) and `max_tbl8s` are gone. In destination mode set `max_ipv4_routes` (and
   `max_ipv4_tbl8s`) for the old IPv4 behaviour; a destination Router with neither family's routes set is
-  refused. In next-hop mode drop the capacity fields and the routes: the Router has no FIB, refuses both, and
-  forwards IPv6 as well as IPv4.
+  refused. In next-hop mode drop the capacity fields, the routes and groups, and any destination-only setting
+  (`max_groups`, `max_domains` above 1, `flow_hash`, `domain_attr`, `punt_miss_gate`,
+  `punt_unresolved_gate`): the Router has no FIB, refuses them, and forwards IPv6 as well as IPv4.
 - `RouterArg` is renumbered (the per-family capacities take fields 1-4, `max_next_hops` is 6, `max_domains` 8,
   `mode` 9, the punt gates 13-16, the resolver's fields 17-25): text and YAML configurations that name fields
   are unaffected, but a binary `RouterArg` encoded against the old numbering must be re-encoded.
@@ -12499,6 +12506,7 @@ limit, `AnEmptyArgNextHopRouterForwardsBothFamiliesWithoutAFib`, `TheNextHopMode
 `GetNeighborsReportsEachBindingsResolution`,
 `AnUnbindAndABindInOneTransactionAtCapacityResolveTheNewNeighbor`,
 `SeveralTransactionsBeforeATickApplyTheFinalBinding`, `ARebindOfAForgottenNeighborStartsIncompleteAndSolicits`,
+`ANeighborMovedToAnotherIdStaysResolved`, `TheRouteValueBoundIsTheFibs`,
 `ARouteOrGroupListedBeforeItsBindingNamesTheBinding`) and `control_apply_pipeline_test`
 (`ResolverOwnedNextHopsAreOutsideDesiredStateConvergence`, `NeighborBindingsConvergeAsTheirOwnResource`). The
 full suite (`meson test -C build/fast --no-suite live`) is the gate.

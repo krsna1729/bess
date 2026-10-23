@@ -32,8 +32,12 @@ void ReserveOneMore(std::vector<T> &v) {
 std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     std::string name, const Config &config, size_t max_next_hops,
     rcu::RcuDomain &domain, size_t max_domains, size_t max_groups) {
-  if (max_next_hops == 0 || max_next_hops > LpmRouteTable::kMaxValue ||
-      max_groups > LpmRouteTable::kMaxValue - max_next_hops) {
+  // With a FIB a route value is 24 bits and holds max_next_hops + group id
+  // (D-065); without one an id is only ever a 32-bit metadata value.
+  const size_t max_value = config.ipv4 || config.ipv6 ? LpmRouteTable::kMaxValue
+                                                       : kMaxNextHopsWithoutFib;
+  if (max_next_hops == 0 || max_next_hops > max_value ||
+      max_groups > max_value - max_next_hops) {
     return std::unexpected(RouteError::kValueOutOfRange);
   }
   if (max_domains == 0 || max_domains > kMaxRouteDomains) {

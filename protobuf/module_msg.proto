@@ -1525,9 +1525,12 @@ enum FlowHashFields {
  * Address families (D-180). In ROUTE_MODE_NEXT_HOP_ID the router has no FIB:
  * it forwards IPv4 and IPv6 alike, decrementing each packet's TTL or hop
  * limit by its own family, takes interface addresses and neighbor bindings of
- * either family, and refuses the FIB fields (max_ipv4_routes, max_ipv4_tbl8s,
- * max_ipv6_routes, max_ipv6_tbl8s, backend) and every route write. An empty
- * RouterArg is a valid next-hop-id router. In ROUTE_MODE_DESTINATION a
+ * either family, and refuses every field only a FIB would read
+ * (max_ipv4_routes, max_ipv4_tbl8s, max_ipv6_routes, max_ipv6_tbl8s, a
+ * non-default backend, a nonzero max_groups, max_domains above 1, a
+ * non-default flow_hash, domain_attr, punt_miss_gate, punt_unresolved_gate)
+ * and every route and group write. An empty RouterArg is a valid next-hop-id
+ * router. In ROUTE_MODE_DESTINATION a
  * family is enabled exactly when its route capacity is set: IPv4 with
  * max_ipv4_routes, IPv6 with max_ipv6_routes, at least one of them. A
  * disabled family has no FIB in any domain; its frames are dropped and
@@ -1550,15 +1553,15 @@ message RouterArg {
   optional uint64 max_ipv6_routes = 3; /// Destination mode: IPv6 routes per domain; setting it enables IPv6 (0 is refused). Refused in next-hop-id mode.
   optional uint64 max_ipv6_tbl8s = 4; /// Destination mode: IPv6 (rte_fib6) tbl8 groups per domain (absent: 8192; 0 is refused; needs max_ipv6_routes). A route reserves one per byte between its length and its covering route's, counted from /24. Refused in next-hop-id mode.
   RouteBackend backend = 5; /// Destination mode: the IPv4 route table structure (default: LPM). IPv6 always uses rte_fib6. A non-default value is refused in next-hop-id mode.
-  uint64 max_next_hops = 6; /// Most next hops (default 4096).
-  uint64 max_groups = 7; /// Most next-hop groups (default 0: none; a route may name a group only with a nonzero bound). Together with max_next_hops, bounded by the 24-bit route value.
-  uint64 max_domains = 8; /// Route domains (VRFs) 0..n-1, each with its own FIB per enabled family, sized as above (default 1: the default domain only).
+  uint64 max_next_hops = 6; /// Most next hops (default 4096). Destination mode: together with max_groups, bounded by the 24-bit route value; next-hop-id mode: by the 32-bit id.
+  uint64 max_groups = 7; /// Destination mode: most next-hop groups (default 0: none; a route may name a group only with a nonzero bound). Together with max_next_hops, bounded by the 24-bit route value. A nonzero value is refused in next-hop-id mode, where only a route could name a group.
+  uint64 max_domains = 8; /// Destination mode: route domains (VRFs) 0..n-1, each with its own FIB per enabled family, sized as above (default 1: the default domain only). Above 1 is refused in next-hop-id mode.
   RouteMode mode = 9; /// What the packet path decides from (default: the next_hop_id metadata).
-  FlowHashFields flow_hash = 10; /// Which fields a route that names a next-hop group hashes to pick its member (default: the whole flow, D-163).
+  FlowHashFields flow_hash = 10; /// Destination mode: which fields a route that names a next-hop group hashes to pick its member (default: the whole flow, D-163). A non-default value is refused in next-hop-id mode.
   string next_hop_attr = 11; /// The metadata attribute next-hop mode reads the next-hop id from (default "next_hop_id").
-  string domain_attr = 12; /// The metadata attribute destination mode reads the route domain from (default "route_domain").
-  uint64 punt_miss_gate = 13; /// Where a frame the FIB has no route for goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. Gate 0 is a real gate, so a punt target is any other gate. The frame is counted either way (D-162).
-  uint64 punt_unresolved_gate = 14; /// Where a frame whose hop's neighbor is unresolved goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE to drop it. The frame is counted either way (D-162).
+  string domain_attr = 12; /// Destination mode: the metadata attribute the route domain is read from (default "route_domain"). Refused in next-hop-id mode.
+  uint64 punt_miss_gate = 13; /// Destination mode: where a frame the FIB has no route for goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. Gate 0 is a real gate, so a punt target is any other gate. The frame is counted either way (D-162). Any nonzero value is refused in next-hop-id mode.
+  uint64 punt_unresolved_gate = 14; /// Destination mode: where a frame whose hop's neighbor is unresolved goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE to drop it. The frame is counted either way (D-162). Any nonzero value is refused in next-hop-id mode.
   uint64 punt_local_gate = 15; /// Where a frame to this node's own address (a local route) goes instead of being dropped: an output gate, or 0 (the default) or DROP_GATE (8192) to drop it. So do link-local or multicast IPv6 frames in destination mode, which are never forwarded, and, unless punt_neighbor_gate names another gate, the ARP requests and Neighbor Solicitations a resolving router receives. The frame is counted either way (D-178, D-180).
   uint64 punt_neighbor_gate = 16; /// Where the ARP requests and Neighbor Solicitations a resolving router receives go, in either mode: an output gate (the responder that answers for the interfaces' addresses), DROP_GATE (8192) to drop them, or 0 (the default) to follow punt_local_gate. Counted either way (D-180).
   string ingress_interface_attr = 17; /// The metadata attribute naming the RouterInterface a frame arrived on, read for ARP and Neighbor Discovery input (default "vif_id", what Vif writes).
