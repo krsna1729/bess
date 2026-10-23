@@ -11,6 +11,10 @@
 //        generation backend (RuntimeMaskedBackend) WildcardMatch rebuilt per
 //        rule, 1 = ConcurrentMaskedTable. Width 13 exercises the masking
 //        kernel's 8+4+1-byte steps (D-124).
+//   BM_UpsertErase/tuples/rules  the table's in-place writer: one new rule
+//        upserted and erased again (both directly, not through a
+//        transaction) on a table of `rules` rules over `tuples` masks, 13-byte
+//        keys. Time is per add + delete.
 
 #include <benchmark/benchmark.h>
 
@@ -126,6 +130,35 @@ void BM_Lookup(benchmark::State &st) {
 }
 BENCHMARK(BM_Lookup)->ArgsProduct(
     {{0, 1}, {1, 4, 8}, {1000, 16000, 128000, 1000000}, {8, 13}});
+
+void BM_UpsertErase(benchmark::State &st) {
+  const int tuples = static_cast<int>(st.range(0));
+  const auto rules = static_cast<size_t>(st.range(1));
+  constexpr size_t kWidth = 13;
+  LookupFixture &f = FixtureFor(tuples, rules, kWidth);
+  // Fresh rules in mask 0 (every byte but byte 0), none of them in the table.
+  std::vector<std::byte> mask(kWidth, std::byte{0xff});
+  mask[0] = std::byte{0};
+  constexpr size_t kFresh = 1024;
+  std::vector<std::byte> fresh(kFresh * kWidth);
+  std::mt19937_64 rng(0xf7e5);
+  for (size_t i = 0; i < kFresh; i++) {
+    std::byte *v = fresh.data() + i * kWidth;
+    for (size_t b = 1; b < kWidth; b++) v[b] = static_cast<std::byte>(rng());
+    v[0] = std::byte{0};
+  }
+  const ConstBytes m(mask.data(), kWidth);
+  size_t i = 0;
+  for (auto _ : st) {
+    const ConstBytes v(fresh.data() + i * kWidth, kWidth);
+    auto r = f.concurrent->Upsert(m, v, 1, 1);
+    benchmark::DoNotOptimize(r);
+    if (!f.concurrent->Erase(m, v)) st.SkipWithError("erase failed");
+    i = (i + 1) % kFresh;
+  }
+  st.SetItemsProcessed(st.iterations());
+}
+BENCHMARK(BM_UpsertErase)->ArgsProduct({{1, 8}, {1000, 16000, 128000}});
 
 #endif  // HAVE_CONCURRENT_MASKED
 

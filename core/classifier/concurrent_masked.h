@@ -9,8 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -34,10 +36,23 @@ namespace bess::classifier {
 //
 // A table value packs the rule id (low 32 bits) with the rule's result (bits
 // 32-47) and its priority (bits 48-63, biased, when it fits in [-32767,
-// 32767]; 0 otherwise), so a packet that exactly one tuple matches takes its
+// 32766]; 0 otherwise), so a packet that exactly one tuple matches takes its
 // result from the table without touching the record, and a second match ranks
 // by the packed priorities; a record is loaded only for equal priorities (the
-// later command wins) or one that does not fit.
+// later command wins) or one that does not fit. Bits 48-63 all set mark a
+// chain instead (below).
+//
+// A rule may also carry ranges (D-186): the field at a byte offset of the key,
+// read as a big-endian unsigned integer, must lie in an inclusive [low, high].
+// A ranged field is not in the rule's mask, so a range adds no tuple. Rule
+// identity is (mask, value, ranges): rules that share a (mask, value) and
+// differ in their ranges coexist under one table key. A key whose only rule
+// has no range keeps the packed value above; any other key's value points
+// at an immutable chain: (rule, ranges) entries best first (priority, then
+// sequence). A lookup that hits a chain takes its first entry whose ranges
+// all hold the packet's unmasked field values, or no match from that tuple.
+// Changing any rule of such a key writes a new chain and swaps the value to
+// it; the old chain is freed only after a grace period, as rule ids are.
 //
 // Each tuple keeps the highest priority any of its rules has had (raised
 // before a rule becomes visible, never lowered while the tuple lives), and the
@@ -79,6 +94,78 @@ class ConcurrentMaskedTable {
     uint32_t result_id;
   };
 
+  // An inclusive range on one field of the key (D-186): the `width` bytes at
+  // `offset`, read as a big-endian unsigned integer, lie in [low, high]. A
+  // rule's ranges are sorted by offset and do not overlap; the mask is zero
+  // under each, and a range that covers its field's whole domain is no range
+  // (refused: the rule without it is the same rule).
+  struct KeyRange {
+    uint32_t offset;
+    uint32_t width;  // 1..8 bytes
+    uint64_t low;
+    uint64_t high;
+    bool operator==(const KeyRange &) const = default;
+  };
+  using Ranges = std::span<const KeyRange>;
+  // MaskedRuleResource keys carry ranges as these bytes: no padding.
+  static_assert(sizeof(KeyRange) == 24);
+
+ private:
+  // One rule of a chain: its packed value (as a table value would hold it)
+  // and its ranges, a slice of the chain's range array.
+  struct ChainEntry {
+    uint64_t packed;
+    uint32_t first_range;
+    uint32_t range_count;
+  };
+  // An immutable chain (write-once once published): one allocation holding
+  // the header, `entry_capacity` entries and `range_capacity` ranges, so a
+  // short chain is a cache line or two. Allocated to a capacity by the
+  // writer before it is needed (a commit fills a spare and cannot allocate).
+  struct alignas(8) Chain {
+    uint32_t count;  // entries, best first
+    uint32_t range_count;
+    uint32_t entry_capacity;
+    uint32_t range_capacity;
+
+    // Frees what New allocated: one raw ::operator new block holding the
+    // header and its trailing arrays (the header is trivially destructible).
+    struct Free {
+      void operator()(Chain *chain) const noexcept { ::operator delete(chain); }
+    };
+    static std::unique_ptr<Chain, Free> New(uint32_t entries, uint32_t ranges);
+
+    const ChainEntry *entries() const noexcept {
+      return reinterpret_cast<const ChainEntry *>(this + 1);
+    }
+    ChainEntry *entries() noexcept {
+      return reinterpret_cast<ChainEntry *>(this + 1);
+    }
+    const KeyRange *ranges() const noexcept {
+      return reinterpret_cast<const KeyRange *>(entries() + entry_capacity);
+    }
+    KeyRange *ranges() noexcept {
+      return reinterpret_cast<KeyRange *>(entries() + entry_capacity);
+    }
+    Ranges RangesOf(const ChainEntry &e) const noexcept {
+      return Ranges(ranges() + e.first_range, e.range_count);
+    }
+  };
+  using ChainPtr = std::unique_ptr<Chain, Chain::Free>;
+  // The writer's view of one table key with prepared, uncommitted changes:
+  // how many, what the upserts among them add, and one spare chain per
+  // change once the key can hold a chain, each large enough for any order
+  // in which the changes commit.
+  struct KeyState {
+    size_t changes = 0;
+    size_t upserts = 0;
+    size_t upsert_ranges = 0;
+    size_t ranged_upserts = 0;
+    std::vector<ChainPtr> spares;
+  };
+  using KeyStates = std::map<std::vector<std::byte>, KeyState>;
+
+ public:
   // One lookup result: the winning rule's gate (out of the packed value) and
   // the rule's id, so a caller that needs the record can load it.
   struct Match {
@@ -93,6 +180,7 @@ class ConcurrentMaskedTable {
     kFull,           // out of rule ids, or a tuple table could not grow
     kNotCanonical,
     kReservedResult,  // kPendingResult is not a rule result
+    kBadRange,        // a range that is not canonical (see KeyRange)
   };
 
   // The result a rule being prepared by a transaction carries (D-024): it
@@ -112,9 +200,10 @@ class ConcurrentMaskedTable {
   // -- writer ------------------------------------------------------------------
 
   UpsertResult Upsert(ConstBytes mask, ConstBytes value, int64_t priority,
-                      uint16_t gate, uint32_t result_id = 0);
-  // False if no rule has exactly this (mask, value).
-  bool Erase(ConstBytes mask, ConstBytes value);
+                      uint16_t gate, uint32_t result_id = 0,
+                      Ranges ranges = {});
+  // False if no rule has exactly this (mask, value, ranges).
+  bool Erase(ConstBytes mask, ConstBytes value, Ranges ranges = {});
   // Removes every rule and every tuple.
   void Clear();
 
@@ -129,43 +218,61 @@ class ConcurrentMaskedTable {
   // store or delete and cannot fail; it returns the id no longer named (0 if
   // none), which the caller hands to Recycle() once a grace period has
   // passed. Cancel() undoes a Prepare*() that will not be committed. Rules
-  // prepared together must have distinct (mask, value).
+  // prepared together must have distinct (mask, value, ranges); several may
+  // share a (mask, value), and each commit builds that key's chain from what
+  // is live at the time, so any commit order (and cancelling any of them)
+  // ends in the same table.
   struct Prepared {
     std::vector<std::byte> mask;
     std::vector<std::byte> value;
+    std::vector<KeyRange> ranges;
     RuleId id = 0;        // the new record (upsert); 0 for an erase
     RuleId old = 0;       // the rule replaced or erased; 0 for a new rule
     uint16_t gate = 0;
     uint32_t result_id = 0;
+    KeyStates::iterator key;  // the writer's pending state for the key
   };
   std::expected<Prepared, UpsertResult> PrepareUpsert(ConstBytes mask,
                                                       ConstBytes value,
                                                       int64_t priority,
                                                       uint16_t gate,
-                                                      uint32_t result_id = 0);
-  // nullopt if no rule has exactly this (mask, value).
-  std::optional<Prepared> PrepareErase(ConstBytes mask, ConstBytes value);
+                                                      uint32_t result_id = 0,
+                                                      Ranges ranges = {});
+  // nullopt if no rule has exactly this (mask, value, ranges).
+  std::optional<Prepared> PrepareErase(ConstBytes mask, ConstBytes value,
+                                       Ranges ranges = {});
   RuleId Commit(const Prepared &prepared) noexcept;
   void Cancel(const Prepared &prepared) noexcept;
   // Returns a committed-away id for reuse, and drops tuples a commit or a
   // cancel left empty (neither can republish the tuple list: it allocates).
   void Recycle(RuleId id);
 
-  // The committed rule with exactly this (mask, value), if any.
-  std::optional<Rule> FindRule(ConstBytes mask, ConstBytes value) const;
+  // The committed rule with exactly this (mask, value, ranges), if any.
+  std::optional<Rule> FindRule(ConstBytes mask, ConstBytes value,
+                               Ranges ranges = {}) const;
 
   // The record a Match names (D-141). Records live in fixed chunks that are
   // never moved or freed while the table lives, so this is a plain indexed
   // load -- the one a module with result fields makes per winner.
   const Rule &RuleAt(RuleId id) const noexcept { return Record(id); }
 
-  // Visits every rule: fn(ConstBytes mask, ConstBytes value, const Rule &).
+  // Visits every rule: fn(ConstBytes mask, ConstBytes value, const Rule &,
+  // Ranges). A key with prepared new rules only (D-024) is visited once,
+  // with the pending record.
   template <typename Fn>
   void ForEach(Fn &&fn) const {
     for (const Tuple &tuple : tuples_.Read()->tuples) {
+      const ConstBytes mask(tuple.mask.data(), tuple.mask.size());
       tuple.table->ForEach([&](ConstBytes value, uint64_t packed) {
-        fn(ConstBytes(tuple.mask.data(), tuple.mask.size()), value,
-           Record(IdOf(packed)));
+        if (!IsChain(packed)) {
+          fn(mask, value, Record(IdOf(packed)), Ranges{});
+          return;
+        }
+        const Chain &chain = ChainOf(packed);
+        for (uint32_t e = 0; e < chain.count; e++) {
+          const ChainEntry &entry = chain.entries()[e];
+          fn(mask, value, Record(IdOf(entry.packed)), chain.RangesOf(entry));
+        }
       });
     }
   }
@@ -176,6 +283,8 @@ class ConcurrentMaskedTable {
   uint32_t key_len() const noexcept { return key_len_; }
   // Rule ids retired but not yet past their grace period.
   size_t retiring_ids() const noexcept { return records_.retiring(); }
+  // Chains replaced but not yet past their grace period.
+  size_t retiring_chains() const noexcept { return retired_chains_.size(); }
   // Rule ids not free: live rules, retiring ids, prepared records and the
   // pending record.
   size_t ids_in_use() const noexcept { return records_.in_use(); }
@@ -221,13 +330,22 @@ class ConcurrentMaskedTable {
       for (uint64_t m = hits; m != 0; m &= m - 1) {
         const size_t i = static_cast<size_t>(__builtin_ctzll(m));
         const uint64_t bit = uint64_t{1} << i;
+        uint64_t hit = ids[i];
+        if (IsChain(hit)) {
+          // The key's first rule whose ranges hold this packet, read from
+          // its unmasked key.
+          hit = Resolve(ChainOf(hit), keys.data() + i * stride);
+          if (hit == 0) {
+            continue;
+          }
+        }
         if ((matched & bit) == 0) {
-          best[i] = ids[i];
-          best_priority[i] = PriorityOf(ids[i]);
+          best[i] = hit;
+          best_priority[i] = PriorityOf(hit);
           matched |= bit;
-        } else if (Better(ids[i], best[i])) {
-          best[i] = ids[i];
-          best_priority[i] = PriorityOf(ids[i]);
+        } else if (Better(hit, best[i])) {
+          best[i] = hit;
+          best_priority[i] = PriorityOf(hit);
         }
       }
     }
@@ -272,11 +390,12 @@ class ConcurrentMaskedTable {
   static RuleId IdOf(uint64_t value) noexcept {
     return static_cast<RuleId>(value);
   }
-  // Bits 48-63: the priority biased by 2^15 when it is in [-32767, 32767],
-  // else 0 (rank from the record).
-  static constexpr int64_t kPackedPriorityLimit = 32767;
+  // Bits 48-63: the priority biased by 2^15 when it is in [-32767, 32766],
+  // else 0 (rank from the record). 0xFFFF marks a chain.
+  static constexpr int64_t kPackedPriorityLow = -32767;
+  static constexpr int64_t kPackedPriorityHigh = 32766;
   static uint64_t PackedPriority(int64_t priority) noexcept {
-    return priority >= -kPackedPriorityLimit && priority <= kPackedPriorityLimit
+    return priority >= kPackedPriorityLow && priority <= kPackedPriorityHigh
                ? static_cast<uint64_t>(priority + 32768)
                : 0;
   }
@@ -288,6 +407,54 @@ class ConcurrentMaskedTable {
   int64_t PriorityOf(uint64_t packed) const noexcept {
     const uint64_t biased = packed >> 48;
     return biased != 0 ? static_cast<int64_t>(biased) - 32768 : Record(IdOf(packed)).priority;
+  }
+
+  // A chain's table value: its address (below 2^48, checked when the chain
+  // is allocated) under the 0xFFFF tag no packed priority reaches.
+  static constexpr uint64_t kChainTag = uint64_t{0xFFFF} << 48;
+  static bool IsChain(uint64_t value) noexcept {
+    return (value & kChainTag) == kChainTag;
+  }
+  static const Chain &ChainOf(uint64_t value) noexcept {
+    // A tagged pointer: the table's 64-bit value is the only slot the
+    // lookup reads, and an id-indexed chain table would add a dependent
+    // load to every ranged hit. The address came from ChainValue.
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+    return *reinterpret_cast<const Chain *>(
+        static_cast<uintptr_t>(value & ~kChainTag));
+  }
+  static uint64_t ChainValue(const Chain *chain) noexcept {
+    return reinterpret_cast<uintptr_t>(chain) | kChainTag;
+  }
+  // The field a range names, big-endian, out of an unmasked key.
+  static uint64_t FieldOf(const std::byte *key, const KeyRange &range) noexcept {
+    uint64_t v = 0;
+    for (uint32_t b = 0; b < range.width; b++) {
+      v = (v << 8) | static_cast<uint8_t>(key[range.offset + b]);
+    }
+    return v;
+  }
+  // The packed value of `chain`'s first entry whose ranges all hold `key`,
+  // or 0.
+  static uint64_t Resolve(const Chain &chain, const std::byte *key) noexcept {
+    // The count first, with acquire (paired with BuildChain's release).
+    const uint32_t count = __atomic_load_n(&chain.count, __ATOMIC_ACQUIRE);
+    const ChainEntry *entries = chain.entries();
+    const KeyRange *ranges = chain.ranges();
+    for (uint32_t e = 0; e < count; e++) {
+      const KeyRange *r = ranges + entries[e].first_range;
+      const KeyRange *end = r + entries[e].range_count;
+      for (; r != end; r++) {
+        const uint64_t v = FieldOf(key, *r);
+        if (v < r->low || v > r->high) {
+          break;
+        }
+      }
+      if (r == end) {
+        return entries[e].packed;
+      }
+    }
+    return 0;
   }
 
   static bool Better(const Rule &candidate, const Rule &incumbent) noexcept {
@@ -330,13 +497,51 @@ class ConcurrentMaskedTable {
   // Raises the order of `list`'s tuple `index` to `priority`, republishing
   // the list if that moves the tuple.
   void RaiseOrder(const TupleList &list, size_t index, int64_t priority);
-  // The rule id stored for `value` in `table`, or 0.
-  static RuleId Find(const ConcurrentExactTable &table, ConstBytes value);
+  // The raw table value stored for `value`, if any.
+  static std::optional<uint64_t> FindValue(const ConcurrentExactTable &table,
+                                           ConstBytes value);
+  // The id of the committed rule with exactly `ranges` in table value
+  // `packed` (one rule, a chain, or a pending entry), or 0.
+  RuleId IdentityIn(uint64_t packed, Ranges ranges) const noexcept;
+  // Rules and ranges a table value holds (a pending entry holds none).
+  uint32_t RulesIn(uint64_t packed) const noexcept;
+  static uint32_t RangesIn(uint64_t packed) noexcept;
+  // Whether `ranges` are canonical for `mask` (see KeyRange).
+  bool CanonicalRanges(ConstBytes mask, Ranges ranges) const noexcept;
   // The index of the tuple with this mask in `list`, or list size.
   size_t TupleIndex(const TupleList &list, ConstBytes mask) const;
   // Republishes the tuple list without tuples that have no entries (left by
   // transactional erases, which cannot republish).
   void DropEmptyTuples();
+
+  // Pending-key bookkeeping (prepare side): the key's state, with spare
+  // chains for every change once the key can hold a chain (`live` is its
+  // current table value, 0 when absent), sized for the change being
+  // prepared too. Nothing is counted until Track() succeeds.
+  KeyStates::iterator PrepareKey(ConstBytes mask, ConstBytes value,
+                                 uint64_t live, size_t new_ranges, bool upsert);
+  // Counts a prepared change against its key (cannot fail).
+  void Track(KeyStates::iterator key, size_t new_ranges, bool upsert) noexcept;
+  // Drops a key no change counts any more (a failed prepare's, or the last
+  // change's after its commit or cancel).
+  void Untrack(KeyStates::iterator key) noexcept;
+  // Un-counts a committed or cancelled change, and frees spares beyond the
+  // changes left.
+  void Settle(const Prepared &prepared) noexcept;
+  // Writes into `out` the rules of table value `live` without `drop` and
+  // with `add` (its packed value and ranges; 0 for none) in rank order.
+  void BuildChain(uint64_t live, RuleId drop, uint64_t add, Ranges add_ranges,
+                  Chain &out) const noexcept;
+  // Hands a replaced chain to the grace period (capacity reserved by its
+  // prepare: cannot allocate).
+  void RetireChain(const Chain *chain) noexcept;
+  // Frees retired chains whose grace period completed.
+  void ReclaimChains() noexcept;
+  // Upsert/Erase through Prepare + Commit, for keys that hold or will hold
+  // a chain.
+  UpsertResult UpsertViaCommit(ConstBytes mask, ConstBytes value,
+                               int64_t priority, uint16_t gate,
+                               uint32_t result_id, Ranges ranges);
 
   const uint32_t key_len_;
   const size_t max_tuples_;
@@ -350,6 +555,17 @@ class ConcurrentMaskedTable {
   // The record every pending entry names (allocated on first use).
   RuleId pending_id_ = 0;
   size_t size_ = 0;
+  // Keys with prepared, uncommitted changes (writer only).
+  KeyStates pending_keys_;
+  // Prepared changes outstanding over every key. Each commit retires at most
+  // one chain, so retired_chains_ keeps this much spare capacity: a commit
+  // then queues without allocating.
+  size_t prepared_changes_ = 0;
+  struct RetiredChain {
+    ChainPtr chain;
+    rcu::GracePeriod token;
+  };
+  std::vector<RetiredChain> retired_chains_;
 };
 
 }  // namespace bess::classifier

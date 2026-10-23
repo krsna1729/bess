@@ -4,6 +4,7 @@
 #define BESS_CLASSIFIER_MASKED_RULE_RESOURCE_H_
 
 #include <any>
+#include <cstring>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -20,8 +21,9 @@
 namespace bess::classifier {
 
 // A ConcurrentMaskedTable exposed as a transactional resource (Decision
-// D-024): key = the rule's mask then its value (2 x key_len bytes, value
-// canonical under the mask), value = MaskedRuleResource::Value.
+// D-024): key = the rule's mask, its value (2 x key_len bytes, value
+// canonical under the mask), then its ranges (D-186), each a
+// ConcurrentMaskedTable::KeyRange's bytes; value = MaskedRuleResource::Value.
 //
 // Reserve() prepares the rule in the table (ConcurrentMaskedTable::
 // PrepareUpsert/PrepareErase): a new mask, a tuple table's growth, the rule
@@ -62,10 +64,14 @@ class MaskedRuleResource final : public dataplane::Resource {
         references_(std::move(hooks.references)),
         records_(std::move(hooks.records)) {}
 
-  static dataplane::ResourceKey Key(ConstBytes mask, ConstBytes value) {
+  static dataplane::ResourceKey Key(
+      ConstBytes mask, ConstBytes value,
+      ConcurrentMaskedTable::Ranges ranges = {}) {
     dataplane::ResourceKey key(reinterpret_cast<const char *>(mask.data()),
                                mask.size());
     key.append(reinterpret_cast<const char *>(value.data()), value.size());
+    key.append(reinterpret_cast<const char *>(ranges.data()),
+               ranges.size_bytes());
     return key;
   }
 
@@ -92,7 +98,8 @@ class MaskedRuleResource final : public dataplane::Resource {
       return;
     }
     table_()->ForEach([&](ConstBytes, ConstBytes,
-                          const ConcurrentMaskedTable::Rule &rule) {
+                          const ConcurrentMaskedTable::Rule &rule,
+                          ConcurrentMaskedTable::Ranges) {
       for (const auto &ref : references_(
                Value{rule.priority, rule.gate, Load(rule.result_id)})) {
         visit(ref);
@@ -105,13 +112,15 @@ class MaskedRuleResource final : public dataplane::Resource {
       const dataplane::Op &op) override {
     std::shared_ptr<ConcurrentMaskedTable> table = table_();
     const size_t len = table->key_len();
-    if (op.key.size() != 2 * len) {
+    const auto ranges = RangesOf(op.key, len);
+    if (!ranges) {
       return std::unexpected("key is " + std::to_string(op.key.size()) +
                              " bytes, want mask and value of " +
-                             std::to_string(len) + " each");
+                             std::to_string(len) +
+                             " each, then whole ranges");
     }
     const ConstBytes mask = Mask(op.key, len), value = ValueBytes(op.key, len);
-    const auto previous = table->FindRule(mask, value);
+    const auto previous = table->FindRule(mask, value, *ranges);
     std::vector<dataplane::Reference> previous_references;
     if (previous && references_) {
       previous_references =
@@ -145,7 +154,7 @@ class MaskedRuleResource final : public dataplane::Resource {
       if (records_ != nullptr && previous->result_id != 0) {
         retire_guard.Reserve(records_.get());
       }
-      auto prepared = table->PrepareErase(mask, value);
+      auto prepared = table->PrepareErase(mask, value, *ranges);
       if (!prepared) {
         return std::unexpected("not found");
       }
@@ -210,7 +219,7 @@ class MaskedRuleResource final : public dataplane::Resource {
       retire_guard.Reserve(records_.get());
     }
     auto prepared = table->PrepareUpsert(mask, value, v->priority, v->gate,
-                                         record_id);
+                                         record_id, *ranges);
     if (!prepared) {
       return std::unexpected(Describe(prepared.error()));
     }
@@ -236,6 +245,22 @@ class MaskedRuleResource final : public dataplane::Resource {
     return ConstBytes(reinterpret_cast<const std::byte *>(key.data()) + len,
                       len);
   }
+  // The ranges after the mask and value; nullopt when the key is not a mask,
+  // a value and whole ranges.
+  static std::optional<std::vector<ConcurrentMaskedTable::KeyRange>> RangesOf(
+      const dataplane::ResourceKey &key, size_t len) {
+    using KeyRange = ConcurrentMaskedTable::KeyRange;
+    if (key.size() < 2 * len || (key.size() - 2 * len) % sizeof(KeyRange) != 0) {
+      return std::nullopt;
+    }
+    std::vector<KeyRange> ranges((key.size() - 2 * len) / sizeof(KeyRange));
+    // An empty vector's data() may be null, which memcpy may not receive.
+    if (!ranges.empty()) {
+      std::memcpy(ranges.data(), key.data() + 2 * len,
+                  ranges.size() * sizeof(KeyRange));
+    }
+    return ranges;
+  }
 
   // The stored record bytes for a rule's id.
   std::vector<std::byte> Load(uint32_t id) const {
@@ -249,10 +274,11 @@ class MaskedRuleResource final : public dataplane::Resource {
   static std::optional<ConcurrentMaskedTable::Rule> Find(
       const ConcurrentMaskedTable &table, const dataplane::ResourceKey &key) {
     const size_t len = table.key_len();
-    if (key.size() != 2 * len) {
+    const auto ranges = RangesOf(key, len);
+    if (!ranges) {
       return std::nullopt;
     }
-    return table.FindRule(Mask(key, len), ValueBytes(key, len));
+    return table.FindRule(Mask(key, len), ValueBytes(key, len), *ranges);
   }
 
   static std::string Describe(ConcurrentMaskedTable::UpsertResult r) {
@@ -264,6 +290,9 @@ class MaskedRuleResource final : public dataplane::Resource {
         return "value has bits outside its mask";
       case R::kReservedResult:
         return "result is reserved (kPendingResult)";
+      case R::kBadRange:
+        return "a range is not canonical (overlapping, masked, empty, or "
+               "the whole field)";
       case R::kFull:
         return "rule table is full";
       case R::kInserted:

@@ -12838,3 +12838,97 @@ MARK, which is DPDK's build default.
 
 **Revisit when:** hardware validation runs, a PMD reports the MARK some other way (a dynamic mbuf field), or a
 reader needs `USER_FLAG` or the tunnel ID.
+
+## D-186 WildcardMatch takes an inclusive range per field
+
+**Status:** accepted (2026-10-23).
+**Code:** `core/classifier/concurrent_masked.{h,cc}`, `core/classifier/masked_rule_resource.h`,
+`core/modules/wildcard_match.{h,cc}`, `protobuf/module_msg.proto` (`WildcardMatchFieldRange`,
+`WildcardMatchRuleKey.ranges`, `WildcardMatchCommandAddArg.ranges`), `core/classifier/concurrent_masked_test.cc`,
+`core/modules/wildcard_match_test.cc`, `core/modules/transaction_conformance_test.cc`,
+`core/classifier/range_vs_firewall_bench.cc`, `core/modules/wildcard_match_update_bench.cc`.
+**Analysis and measurements:** [benchmarking.md](benchmarking.md), [dataplane-tables.md](dataplane-tables.md).
+
+**Context.** A `WildcardMatch` rule could only say "field F under mask M": a range had to be written as up to
+2n-2 prefixes per field, each one a rule and each distinct mask a tuple out of `max_tuples` (D-102). D-147
+gave ranges a home in `FirewallTable`, whose index leaves the ports out of the key; but that table is rebuilt
+whole on every change (D-179: one transaction costs the build), it orders rules as a list, and its key is fixed
+to the 5-tuple. The question was whether the masked table can carry ranges itself, updated in place, and how
+it then compares with the firewall on the same policy. D-038's `ScalarRangeBackend` is the oracle the
+differential test checks the table against.
+
+**Decision.**
+
+- **Wire format.** `WildcardMatchFieldRange {field, low, high}`: `field` indexes the module's `fields`, and
+  `low`/`high` are inclusive bounds on the field read as a big-endian unsigned integer of its width.
+  `WildcardMatchRuleKey` and `WildcardMatchCommandAddArg` carry `repeated ranges`; a rule without ranges
+  encodes exactly as before.
+- **Refused, never widened (EINVAL):** an unknown field, two ranges on one field, `low > high`, a `high` wider
+  than the field, and a range on a field whose mask is not zero (the range replaces the mask). A range over the
+  field's whole domain is dropped, so it is the same rule as none; `low == high` stays a range rather than
+  becoming a mask, so a rule reads back as it was written.
+- **Identity** is (mask, value, ranges): two rules with the same mask and value and different ranges coexist,
+  and writing the same three again replaces the rule, as before.
+- **Table.** A ranged field's mask is zero, so ranges add no tuple and the tuple walk and its ceiling skip
+  (D-098) are unchanged. A table value is either today's packed rule (one unranged rule: no chain, no extra
+  load) or a pointer to an immutable **chain** - one allocation holding the key's rules best first (priority,
+  then the later command) and their ranges contiguously - tagged by 0xFFFF in bits 48-63. A hit on a chain
+  scans it and takes the first entry whose every range holds the packet's field, read from the unmasked key; no
+  entry, no match from that tuple. Any change to a chained key builds a new chain and swaps the value with one
+  store; the old chain is freed after an `RcuDomain` grace period, as rule ids are. The tag costs the packed
+  priority its top value: D-098's packed range is now [-32,767, 32,766] (`docs/limits.md`).
+- **Transactions (D-024).** Prepare does everything that can fail, including allocating, per change, a spare
+  chain large enough for the key's live rules plus every upsert pending on that key; commit builds the key's
+  next chain from the live value into that spare, so several prepared changes to one key commit correctly in
+  any order, and cancelling any subset leaves the key as it was. Commit is one store and allocates nothing
+  (pinned by the conformance test). `MaskedRuleResource`'s key carries the ranges after mask and value, so
+  readback and introspection round-trip them.
+
+**Measured.** `classifier_range_vs_firewall_bench` (`core/classifier/range_vs_firewall_bench.cc`): one IPv4
+policy (source, destination, protocol, ports; eight prefix-length pairs, TCP and UDP rules, so 8 tuples for
+WildcardMatch and 16 groups for the firewall) loaded into both tables, with every key's winner checked equal
+before timing. Release, `-Dcpu=x86-64-v3`, i9-13900H, `balanced` profile, pinned with `taskset -c 2`, medians of
+3 repetitions, every cv <= 2.3%, on a shared desktop host. ns per batch of 32 keys, cycling 4,096 keys:
+
+| policy | keys | WildcardMatch | FirewallTable | FirewallScan |
+|---|---|---|---|---|
+| 10 rules, prefixes only | spread hits | 2,994 | 1,195 | 1,814 |
+| 10 rules, dst-port range | spread hits | 3,152 | 1,344 | 2,128 |
+| 100 rules, dst-port range | spread hits | 3,272 | 4,980 | 14,817 |
+| 1,000 rules, dst-port range | spread hits | 3,223 | 11,204 | - |
+| 1,000 rules, dst-port range | misses | 1,752 | 9,365 | - |
+| 10,000 rules, prefixes only | spread hits | 3,096 | 14,101 | - |
+| 10,000 rules, dst-port range | spread hits | 3,309 | 14,333 | - |
+| 10,000 rules, src and dst ranges | spread hits | 3,485 | 14,551 | - |
+| 10,000 rules, dst-port range | misses | 1,773 | 10,570 | - |
+
+WildcardMatch's cost follows its tuple count, not its rules; the firewall's follows its groups times a binary
+search. Ranges add 5-13% to WildcardMatch's hits (the chain scan) and nothing to its misses. Repeating one 32-key
+batch, as `classifier_firewall_table_bench` does, roughly halves both and narrows the gap to 2.2-2.4x at 10K
+rules; at 10 rules the firewall stays 2.3-2.6x ahead either way. One rule added and removed: `ConcurrentMaskedTable`
+0.41 µs unranged and 1.1 µs ranged at every size, against `FirewallTable::Build` twice at 108-121 µs (1K) and
+1.10-1.11 ms (10K); through each module's `<name>/rules` resource, two transactions cost 1.9-2.3 µs for
+WildcardMatch at every size and 4.1 µs, 18.5 µs, 148-150 µs and 1.73 ms for Firewall at 10, 100, 1K and 10K
+rules. Memory: the firewall ~100-116 bytes per rule; WildcardMatch 147-243 at 10K rules, but each tuple's hash
+table has a floor (about 85 KB), which dominates small policies (68 KB per rule at 10 rules).
+
+Unranged rules do not regress on the packet path: `tools/ab_bench.py` over `modules_wildcard_match_update_bench`,
+origin/develop 3454020b against this change, four ABBA pairs, `taskset -c 2`: 15 of 18 `BM_Lookup/1/*` cases
+(1-8 tuples, 1K-128K rules, 8- and 13-byte keys) show no difference, two are 5% faster and one 5% slower (one
+tuple, 128K rules, 8-byte keys). `BM_UpsertErase` (an unranged rule added and removed) is 1.5-5.2% slower, 6-19
+ns of 368-455 ns, for the write path's range and chain checks.
+
+**Consequences.** A ranged policy no longer spends `max_tuples` on its ranges, and it changes one rule at a time
+in microseconds at any size. What `Firewall` still does that `WildcardMatch` does not: IPv6 addresses (a field is
+at most 8 bytes, so an address is two fields, with prefixes split across them), one policy over both families
+with rules for either, transport offsets that follow the IPv4 header length and the IPv6 extension chain, ports
+read as 0 on a non-first fragment or a protocol without ports, dropping a packet it cannot parse, and
+list-order semantics. Many rules on one (mask, value) make a long chain, scanned in order, as the firewall
+scans the entries that share a key.
+
+Both modules stay. `WildcardMatch` with ranges is the choice for IPv4 policies of about a hundred rules and up,
+and for any policy that changes rule by rule; `Firewall` for IPv6 and mixed-family policies, for header layouts
+its parser follows, and for small policies, where it is faster and much smaller.
+
+**Revisit when:** a policy puts hundreds of ranged rules on one (mask, value) (index the chain), or a caller
+needs ranges on a field wider than 8 bytes.

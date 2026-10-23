@@ -1099,6 +1099,7 @@ if get_option('build_benchmarks')
     'flow_decision_cache_bench': ['flow/decision_cache_bench.cc', benchmark_main_dep],
     'l2_fdb_bench': ['l2/fdb_bench.cc', benchmark_main_dep],
     'classifier_range_backend_bench': ['classifier/range_backend_bench.cc', benchmark_main_dep],
+    'classifier_range_vs_firewall_bench': ['classifier/range_vs_firewall_bench.cc', benchmark_main_dep],
     'utils_memory_backing_bench': ['utils/memory_backing_bench.cc', benchmark_main_dep],
     'object_table_bench': ['dataplane/object_table_bench.cc', benchmark_main_dep],
     'transaction_bench': ['dataplane/transaction_bench.cc', benchmark_main_dep],

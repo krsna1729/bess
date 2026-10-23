@@ -451,9 +451,26 @@ message RouterCommandGetNeighborsResponse {
   repeated RouterNeighborStatus neighbors = 1;
 }
 
+/**
+ * An inclusive range on one of a WildcardMatch's fields (D-186): the field's
+ * bytes, read as a big-endian unsigned integer of the field's size, lie in
+ * [low, high]. The field's mask must be all zero (the range replaces it); a
+ * range costs no tuple. A rule names a field at most once, low <= high, and
+ * high fits the field; a range over the field's whole domain is dropped (the
+ * rule is the one without it), and low == high stays a range.
+ */
+message WildcardMatchFieldRange {
+  uint32 field = 1; /// 0-based index into the module's `fields`.
+  uint64 low = 2;   /// Inclusive lower bound.
+  uint64 high = 3;  /// Inclusive upper bound.
+}
+
+// A rule is (values, masks, ranges): rules with the same values and masks and
+// different ranges are different rules.
 message WildcardMatchRuleKey {
   repeated FieldData values = 1;
   repeated FieldData masks = 2;
+  repeated WildcardMatchFieldRange ranges = 3;
 }
 
 message WildcardMatchRuleValue {
@@ -470,6 +487,7 @@ message WildcardMatchCommandAddArg {
   int64 priority = 2; ///If a packet matches multiple rules, the rule with higher priority will be applied. If priorities are equal behavior is undefined.
   repeated FieldData values = 3; /// The values to check for in each field.
   repeated FieldData masks = 4; /// The bitmask for each field -- set `0x0` to ignore the field altogether.
+  repeated WildcardMatchFieldRange ranges = 5; /// Inclusive per-field ranges, as in WildcardMatchRuleKey.
 }
 
 /**

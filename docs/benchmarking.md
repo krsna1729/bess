@@ -155,6 +155,25 @@ transaction and `busy`, the retries the engine asked for. The cost should
 follow `rules` (one build per transaction) and barely move with `ops`; the
 D-179 table is the reference.
 
+`classifier_range_vs_firewall_bench`
+(`core/classifier/range_vs_firewall_bench.cc`, D-186) puts one IPv4 5-tuple
+policy into WildcardMatch's table with per-field ranges
+(`ConcurrentMaskedTable`) and into `FirewallTable` (and `FirewallScan` up to
+100 rules), and checks before timing that every key gets the same winner from
+each. `BM_Lookup/<impl>/<rules>/<shape>/<dist>` cycles a 4,096-key stream
+(`dist` 0 spread hits, 1 misses) or repeats one 32-key batch (`dist` 2, the
+harness above: a best case, because the branch predictor learns the batch);
+`BM_TableUpdate` and `BM_ModuleUpdate` time one rule added and removed, in the
+table and through each module's `<name>/rules` resource. Run it as above:
+
+```
+ninja -C build/relsem core/classifier_range_vs_firewall_bench
+taskset -c 2 build/relsem/core/classifier_range_vs_firewall_bench \
+    --benchmark_repetitions=3 --benchmark_report_aggregates_only=true
+```
+
+D-186 has the numbers and the tuple and group counts.
+
 ## Flow-state tables
 
 `flow_bench` (`core/flow/flow_bench.cc`, D-052) covers `WorkerFlowTable` and

@@ -66,6 +66,7 @@ stopping traffic.
 | exact match on runtime-defined fields (packet/metadata bytes → small value) | `ConcurrentExactTable` | `classifier/concurrent_exact.h` | in place, O(1) (mode C) |
 | masked/ternary match with priorities (5-tuple ACL style) | `RuntimeMaskedBackend` in a generation | `classifier/masked_exact.h` | rebuild + swap (mode G) |
 | masked 5-tuple **with port ranges**, both families, order = policy order | `FirewallTable` | `classifier/firewall_table.h` | rebuild + swap (mode G) |
+| masked match with priorities and inclusive per-field **ranges**, changed one rule at a time | `ConcurrentMaskedTable` (WildcardMatch's) | `classifier/concurrent_masked.h` | in place (mode C), D-186 |
 | exact match with a compile-time key type (a struct you own) | `ExactTable<Key, Result, Backend>` | `classifier/typed_exact.h` | rebuild + swap (G) |
 | IPv4 longest-prefix match | `RouteTable<Value>`; `Router` for routes + next hops + groups | `route/route_table.h`, `route/router.h` | in place (C) |
 | id → object (the result of a lookup is a rich object) | `ObjectTable<Id, T>` | `dataplane/object_table.h` | rebuild + swap (G) |
@@ -186,10 +187,10 @@ The index is tuple space over the **masked fields only**: one group per
 (family, protocol, source prefix length, destination prefix length), each
 holding one array of (masked key -> rule) entries sorted by key. **The port
 ranges are not in the key**: they are checked after the group's key hits, so a
-range costs no group and no mask. That is what `WildcardMatch` cannot do - it
-must write a range as 2n-2 prefixes per field and pay for each one in its tuple
-budget (D-102) - and it is why the UPF's compiler refuses a PDR with a port
-range today.
+range costs no group and no mask. Before D-186 `WildcardMatch` could not do
+that - it had to write a range as 2n-2 prefixes per field and pay for each one
+in its tuple budget (D-102); it now takes an inclusive range per field, which
+costs no tuple either (D-186 compares the two tables on one policy).
 
 Measured (`classifier_firewall_table_bench`, release, `-march=x86-64-v3`, 32
 keys per batch, pinned to one core; see [benchmarking.md](benchmarking.md) for
@@ -418,7 +419,7 @@ reference to something missing.
   - `ExactRuleResource` over a `ConcurrentExactTable` (key = key bytes,
     value = `uint64_t`);
   - `MaskedRuleResource` over a `ConcurrentMaskedTable` (key = mask and
-    value bytes, value = `{priority, result}`).
+    value bytes, then the rule's ranges; value = `{priority, result}`).
 
   Each takes a function naming the keys a value refers to (a rule's
   meter and next hop).
@@ -689,7 +690,7 @@ reference to something missing.
 |---|---|---|---|
 | ExactMatch | `ConcurrentExactTable` | C: add/delete/clear in place; default gate and restore by G; transactions through resource `<module>/rules` | 0.3 µs per add at any size; D-022 |
 | Router | `RouteTable` (`rte_lpm`) | C: add/delete in place; transactions through the route, next-hop and group resources | routes, next hops and groups as resources (D-023, D-155, D-156); the route key carries its domain |
-| WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list; transactions through resource `<module>/rules` | D-014, D-024 |
+| WildcardMatch | `ConcurrentMaskedTable` (one `ConcurrentExactTable` per mask) | C: add/delete in place; a new or vanished mask republishes only the tuple list; transactions through resource `<module>/rules` | D-014, D-024; per-field ranges cost no tuple (D-186) |
 | L2Forward | `PackedMacTable<SingleWriter>` (one-word slots, 4-way buckets) | C: single-writer, lock-free readers; whole-word slot stores, moves destination-first under a sequence number readers re-check on a miss, no grace period. Multi-entry `add`/`populate` are all-or-nothing per command (validation plus rollback), but not dataplane-atomic: packets see entries one by one | D-017, D-073 |
 | ACL | `std::vector` of rules, linear scan | G: `add` copies, appends and publishes (all or nothing) | D-017; `rte_acl` (G-only) is the candidate for large rule sets |
 | HashLB | configuration only (one `classifier::ExtractPlan` for the custom tuple, rebuilt at resume) | G: one `RcuPtr<Config>`, read once per batch | D-017 |

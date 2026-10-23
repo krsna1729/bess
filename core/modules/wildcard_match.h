@@ -93,12 +93,15 @@ class WildcardMatch final : public Module {
 
  private:
   // One configured rule: per-field value and mask bytes (exactly as decoded
-  // from the protobuf, field-sized) plus its rank and gate. Field bytes are
-  // kept per field so introspection reproduces the legacy byte layout
-  // verbatim; the dense packed key is derived at build time.
+  // from the protobuf, field-sized) plus its ranges, rank and gate. Field
+  // bytes are kept per field so introspection reproduces the legacy byte
+  // layout verbatim; the dense packed key is derived at build time.
   struct Rule {
     std::vector<std::vector<uint8_t>> values;
     std::vector<std::vector<uint8_t>> masks;
+    // Canonical (D-186): in field order, at most one per field, none over a
+    // field's whole domain; offsets and widths in the dense key.
+    std::vector<bess::classifier::ConcurrentMaskedTable::KeyRange> ranges;
     int64_t priority = 0;
     gate_idx_t gate = DROP_GATE;
   };

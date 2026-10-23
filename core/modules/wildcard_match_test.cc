@@ -706,6 +706,7 @@ std::string AddRule(ModuleHarness &h, Module *m, const WildcardMatchCommandAddAr
   bess::pb::WildcardMatchRuleKey key;
   *key.mutable_values() = rule.values();
   *key.mutable_masks() = rule.masks();
+  *key.mutable_ranges() = rule.ranges();
   bess::pb::WildcardMatchRuleValue value;
   value.set_priority(rule.priority());
   value.set_gate(rule.gate());
@@ -1429,6 +1430,187 @@ TEST(WildcardMatchResourceTest, RulesResourceRefusesBadRules) {
   EXPECT_NE("", h.UpsertResource(rules, WmRuleKey({BinData({0xff, 0, 0, 0})}, {BinData(kFull4)}),
                                  WmRuleValue(1, 1)));
   EXPECT_EQ("", h.ReadBackDiffers(rules, {}));
+}
+
+// D-186: per-field ranges. The fields are a 5-tuple's (source and
+// destination address, protocol, source and destination port).
+std::vector<Field> FiveTupleFields() {
+  return {WmField(26, 4), WmField(30, 4), WmField(23, 1), WmField(34, 2), WmField(36, 2)};
+}
+
+bess::pb::WildcardMatchFieldRange FieldRange(uint32_t field, uint64_t low, uint64_t high) {
+  bess::pb::WildcardMatchFieldRange range;
+  range.set_field(field);
+  range.set_low(low);
+  range.set_high(high);
+  return range;
+}
+
+// Source host 26.51.119.68, TCP, any destination; ports wild in the mask.
+bess::pb::WildcardMatchRuleKey HostTcpKey(
+    const std::vector<bess::pb::WildcardMatchFieldRange> &ranges) {
+  const Octets zero4 = {0, 0, 0, 0}, zero2 = {0, 0};
+  auto key = WmRuleKey({BinData(kFull4), BinData(zero4), BinData({0xff}), BinData(zero2),
+                        BinData(zero2)},
+                       {BinData(IpOctets("26.51.119.68")), BinData(zero4), BinData({6}),
+                        BinData(zero2), BinData(zero2)});
+  for (const auto &range : ranges) {
+    *key.add_ranges() = range;
+  }
+  return key;
+}
+
+// Rules that share a (mask, value) and differ in their ranges classify at
+// both bounds of every range (priority, then the later command, decides an
+// overlap), read back with their ranges, and an erase names one by its
+// ranges. A range over a field's whole domain is the rule without it; one
+// value (low == high) stays a range.
+TEST(WildcardMatchResourceTest, RangedRulesClassifyAtTheirBoundsAndRoundTrip) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, FiveTupleFields());
+  ASSERT_NE(nullptr, wm);
+  const std::string rules = wm->name() + "/rules";
+  const auto key_a = HostTcpKey({FieldRange(4, 1000, 1999)});
+  const auto val_a = WmRuleValue(10, 1);
+  const auto key_b = HostTcpKey({FieldRange(3, 5000, 5999), FieldRange(4, 1500, 2500)});
+  const auto val_b = WmRuleValue(20, 2);
+  const auto key_c = HostTcpKey({});
+  const auto val_c = WmRuleValue(1, 3);
+  ASSERT_EQ("", h.UpsertResource(rules, key_a, val_a));
+  // Out of field order on the wire: the same rule.
+  ASSERT_EQ("", h.UpsertResource(rules, HostTcpKey({FieldRange(4, 1500, 2500),
+                                                    FieldRange(3, 5000, 5999)}),
+                                 val_b));
+  // Through the add command's argument (D-140: as the resource).
+  auto add = WmRule(3, 1, {}, {});
+  *add.mutable_values() = key_c.values();
+  *add.mutable_masks() = key_c.masks();
+  ASSERT_EQ("", AddRule(h, wm, add));
+  ASSERT_EQ("", h.SetResource(wm->name() + "/settings", WmSettings(4)));
+
+  std::mt19937 rng(9);
+  const auto gate_of = [&](int sport, int dport, const char *sip = "26.51.119.68") {
+    const auto counts = Counts(h.Run(
+        wm, 0, {TcpPacket({.sip = sip, .dip = "10.0.0.1", .sport = sport, .dport = dport}, rng)},
+        {0, 1, 2, 3, 4}));
+    return counts.size() == 1 ? static_cast<int>(counts.begin()->first) : -1;
+  };
+  EXPECT_EQ(3, gate_of(7, 999));
+  EXPECT_EQ(1, gate_of(7, 1000));
+  EXPECT_EQ(1, gate_of(7, 1999));
+  EXPECT_EQ(3, gate_of(7, 2000));
+  EXPECT_EQ(1, gate_of(4999, 1500)) << "source port below B's range";
+  EXPECT_EQ(2, gate_of(5000, 1500));
+  EXPECT_EQ(2, gate_of(5999, 2500));
+  EXPECT_EQ(3, gate_of(6000, 2500));
+  EXPECT_EQ(3, gate_of(5000, 2501));
+  EXPECT_EQ(4, gate_of(5000, 1500, "26.51.119.69")) << "outside the prefix";
+
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a}, {&key_b, &val_b}, {&key_c, &val_c}}));
+
+  // The whole domain of a field is no range: the same rule as C, replaced.
+  const auto val_c2 = WmRuleValue(1, 0);
+  ASSERT_EQ("", h.UpsertResource(rules, HostTcpKey({FieldRange(4, 0, 65535)}), val_c2));
+  EXPECT_EQ(0, gate_of(7, 999));
+  // One port is a range, and a rule of its own.
+  const auto key_d = HostTcpKey({FieldRange(4, 80, 80)});
+  const auto val_d = WmRuleValue(30, 4);
+  ASSERT_EQ("", h.UpsertResource(rules, key_d, val_d));
+  EXPECT_EQ(4, gate_of(7, 80));
+  EXPECT_EQ(0, gate_of(7, 81));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a},
+                                          {&key_b, &val_b},
+                                          {&key_c, &val_c2},
+                                          {&key_d, &val_d}}));
+
+  EXPECT_NE("", h.EraseResource(rules, HostTcpKey({FieldRange(4, 1000, 1998)})));
+  ASSERT_EQ("", h.EraseResource(rules, key_b));
+  EXPECT_EQ(1, gate_of(5000, 1500));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a}, {&key_c, &val_c2}, {&key_d, &val_d}}));
+}
+
+// A range the module cannot hold exactly is refused rather than widened, and
+// nothing changes.
+TEST(WildcardMatchResourceTest, RangesAreRefusedNotWidened) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, FiveTupleFields());
+  ASSERT_NE(nullptr, wm);
+  const std::string rules = wm->name() + "/rules";
+  const auto value = WmRuleValue(1, 1);
+  EXPECT_NE("", h.UpsertResource(rules, HostTcpKey({FieldRange(5, 1, 2)}), value))
+      << "no such field";
+  EXPECT_NE("", h.UpsertResource(rules, HostTcpKey({FieldRange(4, 1, 2), FieldRange(4, 5, 6)}),
+                                 value))
+      << "two ranges on one field";
+  EXPECT_NE("", h.UpsertResource(rules, HostTcpKey({FieldRange(4, 2, 1)}), value)) << "empty";
+  EXPECT_NE("", h.UpsertResource(rules, HostTcpKey({FieldRange(4, 1, 65536)}), value))
+      << "wider than the 2-byte field";
+  EXPECT_NE("", h.UpsertResource(rules, HostTcpKey({FieldRange(2, 6, 256)}), value))
+      << "wider than the 1-byte field";
+  EXPECT_NE("", h.UpsertResource(rules, HostTcpKey({FieldRange(2, 6, 17)}), value))
+      << "a range on a field whose mask is not zero";
+  EXPECT_NE("", h.EraseResource(rules, HostTcpKey({FieldRange(4, 2, 1)})));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {}));
+}
+
+// One transaction adds two ranged rules to one key and erases its unranged
+// rule; the next replaces one and erases the other. A transaction with one
+// refused operation applies none of it.
+TEST(WildcardMatchResourceTest, OneTransactionChangesSeveralRulesOfOneKey) {
+  ModuleHarness h;
+  Module *wm = CreateWm(h, FiveTupleFields());
+  ASSERT_NE(nullptr, wm);
+  const std::string rules = wm->name() + "/rules";
+  const bess::framework::ResourceCodec *codec = h.Codec(rules);
+  ASSERT_NE(nullptr, codec);
+  const auto op = [&](bool erase, const bess::pb::WildcardMatchRuleKey &key,
+                      const bess::pb::WildcardMatchRuleValue &value) {
+    google::protobuf::Any k, v;
+    EXPECT_TRUE(k.PackFrom(key));
+    EXPECT_TRUE(v.PackFrom(value));
+    auto ek = codec->Key(k.type_url(), k.value());
+    EXPECT_TRUE(ek.has_value());
+    if (erase) {
+      return bess::dataplane::Op::Erase(rules, *ek);
+    }
+    auto ev = codec->Value(v.type_url(), v.value());
+    EXPECT_TRUE(ev.has_value());
+    return bess::dataplane::Op::Upsert(rules, *ek, std::move(*ev));
+  };
+  const auto key_c = HostTcpKey({});
+  const auto key_a = HostTcpKey({FieldRange(4, 100, 199)});
+  const auto key_b = HostTcpKey({FieldRange(4, 150, 249)});
+  ASSERT_EQ("", h.UpsertResource(rules, key_c, WmRuleValue(1, 3)));
+  ASSERT_EQ("", h.SetResource(wm->name() + "/settings", WmSettings(4)));
+  std::mt19937 rng(10);
+  const auto gate_of = [&](int dport) {
+    const auto counts = Counts(h.Run(
+        wm, 0,
+        {TcpPacket({.sip = "26.51.119.68", .dip = "10.0.0.1", .sport = 7, .dport = dport}, rng)},
+        {0, 1, 2, 3, 4}));
+    return counts.size() == 1 ? static_cast<int>(counts.begin()->first) : -1;
+  };
+
+  const auto val_a = WmRuleValue(5, 1), val_b = WmRuleValue(5, 2);
+  ASSERT_EQ("", h.Apply({op(false, key_a, val_a), op(false, key_b, val_b),
+                         op(true, key_c, {})}));
+  EXPECT_EQ(4, gate_of(99));
+  EXPECT_EQ(1, gate_of(100));
+  EXPECT_EQ(2, gate_of(150)) << "equal priority: the later operation";
+  EXPECT_EQ(2, gate_of(249));
+  EXPECT_EQ(4, gate_of(250));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a}, {&key_b, &val_b}}));
+
+  const auto val_a2 = WmRuleValue(5, 0);
+  ASSERT_EQ("", h.Apply({op(false, key_a, val_a2), op(true, key_b, {})}));
+  EXPECT_EQ(0, gate_of(150));
+  EXPECT_EQ(4, gate_of(200));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a2}}));
+
+  // A refused operation (an erase of a rule that is not there) applies none.
+  EXPECT_NE("", h.Apply({op(false, key_b, val_b), op(true, key_c, {})}));
+  EXPECT_EQ("", h.ReadBackDiffers(rules, {{&key_a, &val_a2}}));
+  EXPECT_EQ(4, gate_of(200));
 }
 
 // "<module>/settings" sets the default gate (what set_default_gate does),

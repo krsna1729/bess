@@ -302,6 +302,7 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
         bess::pb::WildcardMatchCommandAddArg arg;
         *arg.mutable_values() = key.values();
         *arg.mutable_masks() = key.masks();
+        *arg.mutable_ranges() = key.ranges();
         Rule rule;
         Error err = RuleFromPb(arg, &rule);
         std::vector<std::byte> value, mask;
@@ -313,7 +314,8 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
         }
         return MaskedRuleResource::Key(
             bess::classifier::ConstBytes(mask.data(), mask.size()),
-            bess::classifier::ConstBytes(value.data(), value.size()));
+            bess::classifier::ConstBytes(value.data(), value.size()),
+            rule.ranges);
       },
       [this](const bess::pb::WildcardMatchRuleValue &value)
           -> std::expected<std::any, std::string> {
@@ -335,8 +337,8 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
                     value.result().size())});
       },
       // Every rule as a client sends it: per-field value and mask bytes,
-      // full field width (the table holds them canonical), as the resource
-      // enumerates them.
+      // full field width (the table holds them canonical), and its ranges
+      // in field order, as the resource enumerates them.
       [this](const bess::framework::TypedCodec<
              bess::pb::WildcardMatchRuleKey,
              bess::pb::WildcardMatchRuleValue>::TypedVisitor &visit) {
@@ -345,16 +347,25 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
         table_->ForEach(
             [&](bess::classifier::ConstBytes mask,
                 bess::classifier::ConstBytes bytes,
-                const bess::classifier::ConcurrentMaskedTable::Rule &r) {
+                const bess::classifier::ConcurrentMaskedTable::Rule &r,
+                bess::classifier::ConcurrentMaskedTable::Ranges ranges) {
               key.Clear();
               value.Clear();
               size_t pos = 0;
-              for (const FieldSpec &spec : field_specs_) {
-                const size_t n = static_cast<size_t>(spec.size);
+              auto range = ranges.begin();
+              for (size_t i = 0; i < field_specs_.size(); i++) {
+                const size_t n = static_cast<size_t>(field_specs_[i].size);
                 key.add_values()->set_value_bin(
                     reinterpret_cast<const char *>(bytes.data() + pos), n);
                 key.add_masks()->set_value_bin(
                     reinterpret_cast<const char *>(mask.data() + pos), n);
+                if (range != ranges.end() && range->offset == pos) {
+                  bess::pb::WildcardMatchFieldRange *out = key.add_ranges();
+                  out->set_field(static_cast<uint32_t>(i));
+                  out->set_low(range->low);
+                  out->set_high(range->high);
+                  ++range;
+                }
                 pos += n;
               }
               value.set_priority(r.priority);
@@ -889,6 +900,62 @@ Error WildcardMatch::RuleFromPb(
       }
     }
   }
+
+  // Ranges (D-186): refused rather than widened. The field's mask must be
+  // zero (the range replaces it); a range over the whole field is the rule
+  // without it, so it is dropped; low == high stays a range.
+  rule->ranges.clear();
+  std::vector<size_t> offsets;
+  size_t pos = 0;
+  for (const FieldSpec &spec : field_specs_) {
+    offsets.push_back(pos);
+    pos += static_cast<size_t>(spec.size);
+  }
+  std::vector<bool> ranged(field_specs_.size(), false);
+  for (const bess::pb::WildcardMatchFieldRange &range : arg.ranges()) {
+    const uint32_t field = range.field();
+    if (field >= field_specs_.size()) {
+      return std::make_pair(
+          EINVAL, bess::utils::Format("range on field %u: the module has %zu "
+                                      "fields",
+                                      field, field_specs_.size()));
+    }
+    if (ranged[field]) {
+      return std::make_pair(
+          EINVAL,
+          bess::utils::Format("field %u has more than one range", field));
+    }
+    ranged[field] = true;
+    const auto width = static_cast<uint32_t>(field_specs_[field].size);
+    const uint64_t max =
+        width == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * width)) - 1;
+    if (range.low() > range.high() || range.high() > max) {
+      return std::make_pair(
+          EINVAL, bess::utils::Format("field %u: range [%llu, %llu] is empty "
+                                      "or wider than the %u-byte field",
+                                      field,
+                                      static_cast<unsigned long long>(range.low()),
+                                      static_cast<unsigned long long>(range.high()),
+                                      width));
+    }
+    for (const uint8_t m : rule->masks[field]) {
+      if (m != 0) {
+        return std::make_pair(
+            EINVAL, bess::utils::Format("field %u has a range and a nonzero "
+                                        "mask",
+                                        field));
+      }
+    }
+    if (range.low() == 0 && range.high() == max) {
+      continue;
+    }
+    rule->ranges.push_back({.offset = static_cast<uint32_t>(offsets[field]),
+                            .width = width,
+                            .low = range.low(),
+                            .high = range.high()});
+  }
+  std::ranges::sort(rule->ranges, {},
+                    &bess::classifier::ConcurrentMaskedTable::KeyRange::offset);
 
   rule->priority = arg.priority();
   rule->gate = gate;
