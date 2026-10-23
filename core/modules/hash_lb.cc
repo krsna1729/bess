@@ -18,10 +18,10 @@
 #include "dataplane/member_select.h"
 #include "event.h"
 #include "metadata.h"
+#include "packet_parse.h"
 #include "snbuf_layout.h"
 #include "utils/ether.h"
 #include "utils/format.h"
-#include "utils/ip.h"
 #include "utils/logging.h"
 
 namespace classifier = bess::classifier;
@@ -49,27 +49,43 @@ static inline T Load(const char *p) {
   return v;
 }
 
-// The first segment must hold an Ethernet header and an IPv4 header with a
-// sane IHL, plus `after_ip` more bytes (the L4 ports). Returns the IPv4 header
-// length in bytes, or 0 when the frame is too short or not IPv4. Hashing a
-// frame the module cannot read would read past its head; hash_range needs a
-// destination, and a drop is the only answer the module has.
-static inline size_t Ipv4HeaderLength(bess::PacketRef pkt, size_t after_ip) {
-  const size_t eth_len = sizeof(bess::utils::Ethernet);
-  const size_t ip_len = sizeof(bess::utils::Ipv4);
-  if (pkt.head_len() < eth_len + ip_len + after_ip) {
-    return 0;
+// The L3 and L4 modes' hash of a frame, over the checked parse ConnTrack,
+// Router and Firewall read (D-188): up to two VLAN tags, IPv4 options, IPv6
+// extension headers, the lengths checked. False for a frame with nothing to
+// hash (not IP, or malformed): the module has no gate for it and drops it, as
+// it drops a frame too short for any mode.
+//
+// The mix is the one these modes always had, over parsed fields: CRC32C of
+// the source and destination address words XORed (an IPv6 address folds its
+// four words; an IPv4 one is its one word, the parse zeroes the rest), in L4
+// mode XORed with both ports as on the wire and the protocol. XOR keeps it
+// symmetric -- a flow's two directions share a gate -- and an untagged IPv4
+// TCP or UDP packet hashes as it always did. route::FlowHash, the Router's
+// group hash, is not symmetric, so it is not used here. A fragment hashes as
+// in L3 mode in either mode: a later fragment has no ports, so the first
+// fragment's are left out too and one datagram's fragments share a gate. ICMP
+// has no ports to add (the parse's two echo-identifier fields cancel).
+template <bool kL4>
+static inline bool ParsedFlowHash(bess::PacketRef pkt, uint32_t *hash) {
+  bess::packet::ParsedFrame p;
+  const bess::packet::ParseStatus status = bess::packet::ParseFrame(
+      std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), p,
+      pkt.total_len());
+  if (status != bess::packet::ParseStatus::kOk &&
+      status != bess::packet::ParseStatus::kFragment) {
+    return false;
   }
-  const uint8_t *head = pkt.head_data<const uint8_t *>();
-  const unsigned version_ihl = head[eth_len];
-  if ((version_ihl >> 4u) != 4u) {
-    return 0;
+  uint32_t words[8];
+  std::memcpy(words, p.src.data(), 16);
+  std::memcpy(words + 4, p.dst.data(), 16);
+  uint32_t v = words[0] ^ words[1] ^ words[2] ^ words[3] ^ words[4] ^ words[5] ^
+               words[6] ^ words[7];
+  if (kL4 && status == bess::packet::ParseStatus::kOk && !p.first_fragment) {
+    v ^= uint32_t{__builtin_bswap16(p.src_port)} ^
+         uint32_t{__builtin_bswap16(p.dst_port)} ^ p.protocol;
   }
-  const size_t ihl = static_cast<size_t>(version_ihl & 0x0fu) * 4;
-  if (ihl < ip_len || pkt.head_len() < eth_len + ihl + after_ip) {
-    return 0;
-  }
-  return ihl;
+  *hash = hash_32(v, 0);
+  return true;
 }
 
 // "settings" (HashLBSettings) holds mode, fields and gates; the class has no
@@ -457,26 +473,12 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL3>(
     Context *ctx, bess::PacketBatch *batch, const Config &config) {
   const gate_idx_t *gates = config.gates.data();
   const uint16_t num_gates = static_cast<uint16_t>(config.gates.size());
-  /* assumes untagged packets */
-  const int ip_offset = sizeof(bess::utils::Ethernet);
-
   for (bess::PacketRef snb : batch->packets()) {
-    if (unlikely(snb.head_len() <
-                 sizeof(bess::utils::Ethernet) +
-                     sizeof(bess::utils::Ipv4))) {
-      // L3 hashes only the fixed src/dst words; options (a larger IHL) may
-      // live in a later segment and do not move those offsets.
+    uint32_t hash_val;
+    if (unlikely(!ParsedFlowHash</*l4=*/false>(snb, &hash_val))) {
       EmitPacket(ctx, snb, DROP_GATE);
       continue;
     }
-    char *head = snb.head_data<char *>();
-
-    uint32_t hash_val;
-    // Header fields need not be aligned (the IP header starts 14 bytes in).
-    uint32_t v0 = Load<uint32_t>(head + ip_offset + 12);  /* src IP */
-    v0 ^= Load<uint32_t>(head + ip_offset + 16);          /* dst IP */
-
-    hash_val = hash_32(v0, 0);
     EmitPacket(ctx, snb, gates[hash_range(hash_val, num_gates)]);
   }
 }
@@ -486,27 +488,12 @@ inline void HashLB::DoProcessBatch<HashLB::Mode::kL4>(
     Context *ctx, bess::PacketBatch *batch, const Config &config) {
   const gate_idx_t *gates = config.gates.data();
   const uint16_t num_gates = static_cast<uint16_t>(config.gates.size());
-  /* assumes untagged packets */
-  const int ip_offset = sizeof(bess::utils::Ethernet);
-
   for (bess::PacketRef snb : batch->packets()) {
-    const size_t ihl = Ipv4HeaderLength(snb, 4);
-    if (unlikely(ihl == 0)) {
+    uint32_t hash_val;
+    if (unlikely(!ParsedFlowHash</*l4=*/true>(snb, &hash_val))) {
       EmitPacket(ctx, snb, DROP_GATE);
       continue;
     }
-    char *head = snb.head_data<char *>();
-    const uint32_t l4_offset = ip_offset + ihl;
-    uint32_t hash_val;
-    uint32_t v0 = Load<uint32_t>(head + ip_offset + 12);  /* src IP */
-    v0 ^= Load<uint32_t>(head + ip_offset + 16);          /* dst IP */
-    v0 ^= Load<uint16_t>(head + l4_offset);               /* src port */
-    v0 ^= Load<uint16_t>(head + l4_offset + 2);           /* dst port */
-
-    v0 ^= *(reinterpret_cast<uint8_t *>(head + ip_offset + 9)); /* ip_proto */
-
-    hash_val = hash_32(v0, 0);
-
     EmitPacket(ctx, snb, gates[hash_range(hash_val, num_gates)]);
   }
 }
