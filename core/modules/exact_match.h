@@ -38,7 +38,8 @@ using Error = std::pair<int, std::string>;
 // A rule's value is its output gate plus a result record. `result_fields`
 // maps slices of that record to metadata attributes or packet offsets; the
 // compiled ResultPlan places them on a hit. With no result fields the module
-// is gate-only. A miss takes the default gate; it also places
+// is gate-only; a metadata field nothing downstream reads is compiled out of
+// the plan (D-181). A miss takes the default gate; it also places
 // `default_result` when the application configured one, and otherwise writes
 // nothing.
 class ExactMatch final : public Module {
@@ -150,8 +151,9 @@ class ExactMatch final : public Module {
     // Compared at PreResume to detect graph-driven offset reassignment.
     std::vector<size_t> baked_source_offsets;
     // Configured result placement: the compiled plan (nullopt in gate-only
-    // mode), the metadata offsets it baked (kInvalidOffset for a packet
-    // field), and the records its ids address. Compared at PreResume.
+    // mode, or when no field has a reader), each field's baked destination
+    // (packet offset, metadata offset, or kSkippedOffset for a field compiled
+    // out), and the records its ids address. Compared at PreResume.
     std::optional<bess::classifier::ResultPlan> result;
     std::vector<size_t> baked_result_offsets;
     std::shared_ptr<bess::classifier::RecordArena> records;
@@ -170,6 +172,9 @@ class ExactMatch final : public Module {
   // Sentinel for a metadata field whose attribute currently has no valid
   // physical offset (e.g. orphan reader, out of space).
   static constexpr size_t kInvalidOffset = static_cast<size_t>(-1);
+  // Destination of a metadata result field whose attribute nothing downstream
+  // reads (kMetadataOffsetNoWrite): the field is left out of the result plan.
+  static constexpr size_t kSkippedOffset = static_cast<size_t>(-2);
 
   // The packet path's per-batch decision, shared by ProcessBatch and
   // ClassifyBatch: calls emit(i, value, hit) once per packet, in order, where
@@ -231,11 +236,13 @@ class ExactMatch final : public Module {
   bool ComputeLayout(bool tolerate_invalid_metadata, KeyLayout *layout,
                      Error *err);
   // Compiles the configured result placement over the current metadata
-  // offsets. With `tolerate_invalid_metadata`, an unreadable attribute gets a
-  // placeholder placement (the degraded generation never runs it).
-  std::optional<bess::classifier::ResultPlan> CompileResultPlan(
-      size_t key_size, bool tolerate_invalid_metadata,
-      std::vector<size_t> *baked_offsets, Error *err) const;
+  // offsets into *plan, recording each field's destination (ResultDestination)
+  // in *baked_offsets. A field nothing reads is compiled out; with no field
+  // left, *plan is nullopt (gate-only). False, with *err set, when a field
+  // has no usable destination.
+  bool CompileResultPlan(size_t key_size,
+                         std::optional<bess::classifier::ResultPlan> *plan,
+                         std::vector<size_t> *baked_offsets, Error *err) const;
   // The resources a rule's result bytes name through configured references
   // (D-172): the field's bytes are the entry key; an all-zero field names
   // nothing.
@@ -281,6 +288,11 @@ class ExactMatch final : public Module {
     uint32_t reference_count = 1;
   };
   std::vector<ResultSpec> result_specs_;
+  // A result field's destination under the current metadata offsets: its
+  // packet offset, its attribute's metadata offset, kSkippedOffset when no
+  // downstream module reads the attribute, or kInvalidOffset when the
+  // attribute has no usable offset (out of space, unresolved update).
+  size_t ResultDestination(const ResultSpec &spec) const;
   // Distinct resource names the result fields reference, for the resource's
   // declaration (D-172).
   std::vector<std::string> result_reference_names_;

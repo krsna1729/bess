@@ -644,37 +644,35 @@ WildcardMatch::GenerationPtr WildcardMatch::Build(
     schema.value_size = result_value_size_;
     schema.bounds = bess::classifier::BoundsPolicy::kCheck;
     for (const ResultSpec &spec : result_specs_) {
+      const size_t at = ResultDestination(spec);
+      result_offsets.push_back(at);
+      if (at == kSkippedOffset) {
+        continue;  // compiled out: nothing downstream reads it
+      }
+      if (at == kInvalidOffset) {
+        *err = std::make_pair(
+            EINVAL, "result field '" + spec.attr_name +
+                        "' has no readable metadata offset");
+        return nullptr;
+      }
       bess::classifier::RuntimeResultField field;
       field.value_offset = spec.value_offset;
       field.size = spec.size;
-      if (spec.by_attr) {
-        const bess::metadata::mt_offset_t offset =
-            attr_offset(static_cast<size_t>(spec.attr_id));
-        if (!bess::metadata::IsValidOffset(offset)) {
-          *err = std::make_pair(
-              EINVAL, "result field '" + spec.attr_name +
-                          "' has no readable metadata offset");
-          return nullptr;
-        }
-        field.destination = bess::classifier::BufferKind::kMetadata;
-        field.destination_offset =
-            static_cast<size_t>(static_cast<uint8_t>(offset));
-        result_offsets.push_back(static_cast<size_t>(
-            static_cast<uint8_t>(offset)));
-      } else {
-        field.destination = bess::classifier::BufferKind::kPacket;
-        field.destination_offset = spec.offset;
-        result_offsets.push_back(spec.offset);
-      }
+      field.destination = spec.by_attr ? bess::classifier::BufferKind::kMetadata
+                                       : bess::classifier::BufferKind::kPacket;
+      field.destination_offset = at;
       schema.result_fields.push_back(std::move(field));
     }
-    auto compiled = bess::classifier::ResultPlan::Compile(schema);
-    if (!compiled) {
-      *err = std::make_pair(EINVAL, "result plan: " +
-                                        compiled.error().message);
-      return nullptr;
+    // Every field compiled out: gate-only.
+    if (!schema.result_fields.empty()) {
+      auto compiled = bess::classifier::ResultPlan::Compile(schema);
+      if (!compiled) {
+        *err = std::make_pair(EINVAL, "result plan: " +
+                                          compiled.error().message);
+        return nullptr;
+      }
+      result = std::move(*compiled);
     }
-    result = std::move(*compiled);
   }
   auto gen = std::make_unique<Generation>(
       default_gate, std::move(*plan), std::move(table), layout.key_size,
@@ -712,6 +710,20 @@ WildcardMatch::GenerationPtr WildcardMatch::BuildDegraded(
       std::vector<size_t>(result_specs_.size(), kInvalidOffset), records_);
 }
 
+size_t WildcardMatch::ResultDestination(const ResultSpec &spec) const {
+  if (!spec.by_attr) {
+    return spec.offset;
+  }
+  const bess::metadata::mt_offset_t offset =
+      attr_offset(static_cast<size_t>(spec.attr_id));
+  if (bess::metadata::IsValidOffset(offset)) {
+    return static_cast<size_t>(static_cast<uint8_t>(offset));
+  }
+  // No downstream reader: the metadata model lets the writer skip the write.
+  return offset == bess::metadata::kMetadataOffsetNoWrite ? kSkippedOffset
+                                                          : kInvalidOffset;
+}
+
 void WildcardMatch::RefreshForResume() {
   metadata_ready_ = true;
   const Generation *current = published_.Read();
@@ -720,22 +732,26 @@ void WildcardMatch::RefreshForResume() {
   }
 
   bool changed = false;
+  bool moved = false;
   for (size_t i = 0; i < result_specs_.size(); i++) {
-    const ResultSpec &spec = result_specs_[i];
-    const size_t now =
-        spec.by_attr
-            ? static_cast<size_t>(attr_offset(
-                  static_cast<size_t>(spec.attr_id)))
-            : kInvalidOffset;
-    if (i >= current->baked_result_offsets.size() ||
-        current->baked_result_offsets[i] != now) {
-      LOG(ERROR) << "WildcardMatch '" << name()
-                 << "': a result field's destination moved (another module "
-                    "replaced its attribute): results take their configured "
-                    "offset or stay zero";
-      changed = true;
-      break;
+    const size_t now = ResultDestination(result_specs_[i]);
+    const size_t baked = i < current->baked_result_offsets.size()
+                             ? current->baked_result_offsets[i]
+                             : kInvalidOffset;
+    if (baked == now) {
+      continue;
     }
+    changed = true;
+    // A deferred plan (offsets not yet resolved), a degraded generation, or
+    // a field compiled out had no destination to move from.
+    moved = moved || (!current->result_plan_deferred &&
+                      baked != kInvalidOffset && baked != kSkippedOffset);
+  }
+  if (moved) {
+    LOG(ERROR) << "WildcardMatch '" << name()
+               << "': a result field's destination moved (another module "
+                  "replaced its attribute): results take their configured "
+                  "offset or stay zero";
   }
   for (size_t i = 0; i < field_specs_.size(); i++) {
     const FieldSpec &spec = field_specs_[i];

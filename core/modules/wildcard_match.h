@@ -136,8 +136,9 @@ class WildcardMatch final : public Module {
     // detect graph-driven offset reassignment.
     std::vector<size_t> baked_source_offsets;
     // Configured result placement: the compiled plan (nullopt in gate-only
-    // mode), the offsets it baked (kInvalidOffset for a packet field), and
-    // the records its ids address. Compared at PreResume.
+    // mode, or when no field has a reader), each field's baked destination
+    // (packet offset, metadata offset, or kSkippedOffset for a field compiled
+    // out), and the records its ids address. Compared at PreResume.
     std::optional<bess::classifier::ResultPlan> result;
     std::vector<size_t> baked_result_offsets;
     std::shared_ptr<bess::classifier::RecordArena> records;
@@ -148,6 +149,9 @@ class WildcardMatch final : public Module {
   // Sentinel for a metadata field whose attribute currently has no valid
   // physical offset (e.g. orphan reader, out of space).
   static constexpr size_t kInvalidOffset = static_cast<size_t>(-1);
+  // Destination of a metadata result field whose attribute nothing downstream
+  // reads (kMetadataOffsetNoWrite): the field is left out of the result plan.
+  static constexpr size_t kSkippedOffset = static_cast<size_t>(-2);
 
   // Field configuration, fixed at Init() time; every generation's plan gets
   // it, so a rebuild reproduces the module's matching exactly.
@@ -240,6 +244,11 @@ class WildcardMatch final : public Module {
     uint32_t reference_count = 1;
   };
   std::vector<ResultSpec> result_specs_;
+  // A result field's destination under the current metadata offsets: its
+  // packet offset, its attribute's metadata offset, kSkippedOffset when no
+  // downstream module reads the attribute, or kInvalidOffset when the
+  // attribute has no usable offset (out of space, unresolved update).
+  size_t ResultDestination(const ResultSpec &spec) const;
   std::vector<std::string> result_reference_names_;
   bool metadata_ready_ = false;
   size_t result_value_size_ = 0;

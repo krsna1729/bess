@@ -22,6 +22,7 @@
 #include "modules/wildcard_match.h"
 #include "pb/module_msg.pb.h"
 #include "testing/module_harness.h"
+#include "utils/logging.h"
 
 namespace {
 // A refused Init must return no module; ModuleHarness treats a refusal as a
@@ -847,6 +848,166 @@ TEST(WildcardMatchPacketTest, RejectsAnOversizedResultRecord) {
   field->set_value_offset(4096);
   field->set_num_bytes(1);
   EXPECT_TRUE(CreateRefused("WildcardMatch", arg));
+}
+
+// Index of `m`'s metadata attribute `name`, or all_attrs().size().
+size_t AttrIndex(const Module *m, const std::string &name) {
+  for (size_t i = 0; i < m->all_attrs().size(); i++) {
+    if (m->all_attrs()[i].name == name) {
+      return i;
+    }
+  }
+  return m->all_attrs().size();
+}
+
+// A WildcardMatch on IPv4 src 10.0.0.1 (rule gate `gate`, default gate
+// `default_gate`) whose result record carries `fields`: each a `size`-byte
+// attribute at the next `size`-byte slice. The rule's record is `record`.
+Module *ResultWm(ModuleHarness &h, const std::vector<std::string> &fields,
+                 uint32_t size, uint64_t gate, uint64_t default_gate,
+                 const std::string &record) {
+  WildcardMatchArg arg;
+  *arg.add_fields() = WmField(26, 4);
+  for (size_t i = 0; i < fields.size(); i++) {
+    auto *field = arg.add_result_fields();
+    field->set_attr_name(fields[i]);
+    field->set_value_offset(static_cast<uint32_t>(i) * size);
+    field->set_num_bytes(size);
+  }
+  arg.set_default_gate(default_gate);
+  Module *wm = h.Create("WildcardMatch", arg);
+  if (wm == nullptr) {
+    return nullptr;
+  }
+  bess::pb::WildcardMatchRuleValue value;
+  value.set_priority(1);
+  value.set_gate(gate);
+  value.set_result(record);
+  EXPECT_EQ("", h.UpsertResource(std::string(wm->name()) + "/rules",
+                                 WmKey({kFull4}, {IpOctets("10.0.0.1")}), value));
+  return wm;
+}
+
+// A metadata result destination with no reader gets kMetadataOffsetNoWrite:
+// the field is compiled out of the plan and a hit still takes its rule's
+// gate, as the metadata model lets a writer skip what nothing reads.
+TEST(WildcardMatchPacketTest, UnreadResultFieldIsSkippedAndTheRuleGateApplies) {
+  ModuleHarness h;
+  Module *wm = ResultWm(h, {"wm_unread_attr"}, 4, 0, 1, std::string(4, '\x07'));
+  ASSERT_NE(nullptr, wm);
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  auto out = h.Run(wm, 0, {pkt}, {0, 1});
+  EXPECT_EQ((GateCounts{{0, 1}}), Counts(out));
+  EXPECT_EQ((std::vector<Bytes>{pkt}), out[0]) << "nothing is written";
+  const size_t unread = AttrIndex(wm, "wm_unread_attr");
+  ASSERT_LT(unread, wm->all_attrs().size());
+  EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, wm->attr_offset(unread));
+}
+
+// One field read downstream, one not: the read field is written (a downstream
+// WildcardMatch matches on it) and the hit takes its rule's gate.
+TEST(WildcardMatchPacketTest, ReadResultFieldIsWrittenBesideAnUnreadOne) {
+  ModuleHarness h;
+  Module *wm = ResultWm(h, {"wm_read_attr", "wm_unread_attr"}, 4, 1, 2,
+                        std::string("\x00\x00\x00\x07\x00\x00\x00\x09", 8));
+  ASSERT_NE(nullptr, wm);
+
+  Field attr;
+  attr.set_attr_name("wm_read_attr");
+  attr.set_num_bytes(4);
+  Module *next = CreateWm(h, {attr});
+  ASSERT_NE(nullptr, next);
+  EXPECT_EQ("", AddRule(h, next, WmRule(1, 0, {kFull4}, {{0, 0, 0, 7}})));
+  EXPECT_EQ("", SetDefaultGate(h, next, 0));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(wm, 1, next, 0, true));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  for (int resume = 0; resume < 2; resume++) {
+    auto out = h.RunPipeline(wm, 0, {pkt}, next, {0, 1});
+    EXPECT_EQ((GateCounts{{1, 1}}), Counts(out)) << "resume " << resume;
+  }
+  const size_t read_id = AttrIndex(wm, "wm_read_attr");
+  const size_t unread_id = AttrIndex(wm, "wm_unread_attr");
+  ASSERT_LT(read_id, wm->all_attrs().size());
+  ASSERT_LT(unread_id, wm->all_attrs().size());
+  EXPECT_TRUE(bess::metadata::IsValidOffset(wm->attr_offset(read_id)));
+  EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, wm->attr_offset(unread_id));
+}
+
+// A result field with a reader but no metadata space (five 32-byte
+// attributes in 128 bytes) has no destination: the first PreResume fails
+// closed and the hit takes the default gate.
+TEST(WildcardMatchPacketTest, ResultFieldWithoutSpaceFailsClosed) {
+  ModuleHarness h;
+  constexpr size_t kFields = 5;
+  constexpr uint32_t kSize = bess::metadata::kMetadataAttrMaxSize;
+  static_assert(kFields * kSize > bess::metadata::kMetadataTotalSize);
+  std::vector<std::string> names;
+  bess::pb::MetadataTestArg read;
+  for (size_t i = 0; i < kFields; i++) {
+    names.push_back("wm_nospace" + std::to_string(i));
+    (*read.mutable_read())[names.back()] = kSize;
+  }
+  Module *wm = ResultWm(h, names, kSize, 1, 0,
+                        std::string(kFields * kSize, '\x07'));
+  ASSERT_NE(nullptr, wm);
+  Module *reader = h.Create("MetadataTest", read);
+  ASSERT_NE(nullptr, reader);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(wm, 1, reader, 0, true));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  auto out = h.RunPipeline(wm, 0, {pkt}, reader, {0});
+  EXPECT_TRUE(Counts(out).empty())
+      << "the hit's gate leads to the reader; the default gate is unwired";
+  bool no_space = false;
+  for (size_t i = 0; i < wm->all_attrs().size(); i++) {
+    no_space = no_space ||
+               wm->attr_offset(i) == bess::metadata::kMetadataOffsetNoSpace;
+  }
+  EXPECT_TRUE(no_space);
+}
+
+// Captures the messages glog emits at ERROR or above while it is alive.
+class ErrorLogCapture : public google::LogSink {
+ public:
+  ErrorLogCapture() { google::AddLogSink(this); }
+  ~ErrorLogCapture() override { google::RemoveLogSink(this); }
+  void send(google::LogSeverity severity, const char *, const char *, int,
+            const google::LogMessageTime &, const char *message,
+            size_t message_len) override {
+    if (severity >= google::GLOG_ERROR) {
+      messages.emplace_back(message, message_len);
+    }
+  }
+  std::vector<std::string> messages;
+};
+
+// The first PreResume resolves a deferred result plan: no destination moved
+// then, nor on a later resume that leaves the offsets alone.
+TEST(WildcardMatchPacketTest, DeferredResultPlanIsNotAMove) {
+  ModuleHarness h;
+  Module *wm = ResultWm(h, {"wm_read_attr"}, 4, 1, 0, std::string("\x00\x00\x00\x07", 4));
+  ASSERT_NE(nullptr, wm);
+  bess::pb::MetadataTestArg read;
+  (*read.mutable_read())["wm_read_attr"] = 4;
+  Module *reader = h.Create("MetadataTest", read);
+  ASSERT_NE(nullptr, reader);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(wm, 1, reader, 0, true));
+
+  auto rng = bess::testing::SeededRng(1);
+  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
+  ErrorLogCapture errors;
+  for (int resume = 0; resume < 2; resume++) {
+    EXPECT_EQ((GateCounts{{0, 1}}), Counts(h.RunPipeline(wm, 0, {pkt}, reader, {0})))
+        << "resume " << resume;
+  }
+  for (const std::string &message : errors.messages) {
+    EXPECT_EQ(std::string::npos, message.find("moved")) << message;
+  }
 }
 
 // An explicitly empty default_result stays a no-op on a gate-only module; a
