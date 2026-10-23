@@ -770,10 +770,26 @@ message MetadataTestArg {
  * __Output Gates__: 2 (same as the input gate)
  */
 /**
+ * A packet's connection-tracking result, as ConnTrack writes it to its
+ * status_attr (D-182).
+ */
+enum ConnTrackStatus {
+  CONNTRACK_STATUS_UNSPECIFIED = 0;
+  CONNTRACK_STATUS_NEW = 1;        /// this packet created the connection
+  CONNTRACK_STATUS_EXISTING = 2;   /// a packet of a tracked connection
+  CONNTRACK_STATUS_RELATED = 3;    /// an ICMP error about a tracked connection
+  CONNTRACK_STATUS_INVALID = 4;    /// may not start a connection, or refused by the TCP state machine
+  CONNTRACK_STATUS_UNTRACKED = 5;  /// not trackable, or not tracked (PER_WORKER failing closed)
+  CONNTRACK_STATUS_FULL = 6;       /// would start a connection, but the table is full
+}
+
+/**
  * Connection tracking (TP8, D-080): the conntrack library as a module.
  * igate 0 may start connections (the inside), igate 1 may not (the outside);
  * ogate 0 gets packets of tracked connections (new, existing, related),
  * ogate 1 everything else (invalid, untracked, refused for a full table).
+ * With status_attr, each packet also carries its ConnTrackStatus, so a module
+ * downstream can tell a new connection from an existing one (D-182).
  */
 message ConnTrackArg {
   enum Mode {
@@ -789,6 +805,10 @@ message ConnTrackArg {
   /// PER_WORKER on inputs that are not verified symmetric: track with one
   /// shared table instead of failing closed.
   bool fallback_shared = 4;
+  /// The metadata attribute (1 byte, a ConnTrackStatus) each packet's result
+  /// is written to; empty: none. The reader must be configured with the same
+  /// name; with no reader the packets carry no status (PreResume reports it).
+  string status_attr = 5;
 }
 
 message NATArg {

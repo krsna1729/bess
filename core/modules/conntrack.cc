@@ -17,6 +17,15 @@ namespace ct = bess::conntrack;
 constexpr size_t kExpireBudget = 256;  // wheel work per batch
 constexpr unsigned kGranularityShift = 24;  // about 17 ms
 
+// The wire status is the library's, plus one (0 is unspecified, D-182).
+constexpr uint8_t WireStatus(ct::TrackStatus s) { return static_cast<uint8_t>(s) + 1; }
+static_assert(WireStatus(ct::TrackStatus::kNew) == bess::pb::CONNTRACK_STATUS_NEW);
+static_assert(WireStatus(ct::TrackStatus::kExisting) == bess::pb::CONNTRACK_STATUS_EXISTING);
+static_assert(WireStatus(ct::TrackStatus::kRelated) == bess::pb::CONNTRACK_STATUS_RELATED);
+static_assert(WireStatus(ct::TrackStatus::kInvalid) == bess::pb::CONNTRACK_STATUS_INVALID);
+static_assert(WireStatus(ct::TrackStatus::kUntracked) == bess::pb::CONNTRACK_STATUS_UNTRACKED);
+static_assert(WireStatus(ct::TrackStatus::kFull) == bess::pb::CONNTRACK_STATUS_FULL);
+
 }  // namespace
 
 const Commands ConnTrack::cmds = {};
@@ -48,6 +57,14 @@ CommandResponse ConnTrack::Init(const bess::pb::ConnTrackArg &arg) {
   policy.tcp_pickup = arg.tcp_pickup();
   policy_ = policy.Scaled(1000ull * 1000 * 1000);  // the packet clock is ns
   fallback_shared_ = arg.fallback_shared();
+  status_attr_name_ = arg.status_attr();
+  if (!status_attr_name_.empty()) {
+    status_attr_ = AddMetadataAttr(status_attr_name_, sizeof(uint8_t),
+                                   bess::metadata::Attribute::AccessMode::kWrite);
+    if (status_attr_ < 0) {
+      return CommandFailure(-status_attr_, "add_metadata_attr() failed");
+    }
+  }
   if (mode_ == bess::pb::ConnTrackArg::SHARED || fallback_shared_) {
     auto made = SharedCt::Create(capacity_, init_context().rcu(), policy_, tsc_to_ns(rdtsc()),
                                  kGranularityShift);
@@ -79,6 +96,12 @@ CommandResponse ConnTrack::Init(const bess::pb::ConnTrackArg &arg) {
 int ConnTrack::OnEvent(bess::Event event) {
   if (event != bess::Event::PreResume) {
     return -ENOTSUP;
+  }
+  // Offsets are assigned just before this: a configured status attribute
+  // promises a reader (D-182).
+  if (status_attr_ >= 0 && !bess::metadata::IsValidOffset(StatusOffset())) {
+    LOG(WARNING) << "ConnTrack '" << name() << "': nothing reads '" << status_attr_name_
+                 << "' (a module downstream reading it would); packets carry no status";
   }
   if (mode_ != bess::pb::ConnTrackArg::PER_WORKER) {
     return 0;
@@ -116,7 +139,14 @@ void ConnTrack::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     if (fallback_shared_) {
       Track(*shared_, ctx, batch);
     } else {
-      RunChooseModule(ctx, 1, batch);  // fail closed
+      // Fail closed: not tracked, and marked so (D-182).
+      const bess::metadata::mt_offset_t status = StatusOffset();
+      if (bess::metadata::IsValidOffset(status)) {
+        for (bess::PacketRef pkt : batch->packets()) {
+          set_attr_with_offset<uint8_t>(status, pkt, bess::pb::CONNTRACK_STATUS_UNTRACKED);
+        }
+      }
+      RunChooseModule(ctx, 1, batch);
     }
     return;
   }
@@ -142,11 +172,16 @@ void ConnTrack::Track(T &table, Context *ctx, bess::PacketBatch *batch) {
   table.TrackBatch(std::span(frames, cnt), std::span(parsed, cnt), now, std::span(results, cnt), 0,
                    may_create);
   uint64_t full = 0;
+  const bess::metadata::mt_offset_t status = StatusOffset();
+  const bool write_status = bess::metadata::IsValidOffset(status);
   for (int i = 0; i < cnt; i++) {
     const ct::TrackStatus s = results[i].status;
     const bool pass = s == ct::TrackStatus::kNew || s == ct::TrackStatus::kExisting ||
                       s == ct::TrackStatus::kRelated;
     full += s == ct::TrackStatus::kFull;
+    if (write_status) {
+      set_attr_with_offset<uint8_t>(status, batch->packet(i), WireStatus(s));
+    }
     EmitPacket(ctx, batch->packet(i), pass ? 0 : 1);
   }
   if (full != 0) [[unlikely]] {
