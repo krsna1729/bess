@@ -1201,6 +1201,10 @@ message ReplicateArg {
  * or sent out with packet data. For examples of SetMetadata use, see
  * [`bessctl/conf/samples/attr_match.yaml`](./bessctl/conf/samples/attr_match.yaml)
  *
+ * An attribute copied from the packet (`offset`) is read from the packet's first
+ * segment: a packet whose first segment is shorter than the largest `offset` +
+ * `size` is dropped, never read past its data or across segments.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
@@ -1316,6 +1320,12 @@ message TimestampArg {
 /**
  * The Update module rewrites a field in a packet's data with a specific value.
  *
+ * Fields are written into the packet's first segment. A packet whose first
+ * segment is shorter than the largest `offset` + `size` is dropped rather than
+ * partly written; a packet whose payload is shared (a clone) is copied first, so
+ * the payload's other holders never see the write (D-153), and a packet whose
+ * copy fails is dropped.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
@@ -1365,6 +1375,12 @@ message UrlFilterConfig {
 /**
  * VLANPop removes the VLAN tag.
  *
+ * A frame shorter than an Ethernet header is dropped, and so is a tagged frame
+ * whose first segment ends before the tag and the EtherType after it (18 bytes):
+ * it is never forwarded still tagged. An untagged frame passes unchanged. A
+ * tagged frame whose payload is shared is copied before the tag is removed (D-153);
+ * a failed copy is dropped.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
@@ -1373,6 +1389,11 @@ message VLANPopArg {
 
 /**
  * VLANPush appends a VLAN tag with a specified TCI value.
+ *
+ * A frame whose first segment is shorter than an Ethernet header, or that has no
+ * headroom for the tag, is dropped rather than forwarded untagged. A frame whose
+ * payload is shared is copied before the tag is written (D-153); a failed copy is
+ * dropped.
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -1383,6 +1404,11 @@ message VLANPushArg {
 
 /**
  * Splits packets across output gates according to VLAN id (e.g., id 3 goes out gate 3).
+ *
+ * Untagged frames leave on gate 0. As in VLANPop, a frame shorter than an Ethernet
+ * header, or a tagged one whose first segment is shorter than 18 bytes, is dropped,
+ * and a shared payload is copied before the tag is removed (D-153); a failed copy
+ * is dropped.
  *
  * __Input Gates__: 1
  * __Output Gates__: many
