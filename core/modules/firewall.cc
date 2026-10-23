@@ -18,11 +18,9 @@
 
 #include "dataplane/resource_registry.h"
 #include "framework/resource_codec.h"
-#include "utils/ether.h"
-#include "utils/ip.h"
+#include "packet_parse.h"
+#include "utils/endian.h"
 #include "utils/logging.h"
-#include "utils/tcp.h"
-#include "utils/udp.h"
 
 // D-179: "<name>/rules" holds the policy, one entry per rule by id; the class
 // has no actions.
@@ -80,15 +78,6 @@ std::optional<Cidr> ParseCidr(const std::string &text) {
   out.len = static_cast<uint8_t>(len);
   return out;
 }
-
-// IPv6's fixed header, by offset (40 bytes; the addresses follow it).
-constexpr size_t kIpv6HeaderBytes = 40;
-constexpr size_t kIpv6NextHeader = 6;
-constexpr size_t kIpv6Src = 8;
-constexpr size_t kIpv6Dst = 24;
-// How many extension headers a packet may carry before this table stops
-// looking for the transport header.
-constexpr int kMaxIpv6ExtHeaders = 4;
 
 // One rule as the wire gives it, converted and checked. The refusal says what
 // is wrong; the caller names the rule.
@@ -453,158 +442,34 @@ void Firewall::DeInit() {
 
 bool Firewall::KeyOf(bess::PacketRef pkt, bess::classifier::FirewallKey *key) {
   using bess::classifier::FirewallFamily;
-  using bess::utils::be16_t;
-  using bess::utils::Ethernet;
-  using bess::utils::Ipv4;
-  using bess::utils::Tcp;
-  using bess::utils::Udp;
+  using bess::packet::L3Kind;
+  using bess::packet::L4Kind;
+  using bess::packet::ParseStatus;
 
-  const size_t len = pkt.data_len();
-  if (len < sizeof(Ethernet)) {
-    return false;
+  // The checked parse ConnTrack, NAT and Router read (D-188): the headers in
+  // the first segment, their lengths checked against the whole packet.
+  bess::packet::ParsedFrame p;
+  const ParseStatus status = bess::packet::ParseFrame(
+      std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), p,
+      pkt.total_len());
+  // A fragment other than the first carries no transport header, so its
+  // ports are unknown, but the IP header (IPv6: the fragment header) still
+  // names the transport protocol: it is judged with ports 0, which only a
+  // rule whose port range starts at 0 can match. Reading ports anyway would
+  // judge it by whatever bytes follow.
+  if (status != ParseStatus::kOk && status != ParseStatus::kFragment) {
+    return false;  // not IP, or malformed: nothing to judge
   }
-  const uint8_t *data = pkt.head_data<const uint8_t *>();
-  const Ethernet *eth = reinterpret_cast<const Ethernet *>(data);
-  const uint8_t *payload = data + sizeof(Ethernet);
-  const size_t payload_bytes = len - sizeof(Ethernet);
-
-  key->src_port = 0;
-  key->dst_port = 0;
-
-  if (eth->ether_type == be16_t(Ethernet::Type::kIpv4)) {
-    if (payload_bytes < sizeof(Ipv4)) {
-      return false;
-    }
-    const Ipv4 *ip = reinterpret_cast<const Ipv4 *>(payload);
-    const size_t ip_bytes = static_cast<size_t>(ip->header_length) << 2;
-    if (ip_bytes < sizeof(Ipv4) || ip_bytes > payload_bytes) {
-      return false;
-    }
-    key->family = FirewallFamily::kIpv4;
-    key->proto = ip->protocol;
-    std::memcpy(key->src.data(), &ip->src, 4);
-    std::memcpy(key->dst.data(), &ip->dst, 4);
-
-    // A fragment other than the first carries no transport header, so its
-    // ports are unknown: the ports stay 0, which only a rule whose port range
-    // starts at 0 can match. Reading them anyway would judge the fragment by
-    // whatever bytes follow.
-    if ((ip->fragment_offset.value() & 0x1fff) != 0) {
-      return true;
-    }
-    if (ip->protocol != Ipv4::Proto::kTcp && ip->protocol != Ipv4::Proto::kUdp) {
-      return true;
-    }
-    const size_t l4_bytes =
-        ip->protocol == Ipv4::Proto::kTcp ? sizeof(Tcp) : sizeof(Udp);
-    if (ip_bytes + l4_bytes > payload_bytes) {
-      return false;
-    }
-    // Both Tcp and Udp begin with the two ports.
-    const uint8_t *l4 = payload + ip_bytes;
-    be16_t src_port;
-    be16_t dst_port;
-    std::memcpy(&src_port, l4, sizeof(be16_t));
-    std::memcpy(&dst_port, l4 + sizeof(be16_t), sizeof(be16_t));
-    key->src_port = src_port.value();
-    key->dst_port = dst_port.value();
-    return true;
-  }
-
-  if (eth->ether_type != be16_t(Ethernet::Type::kIpv6)) {
-    return false;
-  }
-  if (payload_bytes < kIpv6HeaderBytes) {
-    return false;
-  }
-  key->family = FirewallFamily::kIpv6;
-  std::memcpy(key->src.data(), payload + kIpv6Src, 16);
-  std::memcpy(key->dst.data(), payload + kIpv6Dst, 16);
-
-  // Walk the extension chain (bounded) to the transport header: a rule that
-  // names TCP must see the packet's transport protocol, not its first next
-  // header.
-  uint8_t next = payload[kIpv6NextHeader];
-  size_t offset = kIpv6HeaderBytes;
-  for (int hops = 0; hops < kMaxIpv6ExtHeaders; hops++) {
-    if (next == Ipv4::Proto::kTcp || next == Ipv4::Proto::kUdp) {
-      key->proto = next;
-      if (offset + 4 > payload_bytes) {
-        return false;
-      }
-      be16_t src_port;
-      be16_t dst_port;
-      std::memcpy(&src_port, payload + offset, sizeof(be16_t));
-      std::memcpy(&dst_port, payload + offset + sizeof(be16_t), sizeof(be16_t));
-      key->src_port = src_port.value();
-      key->dst_port = dst_port.value();
-      return true;
-    }
-
-    size_t header_bytes = 0;
-    switch (next) {
-      case 0:    // hop-by-hop options
-      case 43:   // routing
-      case 60:   // destination options
-        if (offset + 8 > payload_bytes) {
-          return false;
-        }
-        header_bytes = (static_cast<size_t>(payload[offset + 1]) + 1) * 8;
-        break;
-      case 44: {  // fragment
-        if (offset + 8 > payload_bytes) {
-          return false;
-        }
-        const uint16_t fragment_offset =
-            static_cast<uint16_t>((payload[offset + 2] << 8) | payload[offset + 3]);
-        if ((fragment_offset & 0xfff8) != 0) {
-          // Not the first fragment: no transport header to read, but the
-          // fragment header still names the transport protocol, so a rule
-          // that asks for TCP sees the fragment and only its ports are
-          // unknown.
-          key->proto = payload[offset];
-          return true;
-        }
-        header_bytes = 8;
-        break;
-      }
-      case 51:  // authentication header: its length is in 4-byte units
-        if (offset + 8 > payload_bytes) {
-          return false;
-        }
-        header_bytes = (static_cast<size_t>(payload[offset + 1]) + 2) * 4;
-        break;
-      case 50:  // ESP: everything after it is encrypted
-        key->proto = next;
-        return true;
-      default:
-        // Anything else is either the transport itself or something this
-        // table does not look inside: the protocol is that value and the
-        // ports stay unknown.
-        key->proto = next;
-        return true;
-    }
-    if (offset + header_bytes > payload_bytes) {
-      return false;
-    }
-    next = payload[offset];  // an extension header starts with its successor
-    offset += header_bytes;
-  }
-  key->proto = next;
-  // The transport may sit exactly at the bound: four extension headers and
-  // then the transport header is still the transport header, and the loop
-  // above has already spent its four looks at extension headers.
-  if (next == Ipv4::Proto::kTcp || next == Ipv4::Proto::kUdp) {
-    if (offset + 4 > payload_bytes) {
-      return false;
-    }
-    be16_t src_port;
-    be16_t dst_port;
-    std::memcpy(&src_port, payload + offset, sizeof(be16_t));
-    std::memcpy(&dst_port, payload + offset + sizeof(be16_t), sizeof(be16_t));
-    key->src_port = src_port.value();
-    key->dst_port = dst_port.value();
-  }
+  key->family = p.l3 == L3Kind::kIpv6 ? FirewallFamily::kIpv6
+                                      : FirewallFamily::kIpv4;
+  key->proto = p.protocol;
+  key->src = p.src;
+  key->dst = p.dst;
+  // Only TCP and UDP have ports to match: the parse's ICMP echo identifier
+  // is not one.
+  const bool ports = p.l4 == L4Kind::kTcp || p.l4 == L4Kind::kUdp;
+  key->src_port = ports ? p.src_port : 0;
+  key->dst_port = ports ? p.dst_port : 0;
   return true;
 }
 

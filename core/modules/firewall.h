@@ -85,11 +85,14 @@ class Firewall final : public Module {
   static std::expected<std::unique_ptr<const Published>, std::string>
   BuildPublished(std::vector<Ranked> rules);
 
-  // The packet's 5-tuple. False for a packet this table cannot judge: not IPv4
-  // or IPv6, or a header it cannot read (a truncated one). A packet whose ports
-  // are not in the frame - a non-first fragment, a transport behind more
-  // extension headers than the walk follows - is judged with both ports 0,
-  // which only a rule whose port range starts at 0 can match.
+  // The packet's 5-tuple, from the checked parse (packet_parse.h, D-188): up
+  // to two VLAN tags, IPv4 options, up to eight IPv6 extension headers (AH
+  // included). False for a packet this table cannot judge: not IPv4 or IPv6,
+  // or malformed (a header cut short, lengths that lie, an EtherType its IP
+  // version contradicts, more extension headers than the walk follows). A
+  // packet without ports - a non-first fragment, ICMP, a protocol other than
+  // TCP and UDP - is judged with both ports 0, which only a rule whose port
+  // range starts at 0 can match.
   static bool KeyOf(bess::PacketRef pkt, bess::classifier::FirewallKey *key);
 
   bess::rcu::RcuPtr<Published> published_;
