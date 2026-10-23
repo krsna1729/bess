@@ -7,6 +7,7 @@
 #include <expected>
 #include <string>
 
+#include "modules/rx_mark.h"
 #include "utils/format.h"
 
 namespace {
@@ -67,6 +68,17 @@ CommandResponse PortInc::Init(const bess::pb::PortIncArg &arg) {
     prefetch_ = 1;
   }
 
+  // D-185: the attribute exists only when configured; it has an offset only
+  // when a module downstream reads it.
+  mark_attr_name_ = arg.mark_attr();
+  if (!mark_attr_name_.empty()) {
+    mark_attr_ = AddMetadataAttr(mark_attr_name_, sizeof(bess::utils::be32_t),
+                                 bess::metadata::Attribute::AccessMode::kWrite);
+    if (mark_attr_ < 0) {
+      return CommandFailure(-mark_attr_, "add_metadata_attr() failed");
+    }
+  }
+
   ret = port_->AcquireQueues(reinterpret_cast<const module *>(this),
                              PACKET_DIR_INC, nullptr, 0);
   if (ret < 0) {
@@ -102,6 +114,19 @@ void PortInc::DeInit() {
     port_->ReleaseQueues(reinterpret_cast<const module *>(this), PACKET_DIR_INC,
                          nullptr, 0);
   }
+}
+
+int PortInc::OnEvent(bess::Event event) {
+  if (event != bess::Event::PreResume) {
+    return -ENOTSUP;
+  }
+  // Offsets are assigned just before this: a configured MARK attribute
+  // promises a reader (D-185).
+  if (mark_attr_ >= 0 && !bess::metadata::IsValidOffset(MarkOffset())) {
+    LOG(WARNING) << "PortInc '" << name() << "': nothing reads '" << mark_attr_name_
+                 << "' (a module downstream reading it would); packets carry no MARK";
+  }
+  return 0;
 }
 
 std::string PortInc::GetDesc() const {
@@ -153,6 +178,11 @@ struct task_result PortInc::RunTask(Context *ctx, bess::PacketBatch *batch,
   if (!(p->GetFlags() & DRIVER_FLAG_SELF_INC_STATS)) {
     p->queue_stats[PACKET_DIR_INC][qid].packets += cnt;
     p->queue_stats[PACKET_DIR_INC][qid].bytes += received_bytes;
+  }
+
+  // One test per batch: without a reader of mark_attr nothing is written.
+  if (const bess::metadata::mt_offset_t mark = MarkOffset(); bess::metadata::IsValidOffset(mark)) {
+    bess::modules::WriteRxMarks(mark, batch);
   }
 
   RunNextModule(ctx, batch);

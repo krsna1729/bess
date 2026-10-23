@@ -69,6 +69,11 @@ class ModuleHarness {
   // them): what the module sends of the packets fed to it before.
   std::map<gate_idx_t, std::vector<Bytes>> RunTask(Module *m,
                                                    std::vector<gate_idx_t> ogates = {});
+  // Runs `first`'s first task once through the modules the test connected and
+  // returns what reached each of `last`'s `ogates`, with metadata offsets
+  // computed as in RunPipeline: what a source module writes, as a reader sees it.
+  std::map<gate_idx_t, std::vector<Bytes>> RunTaskPipeline(Module *first, Module *last,
+                                                           std::vector<gate_idx_t> ogates = {});
 
   // Runs `in` into `first`'s input gate `igate` through the modules the test
   // connected (ModuleGraph::ConnectModules) and returns what reached each of

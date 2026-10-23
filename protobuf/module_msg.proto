@@ -973,6 +973,14 @@ message StaticNATArg {
 message PortIncArg {
   string port = 1; /// The portname to connect to.
   bool prefetch = 2; /// Whether or not to prefetch packets from the port.
+  /// When set, each received packet's rte_flow MARK is written to this
+  /// 4-byte (big-endian) metadata attribute (D-185): the MARK the PMD
+  /// reports (RTE_MBUF_F_RX_FDIR_ID, hash.fdir.hi), else 0, so a rule's MARK
+  /// must not be 0 (FlowRuleOwner's mark_base >= 1). Written only when a
+  /// module downstream reads it. `PMDPortArg.rx_mark` negotiates delivery
+  /// where the PMD supports negotiation (sfc requires it); mapping a MARK to a
+  /// result is the application's.
+  string mark_attr = 3;
 }
 
 
@@ -1047,6 +1055,7 @@ message QueueIncArg {
   string port = 1; /// The portname to connect to (read from).
   uint64 qid = 2; /// The queue on that port to read from. qid starts from 0.
   bool prefetch = 3; /// When prefetch is enabled, the module will perform CPU prefetch on the first 64B of each packet onto CPU L1 cache. Default value is false.
+  string mark_attr = 4; /// As PortIncArg.mark_attr (D-185): the rte_flow MARK, else 0, as a 4-byte big-endian attribute.
 }
 
 /**

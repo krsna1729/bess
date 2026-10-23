@@ -3,7 +3,8 @@
 // QueueInc's "<name>/settings" singleton (D-129) in process: the burst set
 // through the resource's codec is what each receive asks the port's queue
 // for, it reads back canonically, and a burst set_burst refuses is refused
-// (set_burst went with the legacy service, D-140).
+// (set_burst went with the legacy service, D-140). And mark_attr (D-185):
+// each packet's rte_flow MARK, as a reader sees it.
 
 #include <gtest/gtest.h>
 
@@ -15,16 +16,19 @@
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
 #include "module.h"
+#include "module_graph.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
 #include "pktbatch.h"
 #include "port.h"
 #include "runtime/runtime_state.h"
+#include "testing/marked_rx_port.h"
 #include "testing/module_harness.h"
 #include "worker.h"
 
 namespace {
 
+using bess::testing::MarkedRxPort;
 using bess::testing::ModuleHarness;
 
 // A port with one incoming queue that always has as many 60-byte packets as
@@ -43,6 +47,7 @@ class QueueIncTestPort final : public Port {
 };
 
 ADD_DRIVER(QueueIncTestPort, "queue_inc_test", "QueueInc test port");
+ADD_DRIVER(MarkedRxPort, "marked_rx", "a port whose packets carry RX MARKs");
 
 // True when "<resource>"'s codec says applying it requires paused workers.
 bool RequiresPausedWorkers(const std::string &resource) {
@@ -118,6 +123,35 @@ TEST_F(QueueIncSettingsTest, AppliesLive) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("QueueInc", Arg(), "qi"));
   EXPECT_FALSE(RequiresPausedWorkers("qi/settings"));
+}
+
+// D-185, as PortInc: a Split on the 4-byte attribute sends each packet to the
+// gate of its MARK, 0 where RTE_MBUF_F_RX_FDIR_ID is not set.
+TEST(QueueIncMarkTest, MarkAttrCarriesEachPacketsMark) {
+  const auto &drivers = PortBuilder::all_port_builders();
+  const auto builder = drivers.find("MarkedRxPort");
+  ASSERT_NE(builder, drivers.end());
+  std::unique_ptr<Port> port(builder->second.CreatePort("marked-rx"));
+  port->num_queues[PACKET_DIR_INC] = 1;
+  ASSERT_TRUE(bess::runtime::runtime().ports().Add(std::move(port)));
+  {
+    ModuleHarness h;
+    bess::pb::QueueIncArg arg;
+    arg.set_port("marked-rx");
+    arg.set_qid(0);
+    arg.set_mark_attr("rx_mark");
+    Module *inc = h.Create("QueueInc", arg);
+    ASSERT_NE(nullptr, inc);
+    bess::pb::SplitArg split_arg;
+    split_arg.set_attribute("rx_mark");
+    split_arg.set_size(4);
+    Module *split = h.Create("Split", split_arg);
+    ASSERT_NE(nullptr, split);
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(inc, 0, split, 0, true));
+    EXPECT_EQ(bess::testing::MarkedRxExpected(),
+              h.RunTaskPipeline(inc, split, bess::testing::MarkedRxGates()));
+  }
+  bess::runtime::runtime().ports().Clear();
 }
 
 }  // namespace
