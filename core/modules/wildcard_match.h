@@ -8,22 +8,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "classifier/extract_plan.h"
 #include "classifier/concurrent_masked.h"
 #include "classifier/masked_rule_resource.h"
-#include "classifier/record_arena.h"
-#include "classifier/result_plan.h"
-#include "classifier/runtime_schema.h"
+#include "classifier/table_schema.h"
 #include "event.h"
 #include "framework/resource_bindings.h"
 #include "framework/singleton_resource.h"
+#include "framework/table_fields.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "rcu/rcu_ptr.h"
@@ -109,91 +106,37 @@ class WildcardMatch final : public Module {
   // The configuration a batch runs against. Immutable once published; the
   // rules themselves are in `table`, which is updated in place.
   struct Generation {
-    Generation(gate_idx_t d, bess::classifier::ExtractPlan e,
+    Generation(gate_idx_t d,
                std::shared_ptr<bess::classifier::ConcurrentMaskedTable> t,
-               size_t k, bool valid, std::vector<size_t> offsets,
-               std::optional<bess::classifier::ResultPlan> r,
-               std::vector<size_t> result_offsets,
-               std::shared_ptr<bess::classifier::RecordArena> records)
+               bess::classifier::CompiledKey k,
+               bess::classifier::CompiledResult r)
         : default_gate(d),
-          extract(std::move(e)),
           table(std::move(t)),
-          key_size(k),
-          extraction_valid(valid),
-          baked_source_offsets(std::move(offsets)),
-          result(std::move(r)),
-          baked_result_offsets(std::move(result_offsets)),
-          records(std::move(records)) {}
+          key(std::move(k)),
+          result(std::move(r)) {}
 
     gate_idx_t default_gate = DROP_GATE;
-    bess::classifier::ExtractPlan extract;
     // Shared, updated in place; owned by every generation that maps it.
     std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table;
-    // Dense packed key width: sum of field sizes. Also the extraction stride.
-    size_t key_size = 0;
-    // False when metadata offsets were invalid at (re)build time. The packet
-    // path then routes everything to the default gate instead of reading an
-    // incorrect metadata region (fail-closed).
-    bool extraction_valid = true;
-    // Init deferred a metadata result plan to the first PreResume; the
-    // offsets may be unchanged (both sentinel) but the plan must be built.
-    bool result_plan_deferred = false;
-    // Per-field source offset baked into `extract`, compared at PreResume to
-    // detect graph-driven offset reassignment.
-    std::vector<size_t> baked_source_offsets;
-    // Configured result placement: the compiled plan (nullopt in gate-only
-    // mode, or when no field has a reader), each field's baked destination
-    // (packet offset, metadata offset, or kSkippedOffset for a field compiled
-    // out), and the records its ids address. Compared at PreResume.
-    std::optional<bess::classifier::ResultPlan> result;
-    std::vector<size_t> baked_result_offsets;
-    std::shared_ptr<bess::classifier::RecordArena> records;
+    // The extraction (invalid in a fail-closed generation: the packet path
+    // then routes everything to the default gate instead of reading an
+    // incorrect metadata region) and the result placement, with the offsets
+    // each baked, compared at PreResume.
+    bess::classifier::CompiledKey key;
+    bess::classifier::CompiledResult result;
   };
 
   using GenerationPtr = std::unique_ptr<const Generation>;
 
-  // Sentinel for a metadata field whose attribute currently has no valid
-  // physical offset (e.g. orphan reader, out of space).
-  static constexpr size_t kInvalidOffset = static_cast<size_t>(-1);
-  // Destination of a metadata result field whose attribute nothing downstream
-  // reads (kMetadataOffsetNoWrite): the field is left out of the result plan.
-  static constexpr size_t kSkippedOffset = static_cast<size_t>(-2);
-
-  // Field configuration, fixed at Init() time; every generation's plan gets
-  // it, so a rebuild reproduces the module's matching exactly.
-  struct FieldSpec {
-    bool by_offset = true;
-    int offset = 0;         // valid when by_offset
-    std::string attr_name;  // otherwise
-    int attr_id = -1;       // resolved once at Init() when !by_offset
-    int size = 0;
-  };
-
-  // Per-field key layout resolved from the module's FieldSpecs and the
-  // current metadata offsets.
-  struct KeyLayout {
-    size_t key_size = 0;
-    std::vector<bess::classifier::RuntimeKeyField> key_fields;
-    // Source offset baked into the plan per field, or kInvalidOffset for
-    // unreadable metadata.
-    std::vector<size_t> baked_offsets;
-    // False when a metadata field has no valid physical offset.
-    bool metadata_valid = true;
-  };
-
   // Calls emit(i, gate, result_id) once per packet, in order. With
   // `with_result` (and result fields configured) a hit's record id is read
-  // from its rule; otherwise result_id is 0 and no rule record is touched.
+  // from its rule; otherwise a hit's result_id is 0 and no rule record is
+  // touched. A miss's result_id is `miss_result_id`.
   template <typename Emit>
   void Classify(bess::PacketBatch *batch, bool with_result, Emit &&emit,
-                uint64_t *out_hits = nullptr) const;
+                uint32_t miss_result_id = 0) const;
 
   CommandResponse AddFieldOne(const bess::pb::Field &field, int idx);
-  // Resolves FieldSpecs into a dense packed layout using current metadata
-  // offsets. With `tolerate_invalid_metadata`, unreadable metadata marks the
-  // layout invalid (fail-closed path) instead of failing.
-  bool ComputeLayout(bool tolerate_invalid_metadata, KeyLayout *layout,
-                     Error *err);
   // Turns a rule's protobuf fields into `rule`'s per-field byte vectors.
   Error RuleFieldsFromPb(const RepeatedPtrField<bess::pb::FieldData> &fields,
                          size_t field_size, std::vector<std::vector<uint8_t>> *out);
@@ -219,58 +162,24 @@ class WildcardMatch final : public Module {
   GenerationPtr BuildDegraded(
       std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table,
       gate_idx_t default_gate);
-  // Replaces the published generation with `build(current)`, or leaves the
-  // active one alone when the builder returns nullptr (with *err set). Runs
-  // only on the control plane, where command and graph mutations are
-  // serialized; never on a packet worker.
-  bool Publish(const std::function<GenerationPtr(const Generation &)> &build,
-               Error *err);
   // Rebuilds and republishes the generation when metadata offsets changed
   // under it (graph reconfiguration + resume). Runs on the control thread with
   // workers paused. Never leaves a stale plan reading a reassigned metadata
   // region: refresh failure publishes a fail-closed generation.
   void RefreshForResume();
 
-  // Field configuration, fixed at Init() time.
-  std::vector<FieldSpec> field_specs_;
+  // Field configuration, fixed at Init() time; every generation's plan gets
+  // it, so a rebuild reproduces the module's matching exactly.
+  bess::framework::KeyFields keys_{kMaxFields, kMaxFieldSize};
   // Distinct masks the table admits (Init's max_tuples); the writer checks
   // it, the packet path never reads it.
   size_t max_tuples_ = kDefaultMaxTuples;
   std::optional<uint64_t> initial_default_gate_;  // as given at creation
 
   // Result fields (fixed at Init): each maps a slice of a rule's record to a
-  // metadata attribute or a packet offset. Empty: gate-only.
-  struct ResultSpec {
-    bool by_attr = true;
-    std::string attr_name;
-    int attr_id = -1;
-    uint32_t offset = 0;
-    uint32_t value_offset = 0;
-    uint32_t size = 0;
-    std::string reference;
-    bool reference_be32 = false;
-    // Consecutive big-endian ids a BE32 field carries (D-172).
-    uint32_t reference_count = 1;
-  };
-  std::vector<ResultSpec> result_specs_;
-  // A result field's destination under the current metadata offsets: its
-  // packet offset, its attribute's metadata offset, kSkippedOffset when no
-  // downstream module reads the attribute, or kInvalidOffset when the
-  // attribute has no usable offset (out of space, a reader also reached by a
-  // path with no writer, an unresolved update).
-  size_t ResultDestination(const ResultSpec &spec) const;
-  std::vector<std::string> result_reference_names_;
-  bool metadata_ready_ = false;
-  size_t result_value_size_ = 0;
-  std::shared_ptr<bess::classifier::RecordArena> records_;
-  std::optional<std::vector<std::byte>> default_result_;
-  uint32_t default_record_id_ = 0;
-
-  // The resources a rule's result bytes name through configured references
-  // (D-172); an all-zero field names nothing.
-  std::vector<bess::dataplane::Reference> ResultReferences(
-      const std::vector<std::byte> &bytes) const;
-
+  // metadata attribute or a packet offset, plus the records and the default
+  // result. Empty: gate-only.
+  bess::framework::ResultFields results_;
 
   // The live rule table (also held by the published generation).
   std::shared_ptr<bess::classifier::ConcurrentMaskedTable> table_;

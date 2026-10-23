@@ -18,6 +18,7 @@ classifier_sources = files(
   'classifier/record_arena.cc',
   'classifier/result_plan.cc',
   'classifier/runtime_schema.cc',
+  'classifier/table_schema.cc',
 )
 
 flow_sources = files(
@@ -598,6 +599,8 @@ core_public_subdir_headers = {
     'framework/resource_bindings.h',
     'framework/resource_codec.h',
     'framework/singleton_resource.h',
+    'framework/table_batch.h',
+    'framework/table_fields.h',
   ),
   'dataplane': files(
     'dataplane/action_id.h',
@@ -624,8 +627,14 @@ core_public_subdir_headers = {
   'classifier': files(
     'classifier/byte_key.h',
     'classifier/classifier.h',
+    'classifier/extract_plan.h',
     'classifier/firewall_table.h',
+    'classifier/plan_copy.h',
     'classifier/range_backend.h',
+    'classifier/record_arena.h',
+    'classifier/result_plan.h',
+    'classifier/runtime_schema.h',
+    'classifier/table_schema.h',
   ),
   'l2': files(
     'l2/fdb.h',
@@ -726,6 +735,7 @@ unit_test_sources = [
   'classifier/runtime_schema_test.cc',
   'classifier/extract_plan_test.cc',
   'classifier/result_plan_test.cc',
+  'classifier/table_schema_test.cc',
   'classifier/typed_exact_test.cc',
   'classifier/masked_exact_test.cc',
   'classifier/range_backend_test.cc',

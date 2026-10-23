@@ -15,7 +15,9 @@ This document formalizes the supported C++ and build contract for out-of-tree BE
 - **Experimental**: the selected headers under
   `bess/core/{classifier,dataplane,flow,meter,rcu,route,stats}`, the wire
   codec facade (`framework/resource_codec.h`, `framework/resource_bindings.h`,
-  D-094), and the static archives of section 6 (D-095). Their interfaces may
+  D-094), the classifier-table helpers (`framework/table_fields.h`,
+  `framework/table_batch.h`, D-189), and the static archives of section 6
+  (D-095). Their interfaces may
   change without preserving source compatibility. (`flow/` is
   the flow-state library, see `docs/flow-state.md`; a plugin that uses it
   links the `bess_flow` symbols `bessd` already exports.) A public header
@@ -626,6 +628,39 @@ module of the plugin's classes, port of its drivers, gate hook of its classes
 or instance its code destroys exists; it then destroys what the plugin's code
 retired to RCU before `dlclose` (D-090). Pointers to the plugin's code that
 another plugin or module keeps on its own are not tracked.
+
+### Classifier tables in a module (experimental, D-189)
+
+`WildcardMatch` and `ExactMatch` are built from installed helpers, and a plugin
+that holds one or several classifier tables uses the same ones. The pure half is
+`classifier/table_schema.h` (no Module, gate or protobuf; compiled into
+`bess_classifier`, which `bessd` exports):
+
+| Piece | What it does |
+|---|---|
+| `KeyLayout`, `CompileKey`, `CompiledKey` | a dense key `field0 \|\| field1 \|\| ...` from resolved source offsets, compiled into an `ExtractPlan` (bounds checked), with the offsets it baked; `CompileKey` refuses a layout with bytes no field writes |
+| `ResultFieldSpec`, `ResultSchema` | the slices of an entry's record and where they go: `Check` a field, `References` decodes the entries a record names (D-172), `Compile` builds the `ResultPlan` for a set of destinations, leaving out `kSkippedOffset` (D-181) and refusing `kUnresolvedOffset` |
+| `CompiledResult` | the plan, its baked destinations, whether it waits for metadata offsets, the `RecordArena` |
+
+The module-bound half is header-only (`bess_framework` does not link the
+classifier, so its calls are emitted in the module that uses it):
+
+| Header | Piece | What it does |
+|---|---|---|
+| `framework/table_fields.h` | `KeyFields` | the key fields (packet offset or metadata attribute) and the module's limits; resolves them against the module's attribute offsets into a `CompiledKey`, optionally with a per-field mask; a fail-closed key; `Changed` at PreResume |
+| | `ResultFields` | parses `result_fields` and `default_result` (registering write attributes), owns the `RecordArena`, checks a rule value (`CheckRule`), compiles the placement (deferred until the first PreResume when it writes metadata), `Compare`s destinations at PreResume |
+| | `PublishGeneration`, `RepublishGeneration`, `RebuildGeneration` | publish a module's own generation struct through its `RcuPtr` and reclaim; the PreResume rebuild that falls back to a fail-closed generation |
+| | `ReleaseTableResource` | the DeInit release of a rules resource (for teardown when its values reference other resources) |
+| `framework/table_batch.h` | `ExtractKeys` | the batch's keys through a `CompiledKey`'s plan, each extracted row written whole, failed rows zeroed |
+| | `PlaceResults` | the records a batch matched written through a `ResultPlan`; a packet that cannot be made writable goes to `DROP_GATE` |
+
+The generation struct is the module's: it holds a `CompiledKey` per table key, a
+`CompiledResult` per record layout, its tables and whatever else its packet path
+reads (a default gate, a specialised kernel). The packet-path helpers are inline
+and take the caller's stack scratch: no allocation and no indirect call per
+batch. The table classes and their rule resources
+(`classifier/concurrent_{exact,masked}.h`, `classifier/{exact,masked}_rule_resource.h`)
+are not installed yet.
 
 ---
 

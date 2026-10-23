@@ -7,22 +7,18 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <map>
-#include <limits>
 #include <string>
-#include <span>
 #include <utility>
 #include <vector>
 
-#include "framework/resource_bindings.h"
 #include "dataplane/transaction_engine.h"
 #include "event.h"
+#include "framework/resource_bindings.h"
+#include "framework/table_batch.h"
 #include "metadata.h"
-#include "packet_reshape.h"
-#include "snbuf_layout.h"
+#include "rcu/rcu_ptr.h"
 #include "utils/bits.h"
 #include "utils/endian.h"
-#include "rcu/rcu_ptr.h"
 #include "utils/format.h"
 
 namespace classifier = bess::classifier;
@@ -80,56 +76,18 @@ bool ConvertMask(uint64_t raw, int size, bool is_packet,
   return true;
 }
 
-// The generic path: extract every key with the generation's plan, then look
-// the batch up. ExactMatch's key layout is dense, so a fully-covering plan
-// writes every byte of every valid row and the used region needs no
-// pre-zeroing; a failed extraction writes nothing, and invalid rows are
-// zeroed before the backend (which looks up all rows) sees them. Gapped
-// generic schemas keep the caller-initializes-gap contract and pre-zero
-// instead. Sets *valid to the extraction mask; returns the hit mask.
+// The generic path: extract every key with the generation's dense key
+// (failed rows zeroed), then look the batch up; the backend looks up every
+// row. Sets *valid to the extraction mask; returns the hit mask.
 uint64_t LookupExtracted(const bess::PacketBatch &batch,
-                         const classifier::ExtractPlan &extract,
-                         size_t key_size,
+                         const classifier::CompiledKey &key,
                          const classifier::ConcurrentExactTable &table,
                          std::byte *keys, uint64_t *values,
                          uint64_t *valid) noexcept {
   const auto cnt = static_cast<size_t>(batch.cnt());
-  const classifier::MutableBytes rows(keys, cnt * key_size);
-  if (!extract.fully_covers_key()) {
-    std::memset(rows.data(), 0, rows.size());
-  }
-  std::array<classifier::SourceView, bess::PacketBatch::kMaxBurst> sources;
-  for (size_t i = 0; i < cnt; i++) {
-    const bess::PacketRef pkt = batch.packet(i);
-    // Packet span is the first segment only: fields reaching past data_len
-    // (or into later segments) fail extraction under kCheck and take the
-    // default gate instead of over-reading, as the legacy 8-byte loads could.
-    sources[i].packet = classifier::ConstBytes(
-        pkt.head_data<const std::byte *>(),
-        static_cast<size_t>(pkt.data_len()));
-    sources[i].metadata = classifier::ConstBytes(
-        pkt.metadata<const std::byte *>(), SNBUF_METADATA);
-  }
-
-  // One extraction batch dispatch, one backend batch dispatch. Metadata
-  // attribute IDs were resolved to physical offsets at (re)build time, so
-  // nothing here resolves names or parses configuration.
-  const uint64_t ok = extract.ExecuteBatch(
-      std::span<const classifier::SourceView>(sources).first(cnt), rows,
-      key_size);
-  // Invalid rows hold stale scratch (or partial gap bytes); zero them so the
-  // backend sees well-defined keys. Their results are discarded through the
-  // validity mask regardless.
-  const uint64_t all_valid = (uint64_t{1} << cnt) - 1;
-  if ((ok & all_valid) != all_valid) {
-    for (size_t i = 0; i < cnt; i++) {
-      if (!(ok & (uint64_t{1} << i))) {
-        std::memset(keys + i * key_size, 0, key_size);
-      }
-    }
-  }
-  *valid = ok;
-  return table.LookupBatch(rows, key_size, values, cnt);
+  *valid = bess::framework::ExtractKeys(key, batch, keys);
+  return table.LookupBatch(classifier::ConstBytes(keys, cnt * key.key_size),
+                           key.key_size, values, cnt);
 }
 
 // The fused fixed-layout kernel (D-121), for a key that is one packet field
@@ -196,13 +154,11 @@ CommandResponse ExactMatch::AddFieldOne(const bess::pb::Field &field,
                                         int idx) {
   int size = field.num_bytes();
   uint64_t mask64 = 0;
-  size_t mask_bin_len = 0;
   if (mask.encoding_case() == bess::pb::FieldData::kValueInt) {
     mask64 = mask.value_int();
   } else if (mask.encoding_case() == bess::pb::FieldData::kValueBin) {
     const std::string &bin = mask.value_bin();
-    mask_bin_len = bin.size();
-    if (mask_bin_len > sizeof(mask64)) {
+    if (bin.size() > sizeof(mask64)) {
       // The legacy parser copied the full bytestring over the stack-local
       // mask word (buffer over-read/over-write); reject it instead.
       return CommandFailure(EINVAL, "idx %d: not a valid %d-byte mask", idx,
@@ -212,11 +168,8 @@ CommandResponse ExactMatch::AddFieldOne(const bess::pb::Field &field,
                       bin.size());
   }
 
-  FieldSpec spec;
+  bess::framework::KeyField spec;
   spec.size = size;
-  spec.mask = mask64;
-  spec.mask_bin_len = mask_bin_len;
-  spec.attr_id = -1;
   if (field.position_case() == bess::pb::Field::kAttrName) {
     spec.by_offset = false;
     spec.attr_name = field.attr_name();
@@ -238,115 +191,40 @@ CommandResponse ExactMatch::AddFieldOne(const bess::pb::Field &field,
                           "idx %d: must specify 'offset' or 'attr_name'", idx);
   }
 
-  field_specs_.push_back(std::move(spec));
+  keys_.Add(std::move(spec));
+  field_masks_.push_back(mask64);
   return CommandSuccess();
 }
 
-// Resolves the module's FieldSpecs into a dense packed key layout using the
-// currently assigned metadata offsets. Packet offsets are config-fixed;
-// metadata offsets are reassigned by ComputeMetadataOffsets on graph changes.
-// With `tolerate_invalid_metadata`, unreadable metadata marks the layout
-// invalid (for the fail-closed path) instead of failing.
-bool ExactMatch::ComputeLayout(bool tolerate_invalid_metadata,
-                               KeyLayout *layout, Error *err) {
-  if (field_specs_.size() > kMaxFields) {
-    *err = std::make_pair(
-        EINVAL, bess::utils::Format("too many fields (max %zu)", kMaxFields));
+bool ExactMatch::FieldMask(size_t i, classifier::Normalization *out,
+                           Error *err) const {
+  const bess::framework::KeyField &field = keys_.fields()[i];
+  std::vector<std::byte> converted;
+  bool is_default = false;
+  if (!ConvertMask(field_masks_[i], field.size, field.by_offset, &converted,
+                   &is_default, err, static_cast<int>(i))) {
     return false;
   }
-
-  layout->key_size = 0;
-  layout->key_fields.clear();
-  layout->baked_offsets.clear();
-  layout->metadata_valid = true;
-  layout->key_fields.reserve(field_specs_.size());
-  layout->baked_offsets.reserve(field_specs_.size());
-
-  size_t pos = 0;
-  for (size_t i = 0; i < field_specs_.size(); i++) {
-    const FieldSpec &spec = field_specs_[i];
-    const int idx = static_cast<int>(i);
-    if (spec.size < 1 ||
-        static_cast<size_t>(spec.size) > kMaxFieldSize) {
-      *err = std::make_pair(
-          EINVAL, bess::utils::Format("idx %d: 'size' must be in [1,%zu]", idx,
-                                      kMaxFieldSize));
-      return false;
-    }
-    if (spec.mask_bin_len > sizeof(uint64_t)) {
-      *err = std::make_pair(
-          EINVAL, bess::utils::Format("idx %d: not a valid %d-byte mask", idx,
-                                      spec.size));
-      return false;
-    }
-
-    classifier::RuntimeKeyField field;
-    field.key_offset = pos;
-    field.size = static_cast<size_t>(spec.size);
-    size_t baked;
-    if (spec.by_offset) {
-      if (spec.offset < 0 || spec.offset > 1024) {
-        *err = std::make_pair(
-            EINVAL, bess::utils::Format("idx %d: invalid 'offset'", idx));
-        return false;
-      }
-      field.source = classifier::SourceKind::kPacket;
-      field.source_offset = static_cast<size_t>(spec.offset);
-      baked = static_cast<size_t>(spec.offset);
-    } else {
-      const bess::metadata::mt_offset_t offset =
-          attr_offset(static_cast<size_t>(spec.attr_id));
-      if (!bess::metadata::IsValidOffset(offset)) {
-        layout->metadata_valid = false;
-        if (!tolerate_invalid_metadata) {
-          *err = std::make_pair(
-              EINVAL,
-              bess::utils::Format(
-                  "idx %d: metadata attribute '%s' has no valid offset "
-                  "(pipeline graph changed?)",
-                  idx, spec.attr_name.c_str()));
-          return false;
-        }
-        baked = kInvalidOffset;
-        // Placeholder; the plan is never executed while invalid.
-        field.source_offset = 0;
-      } else {
-        baked = static_cast<size_t>(offset);
-        field.source_offset = baked;
-      }
-      field.source = classifier::SourceKind::kMetadata;
-    }
-
-    std::vector<std::byte> converted;
-    bool is_default = false;
-    if (!ConvertMask(spec.mask, spec.size, spec.by_offset, &converted,
-                     &is_default, err, idx)) {
-      return false;
-    }
-    if (!is_default) {
-      field.normalization.mask = std::move(converted);
-    }
-    layout->key_fields.push_back(std::move(field));
-    layout->baked_offsets.push_back(baked);
-    pos += static_cast<size_t>(spec.size);
+  if (!is_default) {
+    out->mask = std::move(converted);
   }
-  layout->key_size = pos;
   return true;
 }
 
 Error ExactMatch::PackKey(const std::vector<std::vector<uint8_t>> &fields,
                          std::vector<std::byte> *key) const {
-  if (fields.size() != field_specs_.size()) {
+  const std::vector<bess::framework::KeyField> &specs = keys_.fields();
+  if (fields.size() != specs.size()) {
     return std::make_pair(
         EINVAL, bess::utils::Format("rule should have %zu fields (has %zu)",
-                                    field_specs_.size(), fields.size()));
+                                    specs.size(), fields.size()));
   }
   // Rule bytes are packed densely in field order WITHOUT applying the mask --
   // the legacy table copied rule bytes verbatim while masking only extracted
   // packet/metadata bytes. Preserve that distinction.
   key->clear();
   for (size_t i = 0; i < fields.size(); i++) {
-    const size_t want = static_cast<size_t>(field_specs_[i].size);
+    const size_t want = static_cast<size_t>(specs[i].size);
     if (fields[i].size() != want) {
       return std::make_pair(
           EINVAL,
@@ -361,13 +239,9 @@ Error ExactMatch::PackKey(const std::vector<std::vector<uint8_t>> &fields,
 
 std::expected<std::shared_ptr<classifier::ConcurrentExactTable>, Error>
 ExactMatch::NewTable(size_t rules) const {
-  size_t key_size = 0;
-  for (const FieldSpec &spec : field_specs_) {
-    key_size += static_cast<size_t>(spec.size);
-  }
   // Decision D-010: room for `rules` plus the grace-period headroom.
   auto table = classifier::ConcurrentExactTable::Create(
-      static_cast<uint32_t>(key_size),
+      static_cast<uint32_t>(keys_.key_size()),
       classifier::ConcurrentExactTable::CapacityFor(rules),
       init_context().rcu());
   if (!table) {
@@ -422,170 +296,42 @@ bool ExactMatch::EnsureCapacity(bool force, Error *err) {
     return false;
   }
   auto next_table = *bigger;
-  const bool published = Publish([&](const Generation &current) {
-    return Build(next_table,
-                 current.default_gate.load(std::memory_order_relaxed), err);
-  }, err);
+  const bool published = bess::framework::RepublishGeneration(
+      published_,
+      [&](const Generation &current) {
+        return Build(next_table,
+                     current.default_gate.load(std::memory_order_relaxed), err);
+      },
+      err);
   if (published) {
     table_ = std::move(next_table);
   }
   return published;
 }
 
-std::vector<bess::dataplane::Reference> ExactMatch::ResultReferences(
-    const std::vector<std::byte> &bytes) const {
-  std::vector<bess::dataplane::Reference> refs;
-  // Decode from the zero-padded record, the same bytes a later
-  // replacement/erase reads from the arena (D-172).
-  std::vector<std::byte> record(result_value_size_, std::byte{0});
-  if (!bytes.empty()) {
-    std::memcpy(record.data(), bytes.data(),
-                std::min(bytes.size(), record.size()));
-  }
-  for (const ResultSpec &spec : result_specs_) {
-    if (spec.reference.empty() ||
-        spec.value_offset + spec.size > record.size()) {
-      continue;
-    }
-    bool zero = true;
-    for (uint32_t i = 0; i < spec.size; i++) {
-      if (record[spec.value_offset + i] != std::byte{0}) {
-        zero = false;
-        break;
-      }
-    }
-    if (zero) {
-      continue;  // an all-zero field names nothing (0 = none, D-141)
-    }
-    if (spec.reference_be32) {
-      const auto *at = record.data() + spec.value_offset;
-      for (uint32_t i = 0; i < spec.reference_count; i++) {
-        const auto *chunk = at + static_cast<size_t>(i) * 4;
-        const uint32_t id =
-            (static_cast<uint32_t>(chunk[0]) << 24U) |
-            (static_cast<uint32_t>(chunk[1]) << 16U) |
-            (static_cast<uint32_t>(chunk[2]) << 8U) |
-            static_cast<uint32_t>(chunk[3]);
-        if (id == 0) {
-          continue;  // 0 names nothing at this position (D-141)
-        }
-        refs.push_back({spec.reference, bess::dataplane::EncodeKey(id)});
-      }
-    } else {
-      refs.push_back(
-          {spec.reference,
-           std::string(reinterpret_cast<const char *>(record.data() +
-                                                      spec.value_offset),
-                       spec.size)});
-    }
-  }
-  return refs;
-}
-
-size_t ExactMatch::ResultDestination(const ResultSpec &spec) const {
-  if (!spec.by_attr) {
-    return spec.offset;
-  }
-  const bess::metadata::mt_offset_t offset = attr_offset(spec.attr_id);
-  if (bess::metadata::IsValidOffset(offset)) {
-    return static_cast<size_t>(static_cast<uint8_t>(offset));
-  }
-  // No downstream reader: the metadata model lets the writer skip the write.
-  return offset == bess::metadata::kMetadataOffsetNoWrite ? kSkippedOffset
-                                                          : kInvalidOffset;
-}
-
-bool ExactMatch::CompileResultPlan(size_t key_size,
-                                   std::optional<classifier::ResultPlan> *plan,
-                                   std::vector<size_t> *baked_offsets,
-                                   Error *err) const {
-  classifier::RuntimeClassifierSchema schema;
-  schema.key_size = key_size;
-  schema.value_size = result_value_size_;
-  schema.bounds = classifier::BoundsPolicy::kCheck;
-  baked_offsets->clear();
-  baked_offsets->reserve(result_specs_.size());
-  for (const ResultSpec &spec : result_specs_) {
-    const size_t at = ResultDestination(spec);
-    baked_offsets->push_back(at);
-    if (at == kSkippedOffset) {
-      continue;  // compiled out: nothing downstream reads it
-    }
-    if (at == kInvalidOffset) {
-      *err = std::make_pair(EINVAL, "result field '" + spec.attr_name +
-                                        "' has no readable metadata offset");
-      return false;
-    }
-    classifier::RuntimeResultField field;
-    field.value_offset = spec.value_offset;
-    field.size = spec.size;
-    field.destination = spec.by_attr ? classifier::BufferKind::kMetadata
-                                     : classifier::BufferKind::kPacket;
-    field.destination_offset = at;
-    schema.result_fields.push_back(std::move(field));
-  }
-  plan->reset();
-  if (schema.result_fields.empty()) {
-    return true;  // every field compiled out: gate-only
-  }
-  auto compiled = classifier::ResultPlan::Compile(schema);
-  if (!compiled) {
-    *err = std::make_pair(EINVAL, "result plan: " + compiled.error().message);
-    return false;
-  }
-  *plan = std::move(*compiled);
-  return true;
-}
-
 ExactMatch::GenerationPtr ExactMatch::Build(
     std::shared_ptr<classifier::ConcurrentExactTable> table,
     gate_idx_t default_gate, Error *err) {
-  KeyLayout layout;
-  if (!ComputeLayout(/*tolerate_invalid_metadata=*/false, &layout, err)) {
+  const auto mask = [this](size_t i, classifier::Normalization *out,
+                           Error *e) { return FieldMask(i, out, e); };
+  std::optional<classifier::CompiledKey> key = keys_.Compile(*this, err, mask);
+  if (!key) {
     return nullptr;
   }
-
-  classifier::RuntimeClassifierSchema schema;
-  schema.key_size = layout.key_size;
-  schema.bounds = classifier::BoundsPolicy::kCheck;
-  schema.key_fields = layout.key_fields;
-  auto plan = classifier::ExtractPlan::Compile(schema);
-  if (!plan) {
-    const auto &e = plan.error();
-    *err = std::make_pair(EINVAL, "extraction plan: " + e.message);
+  CHECK_EQ(key->key_size, table->key_len());
+  // Metadata destinations wait for PreResume (deferred): before it every
+  // attribute reads offset 0, and distinct outputs would overlap.
+  classifier::CompiledResult result;
+  if (!results_.Compile(*this, key->key_size, &result, err)) {
     return nullptr;
   }
-  CHECK_EQ(layout.key_size, table->key_len());
-
-  std::vector<size_t> result_offsets;
-  std::optional<classifier::ResultPlan> result;
-  bool needs_metadata = false;
-  if (!result_specs_.empty()) {
-    for (const ResultSpec &spec : result_specs_) {
-      needs_metadata = needs_metadata || spec.by_attr;
-    }
-    if (!metadata_ready_ && needs_metadata) {
-      // Metadata offsets are resolved at PreResume; a plan now would bake
-      // every attribute as offset 0 and reject distinct outputs as
-      // overlapping. RefreshForResume rebuilds with the resolved offsets.
-      result_offsets.assign(result_specs_.size(), kInvalidOffset);
-    } else {
-      if (!CompileResultPlan(layout.key_size, &result, &result_offsets, err)) {
-        return nullptr;
-      }
-    }
-  }
-  auto gen = std::make_unique<Generation>(
-      default_gate, std::move(*plan), std::move(table), layout.key_size,
-      /*extraction_valid=*/true, std::move(layout.baked_offsets),
-      std::move(result), std::move(result_offsets), records_);
-  gen->result_plan_deferred = !result_specs_.empty() && !metadata_ready_ &&
-                              needs_metadata;
+  auto gen = std::make_unique<Generation>(default_gate, std::move(table),
+                                          std::move(*key), std::move(result));
 
   // The fused kernel (D-121) takes a key that is exactly one packet field of
   // 1, 2, 4 or 8 bytes, checked against the first segment (kCheck).
-  const classifier::ExtractPlan &extract = gen->extract;
-  const size_t width = gen->key_size;
+  const classifier::ExtractPlan &extract = gen->key.extract;
+  const size_t width = gen->key.key_size;
   if (fused_enabled_ &&
       extract.kernel() == classifier::ExtractKernel::kSinglePacket &&
       extract.bounds() == classifier::BoundsPolicy::kCheck &&
@@ -606,96 +352,36 @@ ExactMatch::GenerationPtr ExactMatch::Build(
 ExactMatch::GenerationPtr ExactMatch::BuildDegraded(
     std::shared_ptr<classifier::ConcurrentExactTable> table,
     gate_idx_t default_gate) {
-  // Same layout machinery, tolerating unreadable metadata: the resulting plan
-  // is never executed (extraction_valid == false), so placeholder offsets are
-  // safe. Only reachable for established generations, hence key_size > 0.
-  KeyLayout layout;
-  Error err;
-  if (!ComputeLayout(/*tolerate_invalid_metadata=*/true, &layout, &err)) {
-    // Field configuration itself is broken; callers only reach here after a
-    // successful Build, so this is unreachable.
-    CHECK(false) << "degraded ExactMatch build failed: " << err.second;
-  }
-  CHECK_GT(layout.key_size, 0u);
-
-  classifier::RuntimeClassifierSchema schema;
-  schema.key_size = layout.key_size;
-  schema.bounds = classifier::BoundsPolicy::kCheck;
-  schema.key_fields = layout.key_fields;
-  auto plan = classifier::ExtractPlan::Compile(schema);
-  CHECK(plan.has_value()) << "degraded ExactMatch plan failed to compile";
-
-  // The degraded generation never places results: its extraction is invalid,
-  // so ProcessBatch routes every packet to the default gate without touching
-  // packet or metadata bytes.
-  std::vector<size_t> result_offsets(result_specs_.size(), kInvalidOffset);
-  std::optional<classifier::ResultPlan> result;
-
+  // Never places results: its extraction is invalid, so ProcessBatch routes
+  // every packet to the default gate without touching packet or metadata
+  // bytes.
+  const auto mask = [this](size_t i, classifier::Normalization *out,
+                           Error *e) { return FieldMask(i, out, e); };
   return std::make_unique<Generation>(
-      default_gate, std::move(*plan), std::move(table), layout.key_size,
-      /*extraction_valid=*/false, std::move(layout.baked_offsets),
-      std::move(result), std::move(result_offsets), records_);
+      default_gate, std::move(table),
+      keys_.CompileFailClosed(*this, "ExactMatch", mask),
+      results_.CompileFailClosed());
 }
 
 void ExactMatch::RefreshForResume() {
-  metadata_ready_ = true;
+  results_.set_metadata_ready();
   const Generation *current = published_.Read();
   if (current == nullptr) {
     return;  // not initialized (or already deinitialized)
   }
-
-  bool changed = false;
-  for (size_t i = 0; i < field_specs_.size(); i++) {
-    const FieldSpec &spec = field_specs_[i];
-    size_t now;
-    if (spec.by_offset) {
-      now = static_cast<size_t>(spec.offset);
-    } else {
-      const bess::metadata::mt_offset_t offset =
-          attr_offset(static_cast<size_t>(spec.attr_id));
-      now = bess::metadata::IsValidOffset(offset)
-                ? static_cast<size_t>(offset)
-                : kInvalidOffset;
-    }
-    if (i >= current->baked_source_offsets.size() ||
-        current->baked_source_offsets[i] != now) {
-      changed = true;
-      break;
-    }
-  }
-  if (!changed && !result_specs_.empty()) {
-    for (size_t i = 0; i < result_specs_.size(); i++) {
-      if (i >= current->baked_result_offsets.size() ||
-          current->baked_result_offsets[i] !=
-              ResultDestination(result_specs_[i])) {
-        changed = true;
-        break;
-      }
-    }
-  }
-  if (!changed && !current->result_plan_deferred) {
+  if (!keys_.Changed(*this, current->key) &&
+      !results_.Compare(*this, current->result).changed &&
+      !current->result.deferred) {
     return;
   }
-
-  Error err;
+  // A failed rebuild fails closed: rules and default gate stay introspectable,
+  // every packet takes the default gate.
   const gate_idx_t default_gate =
       current->default_gate.load(std::memory_order_relaxed);
-  GenerationPtr next = Build(current->table, default_gate, &err);
-  if (next != nullptr) {
-    published_.Publish(std::move(next));
-    init_context().rcu().ReclaimReady();
-    return;
-  }
-
-  // The dispatcher ignores ordinary OnEvent errors and resume would proceed
-  // with a stale plan reading a reassigned metadata region. Fail closed
-  // instead: keep serving rules/default-gate introspection, but route every
-  // packet to the default gate.
-  LOG(ERROR) << "ExactMatch '" << name()
-             << "': metadata refresh failed (" << err.second
-             << "); routing all packets to the default gate";
-  published_.Publish(BuildDegraded(current->table, default_gate));
-  init_context().rcu().ReclaimReady();
+  bess::framework::RebuildGeneration(
+      published_, "ExactMatch '" + name() + "'",
+      [&](Error *err) { return Build(current->table, default_gate, err); },
+      [&] { return BuildDegraded(current->table, default_gate); });
 }
 
 int ExactMatch::OnEvent(bess::Event event) {
@@ -705,27 +391,6 @@ int ExactMatch::OnEvent(bess::Event event) {
   RefreshForResume();
   // Return 0 (not -ENOTSUP) to stay registered for future resumes.
   return 0;
-}
-
-bool ExactMatch::Publish(
-    const std::function<GenerationPtr(const Generation &)> &build, Error *err) {
-  const Generation *current = published_.Read();
-  if (current == nullptr) {
-    *err = Error(EINVAL, "not initialized");
-    return false;  // not initialized (or already deinitialized)
-  }
-
-  GenerationPtr next = build(*current);
-  if (next == nullptr) {
-    return false;  // the builder owns reporting why
-  }
-
-  // Publish, retire the replaced generation against a fresh grace period, and
-  // reclaim whatever readers are already done with. This runs on the control
-  // thread, so a retired table is destroyed here -- never on a worker.
-  published_.Publish(std::move(next));
-  init_context().rcu().ReclaimReady();
-  return true;
 }
 
 CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
@@ -739,7 +404,8 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
 
   // AddFieldOne only records the configuration; Build() below is what
   // validates it against the module (attr names) and applies it.
-  field_specs_.clear();
+  keys_.Clear();
+  field_masks_.clear();
   for (auto i = 0; i < arg.fields_size(); ++i) {
     CommandResponse err;
 
@@ -759,107 +425,14 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
   // metadata attribute (added here, before Build, so the plan bakes its
   // offset) or a packet byte offset. A rule's record is zero-padded to the
   // widest field's end.
-  result_specs_.clear();
-  result_reference_names_.clear();
-  result_value_size_ = 0;
-  for (const bess::pb::ResultField &field : arg.result_fields()) {
-    if (field.num_bytes() == 0) {
-      return CommandFailure(EINVAL, "a result field has zero bytes");
-    }
-    if (field.value_offset() >
-        std::numeric_limits<uint32_t>::max() - field.num_bytes()) {
-      return CommandFailure(EINVAL, "a result field overflows its record");
-    }
-    ResultSpec spec;
-    spec.value_offset = field.value_offset();
-    spec.size = field.num_bytes();
-    spec.reference = field.reference();
-    spec.reference_be32 = field.reference_key() ==
-                          bess::pb::ResultField::BE32;
-    spec.reference_count =
-        field.reference_count() == 0 ? 1 : field.reference_count();
-    if (spec.reference_be32) {
-      if (spec.reference.empty()) {
-        return CommandFailure(EINVAL,
-                              "a BE32 reference names no resource");
-      }
-      if (static_cast<uint64_t>(spec.size) !=
-          4ull * spec.reference_count) {
-        return CommandFailure(
-            EINVAL,
-            "a BE32 reference carries reference_count 4-byte ids: num_bytes "
-            "must be 4 * reference_count");
-      }
-    } else if (spec.reference_count != 1) {
-      return CommandFailure(
-          EINVAL, "reference_count applies to BE32 references only");
-    }
-    if (!spec.reference.empty() &&
-        std::find(result_reference_names_.begin(),
-                  result_reference_names_.end(),
-                  spec.reference) == result_reference_names_.end()) {
-      result_reference_names_.push_back(spec.reference);
-    }
-    if (field.destination_case() == bess::pb::ResultField::kAttrName) {
-      if (field.attr_name().empty()) {
-        return CommandFailure(EINVAL, "a result field has an empty attribute");
-      }
-      spec.by_attr = true;
-      spec.attr_name = field.attr_name();
-      spec.attr_id = AddMetadataAttr(
-          spec.attr_name, spec.size,
-          bess::metadata::Attribute::AccessMode::kWrite);
-      if (spec.attr_id < 0) {
-        return CommandFailure(-spec.attr_id, "%s: add_metadata_attr failed",
-                              spec.attr_name.c_str());
-      }
-    } else if (field.destination_case() == bess::pb::ResultField::kOffset) {
-      spec.by_attr = false;
-      spec.offset = field.offset();
-    } else {
-      return CommandFailure(
-          EINVAL, "a result field needs an attr_name or an offset");
-    }
-    result_value_size_ =
-        std::max(result_value_size_,
-                 static_cast<size_t>(spec.value_offset) + spec.size);
-    result_specs_.push_back(std::move(spec));
-  }
-  if (result_value_size_ > classifier::RecordArena::kMaxRecordSize) {
-    return CommandFailure(
-        EINVAL, "result record is %zu bytes, the maximum is %zu",
-        result_value_size_, classifier::RecordArena::kMaxRecordSize);
-  }
-  records_ = result_specs_.empty()
-                 ? nullptr
-                 : std::make_shared<classifier::RecordArena>(
-                       std::max<size_t>(1, result_value_size_),
-                       init_context().rcu());
-  if (arg.has_default_result() && records_ == nullptr &&
-      !arg.default_result().empty()) {
-    return CommandFailure(EINVAL,
-                          "default_result needs at least one result field");
-  }
-  if (arg.has_default_result() && records_ != nullptr) {
-    if (arg.default_result().size() > result_value_size_) {
-      return CommandFailure(
-          EINVAL, "default_result is wider than the schema's record ("
-                      "%zu > %zu)",
-          arg.default_result().size(), result_value_size_);
-    }
-    std::vector<std::byte> record(result_value_size_, std::byte{0});
-    if (!arg.default_result().empty()) {
-      std::memcpy(record.data(), arg.default_result().data(),
-                  arg.default_result().size());
-    }
-    default_result_ = std::move(record);
-    default_record_id_ = records_->Allocate();
-    if (default_record_id_ == 0) {
-      return CommandFailure(ENOSPC, "the result arena is full");
-    }
-    classifier::MutableBytes slot = records_->Record(default_record_id_);
-    std::memcpy(slot.data(), default_result_->data(),
-                default_result_->size());
+  if (CommandResponse results = results_.Init(
+          *this, arg.result_fields(),
+          arg.has_default_result()
+              ? std::optional<std::string_view>(arg.default_result())
+              : std::nullopt,
+          init_context().rcu());
+      results.error().code() != 0) {
+    return results;
   }
 
   auto table = NewTable(0);
@@ -894,20 +467,9 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
             return *table_;
           },
           .check_value =
-              [this](const classifier::ExactRuleResource::Value &value)
-              -> classifier::ExactRuleResource::Result {
-            if (!bess::IsValidGateValue(value.gate)) {
-              return std::unexpected("invalid gate " +
-                                     std::to_string(value.gate));
-            }
-            if (value.bytes.size() > result_value_size_) {
-              return std::unexpected(
-                  "result is " + std::to_string(value.bytes.size()) +
-                  " bytes, the schema's record is " +
-                  std::to_string(result_value_size_));
-            }
-            return {};
-          },
+              [this](const classifier::ExactRuleResource::Value &value) {
+                return results_.CheckRule(value.gate, value.bytes.size());
+              },
           .make_room =
               [this](bool force) -> classifier::ExactRuleResource::Result {
             Error grow_err;
@@ -917,10 +479,10 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
             return {};
           },
           .references = [this](const classifier::ExactRuleResource::Value &v) {
-            return ResultReferences(v.bytes);
+            return results_.References(v.bytes);
           },
-          .records = records_.get(),
-          .may_reference = result_reference_names_});
+          .records = results_.records().get(),
+          .may_reference = results_.reference_names()});
   // Typed keys and values over the RPC (D-025): the rule's fields, packed
   // here as the add command packs them, and the rule's value -- the gate and
   // its result record.
@@ -944,15 +506,9 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
       },
       [this](const bess::pb::ExactMatchRuleValue &value)
           -> std::expected<std::any, std::string> {
-        if (!bess::IsValidGateValue(value.gate())) {
-          return std::unexpected("invalid gate " +
-                                 std::to_string(value.gate()));
-        }
-        if (value.result().size() > result_value_size_) {
-          return std::unexpected(
-              "result is " + std::to_string(value.result().size()) +
-              " bytes, the schema's record is " +
-              std::to_string(result_value_size_));
+        if (auto ok = results_.CheckRule(value.gate(), value.result().size());
+            !ok) {
+          return std::unexpected(ok.error());
         }
         classifier::RuleResult result;
         result.gate = static_cast<gate_idx_t>(value.gate());
@@ -973,7 +529,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
         table_->ForEach([&](classifier::ConstBytes packed, uint64_t v) {
           key.Clear();
           size_t pos = 0;
-          for (const FieldSpec &spec : field_specs_) {
+          for (const bess::framework::KeyField &spec : keys_.fields()) {
             key.add_fields()->set_value_bin(
                 reinterpret_cast<const char *>(packed.data() + pos),
                 static_cast<size_t>(spec.size));
@@ -981,9 +537,9 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
           }
           value.Clear();
           value.set_gate(bess::GateOfResult(v));
-          if (records_ != nullptr) {
+          if (const auto &records = results_.records(); records != nullptr) {
             const classifier::ConstBytes record =
-                records_->Lookup(bess::ResultIdOfResult(v));
+                records->Lookup(bess::ResultIdOfResult(v));
             value.set_result(record.data(), record.size());
           }
           visit(key, value);
@@ -1037,23 +593,9 @@ void ExactMatch::DeInit() {
   if (resource_ == nullptr) {
     return;
   }
-  auto &engine = init_context().resources();
-  if (!result_reference_names_.empty()) {
-    // A rule's result field names entries in other resources, so the rules
-    // may leave with live keys while the graph is disconnected around them:
-    // the order modules are destroyed in must not decide whether a pipeline
-    // can be torn down (D-172).
-    const std::string name = resource_->name();
-    auto released =
-        engine.ReleaseForTeardown(std::span<const std::string>(&name, 1));
-    CHECK(released) << released.error();
-  } else {
-    // Cannot be refused: the rules reference nothing and nothing may
-    // reference them (their erases are immediate), and Apply() runs under the
-    // control-plane lock this runs under.
-    auto unregistered = engine.Unregister(resource_->name());
-    CHECK(unregistered) << unregistered.error();
-  }
+  bess::framework::ReleaseTableResource(init_context().resources(),
+                                        resource_->name(),
+                                        !results_.reference_names().empty());
   binding_.Reset();
   resource_.reset();
 }
@@ -1068,7 +610,7 @@ inline void ExactMatch::Classify(bess::PacketBatch *batch,
                                 const Generation &gen, Emit &&emit) const {
   const int cnt = batch->cnt();
 
-  if (!gen.extraction_valid) {
+  if (!gen.key.valid) {
     // Fail-closed generation (metadata offsets unreadable): route everything
     // to the default gate without touching packet or metadata bytes.
     for (int i = 0; i < cnt; i++) {
@@ -1089,8 +631,8 @@ inline void ExactMatch::Classify(bess::PacketBatch *batch,
           ? LookupFused(gen.fused_width, *batch, gen.fused_offset,
                         gen.fused_mask, *gen.table, keys.data(), gates.data(),
                         &valid)
-          : LookupExtracted(*batch, gen.extract, gen.key_size, *gen.table,
-                            keys.data(), gates.data(), &valid);
+          : LookupExtracted(*batch, gen.key, *gen.table, keys.data(),
+                            gates.data(), &valid);
   hits &= valid;
   // A key a transaction is still preparing holds kPending: a miss (D-022).
   // A separate branch-free pass, which the compiler vectorizes; folding the
@@ -1114,12 +656,12 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const Generation *gen = published_.Read();
   const gate_idx_t default_gate =
       gen->default_gate.load(std::memory_order_relaxed);
-  if (!gen->extraction_valid) {
+  if (!gen->key.valid) {
     RunChooseModule(ctx, default_gate, batch);
     return;
   }
   gate_idx_t gates[bess::PacketBatch::kMaxBurst];
-  if (!gen->result) {
+  if (!gen->result.plan) {
     Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
       gates[i] = hit ? bess::GateOfResult(value) : default_gate;
     });
@@ -1133,51 +675,11 @@ void ExactMatch::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   uint32_t record_ids[bess::PacketBatch::kMaxBurst];
   Classify(batch, *gen, [&](int i, uint64_t value, bool hit) {
     gates[i] = hit ? bess::GateOfResult(value) : default_gate;
-    record_ids[i] = hit ? bess::ResultIdOfResult(value) : default_record_id_;
+    record_ids[i] =
+        hit ? bess::ResultIdOfResult(value) : results_.default_record_id();
   });
-
-  const int cnt = batch->cnt();
-  const bool packet_fields = gen->result->required_packet_bytes() != 0;
-  std::array<classifier::ConstBytes, bess::PacketBatch::kMaxBurst> values;
-  std::array<classifier::DestinationView, bess::PacketBatch::kMaxBurst>
-      destinations;
-  int rows = 0;
-  for (int i = 0; i < cnt; i++) {
-    if (record_ids[i] == 0) {
-      continue;
-    }
-    bess::PacketRef pkt = batch->packet(i);
-    classifier::MutableBytes packet_view;
-    if (packet_fields) {
-      bess::PacketHandle handle = pkt.handle();
-      if (!bess::packet::EnsureWritable(handle)) {
-        gates[i] = DROP_GATE;
-        continue;
-      }
-      batch->handles()[i] = handle;
-      pkt = bess::PacketRef(handle);
-      if (pkt.data_len() < gen->result->required_packet_bytes()) {
-        gates[i] = DROP_GATE;
-        continue;
-      }
-      packet_view = classifier::MutableBytes(
-          pkt.head_data<std::byte *>(), static_cast<size_t>(pkt.data_len()));
-    }
-    values[rows] = records_->Lookup(static_cast<classifier::RecordArena::Id>(record_ids[i]));
-    destinations[rows] = classifier::DestinationView{
-        .packet = packet_view,
-        .metadata = classifier::MutableBytes(
-            reinterpret_cast<std::byte *>(pkt.metadata()), SNBUF_METADATA)};
-    rows++;
-  }
-  if (rows > 0 &&
-      !gen->result->ApplyBatch(
-          std::span<const classifier::ConstBytes>(values.data(),
-                                                  static_cast<size_t>(rows)),
-          std::span<const classifier::DestinationView>(
-              destinations.data(), static_cast<size_t>(rows)))) {
-    // The checks above make this unreachable for a valid schema; fail closed
-    // rather than emit a packet whose fields were only partly written.
+  if (!bess::framework::PlaceResults(*gen->result.plan, *gen->result.records,
+                                     batch, record_ids, gates)) {
     RunChooseModule(ctx, default_gate, batch);
     return;
   }
@@ -1205,10 +707,13 @@ size_t ExactMatch::fused_key_width() const {
 bool ExactMatch::SetFusedKernelEnabled(bool enabled, Error *err) {
   const bool was = fused_enabled_;
   fused_enabled_ = enabled;
-  const bool published = Publish([&](const Generation &current) {
-    return Build(table_, current.default_gate.load(std::memory_order_relaxed),
-                 err);
-  }, err);
+  const bool published = bess::framework::RepublishGeneration(
+      published_,
+      [&](const Generation &current) {
+        return Build(table_,
+                     current.default_gate.load(std::memory_order_relaxed), err);
+      },
+      err);
   if (!published) {
     fused_enabled_ = was;
   }
@@ -1216,21 +721,22 @@ bool ExactMatch::SetFusedKernelEnabled(bool enabled, Error *err) {
 }
 
 std::string ExactMatch::GetDesc() const {
-  return bess::utils::Format("%zu fields, %zu rules", field_specs_.size(),
+  return bess::utils::Format("%zu fields, %zu rules", keys_.size(),
                              table_->size());
 }
 
 Error ExactMatch::RuleFieldsFromPb(
     const RepeatedPtrField<bess::pb::FieldData> &fields,
     std::vector<std::vector<uint8_t>> *rule) {
-  if (fields.size() != static_cast<int>(field_specs_.size())) {
+  const std::vector<bess::framework::KeyField> &specs = keys_.fields();
+  if (fields.size() != static_cast<int>(specs.size())) {
     return std::make_pair(
         EINVAL, bess::utils::Format("rule should have %zu fields (has %d)",
-                                    field_specs_.size(), fields.size()));
+                                    specs.size(), fields.size()));
   }
 
   for (auto i = 0; i < fields.size(); i++) {
-    int field_size = field_specs_[i].size;
+    int field_size = specs[i].size;
 
     bess::pb::FieldData current = fields.Get(i);
 
