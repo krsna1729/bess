@@ -72,6 +72,10 @@
 namespace bess::conntrack {
 namespace {
 
+using packet::L3Kind;
+using packet::L4Kind;
+using packet::ParsedFrame;
+
 // -- the TCP state model (Linux) --------------------------------------------------
 
 enum : uint8_t { sNO, sSS, sSR, sES, sFW, sCW, sLA, sTW, sCL, sS2, sIV, sIG };
@@ -140,8 +144,8 @@ struct Flow {
   uint16_t zone;
 };
 
-ParsedFlowPacket Packet(const Flow &f, bool from_x, uint8_t tcp_flags, uint8_t icmp_type) {
-  ParsedFlowPacket p;
+ParsedFrame Packet(const Flow &f, bool from_x, uint8_t tcp_flags, uint8_t icmp_type) {
+  ParsedFrame p;
   p.l3 = f.v6 ? L3Kind::kIpv6 : L3Kind::kIpv4;
   p.l4 = f.l4;
   p.protocol = f.protocol;
@@ -334,7 +338,7 @@ class TableModel {
     }
     const uint8_t flags = f.l4 == L4Kind::kTcp ? RandomFlags() : 0;
     const bool may_create = rng_() % 6 != 0;
-    const ParsedFlowPacket p = Packet(f, from_x, flags, type);
+    const ParsedFrame p = Packet(f, from_x, flags, type);
     const ModelEndpoint sender = from_x ? f.x : f.y;
     const ModelKey key = KeyOf(f);
 

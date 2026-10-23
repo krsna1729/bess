@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "conntrack/packet_parse.h"
+#include "packet_parse.h"
 #include "utils/format.h"
 #include "utils/ip.h"
 #include "utils/time.h"
@@ -276,7 +276,7 @@ void NAT::Translate(N &nat, Context *ctx, bess::PacketBatch *batch) {
   const uint64_t now = ctx->current_ns;
   const int cnt = batch->cnt();
   std::span<uint8_t> frames[bess::PacketBatch::kMaxBurst];
-  bess::conntrack::ParsedFlowPacket parsed[bess::PacketBatch::kMaxBurst];
+  bess::packet::ParsedFrame parsed[bess::PacketBatch::kMaxBurst];
   bool ok[bess::PacketBatch::kMaxBurst];
   nat::Verdict verdicts[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
@@ -284,8 +284,8 @@ void NAT::Translate(N &nat, Context *ctx, bess::PacketBatch *batch) {
     frames[i] = std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len());
     // The headers must be in the first segment; the lengths are checked
     // against the whole packet (a chained packet is translated in place).
-    ok[i] = bess::conntrack::ParseFrame(frames[i], parsed[i], pkt.total_len()) ==
-            bess::conntrack::ParseStatus::kOk;
+    ok[i] = bess::packet::ParseFrame(frames[i], parsed[i], pkt.total_len()) ==
+            bess::packet::ParseStatus::kOk;
   }
   nat.TranslateBatch(std::span(frames, cnt), std::span(parsed, cnt), std::span(ok, cnt), dir,
                      now, std::span(verdicts, cnt));

@@ -5,7 +5,10 @@
 #ifndef BESS_MODULES_HASHLB_H_
 #define BESS_MODULES_HASHLB_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,6 +49,12 @@ class HashLB final : public Module {
   std::string GetDesc() const override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
+
+  // The L3 (`l4` false) and L4 modes' hash of a frame, as the packet path
+  // computes it (hash_lb.cc); false for a frame they drop. `frame` and
+  // `total_len` as packet::ParseFrame's.
+  static bool FrameHash(std::span<const uint8_t> frame, size_t total_len, bool l4,
+                        uint32_t *hash);
 
  private:
   enum class Mode { kL2, kL3, kL4, kOther };

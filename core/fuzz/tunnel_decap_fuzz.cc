@@ -46,23 +46,23 @@
 #include <span>
 #include <vector>
 
-#include "conntrack/packet_parse.h"
 #include "fuzz/fuzz_support.h"
+#include "packet_parse.h"
 #include "tunnel/tunnel.h"
 
 namespace bess::tunnel {
 namespace {
 
-using conntrack::L3Kind;
-using conntrack::L4Kind;
-using conntrack::ParsedFlowPacket;
-using conntrack::ParseStatus;
+using packet::L3Kind;
+using packet::L4Kind;
+using packet::ParsedFrame;
+using packet::ParseStatus;
 using fuzz::FuzzInput;
 
 uint16_t Get16(const uint8_t *p) { return static_cast<uint16_t>(p[0] << 8 | p[1]); }
 uint32_t Get32(const uint8_t *p) { return uint32_t{Get16(p)} << 16 | Get16(p + 2); }
 
-bool SameOuter(const ParsedFlowPacket &a, const ParsedFlowPacket &b) {
+bool SameOuter(const ParsedFrame &a, const ParsedFrame &b) {
   return a.l3 == b.l3 && a.l4 == b.l4 && a.protocol == b.protocol &&
          a.l3_offset == b.l3_offset && a.l4_offset == b.l4_offset &&
          a.l4_length == b.l4_length && a.src == b.src && a.dst == b.dst &&
@@ -100,12 +100,12 @@ bool ChecksumOk(std::span<const uint8_t> b) {
 // when it is refused or a first fragment.
 struct OuterView {
   bool ok;
-  ParsedFlowPacket p;
+  ParsedFrame p;
   size_t end;  // the end of the outer L4 payload
 };
 OuterView ParseOuter(std::span<const uint8_t> frame, size_t total_len) {
   OuterView v{};
-  v.ok = conntrack::ParseFrame(frame, v.p, total_len) == ParseStatus::kOk && !v.p.first_fragment;
+  v.ok = packet::ParseFrame(frame, v.p, total_len) == ParseStatus::kOk && !v.p.first_fragment;
   v.end = size_t{v.p.l4_offset} + v.p.l4_length;
   return v;
 }
@@ -114,7 +114,7 @@ OuterView ParseOuter(std::span<const uint8_t> frame, size_t total_len) {
 
 void CheckVxlan(std::span<const uint8_t> frame, size_t total_len, size_t total,
                 const OuterView &ov, std::optional<uint16_t> port) {
-  ParsedFlowPacket o1, o2;
+  ParsedFrame o1, o2;
   Decapsulated d1{}, d2{};
   const DecapError s = DecapVxlan(frame, o1, d1, port, total_len);
   FUZZ_CHECK(DecapVxlan(frame, o2, d2, port, total_len) == s);
@@ -135,7 +135,7 @@ void CheckVxlan(std::span<const uint8_t> frame, size_t total_len, size_t total,
   FUZZ_CHECK((frame[l4 + 8] & 0x08) != 0);
   FUZZ_CHECK(d1.id == Get32(frame.data() + l4 + 12) >> 8 && d1.id < (1u << 24));
   FUZZ_CHECK(d1.protocol == 0x6558);
-  ParsedFlowPacket o3;
+  ParsedFrame o3;
   Decapsulated d3{};
   FUZZ_CHECK(DecapVxlan(frame.first(d1.inner_offset), o3, d3, port, total) == DecapError::kOk &&
              SameD(d1, d3) && SameOuter(o3, ov.p));
@@ -145,7 +145,7 @@ void CheckVxlan(std::span<const uint8_t> frame, size_t total_len, size_t total,
 
 void CheckGeneve(std::span<const uint8_t> frame, size_t total_len, size_t total,
                  const OuterView &ov, uint16_t port) {
-  ParsedFlowPacket o1, o2;
+  ParsedFrame o1, o2;
   GeneveInfo g1{}, g2{};
   const DecapError s = DecapGeneve(frame, o1, g1, port, total_len);
   FUZZ_CHECK(DecapGeneve(frame, o2, g2, port, total_len) == s);
@@ -169,7 +169,7 @@ void CheckGeneve(std::span<const uint8_t> frame, size_t total_len, size_t total,
   FUZZ_CHECK(g1.tunnel.id == Get32(frame.data() + g + 4) >> 8 &&
              g1.tunnel.protocol == Get16(frame.data() + g + 2));
   FUZZ_CHECK(g1.tunnel.protocol != 0x6558 || inner + kEthernetBytes <= ov.end);
-  ParsedFlowPacket o3;
+  ParsedFrame o3;
   GeneveInfo g3{};
   FUZZ_CHECK(DecapGeneve(frame.first(inner), o3, g3, port, total) == DecapError::kOk &&
              SameG(g1, g3));
@@ -215,7 +215,7 @@ void CheckParseGre(std::span<const uint8_t> frame, size_t off) {
 
 void CheckGre(std::span<const uint8_t> frame, size_t total_len, size_t total,
               const OuterView &ov) {
-  ParsedFlowPacket o1, o2;
+  ParsedFrame o1, o2;
   Decapsulated d1{}, d2{};
   const DecapError s = DecapGre(frame, o1, d1, total_len);
   FUZZ_CHECK(DecapGre(frame, o2, d2, total_len) == s);
@@ -244,7 +244,7 @@ void CheckGre(std::span<const uint8_t> frame, size_t total_len, size_t total,
   FUZZ_CHECK(ParseGre(gre, l4, gi) == DecapError::kOk);
   CheckGreFields(gre, l4, gi);
   if (!(flags & 0x8000)) {
-    ParsedFlowPacket o3;
+    ParsedFrame o3;
     Decapsulated d3{};
     FUZZ_CHECK(DecapGre(frame.first(inner), o3, d3, total) == DecapError::kOk && SameD(d1, d3));
   }
@@ -252,7 +252,7 @@ void CheckGre(std::span<const uint8_t> frame, size_t total_len, size_t total,
 
 void CheckGtpu(std::span<const uint8_t> frame, size_t total_len, size_t total,
                const OuterView &ov, uint16_t port) {
-  ParsedFlowPacket o1, o2;
+  ParsedFrame o1, o2;
   GtpuInfo t1{}, t2{};
   const DecapError s = DecapGtpu(frame, o1, t1, port, total_len);
   FUZZ_CHECK(DecapGtpu(frame, o2, t2, port, total_len) == s);
@@ -298,7 +298,7 @@ void CheckGtpu(std::span<const uint8_t> frame, size_t total_len, size_t total,
   }
   FUZZ_CHECK(t1.sequence == seq && t1.first_extension == first);
   FUZZ_CHECK(t1.tunnel.inner_offset == off && off < stated_end && off <= frame.size());
-  ParsedFlowPacket o3;
+  ParsedFrame o3;
   GtpuInfo t3{};
   FUZZ_CHECK(DecapGtpu(frame.first(off), o3, t3, port, total) == DecapError::kOk &&
              SameT(t1, t3));
@@ -467,7 +467,7 @@ void CheckCut(std::span<const uint8_t> frame, size_t cut, size_t inner, bool nee
 }
 
 // The inner bytes are at the decapsulated offset and run to the outer end.
-void CheckInner(std::span<const uint8_t> frame, const ParsedFlowPacket &outer, size_t offset,
+void CheckInner(std::span<const uint8_t> frame, const ParsedFrame &outer, size_t offset,
                 std::span<const uint8_t> inner) {
   FUZZ_CHECK(size_t{outer.l4_offset} + outer.l4_length == offset + inner.size());
   FUZZ_CHECK(offset + inner.size() <= frame.size() &&
@@ -526,7 +526,7 @@ void RunRoundTrip(FuzzInput &in) {
       } else if (inner.size() < kEthernetBytes) {
         expect = DecapError::kNoInner;
       }
-      ParsedFlowPacket o;
+      ParsedFrame o;
       Decapsulated d{};
       const DecapError s = DecapVxlan(f.bytes, o, d, ask);
       FUZZ_CHECK(s == expect);
@@ -537,7 +537,7 @@ void RunRoundTrip(FuzzInput &in) {
         CheckCut(f.bytes, cut_in % (f.bytes.size() + 1), inner_offset, false,
                  [&](std::span<const uint8_t> b, size_t total) {
                    Decapsulated d2{};
-                   ParsedFlowPacket o2;
+                   ParsedFrame o2;
                    const bool ok = DecapVxlan(b, o2, d2, ask, total) == DecapError::kOk;
                    FUZZ_CHECK(!ok || SameD(d, d2));
                    return ok;
@@ -573,7 +573,7 @@ void RunRoundTrip(FuzzInput &in) {
       } else if (protocol == 0x6558 && inner.size() < kEthernetBytes) {
         expect = DecapError::kNoInner;
       }
-      ParsedFlowPacket o;
+      ParsedFrame o;
       GeneveInfo g{};
       const DecapError s = DecapGeneve(f.bytes, o, g, asked);
       FUZZ_CHECK(s == expect);
@@ -588,7 +588,7 @@ void RunRoundTrip(FuzzInput &in) {
         CheckCut(f.bytes, cut_in % (f.bytes.size() + 1), inner_offset, false,
                  [&](std::span<const uint8_t> b, size_t total) {
                    GeneveInfo g2{};
-                   ParsedFlowPacket o2;
+                   ParsedFrame o2;
                    const bool ok = DecapGeneve(b, o2, g2, asked, total) == DecapError::kOk;
                    FUZZ_CHECK(!ok || SameG(g, g2));
                    return ok;
@@ -613,7 +613,7 @@ void RunRoundTrip(FuzzInput &in) {
       if (inner.empty()) {
         expect = DecapError::kNoInner;
       }
-      ParsedFlowPacket o;
+      ParsedFrame o;
       Decapsulated d{};
       const DecapError s = DecapGre(f.bytes, o, d);
       FUZZ_CHECK(s == expect);
@@ -628,7 +628,7 @@ void RunRoundTrip(FuzzInput &in) {
         CheckCut(f.bytes, cut_in % (f.bytes.size() + 1), inner_offset, needs_all,
                  [&](std::span<const uint8_t> b, size_t total) {
                    Decapsulated d2{};
-                   ParsedFlowPacket o2;
+                   ParsedFrame o2;
                    const bool ok = DecapGre(b, o2, d2, total) == DecapError::kOk;
                    FUZZ_CHECK(!ok || SameD(d, d2));
                    return ok;
@@ -685,7 +685,7 @@ void RunRoundTrip(FuzzInput &in) {
       } else if (inner.empty()) {
         expect = DecapError::kNoInner;
       }
-      ParsedFlowPacket o;
+      ParsedFrame o;
       GtpuInfo t{};
       const DecapError s = DecapGtpu(f.bytes, o, t, asked);
       FUZZ_CHECK(s == expect);
@@ -700,7 +700,7 @@ void RunRoundTrip(FuzzInput &in) {
         CheckCut(f.bytes, cut_in % (f.bytes.size() + 1), inner_offset, false,
                  [&](std::span<const uint8_t> b, size_t total) {
                    GtpuInfo t2{};
-                   ParsedFlowPacket o2;
+                   ParsedFrame o2;
                    const bool ok = DecapGtpu(b, o2, t2, asked, total) == DecapError::kOk;
                    FUZZ_CHECK(!ok || SameT(t, t2));
                    return ok;

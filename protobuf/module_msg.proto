@@ -531,6 +531,13 @@ message ACLArg {
  * range is two bounds, not a set of masks, so a wide range costs the table
  * nothing (see core/classifier/firewall_table.h).
  *
+ * A packet's 5-tuple comes from the checked parse ConnTrack, NAT and the
+ * Router read (core/packet_parse.h, D-188): up to two VLAN tags, IPv4
+ * options, up to eight IPv6 extension headers (AH included). A packet that is
+ * not IP or is malformed is dropped, even by a catch-all rule; a later
+ * fragment, ICMP and protocols other than TCP and UDP are judged with both
+ * ports 0.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1 (the incoming gate)
  */
@@ -730,6 +737,12 @@ message GenericEncapArg {
  * The HashLB module partitions packets between output gates according to either
  * a hash over their MAC src/dst (`mode='l2'`), their IP src/dst (`mode='l3'`), the full
  * IP/TCP 5-tuple (`mode='l4'`), or the N-tuple defined by `fields`.
+ *
+ * The L3 and L4 modes read the checked parse (core/packet_parse.h, D-188):
+ * VLAN-tagged and IPv6 packets are hashed, a fragment hashes on its addresses
+ * in either mode (so one datagram's fragments share a gate), and a packet
+ * that is not IP or is malformed is dropped. The hash is symmetric: a flow's
+ * two directions share a gate.
  *
  * __Input Gates__: 1
  * __Output Gates__: many (configurable)

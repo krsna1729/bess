@@ -22,10 +22,10 @@
 #include <type_traits>
 #include <vector>
 
-#include "conntrack/packet_parse.h"
 #include "dataplane/expiry_wheel.h"
 #include "flow/shared_flow_table.h"
 #include "flow/worker_flow_table.h"
+#include "packet_parse.h"
 #include "rcu/rcu_domain.h"
 #include "utils/checksum.h"
 #include "utils/endian.h"
@@ -536,14 +536,14 @@ class BasicNat {
   // The endpoint a packet carries for `dir`: the source going out, the
   // destination coming in. nullopt for what is not translated (not IPv4, not
   // TCP/UDP/ICMP query).
-  static std::optional<Endpoint> EndpointOf(const conntrack::ParsedFlowPacket &p,
+  static std::optional<Endpoint> EndpointOf(const packet::ParsedFrame &p,
                                             Direction dir, Verdict *why) noexcept {
-    if (p.l3 != conntrack::L3Kind::kIpv4) {
+    if (p.l3 != packet::L3Kind::kIpv4) {
       *why = Verdict::kNotIpv4;
       return std::nullopt;
     }
-    const bool tcp_udp = p.l4 == conntrack::L4Kind::kTcp || p.l4 == conntrack::L4Kind::kUdp;
-    const bool icmp_query = p.l4 == conntrack::L4Kind::kIcmp &&
+    const bool tcp_udp = p.l4 == packet::L4Kind::kTcp || p.l4 == packet::L4Kind::kUdp;
+    const bool icmp_query = p.l4 == packet::L4Kind::kIcmp &&
                             (p.icmp_type == 0 || p.icmp_type == 8 || p.icmp_type == 13 ||
                              p.icmp_type == 14 || p.icmp_type == 15 || p.icmp_type == 16);
     if (!tcp_udp && !icmp_query) {
@@ -564,9 +564,9 @@ class BasicNat {
   }
 
   // Translates one packet in place. `frame` is the packet's writable bytes and
-  // `p` its parse (conntrack::ParseFrame, status kOk). Outbound packets with
+  // `p` its parse (packet::ParseFrame, status kOk). Outbound packets with
   // no mapping get one; inbound ones without are kNoBinding.
-  Verdict Translate(std::span<uint8_t> frame, const conntrack::ParsedFlowPacket &p, Direction dir,
+  Verdict Translate(std::span<uint8_t> frame, const packet::ParsedFrame &p, Direction dir,
                     Tick now) noexcept {
     Verdict why = Verdict::kTranslated;
     const std::optional<Endpoint> before = EndpointOf(p, dir, &why);
@@ -582,7 +582,7 @@ class BasicNat {
   // then each packet is finished in order. A packet `parsed_ok[i]` false is
   // skipped (verdict kUnsupported).
   void TranslateBatch(std::span<const std::span<uint8_t>> frames,
-                      std::span<const conntrack::ParsedFlowPacket> parsed,
+                      std::span<const packet::ParsedFrame> parsed,
                       std::span<const bool> parsed_ok, Direction dir, Tick now,
                       std::span<Verdict> out) noexcept {
     promise(frames.size() <= kMaxBatch && parsed.size() == frames.size() &&
@@ -616,7 +616,7 @@ class BasicNat {
  private:
   // The rest of Translate once the endpoint has been looked up (`b` the
   // binding its key found, or null).
-  Verdict Finish(std::span<uint8_t> frame, const conntrack::ParsedFlowPacket &p, Direction dir,
+  Verdict Finish(std::span<uint8_t> frame, const packet::ParsedFrame &p, Direction dir,
                  Tick now, const Endpoint &before, BindingT *b) noexcept {
     // The internal endpoint is the primary key, the external one the alias:
     // a key that is the other side of a mapping belongs to another mapping.

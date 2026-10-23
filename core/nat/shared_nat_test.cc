@@ -16,9 +16,9 @@
 namespace bess::nat {
 namespace {
 
-using conntrack::ParsedFlowPacket;
-using conntrack::ParseFrame;
-using conntrack::ParseStatus;
+using packet::ParsedFrame;
+using packet::ParseFrame;
+using packet::ParseStatus;
 
 constexpr uint32_t kPublic = 0xc6336401, kRemote = 0x08080808;
 
@@ -76,7 +76,7 @@ TEST(SharedNatTest, OneThreadMatchesTheOwnedNat) {
     const uint32_t host = 0x0a000000u + i % 23;
     const uint16_t port = static_cast<uint16_t>(2000 + i % 7);
     auto a = Udp(host, port, kRemote, 53), b = a;
-    ParsedFlowPacket pa, pb;
+    ParsedFrame pa, pb;
     EXPECT_EQ(ParseStatus::kOk, ParseFrame(a, pa));
     EXPECT_EQ(ParseStatus::kOk, ParseFrame(b, pb));
     const Verdict va = owned->Translate(a, pa, Direction::kForward, now);
@@ -133,12 +133,12 @@ void RunConcurrentCreates(bool expire) {
       for (int r = 0; r < rounds; r++) {
         const auto [host, port] = endpoint_of(r);
         auto f = Udp(host, port, kRemote, 53);
-        ParsedFlowPacket p;
+        ParsedFrame p;
         if (ParseFrame(f, p) != ParseStatus::kOk) std::abort();
         if (nat->Translate(f, p, Direction::kForward, r) == Verdict::kTranslated) {
           translated++;
           auto reply = Udp(kRemote, 53, kPublic, SrcPort(f));
-          ParsedFlowPacket q;
+          ParsedFrame q;
           if (ParseFrame(reply, q) != ParseStatus::kOk) std::abort();
           const Verdict back = nat->Translate(reply, q, Direction::kReverse, r);
           const uint32_t to = static_cast<uint32_t>(reply[30]) << 24 | reply[31] << 16 |
@@ -215,7 +215,7 @@ void RunGrowth(bool expire) {
       while (!stop.load(std::memory_order_relaxed)) {
         const int flow = static_cast<int>(r++ % kFlows);
         auto f = Udp(0x0a000000u + flow / 50, static_cast<uint16_t>(3000 + flow % 50), kRemote, 53);
-        ParsedFlowPacket p;
+        ParsedFrame p;
         if (ParseFrame(f, p) != ParseStatus::kOk) std::abort();
         const uint64_t now = expire ? clock.fetch_add(1, std::memory_order_relaxed) : 1;
         if (expire) {
@@ -228,7 +228,7 @@ void RunGrowth(bool expire) {
             moved_port++;
           }
           auto reply = Udp(kRemote, 53, kPublic, static_cast<uint16_t>(got));
-          ParsedFlowPacket q;
+          ParsedFrame q;
           if (ParseFrame(reply, q) != ParseStatus::kOk) std::abort();
           if (nat->Translate(reply, q, Direction::kReverse, 1) != Verdict::kTranslated ||
               (static_cast<uint32_t>(reply[30]) << 24 | reply[31] << 16 | reply[32] << 8 |

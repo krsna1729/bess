@@ -68,9 +68,9 @@
 namespace bess::nat {
 namespace {
 
-using conntrack::ParsedFlowPacket;
-using conntrack::ParseFrame;
-using conntrack::ParseStatus;
+using packet::ParsedFrame;
+using packet::ParseFrame;
+using packet::ParseStatus;
 
 void Put16(std::vector<uint8_t> &f, size_t off, uint16_t v) {
   f[off] = static_cast<uint8_t>(v >> 8);
@@ -175,7 +175,7 @@ struct ModelBinding {
 
 struct Packet {
   std::vector<uint8_t> frame;
-  ParsedFlowPacket parsed;
+  ParsedFrame parsed;
   bool parsed_ok;
   Direction dir;
   // What the packet carries for its direction (source out, destination in).
@@ -329,7 +329,7 @@ class NatModel {
     p.parsed_ok = ParseFrame(p.frame, p.parsed) == ParseStatus::kOk;
     EXPECT_TRUE(p.parsed_ok);
     if (rng_() % 40 == 0) {
-      p.parsed.l3 = conntrack::L3Kind::kIpv6;  // as the parser reports IPv6
+      p.parsed.l3 = packet::L3Kind::kIpv6;  // as the parser reports IPv6
       p.v6 = true;
     }
     return p;
@@ -496,7 +496,7 @@ class NatModel {
     }
     std::vector<std::vector<uint8_t>> before;
     std::vector<std::span<uint8_t>> frames;
-    std::vector<ParsedFlowPacket> parsed;
+    std::vector<ParsedFrame> parsed;
     std::unique_ptr<bool[]> ok(new bool[n]);
     for (size_t i = 0; i < n; i++) {
       before.push_back(packets[i].frame);

@@ -14,6 +14,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -24,10 +25,13 @@
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
 #include "module_graph.h"
+#include "modules/hash_lb.h"
+#include "packet_parse.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
+#include "testing/parse_corpus.h"
 #include "testing/rng.h"
 
 namespace {
@@ -431,8 +435,8 @@ TEST(HashLbCustomFieldsTest, FieldLimitsAreEnforced) {
       << "refused fields change nothing";
 }
 
-// Each mode hashes bytes at a fixed offset; a frame too short for them is
-// dropped, not read past its first segment.
+// Each mode reads a header; a frame too short for it is dropped, not read
+// past its first segment.
 TEST(HashLbTest, AFrameShorterThanTheHashedHeaderIsDropped) {
   ModuleHarness h;
   Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
@@ -448,18 +452,271 @@ TEST(HashLbTest, AFrameShorterThanTheHashedHeaderIsDropped) {
   none({Bytes(11)});  // shorter than the two MAC addresses
 
   Bytes no_ip(33, 0);
+  no_ip[12] = 0x08;  // EtherType IPv4
   no_ip[14] = 0x45;  // IPv4, IHL 5: a header, but the frame stops inside it
   ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l3", {1, 2})));
   none({no_ip});
 
   Bytes no_ports(60, 0);
+  no_ports[12] = 0x08;
   no_ports[14] = 0x4f;  // IPv4, IHL 15: 60 bytes of header, none of them here
   ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l4", {1, 2})));
   none({no_ports});
 
   Bytes no_ports_short(37, 0);
+  no_ports_short[12] = 0x08;
   no_ports_short[14] = 0x45;  // a 20-byte header, but not 4 bytes of ports
   none({no_ports_short});
+}
+
+// -- L3 and L4 over the checked parse (D-188) ---------------------------------------
+
+using bess::testing::Ip4;
+using bess::testing::Ip6;
+using bess::testing::PacketBuilder;
+
+// Ethernet behind `tags` VLAN tags (1: 802.1Q; 2: 802.1ad then 802.1Q).
+PacketBuilder Tagged(int tags) {
+  PacketBuilder b;
+  b.Ether("02:00:00:00:00:01", "02:00:00:00:00:02");
+  if (tags == 2) {
+    b.Dot1AD(5);
+  }
+  if (tags >= 1) {
+    b.Dot1Q(7);
+  }
+  return b;
+}
+
+Bytes Tcp4(const std::string &src, const std::string &dst, uint16_t sport, uint16_t dport,
+           int tags = 0) {
+  return Tagged(tags).IPv4(src, dst).Tcp(sport, dport).PadTo(64).Build();
+}
+
+Bytes Tcp6(const std::string &src, const std::string &dst, uint16_t sport, uint16_t dport,
+           int tags = 0) {
+  return Tagged(tags).IPv6(src, dst).Tcp(sport, dport).PadTo(80).Build();
+}
+
+// The gate of each packet, run one at a time (DROP_GATE: dropped).
+std::vector<gate_idx_t> Gates(ModuleHarness &h, Module *lb, const std::vector<Bytes> &pkts) {
+  std::vector<gate_idx_t> gates;
+  gates.reserve(pkts.size());
+  for (const Bytes &pkt : pkts) {
+    gates.push_back(GateOf(h.Run(lb, 0, {pkt}, kGates), pkt));
+  }
+  return gates;
+}
+
+// The parse reads through VLAN tags: a flow keeps its gate with no tag, one
+// tag or two (before, a tagged frame hashed the wrong bytes or was dropped).
+TEST(HashLbParsedTest, ATaggedFlowKeepsItsGate) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({0, 1, 2, 3, 4, 5, 6, 7}), "lb");
+  ASSERT_NE(nullptr, lb);
+  for (const char *mode : {"l3", "l4"}) {
+    ASSERT_EQ("", h.SetResource("lb/settings", LbSettings(mode, {0, 1, 2, 3, 4, 5, 6, 7})));
+    for (int i = 0; i < 32; i++) {
+      const std::string src = "10.0.0." + std::to_string(i + 1);
+      const std::string src6 = "2001:db8::" + std::to_string(i + 1);
+      const auto v4 = Gates(h, lb, {Tcp4(src, "10.1.0.1", 1000 + i, 80, 0),
+                                    Tcp4(src, "10.1.0.1", 1000 + i, 80, 1),
+                                    Tcp4(src, "10.1.0.1", 1000 + i, 80, 2)});
+      ASSERT_NE(DROP_GATE, v4[0]) << mode << " " << i;
+      EXPECT_EQ(v4[0], v4[1]) << mode << " " << i;
+      EXPECT_EQ(v4[0], v4[2]) << mode << " " << i;
+      const auto v6 = Gates(h, lb, {Tcp6(src6, "2001:db8:1::1", 1000 + i, 80, 0),
+                                    Tcp6(src6, "2001:db8:1::1", 1000 + i, 80, 1),
+                                    Tcp6(src6, "2001:db8:1::1", 1000 + i, 80, 2)});
+      ASSERT_NE(DROP_GATE, v6[0]) << mode << " " << i;
+      EXPECT_EQ(v6[0], v6[1]) << mode << " " << i;
+      EXPECT_EQ(v6[0], v6[2]) << mode << " " << i;
+    }
+  }
+}
+
+// IPv6 is hashed (before, L4 dropped it and L3 hashed bytes of its header that
+// are not the addresses): flows spread over every gate, a flow's packets
+// share one, and in L4 a flow's ports count.
+TEST(HashLbParsedTest, Ipv6FlowsSpreadOverTheGates) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2, 3, 4}), "lb");
+  ASSERT_NE(nullptr, lb);
+  std::vector<Bytes> by_address, by_port;
+  for (int i = 0; i < 64; i++) {
+    by_address.push_back(Tcp6("2001:db8::" + std::to_string(i + 1), "2001:db8:1::1", 1000, 80));
+    by_port.push_back(Tcp6("2001:db8::1", "2001:db8:1::1", static_cast<uint16_t>(1000 + i), 80));
+  }
+  for (const char *mode : {"l3", "l4"}) {
+    ASSERT_EQ("", h.SetResource("lb/settings", LbSettings(mode, {1, 2, 3, 4})));
+    EXPECT_EQ((std::set<gate_idx_t>{1, 2, 3, 4}),
+              GatesUsed(h.Run(lb, 0, by_address, kGates), by_address))
+        << mode;
+  }
+  // L3: one address pair, one gate, whatever the ports; L4: the ports spread.
+  ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l3", {1, 2, 3, 4})));
+  EXPECT_EQ(1u, GatesUsed(h.Run(lb, 0, by_port, kGates), by_port).size());
+  ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l4", {1, 2, 3, 4})));
+  EXPECT_EQ((std::set<gate_idx_t>{1, 2, 3, 4}), GatesUsed(h.Run(lb, 0, by_port, kGates), by_port));
+}
+
+// In L4 a fragment hashes on its addresses alone: a later fragment has no
+// ports, so the first fragment's are left out too, and all of one datagram's
+// fragments share a gate (before, a later fragment's payload bytes were
+// hashed as ports).
+TEST(HashLbParsedTest, OneDatagramsFragmentsShareAGate) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({0, 1, 2, 3, 4, 5, 6, 7}), "lb");
+  ASSERT_NE(nullptr, lb);
+  ASSERT_EQ("", h.SetResource("lb/settings", LbSettings("l4", {0, 1, 2, 3, 4, 5, 6, 7})));
+  std::set<gate_idx_t> datagram_gates;
+  for (int i = 0; i < 32; i++) {
+    const std::string src = "10.0.0." + std::to_string(i + 1);
+    auto fragment = [&](uint16_t frag, bool udp_header) {
+      PacketBuilder b = Tagged(0);
+      b.Add(PacketBuilder::IPv4Hdr{.src = Ip4(src), .dst = Ip4("10.1.0.1"), .proto = 17, .frag = frag});
+      if (udp_header) {
+        b.Udp(static_cast<uint16_t>(2000 + i), 53);
+      }
+      return b.Payload(std::string(24, static_cast<char>('a' + i % 26))).Build();
+    };
+    const auto v4 = Gates(h, lb, {fragment(0x2000, true),     // first: MF, offset 0
+                                  fragment(0x2004, false),    // MF, offset 32
+                                  fragment(0x0008, false)});  // last, offset 64
+    ASSERT_NE(DROP_GATE, v4[0]) << i;
+    EXPECT_EQ(v4[0], v4[1]) << i;
+    EXPECT_EQ(v4[0], v4[2]) << i;
+    datagram_gates.insert(v4[0]);
+
+    // IPv6: a fragment header (44) in front of UDP, then a later fragment.
+    auto fragment6 = [&](uint8_t offset_lo, bool udp_header) {
+      Bytes frag_header = {17, 0, 0, static_cast<uint8_t>(unsigned{offset_lo} | 1u), 0, 0, 0,
+                           static_cast<uint8_t>(i)};
+      PacketBuilder b = Tagged(0);
+      b.Add(PacketBuilder::IPv6Hdr{.src = Ip6("2001:db8::" + std::to_string(i + 1)),
+                                   .dst = Ip6("2001:db8:1::1"),
+                                   .next = 44});
+      b.Payload(frag_header);
+      if (udp_header) {
+        b.Udp(static_cast<uint16_t>(2000 + i), 53);
+      }
+      return b.Payload(std::string(24, 'x')).Build();
+    };
+    const auto v6 = Gates(h, lb, {fragment6(0x00, true), fragment6(0x20, false)});
+    ASSERT_NE(DROP_GATE, v6[0]) << i;
+    EXPECT_EQ(v6[0], v6[1]) << i;
+  }
+  EXPECT_GT(datagram_gates.size(), 4u) << "datagrams still spread";
+}
+
+// A frame with nothing to hash -- not IP (ARP), malformed, or shorter than an
+// IP header -- is dropped in both modes (before, L3 hashed an ARP frame's
+// bytes as if they were addresses).
+TEST(HashLbParsedTest, NonIpAndMalformedFramesAreDropped) {
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({1, 2}), "lb");
+  ASSERT_NE(nullptr, lb);
+  const Bytes arp = PacketBuilder()
+                        .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+                        .Arp(1, "02:00:00:00:00:02", "10.0.0.1", "00:00:00:00:00:00", "10.0.0.2")
+                        .PadTo(60)
+                        .Build();
+  Bytes lie = Tcp4("10.0.0.1", "10.1.0.1", 1000, 80);
+  lie[16] = 0x01;  // IPv4 total length 256 + 50: past the frame
+  Bytes mismatch = Tcp6("2001:db8::1", "2001:db8:1::1", 1000, 80);
+  mismatch[12] = 0x08;  // EtherType IPv4 over an IPv6 header
+  mismatch[13] = 0x00;
+  for (const char *mode : {"l3", "l4"}) {
+    ASSERT_EQ("", h.SetResource("lb/settings", LbSettings(mode, {1, 2})));
+    EXPECT_EQ((std::vector<gate_idx_t>{DROP_GATE, DROP_GATE, DROP_GATE, DROP_GATE}),
+              Gates(h, lb, {arp, lie, mismatch, Bytes(40, 0)}))
+        << mode;
+    EXPECT_NE(DROP_GATE, Gates(h, lb, {Tcp4("10.0.0.1", "10.1.0.1", 1000, 80)})[0]) << mode;
+  }
+}
+
+// The mix is the one the modes always had, so an untagged IPv4 TCP flow keeps
+// its gate: CRC32C of the addresses (and in L4 the ports, as on the wire, and
+// the protocol) XORed. XOR makes it symmetric: a flow's reply shares its gate.
+TEST(HashLbParsedTest, AnUntaggedIpv4FlowKeepsItsGateAndItsReplyShares) {
+  const std::vector<gate_idx_t> gates = {0, 1, 2, 3, 4, 5, 6, 7};
+  auto load32 = [](const Bytes &p, size_t at) {
+    uint32_t v;
+    std::memcpy(&v, p.data() + at, sizeof(v));
+    return v;
+  };
+  auto load16 = [](const Bytes &p, size_t at) {
+    uint16_t v;
+    std::memcpy(&v, p.data() + at, sizeof(v));
+    return uint32_t{v};
+  };
+  ModuleHarness h;
+  Module *lb = h.Create("HashLB", LbArg({0, 1, 2, 3, 4, 5, 6, 7}), "lb");
+  ASSERT_NE(nullptr, lb);
+  for (const bool l4 : {false, true}) {
+    ASSERT_EQ("", h.SetResource("lb/settings", LbSettings(l4 ? "l4" : "l3", {0, 1, 2, 3, 4, 5, 6, 7})));
+    for (int i = 0; i < 64; i++) {
+      const std::string src = "10.0." + std::to_string(i / 8) + "." + std::to_string(i + 1);
+      const Bytes pkt = Tcp4(src, "10.1.0.1", static_cast<uint16_t>(1000 + i), 80);
+      uint32_t v = load32(pkt, 26) ^ load32(pkt, 30);
+      if (l4) {
+        v ^= load16(pkt, 34) ^ load16(pkt, 36) ^ pkt[23];
+      }
+      const gate_idx_t legacy = gates[bess::dataplane::RangeSelect(bess::arch::Crc32c(v, 0u), 8)];
+      const Bytes reply = Tcp4("10.1.0.1", src, 80, static_cast<uint16_t>(1000 + i));
+      EXPECT_EQ((std::vector<gate_idx_t>{legacy, legacy}), Gates(h, lb, {pkt, reply}))
+          << (l4 ? "l4 " : "l3 ") << i;
+    }
+  }
+}
+
+// The hash L3 (`l4` false) and L4 must produce, from ParseFrame alone.
+bool ReferenceHash(std::span<const uint8_t> frame, size_t total_len, bool l4, uint32_t *hash) {
+  using bess::packet::ParseStatus;
+  bess::packet::ParsedFrame p;
+  const ParseStatus s = bess::packet::ParseFrame(frame, p, total_len);
+  if (s != ParseStatus::kOk && s != ParseStatus::kFragment) {
+    return false;
+  }
+  uint32_t words[8];
+  std::memcpy(words, p.src.data(), 16);
+  std::memcpy(words + 4, p.dst.data(), 16);
+  uint32_t v = 0;
+  for (const uint32_t w : words) {
+    v ^= w;
+  }
+  if (l4 && s == ParseStatus::kOk && !p.first_fragment) {
+    v ^= uint32_t{__builtin_bswap16(p.src_port)} ^ uint32_t{__builtin_bswap16(p.dst_port)} ^
+         p.protocol;
+  }
+  *hash = bess::arch::Crc32c(v, 0u);
+  return true;
+}
+
+// Valid, truncated and corrupted frames, tagged and not, IPv4 and IPv6, and
+// random bytes: both modes, which read the common frame at fixed offsets
+// after CheckFastIpv4, drop and hash every one exactly as through the full
+// parse.
+TEST(HashLbParsedTest, TheFastReadHashesEveryFrameAsTheParse) {
+  size_t fast = 0, fast_hashed = 0;
+  for (const auto &[bytes, total_len] : bess::testing::ParseCorpus()) {
+    const std::span<const uint8_t> frame(bytes);
+    for (const bool l4 : {false, true}) {
+      uint32_t want = 0, got = 0;
+      const bool hashed = ReferenceHash(frame, total_len, l4, &want);
+      ASSERT_EQ(hashed, HashLB::FrameHash(frame, total_len, l4, &got))
+          << ::testing::PrintToString(bytes) << " total " << total_len << " l4 " << l4;
+      if (hashed) {
+        EXPECT_EQ(want, got) << ::testing::PrintToString(bytes) << " l4 " << l4;
+      }
+      if (!l4 && bess::packet::CheckFastIpv4(frame, total_len).taken) {
+        fast++;
+        fast_hashed += hashed;
+      }
+    }
+  }
+  EXPECT_GT(fast_hashed, 500u);
+  EXPECT_GT(fast - fast_hashed, 500u);
 }
 
 }  // namespace

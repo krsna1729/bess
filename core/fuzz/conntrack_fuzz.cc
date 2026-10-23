@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Fuzz target: connection tracking (conntrack/packet_parse.h, conntrack.h).
+// Fuzz target: connection tracking (packet_parse.h, conntrack/conntrack.h).
 //
 // The first input byte picks one of two stages (bit 0).
 //
@@ -50,19 +50,25 @@
 #include <vector>
 
 #include "conntrack/conntrack.h"
-#include "conntrack/packet_parse.h"
 #include "fuzz/fuzz_support.h"
+#include "packet_parse.h"
 
 namespace bess::conntrack {
 namespace {
 
 using fuzz::FuzzInput;
+using packet::L3Kind;
+using packet::L4Kind;
+using packet::ParsedFrame;
+using packet::ParseFrame;
+using packet::ParseIpPacket;
+using packet::ParseStatus;
 
 uint16_t Be16(const uint8_t *p) {
   return static_cast<uint16_t>(p[0] << 8 | p[1]);
 }
 
-bool Same(const ParsedFlowPacket &a, const ParsedFlowPacket &b) {
+bool Same(const ParsedFrame &a, const ParsedFrame &b) {
   return a.l3 == b.l3 && a.l4 == b.l4 && a.protocol == b.protocol &&
          a.tcp_flags == b.tcp_flags && a.l3_offset == b.l3_offset &&
          a.l4_offset == b.l4_offset && a.l4_length == b.l4_length && a.src == b.src &&
@@ -105,7 +111,7 @@ size_t L2Length(std::span<const uint8_t> frame, uint16_t &type) {
 
 // -- stage A: the parser ----------------------------------------------------------
 
-void CheckAccepted(std::span<const uint8_t> frame, size_t total, const ParsedFlowPacket &p) {
+void CheckAccepted(std::span<const uint8_t> frame, size_t total, const ParsedFrame &p) {
   uint16_t type = 0;
   const size_t l2 = L2Length(frame, type);
   FUZZ_CHECK(l2 != 0 && p.l3_offset == l2);
@@ -128,7 +134,19 @@ void CheckAccepted(std::span<const uint8_t> frame, size_t total, const ParsedFlo
     FUZZ_CHECK(p.l3 == L3Kind::kIpv6);
     FUZZ_CHECK(type == 0x86dd && l2 + 40 <= frame.size() && (ip[0] >> 4) == 6);
     ip_total = 40 + size_t{Be16(ip + 4)};
-    FUZZ_CHECK(p.l4_offset >= l2 + 40 && (p.l4_offset - l2 - 40) % 8 == 0);
+    // The chain walked here independently: hop-by-hop, routing and
+    // destination options in 8-byte units, AH in 4-byte units, an initial
+    // fragment header; the transport is where it ends.
+    uint8_t next = ip[6];
+    size_t off = 40;
+    while (next == 0 || next == 43 || next == 60 || next == 44 || next == 51) {
+      FUZZ_CHECK(l2 + off + 8 <= frame.size());
+      const size_t units = ip[off + 1];
+      const size_t len = next == 44 ? 8 : next == 51 ? (units + 2) * 4 : (units + 1) * 8;
+      next = ip[off];
+      off += len;
+    }
+    FUZZ_CHECK(p.l4_offset == l2 + off && p.protocol == next);
     FUZZ_CHECK(std::memcmp(p.src.data(), ip + 8, 16) == 0 &&
                std::memcmp(p.dst.data(), ip + 24, 16) == 0);
   }
@@ -169,7 +187,7 @@ void CheckAccepted(std::span<const uint8_t> frame, size_t total, const ParsedFlo
 
   // Nothing past the headers was needed, and every header byte was.
   const size_t extent = p.l4_offset + hdr;
-  ParsedFlowPacket q;
+  ParsedFrame q;
   FUZZ_CHECK(ParseFrame(frame.first(extent), q, total) == ParseStatus::kOk && Same(p, q));
   FUZZ_CHECK(ParseFrame(frame.first(extent - 1), q, total) != ParseStatus::kOk);
 
@@ -190,8 +208,8 @@ void CheckAccepted(std::span<const uint8_t> frame, size_t total, const ParsedFlo
 }
 
 void CheckParse(std::span<const uint8_t> frame, size_t total_len) {
-  ParsedFlowPacket a;
-  ParsedFlowPacket b;
+  ParsedFrame a;
+  ParsedFrame b;
   const ParseStatus s = ParseFrame(frame, a, total_len);
   FUZZ_CHECK(ParseFrame(frame, b, total_len) == s && Same(a, b));
   if (total_len <= frame.size()) {
@@ -477,7 +495,7 @@ class Tracker {
 
   void Track(std::span<const uint8_t> frame, ParseStatus expect, bool check_expect,
              uint16_t zone, bool may_create) {
-    ParsedFlowPacket p;
+    ParsedFrame p;
     const ParseStatus s = ParseFrame(frame, p);
     if (check_expect) {
       FUZZ_CHECK(s == expect);
@@ -632,8 +650,10 @@ class Tracker {
   }
 
   // The quote of an ICMP error, read from the definition: an IP header
-  // (IPv4: options allowed, not a non-initial fragment) and the first 8 bytes
-  // of its L4 (TCP/UDP ports; for ICMP only an echo's identifier).
+  // (IPv4: options allowed, not a non-initial fragment; IPv6: its extension
+  // headers, at most eight, each within the quote, not a non-initial
+  // fragment) and the first 8 bytes of its L4 (TCP/UDP ports; for ICMP only
+  // an echo's identifier).
   static bool Quote(std::span<const uint8_t> q, bool v6, std::array<uint8_t, 16> &src,
                     std::array<uint8_t, 16> &dst, uint16_t &sport, uint16_t &dport,
                     uint8_t &proto) {
@@ -652,6 +672,16 @@ class Tracker {
       if (q.size() < 40 || (q[0] >> 4) != 6) return false;
       hdr = 40;
       proto = q[6];
+      for (int n = 0; proto == 0 || proto == 43 || proto == 60 || proto == 44 || proto == 51;
+           n++) {
+        if (n == 8 || hdr + 8 > q.size()) return false;
+        if (proto == 44 && (Be16(q.data() + hdr + 2) & 0xfff8u) != 0) return false;
+        const size_t units = q[hdr + 1];
+        const size_t len = proto == 44 ? 8 : proto == 51 ? (units + 2) * 4 : (units + 1) * 8;
+        if (hdr + len > q.size()) return false;
+        proto = q[hdr];
+        hdr += len;
+      }
       std::memcpy(src.data(), q.data() + 8, 16);
       std::memcpy(dst.data(), q.data() + 24, 16);
     }
@@ -669,7 +699,7 @@ class Tracker {
     return true;
   }
 
-  void Related(std::span<const uint8_t> frame, const ParsedFlowPacket &p, uint16_t zone,
+  void Related(std::span<const uint8_t> frame, const ParsedFrame &p, uint16_t zone,
                const Ct::Result &r) {
     const size_t start = size_t{p.l4_offset} + 8;
     const size_t end = std::min(frame.size(), size_t{p.l4_offset} + p.l4_length);
@@ -697,7 +727,7 @@ class Tracker {
                quoted_original ? Direction::kReply : Direction::kOriginal, it->second);
   }
 
-  void Model(std::span<const uint8_t> frame, const ParsedFlowPacket &p, uint16_t zone,
+  void Model(std::span<const uint8_t> frame, const ParsedFrame &p, uint16_t zone,
              bool may_create, const Ct::Result &r) {
     if (p.l3 == L3Kind::kNone || p.l4 == L4Kind::kNone) {
       ExpectNone(r, TrackStatus::kUntracked);
@@ -724,7 +754,7 @@ class Tracker {
     const CanonicalKey made = MakeKey(p, zone);
     FUZZ_CHECK(SameKey(made.key, key) && made.src_is_a == src_is_a);
     // The reverse packet has the same key from the other side.
-    ParsedFlowPacket rev = p;
+    ParsedFrame rev = p;
     std::swap(rev.src, rev.dst);
     std::swap(rev.src_port, rev.dst_port);
     const CanonicalKey made_rev = MakeKey(rev, zone);

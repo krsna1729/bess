@@ -18,7 +18,7 @@ using utils::be32_t;
 
 // The outer parse of the last decapsulation, and wrappers that keep it.
 // They return std::expected for readable tests.
-conntrack::ParsedFlowPacket g_outer;
+packet::ParsedFrame g_outer;
 template <typename R, typename Fn>
 std::expected<R, DecapError> Wrap(Fn fn) {
   R r{};

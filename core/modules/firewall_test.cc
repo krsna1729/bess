@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 
 #include <google/protobuf/any.pb.h>
@@ -19,11 +20,14 @@
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "modules/firewall.h"
+#include "packet_parse.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/allocation_faults.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
+#include "testing/parse_corpus.h"
 #include "testing/rng.h"
 
 namespace {
@@ -115,13 +119,15 @@ bool Passes(ModuleHarness &h, Module *fw, const Bytes &pkt) {
   return true;
 }
 
-// A TCP header's two ports, as the wire writes them.
+// A TCP header (data offset 5, no flags) with the two ports, as the wire
+// writes it.
 Bytes Ports(uint16_t sport, uint16_t dport) {
   Bytes out(20, 0);
   out[0] = static_cast<uint8_t>(sport >> 8);
   out[1] = static_cast<uint8_t>(sport & 0xff);
   out[2] = static_cast<uint8_t>(dport >> 8);
   out[3] = static_cast<uint8_t>(dport & 0xff);
+  out[12] = 0x50;  // TCP data offset 5
   return out;
 }
 
@@ -551,39 +557,278 @@ TEST(FirewallTest, AnIpv6PacketIsJudgedThroughItsExtensionHeaders) {
   EXPECT_TRUE(Passes(h, any_port, v6_fragment));
 }
 
-TEST(FirewallTest, ATransportBehindFourExtensionHeadersIsStillRead) {
-  // Four extension headers and then the transport: the walk follows four
-  // extension headers, and the transport may sit exactly at that bound (the
-  // mobile-IP fragment shape). Its ports are in the frame, so a rule that
-  // constrains them must match - judging it with ports 0 would drop traffic
-  // whose ports are right there.
+// IPv6 2001:db8::1 -> 2001:db8::2 carrying `chain` (its first header `first`)
+// and then `l4`, behind `tags` VLAN tags (1: 802.1Q; 2: 802.1ad, 802.1Q).
+Bytes V6(uint8_t first, const Bytes &chain, const Bytes &l4, int tags = 0) {
+  PacketBuilder b;
+  b.Ether("02:00:00:00:00:01", "02:00:00:00:00:02");
+  if (tags == 2) {
+    b.Dot1AD(5);
+  }
+  if (tags >= 1) {
+    b.Dot1Q(7);
+  }
+  b.Add(PacketBuilder::IPv6Hdr{.src = Ip6("2001:db8::1"), .dst = Ip6("2001:db8::2"), .next = first});
+  return b.Add(PacketBuilder::Raw{Cat(chain, l4)}).PadTo(60).Build();
+}
+
+// `n` destination-options headers of 8 bytes, the last naming `last`.
+Bytes DestOpts(size_t n, uint8_t last) {
+  Bytes chain(8 * n, 0);
+  for (size_t i = 0; i < n; i++) {
+    chain[8 * i] = i + 1 == n ? last : 60;
+  }
+  return chain;
+}
+
+TEST(FirewallTest, ATransportBehindUpToEightExtensionHeadersIsRead) {
+  // The walk is the checked parse's (D-188): up to eight extension headers,
+  // then the transport. Its ports are in the frame, so a rule that constrains
+  // them must match (before D-188 the walk stopped at four, and a transport
+  // behind five to eight was judged with an extension header as its
+  // protocol).
+  ModuleHarness h;
+  Module *port_rule = h.Create(
+      "Firewall", Rules({{.src_ip = "2001:db8::/32", .proto = 6, .dst_port_low = 80, .dst_port_high = 80}}),
+      "fw6_chain");
+  ASSERT_NE(nullptr, port_rule);
+  // The other port still does not match, so the match is the port and not the
+  // protocol alone.
+  Module *wrong_port = h.Create(
+      "Firewall", Rules({{.src_ip = "2001:db8::/32", .proto = 6, .dst_port_low = 443, .dst_port_high = 443}}),
+      "fw6_chain_wrong");
+  ASSERT_NE(nullptr, wrong_port);
+  Module *catch_all = h.Create("Firewall", Rules({{}}), "fw6_chain_all");
+  ASSERT_NE(nullptr, catch_all);
+  for (size_t n = 1; n <= 8; n++) {
+    const Bytes packet = V6(60, DestOpts(n, 6), Ports(1000, 80));
+    EXPECT_TRUE(Passes(h, port_rule, packet)) << n;
+    EXPECT_FALSE(Passes(h, wrong_port, packet)) << n;
+  }
+  // A mixed chain: hop-by-hop, routing, a first fragment, destination options.
   Bytes chain(32, 0);
   chain[0] = 43;   // hop-by-hop -> routing
   chain[8] = 44;   // routing -> fragment
   chain[16] = 60;  // fragment (first: offset 0) -> destination options
   chain[24] = 6;   // destination options -> TCP
-  const Bytes packet = PacketBuilder()
-                           .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
-                           .Add(PacketBuilder::IPv6Hdr{.src = Ip6("2001:db8::1"),
-                                                       .dst = Ip6("2001:db8::2"),
-                                                       .next = 0})
-                           .Add(PacketBuilder::Raw{Cat(chain, Ports(1000, 80))})
-                           .PadTo(96)
-                           .Build();
+  EXPECT_TRUE(Passes(h, port_rule, V6(0, chain, Ports(1000, 80))));
+  // Past the bound the packet is malformed: nothing judges it, not even a
+  // catch-all.
+  EXPECT_FALSE(Passes(h, catch_all, V6(60, DestOpts(9, 6), Ports(1000, 80))));
+}
 
+TEST(FirewallTest, AnIpv6AuthenticationHeaderIsWalked) {
+  // AH (12 bytes: length field 1, in 4-byte units past the first 8) and then
+  // TCP: the rule sees TCP and its ports. ESP ends the walk.
+  Bytes ah(12, 0);
+  ah[0] = 6;
+  ah[1] = 1;
   ModuleHarness h;
   Module *port_rule = h.Create(
       "Firewall", Rules({{.src_ip = "2001:db8::/32", .proto = 6, .dst_port_low = 80, .dst_port_high = 80}}),
-      "fw6_four");
+      "fw6_ah");
   ASSERT_NE(nullptr, port_rule);
-  EXPECT_TRUE(Passes(h, port_rule, packet));
-  // The other port still does not match, so the match is the port and not the
-  // protocol alone.
-  Module *wrong_port = h.Create(
-      "Firewall", Rules({{.src_ip = "2001:db8::/32", .proto = 6, .dst_port_low = 443, .dst_port_high = 443}}),
-      "fw6_four_wrong");
-  ASSERT_NE(nullptr, wrong_port);
-  EXPECT_FALSE(Passes(h, wrong_port, packet));
+  Module *esp_rule = h.Create("Firewall", Rules({{.src_ip = "2001:db8::/32", .proto = 50}}), "fw6_esp");
+  ASSERT_NE(nullptr, esp_rule);
+  EXPECT_TRUE(Passes(h, port_rule, V6(51, ah, Ports(1000, 80))));
+  EXPECT_FALSE(Passes(h, port_rule, V6(51, ah, Ports(1000, 443))));
+  ah[0] = 50;  // AH -> ESP
+  EXPECT_TRUE(Passes(h, esp_rule, V6(51, ah, Bytes(16, 0))));
+  EXPECT_TRUE(Passes(h, esp_rule, V6(50, {}, Bytes(16, 0))));
+}
+
+TEST(FirewallTest, TaggedFramesAreJudged) {
+  // No tag, an 802.1Q tag, and 802.1ad + 802.1Q: the parse reads through up to
+  // two tags (D-188; before, a tagged frame was not judged and was dropped).
+  ModuleHarness h;
+  Module *v4_port = h.Create(
+      "Firewall", Rules({{.src_ip = "10.0.0.0/8", .proto = 6, .dst_port_low = 80, .dst_port_high = 80}}),
+      "fw_tag4");
+  ASSERT_NE(nullptr, v4_port);
+  Module *v4_udp = h.Create(
+      "Firewall", Rules({{.src_ip = "10.0.0.0/8", .proto = 17, .dst_port_low = 53, .dst_port_high = 53}}),
+      "fw_tag4_udp");
+  ASSERT_NE(nullptr, v4_udp);
+  Module *v4_any = h.Create("Firewall", Rules({{.src_ip = "10.0.0.0/8", .proto = 6}}), "fw_tag4_any");
+  ASSERT_NE(nullptr, v4_any);
+  Module *v6_port = h.Create(
+      "Firewall", Rules({{.src_ip = "2001:db8::/32", .proto = 6, .dst_port_low = 80, .dst_port_high = 80}}),
+      "fw_tag6");
+  ASSERT_NE(nullptr, v6_port);
+  auto v4 = [](int tags) {
+    PacketBuilder b;
+    b.Ether("02:00:00:00:00:01", "02:00:00:00:00:02");
+    if (tags == 2) {
+      b.Dot1AD(5);
+    }
+    if (tags >= 1) {
+      b.Dot1Q(7);
+    }
+    return b;
+  };
+  for (int tags = 0; tags <= 2; tags++) {
+    const Bytes tcp = v4(tags).IPv4("10.1.2.3", "20.0.0.1").Tcp(1000, 80).PadTo(64).Build();
+    const Bytes tcp_443 = v4(tags).IPv4("10.1.2.3", "20.0.0.1").Tcp(1000, 443).PadTo(64).Build();
+    const Bytes udp = v4(tags).IPv4("10.1.2.3", "20.0.0.1").Udp(1000, 53).PadTo(64).Build();
+    const Bytes fragment = v4(tags)
+                               .Add(PacketBuilder::IPv4Hdr{.src = Ip4("10.1.2.3"),
+                                                           .dst = Ip4("20.0.0.1"),
+                                                           .proto = 6,
+                                                           .frag = 0x2008})
+                               .Payload("later fragment bytes")
+                               .PadTo(64)
+                               .Build();
+    EXPECT_TRUE(Passes(h, v4_port, tcp)) << tags;
+    EXPECT_FALSE(Passes(h, v4_port, tcp_443)) << tags;
+    EXPECT_TRUE(Passes(h, v4_udp, udp)) << tags;
+    EXPECT_FALSE(Passes(h, v4_port, udp)) << tags;
+    // A later fragment behind tags: judged, with ports 0.
+    EXPECT_FALSE(Passes(h, v4_port, fragment)) << tags;
+    EXPECT_TRUE(Passes(h, v4_any, fragment)) << tags;
+    EXPECT_TRUE(Passes(h, v6_port, V6(6, {}, Ports(1000, 80), tags))) << tags;
+    EXPECT_FALSE(Passes(h, v6_port, V6(6, {}, Ports(1000, 443), tags))) << tags;
+  }
+}
+
+TEST(FirewallTest, MalformedPacketsAreNotJudged) {
+  // A packet whose lengths lie, whose EtherType and IP version disagree, or
+  // whose transport header is impossible is dropped as one the table cannot
+  // judge, even by a catch-all (D-188; before, all of these but the IHL were
+  // judged).
+  const Bytes tcp4 = PacketBuilder()
+                         .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+                         .IPv4("10.1.2.3", "20.0.0.1")
+                         .Tcp(1000, 80)
+                         .PadTo(60)
+                         .Build();
+  const Bytes udp4 = PacketBuilder()
+                         .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+                         .IPv4("10.1.2.3", "20.0.0.1")
+                         .Udp(1000, 53)
+                         .PadTo(60)
+                         .Build();
+  const Bytes tcp6 = V6(6, {}, Ports(1000, 80));
+  auto with = [](Bytes b, size_t at, std::initializer_list<uint8_t> bytes) {
+    for (const uint8_t v : bytes) {
+      b[at++] = v;
+    }
+    return b;
+  };
+  const std::pair<const char *, Bytes> malformed[] = {
+      {"IPv4 total length past the frame", with(tcp4, 16, {0x01, 0x00})},
+      {"IPv4 total length below the header", with(tcp4, 16, {0x00, 0x10})},
+      {"IPv4 header length 15 (60 bytes)", with(tcp4, 14, {0x4f})},
+      {"EtherType IPv4, IPv6 inside", with(tcp6, 12, {0x08, 0x00})},
+      {"EtherType IPv6, IPv4 inside", with(tcp4, 12, {0x86, 0xdd})},
+      {"TCP data offset 4", with(tcp4, 14 + 20 + 12, {0x40})},
+      {"UDP length 7", with(udp4, 14 + 20 + 4, {0x00, 0x07})},
+      {"UDP length past the IP packet", with(udp4, 14 + 20 + 4, {0x00, 0xc8})},
+      {"IPv6 payload length past the frame", with(tcp6, 14 + 4, {0x01, 0x00})},
+      {"IPv6 extension header past the payload", V6(60, with(DestOpts(1, 6), 1, {200}), Ports(1, 2))},
+  };
+  ModuleHarness h;
+  Module *fw = h.Create("Firewall", Rules({{}}), "fw_malformed");
+  ASSERT_NE(nullptr, fw);
+  EXPECT_TRUE(Passes(h, fw, tcp4));
+  EXPECT_TRUE(Passes(h, fw, udp4));
+  EXPECT_TRUE(Passes(h, fw, tcp6));
+  for (const auto &[what, packet] : malformed) {
+    EXPECT_FALSE(Passes(h, fw, packet)) << what;
+  }
+}
+
+TEST(FirewallTest, IcmpMatchesWithPortsZero) {
+  // ICMP has no ports: an echo is judged with both ports 0, never by its
+  // identifier (which the parse carries in its port fields for ConnTrack).
+  const Bytes echo4 = PacketBuilder()
+                          .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+                          .IPv4("10.1.2.3", "20.0.0.1")
+                          .Add(PacketBuilder::IcmpHdr{.type = 8, .id = 7, .seq = 1})
+                          .PadTo(60)
+                          .Build();
+  const Bytes echo6 = PacketBuilder()
+                          .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+                          .Add(PacketBuilder::IPv6Hdr{.src = Ip6("2001:db8::1"),
+                                                      .dst = Ip6("2001:db8::2"),
+                                                      .next = 58})
+                          .Add(PacketBuilder::IcmpHdr{.type = 128, .id = 7, .seq = 1})
+                          .PadTo(70)
+                          .Build();
+  ModuleHarness h;
+  for (const auto &[proto, src, packet] :
+       {std::tuple{1u, "10.0.0.0/8", echo4}, std::tuple{58u, "2001:db8::/32", echo6}}) {
+    const std::string name = "fw_icmp" + std::to_string(proto);
+    Module *zero = h.Create(
+        "Firewall",
+        Rules({{.src_ip = src, .proto = proto, .src_port_high = 0, .dst_port_high = 0}}),
+        name + "_zero");
+    ASSERT_NE(nullptr, zero);
+    Module *id = h.Create(
+        "Firewall", Rules({{.src_ip = src, .proto = proto, .dst_port_low = 7, .dst_port_high = 7}}),
+        name + "_id");
+    ASSERT_NE(nullptr, id);
+    EXPECT_TRUE(Passes(h, zero, packet)) << proto;
+    EXPECT_FALSE(Passes(h, id, packet)) << proto;
+  }
+}
+
+}  // namespace
+
+// -- The common frame's fast read decides as the parse (D-188) ---------------
+
+namespace {
+
+using bess::classifier::FirewallFamily;
+using bess::classifier::FirewallKey;
+
+// The key KeyOf must produce, built from ParseFrame alone.
+bool ReferenceKey(std::span<const uint8_t> frame, size_t total_len, FirewallKey *key) {
+  using bess::packet::L3Kind;
+  using bess::packet::L4Kind;
+  using bess::packet::ParseStatus;
+  bess::packet::ParsedFrame p;
+  const ParseStatus s = bess::packet::ParseFrame(frame, p, total_len);
+  if (s != ParseStatus::kOk && s != ParseStatus::kFragment) {
+    return false;
+  }
+  key->family = p.l3 == L3Kind::kIpv6 ? FirewallFamily::kIpv6 : FirewallFamily::kIpv4;
+  key->proto = p.protocol;
+  key->src = p.src;
+  key->dst = p.dst;
+  const bool ports = p.l4 == L4Kind::kTcp || p.l4 == L4Kind::kUdp;
+  key->src_port = ports ? p.src_port : 0;
+  key->dst_port = ports ? p.dst_port : 0;
+  return true;
+}
+
+// Valid, truncated and corrupted frames, tagged and not, IPv4 and IPv6, and
+// random bytes: KeyOf, which reads the common frame at fixed offsets after
+// CheckFastIpv4, judges and keys every one exactly as the full parse would.
+TEST(FirewallTest, KeyOfDecidesEveryFrameAsTheParse) {
+  size_t fast = 0, fast_judged = 0;
+  for (const auto &[bytes, total_len] : bess::testing::ParseCorpus()) {
+    const std::span<const uint8_t> frame(bytes);
+    FirewallKey want{}, got{};
+    const bool judged = ReferenceKey(frame, total_len, &want);
+    ASSERT_EQ(judged, Firewall::KeyOf(frame, total_len, &got))
+        << ::testing::PrintToString(bytes) << " total " << total_len;
+    if (bess::packet::CheckFastIpv4(frame, total_len).taken) {
+      fast++;
+      fast_judged += judged;
+    }
+    if (!judged) {
+      continue;
+    }
+    EXPECT_EQ(want.family, got.family) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.proto, got.proto) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.src, got.src) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.dst, got.dst) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.src_port, got.src_port) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.dst_port, got.dst_port) << ::testing::PrintToString(bytes);
+  }
+  // Both sides of the fast path are exercised.
+  EXPECT_GT(fast_judged, 500u);
+  EXPECT_GT(fast - fast_judged, 500u);
 }
 
 }  // namespace

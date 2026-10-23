@@ -7,6 +7,7 @@
 #include <cstring>
 #include <span>
 
+#include "packet_parse.h"
 #include "tunnel/tunnel.h"
 #include "utils/endian.h"
 
@@ -39,13 +40,13 @@ void VXLANDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const auto tun_dst = attr_offset(ATTR_W_TUN_IP_DST);
   const auto tun_id = attr_offset(ATTR_W_TUN_ID);
   for (bess::PacketRef pkt : batch->packets()) {
-    bess::conntrack::ParsedFlowPacket outer;
+    bess::packet::ParsedFrame outer;
     bess::tunnel::Decapsulated d;
     const auto status = bess::tunnel::DecapVxlan(
         std::span<const uint8_t>(pkt.head_data<const uint8_t *>(), pkt.head_len()), outer, d,
         std::nullopt, pkt.total_len());
     if (unlikely(status != bess::tunnel::DecapError::kOk ||
-                 outer.l3 != bess::conntrack::L3Kind::kIpv4)) {
+                 outer.l3 != bess::packet::L3Kind::kIpv4)) {
       DropPacket(ctx, pkt);
       continue;
     }

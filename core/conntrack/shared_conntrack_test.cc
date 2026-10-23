@@ -14,10 +14,15 @@
 #include <vector>
 
 #include "conntrack/conntrack.h"
+#include "packet_parse.h"
 #include "rcu/rcu_domain.h"
 
 namespace bess::conntrack {
 namespace {
+
+using packet::ParsedFrame;
+using packet::ParseFrame;
+using packet::ParseStatus;
 
 struct Ep {
   uint32_t ip;
@@ -84,7 +89,7 @@ TEST(SharedConntrackTest, OneThreadMatchesTheOwnedTracker) {
     const uint8_t proto = rng() % 3 == 0 ? 17 : rng() % 5 == 0 ? 1 : 6;
     const uint8_t fl = proto == 1 ? (rng() % 2 ? 8 : 0) : flags[rng() % 7];
     const auto f = forward ? Frame(a, b, proto, fl) : Frame(b, a, proto, fl);
-    ParsedFlowPacket p;
+    ParsedFrame p;
     if (ParseFrame(f, p) != ParseStatus::kOk) continue;
     const bool may_create = rng() % 4 != 0;
     const auto o = owned->Track(f, p, now, 0, may_create);
@@ -131,7 +136,7 @@ TEST(SharedConntrackTest, ConcurrentSynsCreateEachConnectionOnce) {
       for (int c = 0; c < kConns; c++) {
         const Ep client{0x0a000000u + c / 100, static_cast<uint16_t>(2000 + c % 100)};
         const auto f = Frame(client, Ep{0x08080808, 80}, 6, kTcpSyn);
-        ParsedFlowPacket p;
+        ParsedFrame p;
         if (ParseFrame(f, p) != ParseStatus::kOk) std::abort();
         if (ct->Track(f, p, 1).status == TrackStatus::kNew) created[c]++;
         if (c % 32 == w) (void)ct->Expire(1, 16);
@@ -164,7 +169,7 @@ TEST(SharedConntrackTest, DirectionsOnDifferentWorkersStayTracked) {
       for (const auto &[from_client, fl] : {std::pair{true, kTcpSyn}, std::pair{false, uint8_t(kTcpSyn | kTcpAck)},
                                             std::pair{true, kTcpAck}}) {
         const auto f = from_client ? Frame(client(c), server, 6, fl) : Frame(server, client(c), 6, fl);
-        ParsedFlowPacket p;
+        ParsedFrame p;
         ASSERT_EQ(ParseStatus::kOk, ParseFrame(f, p));
         ASSERT_NE(TrackStatus::kInvalid, ct->Track(f, p, 1).status) << c;
       }
@@ -188,7 +193,7 @@ TEST(SharedConntrackTest, DirectionsOnDifferentWorkersStayTracked) {
         for (int c = 0; c < kConns; c++) {
           const auto f = from_client ? Frame(client(c), server, 6, kTcpAck)
                                      : Frame(server, client(c), 6, kTcpAck);
-          ParsedFlowPacket p;
+          ParsedFrame p;
           if (ParseFrame(f, p) != ParseStatus::kOk) std::abort();
           const auto r = ct->Track(f, p, 2 + round, 0, false);
           if (r.status != TrackStatus::kExisting ||

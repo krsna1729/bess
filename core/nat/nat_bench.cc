@@ -42,8 +42,8 @@
 namespace {
 
 using namespace bess::nat;
-using bess::conntrack::ParsedFlowPacket;
-using bess::conntrack::ParseFrame;
+using bess::packet::ParsedFrame;
+using bess::packet::ParseFrame;
 
 // The legacy module's table types (modules/nat.h before M18).
 struct LegacyEntry {
@@ -232,11 +232,11 @@ void TranslateImpl(benchmark::State &st) {
   }
   auto nat = N::Create(c).value();
   std::vector<std::vector<uint8_t>> frames;
-  std::vector<ParsedFlowPacket> parsed;
+  std::vector<ParsedFrame> parsed;
   for (uint32_t i = 0; i < n; i++) {
     auto out = UdpFrame(0x0a000000u + i / 50, static_cast<uint16_t>(2000 + i % 50), 0x08080808, 53);
     // (internal addresses vary, so the hash spreads them over the 20)
-    ParsedFlowPacket p;
+    ParsedFrame p;
     (void)ParseFrame(out, p);
     const auto orig = out;
     if (nat->Translate(out, p, Direction::kForward, 0) != Verdict::kTranslated) std::abort();
@@ -268,7 +268,7 @@ void TranslateImpl(benchmark::State &st) {
   std::vector<uint32_t> order(n);
   for (auto &o : order) o = rng() % n;
   std::vector<std::vector<uint8_t>> sf;
-  std::vector<ParsedFlowPacket> sp;
+  std::vector<ParsedFrame> sp;
   for (const uint32_t i : order) {
     sf.push_back(frames[i]);
     sp.push_back(parsed[i]);
@@ -288,7 +288,7 @@ void TranslateImpl(benchmark::State &st) {
       if (legacy_path) {
         ok += LegacyPacket(legacy, scratch, reverse);
       } else {
-        ParsedFlowPacket p;
+        ParsedFrame p;
         (void)ParseFrame(scratch, p);
         ok += nat->Translate(scratch, p, dir, 1) == Verdict::kTranslated;
       }
@@ -312,12 +312,12 @@ void TranslateImpl(benchmark::State &st) {
       for (size_t i = 0; i < kB; i++) ok += LegacyPacket(legacy, work[i], reverse);
     } else {
       std::span<uint8_t> frames[kB];
-      ParsedFlowPacket ps[kB];
+      ParsedFrame ps[kB];
       bool good[kB];
       Verdict v[kB];
       for (size_t i = 0; i < kB; i++) {
         frames[i] = work[i];
-        good[i] = ParseFrame(frames[i], ps[i]) == bess::conntrack::ParseStatus::kOk;
+        good[i] = ParseFrame(frames[i], ps[i]) == bess::packet::ParseStatus::kOk;
       }
       nat->Expire(1, 256);  // as the module does every batch
       nat->TranslateBatch(frames, ps, good, dir, 1, v);
@@ -349,10 +349,10 @@ void BM_Bind(benchmark::State &st) {
   c.capacity = kCap;
   std::unique_ptr<Nat> nat = Nat::Create(c).value();
   std::vector<std::vector<uint8_t>> frames;
-  std::vector<ParsedFlowPacket> parsed;
+  std::vector<ParsedFrame> parsed;
   for (uint32_t i = 0; i < kCap; i++) {
     frames.push_back(UdpFrame(0x0a000000u + i, static_cast<uint16_t>(3000 + i % 7), 0x08080808, 53));
-    ParsedFlowPacket p;
+    ParsedFrame p;
     (void)ParseFrame(frames.back(), p);
     parsed.push_back(p);
   }

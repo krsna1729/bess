@@ -15,10 +15,10 @@
 #include <span>
 #include <type_traits>
 
-#include "conntrack/packet_parse.h"
 #include "dataplane/batch_tuning.h"
 #include "dataplane/expiry_wheel.h"
 #include "flow/worker_flow_table.h"
+#include "packet_parse.h"
 
 namespace bess::conntrack {
 
@@ -35,6 +35,12 @@ namespace bess::conntrack {
 // segment is not detected).
 
 enum class Direction : uint8_t { kOriginal, kReply };
+
+// TCP flag bits as on the wire (byte 13).
+inline constexpr uint8_t kTcpFin = 0x01;
+inline constexpr uint8_t kTcpSyn = 0x02;
+inline constexpr uint8_t kTcpRst = 0x04;
+inline constexpr uint8_t kTcpAck = 0x10;
 
 // Linux nf_conntrack's TCP states (and their order).
 enum class TcpState : uint8_t {
@@ -75,7 +81,7 @@ static_assert(offsetof(CtKey, port_a) == 32 && offsetof(CtKey, zone) == 38);
 // The key of the connection a packet belongs to. Built with word stores: the
 // hash reads the key in 8-byte words, and a word assembled from narrow stores
 // defeats store forwarding (D-064, D-067 measured it).
-inline CanonicalKey MakeKey(const ParsedFlowPacket &p, uint16_t zone) noexcept {
+inline CanonicalKey MakeKey(const packet::ParsedFrame &p, uint16_t zone) noexcept {
   static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "CtKey tail word layout");
   uint64_t s[2], d[2];
   std::memcpy(s, p.src.data(), 16);
@@ -92,7 +98,8 @@ inline CanonicalKey MakeKey(const ParsedFlowPacket &p, uint16_t zone) noexcept {
   const uint16_t port_a = c.src_is_a ? p.src_port : p.dst_port;
   const uint16_t port_b = c.src_is_a ? p.dst_port : p.src_port;
   const uint64_t tail = uint64_t{port_a} | uint64_t{port_b} << 16 | uint64_t{p.protocol} << 32 |
-                        uint64_t{p.l3 == L3Kind::kIpv4 ? 4u : 6u} << 40 | uint64_t{zone} << 48;
+                        uint64_t{p.l3 == packet::L3Kind::kIpv4 ? 4u : 6u} << 40u |
+                        uint64_t{zone} << 48u;
   std::memcpy(&c.key.port_a, &tail, sizeof(tail));
   return c;
 }
@@ -197,53 +204,60 @@ inline bool ValidFlags(uint8_t flags) noexcept {
   return (kValidFlagSets >> (flags & kCheckedFlags)) & 1;
 }
 
-inline bool IsIcmpError(L4Kind k, uint8_t type) noexcept {
-  return k == L4Kind::kIcmp ? (type == 3 || type == 4 || type == 5 || type == 11 || type == 12)
-                            : (type >= 1 && type <= 4);
+inline bool IsIcmpError(packet::L4Kind k, uint8_t type) noexcept {
+  return k == packet::L4Kind::kIcmp
+             ? (type == 3 || type == 4 || type == 5 || type == 11 || type == 12)
+             : (type >= 1 && type <= 4);
 }
-inline bool IsEchoRequest(L4Kind k, uint8_t type) noexcept {
-  return k == L4Kind::kIcmp ? type == 8 : type == 128;
+inline bool IsEchoRequest(packet::L4Kind k, uint8_t type) noexcept {
+  return k == packet::L4Kind::kIcmp ? type == 8 : type == 128;
 }
-inline bool IsEchoReply(L4Kind k, uint8_t type) noexcept {
-  return k == L4Kind::kIcmp ? type == 0 : type == 129;
+inline bool IsEchoReply(packet::L4Kind k, uint8_t type) noexcept {
+  return k == packet::L4Kind::kIcmp ? type == 0 : type == 129;
 }
 
 // The tuple quoted in an ICMP error (header plus the first 8 bytes of its L4,
 // so the parse is lenient about the quoted packet's stated length), written
-// as a ParsedFlowPacket. False if the quote is too short.
-inline bool ParseQuoted(std::span<const uint8_t> q, bool v6, ParsedFlowPacket &out) noexcept {
-  out = ParsedFlowPacket{};
+// as a ParsedFrame. An IPv6 quote's extension headers are walked as the
+// packet's own were (packet::parse_internal::WalkIpv6Chain, bounded by the
+// quote), so a connection keyed by its transport behind them is found. False
+// if the quote is too short (a header cut short included) or names no ports
+// (a non-initial fragment).
+inline bool ParseQuoted(std::span<const uint8_t> q, bool v6, packet::ParsedFrame &out) noexcept {
+  out = packet::ParsedFrame{};
   size_t off;
   if (!v6) {
     if (q.size() < 20 || (q[0] >> 4) != 4) return false;
     off = static_cast<size_t>(q[0] & 0x0f) * 4;
     if (off < 20 || off > q.size()) return false;
-    out.l3 = L3Kind::kIpv4;
+    out.l3 = packet::L3Kind::kIpv4;
     out.protocol = q[9];
     std::memcpy(out.src.data(), q.data() + 12, 4);
     std::memcpy(out.dst.data(), q.data() + 16, 4);
-    if ((parse_internal::Be16(q.data() + 6) & 0x1fff) != 0) {
+    if ((packet::parse_internal::Be16(q.data() + 6) & 0x1fffu) != 0) {
       return false;  // a non-initial fragment: no ports to read
     }
   } else {
     if (q.size() < 40 || (q[0] >> 4) != 6) return false;
-    off = 40;
-    out.l3 = L3Kind::kIpv6;
-    out.protocol = q[6];  // extension headers in a quote are not followed
+    out.l3 = packet::L3Kind::kIpv6;
+    if (packet::parse_internal::WalkIpv6Chain(q.data(), q.size(), off, out) !=
+        packet::ParseStatus::kOk) {
+      return false;  // cut short by the quote, too many, or a non-initial fragment
+    }
     std::memcpy(out.src.data(), q.data() + 8, 16);
     std::memcpy(out.dst.data(), q.data() + 24, 16);
   }
   if (out.protocol == 6 || out.protocol == 17) {
     if (q.size() < off + 4) return false;
-    out.src_port = parse_internal::Be16(q.data() + off);
-    out.dst_port = parse_internal::Be16(q.data() + off + 2);
+    out.src_port = packet::parse_internal::Be16(q.data() + off);
+    out.dst_port = packet::parse_internal::Be16(q.data() + off + 2);
   } else if (out.protocol == 1 || out.protocol == 58) {
     if (q.size() < off + 8) return false;
     // Only an echo has an identifier there; other types carry an MTU, a
     // pointer or nothing.
     const uint8_t t = q[off];
     if (out.protocol == 1 ? (t != 0 && t != 8) : (t != 128 && t != 129)) return false;
-    out.src_port = out.dst_port = parse_internal::Be16(q.data() + off + 4);
+    out.src_port = out.dst_port = packet::parse_internal::Be16(q.data() + off + 4);
   }
   return true;
 }
@@ -256,9 +270,9 @@ inline bool ParseQuoted(std::span<const uint8_t> q, bool v6, ParsedFlowPacket &o
 // sender as the initiator. Nothing changes on kInvalid.
 enum class Step : uint8_t { kInvalid, kExisting, kReopen };
 template <typename E>
-inline Step StepExisting(E &e, const ParsedFlowPacket &p, Direction dir,
+inline Step StepExisting(E &e, const packet::ParsedFrame &p, Direction dir,
                          bool may_create) noexcept {
-  if (p.l4 == L4Kind::kTcp) {
+  if (p.l4 == packet::L4Kind::kTcp) {
     if (!ValidFlags(p.tcp_flags)) {
       return Step::kInvalid;  // tcp_error(): nothing changes
     }
@@ -282,14 +296,14 @@ inline Step StepExisting(E &e, const ParsedFlowPacket &p, Direction dir,
 
 // A connection's timeout in its state (`e` as for StepExisting).
 template <typename E>
-inline uint64_t TimeoutFor(const TimeoutPolicy &policy, L4Kind l4, const E &e) noexcept {
+inline uint64_t TimeoutFor(const TimeoutPolicy &policy, packet::L4Kind l4, const E &e) noexcept {
   switch (l4) {
-    case L4Kind::kTcp:
+    case packet::L4Kind::kTcp:
       return policy.tcp[static_cast<size_t>(e.tcp)];
-    case L4Kind::kUdp:
+    case packet::L4Kind::kUdp:
       return e.replied ? policy.udp_replied : policy.udp_unreplied;
-    case L4Kind::kIcmp:
-    case L4Kind::kIcmpv6:
+    case packet::L4Kind::kIcmp:
+    case packet::L4Kind::kIcmpv6:
       return policy.icmp;
     default:
       return policy.other;
@@ -298,11 +312,11 @@ inline uint64_t TimeoutFor(const TimeoutPolicy &policy, L4Kind l4, const E &e) n
 
 // A packet that has a connection key: parsed, and not an ICMP error or an
 // ICMP type conntrack does not follow.
-inline bool Keyed(const ParsedFlowPacket &p) noexcept {
-  if (p.l3 == L3Kind::kNone || p.l4 == L4Kind::kNone) {
+inline bool Keyed(const packet::ParsedFrame &p) noexcept {
+  if (p.l3 == packet::L3Kind::kNone || p.l4 == packet::L4Kind::kNone) {
     return false;
   }
-  if (p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) {
+  if (p.l4 == packet::L4Kind::kIcmp || p.l4 == packet::L4Kind::kIcmpv6) {
     return IsEchoRequest(p.l4, p.icmp_type) || IsEchoReply(p.l4, p.icmp_type);
   }
   return true;
@@ -311,7 +325,7 @@ inline bool Keyed(const ParsedFlowPacket &p) noexcept {
 // An ICMP error's quoted packet as a connection key (the quote went from us
 // toward the error's sender, so its tuple, as written, is the connection's).
 // False when the quote is short or unparsable.
-inline bool QuotedKey(std::span<const uint8_t> frame, const ParsedFlowPacket &p, uint16_t zone,
+inline bool QuotedKey(std::span<const uint8_t> frame, const packet::ParsedFrame &p, uint16_t zone,
                       CanonicalKey *out) noexcept {
   const size_t quote = size_t{p.l4_offset} + 8;
   if (frame.size() < quote) {
@@ -321,8 +335,8 @@ inline bool QuotedKey(std::span<const uint8_t> frame, const ParsedFlowPacket &p,
   if (ip_end < quote) {
     return false;
   }
-  ParsedFlowPacket inner;
-  if (!ParseQuoted(frame.subspan(quote, ip_end - quote), p.l3 == L3Kind::kIpv6, inner) ||
+  packet::ParsedFrame inner;
+  if (!ParseQuoted(frame.subspan(quote, ip_end - quote), p.l3 == packet::L3Kind::kIpv6, inner) ||
       inner.l3 != p.l3) {
     return false;
   }
@@ -392,7 +406,7 @@ class Conntrack {
   // timeout. `frame` holds the bytes `p` was parsed from (an ICMP error's
   // quote is read from it). `may_create` false: a packet that would start a
   // connection is kInvalid instead (the caller's policy refused it).
-  Result Track(std::span<const uint8_t> frame, const ParsedFlowPacket &p, Tick now,
+  Result Track(std::span<const uint8_t> frame, const packet::ParsedFrame &p, Tick now,
                uint16_t zone = 0, bool may_create = true) noexcept {
     if (!Keyed(p)) {
       return Unkeyed(frame, p, zone);
@@ -410,7 +424,7 @@ class Conntrack {
   // Staged or plain as chosen at Create from the table's footprint (staged
   // once it outgrows L2; BESS_LOOKUP_BODY overrides).
   void TrackBatch(std::span<const std::span<const uint8_t>> frames,
-                  std::span<const ParsedFlowPacket> parsed, Tick now, std::span<Result> out,
+                  std::span<const packet::ParsedFrame> parsed, Tick now, std::span<Result> out,
                   uint16_t zone = 0, bool may_create = true) noexcept {
     promise(frames.size() <= kMaxBatch && parsed.size() == frames.size() &&
             out.size() >= frames.size());
@@ -447,13 +461,13 @@ class Conntrack {
   }
 
  private:
-  static bool Keyed(const ParsedFlowPacket &p) noexcept { return ct_internal::Keyed(p); }
+  static bool Keyed(const packet::ParsedFrame &p) noexcept { return ct_internal::Keyed(p); }
 
   // What Track answers for a packet without a key.
-  Result Unkeyed(std::span<const uint8_t> frame, const ParsedFlowPacket &p,
+  Result Unkeyed(std::span<const uint8_t> frame, const packet::ParsedFrame &p,
                  uint16_t zone) noexcept {
-    if (p.l3 != L3Kind::kNone && p.l4 != L4Kind::kNone &&
-        (p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) &&
+    if (p.l3 != packet::L3Kind::kNone && p.l4 != packet::L4Kind::kNone &&
+        (p.l4 == packet::L4Kind::kIcmp || p.l4 == packet::L4Kind::kIcmpv6) &&
         ct_internal::IsIcmpError(p.l4, p.icmp_type)) {
       return Related(frame, p, zone);
     }
@@ -461,8 +475,8 @@ class Conntrack {
   }
 
   // The rest of Track once the key has been looked up.
-  Result Resolve(const ParsedFlowPacket &p, const CanonicalKey &c, const flow::FlowRef<Entry> &ref,
-                 Tick now, bool may_create) noexcept {
+  Result Resolve(const packet::ParsedFrame &p, const CanonicalKey &c,
+                 const flow::FlowRef<Entry> &ref, Tick now, bool may_create) noexcept {
     if (ref.state != nullptr) {
       Entry &e = *ref.state;
       const Direction dir = c.src_is_a == e.initiator_is_a ? Direction::kOriginal : Direction::kReply;
@@ -488,7 +502,7 @@ class Conntrack {
     // No connection: may this packet start one?
     Entry fresh;
     fresh.initiator_is_a = c.src_is_a;
-    if (p.l4 == L4Kind::kTcp) {
+    if (p.l4 == packet::L4Kind::kTcp) {
       const auto cls = ct_internal::ClassOf(p.tcp_flags);
       if (!ct_internal::ValidFlags(p.tcp_flags)) {
         return {TrackStatus::kInvalid};  // tcp_error(): creates nothing
@@ -500,7 +514,7 @@ class Conntrack {
       } else {
         return {TrackStatus::kInvalid};
       }
-    } else if ((p.l4 == L4Kind::kIcmp || p.l4 == L4Kind::kIcmpv6) &&
+    } else if ((p.l4 == packet::L4Kind::kIcmp || p.l4 == packet::L4Kind::kIcmpv6) &&
                !ct_internal::IsEchoRequest(p.l4, p.icmp_type)) {
       return {TrackStatus::kInvalid};  // an echo reply with no request
     }
@@ -565,13 +579,14 @@ class Conntrack {
   Conntrack(std::unique_ptr<Table> table, std::unique_ptr<Wheel> wheel, const TimeoutPolicy &policy)
       : table_(std::move(table)), wheel_(std::move(wheel)), policy_(policy) {}
 
-  Tick TimeoutOf(L4Kind l4, const Entry &e) const noexcept {
+  Tick TimeoutOf(packet::L4Kind l4, const Entry &e) const noexcept {
     return ct_internal::TimeoutFor(policy_, l4, e);
   }
 
   // An ICMP error: the quoted packet went from us toward the error's sender,
   // so its tuple, as written, is the connection's.
-  Result Related(std::span<const uint8_t> frame, const ParsedFlowPacket &p, uint16_t zone) noexcept {
+  Result Related(std::span<const uint8_t> frame, const packet::ParsedFrame &p,
+                 uint16_t zone) noexcept {
     CanonicalKey c;
     if (!ct_internal::QuotedKey(frame, p, zone, &c)) {
       return {TrackStatus::kInvalid};

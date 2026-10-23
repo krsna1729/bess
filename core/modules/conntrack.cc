@@ -4,9 +4,9 @@
 
 #include <span>
 
-#include "conntrack/packet_parse.h"
 #include "event.h"
 #include "modules/symmetric_inputs.h"
+#include "packet_parse.h"
 #include "utils/format.h"
 #include "utils/time.h"
 
@@ -160,13 +160,14 @@ void ConnTrack::Track(T &table, Context *ctx, bess::PacketBatch *batch) {
   table.Expire(now, kExpireBudget);
   const bool may_create = ctx->current_igate == 0;
   std::span<const uint8_t> frames[bess::PacketBatch::kMaxBurst];
-  ct::ParsedFlowPacket parsed[bess::PacketBatch::kMaxBurst];
+  bess::packet::ParsedFrame parsed[bess::PacketBatch::kMaxBurst];
   typename T::Result results[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
     bess::PacketRef pkt = batch->packet(i);
     frames[i] = std::span<const uint8_t>(pkt.head_data<const uint8_t *>(), pkt.head_len());
-    if (ct::ParseFrame(frames[i], parsed[i], pkt.total_len()) != ct::ParseStatus::kOk) {
-      parsed[i] = ct::ParsedFlowPacket{};  // unkeyed: untracked
+    if (bess::packet::ParseFrame(frames[i], parsed[i], pkt.total_len()) !=
+        bess::packet::ParseStatus::kOk) {
+      parsed[i] = bess::packet::ParsedFrame{};  // unkeyed: untracked
     }
   }
   table.TrackBatch(std::span(frames, cnt), std::span(parsed, cnt), now, std::span(results, cnt), 0,

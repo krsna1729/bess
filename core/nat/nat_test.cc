@@ -25,9 +25,9 @@
 namespace bess::nat {
 namespace {
 
-using conntrack::ParsedFlowPacket;
-using conntrack::ParseFrame;
-using conntrack::ParseStatus;
+using packet::ParsedFrame;
+using packet::ParseFrame;
+using packet::ParseStatus;
 
 constexpr uint64_t kSec = 1'000'000'000;
 
@@ -91,7 +91,7 @@ bool ChecksumsValid(const std::vector<uint8_t> &f) {
 }
 
 Endpoint Src(const std::vector<uint8_t> &f) {
-  ParsedFlowPacket p;
+  ParsedFrame p;
   EXPECT_EQ(ParseStatus::kOk, ParseFrame(f, p));
   Verdict why;
   return Nat::EndpointOf(p, Direction::kForward, &why).value();
@@ -109,7 +109,7 @@ struct Harness {
     nat = Nat::Create(c).value();
   }
   Verdict Send(std::vector<uint8_t> &f, Direction dir, uint64_t now) {
-    ParsedFlowPacket p;
+    ParsedFrame p;
     if (ParseFrame(f, p) != ParseStatus::kOk) return Verdict::kUnsupported;
     return nat->Translate(f, p, dir, now);
   }
@@ -133,7 +133,7 @@ TEST(NatTest, ForwardAndReverseRewriteKeepChecksumsValid) {
                     proto == 1 ? 0 : ext.port.value());
     ASSERT_EQ(Verdict::kTranslated, h.Send(in, Direction::kReverse, 1)) << int(proto);
     EXPECT_TRUE(ChecksumsValid(in)) << int(proto);
-    ParsedFlowPacket p;
+    ParsedFrame p;
     ASSERT_EQ(ParseStatus::kOk, ParseFrame(in, p));
     Verdict why;
     const Endpoint back = Nat::EndpointOf(p, Direction::kReverse, &why).value();
@@ -396,7 +396,7 @@ TEST(NatTest, ChainedPacketsAreTranslatedFromTheFirstSegment) {
   udp->checksum = 0;
   udp->checksum = utils::CalculateIpv4UdpChecksum(*ip, *udp);
   const std::span<uint8_t> head(f.data(), 60);  // the first segment
-  ParsedFlowPacket p;
+  ParsedFrame p;
   EXPECT_EQ(ParseStatus::kMalformed, ParseFrame(head, p)) << "alone, the lengths lie";
   ASSERT_EQ(ParseStatus::kOk, ParseFrame(head, p, f.size()));
   ASSERT_EQ(Verdict::kTranslated, h.nat->Translate(head, p, Direction::kForward, 0));
@@ -453,7 +453,7 @@ TEST(NatTest, GrowthNeverLosesABindingWhenCreatesOutrunMigration) {
   auto nat = GrowableNat::Create(c).value();
   auto send = [&](uint16_t port) {
     auto f = Frame(17, kInside, port, kRemote, 53);
-    ParsedFlowPacket p;
+    ParsedFrame p;
     EXPECT_EQ(ParseStatus::kOk, ParseFrame(f, p));
     return nat->Translate(f, p, Direction::kForward, 0);
   };
@@ -500,7 +500,7 @@ TEST(NatTest, BatchMatchesPacketByPacket) {
         want.push_back(one.Send(f, dir, round));
       }
       std::span<uint8_t> frames[32];
-      ParsedFlowPacket ps[32];
+      ParsedFrame ps[32];
       bool good[32];
       Verdict got[32];
       for (int i = 0; i < 32; i++) {

@@ -2,7 +2,7 @@
 
 // Fuzzes the NAT engine (core/nat/nat.h): Nat::Translate, Nat::TranslateBatch,
 // Nat::Expire and, through them, Rewrite, the port pool and the binding table,
-// on frames parsed by conntrack::ParseFrame.
+// on frames parsed by packet::ParseFrame.
 //
 // Each input builds two identical Nats (one of three small fixed address
 // configurations, capacity 1-16, timeout 1000 ticks, wheel granularity 2^0 or
@@ -78,17 +78,17 @@
 #include <utility>
 #include <vector>
 
-#include "conntrack/packet_parse.h"
 #include "fuzz/fuzz_support.h"
 #include "nat/nat.h"
+#include "packet_parse.h"
 
 namespace {
 
-using bess::conntrack::L3Kind;
-using bess::conntrack::L4Kind;
-using bess::conntrack::ParsedFlowPacket;
-using bess::conntrack::ParseFrame;
-using bess::conntrack::ParseStatus;
+using bess::packet::L3Kind;
+using bess::packet::L4Kind;
+using bess::packet::ParsedFrame;
+using bess::packet::ParseFrame;
+using bess::packet::ParseStatus;
 using bess::fuzz::FuzzInput;
 using bess::nat::be16_t;
 using bess::nat::be32_t;
@@ -158,7 +158,7 @@ struct Pkt {
     all.insert(all.end(), tail.begin(), tail.end());
     return all;
   }
-  ParseStatus Parse(ParsedFlowPacket &p) const {
+  ParseStatus Parse(ParsedFrame &p) const {
     return ParseFrame(head, p, head.size() + tail.size());
   }
 };
@@ -172,12 +172,12 @@ struct Ep {
 
 bess::nat::Endpoint ToNat(const Ep &e) { return {be32_t(e.addr), be16_t(e.port), e.proto}; }
 
-Ep EndpointOf(const ParsedFlowPacket &p, Direction dir) {
+Ep EndpointOf(const ParsedFrame &p, Direction dir) {
   const bool fwd = dir == Direction::kForward;
   return {Get32((fwd ? p.src : p.dst).data()), fwd ? p.src_port : p.dst_port, p.protocol};
 }
 
-bool Supported(const ParsedFlowPacket &p) {
+bool Supported(const ParsedFrame &p) {
   if (p.l4 == L4Kind::kTcp || p.l4 == L4Kind::kUdp) return true;
   if (p.l4 != L4Kind::kIcmp) return false;
   const uint8_t t = p.icmp_type;
@@ -442,7 +442,7 @@ struct Sums {
 // Checksum validity of a parsed IPv4 TCP/UDP/ICMP packet over its logical bytes:
 // the IPv4 header, and the L4 checksum over the IP payload (with the pseudo
 // header for TCP and UDP; a UDP checksum 0 is "absent", not valid).
-Sums Validity(const std::vector<uint8_t> &f, const ParsedFlowPacket &p) {
+Sums Validity(const std::vector<uint8_t> &f, const ParsedFrame &p) {
   const uint8_t *ip = f.data() + p.l3_offset;
   const uint8_t *l4 = f.data() + p.l4_offset;
   Sums s{};
@@ -460,7 +460,7 @@ Sums Validity(const std::vector<uint8_t> &f, const ParsedFlowPacket &p) {
 size_t L4ChecksumOffset(uint8_t proto) { return proto == 6 ? 16 : proto == 17 ? 6 : 2; }
 
 // The bytes Rewrite may change for a translated packet.
-bool Rewritable(size_t i, const ParsedFlowPacket &p, Direction dir) {
+bool Rewritable(size_t i, const ParsedFrame &p, Direction dir) {
   const bool fwd = dir == Direction::kForward;
   auto in = [i](size_t base, size_t off, size_t n) { return i >= base + off && i < base + off + n; };
   const size_t l3 = p.l3_offset, l4 = p.l4_offset;
@@ -495,7 +495,7 @@ std::pair<uint32_t, uint32_t> Span(const bess::nat::PortRange &r, const Ep &inte
 // Checks one packet of Nat A against the model and updates the model.
 // `before`/`after` are the logical bytes around Translate.
 void CheckOne(World &w, const std::vector<uint8_t> &before, const std::vector<uint8_t> &after,
-              ParseStatus st, const ParsedFlowPacket &p, Direction dir, Verdict v) {
+              ParseStatus st, const ParsedFrame &p, Direction dir, Verdict v) {
   if (v != Verdict::kTranslated) {
     FUZZ_CHECK(before == after);
   }
@@ -567,7 +567,7 @@ void CheckOne(World &w, const std::vector<uint8_t> &before, const std::vector<ui
       return;
     }
     FUZZ_CHECK(v == Verdict::kTranslated);
-    ParsedFlowPacket q;
+    ParsedFrame q;
     FUZZ_CHECK(ParseFrame(after, q) == ParseStatus::kOk);
     target = EndpointOf(q, dir);
     FUZZ_CHECK(target.addr == ext_ip && target.proto == ep.proto);
@@ -580,7 +580,7 @@ void CheckOne(World &w, const std::vector<uint8_t> &before, const std::vector<ui
   for (size_t i = 0; i < before.size(); i++) {
     FUZZ_CHECK(before[i] == after[i] || Rewritable(i, p, dir));
   }
-  ParsedFlowPacket q;
+  ParsedFrame q;
   FUZZ_CHECK(ParseFrame(after, q) == ParseStatus::kOk);
   FUZZ_CHECK(EndpointOf(q, dir) == target);
   const Sums was = Validity(before, p), now = Validity(after, p);
@@ -595,7 +595,7 @@ void RunBatch(World &w, std::vector<Pkt> &pkts, Direction dir, Verdict *out) {
   const size_t n = pkts.size();
   std::vector<Pkt> copies = pkts;
   for (size_t i = 0; i < n; i++) {
-    ParsedFlowPacket p;
+    ParsedFrame p;
     const ParseStatus st = pkts[i].Parse(p);
     const std::vector<uint8_t> before = pkts[i].Logical();
     out[i] = st == ParseStatus::kOk ? w.a->Translate(pkts[i].head, p, dir, w.now)
@@ -603,7 +603,7 @@ void RunBatch(World &w, std::vector<Pkt> &pkts, Direction dir, Verdict *out) {
     CheckOne(w, before, pkts[i].Logical(), st, p, dir, out[i]);
   }
   std::span<uint8_t> frames[kMaxFrames];
-  ParsedFlowPacket parsed[kMaxFrames];
+  ParsedFrame parsed[kMaxFrames];
   bool ok[kMaxFrames];
   Verdict got[kMaxFrames];
   for (size_t i = 0; i < n; i++) {
@@ -611,7 +611,7 @@ void RunBatch(World &w, std::vector<Pkt> &pkts, Direction dir, Verdict *out) {
     ok[i] = copies[i].Parse(parsed[i]) == ParseStatus::kOk;
   }
   w.b->TranslateBatch(std::span<const std::span<uint8_t>>(frames, n),
-                      std::span<const ParsedFlowPacket>(parsed, n), std::span<const bool>(ok, n),
+                      std::span<const ParsedFrame>(parsed, n), std::span<const bool>(ok, n),
                       dir, w.now, std::span<Verdict>(got, n));
   for (size_t i = 0; i < n; i++) {
     FUZZ_CHECK(got[i] == out[i]);
@@ -623,7 +623,7 @@ void RunBatch(World &w, std::vector<Pkt> &pkts, Direction dir, Verdict *out) {
 
 // The reply to a packet: addresses swapped, TCP/UDP ports swapped (an ICMP
 // query keeps its identifier). Checksums stay valid: the sums commute.
-void Swap(std::vector<uint8_t> &f, const ParsedFlowPacket &p) {
+void Swap(std::vector<uint8_t> &f, const ParsedFrame &p) {
   uint8_t *ip = f.data() + p.l3_offset;
   std::swap_ranges(ip + 12, ip + 16, ip + 16);
   if (p.protocol == 6 || p.protocol == 17) {
@@ -634,7 +634,7 @@ void Swap(std::vector<uint8_t> &f, const ParsedFlowPacket &p) {
 
 // Equal, except that checksum fields may differ by the one's complement zero.
 bool SameUpToZero(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b,
-                  const ParsedFlowPacket &p) {
+                  const ParsedFrame &p) {
   if (a.size() != b.size()) return false;
   const size_t sums[2] = {size_t{p.l3_offset} + 10, p.l4_offset + L4ChecksumOffset(p.protocol)};
   for (size_t i = 0; i < a.size(); i++) {
@@ -715,12 +715,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // originals, swapped.
     std::vector<Pkt> replies;
     std::vector<std::vector<uint8_t>> want;
-    std::vector<ParsedFlowPacket> layout;
+    std::vector<ParsedFrame> layout;
     for (size_t i = 0; i < n; i++) {
       if (v[i] != Verdict::kTranslated) continue;
       Pkt r;
       r.head = pkts[i].Logical();
-      ParsedFlowPacket p;
+      ParsedFrame p;
       FUZZ_CHECK(ParseFrame(r.head, p) == ParseStatus::kOk);
       Swap(r.head, p);
       std::vector<uint8_t> o = orig[i].Logical();
