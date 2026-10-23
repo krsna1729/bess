@@ -14,6 +14,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -24,10 +25,13 @@
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
 #include "module_graph.h"
+#include "modules/hash_lb.h"
+#include "packet_parse.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
+#include "testing/parse_corpus.h"
 #include "testing/rng.h"
 
 namespace {
@@ -663,6 +667,55 @@ TEST(HashLbParsedTest, AnUntaggedIpv4FlowKeepsItsGateAndItsReplyShares) {
           << (l4 ? "l4 " : "l3 ") << i;
     }
   }
+}
+
+// The hash L3 (`l4` false) and L4 must produce, from ParseFrame alone.
+bool ReferenceHash(std::span<const uint8_t> frame, size_t total_len, bool l4, uint32_t *hash) {
+  using bess::packet::ParseStatus;
+  bess::packet::ParsedFrame p;
+  const ParseStatus s = bess::packet::ParseFrame(frame, p, total_len);
+  if (s != ParseStatus::kOk && s != ParseStatus::kFragment) {
+    return false;
+  }
+  uint32_t words[8];
+  std::memcpy(words, p.src.data(), 16);
+  std::memcpy(words + 4, p.dst.data(), 16);
+  uint32_t v = 0;
+  for (const uint32_t w : words) {
+    v ^= w;
+  }
+  if (l4 && s == ParseStatus::kOk && !p.first_fragment) {
+    v ^= uint32_t{__builtin_bswap16(p.src_port)} ^ uint32_t{__builtin_bswap16(p.dst_port)} ^
+         p.protocol;
+  }
+  *hash = bess::arch::Crc32c(v, 0u);
+  return true;
+}
+
+// Valid, truncated and corrupted frames, tagged and not, IPv4 and IPv6, and
+// random bytes: both modes, which read the common frame at fixed offsets
+// after CheckFastIpv4, drop and hash every one exactly as through the full
+// parse.
+TEST(HashLbParsedTest, TheFastReadHashesEveryFrameAsTheParse) {
+  size_t fast = 0, fast_hashed = 0;
+  for (const auto &[bytes, total_len] : bess::testing::ParseCorpus()) {
+    const std::span<const uint8_t> frame(bytes);
+    for (const bool l4 : {false, true}) {
+      uint32_t want = 0, got = 0;
+      const bool hashed = ReferenceHash(frame, total_len, l4, &want);
+      ASSERT_EQ(hashed, HashLB::FrameHash(frame, total_len, l4, &got))
+          << ::testing::PrintToString(bytes) << " total " << total_len << " l4 " << l4;
+      if (hashed) {
+        EXPECT_EQ(want, got) << ::testing::PrintToString(bytes) << " l4 " << l4;
+      }
+      if (!l4 && bess::packet::CheckFastIpv4(frame, total_len).taken) {
+        fast++;
+        fast_hashed += hashed;
+      }
+    }
+  }
+  EXPECT_GT(fast_hashed, 500u);
+  EXPECT_GT(fast - fast_hashed, 500u);
 }
 
 }  // namespace

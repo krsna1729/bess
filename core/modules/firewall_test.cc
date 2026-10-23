@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 
 #include <google/protobuf/any.pb.h>
@@ -19,11 +20,14 @@
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "modules/firewall.h"
+#include "packet_parse.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/allocation_faults.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
+#include "testing/parse_corpus.h"
 #include "testing/rng.h"
 
 namespace {
@@ -766,6 +770,65 @@ TEST(FirewallTest, IcmpMatchesWithPortsZero) {
     EXPECT_TRUE(Passes(h, zero, packet)) << proto;
     EXPECT_FALSE(Passes(h, id, packet)) << proto;
   }
+}
+
+}  // namespace
+
+// -- The common frame's fast read decides as the parse (D-188) ---------------
+
+namespace {
+
+using bess::classifier::FirewallFamily;
+using bess::classifier::FirewallKey;
+
+// The key KeyOf must produce, built from ParseFrame alone.
+bool ReferenceKey(std::span<const uint8_t> frame, size_t total_len, FirewallKey *key) {
+  using bess::packet::L3Kind;
+  using bess::packet::L4Kind;
+  using bess::packet::ParseStatus;
+  bess::packet::ParsedFrame p;
+  const ParseStatus s = bess::packet::ParseFrame(frame, p, total_len);
+  if (s != ParseStatus::kOk && s != ParseStatus::kFragment) {
+    return false;
+  }
+  key->family = p.l3 == L3Kind::kIpv6 ? FirewallFamily::kIpv6 : FirewallFamily::kIpv4;
+  key->proto = p.protocol;
+  key->src = p.src;
+  key->dst = p.dst;
+  const bool ports = p.l4 == L4Kind::kTcp || p.l4 == L4Kind::kUdp;
+  key->src_port = ports ? p.src_port : 0;
+  key->dst_port = ports ? p.dst_port : 0;
+  return true;
+}
+
+// Valid, truncated and corrupted frames, tagged and not, IPv4 and IPv6, and
+// random bytes: KeyOf, which reads the common frame at fixed offsets after
+// CheckFastIpv4, judges and keys every one exactly as the full parse would.
+TEST(FirewallTest, KeyOfDecidesEveryFrameAsTheParse) {
+  size_t fast = 0, fast_judged = 0;
+  for (const auto &[bytes, total_len] : bess::testing::ParseCorpus()) {
+    const std::span<const uint8_t> frame(bytes);
+    FirewallKey want{}, got{};
+    const bool judged = ReferenceKey(frame, total_len, &want);
+    ASSERT_EQ(judged, Firewall::KeyOf(frame, total_len, &got))
+        << ::testing::PrintToString(bytes) << " total " << total_len;
+    if (bess::packet::CheckFastIpv4(frame, total_len).taken) {
+      fast++;
+      fast_judged += judged;
+    }
+    if (!judged) {
+      continue;
+    }
+    EXPECT_EQ(want.family, got.family) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.proto, got.proto) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.src, got.src) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.dst, got.dst) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.src_port, got.src_port) << ::testing::PrintToString(bytes);
+    EXPECT_EQ(want.dst_port, got.dst_port) << ::testing::PrintToString(bytes);
+  }
+  // Both sides of the fast path are exercised.
+  EXPECT_GT(fast_judged, 500u);
+  EXPECT_GT(fast - fast_judged, 500u);
 }
 
 }  // namespace

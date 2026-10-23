@@ -12,13 +12,16 @@
 
 namespace bess::packet {
 
-// The checked packet parse (M17, D-067), one for every module that reads a
-// frame's flow fields (ConnTrack, NAT, the tunnel decaps, Router): where the
-// L3 and L4 headers are, the L4 ports or ICMP identity, and the TCP flags.
-// Every offset is checked against the frame before it is recorded: a frame
-// whose headers do not fit, or that lies about its lengths, is kMalformed,
-// never read past. No fixed Ethernet header, no untagged-IPv4 assumption: up
-// to two VLAN tags, IPv4 with options, IPv6 with its extension-header chain.
+// The checked packet parse (M17, D-067, D-188), one for every module that
+// reads a frame's flow fields (ConnTrack, NAT, the tunnel decaps, Router,
+// Firewall, HashLB's L3 and L4 modes): where the L3 and L4 headers are, the
+// L4 ports or ICMP identity, and the TCP flags. Every offset is checked
+// against the frame before it is recorded: a frame whose headers do not fit,
+// or that lies about its lengths, is kMalformed, never read past. No fixed
+// Ethernet header, no untagged-IPv4 assumption: up to two VLAN tags, IPv4
+// with options, IPv6 with its extension-header chain (AH included). A reader
+// that needs only the addresses, protocol and ports may test the common frame
+// with CheckFastIpv4 first: the same checks, so the same decisions.
 
 enum class L3Kind : uint8_t { kNone, kIpv4, kIpv6 };
 enum class L4Kind : uint8_t { kNone, kTcp, kUdp, kIcmp, kIcmpv6, kOther };
@@ -141,6 +144,57 @@ inline ParseStatus WalkIpv6Chain(const uint8_t *ip, size_t have, size_t &off,
   return ParseStatus::kOk;
 }
 
+// The L4 header checks, the one definition ParseL4 and CheckFastIpv4 share
+// (kFill: also the fields, into `out`, in the same switch): `have` readable
+// header bytes at `l4`, `room` the L4 length the IP header states. A first
+// fragment needs only the fixed header (TCP options and the UDP datagram may
+// continue in later fragments).
+template <bool kFill>
+inline ParseStatus CheckL4(uint8_t protocol, const uint8_t *l4, size_t have, size_t room,
+                           bool first_fragment, ParsedFrame *out) noexcept {
+  switch (protocol) {
+    case 6:  // TCP
+      if (have < 20 || (l4[12] >> 4) < 5 ||
+          (!first_fragment && static_cast<size_t>(l4[12] >> 4) * 4 > room)) {
+        return ParseStatus::kMalformed;
+      }
+      if constexpr (kFill) {
+        out->l4 = L4Kind::kTcp;
+        out->src_port = Be16(l4);
+        out->dst_port = Be16(l4 + 2);
+        out->tcp_flags = l4[13];
+      }
+      return ParseStatus::kOk;
+    case 17:  // UDP: its length covers the whole datagram
+      if (have < 8 || Be16(l4 + 4) < 8 || (!first_fragment && Be16(l4 + 4) > room)) {
+        return ParseStatus::kMalformed;
+      }
+      if constexpr (kFill) {
+        out->l4 = L4Kind::kUdp;
+        out->src_port = Be16(l4);
+        out->dst_port = Be16(l4 + 2);
+      }
+      return ParseStatus::kOk;
+    case 1:   // ICMP
+    case 58:  // ICMPv6
+      if (have < 8) {
+        return ParseStatus::kMalformed;
+      }
+      if constexpr (kFill) {
+        out->l4 = protocol == 1 ? L4Kind::kIcmp : L4Kind::kIcmpv6;
+        out->icmp_type = l4[0];
+        out->icmp_code = l4[1];
+        out->src_port = out->dst_port = Be16(l4 + 4);  // echo identifier
+      }
+      return ParseStatus::kOk;
+    default:
+      if constexpr (kFill) {
+        out->l4 = L4Kind::kOther;
+      }
+      return ParseStatus::kOk;
+  }
+}
+
 // L4 at `off` of the IP packet at `ip`: `present` bytes of it are readable
 // (headers must lie there), `total` is its stated length (which the length
 // checks use; for a chained packet the rest lies in later segments).
@@ -148,49 +202,8 @@ inline ParseStatus ParseL4(const uint8_t *ip, size_t present, size_t total, size
                            size_t frame_base, ParsedFrame &out) noexcept {
   out.l4_offset = static_cast<uint16_t>(frame_base + off);
   out.l4_length = static_cast<uint16_t>(total - off);
-  const uint8_t *l4 = ip + off;
   const size_t have = present > off ? present - off : 0;  // readable header bytes
-  const size_t room = total - off;                          // the L4 length
-  switch (out.protocol) {
-    case 6: {  // TCP
-      // A first fragment holds at least the fixed header; its options may
-      // continue in the next fragment.
-      if (have < 20 || (l4[12] >> 4) < 5 ||
-          (!out.first_fragment && static_cast<size_t>(l4[12] >> 4) * 4 > room)) {
-        return ParseStatus::kMalformed;
-      }
-      out.l4 = L4Kind::kTcp;
-      out.src_port = Be16(l4);
-      out.dst_port = Be16(l4 + 2);
-      out.tcp_flags = l4[13];
-      return ParseStatus::kOk;
-    }
-    case 17: {  // UDP
-      // The UDP length covers the whole datagram, so a first fragment holds
-      // less than it says.
-      if (have < 8 || Be16(l4 + 4) < 8 || (!out.first_fragment && Be16(l4 + 4) > room)) {
-        return ParseStatus::kMalformed;
-      }
-      out.l4 = L4Kind::kUdp;
-      out.src_port = Be16(l4);
-      out.dst_port = Be16(l4 + 2);
-      return ParseStatus::kOk;
-    }
-    case 1:     // ICMP
-    case 58: {  // ICMPv6
-      if (have < 8) {
-        return ParseStatus::kMalformed;
-      }
-      out.l4 = out.protocol == 1 ? L4Kind::kIcmp : L4Kind::kIcmpv6;
-      out.icmp_type = l4[0];
-      out.icmp_code = l4[1];
-      out.src_port = out.dst_port = Be16(l4 + 4);  // echo identifier
-      return ParseStatus::kOk;
-    }
-    default:
-      out.l4 = L4Kind::kOther;
-      return ParseStatus::kOk;
-  }
+  return CheckL4<true>(out.protocol, ip + off, have, total - off, out.first_fragment, &out);
 }
 
 // An IP packet starting at `ip` (frame offset `base`): `present` bytes are
@@ -273,40 +286,103 @@ inline ParseStatus ParseFrameGeneral(std::span<const uint8_t> frame, ParsedFrame
 }
 }  // namespace parse_internal
 
+// The common frame (D-085): untagged Ethernet carrying IPv4 without options,
+// so every field sits at a fixed offset of the frame.
+inline constexpr size_t kFastIpv4Src = 26;  // 4 bytes
+inline constexpr size_t kFastIpv4Dst = 30;  // 4 bytes
+inline constexpr size_t kFastIpv4L4 = 34;   // ports at +0 and +2
+
+// CheckFastIpv4's verdict on a frame. `taken`: the frame is the common frame,
+// and `status` is exactly what ParseFrame returns for it; otherwise ParseFrame
+// takes its general path and the caller must too. `header_ok`: the IPv4
+// header was accepted (then `protocol` and the addresses are valid, and the
+// status is kOk, kFragment or a malformed L4 header).
+struct FastIpv4 {
+  bool taken = false;
+  bool header_ok = false;
+  bool first_fragment = false;
+  uint8_t protocol = 0;
+  uint16_t total = 0;  // the IPv4 total length
+  ParseStatus status = ParseStatus::kMalformed;
+};
+
+namespace parse_internal {
+// Untagged Ethernet, EtherType IPv4, version 4 with IHL 5, the fixed headers there.
+inline bool IsCommonFrame(std::span<const uint8_t> frame) noexcept {
+  return frame.size() >= 34 && frame[12] == 0x08 && frame[13] == 0x00 && frame[14] == 0x45;
+}
+
+// The common frame's checks, in the order that decides fastest; with kFill,
+// ParseFrame's fields too (into `out`, which starts zeroed), as the checks
+// reach them.
+template <bool kFill>
+inline FastIpv4 FastFrame(std::span<const uint8_t> frame, size_t total_len,
+                          ParsedFrame *out) noexcept {
+  FastIpv4 f;
+  if (!IsCommonFrame(frame)) [[unlikely]] {
+    return f;
+  }
+  f.taken = true;
+  total_len = std::max(total_len, frame.size());
+  const uint8_t *ip = frame.data() + 14;
+  if constexpr (kFill) {
+    out->l3_offset = 14;
+  }
+  const size_t total = Be16(ip + 2);
+  if (total < 20 || total > total_len - 14) {
+    return f;
+  }
+  f.header_ok = true;
+  f.total = static_cast<uint16_t>(total);
+  f.protocol = ip[9];
+  if constexpr (kFill) {
+    out->l3 = L3Kind::kIpv4;
+    out->protocol = ip[9];
+    std::memcpy(out->src.data(), ip + 12, 4);
+    std::memcpy(out->dst.data(), ip + 16, 4);
+  }
+  const uint16_t frag = Be16(ip + 6);
+  if ((frag & 0x1fff) != 0) {
+    f.status = ParseStatus::kFragment;
+    return f;
+  }
+  f.first_fragment = (frag & 0x2000) != 0;
+  if constexpr (kFill) {
+    out->first_fragment = f.first_fragment;
+    out->l4_offset = 34;
+    out->l4_length = static_cast<uint16_t>(total - 20);
+  }
+  // frame.size() >= 34 and total >= 20: at least the 20-byte header is here.
+  f.status = CheckL4<kFill>(f.protocol, ip + 20, std::min(frame.size() - 14, total) - 20,
+                            total - 20, f.first_fragment, out);
+  return f;
+}
+}  // namespace parse_internal
+
+// ParseFrame's checks for the common frame, the one definition ParseFrame
+// itself runs (and conntrack_test checks against its general path), so a
+// reader that needs only the addresses, protocol and ports can take them from
+// the fixed offsets without building a ParsedFrame and decide exactly as the
+// parse would. Arguments as ParseFrame's.
+inline FastIpv4 CheckFastIpv4(std::span<const uint8_t> frame, size_t total_len = 0) noexcept {
+  return parse_internal::FastFrame<false>(frame, total_len, nullptr);
+}
+
 // Parses an Ethernet frame (optionally with up to two 802.1Q/802.1ad tags).
 // `frame` is the readable bytes (for a chained packet, its first segment) and
 // `total_len` the packet's length (default: the span's): the headers must be
 // in `frame`, and the IP and L4 lengths are checked against `total_len`.
 inline ParseStatus ParseFrame(std::span<const uint8_t> frame, ParsedFrame &out,
                               size_t total_len = 0) noexcept {
-  if (total_len < frame.size()) {
-    total_len = frame.size();
-  }
   out = ParsedFrame{};
   // The common frame first, validated in one place: untagged Ethernet, IPv4
   // without options. The same checks as the general path below, in the order
   // that decides fastest (the tunnel review's "validate once, execute fast";
   // conntrack_test checks both paths agree on every frame it builds).
-  if (frame.size() >= 34 && frame[12] == 0x08 && frame[13] == 0x00 && frame[14] == 0x45)
-      [[likely]] {
-    const uint8_t *ip = frame.data() + 14;
-    out.l3_offset = 14;
-    const size_t total = parse_internal::Be16(ip + 2);
-    if (total < 20 || total > total_len - 14) {
-      return ParseStatus::kMalformed;
-    }
-    out.l3 = L3Kind::kIpv4;
-    out.protocol = ip[9];
-    std::memcpy(out.src.data(), ip + 12, 4);
-    std::memcpy(out.dst.data(), ip + 16, 4);
-    const uint16_t frag = parse_internal::Be16(ip + 6);
-    if ((frag & 0x1fff) != 0) {
-      return ParseStatus::kFragment;
-    }
-    out.first_fragment = (frag & 0x2000) != 0;
-    return parse_internal::ParseL4(ip, std::min(frame.size() - 14, total), total, 20, 14, out);
+  if (parse_internal::IsCommonFrame(frame)) [[likely]] {
+    return parse_internal::FastFrame<true>(frame, total_len, &out).status;
   }
-  return parse_internal::ParseFrameGeneral(frame, out, total_len);
+  return parse_internal::ParseFrameGeneral(frame, out, std::max(total_len, frame.size()));
 }
 
 // Parses a packet that starts at its IP header.

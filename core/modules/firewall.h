@@ -3,10 +3,12 @@
 #ifndef BESS_MODULES_FIREWALL_H_
 #define BESS_MODULES_FIREWALL_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -50,6 +52,19 @@ class Firewall final : public Module {
   // The module's "<name>/rules" resource (D-179).
   class RulesResource;
 
+  // The packet's 5-tuple, from the checked parse (packet_parse.h, D-188): up
+  // to two VLAN tags, IPv4 options, up to eight IPv6 extension headers (AH
+  // included). False for a packet this table cannot judge: not IPv4 or IPv6,
+  // or malformed (a header cut short, lengths that lie, an EtherType its IP
+  // version contradicts, more extension headers than the walk follows). A
+  // packet without ports - a non-first fragment, ICMP, a protocol other than
+  // TCP and UDP - is judged with both ports 0, which only a rule whose port
+  // range starts at 0 can match. The common frame is read at its fixed
+  // offsets after the parse's own checks (CheckFastIpv4), so it decides as
+  // ParseFrame would. `frame` and `total_len` as ParseFrame's.
+  static bool KeyOf(std::span<const uint8_t> frame, size_t total_len,
+                    bess::classifier::FirewallKey *key);
+
  private:
   friend class RulesResource;
 
@@ -84,16 +99,6 @@ class Firewall final : public Module {
   // priorities by id, lowest first.
   static std::expected<std::unique_ptr<const Published>, std::string>
   BuildPublished(std::vector<Ranked> rules);
-
-  // The packet's 5-tuple, from the checked parse (packet_parse.h, D-188): up
-  // to two VLAN tags, IPv4 options, up to eight IPv6 extension headers (AH
-  // included). False for a packet this table cannot judge: not IPv4 or IPv6,
-  // or malformed (a header cut short, lengths that lie, an EtherType its IP
-  // version contradicts, more extension headers than the walk follows). A
-  // packet without ports - a non-first fragment, ICMP, a protocol other than
-  // TCP and UDP - is judged with both ports 0, which only a rule whose port
-  // range starts at 0 can match.
-  static bool KeyOf(bess::PacketRef pkt, bess::classifier::FirewallKey *key);
 
   bess::rcu::RcuPtr<Published> published_;
   // The committed rules by id (control side): the policy the published table

@@ -440,23 +440,19 @@ void Firewall::DeInit() {
   resource_.reset();
 }
 
-bool Firewall::KeyOf(bess::PacketRef pkt, bess::classifier::FirewallKey *key) {
-  using bess::classifier::FirewallFamily;
+namespace {
+
+// KeyOf's path for every frame but the common one: the checked parse
+// ConnTrack, NAT and Router read (D-188), the headers in the first segment,
+// their lengths checked against the whole packet. Out of line, so the common
+// frame's path stays small enough to inline into the batch loop.
+[[gnu::noinline]] bool KeyOfParsed(std::span<const uint8_t> frame, size_t total_len,
+                                   bess::classifier::FirewallKey *key) {
   using bess::packet::L3Kind;
   using bess::packet::L4Kind;
   using bess::packet::ParseStatus;
-
-  // The checked parse ConnTrack, NAT and Router read (D-188): the headers in
-  // the first segment, their lengths checked against the whole packet.
   bess::packet::ParsedFrame p;
-  const ParseStatus status = bess::packet::ParseFrame(
-      std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), p,
-      pkt.total_len());
-  // A fragment other than the first carries no transport header, so its
-  // ports are unknown, but the IP header (IPv6: the fragment header) still
-  // names the transport protocol: it is judged with ports 0, which only a
-  // rule whose port range starts at 0 can match. Reading ports anyway would
-  // judge it by whatever bytes follow.
+  const ParseStatus status = bess::packet::ParseFrame(frame, p, total_len);
   if (status != ParseStatus::kOk && status != ParseStatus::kFragment) {
     return false;  // not IP, or malformed: nothing to judge
   }
@@ -465,11 +461,44 @@ bool Firewall::KeyOf(bess::PacketRef pkt, bess::classifier::FirewallKey *key) {
   key->proto = p.protocol;
   key->src = p.src;
   key->dst = p.dst;
-  // Only TCP and UDP have ports to match: the parse's ICMP echo identifier
-  // is not one.
   const bool ports = p.l4 == L4Kind::kTcp || p.l4 == L4Kind::kUdp;
   key->src_port = ports ? p.src_port : 0;
   key->dst_port = ports ? p.dst_port : 0;
+  return true;
+}
+
+}  // namespace
+
+bool Firewall::KeyOf(std::span<const uint8_t> frame, size_t total_len,
+                     bess::classifier::FirewallKey *key) {
+  using bess::packet::ParseStatus;
+
+  // A fragment other than the first carries no transport header, so its
+  // ports are unknown, but the IP header (IPv6: the fragment header) still
+  // names the transport protocol: it is judged with ports 0, which only a
+  // rule whose port range starts at 0 can match. Reading ports anyway would
+  // judge it by whatever bytes follow. Only TCP and UDP have ports to match:
+  // the parse's ICMP echo identifier is not one.
+
+  // The common frame: the parse's checks, then the fields at their offsets.
+  const bess::packet::FastIpv4 f = bess::packet::CheckFastIpv4(frame, total_len);
+  if (!f.taken) [[unlikely]] {
+    return KeyOfParsed(frame, total_len, key);
+  }
+  if (f.status != ParseStatus::kOk && f.status != ParseStatus::kFragment) {
+    return false;
+  }
+  key->family = FirewallFamily::kIpv4;
+  key->proto = f.protocol;
+  key->src = {};
+  key->dst = {};
+  std::memcpy(key->src.data(), frame.data() + bess::packet::kFastIpv4Src, 4);
+  std::memcpy(key->dst.data(), frame.data() + bess::packet::kFastIpv4Dst, 4);
+  const bool ports =
+      f.status == ParseStatus::kOk && (f.protocol == 6 || f.protocol == 17);
+  const uint8_t *l4 = frame.data() + bess::packet::kFastIpv4L4;
+  key->src_port = ports ? static_cast<uint16_t>(l4[0] << 8 | l4[1]) : 0;
+  key->dst_port = ports ? static_cast<uint16_t>(l4[2] << 8 | l4[3]) : 0;
   return true;
 }
 
@@ -499,7 +528,9 @@ void Firewall::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       table != nullptr && table->HasFamily(FirewallFamily::kIpv6);
   uint64_t parseable = 0;
   for (size_t i = 0; i < n; i++) {
-    if (!KeyOf(batch->packet(i), &keys[i])) {
+    bess::PacketRef pkt = batch->packet(i);
+    if (!KeyOf(std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), pkt.total_len(),
+               &keys[i])) {
       keys[i] = FirewallKey{};
       continue;
     }
