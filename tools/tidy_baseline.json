@@ -80,7 +80,7 @@
     "core/module.h": {
       "bugprone-fold-init-type": 1,
       "performance-no-int-to-ptr": 1,
-      "performance-unnecessary-value-param": 2
+      "performance-unnecessary-value-param": 1
     },
     "core/module_graph.cc": {
       "performance-unnecessary-copy-initialization": 2
