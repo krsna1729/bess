@@ -538,7 +538,8 @@ class PublishConformanceTest : public ::testing::Test {
     size_t entries = 0;
     masked_table_->ForEach(
         [&](classifier::ConstBytes, classifier::ConstBytes,
-            const classifier::ConcurrentMaskedTable::Rule &) { entries++; });
+            const classifier::ConcurrentMaskedTable::Rule &,
+            classifier::ConcurrentMaskedTable::Ranges) { entries++; });
     return entries;
   }
 
@@ -716,6 +717,79 @@ TEST_F(PublishConformanceTest, MaskedRuleStagingFailureAtEveryAllocationLeavesNo
     EXPECT_EQ(masked_table_->ids_in_use(), baseline_ids);
   });
   EXPECT_GT(points, 1u);
+}
+
+// The same for a ranged rule (D-186) joining a key that already holds a
+// ranged rule: a failure at any allocation (the key's spare chain among them)
+// leaves the key's one rule, its id count and no pending state; the rule
+// applies on retry, and publishing it, replacing it and erasing it allocate
+// nothing.
+TEST_F(PublishConformanceTest, RangedRuleStagingFailureLeavesNoTraceAndPublishAllocatesNothing) {
+  // Six address-like bytes under the mask, a two-byte port range after them.
+  const auto key = [](uint16_t low, uint16_t high) {
+    std::string bytes(6, '\xff');
+    bytes.append(2, '\0');
+    bytes.append(1, '\x01');
+    bytes.append(7, '\0');
+    const classifier::ConcurrentMaskedTable::KeyRange range{6, 2, low, high};
+    bytes.append(reinterpret_cast<const char *>(&range), sizeof(range));
+    return bytes;
+  };
+  const auto upsert = [&](uint16_t low, uint16_t high, uint16_t gate) {
+    return Op::Upsert("masked", key(low, high),
+                      std::any(classifier::MaskedRuleResource::Value{1, gate, {}}));
+  };
+  ASSERT_EQ(engine_.Apply(std::vector<Op>{upsert(1, 10, 1)}).outcome, Outcome::kApplied);
+  const Op op = upsert(5, 20, 2);
+  const size_t baseline_ids = masked_table_->ids_in_use();
+  const size_t points = fault_injection::ForEachFailurePoint([&](size_t k) {
+    std::optional<dataplane::Resource::Reservation> held;
+    bool injected = false;
+    {
+      fault_injection::AllocationFaults faults(k);
+      try {
+        auto reserved = masked_->Reserve(op);
+        if (reserved) {
+          held.emplace(std::move(*reserved));
+        }
+      } catch (const std::bad_alloc &) {
+      }
+      injected = faults.injected();
+    }
+    if (held) {
+      held->staged->Abort();
+    }
+    EXPECT_EQ(masked_table_->size(), 1u) << "an aborted rule became visible";
+    EXPECT_EQ(MaskedEntries(), 1u) << "the key's chain changed";
+    EXPECT_EQ(masked_table_->ids_in_use(), baseline_ids)
+        << "a prepared rule leaked its arena id";
+    if (!injected) {
+      return;
+    }
+    ASSERT_EQ(engine_.Apply(std::vector<Op>{op}).outcome, Outcome::kApplied);
+    EXPECT_EQ(MaskedEntries(), 2u);
+    ASSERT_EQ(engine_.Apply(std::vector<Op>{Op::Erase("masked", key(5, 20))}).outcome,
+              Outcome::kApplied);
+    for (int i = 0; i < 1000 && engine_.ReclaimRetired() != 0; i++) {
+    }
+    EXPECT_EQ(masked_table_->ids_in_use(), baseline_ids);
+  });
+  EXPECT_GT(points, 1u);
+
+  g_publish_allocations = 0;
+  dataplane::internal::g_publish_window_hook = CountPublishAllocations;
+  ASSERT_EQ(engine_.Apply(std::vector<Op>{op}).outcome, Outcome::kApplied);
+  ASSERT_EQ(engine_.Apply(std::vector<Op>{upsert(5, 20, 3), upsert(30, 40, 4),
+                                          Op::Erase("masked", key(1, 10))})
+                .outcome,
+            Outcome::kApplied);
+  ASSERT_EQ(engine_.Apply(std::vector<Op>{Op::Erase("masked", key(5, 20)),
+                                          Op::Erase("masked", key(30, 40))})
+                .outcome,
+            Outcome::kApplied);
+  dataplane::internal::g_publish_window_hook = nullptr;
+  EXPECT_EQ(g_publish_allocations.load(), 0u) << "publishing a chain allocated";
+  EXPECT_EQ(MaskedEntries(), 0u);
 }
 
 // A failure at any allocation while SlotResource stages an upsert frees the

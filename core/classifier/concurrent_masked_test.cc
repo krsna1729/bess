@@ -9,11 +9,15 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <map>
+#include <numeric>
 #include <optional>
 #include <random>
+#include <tuple>
 #include <thread>
 #include <vector>
 
+#include "classifier/range_backend.h"
 #include "runtime/runtime_state.h"
 namespace bess::classifier {
 namespace {
@@ -387,7 +391,7 @@ TEST(ConcurrentMaskedTableTest, GrowsWithoutLosingRules) {
     ASSERT_EQ(static_cast<int>(i & 0xffff), Classify(*t, i | (7ull << 40)));
   }
   size_t seen = 0;
-  t->ForEach([&](ConstBytes mask, ConstBytes, const auto &) {
+  t->ForEach([&](ConstBytes mask, ConstBytes, const auto &, auto) {
     EXPECT_EQ(0, std::memcmp(mask.data(), kLow4.data(), kKeyLen));
     seen++;
   });
@@ -504,6 +508,645 @@ TEST(ConcurrentMaskedTableTest, ConcurrentReadersAlwaysSeeTheStableWinner) {
   EXPECT_EQ(0u, wrong.load()) << "of " << batches.load() << " batch rounds, "
                               << ops << " ops";
   EXPECT_GT(ops, 10000u);
+}
+
+
+// -- ranges (D-186) -----------------------------------------------------------
+//
+// These keys are WildcardMatch's packing of fields of 4, 2 and 2 bytes: an
+// address, then two big-endian ports. Prefixes are on the address, ranges on
+// the ports.
+
+using Range = ConcurrentMaskedTable::KeyRange;
+using RangeList = std::vector<Range>;
+
+Bytes Key(uint32_t addr, uint16_t sport, uint16_t dport) {
+  Bytes k{};
+  for (int b = 0; b < 4; b++) {
+    k[b] = std::byte{static_cast<uint8_t>(addr >> (24 - 8 * b))};
+  }
+  k[4] = std::byte{static_cast<uint8_t>(sport >> 8)};
+  k[5] = std::byte{static_cast<uint8_t>(sport)};
+  k[6] = std::byte{static_cast<uint8_t>(dport >> 8)};
+  k[7] = std::byte{static_cast<uint8_t>(dport)};
+  return k;
+}
+Bytes Prefix(int len) {
+  return Key(len == 0 ? 0 : ~uint32_t{0} << (32 - len), 0, 0);
+}
+Range Sport(uint64_t low, uint64_t high) { return {4, 2, low, high}; }
+Range Dport(uint64_t low, uint64_t high) { return {6, 2, low, high}; }
+
+int ClassifyKey(const ConcurrentMaskedTable &t, const Bytes &k) {
+  ConcurrentMaskedTable::Match m{};
+  return t.LookupBatch(C(k), kKeyLen, &m, 1) ? m.gate : -1;
+}
+
+// Rules that share a (mask, value) and differ in their ranges are distinct
+// rules under one key: inside their ranges they rank like any rules (priority,
+// then the later command), outside them they do not match, an unranged rule of
+// the same key is one more of them, and replacing, erasing and erasing the last
+// rule behave as they do for masks alone.
+TEST(ConcurrentMaskedTableRangeTest, RulesOfOneKeyRankByPriorityThenCommand) {
+  auto t = MakeTable();
+  const Bytes m24 = Prefix(24), net = Key(0x0a000100, 0, 0);
+  const auto at = [&](uint16_t dport) {
+    return ClassifyKey(*t, Key(0x0a000105, 1000, dport));
+  };
+  const RangeList low = {Dport(100, 199)}, high = {Dport(150, 299)};
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 5, 1, 0, low));
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 5, 2, 0, high));
+  EXPECT_EQ(-1, at(99));
+  EXPECT_EQ(1, at(100));
+  EXPECT_EQ(1, at(149));
+  EXPECT_EQ(2, at(150)) << "overlap at equal priority: the later command";
+  EXPECT_EQ(2, at(299));
+  EXPECT_EQ(-1, at(300));
+  EXPECT_EQ(-1, ClassifyKey(*t, Key(0x0a000205, 1000, 120))) << "outside the prefix";
+
+  const RangeList narrow = {Dport(160, 170)};
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 9, 3, 0, narrow));
+  EXPECT_EQ(2, at(159));
+  EXPECT_EQ(3, at(160));
+  EXPECT_EQ(3, at(170));
+  EXPECT_EQ(2, at(171));
+
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 1, 4));
+  EXPECT_EQ(4, at(99)) << "the key's unranged rule";
+  EXPECT_EQ(1, at(120));
+  EXPECT_EQ(4u, t->size());
+  EXPECT_EQ(1u, t->tuple_count()) << "a range costs no tuple";
+
+  // The same (mask, value, ranges) again replaces the rule, as the later
+  // command.
+  ASSERT_EQ(R::kUpdated, t->Upsert(C(m24), C(net), 5, 5, 0, low));
+  EXPECT_EQ(5, at(150));
+  EXPECT_EQ(5, at(120));
+  EXPECT_EQ(2, at(200));
+  EXPECT_EQ(4u, t->size());
+  ASSERT_TRUE(t->FindRule(C(m24), C(net), low).has_value());
+  EXPECT_EQ(5, t->FindRule(C(m24), C(net), low)->gate);
+  EXPECT_EQ(4, t->FindRule(C(m24), C(net))->gate);
+  EXPECT_FALSE(t->FindRule(C(m24), C(net), RangeList{Dport(100, 198)}).has_value());
+
+  EXPECT_FALSE(t->Erase(C(m24), C(net), RangeList{Dport(100, 198)}));
+  ASSERT_TRUE(t->Erase(C(m24), C(net), high));
+  EXPECT_EQ(4, at(250));
+  EXPECT_EQ(5, at(150));
+  EXPECT_EQ(3, at(165));
+  ASSERT_TRUE(t->Erase(C(m24), C(net), low));
+  ASSERT_TRUE(t->Erase(C(m24), C(net), narrow));
+  EXPECT_EQ(4, at(165));
+  EXPECT_EQ(1u, t->size());
+  ASSERT_TRUE(t->Erase(C(m24), C(net)));
+  EXPECT_EQ(-1, at(99));
+  EXPECT_EQ(0u, t->size());
+  EXPECT_EQ(0u, t->tuple_count()) << "the key's last rule took the tuple";
+
+  // A key whose last rule is ranged goes the same way.
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 5, 1, 0, low));
+  ASSERT_TRUE(t->Erase(C(m24), C(net), low));
+  EXPECT_EQ(-1, at(120));
+  EXPECT_EQ(0u, t->size());
+  EXPECT_EQ(0u, t->tuple_count());
+}
+
+// Every range of a rule must hold, each read from its own bytes, and the
+// bounds are inclusive.
+TEST(ConcurrentMaskedTableRangeTest, EveryRangeOfARuleMustHold) {
+  auto t = MakeTable();
+  const RangeList both = {Sport(1000, 1999), Dport(80, 80)};
+  ASSERT_EQ(R::kInserted, t->Upsert(C(Prefix(0)), C(Prefix(0)), 1, 1, 0, both));
+  EXPECT_EQ(1, ClassifyKey(*t, Key(1, 1000, 80)));
+  EXPECT_EQ(1, ClassifyKey(*t, Key(2, 1999, 80)));
+  EXPECT_EQ(-1, ClassifyKey(*t, Key(1, 999, 80)));
+  EXPECT_EQ(-1, ClassifyKey(*t, Key(1, 2000, 80)));
+  EXPECT_EQ(-1, ClassifyKey(*t, Key(1, 1500, 79)));
+  EXPECT_EQ(-1, ClassifyKey(*t, Key(1, 1500, 81)));
+}
+
+// A ranged rule competes with other tuples as any rule does: a better rule in
+// another mask wins, a worse one loses inside the range and answers outside it
+// (a key whose ranges all miss contributes nothing from its tuple), in one
+// batch.
+TEST(ConcurrentMaskedTableRangeTest, RangedRuleRanksAcrossTuples) {
+  auto t = MakeTable();
+  const Bytes host = Key(0x0a000105, 0, 0), net16 = Key(0x0a000000, 0, 0);
+  ASSERT_EQ(R::kInserted,
+            t->Upsert(C(Prefix(32)), C(host), 5, 1, 0, RangeList{Dport(100, 199)}));
+  ASSERT_EQ(R::kInserted, t->Upsert(C(Prefix(16)), C(net16), 10, 2));
+  EXPECT_EQ(2, ClassifyKey(*t, Key(0x0a000105, 7, 150)));
+  ASSERT_EQ(R::kUpdated, t->Upsert(C(Prefix(16)), C(net16), 1, 2));
+
+  const std::array<Bytes, 4> keys = {Key(0x0a000105, 7, 150), Key(0x0a000105, 7, 250),
+                                     Key(0x0a000201, 7, 150), Key(0x0b000105, 7, 150)};
+  std::array<uint16_t, 4> out{};
+  EXPECT_EQ(0x7u, LookupGates(*t, ConstBytes(keys[0].data(), 4 * kKeyLen), kKeyLen,
+                              out.data(), 4));
+  EXPECT_EQ(1, out[0]) << "inside the range the ranged rule outranks the /16";
+  EXPECT_EQ(2, out[1]) << "outside it the /16 answers";
+  EXPECT_EQ(2, out[2]);
+}
+
+// A range the table cannot hold exactly is refused, not widened, and leaves
+// nothing behind; one value (low == high) is a range.
+TEST(ConcurrentMaskedTableRangeTest, RefusesNonCanonicalRanges) {
+  auto t = MakeTable();
+  const Bytes m24 = Prefix(24), net = Key(0x0a000100, 0, 0);
+  const std::vector<RangeList> bad = {
+      {Range{6, 0, 1, 2}},               // no width
+      {Range{0, 9, 1, 2}},               // wider than 8 bytes
+      {Range{7, 2, 1, 2}},               // past the key
+      {Dport(200, 100)},                 // empty
+      {Range{6, 2, 1, 0x10000}},         // beyond the field
+      {Dport(0, 0xffff)},                // the whole field: no range
+      {Range{2, 2, 1, 2}},               // under the mask
+      {Dport(1, 2), Sport(1, 2)},        // out of order
+      {Range{4, 3, 1, 2}, Dport(1, 2)},  // overlapping
+  };
+  for (const RangeList &ranges : bad) {
+    EXPECT_EQ(R::kBadRange, t->Upsert(C(m24), C(net), 1, 1, 0, ranges));
+    EXPECT_FALSE(t->PrepareUpsert(C(m24), C(net), 1, 1, 0, ranges).has_value());
+  }
+  EXPECT_EQ(0u, t->size());
+  EXPECT_EQ(0u, t->tuple_count());
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 1, 1, 0, RangeList{Dport(80, 80)}));
+  EXPECT_EQ(1, ClassifyKey(*t, Key(0x0a000101, 0, 80)));
+  EXPECT_EQ(-1, ClassifyKey(*t, Key(0x0a000101, 0, 81)));
+}
+
+// A replaced chain is freed only after a grace period: with a reader online
+// since before the swaps, every replaced chain is still held; once it is
+// quiescent, the next write frees them. A key back to one unranged rule holds
+// no chain, so replacing that rule retires none.
+TEST(ConcurrentMaskedTableRangeTest, ReplacedChainWaitsForOnlineReaders) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  auto t = MakeTable();
+  const Bytes m24 = Prefix(24), net = Key(0x0a000100, 0, 0);
+  const RangeList a = {Dport(1, 10)}, b = {Dport(5, 20)};
+
+  constexpr uint32_t kReader = 28;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 1, 1));
+  ASSERT_EQ(R::kUpdated, t->Upsert(C(m24), C(net), 1, 2));
+  EXPECT_EQ(0u, t->retiring_chains()) << "one unranged rule is no chain";
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 2, 3, 0, a));
+  EXPECT_EQ(0u, t->retiring_chains());
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 3, 4, 0, b));
+  EXPECT_EQ(1u, t->retiring_chains());
+  ASSERT_TRUE(t->Erase(C(m24), C(net), a));
+  ASSERT_TRUE(t->Erase(C(m24), C(net), b));
+  EXPECT_EQ(3u, t->retiring_chains())
+      << "a chain was freed while a reader was mid-grace-period";
+  ASSERT_EQ(R::kUpdated, t->Upsert(C(m24), C(net), 1, 5));
+  EXPECT_EQ(3u, t->retiring_chains()) << "back to one unranged rule: no chain";
+  EXPECT_EQ(5, ClassifyKey(*t, Key(0x0a000101, 0, 7)));
+
+  domain.Quiescent(kReader);
+  ASSERT_EQ(R::kInserted, t->Upsert(C(Prefix(32)), C(Key(1, 0, 0)), 0, 6));
+  EXPECT_EQ(0u, t->retiring_chains()) << "retired chains never came back";
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+}
+
+// Readers never miss a stable ranged rule while the chain of its own key is
+// rewritten underneath them: lower-priority rules with overlapping ranges come
+// and go on the same key (each change swaps in a new chain and retires the
+// old one), directly and through prepare/commit, and the key's unranged rule
+// is added and erased.
+TEST(ConcurrentMaskedTableRangeTest, ConcurrentReadersSeeTheStableRangedWinner) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  auto t = MakeTable();
+  const Bytes m24 = Prefix(24), net = Key(0x0a000100, 0, 0);
+  const RangeList stable = {Dport(1000, 1999)};
+  ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 100, 7, 0, stable));
+  std::vector<Bytes> keys;
+  for (uint16_t i = 0; i < 32; i++) {
+    keys.push_back(Key(0x0a000100 | i, i, static_cast<uint16_t>(1000 + i * 31)));
+  }
+
+  constexpr int kReaders = 2;
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> wrong{0};
+  std::vector<std::thread> readers;
+  for (int r = 0; r < kReaders; r++) {
+    const uint32_t reader_id = 29 + r;
+    ASSERT_TRUE(domain.Register(reader_id).has_value());
+    readers.emplace_back([&, reader_id] {
+      domain.Online(reader_id);
+      while (!stop.load(std::memory_order_relaxed)) {
+        uint16_t results[32];
+        const uint64_t hits =
+            LookupGates(*t, ConstBytes(keys[0].data(), 32 * kKeyLen), kKeyLen, results, 32);
+        if (hits != 0xffffffffull) {
+          wrong++;
+        } else {
+          for (const uint16_t g : results) wrong += g != 7;
+        }
+        domain.Quiescent(reader_id);
+      }
+      domain.Offline(reader_id);
+    });
+  }
+
+  std::mt19937_64 rng(0x7a9e);
+  std::vector<RangeList> live;
+  uint64_t ops = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (std::chrono::steady_clock::now() < deadline || ops <= 10000u) {
+    const uint64_t low = rng() % 2500;
+    const RangeList ranges = {Dport(low, low + rng() % 600)};
+    const bool present = std::find(live.begin(), live.end(), ranges) != live.end();
+    switch (rng() % 4) {
+      case 0:
+        if (!live.empty()) {
+          const size_t at = rng() % live.size();
+          ASSERT_TRUE(t->Erase(C(m24), C(net), live[at]));
+          live[at] = live.back();
+          live.pop_back();
+        }
+        break;
+      case 1: {
+        // Through the transactional split, one commit per change.
+        auto p = t->PrepareUpsert(C(m24), C(net), static_cast<int64_t>(rng() % 100), 9, 0,
+                                  ranges);
+        ASSERT_TRUE(p.has_value());
+        if (const auto freed = t->Commit(*p); freed != 0) t->Recycle(freed);
+        if (!present) live.push_back(ranges);
+        break;
+      }
+      case 2:
+        if (t->FindRule(C(m24), C(net)).has_value()) {
+          ASSERT_TRUE(t->Erase(C(m24), C(net)));
+        } else {
+          ASSERT_EQ(R::kInserted, t->Upsert(C(m24), C(net), 50, 9));
+        }
+        break;
+      default:
+        ASSERT_TRUE(R::kInserted ==
+                        t->Upsert(C(m24), C(net), static_cast<int64_t>(rng() % 100), 9, 0,
+                                  ranges) ||
+                    present);
+        if (!present) live.push_back(ranges);
+        break;
+    }
+    ops++;
+  }
+  stop = true;
+  for (auto &th : readers) th.join();
+  for (int r = 0; r < kReaders; r++) domain.Unregister(29 + r);
+  EXPECT_EQ(0u, wrong.load()) << ops << " ops";
+}
+
+// -- transactions over one key (D-024, D-186) ----------------------------------
+
+struct Change {
+  bool erase;
+  Bytes mask, value;
+  RangeList ranges;
+  int64_t priority = 0;
+  uint16_t gate = 0;
+};
+using Identity = std::tuple<Bytes, Bytes, std::vector<std::array<uint64_t, 4>>>;
+Identity IdentityOf(const Bytes &mask, const Bytes &value, const RangeList &ranges) {
+  std::vector<std::array<uint64_t, 4>> r;
+  for (const Range &range : ranges) {
+    r.push_back({range.offset, range.width, range.low, range.high});
+  }
+  return {mask, value, r};
+}
+struct ModelRule {
+  RangeList ranges;
+  int64_t priority;
+  uint64_t seq;
+  uint16_t gate;
+};
+using Model = std::map<Identity, ModelRule>;
+
+bool RuleMatches(const Identity &id, const ModelRule &rule, const Bytes &key) {
+  for (size_t b = 0; b < kKeyLen; b++) {
+    if ((key[b] & std::get<0>(id)[b]) != std::get<1>(id)[b]) {
+      return false;
+    }
+  }
+  for (const Range &r : rule.ranges) {
+    uint64_t v = 0;
+    for (uint32_t b = 0; b < r.width; b++) {
+      v = (v << 8) | static_cast<uint8_t>(key[r.offset + b]);
+    }
+    if (v < r.low || v > r.high) {
+      return false;
+    }
+  }
+  return true;
+}
+int ModelClassify(const Model &model, const Bytes &key) {
+  const ModelRule *best = nullptr;
+  for (const auto &[id, rule] : model) {
+    if (RuleMatches(id, rule, key) &&
+        (best == nullptr || rule.priority > best->priority ||
+         (rule.priority == best->priority && rule.seq > best->seq))) {
+      best = &rule;
+    }
+  }
+  return best == nullptr ? -1 : best->gate;
+}
+// Every rule the table visits, as (identity, priority, gate).
+std::vector<std::tuple<Identity, int64_t, uint16_t>> Snapshot(const ConcurrentMaskedTable &t) {
+  std::vector<std::tuple<Identity, int64_t, uint16_t>> out;
+  t.ForEach([&](ConstBytes mask, ConstBytes value, const ConcurrentMaskedTable::Rule &rule,
+                ConcurrentMaskedTable::Ranges ranges) {
+    Bytes m, v;
+    std::memcpy(m.data(), mask.data(), kKeyLen);
+    std::memcpy(v.data(), value.data(), kKeyLen);
+    out.emplace_back(IdentityOf(m, v, RangeList(ranges.begin(), ranges.end())), rule.priority,
+                     rule.gate);
+  });
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// Changes to one key prepared together (new ranged rules, a replacement, an
+// erase of its unranged rule, of every rule) committed in every order, with
+// every subset cancelled: prepared rules never answer, the table ends as if
+// only the committed changes were applied whatever the order, and cancelling
+// every change leaves the table exactly as it was.
+void CommitInEveryOrder(const std::vector<Change> &base, const std::vector<Change> &changes,
+                        const std::vector<Bytes> &probes) {
+  const size_t n = changes.size();
+  for (uint32_t cancelled = 0; cancelled < (1u << n); cancelled++) {
+    std::vector<size_t> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    do {
+      SCOPED_TRACE(::testing::Message() << "cancelled " << cancelled << " order "
+                                        << ::testing::PrintToString(order));
+      auto t = MakeTable();
+      Model model;
+      uint64_t seq = 0;
+      for (const Change &c : base) {
+        ASSERT_EQ(R::kInserted,
+                  t->Upsert(C(c.mask), C(c.value), c.priority, c.gate, 0, c.ranges));
+        model[IdentityOf(c.mask, c.value, c.ranges)] = {c.ranges, c.priority, ++seq, c.gate};
+      }
+      const auto before = Snapshot(*t);
+      std::vector<ConcurrentMaskedTable::Prepared> prepared;
+      std::vector<uint64_t> seqs;
+      for (const Change &c : changes) {
+        if (c.erase) {
+          auto p = t->PrepareErase(C(c.mask), C(c.value), c.ranges);
+          ASSERT_TRUE(p.has_value());
+          prepared.push_back(std::move(*p));
+          seqs.push_back(0);
+        } else {
+          auto p = t->PrepareUpsert(C(c.mask), C(c.value), c.priority, c.gate, 0, c.ranges);
+          ASSERT_TRUE(p.has_value());
+          prepared.push_back(std::move(*p));
+          seqs.push_back(++seq);
+        }
+      }
+      for (const Bytes &k : probes) {
+        ASSERT_EQ(ModelClassify(model, k), ClassifyKey(*t, k)) << "a prepared change answered";
+      }
+      std::vector<ConcurrentMaskedTable::RuleId> freed;
+      for (const size_t i : order) {
+        if ((cancelled >> i) & 1) {
+          t->Cancel(prepared[i]);
+          continue;
+        }
+        freed.push_back(t->Commit(prepared[i]));
+        const Change &c = changes[i];
+        const Identity id = IdentityOf(c.mask, c.value, c.ranges);
+        if (c.erase) {
+          model.erase(id);
+        } else {
+          model[id] = {c.ranges, c.priority, seqs[i], c.gate};
+        }
+        for (const Bytes &k : probes) {
+          ASSERT_EQ(ModelClassify(model, k), ClassifyKey(*t, k));
+        }
+      }
+      for (const ConcurrentMaskedTable::RuleId id : freed) {
+        if (id != 0) {
+          t->Recycle(id);
+        }
+      }
+      EXPECT_EQ(model.size(), t->size());
+      for (const auto &[id, rule] : model) {
+        const auto found = t->FindRule(C(std::get<0>(id)), C(std::get<1>(id)), rule.ranges);
+        ASSERT_TRUE(found.has_value());
+        EXPECT_EQ(rule.gate, found->gate);
+      }
+      if (cancelled == (1u << n) - 1) {
+        EXPECT_EQ(before, Snapshot(*t)) << "cancelling every change changed the table";
+      }
+      EXPECT_EQ(model.size(), Snapshot(*t).size()) << "a pending entry was left behind";
+    } while (std::next_permutation(order.begin(), order.end()));
+  }
+}
+
+std::vector<Bytes> PortProbes(uint32_t addr) {
+  std::vector<Bytes> probes;
+  for (const uint16_t dport : {0, 1, 99, 100, 149, 150, 199, 200, 249, 250}) {
+    for (const uint16_t sport : {9, 10, 20, 21}) {
+      probes.push_back(Key(addr, sport, dport));
+    }
+  }
+  probes.push_back(Key(addr ^ 0x01000000, 10, 150));
+  return probes;
+}
+
+TEST(ConcurrentMaskedTableRangeTest, ChangesToOneKeyCommitInAnyOrder) {
+  const Bytes m24 = Prefix(24), net = Key(0x0a000100, 0, 0);
+  CommitInEveryOrder(
+      {{false, m24, net, {}, 1, 1}, {false, m24, net, {Dport(100, 199)}, 5, 2}},
+      {{false, m24, net, {Dport(150, 249)}, 7, 3},
+       {false, m24, net, {Dport(100, 199)}, 5, 4},
+       {true, m24, net, {}},
+       {false, m24, net, {Sport(10, 20)}, 2, 5}},
+      PortProbes(0x0a000107));
+}
+
+TEST(ConcurrentMaskedTableRangeTest, NewKeyChangesCommitInAnyOrder) {
+  const Bytes m24 = Prefix(24), net = Key(0x0a000100, 0, 0);
+  CommitInEveryOrder({{false, Prefix(16), Key(0x0a000000, 0, 0), {}, 0, 9}},
+                     {{false, m24, net, {Dport(1, 150)}, 3, 6},
+                      {false, m24, net, {}, 0, 7},
+                      {false, m24, net, {Sport(10, 10)}, 3, 8}},
+                     PortProbes(0x0a000107));
+}
+
+TEST(ConcurrentMaskedTableRangeTest, ErasingEveryRuleOfAKeyCommitsInAnyOrder) {
+  const Bytes m24 = Prefix(24), net = Key(0x0a000100, 0, 0);
+  CommitInEveryOrder(
+      {{false, m24, net, {Dport(100, 199)}, 5, 2}, {false, m24, net, {Dport(150, 249)}, 6, 3}},
+      {{true, m24, net, {Dport(100, 199)}},
+       {true, m24, net, {Dport(150, 249)}},
+       {false, m24, net, {}, 0, 4}},
+      PortProbes(0x0a000107));
+}
+
+// Against the scalar oracle (D-038's ScalarRangeBackend): random rules over
+// five prefix lengths with source and destination port ranges that overlap,
+// many sharing a (mask, value), priorities with ties and beyond the packed
+// range; random upserts, replacements and erases, directly and as
+// transactions that commit in random order and cancel some changes; random
+// batches checked after every step, and while a transaction is prepared.
+TEST(ConcurrentMaskedTableRangeTest, RandomRangedRulesMatchTheScalarOracle) {
+  for (uint32_t seed = 1; seed <= 4; seed++) {
+    SCOPED_TRACE(::testing::Message() << "seed " << seed);
+    std::mt19937_64 rng(seed);
+    auto t = MakeTable(8);
+    Model model;
+    uint64_t seq = 0;
+    constexpr std::array<int, 5> kLens = {0, 8, 16, 24, 32};
+    const auto random_identity = [&] {
+      const Bytes mask = Prefix(kLens[rng() % kLens.size()]);
+      Bytes value = Key(0x0a000000 | static_cast<uint32_t>(rng() % 3) << 8 |
+                            static_cast<uint32_t>(rng() % 2),
+                        0, 0);
+      for (size_t b = 0; b < kKeyLen; b++) value[b] &= mask[b];
+      RangeList ranges;
+      const auto random_range = [&](Range (*make)(uint64_t, uint64_t)) {
+        const uint64_t low = rng() % 60;
+        ranges.push_back(make(low, low + rng() % 20));
+      };
+      const int shape = static_cast<int>(rng() % 4);
+      if (shape & 1) random_range(Sport);
+      if (shape & 2) random_range(Dport);
+      return std::tuple{mask, value, ranges};
+    };
+    const auto random_priority = [&] {
+      return rng() % 3 == 0 ? static_cast<int64_t>(rng() % 200000) - 100000
+                            : static_cast<int64_t>(rng() % 8);
+    };
+    const auto check = [&](const Model &expected, int step) {
+      std::vector<RangeRule<uint16_t>> rules;
+      std::vector<std::pair<const Identity *, const ModelRule *>> by_seq;
+      for (const auto &[id, rule] : expected) by_seq.emplace_back(&id, &rule);
+      // Latest first: the oracle's stable priority sort then gives ties to
+      // the later command, as the table does.
+      std::sort(by_seq.begin(), by_seq.end(),
+                [](const auto &a, const auto &b) { return a.second->seq > b.second->seq; });
+      for (const auto &[id, rule] : by_seq) {
+        RangeRule<uint16_t> r;
+        r.mask.assign(std::get<0>(*id).begin(), std::get<0>(*id).end());
+        r.value.assign(std::get<1>(*id).begin(), std::get<1>(*id).end());
+        r.src_port_offset = 4;
+        r.dst_port_offset = 6;
+        for (const Range &range : rule->ranges) {
+          (range.offset == 4 ? r.src_range : r.dst_range) =
+              PortRange{static_cast<uint16_t>(range.low), static_cast<uint16_t>(range.high)};
+        }
+        r.priority = rule->priority;
+        r.result = rule->gate;
+        rules.push_back(std::move(r));
+      }
+      const ScalarRangeBackend<uint16_t> oracle(std::move(rules));
+      const size_t n = 1 + rng() % 64;
+      std::vector<Bytes> keys(n);
+      for (Bytes &k : keys) {
+        k = Key(0x0a000000 | static_cast<uint32_t>(rng() % 3) << 8 |
+                    static_cast<uint32_t>(rng() % 3),
+                static_cast<uint16_t>(rng() % 85), static_cast<uint16_t>(rng() % 85));
+      }
+      std::vector<uint16_t> want(n, 0), got(n, 0);
+      const uint64_t want_hits = oracle.LookupBatch(
+          ConstBytes(keys[0].data(), n * kKeyLen), kKeyLen, kKeyLen, std::span<uint16_t>(want));
+      const uint64_t got_hits =
+          LookupGates(*t, ConstBytes(keys[0].data(), n * kKeyLen), kKeyLen, got.data(), n);
+      ASSERT_EQ(want_hits, got_hits) << "step " << step;
+      for (size_t i = 0; i < n; i++) {
+        if ((want_hits >> i) & 1) {
+          ASSERT_EQ(want[i], got[i]) << "step " << step << " key " << i;
+        }
+      }
+    };
+
+    for (int step = 0; step < 400; step++) {
+      const uint64_t op = rng() % 10;
+      if (op < 2 && !model.empty()) {
+        auto it = model.begin();
+        std::advance(it, static_cast<ptrdiff_t>(rng() % model.size()));
+        ASSERT_TRUE(t->Erase(C(std::get<0>(it->first)), C(std::get<1>(it->first)),
+                             it->second.ranges));
+        model.erase(it);
+      } else if (op < 5) {
+        // A transaction of up to five distinct rules, mostly on one key.
+        std::vector<Change> changes;
+        std::vector<Identity> ids;
+        const auto [mask, value, unused] = random_identity();
+        for (int k = 0, want = 1 + static_cast<int>(rng() % 5); k < want; k++) {
+          auto [m, v, ranges] = random_identity();
+          if (rng() % 4 != 0) {
+            m = mask;
+            v = value;
+          }
+          const Identity id = IdentityOf(m, v, ranges);
+          if (std::find(ids.begin(), ids.end(), id) != ids.end()) continue;
+          ids.push_back(id);
+          const bool erase = model.contains(id) && rng() % 3 == 0;
+          changes.push_back({erase, m, v, ranges, random_priority(),
+                             static_cast<uint16_t>(rng() % 1000)});
+        }
+        std::vector<ConcurrentMaskedTable::Prepared> prepared;
+        std::vector<uint64_t> seqs;
+        for (const Change &c : changes) {
+          if (c.erase) {
+            auto p = t->PrepareErase(C(c.mask), C(c.value), c.ranges);
+            ASSERT_TRUE(p.has_value());
+            prepared.push_back(std::move(*p));
+            seqs.push_back(0);
+          } else {
+            auto p = t->PrepareUpsert(C(c.mask), C(c.value), c.priority, c.gate, 0, c.ranges);
+            ASSERT_TRUE(p.has_value());
+            prepared.push_back(std::move(*p));
+            seqs.push_back(++seq);
+          }
+        }
+        check(model, step);  // prepared changes never answer
+        std::vector<size_t> order(changes.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::shuffle(order.begin(), order.end(), rng);
+        for (const size_t i : order) {
+          if (rng() % 4 == 0) {
+            t->Cancel(prepared[i]);
+            continue;
+          }
+          const ConcurrentMaskedTable::RuleId freed = t->Commit(prepared[i]);
+          const Change &c = changes[i];
+          if (c.erase) {
+            model.erase(IdentityOf(c.mask, c.value, c.ranges));
+          } else {
+            model[IdentityOf(c.mask, c.value, c.ranges)] = {c.ranges, c.priority, seqs[i],
+                                                            c.gate};
+          }
+          if (freed != 0) t->Recycle(freed);
+        }
+      } else {
+        const auto [mask, value, ranges] = random_identity();
+        const int64_t priority = random_priority();
+        const auto gate = static_cast<uint16_t>(rng() % 1000);
+        const auto r = t->Upsert(C(mask), C(value), priority, gate, 0, ranges);
+        const Identity id = IdentityOf(mask, value, ranges);
+        ASSERT_EQ(model.contains(id) ? R::kUpdated : R::kInserted, r);
+        model[id] = {ranges, priority, ++seq, gate};
+      }
+      ASSERT_EQ(model.size(), t->size()) << "step " << step;
+      check(model, step);
+    }
+    // Every rule erased: no rule id, chain or tuple is left.
+    const size_t base_ids = 1;  // the pending record
+    for (const auto &[id, rule] : model) {
+      ASSERT_TRUE(t->Erase(C(std::get<0>(id)), C(std::get<1>(id)), rule.ranges));
+    }
+    EXPECT_EQ(0u, t->size());
+    EXPECT_EQ(0u, t->tuple_count());
+    ASSERT_EQ(R::kInserted, t->Upsert(C(Prefix(32)), C(Key(1, 0, 0)), 0, 1));
+    ASSERT_TRUE(t->Erase(C(Prefix(32)), C(Key(1, 0, 0))));
+    EXPECT_EQ(0u, t->retiring_chains());
+    EXPECT_LE(t->ids_in_use(), base_ids + t->retiring_ids());
+  }
 }
 
 }  // namespace
