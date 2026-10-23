@@ -12415,3 +12415,45 @@ result field is no longer an error at resume: nothing reads it, so nothing is wr
 
 **Revisit when:** a consumer needs a result field's absence to be an error (then a per-field required flag),
 or the metadata pass gains per-path offsets.
+
+## D-182 ConnTrack can mark each packet with its connection status
+
+**Status:** accepted (2026-10-23).
+**Code:** `core/modules/conntrack.{h,cc}`, `protobuf/module_msg.proto` (`ConnTrackStatus`,
+`ConnTrackArg.status_attr`), `core/modules/conntrack_test.cc`.
+
+**Context.** ConnTrack (D-080) gives each packet one of two gates: tracked (new, existing, related) or not
+(invalid, untracked, refused for a full table). A module downstream cannot tell a new connection from an
+existing one. A stateful policy must make that distinction, for example to admit a new connection only on
+some ports, or to count or meter new connections separately from established ones.
+
+**Decision.**
+
+- **`ConnTrackArg.status_attr`, optional.** When it names an attribute, ConnTrack writes one byte to it in
+  every packet: a `ConnTrackStatus` value (new 1, existing 2, related 3, invalid 4, untracked 5, full 6;
+  0 is unspecified and never written). The gates do not change.
+- **The library's status, plus one.** `WireStatus` adds 1 to `conntrack::TrackStatus`. A `static_assert` for
+  each value fails the build if the library's order and the wire enum disagree.
+- **Every packet that leaves is marked.** This includes packets of PER_WORKER inputs that fail closed
+  (D-080): they are not tracked, so they carry untracked. A value from an earlier module therefore cannot
+  reach a reader.
+- **The write follows the metadata contract** (D-177), as the Firewall's `action_attr` does (D-141). The
+  attribute is registered only when configured. It has an offset only when a module downstream reads it,
+  and without a reader the packet path writes nothing. A configured name with no reader is reported once,
+  at PreResume.
+
+**Why.** One byte from a result the tracker already computes costs a store per packet, and only when a
+reader exists. Using the library's order plus one keeps 0 free for "unset" without a lookup table. The
+compiler checks the mapping, not a test.
+
+**Test.** `ConnTrackModuleTest.StatusAttrCarriesEachPacketsResult`: ConnTrack feeds a `Split` that reads the
+attribute, and each packet leaves on the gate of its status. An inside SYN is new, its reply is existing,
+an outside SYN is invalid, and an ARP frame is untracked. All seven status values are wired gates, so a
+packet with a wrong status, or none, leaves on another gate. Live: `ConnTrackSourceFedTest.PerWorkerOnOtherInputs`
+routes on the status too. When it fails closed, every packet is untracked; when it falls back to the shared
+table, exactly one packet is new.
+
+**Consequences.** A pipeline that does not set `status_attr` is unchanged. The packet direction (original
+or reply) is not part of the status.
+
+**Revisit when:** a reader needs the packet direction or the TCP state, not only the status.

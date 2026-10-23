@@ -57,6 +57,12 @@ class ConnTrack final : public Module {
 
   std::unique_ptr<Ct> MakeTable() const;
 
+  // status_attr's offset when something reads it (D-182), else an invalid
+  // offset: the packet path writes nothing.
+  bess::metadata::mt_offset_t StatusOffset() const {
+    return status_attr_ < 0 ? bess::metadata::kMetadataOffsetNoWrite : attr_offset(status_attr_);
+  }
+
   bess::pb::ConnTrackArg::Mode mode_ = bess::pb::ConnTrackArg::OWNED;
   size_t capacity_ = 0;
   bess::conntrack::TimeoutPolicy policy_;
@@ -71,6 +77,9 @@ class ConnTrack final : public Module {
   std::optional<std::string> refused_;
   // Connections refused because the table was full (M25, D-089).
   bess::stats::EventThrottle table_full_;
+  // The configured status attribute (D-182); -1 when none.
+  int status_attr_ = -1;
+  std::string status_attr_name_;
 };
 
 #endif  // BESS_MODULES_CONNTRACK_H_

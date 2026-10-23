@@ -585,7 +585,8 @@ TEST_F(ClassifierTrafficTest, ConnTrackPerWorkerOnSymmetricInputs) {
 
 // An inside SYN from a Source (not a port queue): no symmetric hash to rely
 // on. `fallback_shared` false: per-worker tracking is refused and everything
-// goes to ogate 1; true: one shared table tracks it, to ogate 0.
+// goes to ogate 1; true: one shared table tracks it, to ogate 0. Either way
+// each packet carries its status (D-182), which a Split routes on.
 class ConnTrackSourceFedTest : public ClassifierTrafficTest,
                                public ::testing::WithParamInterface<bool> {};
 
@@ -595,17 +596,24 @@ TEST_P(ConnTrackSourceFedTest, PerWorkerOnOtherInputs) {
                  R"({"templates": [")" + Base64(TcpFrame(kInside, kOutside, 40000, 80, 0x02)) +
                      R"("]})");
   auto ct_arg = Arg("ConnTrackArg", std::string(R"({"mode": "PER_WORKER", "fallback_shared": )") +
-                                        (fallback ? "true" : "false") + "}");
+                                        (fallback ? "true" : "false") +
+                                        R"(, "status_attr": "ct_status"})");
+  auto split_arg = Arg("SplitArg", R"({"attribute": "ct_status", "size": 1})");
+  // ConnTrackStatus values: the Split's gates (D-182).
+  constexpr int kNew = 1, kExisting = 2, kUntracked = 5;
   Apply(PipelineBuilder()
             .Worker(0, AllowedCores().at(0), "")
             .Module("src", "Source", nullptr)
             .Module("syn", "Rewrite", syn.get())
             .Module("ct", "ConnTrack", ct_arg.get())
-            .Module("sink0", "Sink", nullptr)
-            .Module("sink1", "Sink", nullptr)
+            .Module("status", "Split", split_arg.get())
+            .Module("sink", "Sink", nullptr)
             .Chain({"src", "syn", "ct"})
-            .Connect("ct", 0, "sink0", 0)
-            .Connect("ct", 1, "sink1", 0)
+            .Connect("ct", 0, "status", 0)
+            .Connect("ct", 1, "status", 0)
+            .Connect("status", kNew, "sink", 0)
+            .Connect("status", kExisting, "sink", 0)
+            .Connect("status", kUntracked, "sink", 0)
             .Task(OnWorker("src", 0)));
   RunWhileForwarding(milliseconds(500));
   const double sent = Packets("syn", 0);
@@ -613,9 +621,12 @@ TEST_P(ConnTrackSourceFedTest, PerWorkerOnOtherInputs) {
   if (fallback) {
     EXPECT_EQ(sent, Packets("ct", 0)) << "tracked in the shared table";
     EXPECT_EQ(0, Packets("ct", 1));
+    EXPECT_EQ(1, Packets("status", kNew)) << "the first SYN starts the one connection";
+    EXPECT_EQ(0, Packets("status", kUntracked));
   } else {
     EXPECT_EQ(0, Packets("ct", 0));
     EXPECT_EQ(sent, Packets("ct", 1)) << "fails closed";
+    EXPECT_EQ(sent, Packets("status", kUntracked)) << "and marks each packet untracked";
   }
 }
 
