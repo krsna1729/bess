@@ -456,6 +456,17 @@ static CommandResponse find_dpdk_vdev(const std::string &vdev,
   return CommandSuccess();
 }
 
+RxMarkNegotiation ClassifyRxMarkNegotiation(int ret, uint64_t features) {
+  if (ret == -ENOTSUP) {
+    return RxMarkNegotiation::kAssumed;
+  }
+  if (ret != 0) {
+    return RxMarkNegotiation::kFailed;
+  }
+  return (features & kRxMetadataUserMark) != 0 ? RxMarkNegotiation::kGranted
+                                               : RxMarkNegotiation::kRefused;
+}
+
 CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
   dpdk_port_t ret_port_id = DPDK_PORT_UNKNOWN;
   rte_eth_dev_info dev_info;
@@ -503,6 +514,32 @@ CommandResponse PMDPort::Init(const bess::pb::PMDPortArg &arg) {
     return CommandFailure(ENOTSUP,
                           "symmetric_rss: the device offers neither a symmetric Toeplitz "
                           "hash nor a Toeplitz hash with a settable key");
+  }
+  // D-185: the negotiated result takes effect at configure, so it precedes
+  // the first rte_eth_dev_configure() (DPDK refuses it afterwards, -EBUSY).
+  if (arg.rx_mark()) {
+    const char *driver = dev_info.driver_name ?: "unknown";
+    uint64_t features = kRxMetadataUserMark;
+    ret = rte_eth_rx_metadata_negotiate(ret_port_id, &features);
+    switch (ClassifyRxMarkNegotiation(ret, features)) {
+      case RxMarkNegotiation::kGranted:
+        break;
+      case RxMarkNegotiation::kAssumed:
+        LOG(INFO) << "PMDPort " << name() << ": rx_mark: " << driver
+                  << " does not negotiate RX metadata (ENOTSUP); MARK delivery "
+                     "is assumed, as DPDK specifies";
+        break;
+      case RxMarkNegotiation::kRefused:
+        return CommandFailure(ENOTSUP,
+                              "rx_mark: the device cannot deliver MARK (%s cleared "
+                              "RTE_ETH_RX_METADATA_USER_MARK)",
+                              driver);
+      case RxMarkNegotiation::kFailed:
+        return CommandFailure(-ret, "rx_mark: rte_eth_rx_metadata_negotiate() failed%s",
+                              ret == -EBUSY ? ": the device was configured before, and "
+                                              "negotiation must precede the first configure"
+                                            : "");
+    }
   }
   vlan_offload_mask_ =
       (arg.vlan_offload_rx_strip() ? RTE_ETH_VLAN_STRIP_OFFLOAD : 0) |
