@@ -1615,8 +1615,14 @@ std::expected<void, RouteError> Router::SetNextHopGroup(
       previous != nullptr ? DistinctMembers(*previous) : std::vector<NextHopId>{};
   const std::vector<NextHopId> added = Difference(now, before);
   const std::vector<NextHopId> removed = Difference(before, now);
-  ReserveMemberships(added);
-  rcu_.ReserveRetirements(1);  // for the group this one may replace
+  try {
+    ReserveMemberships(added);
+    rcu_.ReserveRetirements(1);  // for the group this one may replace
+  } catch (...) {
+    // No trace in the reverse index: drop the entries the reservation added.
+    EraseEmptyMemberships(added);
+    throw;
+  }
   for (const NextHopId m : Configured(*group)) {
     member_references_[m.value()]++;
   }
