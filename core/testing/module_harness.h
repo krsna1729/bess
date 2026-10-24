@@ -21,6 +21,8 @@
 
 #include <google/protobuf/message.h>
 
+#include <cstddef>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -29,6 +31,7 @@
 #include "framework/resource_codec.h"
 #include "message.h"
 #include "module.h"
+#include "packet.h"
 #include "testing/packet_builder.h"
 
 namespace bess::testing {
@@ -36,6 +39,15 @@ namespace bess::testing {
 // Packet pools (malloc-backed: no hugepages, no root), the port drivers, and
 // this thread as a non-worker. Once per process; ModuleHarness calls it.
 void InitModuleTests();
+
+// `bytes` as a packet from the harness's pool: one segment, or, with `split`
+// in (0, bytes.size()), a two-segment chain whose first segment ends there.
+// nullptr (and a test failure) when it cannot be built. After a ModuleHarness
+// exists (the pool is its).
+bess::PacketHandle MakePacket(const Bytes &bytes, size_t split = 0);
+
+// A packet's bytes, across its segments.
+Bytes PacketBytes(bess::PacketHandle packet);
 
 class ModuleHarness {
  public:
@@ -83,6 +95,13 @@ class ModuleHarness {
   std::map<gate_idx_t, std::vector<Bytes>> RunPipeline(Module *first, gate_idx_t igate,
                                                        const std::vector<Bytes> &in, Module *last,
                                                        std::vector<gate_idx_t> ogates = {});
+  // RunPipeline with packets the test built itself (a chain, a clone): the
+  // harness takes ownership of each of `in`. A test that keeps another
+  // reference (a clone's original) frees that one itself.
+  std::map<gate_idx_t, std::vector<Bytes>> RunPackets(Module *first, gate_idx_t igate,
+                                                      const std::vector<bess::PacketHandle> &in,
+                                                      Module *last,
+                                                      std::vector<gate_idx_t> ogates = {});
 
   // An action, as control_v2's InvokeAction runs it (D-140: the class's
   // commands are its actions; an unknown one is ENOTSUP).
@@ -123,6 +142,14 @@ class ModuleHarness {
   // Connects exactly `m`'s gates `ogates` to the capture (all of 0-15 that
   // `m` has when empty) and sizes `task`'s per-gate batches.
   void WireOutputs(Module *m, std::vector<gate_idx_t> ogates, Task &task);
+  // Whether RunQueued can run `first`..`last` (both exist, and so do the
+  // harness's own injector and capture).
+  bool CanRun(const Module *first, const Module *last) const;
+  // Runs `count` packets through `first`..`last` one burst at a time;
+  // `packet(i)` builds the i-th when its burst is queued.
+  std::map<gate_idx_t, std::vector<Bytes>> RunQueued(
+      Module *first, gate_idx_t igate, Module *last, std::vector<gate_idx_t> ogates, size_t count,
+      const std::function<bess::PacketHandle(size_t)> &packet);
   // Runs `task` once.
   void RunOnce(Task &task);
   Module *capture_ = nullptr;

@@ -2,9 +2,13 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <tuple>
+#include <vector>
 
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
@@ -34,8 +38,10 @@ using bess::pb::VifCommandAddArg;
 using bess::pb::VifInterfaceKey;
 using bess::pb::VifInterfaceValue;
 using bess::testing::Bytes;
+using bess::testing::MakePacket;
 using bess::testing::ModuleHarness;
 using bess::testing::PacketBuilder;
+using bess::testing::PacketBytes;
 using bess::utils::Arp;
 using bess::utils::be16_t;
 using bess::utils::be32_t;
@@ -544,6 +550,111 @@ TEST_F(VifTest, TheMetadataNamesAreConfiguration) {
   }
   EXPECT_TRUE(wrote_id);
   EXPECT_TRUE(wrote_domain);
+}
+
+// Interfaces for the shared and truncated-tag tests: id 1 on VLAN 5 (gate 1)
+// and id 2 untagged with the same MAC (gate 2), both answering ARP and ND.
+// The default gate is 0.
+VifArg TwoInterfaces() {
+  VifArg arg;
+  arg.set_default_gate(0);
+  for (const auto &[id, vlan, gate] : {std::tuple{1U, 5U, 1U}, std::tuple{2U, 0U, 2U}}) {
+    auto *iface = arg.add_interfaces();
+    iface->set_id(id);
+    iface->set_vlan(vlan);
+    iface->set_mac_addr("02:00:00:00:00:10");
+    iface->set_ip_addr("10.0.0.10");
+    iface->set_ipv6_addr("fe80::10");
+    iface->set_route_domain(7);
+    iface->set_gate(gate);
+  }
+  return arg;
+}
+
+Bytes Untagged() {
+  return PacketBuilder()
+      .Ether("02:00:00:00:00:10", "02:00:00:00:00:01")
+      .IPv4("10.0.0.1", "10.0.0.10")
+      .Build();
+}
+
+// A clone of a frame Vif rewrites in place -- a tagged frame (the strip), an
+// ARP request and a Neighbor Solicitation for a local address (the answers)
+// -- is copied first; the payload's other holder still reads the frame it
+// had (D-153). The old code rewrote the shared bytes.
+TEST(VifSharedTest, ASharedFrameIsCopiedBeforeAnInPlaceWrite) {
+  ModuleHarness h;
+  Module *vif = h.Create("Vif", TwoInterfaces());
+  ASSERT_NE(nullptr, vif);
+
+  std::array<uint8_t, bess::route::kNdFrameSize> ns{};
+  Ethernet::Address peer_mac;
+  peer_mac.FromString("02:00:00:00:00:01");
+  ASSERT_EQ(bess::route::kNdFrameSize,
+            bess::route::BuildNeighborSolicitation(peer_mac, ParsedIpv6("fe80::1"),
+                                                   ParsedIpv6("fe80::10"), ns));
+  // Each answer reads the whole request from the first segment, so only the
+  // strip is also tried on a chain.
+  const struct {
+    const char *what;
+    Bytes frame;
+    gate_idx_t gate;
+    std::vector<size_t> splits;
+  } cases[] = {
+      {"tagged", ToIface(), 1, {0, 30}},
+      {"ARP request",
+       PacketBuilder()
+           .Ether("ff:ff:ff:ff:ff:ff", "02:00:00:00:00:01")
+           .Arp(1, "02:00:00:00:00:01", "10.0.0.1", "00:00:00:00:00:00", "10.0.0.10")
+           .Build(),
+       2,
+       {0}},
+      {"Neighbor Solicitation", Bytes(ns.begin(), ns.end()), 2, {0}},
+  };
+  for (const auto &c : cases) {
+    for (size_t split : c.splits) {
+      bess::PacketHandle original = MakePacket(c.frame, split);
+      ASSERT_NE(nullptr, original);
+      bess::PacketHandle clone = bess::PacketClone(original);
+      ASSERT_NE(nullptr, clone);
+      auto out = h.RunPackets(vif, 0, {clone}, vif, {0, 1, 2});
+      ASSERT_EQ(1U, out[c.gate].size()) << c.what << ", split " << split;
+      EXPECT_NE(c.frame, out[c.gate][0]) << c.what << ", split " << split << ": rewritten";
+      EXPECT_EQ(c.frame, PacketBytes(original))
+          << c.what << ", split " << split << ": the original is untouched";
+      bess::PacketFree(original);
+    }
+  }
+  const Bytes untagged = Untagged();
+  auto out = h.Run(vif, 0, {ToIface()}, {1});
+  ASSERT_EQ(1U, out[1].size());
+  EXPECT_EQ(untagged, out[1][0]) << "the strip itself";
+}
+
+// A tagged frame whose first segment ends before the tag and the EtherType
+// after it (14-17 bytes, or a chain split there) has no VLAN to steer by: it
+// leaves on the default gate as it came. The old code steered it as VLAN 0
+// (here interface 2, same MAC, gate 2) with the tag still on.
+TEST(VifSharedTest, ATruncatedTagGoesToTheDefaultGate) {
+  ModuleHarness h;
+  Module *vif = h.Create("Vif", TwoInterfaces());
+  ASSERT_NE(nullptr, vif);
+  const Bytes tagged = ToIface();
+
+  for (size_t n = 14; n < 18; n++) {
+    const Bytes runt(tagged.begin(), tagged.begin() + static_cast<ptrdiff_t>(n));
+    auto out = h.Run(vif, 0, {runt}, {0, 1, 2});
+    ASSERT_EQ(1U, out[0].size()) << n << " bytes";
+    EXPECT_EQ(runt, out[0][0]) << n << " bytes";
+  }
+  for (size_t split = 14; split < 18; split++) {
+    auto out = h.RunPackets(vif, 0, {MakePacket(tagged, split)}, vif, {0, 1, 2});
+    ASSERT_EQ(1U, out[0].size()) << "first segment of " << split << " bytes";
+    EXPECT_EQ(tagged, out[0][0]) << "first segment of " << split << " bytes";
+  }
+  auto out = h.RunPackets(vif, 0, {MakePacket(tagged, 18)}, vif, {0, 1, 2});
+  ASSERT_EQ(1U, out[1].size()) << "a first segment of 18 bytes is stripped";
+  EXPECT_EQ(Untagged(), out[1][0]);
 }
 
 }  // namespace

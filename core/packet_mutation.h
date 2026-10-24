@@ -45,6 +45,14 @@ inline PayloadWriteability PayloadWriteabilityOf(
     return PayloadWriteability::kShared;
   }
 
+  // A direct mbuf (no external buffer, not attached to another) is the
+  // common case on a packet path, so it is decided first: one flag test and
+  // its own reference count.
+  if (likely(RTE_MBUF_DIRECT(mbuf))) {  // NOLINT(bugprone-signed-bitwise)
+    return rte_mbuf_refcnt_read(mbuf) == 1 ? PayloadWriteability::kWritable
+                                           : PayloadWriteability::kShared;
+  }
+
   if (RTE_MBUF_HAS_EXTBUF(mbuf)) {
     return mbuf->shinfo != nullptr &&
                    rte_mbuf_ext_refcnt_read(mbuf->shinfo) == 1
@@ -52,15 +60,10 @@ inline PayloadWriteability PayloadWriteabilityOf(
                : PayloadWriteability::kShared;
   }
 
-  if (!RTE_MBUF_DIRECT(mbuf)) {
-    ::rte_mbuf *direct = rte_mbuf_from_indirect(mbuf);
-    return direct != nullptr && rte_mbuf_refcnt_read(direct) == 1
-               ? PayloadWriteability::kWritable
-               : PayloadWriteability::kShared;
-  }
-
-  return rte_mbuf_refcnt_read(mbuf) == 1 ? PayloadWriteability::kWritable
-                                         : PayloadWriteability::kShared;
+  ::rte_mbuf *direct = rte_mbuf_from_indirect(mbuf);
+  return direct != nullptr && rte_mbuf_refcnt_read(direct) == 1
+             ? PayloadWriteability::kWritable
+             : PayloadWriteability::kShared;
 }
 
 namespace detail {

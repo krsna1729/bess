@@ -21,7 +21,7 @@ class Update final : public Module {
   static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
-  Update() : Module(), num_fields_(), fields_() {
+  Update() : Module(), num_fields_(), required_len_(), fields_() {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
@@ -43,6 +43,7 @@ class Update final : public Module {
   // came from (read back as given).
   struct Staged {
     size_t num_fields = 0;
+    size_t required_len = 0;
     Field fields[kMaxFields] = {};
     bess::pb::UpdateArg arg;
   };
@@ -54,11 +55,24 @@ class Update final : public Module {
   // Validates and converts a whole field list. Init and "<name>/fields" share
   // it, so a list one refuses the other refuses too (Init used to index
   // fields_ without the limit check). On failure the array's contents are
-  // unspecified and *num_fields is untouched.
+  // unspecified and *num_fields and *required_len are untouched.
   static CommandResponse ParseFields(const bess::pb::UpdateArg &arg,
-                                     Field *fields, size_t *num_fields);
+                                     Field *fields, size_t *num_fields,
+                                     size_t *required_len);
+
+  // Whether `pkt` is the common case every field can be written into as it
+  // is: its first segment holds `required` bytes and it is a direct mbuf held
+  // once. False also for an indirect mbuf or external buffer that is in fact
+  // writable; PrepareBatch decides those.
+  static bool Ready(bess::PacketRef pkt, size_t required);
+  // The slow path for a batch with a packet that is not Ready(): drops what
+  // is too short, copies what is shared, and compacts the batch.
+  void PrepareBatch(Context *ctx, bess::PacketBatch *batch);
 
   size_t num_fields_;
+  // The largest offset + size over fields_: a packet's first segment must
+  // hold this many bytes for every field to be written (0 with no fields).
+  size_t required_len_;
 
   Field fields_[kMaxFields];
 
