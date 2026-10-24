@@ -97,12 +97,15 @@ class ExtractPlan {
                                  MutableBytes, size_t) noexcept;
   static uint64_t ExecuteTwoOps(const ExtractPlan &, std::span<const SourceView>,
                                 MutableBytes, size_t) noexcept;
-  static uint64_t ExecuteSinglePacket(const ExtractPlan &,
-                                      std::span<const SourceView>, MutableBytes,
-                                      size_t) noexcept;
-  static uint64_t ExecuteSingleMetadata(const ExtractPlan &,
-                                        std::span<const SourceView>, MutableBytes,
-                                        size_t) noexcept;
+  // One op with its source, width and mask state known at kernel-selection
+  // time (as ResultPlan::ApplySingleSized): a row is one bounds check, one
+  // straight-line copy and the loop branch, with no per-row width dispatch.
+  template <SourceKind Source, size_t Size, bool Masked>
+  static uint64_t ExecuteSingle(const ExtractPlan &,
+                                std::span<const SourceView>, MutableBytes,
+                                size_t) noexcept;
+  template <SourceKind Source>
+  static ExtractBatchFn SelectSingle(const ExtractOp &op) noexcept;
 
   size_t key_size_;
   BoundsPolicy bounds_;

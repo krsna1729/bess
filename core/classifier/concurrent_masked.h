@@ -253,8 +253,12 @@ class ConcurrentMaskedTable {
 
   // The record a Match names (D-141). Records live in fixed chunks that are
   // never moved or freed while the table lives, so this is a plain indexed
-  // load -- the one a module with result fields makes per winner.
-  const Rule &RuleAt(RuleId id) const noexcept { return Record(id); }
+  // load -- the one a module with result fields makes per winner. Always
+  // inlined, as RecordArena::Lookup is: left to the inliner, a change
+  // elsewhere in the caller can turn the load into a call per packet.
+  [[gnu::always_inline]] const Rule &RuleAt(RuleId id) const noexcept {
+    return Record(id);
+  }
 
   // Visits every rule: fn(ConstBytes mask, ConstBytes value, const Rule &,
   // Ranges). A key with prepared new rules only (D-024) is visited once,
@@ -479,7 +483,7 @@ class ConcurrentMaskedTable {
     }
   }
 
-  const Rule &Record(RuleId id) const noexcept {
+  [[gnu::always_inline]] const Rule &Record(RuleId id) const noexcept {
     return *reinterpret_cast<const Rule *>(records_.Lookup(id).data());
   }
   Rule &MutableRecord(RuleId id) {

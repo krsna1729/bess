@@ -13110,3 +13110,114 @@ balancer. A packet the old readers misread is now judged, hashed or dropped by t
 
 **Revisit when:** a deployment needs HashLB or Firewall to pass malformed traffic, or the common frame's
 remaining checks show up in a profile that matters.
+
+## D-189 Table plumbing as installed helpers; WildcardMatch and ExactMatch are adapters over them
+
+**Status:** accepted (2026-10-23).
+**Code:** `core/classifier/table_schema.{h,cc}`, `core/framework/table_fields.h`, `core/framework/table_batch.h`,
+`core/modules/wildcard_match.{h,cc}`, `core/modules/exact_match.{h,cc}`, `core/classifier/table_schema_test.cc`,
+`core/modules/match_path_bench.cc`, `core/classifier/concurrent_masked.h` (`RuleAt` always inlined), `core/meson.build`,
+`tools/api_classes.json`, `tools/tidy_baseline.json`.
+**Analysis and measurements:** [benchmarking.md](benchmarking.md), [plugin-api.md](plugin-api.md).
+
+**Context.** The architecture asks for thin adapters over pure libraries (`docs/architecture.md`), and the
+roadmap for modules that wrap mechanisms rather than implement them (§5.5, §5.6); D-157 made the Router's
+forwarding chain one library call. `WildcardMatch` and `ExactMatch` each carried about 700 lines of the same
+plumbing around their tables: parsing `result_fields` and `default_result` into a record layout and its arena,
+decoding the references a record holds (D-172), compiling out destinations nothing reads (D-181), the dense key
+layout from field offsets, the extraction and result plans, the PreResume refresh with its fail-closed
+generation, the RCU publish, and the per-batch key gather and result placement. A plugin with a table of its own
+had to copy all of it, and could not build the copy from installed headers.
+
+**Decision.**
+
+- **Pure half, in `bess_classifier`** (`classifier/table_schema.h`): no `Module`, gate, packet or protobuf.
+  `KeyLayout` (fields appended with their resolved source offsets, `kUnresolvedOffset` for a metadata attribute
+  that has none yet) and `CompileKey`, giving a `CompiledKey` (the `ExtractPlan`, the key size, whether it
+  compiled, the offsets it baked); `ResultFieldSpec` and `ResultSchema` (`Check` a field against the record,
+  `Add`, `References` decodes the resource entries a record names, `Compile` builds the `ResultPlan` for a set of
+  destinations, leaving out `kSkippedOffset` and refusing `kUnresolvedOffset`); `CompiledResult` (the plan, its
+  baked destinations, whether it waits for metadata offsets, the `RecordArena`).
+- **Module-bound half, header-only, in `framework/`.** `table_fields.h`: `KeyFields` (the key fields and the
+  module's limits; resolves them against the module's attribute offsets into a `CompiledKey`, with an optional
+  per-field mask that `ExactMatch` supplies; a fail-closed key; `Changed` at PreResume), `ResultFields` (parses
+  the `ResultField` messages and `default_result`, registering the write attributes; owns the arena;
+  `CheckRule`; `Destination` applies D-181; `Compile`, `CompileFailClosed`, `Compare` at PreResume),
+  `PublishGeneration`, `RepublishGeneration` and `RebuildGeneration` (templates over the module's own generation
+  struct and its `RcuPtr`), `ReleaseTableResource`. `table_batch.h`: `ExtractKeys` and `PlaceResults`, always
+  inlined, called once per batch with the caller's stack scratch.
+- **Why the split falls there.** The layer DAG has no edge from the classifier to the packet or framework layers,
+  and the placement loop needs `PacketBatch`, `EnsureWritable` and `DROP_GATE`; its pure core is
+  `ResultPlan::ApplyBatch`, which the classifier already had. Attribute registration and protobuf parsing need
+  `Module` and the generated messages. The framework half is **header-only** because `tools/layer_dag.json`
+  forbids a `bess_framework` -> `bess_classifier` link edge: the helpers' calls into the classifier are emitted
+  in the module that includes them (`bess_modules` or a plugin, both allowed classifier symbols, which `bessd`
+  exports), so the link graph does not change.
+- **What stays in the modules.** Parsing each module's `Field` (validation order and messages differ, and
+  `ExactMatch` parses masks), rules and their resources, codecs and introspection, settings, `ExactMatch`'s fused
+  D-121 kernel and its growth (`EnsureCapacity`), and `WildcardMatch`'s ranges and tuples. Nothing assumes one
+  table per module: a module holds one `KeyFields` per key and one `ResultFields` per record layout, and its own
+  generation struct holds the compiled pieces.
+- **Same behaviour, same wire.** No proto change; every existing test passes unchanged, and log and error text
+  are kept. Two checks that could not fail were dropped (`WildcardMatch`'s empty-field check in its layout, which
+  `Init` refuses first; `ExactMatch`'s mask-width recheck, which field parsing refuses first), and
+  `WildcardMatch`'s unused `Publish` is gone.
+- **Less work on the packet path.** A `CompiledKey` is dense: `CompileKey` refuses a layout with
+  bytes no field writes (`KeyLayout::Append` never makes one), so `ExtractKeys` takes the `CompiledKey` and writes
+  each extracted row whole, without the pre-zero branch `ExactMatch` carried for gapped plans. `WildcardMatch`
+  gives a miss its default record inside the classify pass, as `ExactMatch` does, instead of a second pass over
+  the batch, and reads the default gate after the lookup call, so it is not reloaded from the stack per miss.
+  `ConcurrentMaskedTable::RuleAt`, the per-winner record load, is always inlined, as `RecordArena::Lookup`
+  already was: left to the inliner, a small change in the caller made it a call per packet.
+- **A one-field key extracts without a per-key width dispatch.** `ExtractPlan::Compile` picks a single-op
+  kernel by source, width (1, 2, 4, 8, 16, 32, else a runtime width) and mask, as `ResultPlan::SelectSingle`
+  does. The kernel it replaces switched on the op's width through a jump table inside the per-key loop, four
+  taken branches per key, and that 32-key loop's exit was mispredicted at most code placements.
+- **Installed, experimental**, by D-147's procedure (`core/meson.build`, `tools/api_classes.json`, this record):
+  `framework/table_fields.h`, `framework/table_batch.h`, `classifier/table_schema.h`, and the classifier headers
+  their signatures name, `extract_plan.h`, `runtime_schema.h`, `plan_copy.h`, `result_plan.h` and
+  `record_arena.h`. The table classes and their rule resources stay internal.
+
+**Measured.** No existing bench drove either module's `ProcessBatch` or placement, so
+`modules_match_path_bench` (`core/modules/match_path_bench.cc`, committed before the change so both sides run it)
+feeds one 32-packet batch per iteration through each module, keys of one or two fields, gate only, metadata
+results, or a metadata plus a packet result, all hits or all misses; and adds and erases a rule through
+`<name>/rules`. `tools/ab_bench.py`, develop plus the benches against this change, release, `-Dcpu=x86-64-v3`,
+pinned to one P-core of a shared desktop host (Raptor Lake). Every case of `modules_match_path_bench` (16 rounds,
+and pooled over eight text shifts), every `ExtractPlan` case of `modules_exact_match_bench`,
+`modules_wildcard_match_bench`, `classifier_bench` and `classifier_typed_bench`, `modules_wildcard_match_update_bench`
+and `modules_exact_match_update_bench` `BM_Lookup`, `BM_ModuleClassify` and `BM_ModuleUpdate/0` reads "no clear
+difference" or faster (`WildcardMatch` one-field cases -4.7..-8.3% pooled; one-field `ExtractPlan` extraction
+-35..-66%).
+
+A first version read `WildcardMatch` two-field placed results +2.1% (metadata) and +2.7% (metadata and packet),
+no round faster. Two causes, told apart by moving the whole binary's code against the DPDK libraries in 256-byte
+steps (a padding block in the bench's own translation unit, both sides):
+
+- **A cost of the code, fixed above.** With metadata results the change was 1.4-2.6% slower at nearly every
+  shift, with every function 64-byte aligned (`-falign-functions=64`), with loops 64-byte aligned, and with the heap
+  shifted: one more branch misprediction per batch (the placement loop's exit, rte_hash's bulk lookup) for fewer
+  instructions. Folding the default record into the classify pass and dropping the pre-zero branch removed it.
+- **Code placement at a 4 KiB period, which no alignment controls.** The same binary, byte for byte, at sixteen
+  shifts spans 4,067-4,446 cycles per batch on two-field metadata-and-packet hits (uop-cache misses 7-60 per
+  batch, the misses moving between `LookupBatch`, `ProcessBatch` and rte_hash's code from shift to shift); develop
+  spans 4,147-4,314. The table's `LookupBatch` at the same 64-byte offset is fast in one link and slow in another,
+  so its move from a 64-byte to a 32-byte boundary was not the cause. Any edit anywhere moves this.
+
+So `WildcardMatch`'s two-field and one-field cases were also measured over eight shifts of both binaries, four ABBA
+rounds each, pooled. One-field gate-only misses then read +3.4% (1 of 32 pairs faster) with as many instructions:
+the exits of the extraction loop and of rte_hash's 32-key signature-compare loop mispredicted while the loop
+stream detector replayed those loops, at 11 of 16 placements of this change. Develop shows the same at one
+64-byte shift (0.9 mispredictions and 235 LSD uops per batch against 0.2 and 65 elsewhere, more in other runs),
+and moving the stack does not change it. The single-op extraction kernel above removed the extraction loop's
+share; rte_hash's loop stays
+placement-sensitive on both sides. With it the case reads -5.0% pooled (31 of 32 faster) and 614 fewer
+instructions per batch.
+
+**Consequences.** `wildcard_match.{h,cc}` goes from 1,446 to 860 lines and `exact_match.{h,cc}` from 1,592 to
+998; the helpers are 936. A plugin can compose a table-backed module from installed headers. The offset cast
+the curated clang-tidy baseline counted once per module (`bugprone-signed-char-misuse`, `cert-str34-c`) left
+with the code it was in, so the baseline is lowered. `Firewall` is not rebased on the helpers yet.
+
+**Revisit when:** the table classes and rule resources are installed (a plugin then needs no table of its own),
+or a module needs a key that is not dense.

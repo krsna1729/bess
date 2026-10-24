@@ -44,17 +44,6 @@ bool CanCoalesce(const ExtractOp &previous, const ExtractOp &current) {
          previous.size <= std::numeric_limits<size_t>::max() - current.size;
 }
 
-// Width dispatch for one op whose source range is already established:
-// `src` points at the op's first source byte, `dst` at its first key byte.
-inline void CopySingleUnchecked(const ExtractOp &op, const std::byte *src,
-                                std::byte *dst) noexcept {
-  if (op.mask.empty()) {
-    CopyBytes(dst, src, op.size);
-  } else {
-    CopyMasked(dst, src, op.size, op.mask.data());
-  }
-}
-
 // Saturating end computation for required-bytes precomputation: source
 // offsets are runtime values, so guard against offset + size overflow.
 size_t SaturatingEnd(size_t offset, size_t size) {
@@ -103,10 +92,10 @@ ClassifierResult<ExtractPlan> ExtractPlan::Compile(
   ExtractKernel kernel_kind = ExtractKernel::kGeneric;
   if (coalesced.size() == 1) {
     if (coalesced[0].source == SourceKind::kPacket) {
-      kernel = &ExtractPlan::ExecuteSinglePacket;
+      kernel = SelectSingle<SourceKind::kPacket>(coalesced[0]);
       kernel_kind = ExtractKernel::kSinglePacket;
     } else {
-      kernel = &ExtractPlan::ExecuteSingleMetadata;
+      kernel = SelectSingle<SourceKind::kMetadata>(coalesced[0]);
       kernel_kind = ExtractKernel::kSingleMetadata;
     }
   } else if (coalesced.size() == 2) {
@@ -235,43 +224,63 @@ uint64_t ExtractPlan::ExecuteTwoOps(const ExtractPlan &plan,
   return valid;
 }
 
-uint64_t ExtractPlan::ExecuteSinglePacket(const ExtractPlan &plan,
-                                          std::span<const SourceView> sources,
-                                          MutableBytes output,
-                                          size_t key_stride) noexcept {
-  uint64_t valid = 0;
-  const ExtractOp &op = plan.ops_[0];
-  const bool check = plan.bounds_ == BoundsPolicy::kCheck;
-  const size_t need = plan.required_packet_bytes_;
-  for (size_t i = 0; i < sources.size(); i++) {
-    const ConstBytes packet = sources[i].packet;
-    if (check && packet.size() < need) {
-      continue;
-    }
-    CopySingleUnchecked(op, packet.data() + op.source_offset,
-                        output.data() + i * key_stride +
-                            op.destination_offset);
-    valid |= (uint64_t{1} << i);
+template <SourceKind Source>
+ExtractBatchFn ExtractPlan::SelectSingle(const ExtractOp &op) noexcept {
+  const bool masked = !op.mask.empty();
+  switch (op.size) {
+    case 1:
+      return masked ? &ExecuteSingle<Source, 1, true>
+                    : &ExecuteSingle<Source, 1, false>;
+    case 2:
+      return masked ? &ExecuteSingle<Source, 2, true>
+                    : &ExecuteSingle<Source, 2, false>;
+    case 4:
+      return masked ? &ExecuteSingle<Source, 4, true>
+                    : &ExecuteSingle<Source, 4, false>;
+    case 8:
+      return masked ? &ExecuteSingle<Source, 8, true>
+                    : &ExecuteSingle<Source, 8, false>;
+    case 16:
+      return masked ? &ExecuteSingle<Source, 16, true>
+                    : &ExecuteSingle<Source, 16, false>;
+    case 32:
+      return masked ? &ExecuteSingle<Source, 32, true>
+                    : &ExecuteSingle<Source, 32, false>;
+    default:
+      return masked ? &ExecuteSingle<Source, 0, true>
+                    : &ExecuteSingle<Source, 0, false>;
   }
-  return valid;
 }
 
-uint64_t ExtractPlan::ExecuteSingleMetadata(const ExtractPlan &plan,
-                                            std::span<const SourceView> sources,
-                                            MutableBytes output,
-                                            size_t key_stride) noexcept {
-  uint64_t valid = 0;
+template <SourceKind Source, size_t Size, bool Masked>
+uint64_t ExtractPlan::ExecuteSingle(const ExtractPlan &plan,
+                                    std::span<const SourceView> sources,
+                                    MutableBytes output,
+                                    size_t key_stride) noexcept {
+  // Loop invariants, read out of the op once.
   const ExtractOp &op = plan.ops_[0];
   const bool check = plan.bounds_ == BoundsPolicy::kCheck;
-  const size_t need = plan.required_metadata_bytes_;
+  const size_t need = Source == SourceKind::kPacket
+                          ? plan.required_packet_bytes_
+                          : plan.required_metadata_bytes_;
+  const size_t source_offset = op.source_offset;
+  const size_t size = Size != 0 ? Size : op.size;
+  [[maybe_unused]] const std::byte *mask = op.mask.data();
+  std::byte *const keys = output.data() + op.destination_offset;
+  uint64_t valid = 0;
   for (size_t i = 0; i < sources.size(); i++) {
-    const ConstBytes metadata = sources[i].metadata;
-    if (check && metadata.size() < need) {
+    const ConstBytes bytes =
+        Source == SourceKind::kPacket ? sources[i].packet : sources[i].metadata;
+    if (check && bytes.size() < need) {
       continue;
     }
-    CopySingleUnchecked(op, metadata.data() + op.source_offset,
-                        output.data() + i * key_stride +
-                            op.destination_offset);
+    const std::byte *src = bytes.data() + source_offset;
+    std::byte *dst = keys + (i * key_stride);
+    if constexpr (Masked) {
+      CopyMasked(dst, src, size, mask);
+    } else {
+      CopyBytes(dst, src, size);
+    }
     valid |= (uint64_t{1} << i);
   }
   return valid;

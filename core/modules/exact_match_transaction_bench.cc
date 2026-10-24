@@ -68,7 +68,8 @@ std::string Key(uint32_t a, uint16_t b) {
 
 // Fields: 4 bytes at offset 26 (IPv4 source), 2 bytes at offset 34 (UDP
 // source port). Rule r matches (r, r & 0xffff) and goes to gate 1 + r % 63;
-// misses take the default gate, 0.
+// misses take the default gate, set to 0 (unset, it is DROP_GATE, which the
+// hit count would take for a hit).
 ExactMatch *CreateModule(const char *name, size_t rules) {
   bess::pb::ExactMatchArg arg;
   auto *f = arg.add_fields();
@@ -77,6 +78,7 @@ ExactMatch *CreateModule(const char *name, size_t rules) {
   f = arg.add_fields();
   f->set_offset(34);
   f->set_num_bytes(2);
+  arg.set_default_gate(0);
   google::protobuf::Any packed;
   if (!packed.PackFrom(arg)) {
     std::abort();

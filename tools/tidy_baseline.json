@@ -99,8 +99,6 @@
       "cppcoreguidelines-narrowing-conversions": 1
     },
     "core/modules/exact_match.cc": {
-      "bugprone-signed-char-misuse": 1,
-      "cert-str34-c": 1,
       "cppcoreguidelines-narrowing-conversions": 2,
       "performance-unnecessary-copy-initialization": 1
     },
@@ -147,8 +145,6 @@
       "cppcoreguidelines-narrowing-conversions": 1
     },
     "core/modules/wildcard_match.cc": {
-      "bugprone-signed-char-misuse": 1,
-      "cert-str34-c": 1,
       "cppcoreguidelines-narrowing-conversions": 2
     },
     "core/packet_checksum.cc": {

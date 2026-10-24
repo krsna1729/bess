@@ -2,10 +2,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
+#include <string>
 #include <vector>
 
 #include "classifier/extract_plan.h"
@@ -412,6 +415,117 @@ TEST(ExtractPlanTest, FailedExtractionWritesNothing) {
   for (size_t i = 0; i < 8; i++) {
     EXPECT_EQ(Byte(0xA5), output[i]) << "byte " << i;
   }
+}
+
+constexpr size_t kSingleOpSourceBytes = 64;
+
+// One single-op plan run over a batch: every row must equal the per-source
+// generic path (Execute) and a plain memcpy+mask reference, bytes outside
+// the op stay untouched, and a row one byte short of the field fails without
+// a write.
+void CheckSingleOpKernel(SourceKind kind, size_t width, bool masked,
+                         size_t source_offset, size_t key_offset) {
+  SCOPED_TRACE("kind=" + std::to_string(static_cast<int>(kind)) +
+               " width=" + std::to_string(width) +
+               " masked=" + std::to_string(static_cast<int>(masked)) +
+               " source_offset=" + std::to_string(source_offset) +
+               " key_offset=" + std::to_string(key_offset));
+  constexpr size_t kSourceBytes = kSingleOpSourceBytes;
+  constexpr size_t kRows = 5;
+  constexpr size_t kShortRow = 3;
+  RuntimeClassifierSchema schema;
+  schema.key_size = key_offset + width;
+  schema.bounds = BoundsPolicy::kCheck;
+  RuntimeKeyField field{kind, source_offset, key_offset, width};
+  if (masked) {
+    for (size_t i = 0; i < width; i++) {
+      field.normalization.mask.push_back(
+          Byte((0x5Au ^ static_cast<unsigned>(i * 7)) & 0xFFu));
+    }
+  }
+  schema.key_fields.push_back(field);
+  auto compiled = ExtractPlan::Compile(schema);
+  ASSERT_TRUE(compiled);
+  EXPECT_EQ(kind == SourceKind::kPacket ? ExtractKernel::kSinglePacket
+                                        : ExtractKernel::kSingleMetadata,
+            compiled->kernel());
+
+  std::array<std::array<std::byte, kSourceBytes>, kRows> bytes;
+  std::array<SourceView, kRows> sources;
+  for (size_t r = 0; r < kRows; r++) {
+    for (size_t i = 0; i < kSourceBytes; i++) {
+      bytes[r][i] =
+          Byte(static_cast<unsigned>((r * 31) + (i * 13) + 1) & 0xFFu);
+    }
+    const size_t size =
+        r == kShortRow ? source_offset + width - 1 : kSourceBytes;
+    const ConstBytes span(bytes[r].data(), size);
+    sources[r] = kind == SourceKind::kPacket ? SourceView{span, {}}
+                                             : SourceView{{}, span};
+  }
+
+  const size_t stride = schema.key_size + 5;
+  std::vector<std::byte> rows(kRows * stride, Byte(0xA5));
+  const uint64_t valid =
+      compiled->ExecuteBatch(sources, MutableBytes(rows), stride);
+  EXPECT_EQ(((uint64_t{1} << kRows) - 1) & ~(uint64_t{1} << kShortRow), valid);
+  for (size_t r = 0; r < kRows; r++) {
+    std::vector<std::byte> generic(stride, Byte(0xA5));
+    std::vector<std::byte> reference(stride, Byte(0xA5));
+    const bool ok = compiled->Execute(
+        sources[r], MutableBytes(generic).first(schema.key_size));
+    EXPECT_EQ(r != kShortRow, ok) << "row " << r;
+    if (ok) {
+      ASSERT_TRUE(ReferenceExtract(
+          schema, sources[r], MutableBytes(reference).first(schema.key_size)));
+      for (size_t i = 0; i < field.normalization.mask.size(); i++) {
+        reference[key_offset + i] &= field.normalization.mask[i];
+      }
+    }
+    const auto row =
+        std::span<const std::byte>(rows).subspan(r * stride, stride);
+    EXPECT_TRUE(std::equal(row.begin(), row.end(), generic.begin()))
+        << "row " << r;
+    EXPECT_TRUE(std::equal(row.begin(), row.end(), reference.begin()))
+        << "row " << r;
+  }
+}
+
+// A single-op plan runs a kernel Compile picks by source, width and mask:
+// widths 1, 2, 4, 8, 16 and 32 are compile-time constants, any other width
+// takes the runtime-width instantiation. The field sits at the source's
+// start, then ends at its last byte.
+TEST(ExtractPlanTest, SingleOpKernelsMatchTheGenericPath) {
+  constexpr size_t kSourceBytes = kSingleOpSourceBytes;
+  for (SourceKind kind : {SourceKind::kPacket, SourceKind::kMetadata}) {
+    for (size_t width : {1u, 2u, 3u, 4u, 7u, 8u, 16u, 24u, 32u, 40u}) {
+      for (bool masked : {false, true}) {
+        for (size_t source_offset : {size_t{0}, kSourceBytes - width}) {
+          for (size_t key_offset : {size_t{0}, size_t{3}}) {
+            CheckSingleOpKernel(kind, width, masked, source_offset, key_offset);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Compile keeps the single-op kernels for single-op plans: two ops that do
+// not coalesce take the two-op kernel, three the generic one.
+TEST(ExtractPlanTest, MultiOpPlansDoNotTakeASingleOpKernel) {
+  auto two = ExtractPlan::Compile(
+      RuntimeClassifierSchema{.key_size = 6,
+                              .key_fields = {{SourceKind::kPacket, 0, 0, 4},
+                                             {SourceKind::kPacket, 10, 4, 2}}});
+  ASSERT_TRUE(two);
+  EXPECT_EQ(ExtractKernel::kTwoOp, two->kernel());
+  auto three = ExtractPlan::Compile(RuntimeClassifierSchema{
+      .key_size = 7,
+      .key_fields = {{SourceKind::kPacket, 0, 0, 4},
+                     {SourceKind::kPacket, 10, 4, 2},
+                     {SourceKind::kMetadata, 0, 6, 1}}});
+  ASSERT_TRUE(three);
+  EXPECT_EQ(ExtractKernel::kGeneric, three->kernel());
 }
 
 }  // namespace
