@@ -28,6 +28,8 @@ using bess::packet::EnsureWritable;
 using bess::packet::HeadWritableInPlace;
 using bess::packet::PayloadWriteability;
 using bess::packet::PayloadWriteabilityOf;
+using bess::packet::PrependableInPlace;
+using bess::packet::PrependWritable;
 using bess::packet::RemovePrefix;
 using bess::packet::ReshapeError;
 using bess::packet::TrimSuffix;
@@ -122,7 +124,7 @@ void FreeExternalBuffer(void *address, void *opaque) {
 
 PacketHandle MakeExternal(PlainPacketPool &pool, int *free_count,
                           rte_mbuf_ext_shared_info **shinfo_out,
-                          size_t data_len) {
+                          size_t data_len, uint16_t data_off = 0) {
   auto *buffer = new unsigned char[4096];
   auto *owner = new ExternalBufferOwner{free_count};
   uint16_t buffer_len = 4096;
@@ -134,8 +136,8 @@ PacketHandle MakeExternal(PlainPacketPool &pool, int *free_count,
     return nullptr;
   }
 
-  PacketHandle packet =
-      pool.AllocExternal(buffer, RTE_BAD_IOVA, buffer_len, shinfo, data_len);
+  PacketHandle packet = pool.AllocExternal(buffer, RTE_BAD_IOVA, buffer_len,
+                                           shinfo, data_len, data_off);
   if (packet == nullptr) {
     delete[] buffer;
     delete owner;
@@ -2015,5 +2017,322 @@ TEST(PacketReshapeTest, WritableHeadCopyFailureLeavesThePacket) {
   bess::PacketFreeBulk(fillers, 2);
   PacketFree(clone);
   PacketFree(source);
+}
+
+// The `n` bytes in front of `packet`'s data: the end of its headroom, where a
+// prepend into `packet` writes.
+std::vector<std::byte> HeadroomTail(PacketHandle packet, size_t n) {
+  const std::byte *data = PacketRef(packet).head_data<const std::byte *>();
+  return std::vector<std::byte>(data - n, data);
+}
+
+// Fills the end of `packet`'s headroom with `value`, so a write there shows.
+void FillHeadroomTail(PacketHandle packet, size_t n, std::byte value) {
+  std::fill_n(PacketRef(packet).head_data<std::byte *>() - n, n, value);
+}
+
+// `n` bytes of `value`, then `rest`.
+std::vector<std::byte> Prefixed(size_t n, std::byte value, const std::vector<std::byte> &rest) {
+  std::vector<std::byte> out(n, value);
+  out.insert(out.end(), rest.begin(), rest.end());
+  return out;
+}
+
+// PrependWritable's span: `bytes` long, at the packet's new data.
+void ExpectPrependSpan(PacketHandle packet, size_t bytes,
+                       const std::expected<bess::packet::MutableBytes, ReshapeError> &prepended) {
+  ASSERT_TRUE(prepended.has_value());
+  EXPECT_EQ(prepended->data(), PacketRef(packet).head_data<std::byte *>());
+  EXPECT_EQ(prepended->size(), bytes);
+}
+
+// A direct mbuf held once: the inline case, up to exactly its headroom, with
+// no copy; one byte more than the headroom fails without touching the
+// packet. Zero bytes is an empty span.
+TEST(PacketReshapeTest, PrependWritableUsesAnExclusivePacketsHeadroom) {
+  PlainPacketPool pool(8, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(64);
+  PacketHandle packet = pool.AllocCopy(bytes.data(), bytes.size());
+  ASSERT_NE(packet, nullptr);
+  const PacketHandle original = packet;
+  const size_t available = pool.Size();
+  const size_t headroom = rte_pktmbuf_headroom(packet);
+  ASSERT_GE(headroom, 14u);
+
+  EXPECT_TRUE(PrependableInPlace(PacketRef(packet), headroom));
+  EXPECT_FALSE(PrependableInPlace(PacketRef(packet), headroom + 1));
+  const auto past = PrependWritable(packet, headroom + 1);
+  ASSERT_FALSE(past.has_value());
+  EXPECT_EQ(past.error(), ReshapeError::kInsufficientHeadroom);
+  EXPECT_EQ(packet, original);
+  EXPECT_EQ(rte_pktmbuf_headroom(packet), headroom);
+  EXPECT_EQ(PacketBytes(packet), bytes);
+
+  const auto header = PrependWritable(packet, 14);
+  EXPECT_EQ(packet, original);
+  ExpectPrependSpan(packet, 14, header);
+  std::fill(header->begin(), header->end(), std::byte{0xab});
+  EXPECT_EQ(packet->data_len, 78u);
+  EXPECT_EQ(packet->pkt_len, 78u);
+  EXPECT_EQ(PacketBytes(packet), Prefixed(14, std::byte{0xab}, bytes));
+
+  const auto rest = PrependWritable(packet, headroom - 14);
+  EXPECT_EQ(packet, original);
+  ExpectPrependSpan(packet, headroom - 14, rest);
+  EXPECT_EQ(rte_pktmbuf_headroom(packet), 0u);
+  const auto none = PrependWritable(packet, 1);
+  ASSERT_FALSE(none.has_value());
+  EXPECT_EQ(none.error(), ReshapeError::kInsufficientHeadroom);
+  const auto zero = PrependWritable(packet, 0);
+  ASSERT_TRUE(zero.has_value());
+  EXPECT_TRUE(zero->empty());
+  EXPECT_EQ(packet->pkt_len, 64u + headroom);
+  EXPECT_EQ(pool.Size(), available);
+  PacketFree(packet);
+}
+
+// A clone (indirect) and the source it shares (direct, reference count 2)
+// share the headroom too: each is copied before the prepend, and the other
+// holder's data and headroom stay. A shared packet without the headroom
+// fails without a copy.
+TEST(PacketReshapeTest, PrependWritableCopiesASharedPacket) {
+  PlainPacketPool pool(16, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(64);
+  for (bool write_clone : {true, false}) {
+    SCOPED_TRACE(write_clone ? "clone" : "source");
+    PacketHandle source = pool.AllocCopy(bytes.data(), bytes.size());
+    ASSERT_NE(source, nullptr);
+    FillHeadroomTail(source, 14, std::byte{0x11});
+    PacketHandle clone = bess::PacketClone(source);
+    ASSERT_NE(clone, nullptr);
+    PacketHandle &written = write_clone ? clone : source;
+    PacketHandle &other = write_clone ? source : clone;
+    const PacketHandle before = written;
+    EXPECT_FALSE(PrependableInPlace(PacketRef(written), 14));
+
+    const size_t available = pool.Size();
+    const auto past = PrependWritable(written, rte_pktmbuf_headroom(written) + 1);
+    ASSERT_FALSE(past.has_value());
+    EXPECT_EQ(past.error(), ReshapeError::kInsufficientHeadroom);
+    EXPECT_EQ(written, before);
+    EXPECT_EQ(pool.Size(), available) << "no copy for a packet without the headroom";
+
+    const auto header = PrependWritable(written, 14);
+    EXPECT_NE(written, before);
+    ExpectPrependSpan(written, 14, header);
+    EXPECT_TRUE(RTE_MBUF_DIRECT(written));  // NOLINT(bugprone-signed-bitwise)
+    EXPECT_EQ(rte_mbuf_refcnt_read(written), 1);
+    std::fill(header->begin(), header->end(), std::byte{0xee});
+    EXPECT_EQ(PacketBytes(written), Prefixed(14, std::byte{0xee}, bytes));
+    EXPECT_EQ(PacketBytes(other), bytes) << "the other holder's data is untouched";
+    EXPECT_EQ(HeadroomTail(other, 14), std::vector<std::byte>(14, std::byte{0x11}))
+        << "the other holder's headroom is untouched";
+    PacketFree(clone);
+    PacketFree(source);
+  }
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+// An indirect mbuf whose source was freed, and an external buffer held once,
+// take the bytes from their own headroom (out of line, without a copy); a
+// shared external buffer is copied first.
+TEST(PacketReshapeTest, PrependWritableDecidesIndirectAndExternalPackets) {
+  PlainPacketPool pool(16, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(64);
+  PacketHandle source = pool.AllocCopy(bytes.data(), bytes.size());
+  ASSERT_NE(source, nullptr);
+  PacketHandle indirect = bess::PacketClone(source);
+  ASSERT_NE(indirect, nullptr);
+  PacketFree(source);
+  const PacketHandle indirect_head = indirect;
+  size_t available = pool.Size();
+  EXPECT_FALSE(PrependableInPlace(PacketRef(indirect), 14));
+  ExpectPrependSpan(indirect, 14, PrependWritable(indirect, 14));
+  EXPECT_EQ(indirect, indirect_head);
+  EXPECT_EQ(pool.Size(), available);
+  PacketFree(indirect);
+
+  int free_count = 0;
+  rte_mbuf_ext_shared_info *shinfo = nullptr;
+  PacketHandle external = MakeExternal(pool, &free_count, &shinfo, 64, 32);
+  ASSERT_NE(external, nullptr);
+  const PacketHandle external_head = external;
+  available = pool.Size();
+  EXPECT_FALSE(PrependableInPlace(PacketRef(external), 14));
+  ExpectPrependSpan(external, 14, PrependWritable(external, 14));
+  EXPECT_EQ(external, external_head) << "held once: prepended in place";
+  EXPECT_EQ(pool.Size(), available);
+
+  PacketHandle sharer = bess::PacketClone(external);
+  ASSERT_NE(sharer, nullptr);
+  ASSERT_EQ(rte_mbuf_ext_refcnt_read(shinfo), 2);
+  const std::vector<std::byte> shared_bytes = PacketBytes(external);
+  FillHeadroomTail(sharer, 14, std::byte{0x22});
+  const auto header = PrependWritable(external, 14);
+  EXPECT_NE(external, external_head) << "shared: copied";
+  ExpectPrependSpan(external, 14, header);
+  std::fill(header->begin(), header->end(), std::byte{0xd1});
+  EXPECT_EQ(PacketBytes(external), Prefixed(14, std::byte{0xd1}, shared_bytes));
+  EXPECT_EQ(PacketBytes(sharer), shared_bytes);
+  EXPECT_EQ(HeadroomTail(sharer, 14), std::vector<std::byte>(14, std::byte{0x22}));
+  PacketFree(external);
+  PacketFree(sharer);
+  EXPECT_EQ(free_count, 1);
+}
+
+// Only the first segment's headroom counts, and only its sharing: an
+// exclusive chain takes the bytes in its head with its segments unchanged; a
+// shared tail behind an exclusive head is not copied; a clone of a chain is
+// copied whole, and the source's bytes and headroom stay.
+TEST(PacketReshapeTest, PrependWritableTakesAChainsHeadHeadroom) {
+  PlainPacketPool pool(16, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(64);
+  const std::array<size_t, 2> lengths = {32, 32};
+  PacketHandle chain = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(chain, nullptr);
+  const PacketHandle chain_head = chain;
+  const PacketHandle chain_tail = chain->next;
+  const auto header = PrependWritable(chain, 14);
+  EXPECT_EQ(chain, chain_head);
+  EXPECT_EQ(chain->next, chain_tail);
+  EXPECT_EQ(chain->nb_segs, 2u);
+  ExpectPrependSpan(chain, 14, header);
+  std::fill(header->begin(), header->end(), std::byte{0x5c});
+  EXPECT_EQ(chain->data_len, 46u);
+  EXPECT_EQ(PacketBytes(chain), Prefixed(14, std::byte{0x5c}, bytes));
+  PacketFree(chain);
+
+  chain = BuildChain(pool, lengths, bytes);
+  ASSERT_NE(chain, nullptr);
+  FillHeadroomTail(chain, 14, std::byte{0x33});
+  PacketHandle clone = bess::PacketClone(chain);
+  ASSERT_NE(clone, nullptr);
+  const PacketHandle clone_head = clone;
+  const auto clone_header = PrependWritable(clone, 14);
+  EXPECT_NE(clone, clone_head);
+  ExpectPrependSpan(clone, 14, clone_header);
+  std::fill(clone_header->begin(), clone_header->end(), std::byte{0x77});
+  EXPECT_EQ(PacketBytes(clone), Prefixed(14, std::byte{0x77}, bytes));
+  EXPECT_EQ(PacketBytes(chain), bytes);
+  EXPECT_EQ(HeadroomTail(chain, 14), std::vector<std::byte>(14, std::byte{0x33}));
+  PacketFree(clone);
+  PacketFree(chain);
+
+  const std::vector<std::byte> head_bytes = Pattern(32);
+  const std::vector<std::byte> tail_bytes = Pattern(32);
+  PacketHandle tail_owner = nullptr;
+  PacketHandle mixed = BuildWritableHeadSharedTail(pool, head_bytes, tail_bytes, &tail_owner);
+  ASSERT_NE(mixed, nullptr);
+  const PacketHandle mixed_head = mixed;
+  const PacketHandle mixed_tail = mixed->next;
+  EXPECT_TRUE(PrependableInPlace(PacketRef(mixed), 14));
+  ExpectPrependSpan(mixed, 14, PrependWritable(mixed, 14));
+  EXPECT_EQ(mixed, mixed_head);
+  EXPECT_EQ(mixed->next, mixed_tail);
+  PacketFree(mixed);
+  PacketFree(tail_owner);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+// A copy that cannot be allocated fails with the packet unchanged, and
+// nothing is written; the caller drops it.
+TEST(PacketReshapeTest, PrependWritableCopyFailureLeavesThePacket) {
+  PlainPacketPool pool(4, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(64);
+  PacketHandle source = pool.AllocCopy(bytes.data(), bytes.size());
+  ASSERT_NE(source, nullptr);
+  FillHeadroomTail(source, 14, std::byte{0x44});
+  PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(clone, nullptr);
+  PacketHandle fillers[2] = {nullptr, nullptr};
+  ASSERT_TRUE(pool.AllocBulk(fillers, 2, 64));
+  const PacketHandle original = clone;
+
+  const auto header = PrependWritable(clone, 14);
+  ASSERT_FALSE(header.has_value());
+  EXPECT_EQ(header.error(), ReshapeError::kAllocationFailed);
+  EXPECT_EQ(clone, original);
+  EXPECT_EQ(PacketBytes(clone), bytes);
+  EXPECT_EQ(PacketBytes(source), bytes);
+  EXPECT_EQ(HeadroomTail(source, 14), std::vector<std::byte>(14, std::byte{0x44}));
+
+  bess::PacketFreeBulk(fillers, 2);
+  PacketFree(clone);
+  PacketFree(source);
+}
+
+// A shared first segment holds no payload byte, but its headroom is still
+// the other holders' buffer: a clone of an empty packet, and an empty shared
+// head in front of an exclusive segment, are copied before the prepend.
+TEST(PacketReshapeTest, PrependWritableCopiesAnEmptySharedHead) {
+  PlainPacketPool pool(16, -1, 128);
+  PacketHandle source = pool.Alloc(0);
+  ASSERT_NE(source, nullptr);
+  FillHeadroomTail(source, 14, std::byte{0x55});
+  const std::vector<std::byte> source_headroom(14, std::byte{0x55});
+
+  PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(clone, nullptr);
+  const PacketHandle clone_head = clone;
+  const auto header = PrependWritable(clone, 14);
+  EXPECT_NE(clone, clone_head);
+  ExpectPrependSpan(clone, 14, header);
+  EXPECT_TRUE(RTE_MBUF_DIRECT(clone));  // NOLINT(bugprone-signed-bitwise)
+  EXPECT_EQ(rte_mbuf_refcnt_read(clone), 1);
+  std::fill(header->begin(), header->end(), std::byte{0x66});
+  EXPECT_EQ(PacketBytes(clone), std::vector<std::byte>(14, std::byte{0x66}));
+  EXPECT_EQ(source->data_len, 0u);
+  EXPECT_EQ(HeadroomTail(source, 14), source_headroom);
+  PacketFree(clone);
+
+  const std::vector<std::byte> bytes = Pattern(32);
+  PacketHandle mixed = bess::PacketClone(source);
+  ASSERT_NE(mixed, nullptr);
+  PacketHandle tail = pool.AllocCopy(bytes.data(), bytes.size());
+  ASSERT_NE(tail, nullptr);
+  ASSERT_EQ(rte_pktmbuf_chain(mixed, tail), 0);
+  const PacketHandle mixed_head = mixed;
+  const auto mixed_header = PrependWritable(mixed, 14);
+  EXPECT_NE(mixed, mixed_head);
+  ExpectPrependSpan(mixed, 14, mixed_header);
+  std::fill(mixed_header->begin(), mixed_header->end(), std::byte{0x67});
+  EXPECT_EQ(PacketBytes(mixed), Prefixed(14, std::byte{0x67}, bytes));
+  EXPECT_EQ(HeadroomTail(source, 14), source_headroom);
+  PacketFree(mixed);
+  PacketFree(source);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+// A shared packet with the headroom whose copy has less (a copy starts at
+// the pool's default headroom) fails with kInsufficientHeadroom. `packet` is
+// then the copy, direct and exclusive, and the caller drops it; the other
+// holder keeps its bytes and its headroom.
+TEST(PacketReshapeTest, PrependWritableFailsWhenTheCopyHasLessHeadroom) {
+  PlainPacketPool pool(16, -1, 128);
+  const std::vector<std::byte> bytes = Pattern(64);
+  PacketHandle source = pool.AllocCopy(bytes.data(), bytes.size());
+  ASSERT_NE(source, nullptr);
+  const size_t default_headroom = rte_pktmbuf_headroom(source);
+  ASSERT_NE(rte_pktmbuf_adj(source, 20), nullptr);
+  const std::vector<std::byte> kept(bytes.begin() + 20, bytes.end());
+  const size_t wanted = default_headroom + 12;
+  ASSERT_GE(rte_pktmbuf_headroom(source), wanted);
+  FillHeadroomTail(source, wanted, std::byte{0x12});
+
+  PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(clone, nullptr);
+  const PacketHandle clone_head = clone;
+  const auto prepended = PrependWritable(clone, wanted);
+  ASSERT_FALSE(prepended.has_value());
+  EXPECT_EQ(prepended.error(), ReshapeError::kInsufficientHeadroom);
+  EXPECT_NE(clone, clone_head) << "the copy replaced the clone";
+  EXPECT_TRUE(RTE_MBUF_DIRECT(clone));  // NOLINT(bugprone-signed-bitwise)
+  EXPECT_EQ(rte_mbuf_refcnt_read(clone), 1);
+  EXPECT_EQ(PacketBytes(clone), kept);
+  EXPECT_EQ(PacketBytes(source), kept);
+  EXPECT_EQ(HeadroomTail(source, wanted), std::vector<std::byte>(wanted, std::byte{0x12}));
+  PacketFree(clone);
+  PacketFree(source);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
 }
 }  // namespace

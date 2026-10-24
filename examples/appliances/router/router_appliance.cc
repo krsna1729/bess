@@ -22,6 +22,7 @@
 
 #include "framework/plugin.h"
 #include "module.h"
+#include "packet_reshape.h"
 #include "router/router_app.h"
 
 namespace {
@@ -64,13 +65,22 @@ class RouterAppliance final : public Module {
     return CommandSuccess();
   }
 
+  // RouterApp writes a forwarded frame in place (TTL, checksum, addresses). A
+  // shared payload (a clone, an indirect mbuf) is copied first
+  // (packet::WritableHead), so another holder never sees the writes; a frame
+  // whose copy fails is dropped.
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override {
     const auto ingress = If(static_cast<uint16_t>(2 * ctx->current_igate + 1));
     for (int i = 0; i < batch->cnt(); i++) {
-      bess::PacketRef pkt = batch->packet(i);
+      bess::PacketHandle handle = batch->handles()[i];
+      const auto head = bess::packet::WritableHead(handle, 0);
+      const bess::PacketRef pkt(handle);
       const RouterApp::Decision d =
-          app_->Process(ingress, std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len()),
-                        pkt.total_len());
+          head ? app_->Process(ingress,
+                               std::span<uint8_t>(reinterpret_cast<uint8_t *>(head->data()),
+                                                  head->size()),
+                               pkt.total_len())
+               : RouterApp::Decision{};
       if (d.verdict == bess::route::ForwardVerdict::kForward) {
         EmitPacket(ctx, pkt, static_cast<gate_idx_t>(d.egress.value() - 1));
       } else {

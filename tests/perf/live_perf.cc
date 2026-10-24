@@ -1047,6 +1047,13 @@ std::vector<Test> Catalogue() {
              R"(}}, {"size": 6, "value": {"value_int": )" + std::to_string(0x020000000001ull) +
              R"(}}, {"size": 2, "value": {"value_int": 2048}}]})",
          1)},
+      // The prepending encapsulations and the decapsulation. No upstream
+      // writer: the header attributes read as zeros. Every frame has the
+      // headroom and is unshared, so each prepend takes the inline case.
+      {"M.ether_encap", 'M', m("EtherEncap", "ee", "{}", 1)},
+      {"M.vxlan_encap", 'M', m("VXLANEncap", "vxe", "{}", 1)},
+      {"M.ip_encap", 'M', m("IPEncap", "ipe", "{}", 1)},
+      {"M.generic_decap", 'M', m("GenericDecap", "gd", R"({"bytes": 14})", 1)},
       // Timestamp and SetMetadata write attributes GenericEncap reads.
       {"M.metadata", 'M',
        [](Build &b) {

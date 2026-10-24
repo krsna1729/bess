@@ -15,6 +15,7 @@
 
 #include "framework/plugin.h"
 #include "module.h"
+#include "packet_reshape.h"
 #include "utils/time.h"
 #include "nat/nat_app.h"
 
@@ -73,13 +74,21 @@ class NatAppliance final : public Module {
     return CommandSuccess();
   }
 
+  // NatApp translates the frame in place. A shared payload (a clone, an
+  // indirect mbuf) is copied first (packet::WritableHead), so another holder
+  // never sees the translation; a frame whose copy fails is dropped.
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override {
     const bool outbound = ctx->current_igate == 0;
     app_->Expire(ctx->current_ns);
     for (int i = 0; i < batch->cnt(); i++) {
-      bess::PacketRef pkt = batch->packet(i);
-      const auto v = app_->Process(std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len()),
-                                   outbound, ctx->current_ns, pkt.total_len());
+      bess::PacketHandle handle = batch->handles()[i];
+      const auto head = bess::packet::WritableHead(handle, 0);
+      const bess::PacketRef pkt(handle);
+      const auto v =
+          head ? app_->Process(std::span<uint8_t>(reinterpret_cast<uint8_t *>(head->data()),
+                                                  head->size()),
+                               outbound, ctx->current_ns, pkt.total_len())
+               : NatApp::Verdict::kNotTranslated;
       if (v == NatApp::Verdict::kForward) {
         EmitPacket(ctx, pkt, outbound ? 0 : 1);
       } else {

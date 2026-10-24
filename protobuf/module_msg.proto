@@ -634,6 +634,11 @@ message DumpArg {
  * For example: `SetMetadata('dst_mac', 11:22:33:44:55) -> EtherEncap()`
  * This is useful when upstream modules wish to assign a MAC address to a packet, e.g., due to an ARP request.
  *
+ * The header goes into the packet's headroom. A shared payload (a clone, an
+ * indirect mbuf) is copied first (D-153), as its headroom is the other
+ * holders' buffer too. A packet without the headroom, or whose copy fails,
+ * is dropped, never forwarded without the header.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
@@ -693,6 +698,11 @@ message FlowGenArg {
 /**
  * The GenericDecap module strips off the first few bytes of data from a packet.
  *
+ * The bytes must be in the packet's first segment (D-121): a shorter packet,
+ * or a chain whose first segment ends inside them, is dropped (D-172), never
+ * forwarded with the header still on. No byte is written, so a shared payload
+ * is stripped as it is.
+ *
  * __Input Gates__: 1
  * __Ouptut Gates__: 1
  */
@@ -715,6 +725,11 @@ message GenericDecapArg {
  * where the 2-byte `<xx> <xx>` comes from the value of metadata attribute `'foo'`
  * for each packet.
  * An example script using GenericEncap is in [`bessctl/conf/samples/generic_encap.yaml`](./bessctl/conf/samples/generic_encap.yaml).
+ *
+ * The header goes into the packet's headroom. A shared payload (a clone, an
+ * indirect mbuf) is copied first (D-153), as its headroom is the other
+ * holders' buffer too. A packet without the headroom, or whose copy fails,
+ * is dropped, never forwarded without the header.
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -757,6 +772,13 @@ message HashLBArg {
  * Encapsulates a packet with an IP header, where IP src, dst, and proto are filled in
  * by metadata values carried with the packet. Metadata attributes must include:
  * ip_src, ip_dst, ip_proto, ip_nexthop, and ether_type.
+ *
+ * The header has no options, identification 0, don't-fragment set and TTL
+ * 64, and goes into the packet's headroom. A shared payload (a clone, an
+ * indirect mbuf) is copied first (D-153), as its headroom is the other
+ * holders' buffer too. A packet is dropped, never forwarded without the
+ * header, when it has no headroom, when the copy fails, or when it is too
+ * long for the total length (more than 65,515 bytes before the header).
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -872,6 +894,10 @@ message MetadataTestArg {
  *
  * Currently only supports TCP/UDP/ICMP.
  * Note that address/port in packet payload (e.g., FTP) are NOT translated.
+ *
+ * A packet is translated in place: a shared payload (a clone, an indirect
+ * mbuf) is copied first (D-153), and a packet whose copy fails is dropped, as
+ * an untranslated one is.
  *
  * __Input Gates__: 2 (0 for internal->external, and 1 for external->internal direction)
  * __Output Gates__: 2 (same as the input gate)
@@ -1487,6 +1513,13 @@ message VXLANDecapArg {
 
 /**
  * VXLANEncap module wraps a packet in a VXLAN header with a specified destination port.
+ *
+ * The UDP and VXLAN headers go into the packet's headroom. A shared payload
+ * (a clone, an indirect mbuf) is copied first (D-153), as its headroom is
+ * the other holders' buffer too. A packet is dropped, never forwarded
+ * without the headers, when it has no headroom, when the copy fails, or when
+ * it is too long for the UDP length (more than 65,519 bytes before the
+ * headers).
  *
  * __Input Gates__: 1
  * __Output Gates__: 1

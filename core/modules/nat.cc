@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "packet_parse.h"
+#include "packet_reshape.h"
 #include "utils/format.h"
 #include "utils/ip.h"
 #include "utils/time.h"
@@ -280,12 +281,29 @@ void NAT::Translate(N &nat, Context *ctx, bess::PacketBatch *batch) {
   bool ok[bess::PacketBatch::kMaxBurst];
   nat::Verdict verdicts[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+    bess::PacketHandle &handle = batch->handles()[i];
+    const bess::PacketRef pkt(handle);
     frames[i] = std::span<uint8_t>(pkt.head_data<uint8_t *>(), pkt.head_len());
     // The headers must be in the first segment; the lengths are checked
     // against the whole packet (a chained packet is translated in place).
     ok[i] = bess::packet::ParseFrame(frames[i], parsed[i], pkt.total_len()) ==
             bess::packet::ParseStatus::kOk;
+    if (!ok[i]) {
+      continue;
+    }
+    // The rewrite writes the IPv4 header and the L4 header up to its
+    // checksum (TCP: 18 bytes; UDP and ICMP: 8), which the parse found in
+    // the first segment. A shared payload (a clone, an indirect mbuf) is
+    // copied first (WritableHead, D-153), so another holder never sees the
+    // translation; a packet whose copy fails is not translated, and dropped
+    // as every untranslated packet is.
+    const size_t l4_header = parsed[i].l4 == bess::packet::L4Kind::kTcp ? 20 : 8;
+    const auto head = bess::packet::WritableHead(handle, size_t{parsed[i].l4_offset} + l4_header);
+    if (unlikely(!head)) {
+      ok[i] = false;
+      continue;
+    }
+    frames[i] = std::span<uint8_t>(reinterpret_cast<uint8_t *>(head->data()), head->size());
   }
   nat.TranslateBatch(std::span(frames, cnt), std::span(parsed, cnt), std::span(ok, cnt), dir,
                      now, std::span(verdicts, cnt));
