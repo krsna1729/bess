@@ -106,8 +106,8 @@ class Bridge::StaticsResource final : public dataplane::Resource {
       return std::unexpected("wrong value type (want a gate)");
     }
     // The RPC codec refuses a gate outside [0, MAX_GATES) or DROP_GATE; the
-    // typed path must too, and before a slot is reserved, or publication
-    // would fail after Reserve and leave a placeholder nothing removes.
+    // typed path must too, and before a slot is reserved: a valid gate's
+    // interface, at most DROP_GATE + 1, is one AddStatic takes.
     if (!bess::IsValidGateValue(static_cast<uint64_t>(*gate))) {
       return std::unexpected("invalid static gate");
     }
@@ -123,6 +123,13 @@ class Bridge::StaticsResource final : public dataplane::Resource {
     // table's cuckoo search can fail below capacity, and Publish must not.
     // Erases of this transaction may publish after its upserts, so they free
     // nothing here.
+    //
+    // Publish then finds the key: a static stays (only an erase removes it,
+    // and the engine refuses a second operation on a key in a transaction);
+    // a learned entry stays (learning and aging run on the packet path, and
+    // the workers are paused; `flush` is a command, and commands and Apply
+    // are serialized by the control-plane lock); a placeholder stays (it is
+    // static to aging and flush).
     if (!existed && owner_.fdb_->Lookup(kDomain, ToL2(mac)) ==
                         dataplane::kInvalidInterfaceId) {
       if (!owner_.fdb_->ReserveStatic(kDomain, ToL2(mac))) {
@@ -148,15 +155,14 @@ class Bridge::StaticsResource final : public dataplane::Resource {
     void Publish(dataplane::Retirer &) noexcept override {
       const Mac mac = node_.key();
       const gate_idx_t gate = node_.mapped();
+      // Reserve checked the MAC (unicast) and the gate (a valid interface),
+      // and the key is present (the static, the learned entry or the slot
+      // Reserve took): an in-place store, which cannot be refused.
       const l2::ProgramResult result =
           owner_.fdb_->AddStatic(kDomain, ToL2(mac), InterfaceOfGate(gate));
-      if (result != l2::ProgramResult::kAdded &&
-          result != l2::ProgramResult::kReplaced) {
-        LOG(ERROR) << "Bridge '" << owner_.name()
-                   << "': no FDB slot for a static entry";
-        return;
-      }
-      published_ = true;
+      CHECK(result == l2::ProgramResult::kReplaced)
+          << "Bridge '" << owner_.name() << "': static entry not reprogrammed in place ("
+          << static_cast<int>(result) << ")";
       auto it = owner_.statics_.find(mac);
       if (it != owner_.statics_.end()) {
         it->second = gate;
@@ -165,10 +171,10 @@ class Bridge::StaticsResource final : public dataplane::Resource {
       }
     }
 
-    // The reservation was taken in Reserve and this operation will not
+    // The reservation was taken in Reserve and the transaction will not
     // publish: give the slot back.
     void Abort() noexcept override {
-      if (reserved_ && !published_) {
+      if (reserved_) {
         (void)owner_.fdb_->Remove(kDomain, ToL2(node_.key()));
       }
     }
@@ -179,7 +185,6 @@ class Bridge::StaticsResource final : public dataplane::Resource {
     Bridge &owner_;
     Node node_;
     bool reserved_;
-    bool published_ = false;
   };
 
   class EraseOp final : public dataplane::StagedOp {

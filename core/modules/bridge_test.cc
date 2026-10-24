@@ -2,9 +2,13 @@
 
 #include <gtest/gtest.h>
 
+#include <any>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
@@ -381,8 +385,9 @@ TEST(BridgeResourceTest, FlushActionForgetsLearnedMacsOnly) {
 }
 
 // A typed transaction can name a gate no RPC would accept. It must be refused
-// before an FDB slot is reserved: otherwise publication fails after Reserve,
-// the placeholder is never released, and repeated writes fill the table.
+// before an FDB slot is reserved: a placeholder taken by a refused operation
+// is never released, and repeated writes fill the table. A placeholder is a
+// lookup miss, but the entry count shows it.
 TEST(BridgeResourceTest, ATypedOutOfRangeGateIsRefusedBeforeReserving) {
   ModuleHarness h;
   Module *br = h.Create("Bridge", BridgeArg());
@@ -397,13 +402,160 @@ TEST(BridgeResourceTest, ATypedOutOfRangeGateIsRefusedBeforeReserving) {
   // typed path does too.
   EXPECT_NE("", h.Apply({bess::dataplane::Op::Upsert(
                 statics, key, std::any(gate_idx_t{MAX_GATES + 1}))}));
+  EXPECT_EQ("0 FDB entries, max 1024", br->GetDesc());  // no placeholder left
   // DROP_GATE is the one valid sentinel outside [0, MAX_GATES).
   EXPECT_EQ("", h.Apply({bess::dataplane::Op::Upsert(
                   statics, key, std::any(gate_idx_t{DROP_GATE}))}));
-
-  // The valid gate still applies: no placeholder was left behind.
   EXPECT_EQ("", h.Apply({bess::dataplane::Op::Upsert(
                   statics, key, std::any(gate_idx_t{1}))}));
+  EXPECT_EQ("1 FDB entries, max 1024", br->GetDesc());
+}
+
+// A frame from `src` to `dst`.
+Bytes Frame(const std::string &dst, const std::string &src) {
+  return PacketBuilder().Ether(dst, src).IPv4("10.0.0.1", "10.0.0.2").Build();
+}
+
+// The engine requires a static's publication not to fail, and Publish
+// CHECKs it: Reserve takes the FDB slot a new MAC needs, and a MAC the FDB
+// holds is reprogrammed in place. These tests fill the FDB to its capacity,
+// so whether a new key fits is the size bound's answer, not cuckoo
+// placement's. A bridge of size 1 holds 1 + kStaticReserve entries in a
+// table at most half full by slots: host A, learned on gate 0 (the one
+// learned entry `size` allows), and kStaticReserve statics on gate 1.
+constexpr char kHostA[] = "02:00:00:00:00:01";
+constexpr char kHostB[] = "02:00:00:00:00:02";
+constexpr char kHostC[] = "02:00:00:00:00:03";
+constexpr char kFiller0[] = "02:00:00:01:00:00";  // FillerMac(0)
+constexpr size_t kFullFdb = 1 + Bridge::kStaticReserve;
+
+Bridge::Mac FillerMac(size_t i) {
+  return {{0x02, 0x00, 0x00, 0x01, static_cast<uint8_t>(i >> 8u), static_cast<uint8_t>(i)}};
+}
+
+std::string FdbEntries(size_t n) {
+  return bess::utils::Format("%zu FDB entries, max 1", n);
+}
+
+Module *FullBridge(ModuleHarness &h) {
+  BridgeArg arg;
+  arg.set_size(1);
+  Module *br = h.Create("Bridge", arg);
+  if (br == nullptr) {
+    return nullptr;
+  }
+  h.Run(br, 0, {Frame(kHostB, kHostA)}, {1, 2});  // learns A on gate 0
+  std::vector<bess::dataplane::Op> fill;
+  fill.reserve(Bridge::kStaticReserve);
+  for (size_t i = 0; i < Bridge::kStaticReserve; i++) {
+    fill.push_back(bess::dataplane::Op::Upsert(br->name() + "/statics",
+                                               bess::dataplane::EncodeKey(FillerMac(i)),
+                                               std::any(gate_idx_t{1})));
+  }
+  EXPECT_EQ("", h.Apply(fill));
+  EXPECT_EQ(FdbEntries(kFullFdb), br->GetDesc());
+  return br;
+}
+
+// A MAC the full FDB learned becomes static in place: it needs no slot, so
+// the upsert publishes, the entry count stays, and the MAC goes to its static
+// gate and is no longer moved by learning.
+TEST(BridgeResourceTest, AFullFdbMakesALearnedMacStaticInPlace) {
+  ModuleHarness h;
+  Module *br = FullBridge(h);
+  ASSERT_NE(nullptr, br);
+  const std::string statics = br->name() + "/statics";
+  auto out = h.Run(br, 1, {Frame(kHostA, kHostB)}, {0, 2});
+  EXPECT_EQ(1u, out[0].size());  // learned on gate 0
+  EXPECT_TRUE(out[2].empty());
+
+  ASSERT_EQ("", h.UpsertResource(statics, StaticKey(kHostA), StaticValue(2)));
+  EXPECT_EQ(FdbEntries(kFullFdb), br->GetDesc());
+  EXPECT_EQ(kFullFdb, h.ReadResource(statics).size());
+  out = h.Run(br, 1, {Frame(kHostA, kHostB)}, {0, 2});
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_EQ(1u, out[2].size());
+
+  // A frame from A on gate 0 does not move it back: it is static now.
+  h.Run(br, 0, {Frame(kHostB, kHostA)}, {1, 2});
+  out = h.Run(br, 1, {Frame(kHostA, kHostB)}, {0, 2});
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_EQ(1u, out[2].size());
+}
+
+// The error the engine gives operation `i` of a transaction it refuses
+// ("applied" if it applies): ModuleHarness::Apply reports operation 0's only.
+std::string ApplyError(const std::vector<bess::dataplane::Op> &ops, size_t i) {
+  const bess::dataplane::TransactionEngine::Result result =
+      bess::runtime::runtime().transactions().Apply(std::span<const bess::dataplane::Op>(ops));
+  if (result.outcome == bess::dataplane::TransactionEngine::Outcome::kApplied) {
+    return "applied";
+  }
+  return i < result.ops.size() ? result.ops[i].error : "no result for the operation";
+}
+
+// A new MAC needs a slot the full FDB does not have: Reserve refuses it and
+// nothing changes, also when an erase of a static is reserved before it in
+// the same transaction (erases publish after upserts, so they free nothing at
+// Reserve).
+TEST(BridgeResourceTest, AFullFdbRefusesANewStaticMacAndChangesNothing) {
+  ModuleHarness h;
+  Module *br = FullBridge(h);
+  ASSERT_NE(nullptr, br);
+  const std::string statics = br->name() + "/statics";
+  const Bridge::Mac host_c{{0x02, 0x00, 0x00, 0x00, 0x00, 0x03}};
+
+  const std::string refused = h.UpsertResource(statics, StaticKey(kHostC), StaticValue(2));
+  EXPECT_NE(std::string::npos, refused.find("FDB full")) << refused;
+  const std::string with_erase = ApplyError(
+      {bess::dataplane::Op::Erase(statics, bess::dataplane::EncodeKey(FillerMac(0))),
+       bess::dataplane::Op::Upsert(statics, bess::dataplane::EncodeKey(host_c),
+                                   std::any(gate_idx_t{2}))},
+      1);
+  EXPECT_NE(std::string::npos, with_erase.find("FDB full")) << with_erase;
+
+  EXPECT_EQ(FdbEntries(kFullFdb), br->GetDesc());
+  EXPECT_EQ(Bridge::kStaticReserve, h.ReadResource(statics).size());
+  auto out = h.Run(br, 1, {Frame(kHostC, kHostB)}, {0, 2});
+  EXPECT_EQ(1u, out[0].size());  // C is unknown: flooded
+  EXPECT_EQ(1u, out[2].size());
+  out = h.Run(br, 1, {Frame(kHostA, kHostB)}, {0, 2});
+  EXPECT_EQ(1u, out[0].size());  // A is still learned on gate 0
+  EXPECT_TRUE(out[2].empty());
+  out = h.Run(br, 0, {Frame(kFiller0, kHostB)}, {1, 2});
+  EXPECT_EQ(1u, out[1].size());  // the erase was not applied
+  EXPECT_TRUE(out[2].empty());
+}
+
+// A transaction refused after a new MAC took the FDB's one free slot gives
+// the slot back. The placeholder is a lookup miss, so traffic cannot show a
+// leaked one; the entry count (which counts it) can, and so can the next new
+// MAC, which needs that slot.
+TEST(BridgeResourceTest, ARefusedTransactionGivesItsReservedSlotBack) {
+  ModuleHarness h;
+  Module *br = FullBridge(h);
+  ASSERT_NE(nullptr, br);
+  const std::string statics = br->name() + "/statics";
+  const Bridge::Mac host_b{{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}};
+  const Bridge::Mac host_c{{0x02, 0x00, 0x00, 0x00, 0x00, 0x03}};
+  ASSERT_EQ("", h.EraseResource(statics, StaticKey(kFiller0)));
+  ASSERT_EQ(FdbEntries(kFullFdb - 1), br->GetDesc());
+
+  // C reserves the free slot; erasing B, which is no static, refuses the
+  // transaction.
+  const std::string refused = ApplyError(
+      {bess::dataplane::Op::Upsert(statics, bess::dataplane::EncodeKey(host_c),
+                                   std::any(gate_idx_t{2})),
+       bess::dataplane::Op::Erase(statics, bess::dataplane::EncodeKey(host_b))},
+      1);
+  EXPECT_NE(std::string::npos, refused.find("not found")) << refused;
+  EXPECT_EQ(FdbEntries(kFullFdb - 1), br->GetDesc());
+  EXPECT_EQ(Bridge::kStaticReserve - 1, h.ReadResource(statics).size());
+
+  ASSERT_EQ("", h.UpsertResource(statics, StaticKey("02:00:00:00:00:04"), StaticValue(2)));
+  EXPECT_EQ(FdbEntries(kFullFdb), br->GetDesc());
+  const std::string full = h.UpsertResource(statics, StaticKey(kHostC), StaticValue(2));
+  EXPECT_NE(std::string::npos, full.find("FDB full")) << full;
 }
 
 }  // namespace
