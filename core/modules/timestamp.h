@@ -12,6 +12,8 @@ class Timestamp final : public Module {
  public:
   using MarkerType = uint32_t;
   static const MarkerType kMarker = 0x54C5BE55;
+  // The in-packet stamp (offset mode): the marker, then the time in ns.
+  static constexpr size_t kStampSize = sizeof(MarkerType) + sizeof(uint64_t);
   // Stamps the current time into each packet; keeps no state.
   static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
                                                     ModuleCapabilities::FlowAffinity::kNone};
