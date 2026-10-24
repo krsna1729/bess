@@ -848,6 +848,7 @@ unit_test_sources = [
   'modules/ether_encap_test.cc',
   'modules/set_metadata_test.cc',
   'modules/vxlan_decap_test.cc',
+  'modules/vxlan_encap_test.cc',
   'modules/vlan_split_test.cc',
   'modules/random_split_test.cc',
   'modules/url_filter_test.cc',
