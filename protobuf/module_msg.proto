@@ -499,8 +499,21 @@ message WildcardMatchSettings {
 }
 
 /**
- * The module ACL creates an access control module which by default blocks all traffic, unless it contains a rule which specifies otherwise.
+ * The module ACL creates an access control module: the rules are checked in
+ * order, the first rule that matches a packet forwards or drops it, and a
+ * packet that no rule matches is dropped.
  * Examples of ACL can be found in [`bessctl/conf/samples/acl.yaml`](./bessctl/conf/samples/acl.yaml)
+ *
+ * A rule constrains only the fields it names. A packet's addresses and ports
+ * come from the checked parse (core/packet_parse.h, D-188): IPv4, untagged or
+ * behind up to two VLAN tags, with options. The ports are those of TCP and
+ * UDP; ICMP, other protocols and a non-first fragment are judged with ports
+ * 0, which only a rule with wildcard ports matches. A rule whose four fields
+ * are all wildcards ("" or a /0 prefix, port 0) matches every packet, IPv4 or
+ * not; any other rule matches only IPv4. So a packet that is not IPv4 (ARP,
+ * IPv6, ...) takes the first all-wildcard rule, or is dropped when there is
+ * none. A packet whose headers do not fit its first segment or lie about
+ * their lengths is dropped before any rule, even an all-wildcard one.
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -515,7 +528,7 @@ message ACLArg {
     uint32 src_port = 3;  /// TCP/UDP source port. Wildcard if 0.
     uint32 dst_port = 4;  /// TCP/UDP Destination port. Wildcard if 0.
     bool established = 5; /// Not implemented
-    bool drop = 6;        /// Drop matched packets if true, forward if false. By default ACL drops all traffic.
+    bool drop = 6;        /// Drop matched packets if true, forward if false. A packet no rule matches is dropped.
   }
   repeated Rule rules = 1; ///A list of ACL rules.
 }

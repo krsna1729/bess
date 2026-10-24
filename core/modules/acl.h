@@ -4,7 +4,10 @@
 #ifndef BESS_MODULES_ACL_H_
 #define BESS_MODULES_ACL_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "framework/singleton_resource.h"
@@ -31,7 +34,35 @@ class ACL final : public Module {
     be16_t src_port;
     be16_t dst_port;
     bool drop;
+    // Every field is a wildcard (both prefixes /0 or "", both ports 0): the
+    // rule names no IPv4 field, so it matches any frame, IPv4 or not.
+    bool any;
   };
+
+  // What the rules match, from the checked parse (core/packet_parse.h,
+  // D-188): IPv4, untagged or behind up to two VLAN tags, options allowed.
+  // The ports are TCP's or UDP's; ICMP, other protocols and a non-first
+  // fragment (no transport header) have ports 0, which only a rule with
+  // wildcard ports matches.
+  struct Key {
+    be32_t src;
+    be32_t dst;
+    be16_t src_port;
+    be16_t dst_port;
+  };
+
+  // KeyOf's verdict on a frame.
+  enum class Frame : uint8_t {
+    kIpv4,       // `key` is filled: every rule can match
+    kNotIpv4,    // a valid frame that is not IPv4 (ARP, IPv6, ...): only
+                 // a rule with every field a wildcard matches
+    kMalformed,  // headers that do not fit the frame or lie about their
+                 // lengths: dropped before any rule
+  };
+
+  // The common frame is read at its fixed offsets after CheckFastIpv4, so it
+  // decides as ParseFrame would. `frame` and `total_len` as ParseFrame's.
+  static Frame KeyOf(std::span<const uint8_t> frame, size_t total_len, Key *key);
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
