@@ -18,7 +18,7 @@
 #include "utils/logging.h"
 #include <rte_hash_crc.h>
 
-#include "arch/word_probe.h"
+#include "l2/mac_table_kernels.h"
 
 #include "dataplane/batch_stages.h"
 #include "gate.h"

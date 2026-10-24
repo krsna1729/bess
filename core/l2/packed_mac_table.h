@@ -23,8 +23,8 @@
 
 #include "arch/cpu.h"
 #include "arch/crc32c.h"
-#include "arch/word_probe.h"
 #include "dataplane/table_policy.h"
+#include "l2/mac_table_kernels.h"
 #include "utils/common.h"
 
 namespace bess::l2 {

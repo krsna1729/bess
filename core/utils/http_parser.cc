@@ -30,7 +30,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#include "arch/byte_match.h"
+#include "utils/http_parser_kernels.h"
 
 /* $Id$ */
 

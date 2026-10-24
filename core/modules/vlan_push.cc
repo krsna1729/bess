@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "arch/vlan.h"
+#include "modules/vlan_kernels.h"
 #include "packet_mutation.h"
 #include "packet_reshape.h"
 #include "utils/ether.h"

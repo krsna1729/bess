@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_ARCH_BYTE_MATCH_H_
-#define BESS_ARCH_BYTE_MATCH_H_
+#ifndef BESS_UTILS_HTTP_PARSER_KERNELS_H_
+#define BESS_UTILS_HTTP_PARSER_KERNELS_H_
 
-// Byte-class scanning for the HTTP parser (utils/http_parser.cc, from
-// picohttpparser) (M21, D-071).
+// The HTTP parser's kernel file (D-190): byte-class scanning for
+// utils/http_parser.cc (from picohttpparser) (M21, D-071).
 
 #include <cstddef>
 
 #include "arch/cpu.h"
 
-#if defined(BESS_ARCH_X86) && defined(__SSE4_2__)
-#define BESS_ARCH_BYTE_MATCH_SSE42 1
+#if defined(BESS_ARCH_SSE4_2)
 #include <nmmintrin.h>
 #endif
 
@@ -29,7 +28,7 @@ inline const char *SkipBytesOutsideRanges(const char *buf, const char *buf_end,
                                           size_t ranges_size,
                                           bool *found) noexcept {
   *found = false;
-#if defined(BESS_ARCH_BYTE_MATCH_SSE42)
+#if defined(BESS_ARCH_SSE4_2)
   // SSE4.2 PCMPESTRI in ranges mode, as upstream picohttpparser does.
   if (__builtin_expect(buf_end - buf >= 16, 1)) {
     __m128i ranges16 = _mm_loadu_si128(
@@ -59,4 +58,4 @@ inline const char *SkipBytesOutsideRanges(const char *buf, const char *buf_end,
 
 }  // namespace bess::arch
 
-#endif  // BESS_ARCH_BYTE_MATCH_H_
+#endif  // BESS_UTILS_HTTP_PARSER_KERNELS_H_

@@ -365,7 +365,8 @@ bess_packet = static_library(
 )
 
 # The assembly-shape probe (roadmap Appendix J; docs/assembly-shape.md). Every
-# kernel in arch/ is inline in a header, so no archive carries a symbol to
+# kernel, in arch/ or in an owner's *_kernels.h (D-190), is inline in a header,
+# so no archive carries a symbol to
 # disassemble: this target compiles the noinline wrappers with the real flags
 # in every lane, which keeps the probe compiling and gives clang-tidy the file's
 # flags. Nothing links it into bessd and nothing installs it.
@@ -560,15 +561,12 @@ install_headers(core_public_headers, subdir: 'bess/core')
 core_public_subdir_headers = {
   'arch': files(
     'arch/cpu.h',
-    'arch/byte_match.h',
     'arch/checksum_kernels.h',
     'arch/crc32c.h',
     'arch/fp_env.h',
     'arch/signal_context.h',
     'arch/simd_dispatch.h',
     'arch/tag_match.h',
-    'arch/vlan.h',
-    'arch/word_probe.h',
   ),
   'utils': files(
     'utils/arp.h',
@@ -639,6 +637,7 @@ core_public_subdir_headers = {
   'l2': files(
     'l2/fdb.h',
     'l2/mac_table.h',
+    'l2/mac_table_kernels.h',
     'l2/packed_mac_table.h',
   ),
   'nat': files(
@@ -716,6 +715,7 @@ unit_test_sources = [
   'l2/fdb_test.cc',
   'l2/fdb_model_test.cc',
   'l2/packed_mac_table_test.cc',
+  'l2/mac_table_kernels_test.cc',
   'l2/mac_table_resource_test.cc',
   'conntrack/conntrack_test.cc',
   'conntrack/conntrack_model_test.cc',
@@ -740,6 +740,7 @@ unit_test_sources = [
   'classifier/masked_exact_test.cc',
   'classifier/range_backend_test.cc',
   'classifier/firewall_table_test.cc',
+  'classifier/firewall_kernels_test.cc',
   'classifier/generation_test.cc',
   'classifier/packed_value_store_test.cc',
   'classifier/cuckoo_exact_test.cc',
@@ -857,6 +858,7 @@ unit_test_sources = [
   'modules/round_robin_test.cc',
   'modules/vlan_push_test.cc',
   'modules/vlan_pop_test.cc',
+  'modules/vlan_kernels_test.cc',
   'modules/mpls_pop_test.cc',
   'modules/dump_test.cc',
   'modules/worker_split_test.cc',
@@ -878,6 +880,7 @@ unit_test_sources = [
   'utils/bpf_program_test.cc',
   'utils/checksum_test.cc',
   'utils/copy_test.cc',
+  'utils/http_parser_kernels_test.cc',
   'utils/codel_test.cc',
   'utils/cuckoo_map_test.cc',
   'utils/endian_test.cc',

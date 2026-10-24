@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The architecture kernels (M21, D-071) agree with their portable
+// core/arch's shared kernels (M21, D-071) agree with their portable
 // definitions, whichever path this build takes (the vector kernels in an x86
-// build, the portable loops with -DBESS_ARCH_GENERIC or on arm64).
+// build, the portable loops with -DBESS_ARCH_GENERIC or on arm64). An owner's
+// kernel is tested next to it, in <owner>_kernels_test.cc (D-190).
 
-#include "arch/masked_addr.h"
 #include "arch/tag_match.h"
-#include "arch/vlan.h"
-#include "arch/word_probe.h"
 #include "testing/rng.h"
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
-#include <array>
-#include <cstring>
-#include <numeric>
+#include <cstdint>
 #include <random>
 
 namespace bess::arch {
@@ -62,101 +57,6 @@ TEST(MatchTest, Hashes32x4EqualDefinition) {
       hashes[i] = (pattern >> i & 1) ? 0xffffffffu : 0x80000000u;
     }
     ASSERT_EQ(pattern, MatchHashes32x4(hashes, 0xffffffffu));
-  }
-}
-
-constexpr uint64_t kMask = 0x8000ffffFFFFffffull;  // L2Forward's key bits
-
-// Every word that matches under the mask is a candidate, whatever the bits
-// outside the mask hold. (A candidate need not match: the caller re-checks.)
-TEST(MatchTest, MaskedWordCandidatesIncludeEveryMatch) {
-  std::mt19937_64 rng(17);
-  alignas(32) uint64_t words[4];
-  for (int trial = 0; trial < 20000; trial++) {
-    // Keys from a small alphabet, occupied bit random, payload (the bits
-    // outside the mask) random.
-    for (auto &w : words) {
-      w = (rng() % 3) | (rng() & ~kMask) | ((rng() & 1) << 63);
-    }
-    const uint64_t want = (rng() % 3) | (1ull << 63);
-    unsigned matches = 0;
-    for (int i = 0; i < 4; i++) {
-      matches |= unsigned{(words[i] & kMask) == want} << i;
-    }
-    const unsigned candidates = MaskedWordCandidates64x4(words, kMask, want);
-    ASSERT_EQ(matches, candidates & matches) << std::hex << candidates;
-    ASSERT_EQ(0u, candidates & ~0xfu);
-  }
-}
-
-// Bytes 0..23 of a buffer hold 1..24. The kernels touch 16 bytes; the bytes
-// around them must stay put.
-std::array<uint8_t, 24> Numbered() {
-  std::array<uint8_t, 24> b;
-  std::iota(b.begin(), b.end(), uint8_t{1});
-  return b;
-}
-
-TEST(VlanTest, RemoveMovesTheAddressesOverTheTag) {
-  auto b = Numbered();
-  RemoveVlanTag(b.data() + 4);
-  // [0 0 0 0 | the 12 address bytes that were at 4..15] at 4..19.
-  const std::array<uint8_t, 24> want = {1,  2,  3,  4,  0,  0,  0,  0,
-                                        5,  6,  7,  8,  9,  10, 11, 12,
-                                        13, 14, 15, 16, 21, 22, 23, 24};
-  EXPECT_EQ(want, b);
-}
-
-TEST(VlanTest, InsertMovesTheAddressesBackAndFillsTheGap) {
-  auto b = Numbered();
-  const uint8_t tag[4] = {0x81, 0x00, 0x0a, 0xbc};  // TPID 0x8100, TCI 0x0abc
-  uint32_t tag_raw;
-  std::memcpy(&tag_raw, tag, sizeof(tag_raw));
-  // The frame was at 4; it now starts at 0.
-  InsertVlanTag(b.data(), tag_raw);
-  const std::array<uint8_t, 24> want = {
-      5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,  // addresses
-      0x81, 0x00, 0x0a, 0xbc,                          // the tag
-      17, 18, 19, 20, 21, 22, 23, 24};                 // EtherType onwards
-  EXPECT_EQ(want, b);
-  // Removing it again restores the frame at 4.
-  RemoveVlanTag(b.data());
-  auto original = Numbered();
-  EXPECT_TRUE(std::equal(b.begin() + 4, b.end(), original.begin() + 4));
-}
-
-TEST(MaskedAddrTest, PairAgreesWithThePortableDefinition) {
-  std::mt19937 rng = bess::testing::SeededRng(41);
-  alignas(32) uint8_t src[16];
-  alignas(32) uint8_t dst[16];
-  alignas(32) uint8_t mask_src[16];
-  alignas(32) uint8_t mask_dst[16];
-  alignas(32) uint8_t out[32];
-  for (int trial = 0; trial < 20000; trial++) {
-    for (size_t i = 0; i < 16; i++) {
-      src[i] = static_cast<uint8_t>(rng());
-      dst[i] = static_cast<uint8_t>(rng());
-      mask_src[i] = static_cast<uint8_t>(rng());
-      mask_dst[i] = static_cast<uint8_t>(rng());
-    }
-    // Whole-byte masks as well as arbitrary ones: a prefix mask has whole
-    // bytes set and one partial byte.
-    if (trial % 3 == 0) {
-      const size_t bits = static_cast<size_t>(rng() % 129);
-      for (size_t i = 0; i < 16; i++) {
-        mask_src[i] = i * 8 + 8 <= bits ? 0xff
-                                       : (i * 8 < bits ? static_cast<uint8_t>(
-                                                             0xffu << (8 - (bits - i * 8)))
-                                                       : 0);
-        mask_dst[i] = mask_src[15 - i];
-      }
-    }
-    MaskedAddrPair16x2(out, src, dst, mask_src, mask_dst);
-    for (size_t i = 0; i < 16; i++) {
-      ASSERT_EQ(static_cast<uint8_t>(src[i] & mask_src[i]), out[i]) << trial;
-      ASSERT_EQ(static_cast<uint8_t>(dst[i] & mask_dst[i]), out[16 + i])
-          << trial;
-    }
   }
 }
 

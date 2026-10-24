@@ -3,7 +3,7 @@
 // The firewall table's packet path: ns per key over the shapes a deployment
 // has, next to the scalar reference scan (the definition the index must
 // reproduce, at the cost a reader of the list pays) and next to the masking
-// kernel's portable alternative (the delta arch/masked_addr.h records).
+// kernel's portable alternative (the delta classifier/firewall_kernels.h records).
 // WildcardMatch's own cost is measured where it belongs: tests/perf/live_perf
 // compares the modules end to end.
 //
@@ -23,7 +23,7 @@
 #include <random>
 #include <vector>
 
-#include "arch/masked_addr.h"
+#include "classifier/firewall_kernels.h"
 #include "classifier/firewall_table.h"
 #include "testing/rng.h"
 

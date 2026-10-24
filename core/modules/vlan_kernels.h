@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_ARCH_VLAN_H_
-#define BESS_ARCH_VLAN_H_
+#ifndef BESS_MODULES_VLAN_KERNELS_H_
+#define BESS_MODULES_VLAN_KERNELS_H_
 
-// 802.1Q / 802.1ad tag removal and insertion at the front of an Ethernet
-// frame (VLANPop, VLANSplit, VLANPush, Vif) (M21, D-071). Each is one 16-byte
-// load, one byte shift or lane insert, and one 16-byte store, written with
+// The VLAN modules' kernel file (D-190): 802.1Q / 802.1ad tag removal and
+// insertion at the front of an Ethernet frame (VLANPop, VLANSplit, VLANPush,
+// Vif) (M21, D-071). Each is one 16-byte load, one byte shift or lane
+// insert, and one 16-byte store, written with
 // GCC/Clang vector extensions rather than intrinsics: the compiler emits
 // SSE2/SSE4.1 on x86 (the same instructions as the former intrinsics) and
 // NEON on arm64, and plain stores where there is no vector unit. One path
@@ -45,4 +46,4 @@ inline void InsertVlanTag(void *p, uint32_t tag_raw) noexcept {
 
 }  // namespace bess::arch
 
-#endif  // BESS_ARCH_VLAN_H_
+#endif  // BESS_MODULES_VLAN_KERNELS_H_

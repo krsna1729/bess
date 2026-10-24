@@ -10,9 +10,9 @@
 #include <span>
 #include <string>
 
-#include "arch/vlan.h"
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_codec.h"
+#include "modules/vlan_kernels.h"
 #include "packet_mutation.h"
 #include "packet_reshape.h"
 #include "route/l3_packet.h"
