@@ -69,7 +69,7 @@ Columns:
 | GenericEncap | fields; bytes per field | 8; 8 | `MAX_FIELDS`, `MAX_FIELD_SIZE` (`generic_encap.h`) | No | EINVAL "at most 8 fields" |
 | Update | fields | 16 | `Update::kMaxFields` | No | EINVAL |
 | RandomUpdate | fields | 16 | `kMaxVariable` (`random_update.h`) | No | EINVAL |
-| Rewrite / FlowGen | template | 1,536 B | `Rewrite::kMaxTemplateSize`, `MAX_TEMPLATE_SIZE` (`flowgen.h`) | No | EINVAL "template is too big" |
+| Rewrite / FlowGen | template | 1,536 B; Rewrite also at most the packet data room | `Rewrite::kMaxTemplateSize`, `MAX_TEMPLATE_SIZE` (`flowgen.h`); the default pool's data room (`--packet_data_room`) | No | EINVAL "template is too big" / "template is larger than the N-byte packet data room"; a packet whose own buffer cannot hold its template is dropped |
 | Replicate | gates | 32 | `Replicate::kMaxGates` | No | EINVAL |
 | HashLB | gates | 16,384 | `HashLB::kMaxGates` | No | EINVAL |
 | HashLB | custom-tuple fields; bytes per field; packet offset | 8; 8; 0-1,024 | `HashLB::kMaxFields`, `kMaxFieldSize`, `kMaxFieldOffset` | No | EINVAL |

@@ -59,8 +59,15 @@ class Rewrite final : public Module {
   static CommandResponse Build(const bess::pb::RewriteArg &arg,
                                Templates *out);
 
-  inline void DoRewrite(const Templates &t, bess::PacketBatch *batch, size_t &next_turn);
-  inline void DoRewriteSingle(const Templates &t, bess::PacketBatch *batch);
+  // Gives a packet that cannot be reset in place a payload it alone holds, in
+  // a direct mbuf or an external buffer it alone holds; nullptr after
+  // dropping one that cannot get it. Off the common path.
+  [[gnu::cold, gnu::noinline]] bess::PacketHandle MakeWritable(Context *ctx, bess::PacketRef pkt);
+  inline void RewriteOne(Context *ctx, bess::PacketBatch *batch, int &out_cnt,
+                         bess::PacketRef pkt, const void *templ, uint16_t size);
+  inline void DoRewrite(Context *ctx, const Templates &t, bess::PacketBatch *batch,
+                        size_t &next_turn);
+  inline void DoRewriteSingle(Context *ctx, const Templates &t, bess::PacketBatch *batch);
 
   // Each worker remembers its next index in [0, num), on separate cache lines.
   bess::stats::WorkerLocal<size_t> next_turn_;

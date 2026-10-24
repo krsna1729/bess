@@ -1166,6 +1166,14 @@ message RandomUpdateArg {
  * converting all packets that pass through to copies of the of one of
  * the templates.
  *
+ * A template is at most 1536 bytes and at most the packet data room
+ * (`--packet_data_room`); a larger one is refused (EINVAL). A packet whose
+ * payload is shared (a clone, its parent, a shared external buffer) gets a
+ * buffer of its own first, so the other holder never sees the template
+ * (D-153); a chain's tail is freed. A packet whose buffer cannot hold its
+ * template (one from a pool with a smaller data room), or that cannot get a
+ * buffer of its own, is dropped. With no template, packets pass unchanged.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
