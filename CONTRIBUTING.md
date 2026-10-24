@@ -14,8 +14,12 @@ Please respect the following coding styles. Let's not be too dogmatic, though.
   * There is a [`.clang_format`](https://github.com/NetSys/bess/blob/master/core/.clang-format) file that you can utilize directly with [`clang-format`](https://clang.llvm.org/docs/ClangFormat.html) or integrate with your favorite editor ([Vim](https://github.com/rhysd/vim-clang-format), [Emacs](https://llvm.org/svn/llvm-project/cfe/trunk/tools/clang-format/clang-format.el), [Atom](https://atom.io/packages/clang-format), etc.)
 * C: [Linux kernel coding style](https://github.com/torvalds/linux/blob/master/Documentation/process/coding-style.rst)
   * Currently C is only used for the Linux kernel module.
-* Python: [PEP 8 -- Style Guide for Python Code](https://www.python.org/dev/peps/pep-0008/)
-  * For new code, please make it compatible with both Python 2 and 3.
+* Python: [PEP 8 -- Style Guide for Python Code](https://www.python.org/dev/peps/pep-0008/), Python 3.
+
+### Engineering rules
+Read [docs/engineering-guide.md](docs/engineering-guide.md) before you send a
+change. It gives the packet-safety, layering, performance and change-hygiene
+rules that review checks, and links the full contracts.
 
 ### Dataplane tables
 Before adding a lookup table to a module, read
@@ -24,7 +28,11 @@ structures exist, how rule changes reach workers without stopping traffic,
 and which DPDK behaviours are pinned by tests.
 
 ### Running Tests
-For C++ and Python code updates, we recommend adding unit tests with [Google Test](https://github.com/google/googletest) and [unittest.py](https://docs.python.org/2/library/unittest.html). Also, please run existing tests to make sure your changes to avoid regressions.
+Add unit tests with [Google Test](https://github.com/google/googletest) for
+C++, and with `unittest` for Python (`sdk/python/tests/`; a `tools/check_*.py`
+script carries a `--self-test`). Run what CI runs before you open a pull
+request: [docs/ci-parity.md](docs/ci-parity.md) shows how to run each CI lane
+locally.
 
 ## Questions? Found a Bug? Have a Request for New Features?
 Great. You can use GitHub Issues for any questions, suggestions, or issues. Please do not email individuals.
