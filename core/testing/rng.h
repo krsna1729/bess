@@ -17,6 +17,10 @@ inline std::mt19937 SeededRng(uint32_t seed) {
   return std::mt19937(seed);
 }
 
+inline std::mt19937_64 SeededRng64(uint64_t seed) {
+  return std::mt19937_64(seed);
+}
+
 }  // namespace bess::testing
 
 #endif  // BESS_TESTING_RNG_H_

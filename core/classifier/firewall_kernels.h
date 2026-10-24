@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_ARCH_MASKED_ADDR_H_
-#define BESS_ARCH_MASKED_ADDR_H_
+#ifndef BESS_CLASSIFIER_FIREWALL_KERNELS_H_
+#define BESS_CLASSIFIER_FIREWALL_KERNELS_H_
 
-// Masking the source and destination addresses of a classification key
-// against the prefix lengths of a rule (the firewall table, and any other
-// classifier that keys on a masked address pair).
+// The firewall table's kernel file (D-190): masking the source and destination
+// addresses of a classification key against the prefix lengths of a rule
+// (classifier/firewall_table.cc; another classifier that keys on a masked
+// address pair would promote it to core/arch/).
 //
 // One 16-byte load, one AND and one 16-byte store per address, written with
-// GCC/Clang vector extensions rather than intrinsics, as arch/vlan.h is: the
-// compiler emits SSE2 on x86-64 (the same `vmovdqu`/`vpand` intrinsics would)
-// and NEON on arm64, and plain loads where there is no vector unit. One path
+// GCC/Clang vector extensions rather than intrinsics, as
+// modules/vlan_kernels.h is: the compiler emits SSE2 on x86-64 (the same
+// `vmovdqu`/`vpand` intrinsics would) and NEON on arm64, and plain loads
+// where there is no vector unit. One path
 // for every target; nothing here depends on BESS_ARCH_*, so the
 // -Darch_generic build and the arm64 lanes compile this source too.
 //
@@ -61,4 +63,4 @@ inline void MaskedAddrPair16x2(void *out, const void *src, const void *dst,
 
 }  // namespace bess::arch
 
-#endif  // BESS_ARCH_MASKED_ADDR_H_
+#endif  // BESS_CLASSIFIER_FIREWALL_KERNELS_H_

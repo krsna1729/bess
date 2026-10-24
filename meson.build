@@ -50,8 +50,9 @@ fs = import('fs')
 # from these two options alone (M21). `cpu` is passed as -march=<cpu> on both
 # supported architectures: native, or a named baseline (x86_64: x86-64-v3, the
 # CI floor; aarch64: armv8.2-a, the CI floor); '' passes no flag (the
-# compiler's default ISA). `arch_generic` makes core/arch/ take its portable
-# paths so an x86 build compiles and tests what other architectures run.
+# compiler's default ISA). `arch_generic` makes core/arch/ and the owners'
+# *_kernels files (D-190) take their portable paths so an x86 build compiles
+# and tests what other architectures run.
 cpu_family = host_machine.cpu_family()
 if cpu_family not in ['x86_64', 'aarch64']
   warning('BESS is built and tested on x86_64 and aarch64; @0@ is unsupported'.format(cpu_family))

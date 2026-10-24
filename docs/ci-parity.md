@@ -63,7 +63,7 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
 - **Lanes.** `gcc-arm64` and `clang-arm64` run every step on
   `ubuntu-24.04-arm` with the gating compilers, AF_XDP required (Ubuntu 24.04
   ships libxdp/libbpf for arm64). `gcc-generic` is x86 with
-  `-Darch_generic=true`: `core/arch/` takes its portable paths, the ones a
+  `-Darch_generic=true`: `core/arch/` and the owner kernel files take their portable paths, the ones a
   third architecture runs, and everything (benchmarks too) builds and tests
   against them. All three are experimental (cannot block a merge) until they
   have been green; `check-pins` already holds them to the gating pins.
@@ -131,12 +131,24 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   filtered DPDK flags instead of requiring libdpdk, so plugins build for the
   same ISA; in `verify-install`, `check_installed_headers.py --march <cpu>`
   fails unless bess-dev's only machine flag is exactly that `-march`.
-- **Architecture code stays in `core/arch/`.** `tools/check_arch.py` (in
-  `layers` and the meson `architecture` suite) counts, outside `core/arch/`,
-  intrinsic-header includes, preprocessor conditions on architecture/ISA
-  macros, asm instructions and intrinsic uses, tests and benchmarks included.
-  `tools/arch_allowlist.json` grandfathers the existing ones per file with a
-  reason; any count above or below its entry fails, so the list only shrinks.
+- **Architecture code stays in `core/arch/` or an owner's kernel file.**
+  `tools/check_arch.py` (in `layers` and the meson `architecture` suite)
+  allows ISA code in `core/arch/` and in `<owner>_kernels.h`/`.cc` files
+  (D-190): there, a condition may name only `arch/cpu.h`'s `BESS_ARCH_*`
+  macros (no raw `__AVX2__` or `__aarch64__`, no `RTE_ARCH_*`,
+  `RTE_MACHINE_CPUFLAG_*` or `RTE_CPUFLAG_*`; conditions only, so a `#define`
+  alias is left to review), every ISA use sits in a branch whose condition
+  is `#ifdef M` or, with `defined(N)` written `defined N`, a chain of `&&`
+  terms without parentheses, `||`, `?` or `,`, one term exactly `M` or
+  `defined M` (`M` a `BESS_ARCH_*` feature macro, not `BESS_ARCH_GENERIC`),
+  so `-Darch_generic` compiles it out, and a
+  file with ISA code has an alternative branch (`#else` or
+  `BESS_ARCH_GENERIC`). Everywhere
+  else it counts intrinsic-header includes, preprocessor conditions on
+  architecture/ISA macros, asm instructions and intrinsic uses, tests and
+  benchmarks included. `tools/arch_allowlist.json` grandfathers the existing
+  ones per file with a reason; any count above or below its entry fails, so
+  the list only shrinks.
   It is edited by hand; `check_arch.py --report` prints the current counts in
   its format.
 - **Local DPDK patches apply and say why.** `layers` runs

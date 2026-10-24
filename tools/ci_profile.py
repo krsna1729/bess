@@ -88,9 +88,10 @@ LANES = [
     {'name': 'gcc', 'os': 'ubuntu-24.04', 'cc': 'gcc-14', 'cxx': 'g++-14'},
     # Clang 19 updates __cpp_concepts for libstdc++'s C++23 <expected>.
     {'name': 'clang', 'os': 'ubuntu-24.04', 'cc': 'clang-19', 'cxx': 'clang++-19'},
-    # x86 with -Darch_generic=true: core/arch/ takes the portable paths every
-    # other architecture runs, so they are built (benchmarks included) and
-    # tested; the gating lanes keep testing the x86 paths that ship.
+    # x86 with -Darch_generic=true: core/arch/ and the owners' *_kernels files
+    # take the portable paths every other architecture runs, so they are built
+    # (benchmarks included) and tested; the gating lanes keep testing the x86
+    # paths that ship.
     {'name': 'gcc-generic', 'os': 'ubuntu-24.04', 'cc': 'gcc-14', 'cxx': 'g++-14',
      'lane_args': '--arch-generic', 'experimental': True, 'push_only': True},
     # arm64: GitHub's ubuntu-24.04-arm runners (Azure Cobalt 100, Neoverse

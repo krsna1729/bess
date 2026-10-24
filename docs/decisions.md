@@ -6505,7 +6505,9 @@ has removed) a rule: a rule the device took is always tracked.
 ## D-071 Portability: one architecture boundary (core/arch), generic fallback for every kernel (M21)
 
 **Status:** accepted (2026-10-04). ARM64 is compiled and tested only by CI's new experimental lanes; nothing was built
-for aarch64 on this machine.
+for aarch64 on this machine. *Location rule amended by D-190*: ISA code may also live in an owner's
+`<owner>_kernels.{h,cc}` file; single-owner kernels moved out of `core/arch/` (`byte_match.h`, `vlan.h`,
+`word_probe.h`, and `masked_addr.h` from D-147). The guarantees below are unchanged.
 **Code:** `core/arch/` (new: `cpu.h`, `crc32c.h`, `signal_context.h`, `checksum_kernels.h`, `byte_match.h`, `vlan.h`,
 `tag_match.h`, `word_probe.h`, `fp_env.h`, tests); `core/utils/{copy,bits,checksum,time,common,mcslock,syscallthread,
 cuckoo_map}.h`, `http_parser.cc`; `core/utils/simd.{h,cc}` deleted; modules (vif, vlan_*, l2_table, l2_forward,
@@ -13221,3 +13223,101 @@ with the code it was in, so the baseline is lowered. `Firewall` is not rebased o
 
 **Revisit when:** the table classes and rule resources are installed (a plugin then needs no table of its own),
 or a module needs a key that is not dense.
+
+## D-190 Owner kernel files: low-level code stays with its owner
+
+**Status:** accepted (2026-10-24). Amends D-071's location rule; D-071's other guarantees are kept.
+**Code:** `core/classifier/firewall_kernels.h` (was `core/arch/masked_addr.h`), `core/l2/mac_table_kernels.h` (was
+`core/arch/word_probe.h`), `core/utils/http_parser_kernels.h` (was `core/arch/byte_match.h`),
+`core/modules/vlan_kernels.h` (was `core/arch/vlan.h`), their tests `*_kernels_test.cc` beside them (from
+`core/arch/kernels_test.cc`, plus a new contract test for the HTTP scan), `core/arch/cpu.h` (`BESS_ARCH_SSE4_2`,
+`BESS_ARCH_AVX2`), `core/arch/asm_shape.cc`, `core/meson.build`, `tools/check_arch.py`, `tools/check_includes.py`,
+`tools/api_classes.json`, docs.
+
+**Context.** D-071 made `core/arch/` the only place for ISA conditions, intrinsic headers and instruction asm. That
+kept the ISA code auditable, but it also put domain kernels with one user into the platform layer: the HTTP
+parser's byte scan, the MAC table's bucket probe, the firewall table's address mask and the VLAN modules' tag
+shifts. Each of these is part of its owner's design (the MAC table probe is correct only with the table's atomic
+re-check, D-017), and a reader of `core/arch/` had to find the owner to understand it. The performance work after
+the packet-safety PRs needs more such kernels (the parser's fixed IPv4 check, key gathers, MAC swaps), and each
+would otherwise have to be a "neutral" `core/arch/` primitive with one caller.
+
+**Decision.**
+- **The rule.** A module or library may use any low-level code it needs, intrinsics and asm included. It keeps that
+  code next to itself, in `<owner>_kernels.h` or `<owner>_kernels.cc` (the owner's own file name, or its family's:
+  `mac_table_kernels.h` for `packed_mac_table.h`). Module and library logic files stay free of ISA code. This
+  applies under `core/`, `sample_plugin/` and `examples/`.
+- **What stays in `core/arch/`.** The platform layer: `cpu.h` (the `BESS_ARCH_*` macros, cache line, `CpuRelax`,
+  cycle counter), `simd_dispatch.h` (`RuntimeDispatch`, the SIMD width, D-126), `dpdk_simd.h` (DPDK's SIMD limit,
+  internal), `fp_env.h` and `signal_context.h`; and primitives with several unrelated users: `crc32c.h`,
+  `checksum_kernels.h` and `tag_match.h`. `asm_shape.cc` stays as the probe of every kernel.
+- **Promotion.** When a second, unrelated owner needs a kernel, the kernel moves to `core/arch/` as a neutral
+  primitive. The kernel functions keep the `bess::arch` namespace wherever they live, so a promotion is a file move
+  and an include change, not a rename in the callers.
+- **The moves.** By their users (`git grep`): `masked_addr.h` is used only by the firewall table, so it is
+  `classifier/firewall_kernels.h`. Its operation is general (any classifier that masks an address pair), but
+  generality is what promotion is for; the file is named for its one owner. `word_probe.h` is used by
+  `l2/packed_mac_table.h` and its legacy bench, so it is `l2/mac_table_kernels.h`. `byte_match.h` is used only by
+  `utils/http_parser.cc`, so it is `utils/http_parser_kernels.h`. `vlan.h` is used by VLANPop, VLANPush,
+  VLANSplit and Vif, so it is `modules/vlan_kernels.h`. Content, instructions and behaviour are unchanged; the
+  two kernels that tested raw compiler macros (`__AVX2__`, `__SSE4_2__`) now test the equivalent `cpu.h` macros.
+
+**D-071's guarantees, kept and enforced.**
+- **One source of CPU-feature truth.** A kernel file outside `core/arch/` tests ISA features only through the
+  `BESS_ARCH_*` macros of `arch/cpu.h`. A preprocessor condition that names a raw compiler macro (`__AVX2__`,
+  `__SSE4_2__`, `__x86_64__`, `__aarch64__`, `__ARM_*`, ...), one of DPDK's ISA macros (`RTE_ARCH_*`,
+  `RTE_MACHINE_CPUFLAG_*`, `RTE_CPUFLAG_*`) or `__has_include(<immintrin.h>)` fails `tools/check_arch.py`. The DPDK
+  ones are refused because DPDK's view of the ISA comes from its own build flags, not from bessd's `-march`. `cpu.h`
+  derives the `BESS_ARCH_*` macros from the raw ones, so `core/arch/` stays exempt. `cpu.h` now also defines
+  `BESS_ARCH_SSE4_2` and `BESS_ARCH_AVX2` (AVX2 on x86-64); a new feature is a new macro there. Only conditions are
+  checked, as in the base tool: a `#define` that aliases a raw macro is not caught, and review covers it.
+- **A tested portable fallback.** `check_arch.py` checks two things in a kernel file. First, every ISA use (an
+  intrinsic-header include, an intrinsic, an asm instruction) is guarded: an enclosing `#if`, `#ifdef` or `#elif`
+  branch has a guard condition. A guard condition is `#ifdef M`, or an `#if`/`#elif` condition that, with comments
+  removed and each `defined(N)` written `defined N`, has no parenthesis, `||`, `?` or `,`, and is a chain of `&&`
+  terms, one of which is exactly `M` or `defined M`; the other terms may be anything. `M` is a `BESS_ARCH_*` feature
+  macro other than `BESS_ARCH_GENERIC` (`BESS_ARCH_X86`, `BESS_ARCH_ARM64`, `BESS_ARCH_AVX2`, `BESS_ARCH_SSE4_2`,
+  or a later one). Every C operator except `||`, `?:` and `,` binds tighter than `&&`, so such a condition is false
+  when `M` is undefined, and `cpu.h` leaves every `M` undefined in a `BESS_ARCH_GENERIC` build, so that build
+  compiles every ISA use out. An `#else` or `#ifndef` branch guards nothing, and neither does any other condition:
+  `!defined(M)`, `defined(M) == 0`, `defined(M) | 1`, `||`, a group in parentheses, or an unrelated macro such as
+  `NDEBUG`. A false positive only fails the lint. Second, a kernel file with ISA code has an alternative branch: an
+  `#else` directive or a condition that names `BESS_ARCH_GENERIC`.
+  The tool proves that the ISA code compiles out and that another branch exists, not that this branch is right.
+  The `-Darch_generic` and arm64 builds, and the kernel's identity test `<owner>_kernels_test.cc` beside it, which
+  the generic lane runs, prove that.
+- **Auditable ISA code.** ISA code is in `core/arch/` or in a file whose name says it is a kernel file, and nowhere
+  else: everywhere else the shrink-only allowlist (`tools/arch_allowlist.json`, the BPF JIT's 7 findings) still
+  applies, and the allowlist may not list a kernel file. `core/arch/asm_shape.cc` includes the owners' kernel
+  headers (a probe, not a library dependency; `tools/check_includes.py` exempts it from the `arch/` layering rule),
+  and [assembly-shape.md](assembly-shape.md) names each kernel's file.
+
+**Installed headers.** `arch/byte_match.h`, `arch/vlan.h` and `arch/word_probe.h` were installed as experimental.
+This is a clean cutover with no forwarding headers, which the experimental class allows. `l2/mac_table_kernels.h`
+is installed, experimental, because the installed `l2/packed_mac_table.h` includes it. `modules/vlan_kernels.h` and
+`utils/http_parser_kernels.h` are not installed: no installed header includes them, and their owners are not
+installed. A plugin that included one of the three old paths copies the kernel into its own kernel file.
+`classifier/firewall_kernels.h` was never installed and is not now. A kernel file of an owner that `api_classes.json`
+marks public would keep a forwarding header for one release; none is public.
+
+**Evidence.** No behaviour change: the moved kernels' tests are the old ones, unchanged except for their file (and
+a seeded 64-bit generator helper); the HTTP scan, which had no test of its own, gets one for its contract with the
+scalar loop. `core/arch/asm_shape.cc` compiled before and after (`g++ -O3 -march=x86-64-v3 -DNDEBUG`) gives the
+same instructions in all ten probe wrappers (319 lines, no difference). The fast build passes the full suite
+(287/287, daemon suites included); the `-Darch_generic` build compiles everything and passes the five kernel tests
+and their owners' tests. `verify-install` passes with the new installed set. `check_arch.py`'s self-test covers
+the kernel-file names, the kernel rules (guarded, negated, nested, `#else`-branch and unrelated-condition cases)
+and a tree scan in which the same intrinsic passes in `m_kernels.h` and fails in `m.cc`. Mutation checks on a
+copy of the tree: an intrinsic in `modules/vlan_pop.cc` fails; `__AVX2__` in `l2/mac_table_kernels.h` fails;
+`RTE_ARCH_X86` in a kernel file fails; an unguarded intrinsic-header include and intrinsic beside an unrelated
+`#ifndef NDEBUG`/`#else` fail; the probe body of `mac_table_kernels.h` with its `BESS_ARCH_AVX2` guard replaced by
+`#if 1` fails; the scan in `http_parser_kernels.h` under a negated guard fails; an intrinsic in a kernel file
+under `BESS_ARCH_X86` with a `BESS_ARCH_GENERIC` branch passes. The self-test also refuses guards that can be true
+without the feature macro (`!(defined(BESS_ARCH_X86))`, `defined(BESS_ARCH_X86) || defined(BESS_ARCH_GENERIC)`,
+`1 || defined(BESS_ARCH_X86)`, `defined(BESS_ARCH_X86) == 0`, `| 1`, `? 1 : 1`,
+`(defined(BESS_ARCH_X86) && 1) == 0`), accepts `defined(M)`, `defined M`, bare `M` and `&&` chains, and checks that
+comments on a condition line neither reject nor make a guard. The four moved kernel files pass as they are; each
+guard is a single `defined(BESS_ARCH_*)`.
+
+**Revisit when:** a kernel file grows a second unrelated owner (promote it), or a kernel file passes the guard
+check while its generic build is broken (then build the generic lane per kernel file instead).

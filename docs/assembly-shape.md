@@ -1,4 +1,4 @@
-# The assembly shape of `core/arch`'s kernels
+# The assembly shape of BESS's kernels
 
 Appendix J's "assembly review complete for critical kernels". The kernels are
 header-only, so their shape is what the *release* flags make of them: this page
@@ -33,18 +33,21 @@ page did exactly that, and swapped two bodies).
 
 ## What each kernel is
 
-| wrapper | kernel | the emitted body | header's claim |
+Kernels live in `core/arch/` (the shared primitives) or in their owner's
+`<owner>_kernels.h` (D-190); the probe includes both.
+
+| wrapper | kernel (header under `core/`) | the emitted body | header's claim |
 |---|---|---|---|
-| `k_crc64` | `Crc32c(uint64_t, uint32_t)` | `movl` + `crc32q %rdi, %rax` + `ret` | the instruction |
-| `k_sumwords` | `SumWords32` | four `vmovdqu` + four `vpunpck{h,l}dq` + eight `vpaddq` + `vextracti128`/`vpextrq`, then the `addq`/`adcq` chain, with the block loop (`jbe`) | "two ymm streams", "8 then 2 words per step" |
-| `k_addwords5` | `AddWords32<5>` | the inline asm: `addl (%rsi), %eax` + five `adcl` | "one add/adc chain" |
-| `k_skipbytes` | `SkipBytesOutsideRanges` | `vmovdqu` + `vpcmpestri $4, (%rdi), %xmm0`, the pointer arithmetic and the block loop | "SSE4.2 PCMPESTRI in ranges mode" |
-| `k_probe4` | `MaskedWordCandidates64x4` | `vmovdqa (%rdi), %ymm0` (the inline asm's 32-byte load) + two `vpbroadcastq` + `vpcmpeqq` + `vmovmskpd` + `vzeroupper` | "one 32-byte vector load, issued as inline assembly" |
-| `k_match16x8` | `MatchTags16x8` | `vpbroadcastw` + `vpcmpeqw` + `vpacksswb` + `vpmovmskb` + `vmovd` | "one vector compare, one mask" |
-| `k_match32x4` | `MatchHashes32x4` | `jmp` - the dispatch itself; the AVX2 callee is `vpbroadcastd` + `vpcmpeqd` + `vmovmskps`, and the scalar callee (local, no symbol) is `vpcmpeqd` + `vpand` + a `vpsrldq`/`vpor` fold | the dispatched AVX2 compare |
-| `k_vlan_remove` | `RemoveVlanTag` | `vmovdqu` + `vpslldq $4` + `vmovdqu` | "one 16-byte load, one byte shift, one store" |
-| `k_vlan_insert` | `InsertVlanTag` | `vmovdqu 4(%rdi)` + `vpinsrd $3` + `vmovdqu` | "one 16-byte load, one lane insert, one store" |
-| `k_maskpair16x2` | `MaskedAddrPair16x2` | two `vmovdqu` mask loads, two `vpand` with the address as the memory operand, two `vmovdqu` stores | "one 16-byte load, one AND and one 16-byte store per address" |
+| `k_crc64` | `Crc32c(uint64_t, uint32_t)` (`arch/crc32c.h`) | `movl` + `crc32q %rdi, %rax` + `ret` | the instruction |
+| `k_sumwords` | `SumWords32` (`arch/checksum_kernels.h`) | four `vmovdqu` + four `vpunpck{h,l}dq` + eight `vpaddq` + `vextracti128`/`vpextrq`, then the `addq`/`adcq` chain, with the block loop (`jbe`) | "two ymm streams", "8 then 2 words per step" |
+| `k_addwords5` | `AddWords32<5>` (`arch/checksum_kernels.h`) | the inline asm: `addl (%rsi), %eax` + five `adcl` | "one add/adc chain" |
+| `k_skipbytes` | `SkipBytesOutsideRanges` (`utils/http_parser_kernels.h`) | `vmovdqu` + `vpcmpestri $4, (%rdi), %xmm0`, the pointer arithmetic and the block loop | "SSE4.2 PCMPESTRI in ranges mode" |
+| `k_probe4` | `MaskedWordCandidates64x4` (`l2/mac_table_kernels.h`) | `vmovdqa (%rdi), %ymm0` (the inline asm's 32-byte load) + two `vpbroadcastq` + `vpcmpeqq` + `vmovmskpd` + `vzeroupper` | "one 32-byte vector load, issued as inline assembly" |
+| `k_match16x8` | `MatchTags16x8` (`arch/tag_match.h`) | `vpbroadcastw` + `vpcmpeqw` + `vpacksswb` + `vpmovmskb` + `vmovd` | "one vector compare, one mask" |
+| `k_match32x4` | `MatchHashes32x4` (`arch/tag_match.h`) | `jmp` - the dispatch itself; the AVX2 callee is `vpbroadcastd` + `vpcmpeqd` + `vmovmskps`, and the scalar callee (local, no symbol) is `vpcmpeqd` + `vpand` + a `vpsrldq`/`vpor` fold | the dispatched AVX2 compare |
+| `k_vlan_remove` | `RemoveVlanTag` (`modules/vlan_kernels.h`) | `vmovdqu` + `vpslldq $4` + `vmovdqu` | "one 16-byte load, one byte shift, one store" |
+| `k_vlan_insert` | `InsertVlanTag` (`modules/vlan_kernels.h`) | `vmovdqu 4(%rdi)` + `vpinsrd $3` + `vmovdqu` | "one 16-byte load, one lane insert, one store" |
+| `k_maskpair16x2` | `MaskedAddrPair16x2` (`classifier/firewall_kernels.h`) | two `vmovdqu` mask loads, two `vpand` with the address as the memory operand, two `vmovdqu` stores | "one 16-byte load, one AND and one 16-byte store per address" |
 
 Every body is three to forty instructions, with no call, and the only branches
 are the two length loops (`SkipBytesOutsideRanges`, `SumWords32`). The three

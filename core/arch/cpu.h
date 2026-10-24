@@ -4,13 +4,15 @@
 #define BESS_ARCH_CPU_H_
 
 // CPU primitives every architecture provides (M21, D-071): the cache-line
-// size, a spin-wait hint and a cycle counter. This directory is the one place
-// for architecture branches and intrinsics; libraries call these functions
+// size, a spin-wait hint and a cycle counter, and the one source of the
+// build's CPU features. Architecture branches and intrinsics live in core/arch/
+// and in owner kernel files (`<owner>_kernels.h`, D-190), which test features
+// only through the BESS_ARCH_* macros below; libraries call these functions
 // (tools/check_arch.py keeps it so).
 //
-// BESS_ARCH_GENERIC (meson -Darch_generic=true) makes every arch header take
-// its portable path, so an x86 build compiles and tests what other
-// architectures run.
+// BESS_ARCH_GENERIC (meson -Darch_generic=true) makes every arch header and
+// kernel file take its portable path, so an x86 build compiles and tests what
+// other architectures run.
 
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +23,15 @@
 #include <x86intrin.h>
 #elif !defined(BESS_ARCH_GENERIC) && defined(__aarch64__)
 #define BESS_ARCH_ARM64 1
+#endif
+
+// The ISA features the build's -march (-Dcpu) enables, for kernel files:
+// undefined in a BESS_ARCH_GENERIC build. Add one here when a kernel needs it.
+#if defined(BESS_ARCH_X86) && defined(__SSE4_2__)
+#define BESS_ARCH_SSE4_2 1
+#endif
+#if defined(BESS_ARCH_X86) && defined(__x86_64__) && defined(__AVX2__)
+#define BESS_ARCH_AVX2 1  // AVX2 on x86-64 (not 32-bit x86)
 #endif
 
 namespace bess::arch {

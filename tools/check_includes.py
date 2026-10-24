@@ -176,9 +176,11 @@ FORBIDDEN_RULES = [
         ],
     ),
     # The architecture primitives (M21, D-071) are the bottom layer: nothing
-    # from BESS, only system and DPDK headers.
+    # from BESS, only system and DPDK headers. The assembly-shape probe
+    # (arch/asm_shape.cc) is not a library: it includes the owners' kernel
+    # headers (D-190), and nothing links it.
     (
-        re.compile(r"^core/arch/"),
+        re.compile(r"^core/arch/(?!asm_shape\.cc$)"),
         [
             ("utils/", "arch must not depend on utils"),
             ("module.h", "arch must not depend on Module"),
@@ -426,6 +428,8 @@ SELF_TEST_CLEAN = [
     ("core/flow/a.h", '#include "flow_key.h"'),
     # tests are exempt from layering, not from the '..' ban
     ("core/dataplane/a_test.cc", '#include "runtime/runtime_state.h"'),
+    # the assembly-shape probe may include an owner's kernel header (D-190)
+    ("core/arch/asm_shape.cc", '#include "utils/http_parser_kernels.h"'),
 ]
 
 

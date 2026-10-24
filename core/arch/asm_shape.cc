@@ -3,10 +3,13 @@
 // The assembly-shape probe for docs/assembly-shape.md (roadmap Appendix J:
 // "assembly review complete for critical kernels").
 //
-// Every kernel in arch/ is `inline` in a header, so no archive carries a symbol
-// to disassemble. This unit calls each one behind a `noinline` wrapper, and
-// Meson builds it as bess_arch_asm_shape (nothing links or installs it), so
-// every lane compiles the probe with the real flags. Read the assembly from the
+// Every kernel, in arch/ or in an owner's `*_kernels.h` (D-190), is `inline`
+// in a header, so no archive carries a symbol to disassemble. This unit calls
+// each one behind a `noinline` wrapper, and Meson builds it as
+// bess_arch_asm_shape (nothing links or installs it), so every lane compiles
+// the probe with the real flags. It is a probe, not a library: including the
+// owners' kernel headers adds no dependency of arch/ on them
+// (tools/check_includes.py exempts this file). Read the assembly from the
 // built archive:
 //
 //   ninja -C build/perf-release core/libbess_arch_asm_shape.a
@@ -26,13 +29,13 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "arch/byte_match.h"
 #include "arch/checksum_kernels.h"
 #include "arch/crc32c.h"
-#include "arch/masked_addr.h"
 #include "arch/tag_match.h"
-#include "arch/vlan.h"
-#include "arch/word_probe.h"
+#include "classifier/firewall_kernels.h"
+#include "l2/mac_table_kernels.h"
+#include "modules/vlan_kernels.h"
+#include "utils/http_parser_kernels.h"
 
 using namespace bess::arch;
 

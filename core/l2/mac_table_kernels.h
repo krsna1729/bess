@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#ifndef BESS_ARCH_WORD_PROBE_H_
-#define BESS_ARCH_WORD_PROBE_H_
+#ifndef BESS_L2_MAC_TABLE_KERNELS_H_
+#define BESS_L2_MAC_TABLE_KERNELS_H_
 
-// Probing a bucket of four 64-bit words that a writer replaces concurrently,
-// one atomic store per word (L2Forward's MAC table, D-017) (M21, D-071).
+// The MAC table's kernel file (D-190): probing a bucket of four 64-bit words
+// that a writer replaces concurrently, one atomic store per word (L2Forward's
+// MAC table, l2/packed_mac_table.h, D-017) (M21, D-071).
 
 #include <cstdint>
 
 #include "arch/cpu.h"
 
-#if defined(BESS_ARCH_X86) && defined(__x86_64__) && defined(__AVX2__)
-#define BESS_ARCH_WORD_PROBE_AVX2 1
+#if defined(BESS_ARCH_AVX2)
 #include <immintrin.h>
 #endif
 
@@ -30,7 +30,7 @@ namespace bess::arch {
 inline unsigned MaskedWordCandidates64x4([[maybe_unused]] const void *words,
                                          [[maybe_unused]] uint64_t mask,
                                          [[maybe_unused]] uint64_t want) noexcept {
-#if defined(BESS_ARCH_WORD_PROBE_AVX2)
+#if defined(BESS_ARCH_AVX2)
   // The four words are read with one 32-byte vector load, issued as inline
   // assembly: a C++ vector load of words the writer stores atomically would
   // be a data race in the language (undefined behaviour), while the asm is
@@ -62,4 +62,4 @@ inline unsigned MaskedWordCandidates64x4([[maybe_unused]] const void *words,
 
 }  // namespace bess::arch
 
-#endif  // BESS_ARCH_WORD_PROBE_H_
+#endif  // BESS_L2_MAC_TABLE_KERNELS_H_

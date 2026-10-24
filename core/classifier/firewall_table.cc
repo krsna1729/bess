@@ -8,7 +8,7 @@
 #include <tuple>
 #include <utility>
 
-#include "arch/masked_addr.h"
+#include "classifier/firewall_kernels.h"
 #include "utils/common.h"
 
 namespace bess::classifier {
@@ -111,7 +111,7 @@ FirewallAddr MaskBytes(uint8_t len, FirewallFamily family) {
 FirewallAddr FirewallTable::MaskedAddr(const FirewallAddr &addr, uint8_t len,
                                        FirewallFamily family) noexcept {
   // The build path, once per rule: a loop is right here. The packet path
-  // masks a whole pair with the arch kernel (arch/masked_addr.h).
+  // masks a whole pair with the table's kernel (classifier/firewall_kernels.h).
   const FirewallAddr mask = MaskBytes(len, family);
   FirewallAddr out{};
   const size_t bytes = FamilyBytes(family);

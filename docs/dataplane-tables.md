@@ -233,7 +233,7 @@ transport header - and a packet the table cannot judge (a non-IP frame, a
 truncated header) is dropped rather than passed by a catch-all rule. A
 fragment whose ports cannot be read is looked up with both ports 0, so only a
 rule whose range starts at 0 can match it. Masking is the `MaskedAddrPair16x2`
-kernel (`arch/masked_addr.h`); an IPv4 key is one 64-bit register, so its whole
+kernel (`classifier/firewall_kernels.h`); an IPv4 key is one 64-bit register, so its whole
 masking step is two 32-bit loads, a shift, an OR and an AND.
 
 **Actions.** A rule carries an `action_id` (D-141) beside its `drop` flag: the
