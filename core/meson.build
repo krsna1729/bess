@@ -1046,8 +1046,9 @@ test(
   args: [files('../tools/check_limits.py'), '--self-test'],
   suite: 'architecture',
 )
-# Architecture code stays in core/arch/; the allowlist grandfathers the rest
-# and only shrinks (M21, D-071).
+# Architecture code stays in core/arch/ or in an owner's *_kernels.{h,cc} file
+# (BESS_ARCH_* conditions only, with a portable branch); the allowlist
+# grandfathers the rest and only shrinks (M21, D-071, D-190).
 test(
   'check_arch',
   python,
