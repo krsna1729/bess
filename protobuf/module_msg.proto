@@ -721,6 +721,11 @@ message GenericDecapArg {
  * for each packet.
  * An example script using GenericEncap is in [`bessctl/conf/samples/generic_encap.yaml`](./bessctl/conf/samples/generic_encap.yaml).
  *
+ * The header goes into the packet's headroom. A shared payload (a clone, an
+ * indirect mbuf) is copied first (D-153), as its headroom is the other
+ * holders' buffer too. A packet without the headroom, or whose copy fails,
+ * is dropped, never forwarded without the header.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
