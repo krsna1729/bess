@@ -74,6 +74,7 @@ Columns:
 | HashLB | gates | 16,384 | `HashLB::kMaxGates` | No | EINVAL |
 | HashLB | custom-tuple fields; bytes per field; packet offset | 8; 8; 0-1,024 | `HashLB::kMaxFields`, `kMaxFieldSize`, `kMaxFieldOffset` | No | EINVAL |
 | RandomSplit / RoundRobin | gates | 16,384 | `MAX_SPLIT_GATES`, `MAX_RR_GATES` | No | EINVAL |
+| Split | value size; packet offset | 1-8 B; 0-1,024, and `offset` + `size` at most the packet data room | `Split::Init` (`split.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet whose first segment ends before `offset` + `size` is dropped |
 | VLANSplit | gates | 4,096 (one per VID) | `kNumOGates` | No | — |
 | WorkerSplit | gates | 64 (one per worker) | `kNumOGates` | No | — |
 | L2Forward | table size; bucket | 64M (default 1,024); 4 | `kMaxTableSize`, `kDefaultTableSize`, `kMaxBucketSize` (`l2_forward.cc`) | `size`, `bucket` | EINVAL |

@@ -1373,6 +1373,12 @@ message L4ChecksumArg {
  * based on data in the packet (e.g., if the read in value is 3, the packet
  * is directed out output gate 3).
  *
+ * With `offset`, the value is the `size` bytes at `offset` in the packet's
+ * first segment. `offset` is at most 1024, and `offset` + `size` must fit
+ * the packet data room (`--packet_data_room`); otherwise the module is
+ * refused (EINVAL). A packet whose first segment ends before `offset` +
+ * `size` has no value: it is dropped.
+ *
  * __Input Gates__: 1
  * __Output Gates__: many (up to 2^(size * 8))
  */
