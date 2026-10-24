@@ -843,6 +843,7 @@ unit_test_sources = [
   'modules/ipswap_test.cc',
   'modules/static_nat_test.cc',
   'modules/ip_checksum_test.cc',
+  'modules/l4_checksum_test.cc',
   'modules/replicate_test.cc',
   'modules/ether_encap_test.cc',
   'modules/set_metadata_test.cc',

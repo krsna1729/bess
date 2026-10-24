@@ -34,8 +34,7 @@ using bess::live::Types;
 using bess::testing::Bytes;
 using bess::testing::PacketBuilder;
 
-// UDP: L4Checksum computes a TCP checksum without forwarding the packet when
-// not verifying, so TCP traffic would stop there.
+// A UDP frame: L4Checksum recomputes its checksum (the AVX2 kernels' path).
 Bytes Udp() {
   return PacketBuilder()
       .Ether("02:00:00:00:00:02", "02:00:00:00:00:01")

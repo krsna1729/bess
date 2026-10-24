@@ -1022,6 +1022,14 @@ std::vector<Test> Catalogue() {
          R"({"pairs": [{"int_range": {"start": "10.0.0.0", "end": "10.0.255.255"},)"
          R"( "ext_range": {"start": "192.0.0.0", "end": "192.0.255.255"}}]})",
          2)},
+      // The checksum modules. RandomUpdate rewrites the source address, so
+      // the IPv4 checksum the frame carries is wrong and verify sends most
+      // frames out of gate 1; the UDP checksum is 0 ("none"), which verify
+      // passes. Without verify each frame's checksum is recomputed.
+      {"M.ip_checksum", 'M', m("IPChecksum", "ipc", "{}", 1)},
+      {"M.ip_checksum/verify", 'M', m("IPChecksum", "ipc", R"({"verify": true})", 2)},
+      {"M.l4_checksum", 'M', m("L4Checksum", "l4c", "{}", 1)},
+      {"M.l4_checksum/verify", 'M', m("L4Checksum", "l4c", R"({"verify": true})", 2)},
       {"M.nat", 'M',
        m("NAT", "nat",
          R"({"ext_addrs": [{"ext_addr": "192.0.2.1", "port_ranges": [{"begin": 1024, "end": 65535}]}]})",

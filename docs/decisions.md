@@ -9077,9 +9077,9 @@ runner the 512 case expects 512.
 
 **Not done.** AVX-512 variants of BESS kernels (hardware-blocked, above). Found while writing the live test, not
 changed here: L4Checksum with `verify` false computes a TCP checksum and never emits the packet (an `else` without
-braces, `core/modules/l4_checksum.cc`), so TCP traffic stops there; and DRR behind a rate-limited traffic class
-forwarded exactly 2 x `num_flows` - 1 packets (8,191 for 4,096 flows, 32,767 for 16,384) in 1.5 s at a 1 Mpps
-limit, then nothing.
+braces, `core/modules/l4_checksum.cc`), so TCP traffic stops there (Fixed in PR #88: L4Checksum now forwards or
+drops every packet.); and DRR behind a rate-limited traffic class forwarded exactly 2 x `num_flows` - 1 packets
+(8,191 for 4,096 flows, 32,767 for 16,384) in 1.5 s at a 1 Mpps limit, then nothing.
 
 **Code.** `core/arch/simd_dispatch.h` (new, installed, experimental in `tools/api_classes.json`),
 `core/arch/dpdk_simd.h` (new, internal), `core/arch/tag_match.h`, `core/runtime/simd_width.{h,cc}` (new),
