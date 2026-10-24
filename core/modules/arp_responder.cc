@@ -6,17 +6,19 @@
 
 #include <any>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
 
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_codec.h"
+#include "packet_reshape.h"
+#include "route/l3_packet.h"
 #include "utils/arp.h"
 
 namespace dataplane = bess::dataplane;
 using bess::utils::Arp;
-using bess::utils::be16_t;
 
 // The entries are the "<module>/entries" resource (D-129); the class has no
 // actions.
@@ -208,47 +210,48 @@ CommandResponse ArpResponder::Add(const bess::pb::ArpResponderArg &arg) {
   return CommandSuccess();
 }
 
+// The request is read with the resolution library's ARP parse
+// (route::ParseArp): an Ethernet frame whose first segment holds the 42-byte
+// IPv4-over-Ethernet ARP message (EtherType, hardware and protocol types and
+// lengths). Anything else -- not ARP, a runt, a chain split inside the
+// message, another hardware or protocol type -- is dropped, as non-ARP frames
+// always were. A request for an entry's address is rewritten in place into
+// the reply (route::AnswerArpRequest, as Vif answers): a shared payload is
+// copied first (D-153), and a frame whose copy fails is dropped. Replies,
+// other opcodes and requests for other addresses are dropped.
 void ArpResponder::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   for (bess::PacketRef pkt : batch->packets()) {
     // we should drop-or-emit each packet
-    Ethernet *eth = pkt.head_data<Ethernet *>();
-    if (eth->ether_type != be16_t(Ethernet::Type::kArp)) {
-      // Currently drop all non ARP packets
+    const std::optional<bess::route::ArpMessage> arp =
+        bess::route::ParseArp(std::span<const uint8_t>(
+            pkt.head_data<const uint8_t *>(), pkt.head_len()));
+    // TODO(galsagie) When learn is added, learn SRC MAC from requests and
+    // replies here.
+    if (!arp || arp->opcode != Arp::Opcode::kRequest) {
       DropPacket(ctx, pkt);
       continue;
     }
 
-    Arp *arp = reinterpret_cast<Arp *>(eth + 1);
-    if (arp->opcode == be16_t(Arp::Opcode::kRequest)) {
-      // TODO(galsagie) When learn is added, learn SRC MAC here
-
-      // Try to find target IP in cache, if exists convert request to reply
-      auto it = entries_.find(arp->target_ip_addr);
-      if (it != entries_.end()) {
-        const struct arp_entry &entry = it->second;
-        arp->opcode = be16_t(Arp::Opcode::kReply);
-
-        eth->dst_addr = eth->src_addr;
-        eth->src_addr = entry.mac_addr;
-
-        arp->target_hw_addr = arp->sender_hw_addr;
-        arp->sender_hw_addr = entry.mac_addr;
-
-        arp->target_ip_addr = arp->sender_ip_addr;
-        arp->sender_ip_addr = entry.ip_addr;
-        EmitPacket(ctx, pkt, 0);
-      } else {
-        // Did not find an ARP entry in cache, drop packet
-        // TODO(galsagie) Optinally emit packet to next module here
-        DropPacket(ctx, pkt);
-      }
-    } else if (arp->opcode == be16_t(Arp::Opcode::kReply)) {
-      // TODO(galsagie) When learn is added, learn SRC MAC here
+    // Try to find target IP in cache, if exists convert request to reply
+    auto it = entries_.find(arp->target_ip);
+    if (it == entries_.end()) {
+      // Did not find an ARP entry in cache, drop packet
+      // TODO(galsagie) Optinally emit packet to next module here
       DropPacket(ctx, pkt);
-    } else {
-      // TODO(galsagie) Other opcodes are not handled yet.
-      DropPacket(ctx, pkt);
+      continue;
     }
+
+    const struct arp_entry &entry = it->second;
+    bess::PacketHandle handle = pkt.handle();
+    const auto head = bess::packet::WritableHead(handle, bess::route::kArpFrameSize);
+    if (unlikely(!head) ||
+        !bess::route::AnswerArpRequest(
+            std::span<uint8_t>(reinterpret_cast<uint8_t *>(head->data()), head->size()),
+            entry.mac_addr, entry.ip_addr)) {
+      DropPacket(ctx, bess::PacketRef(handle));
+      continue;
+    }
+    EmitPacket(ctx, bess::PacketRef(handle), 0);
   }
 }
 

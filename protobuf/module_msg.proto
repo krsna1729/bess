@@ -1499,6 +1499,18 @@ message WildcardMatchArg {
  * The ARP Responder module is responding to ARP requests.
  * It has a function `add(...)` which adds one IP-MAC mapping.
  *
+ * A request for an entry's address is rewritten in place into the reply, as
+ * Vif's local responder answers. The reply's Ethernet destination is the
+ * request's ARP sender hardware address, not its Ethernet source: RFC 826
+ * sends the reply "to the (new) target hardware address", and Linux's
+ * arp_process does the same (arp_send_dst with dest_hw = sha). Only
+ * IPv4-over-Ethernet ARP is answered (hardware type
+ * 1, protocol 0x0800, lengths 6 and 4, the 42-byte message in the frame's
+ * first segment); every other frame is dropped, as are replies, other opcodes
+ * and requests for other addresses. A request whose payload is shared (a
+ * clone) is copied first, so the payload's other holders never see the reply
+ * (D-153), and a request whose copy fails is dropped.
+ *
  * TODO: Dynamic learn new MAC's-IP's mapping
  *
  * __Input Gates__: 1
