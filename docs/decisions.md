@@ -13169,6 +13169,10 @@ had to copy all of it, and could not build the copy from installed headers.
   the batch, and reads the default gate after the lookup call, so it is not reloaded from the stack per miss.
   `ConcurrentMaskedTable::RuleAt`, the per-winner record load, is always inlined, as `RecordArena::Lookup`
   already was: left to the inliner, a small change in the caller made it a call per packet.
+- **A one-field key extracts without a per-key width dispatch.** `ExtractPlan::Compile` picks a single-op
+  kernel by source, width (1, 2, 4, 8, 16, 32, else a runtime width) and mask, as `ResultPlan::SelectSingle`
+  does. The kernel it replaces switched on the op's width through a jump table inside the per-key loop, four
+  taken branches per key, and that 32-key loop's exit was mispredicted at most code placements.
 - **Installed, experimental**, by D-147's procedure (`core/meson.build`, `tools/api_classes.json`, this record):
   `framework/table_fields.h`, `framework/table_batch.h`, `classifier/table_schema.h`, and the classifier headers
   their signatures name, `extract_plan.h`, `runtime_schema.h`, `plan_copy.h`, `result_plan.h` and
@@ -13179,10 +13183,12 @@ had to copy all of it, and could not build the copy from installed headers.
 feeds one 32-packet batch per iteration through each module, keys of one or two fields, gate only, metadata
 results, or a metadata plus a packet result, all hits or all misses; and adds and erases a rule through
 `<name>/rules`. `tools/ab_bench.py`, develop plus the benches against this change, release, `-Dcpu=x86-64-v3`,
-pinned to one P-core of a shared desktop host (Raptor Lake). Every case of `modules_match_path_bench` (8 rounds),
-`modules_exact_match_transaction_bench` `BM_ModuleClassify`, `classifier_range_vs_firewall_bench`
-`BM_ModuleUpdate/0` and `modules_exact_match_update_bench` reads "no clear difference" or faster (`WildcardMatch`
-one-field gate-only hits -3.0%, two-field metadata misses -3.2%, one-field metadata misses -3.4..-3.9%).
+pinned to one P-core of a shared desktop host (Raptor Lake). Every case of `modules_match_path_bench` (16 rounds,
+and pooled over eight text shifts), every `ExtractPlan` case of `modules_exact_match_bench`,
+`modules_wildcard_match_bench`, `classifier_bench` and `classifier_typed_bench`, `modules_wildcard_match_update_bench`
+and `modules_exact_match_update_bench` `BM_Lookup`, `BM_ModuleClassify` and `BM_ModuleUpdate/0` reads "no clear
+difference" or faster (`WildcardMatch` one-field cases -4.7..-8.3% pooled; one-field `ExtractPlan` extraction
+-35..-66%).
 
 A first version read `WildcardMatch` two-field placed results +2.1% (metadata) and +2.7% (metadata and packet),
 no round faster. Two causes, told apart by moving the whole binary's code against the DPDK libraries in 256-byte
@@ -13199,11 +13205,14 @@ steps (a padding block in the bench's own translation unit, both sides):
   so its move from a 64-byte to a 32-byte boundary was not the cause. Any edit anywhere moves this.
 
 So `WildcardMatch`'s two-field and one-field cases were also measured over eight shifts of both binaries, four ABBA
-rounds each, pooled: every case reads "no clear difference" (pooled paired B/A 0.985-1.012). At the single
-unshifted link, two-field metadata-and-packet hits still read +2.2% with no round faster, and two-field gate-only
-misses +1.7%; pooled over the shifts they are 1.009 (7 of 32 pairs faster) and 1.012 (8 of 32). The latter path
-runs about one more instruction per miss: the compiler keeps the default gate on the stack rather than in a
-register. `modules_exact_match_bench` and `modules_wildcard_match_bench` exercise library code only.
+rounds each, pooled. One-field gate-only misses then read +3.4% (1 of 32 pairs faster) with as many instructions:
+the exits of the extraction loop and of rte_hash's 32-key signature-compare loop mispredicted while the loop
+stream detector replayed those loops, at 11 of 16 placements of this change. Develop shows the same at one
+64-byte shift (0.9 mispredictions and 235 LSD uops per batch against 0.2 and 65 elsewhere, more in other runs),
+and moving the stack does not change it. The single-op extraction kernel above removed the extraction loop's
+share; rte_hash's loop stays
+placement-sensitive on both sides. With it the case reads -5.0% pooled (31 of 32 faster) and 614 fewer
+instructions per batch.
 
 **Consequences.** `wildcard_match.{h,cc}` goes from 1,446 to 860 lines and `exact_match.{h,cc}` from 1,592 to
 998; the helpers are 936. A plugin can compose a table-backed module from installed headers. The offset cast
