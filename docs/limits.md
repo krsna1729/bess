@@ -111,6 +111,7 @@ Columns:
 | DRR | default quantum; per-flow queue | 1,500 B; 2,048 growing ×2 to 8,192 | `kDefaultQuantum`, `kFlowQueueSize`, `kFlowQueueMax` | `quantum`, `max_flow_queue_size` | — |
 | Measure | jitter sample probability | 0.05 | `kDefaultIpDvSampleProb` | `jitter_sample_prob` | — |
 | Timestamp | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Timestamp::Init` (`timestamp.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet the stamp cannot be placed in, in its first segment, is dropped (D-172) |
+| Measure | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Measure::Init` (`measure.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet whose first segment ends before the stamp's end is forwarded, not measured |
 | FlowGen | smallest TCP packet | 60 B | `kMinTcpPacketSize` (`flowgen.cc`) | No | — |
 | unix_socket port | idle poll interval | 50 µs | `UnixSocketPort::kDefaultMinRxInterval` | port argument `min_rx_interval_ns` | — |
 | VXLANEncap | UDP destination port | 4789 | `VXLANEncap::kDefaultDstPort` | `dstport` | — |

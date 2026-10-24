@@ -867,6 +867,12 @@ message MACSwapArg {
  * This module is somewhat experimental and undergoing various changes.
  * There is a test for the Measure module (with Timestamp) in [`tests/live/module_traffic_test.cc`](./tests/live/module_traffic_test.cc).
  *
+ * With `offset`, Measure looks for Timestamp's 12-byte in-packet stamp at
+ * `offset` in the packet's first segment; `offset` + 12 must fit the packet
+ * data room (`--packet_data_room`), or the module is refused (EINVAL). A
+ * packet whose first segment ends before the stamp's end carries no stamp:
+ * it is counted and forwarded, not measured. Measure forwards every packet.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
