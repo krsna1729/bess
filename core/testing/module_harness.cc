@@ -153,6 +153,46 @@ bess::PacketHandle MakePacket(const Bytes &bytes, size_t split) {
   return head;
 }
 
+bess::PacketHandle MakeChain(const Bytes &bytes, size_t segment) {
+  if (segment == 0 || bytes.empty()) {
+    ADD_FAILURE() << "a chain needs bytes and a segment size";
+    return nullptr;
+  }
+  bess::PacketHandle head = nullptr;
+  for (size_t at = 0; at < bytes.size(); at += segment) {
+    bess::PacketHandle next = Segment(bytes.data() + at, std::min(segment, bytes.size() - at));
+    if (next == nullptr || (head != nullptr && rte_pktmbuf_chain(head, next) != 0)) {
+      ADD_FAILURE() << "cannot chain a test packet";
+      bess::PacketFree(next);
+      bess::PacketFree(head);
+      return nullptr;
+    }
+    if (head == nullptr) {
+      head = next;
+    }
+  }
+  return head;
+}
+
+bess::PacketHandle MakePacketWithoutHeadroom(const Bytes &bytes) {
+  bess::PacketHandle h = MakePacket(bytes);
+  if (h == nullptr) {
+    return nullptr;
+  }
+  std::memmove(h->buf_addr, bess::PacketRef(h).head_data(), bytes.size());
+  h->data_off = 0;
+  return h;
+}
+
+Bytes HeadroomBytes(bess::PacketHandle packet, size_t n) {
+  const auto *data = bess::PacketRef(packet).head_data<const uint8_t *>();
+  return Bytes(data - n, data);
+}
+
+void FillHeadroom(bess::PacketHandle packet, size_t n, uint8_t value) {
+  std::fill_n(bess::PacketRef(packet).head_data<uint8_t *>() - n, n, value);
+}
+
 void InitModuleTests() {
   static const bool done = [] {
     FLAGS_m = 0;  // malloc-backed pools: no hugepages, no root

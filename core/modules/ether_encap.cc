@@ -4,9 +4,23 @@
 
 #include "ether_encap.h"
 
+#include "packet_reshape.h"
 #include "utils/ether.h"
 
 using bess::utils::Ethernet;
+
+namespace {
+
+// Fills the Ethernet header PrependWritable made room for.
+void WriteHeader(bess::packet::MutableBytes header, const Ethernet::Address &src,
+                 const Ethernet::Address &dst, bess::utils::be16_t ether_type) {
+  auto *eth = reinterpret_cast<Ethernet *>(header.data());
+  eth->dst_addr = dst;
+  eth->src_addr = src;
+  eth->ether_type = ether_type;
+}
+
+}  // namespace
 
 enum {
   ATTR_R_ETHER_SRC,
@@ -25,17 +39,15 @@ CommandResponse EtherEncap::Init(
   return CommandSuccess();
 };
 
-bool EtherEncap::Encap(bess::PacketRef pkt,
+bool EtherEncap::Encap(bess::PacketHandle &pkt,
                        const Ethernet::Address &src,
                        const Ethernet::Address &dst,
                        bess::utils::be16_t ether_type) {
-  Ethernet *eth = static_cast<Ethernet *>(pkt.prepend(sizeof(*eth)));
-  if (unlikely(!eth)) {
+  const auto header = bess::packet::PrependWritable(pkt, sizeof(Ethernet));
+  if (unlikely(!header)) {
     return false;
   }
-  eth->dst_addr = dst;
-  eth->src_addr = src;
-  eth->ether_type = ether_type;
+  WriteHeader(*header, src, dst, ether_type);
   return true;
 }
 
@@ -44,22 +56,30 @@ void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const auto dst_off = attr_offset(ATTR_R_ETHER_DST);
   const auto type_off = attr_offset(ATTR_R_ETHER_TYPE);
 
+  const int cnt = batch->cnt();
   int out_cnt = 0;
-  for (bess::PacketRef pkt : batch->packets()) {
+  for (int i = 0; i < cnt; i++) {
+    bess::PacketHandle pkt = batch->handles()[i];
+    const bess::PacketRef ref(pkt);
     const Ethernet::Address ether_src =
-        get_attr_with_offset<Ethernet::Address>(src_off, pkt);
+        get_attr_with_offset<Ethernet::Address>(src_off, ref);
     const Ethernet::Address ether_dst =
-        get_attr_with_offset<Ethernet::Address>(dst_off, pkt);
+        get_attr_with_offset<Ethernet::Address>(dst_off, ref);
     const bess::utils::be16_t ether_type =
-        get_attr_with_offset<bess::utils::be16_t>(type_off, pkt);
+        get_attr_with_offset<bess::utils::be16_t>(type_off, ref);
 
-    if (unlikely(!Encap(pkt, ether_src, ether_dst, ether_type))) {
-      // No headroom: forwarding the payload would put a frame on the wire
-      // without the header the graph configured. Drop and keep the rest.
-      EmitPacket(ctx, pkt, DROP_GATE);
+    // The prepend itself, not Encap: a call per packet would keep the
+    // inline case out of this loop.
+    const auto header = bess::packet::PrependWritable(pkt, sizeof(Ethernet));
+    if (unlikely(!header)) {
+      // No headroom, or a shared payload whose copy failed: forwarding the
+      // payload would put a frame on the wire without the header the graph
+      // configured. Drop and keep the rest.
+      DropPacket(ctx, bess::PacketRef(pkt));
       continue;
     }
-    batch->handles()[out_cnt++] = pkt.handle();
+    WriteHeader(*header, ether_src, ether_dst, ether_type);
+    batch->handles()[out_cnt++] = pkt;
   }
   batch->set_cnt(out_cnt);
 

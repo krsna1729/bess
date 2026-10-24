@@ -22,6 +22,7 @@
 #include <google/protobuf/message.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
@@ -45,6 +46,23 @@ void InitModuleTests();
 // nullptr (and a test failure) when it cannot be built. After a ModuleHarness
 // exists (the pool is its).
 bess::PacketHandle MakePacket(const Bytes &bytes, size_t split = 0);
+
+// `bytes` as a chain of segments of `segment` bytes each (the last one
+// shorter), from the harness's pool: a packet longer than one mbuf holds,
+// such as one past the 65,535 bytes an IPv4 or UDP length counts. nullptr
+// (and a test failure) when it cannot be built.
+bess::PacketHandle MakeChain(const Bytes &bytes, size_t segment);
+
+// `bytes` as a one-segment packet with no headroom: its data starts at its
+// buffer's start, so a prepend has nowhere to go. nullptr (and a test
+// failure) when it cannot be built.
+bess::PacketHandle MakePacketWithoutHeadroom(const Bytes &bytes);
+
+// The `n` bytes of `packet`'s headroom right before its data (where a prepend
+// writes), and a fill of them: a test that shares the payload checks that
+// the other holder's headroom stays.
+Bytes HeadroomBytes(bess::PacketHandle packet, size_t n);
+void FillHeadroom(bess::PacketHandle packet, size_t n, uint8_t value);
 
 // A packet's bytes, across its segments.
 Bytes PacketBytes(bess::PacketHandle packet);
