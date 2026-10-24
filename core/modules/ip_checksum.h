@@ -13,7 +13,7 @@ class IPChecksum final : public Module {
  public:
   IPChecksum() : Module(), verify_(false) { max_allowed_workers_ = Worker::kMaxWorkers; }
 
-  /* Gates: (0) Default, (1) Drop */
+  // Gates: (0) default, (1) verify failed. Malformed frames are dropped.
   static const gate_idx_t kNumOGates = 2;
   // Rewrites or checks each packet's checksum; keeps no state.
   static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kNone,
