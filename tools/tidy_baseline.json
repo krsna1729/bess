@@ -103,7 +103,6 @@
       "performance-unnecessary-copy-initialization": 1
     },
     "core/modules/flowgen.cc": {
-      "bugprone-implicit-widening-of-multiplication-result": 1,
       "bugprone-integer-division": 1,
       "cppcoreguidelines-narrowing-conversions": 7
     },
@@ -138,7 +137,6 @@
       "cppcoreguidelines-narrowing-conversions": 1
     },
     "core/modules/source.cc": {
-      "bugprone-implicit-widening-of-multiplication-result": 1,
       "cppcoreguidelines-narrowing-conversions": 3
     },
     "core/modules/split.cc": {

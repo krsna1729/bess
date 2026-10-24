@@ -114,7 +114,8 @@ struct task_result Source::RunTask(Context *ctx, bess::PacketBatch *batch,
     RunNextModule(ctx, batch);  // it's fine to call this function with cnt==0
     return {.block = false,
             .packets = burst,
-            .bits = (pkt_size + pkt_overhead) * burst * 8};
+            .bits = uint64_t{static_cast<uint32_t>(pkt_size + pkt_overhead)} *
+                    burst * 8};
   }
 
   return {.block = true, .packets = 0, .bits = 0};
