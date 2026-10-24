@@ -33,6 +33,7 @@
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
 #include "module.h"
+#include "packet_reshape.h"
 #include "pb/module_msg.pb.h"
 #include "session_appliance.pb.h"
 #include "session/session_app.h"
@@ -323,21 +324,33 @@ class SessionAppliance final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override {
     const uint64_t now = bess::meter::MeterNow();
+    // GTP-U in place: the Ethernet header's last 8 bytes become the GTP-U
+    // header in front of the inner packet.
+    constexpr uint16_t kTrim = SessionApp::kInner - bess::tunnel::kGtpuBaseBytes;
+    // The GTP-U length (the bytes after its 8-byte header) is 16 bits: a
+    // longer frame is dropped, never sent with a wrapped length.
+    constexpr size_t kMaxFrame = SessionApp::kInner + 0xffff;
     for (int i = 0; i < batch->cnt(); i++) {
-      bess::PacketRef pkt = batch->packet(i);
+      bess::PacketHandle handle = batch->handles()[i];
+      bess::PacketRef in(handle);
       const SessionApp::Decision d = app_->Decide(
-          std::span<const uint8_t>(pkt.head_data<const uint8_t *>(), pkt.head_len()), pkt.total_len(),
+          std::span<const uint8_t>(in.head_data<const uint8_t *>(), in.head_len()), in.total_len(),
           now);
-      // GTP-U in place: the Ethernet header's last 8 bytes become the GTP-U
-      // header in front of the inner packet.
-      constexpr uint16_t kTrim = SessionApp::kInner - bess::tunnel::kGtpuBaseBytes;
-      if (d.verdict == SessionApp::Verdict::kForwarded && pkt.adj(kTrim) != nullptr) {
-        bess::tunnel::WriteGtpu(pkt.head_data<uint8_t *>(), d.teid,
-                                static_cast<uint16_t>(pkt.total_len() - bess::tunnel::kGtpuBaseBytes));
-        EmitPacket(ctx, pkt, static_cast<gate_idx_t>(d.egress.value() - 1));
-      } else {
-        DropPacket(ctx, pkt);
+      if (d.verdict == SessionApp::Verdict::kForwarded && in.total_len() <= kMaxFrame &&
+          in.adj(kTrim) != nullptr) {
+        // The trim moves only this packet's start. The header is written in
+        // place: a shared payload (a clone, an indirect mbuf) is copied first
+        // (packet::WritableHead), so another holder never sees it; a frame
+        // whose copy fails is dropped.
+        if (const auto head = bess::packet::WritableHead(handle, bess::tunnel::kGtpuBaseBytes)) {
+          const bess::PacketRef pkt(handle);
+          bess::tunnel::WriteGtpu(reinterpret_cast<uint8_t *>(head->data()), d.teid,
+                                  static_cast<uint16_t>(pkt.total_len() - bess::tunnel::kGtpuBaseBytes));
+          EmitPacket(ctx, pkt, static_cast<gate_idx_t>(d.egress.value() - 1));
+          continue;
+        }
       }
+      DropPacket(ctx, bess::PacketRef(handle));
     }
   }
 
