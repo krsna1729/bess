@@ -1,0 +1,26 @@
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:00"
+      timezone: "Asia/Kolkata"
+
+  - package-ecosystem: "gomod"
+    directory: "/sdk/go"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:15"
+      timezone: "Asia/Kolkata"
+
+  - package-ecosystem: "docker"
+    directory: "/env"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:30"
+      timezone: "Asia/Kolkata"
