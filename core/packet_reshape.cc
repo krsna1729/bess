@@ -246,6 +246,41 @@ std::expected<MutableBytes, ReshapeError> WritableHeadSlow(
   return MutableBytes(rte_pktmbuf_mtod(packet, std::byte *), packet->data_len);
 }
 
+namespace {
+
+ReshapeError FromMutationError(MutationError error) noexcept {
+  switch (error) {
+    case MutationError::kNullPacket:
+      return ReshapeError::kNullPacket;
+    case MutationError::kInsufficientHeadroom:
+      return ReshapeError::kInsufficientHeadroom;
+    default:
+      return ReshapeError::kLengthOutOfRange;
+  }
+}
+
+}  // namespace
+
+std::expected<MutableBytes, ReshapeError> PrependWritableSlow(
+    ::bess::PacketHandle &packet, size_t bytes) noexcept {
+  auto prepended = PrependInPlace(::bess::PacketRef(packet), bytes);
+  if (prepended) {
+    return *prepended;
+  }
+  if (prepended.error() != MutationError::kSharedStorage) {
+    return std::unexpected(FromMutationError(prepended.error()));
+  }
+  const auto copied = EnsureWritable(packet);
+  if (!copied) {
+    return std::unexpected(copied.error());
+  }
+  prepended = PrependInPlace(::bess::PacketRef(packet), bytes);
+  if (!prepended) {
+    return std::unexpected(FromMutationError(prepended.error()));
+  }
+  return *prepended;
+}
+
 }  // namespace detail
 
 std::expected<void, ReshapeError> EnsureLinear(
