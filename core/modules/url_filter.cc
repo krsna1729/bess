@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <expected>
+#include <span>
 #include <string>
 #include <tuple>
 
+#include "packet_parse.h"
 #include "utils/checksum.h"
 #include "utils/ether.h"
 #include "utils/format.h"
@@ -202,17 +204,28 @@ void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   }
 
   for (bess::PacketRef pkt : batch->packets()) {
-    Ethernet *eth = pkt.head_data<Ethernet *>();
-    Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
-
-    if (ip->protocol != Ipv4::Proto::kTcp) {
+    // The checked parse (D-188): the headers in the first segment (D-121),
+    // their lengths consistent with each other and the packet. Only untagged
+    // IPv4 TCP is analyzed (the RSTs and the 403 are built as untagged IPv4);
+    // everything else passes, as before. A frame the parse refuses cannot be
+    // judged and is dropped, as Firewall drops one.
+    bess::packet::ParsedFrame parsed;
+    const bess::packet::ParseStatus status = bess::packet::ParseFrame(
+        std::span<const uint8_t>(pkt.head_data<const uint8_t *>(), pkt.head_len()), parsed,
+        pkt.total_len());
+    if (status == bess::packet::ParseStatus::kMalformed) {
+      DropPacket(ctx, pkt);
+      continue;
+    }
+    if (status != bess::packet::ParseStatus::kOk || parsed.l3 != bess::packet::L3Kind::kIpv4 ||
+        parsed.l4 != bess::packet::L4Kind::kTcp || parsed.l3_offset != sizeof(Ethernet)) {
       EmitPacket(ctx, pkt, 0);
       continue;
     }
 
-    int ip_bytes = ip->header_length << 2;
-    Tcp *tcp =
-        reinterpret_cast<Tcp *>(reinterpret_cast<uint8_t *>(ip) + ip_bytes);
+    Ethernet *eth = pkt.head_data<Ethernet *>();
+    Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
+    Tcp *tcp = pkt.head_data<Tcp *>(parsed.l4_offset);
 
     Flow flow;
     flow.src_ip = ip->src;
@@ -261,7 +274,7 @@ void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // as a flow to pass.  Note: we only get failure if there is
     // something seriously wrong; we get success if there are holes
     // in the data (in which case the contiguous_len() below is short).
-    bool success = buffer.InsertPacket(pkt);
+    bool success = buffer.InsertParsed(pkt, parsed);
     if (!success) {
       VLOG(1) << "Reconstruction failure";
       flow_cache_.erase(it);

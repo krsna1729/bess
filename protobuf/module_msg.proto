@@ -1166,6 +1166,14 @@ message RandomUpdateArg {
  * converting all packets that pass through to copies of the of one of
  * the templates.
  *
+ * A template is at most 1536 bytes and at most the packet data room
+ * (`--packet_data_room`); a larger one is refused (EINVAL). A packet whose
+ * payload is shared (a clone, its parent, a shared external buffer) gets a
+ * buffer of its own first, so the other holder never sees the template
+ * (D-153); a chain's tail is freed. A packet whose buffer cannot hold its
+ * template (one from a pool with a smaller data room), or that cannot get a
+ * buffer of its own, is dropped. With no template, packets pass unchanged.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
@@ -1302,10 +1310,20 @@ message SplitArg {
 }
 
 /**
- * The timestamp module takes an offset parameter. It inserts the current
- * time in nanoseconds into the packet, to be used for latency measurements
- * alongside the Measure module.  The default offset is after an IPv4 UDP
- * header.
+ * The timestamp module records the current time in nanoseconds, to be used
+ * for latency measurements alongside the Measure module: in a metadata
+ * attribute (`attr_name`, "timestamp" by default, used when no `offset` is
+ * given), or in the packet at `offset` as a 4-byte marker and the 8-byte time.
+ *
+ * The in-packet stamp goes into the packet's first segment, and `offset` + 12
+ * must fit the packet data room (`--packet_data_room`); a larger offset is
+ * refused (EINVAL). A one-segment packet whose data reaches `offset` but ends
+ * before the stamp's end is grown to hold it. A packet the stamp cannot be
+ * placed in -- a chain whose first segment ends before the stamp's end, a
+ * packet whose data ends before `offset`, or one without the tailroom to grow
+ * -- is dropped, never forwarded without the stamp (D-172). A packet whose
+ * payload is shared (a clone) is copied first, so the other holders never see
+ * the stamp (D-153); one whose copy fails is dropped.
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -1344,6 +1362,12 @@ message UpdateArg {
 /**
  * The URLFilter performs TCP reconstruction over a flow and blocks
  * connections which mention a banned URL.
+ *
+ * Only untagged IPv4 TCP on input gate 0 is analyzed; other frames pass
+ * (gate 0). A frame the checked parse refuses (headers that do not fit the
+ * first segment, lengths that lie) is dropped. A flow's request is
+ * reconstructed from the first 64 KiB after the SYN; data past that is
+ * ignored.
  *
  * __Input Gates__: 2
  * __Output Gates__: 2

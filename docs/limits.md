@@ -69,7 +69,7 @@ Columns:
 | GenericEncap | fields; bytes per field | 8; 8 | `MAX_FIELDS`, `MAX_FIELD_SIZE` (`generic_encap.h`) | No | EINVAL "at most 8 fields" |
 | Update | fields | 16 | `Update::kMaxFields` | No | EINVAL |
 | RandomUpdate | fields | 16 | `kMaxVariable` (`random_update.h`) | No | EINVAL |
-| Rewrite / FlowGen | template | 1,536 B | `Rewrite::kMaxTemplateSize`, `MAX_TEMPLATE_SIZE` (`flowgen.h`) | No | EINVAL "template is too big" |
+| Rewrite / FlowGen | template | 1,536 B; Rewrite also at most the packet data room | `Rewrite::kMaxTemplateSize`, `MAX_TEMPLATE_SIZE` (`flowgen.h`); the default pool's data room (`--packet_data_room`) | No | EINVAL "template is too big" / "template is larger than the N-byte packet data room"; a packet whose own buffer cannot hold its template is dropped |
 | Replicate | gates | 32 | `Replicate::kMaxGates` | No | EINVAL |
 | HashLB | gates | 16,384 | `HashLB::kMaxGates` | No | EINVAL |
 | HashLB | custom-tuple fields; bytes per field; packet offset | 8; 8; 0-1,024 | `HashLB::kMaxFields`, `kMaxFieldSize`, `kMaxFieldOffset` | No | EINVAL |
@@ -97,7 +97,8 @@ Columns:
 | NAT | flows | default 65,536 | `NATArg.capacity`, `max_capacity` | yes | the table grows up to `max_capacity`; past it a new flow's packet is dropped and `bess.table_full` is raised |
 | NAT | idle timeout | 300 s | `kDefaultNatTimeout` (`nat/nat.h`), `BasicNat::kDefaultTimeout` | No | — |
 | Conntrack | flows | default 65,536 | `ConntrackArg.capacity` | yes | a new connection's packet leaves on gate 1 (not tracked) and `bess.table_full` is raised |
-| Conntrack, NAT, tunnel decaps, Router, Firewall, HashLB (L3/L4) | IPv6 extension headers parsed (hop-by-hop, routing, destination options, fragment, AH) | 8 | `kMaxExtensionHeaders` (`packet_parse.h`) | No | packet treated as malformed: Firewall and HashLB drop it (D-188) |
+| URLFilter | reconstructed bytes per flow | 64 KiB from the SYN's sequence number | `TcpFlowReconstruct::kMaxBufLen` (`utils/tcp_flow_reconstruct.h`) | No | data past it is ignored (a segment straddling it keeps the part inside); a request whose headers do not end inside it is never matched and the flow passes |
+| Conntrack, NAT, tunnel decaps, Router, Firewall, HashLB (L3/L4), URLFilter | IPv6 extension headers parsed (hop-by-hop, routing, destination options, fragment, AH) | 8 | `kMaxExtensionHeaders` (`packet_parse.h`) | No | packet treated as malformed: Firewall, HashLB and URLFilter drop it (D-188) |
 | DRR | flows | default 4,096; max 16M | `DRR::kDefaultNumFlows`, `kMaxNumFlows` | `num_flows` | EINVAL |
 | Queue | size | default 1,024; 4–16,384, a power of 2 | `DEFAULT_QUEUE_SIZE` (`queue.cc`); the bounds are literals in `Queue::SetSize` | `size` | EINVAL "must be in [4, 16384]" / "must be a power of 2" |
 | Measure | histogram | 100 ns buckets to 100 ms | `kDefaultNsPerBucket`, `kDefaultMaxNs` | `latency_ns_resolution`, `latency_ns_max` | values above the range are counted in the last bucket |
@@ -108,6 +109,7 @@ Columns:
 | HashLB | default hash mode | L4 | `HashLB::kDefaultMode` | `mode` | — |
 | DRR | default quantum; per-flow queue | 1,500 B; 2,048 growing ×2 to 8,192 | `kDefaultQuantum`, `kFlowQueueSize`, `kFlowQueueMax` | `quantum`, `max_flow_queue_size` | — |
 | Measure | jitter sample probability | 0.05 | `kDefaultIpDvSampleProb` | `jitter_sample_prob` | — |
+| Timestamp | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Timestamp::Init` (`timestamp.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet the stamp cannot be placed in, in its first segment, is dropped (D-172) |
 | FlowGen | smallest TCP packet | 60 B | `kMinTcpPacketSize` (`flowgen.cc`) | No | — |
 | unix_socket port | idle poll interval | 50 µs | `UnixSocketPort::kDefaultMinRxInterval` | port argument `min_rx_interval_ns` | — |
 | VXLANEncap | UDP destination port | 4789 | `VXLANEncap::kDefaultDstPort` | `dstport` | — |

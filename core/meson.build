@@ -819,6 +819,7 @@ unit_test_sources = [
   'modules/vif_test.cc',
   'modules/packet_store_test.cc',
   'modules/measure_test.cc',
+  'modules/timestamp_test.cc',
   'modules/port_inc_test.cc',
   'modules/queue_inc_test.cc',
   'modules/source_test.cc',
