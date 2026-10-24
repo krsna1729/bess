@@ -840,6 +840,7 @@ unit_test_sources = [
   'modules/update_ttl_test.cc',
   'modules/macswap_test.cc',
   'modules/ipswap_test.cc',
+  'modules/static_nat_test.cc',
   'modules/ip_checksum_test.cc',
   'modules/replicate_test.cc',
   'modules/ether_encap_test.cc',

@@ -971,17 +971,27 @@ message NATUsageResponse {
  * To see an example of NAT in use, see:
  * [`bessctl/conf/samples/nat.yaml`](./bessctl/conf/samples/nat.yaml)
  *
- * Forward direction (from input gate 0 to output gate 0):
+ * Forward direction (from input gate 0 to output gate 1):
  *  - Source IP address is updated, from internal to external address.
- * Reverse direction (from input gate 1 to output gate 1):
+ * Reverse direction (from input gate 1 to output gate 0):
  *  - Destination IP address is updated, from external to internal address.
  * If the original address is outside any of the ranges, packets are forwarded
  * without NAT.
  *
  * Note that address in packet payload (e.g., FTP) are NOT translated.
  *
+ * The headers are found with the checked parse: IPv4 untagged or behind up
+ * to two VLAN tags, with options. A non-first fragment has its address and IP
+ * checksum translated only (it carries no L4 header). A frame that is not
+ * IPv4 (ARP, IPv6) is forwarded without NAT, as an address outside every
+ * range is. A frame whose IP headers do not fit its first segment or are
+ * inconsistent (lengths, TCP data offset, UDP length) is dropped. A frame
+ * translated in place whose payload is shared (a clone) is copied first, so
+ * the payload's other holders never see the translation (D-153), and a frame
+ * whose copy fails is dropped.
+ *
  * __Input Gates__: 2 (0 for internal->external, and 1 for external->internal direction)
- * __Output Gates__: 2 (same as the input gate)
+ * __Output Gates__: 2 (1 for internal->external, and 0 for external->internal direction)
  */
 message StaticNATArg {
   message AddressRange {
