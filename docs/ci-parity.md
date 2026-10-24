@@ -73,7 +73,16 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
   gating lanes test `debugoptimized` with every check on; this lane shows a
   test that passes only because a check stops it, or code that breaks only at
   `-O3`. It is not packaging (the `release` step builds the artifacts, without
-  tests). Push-only and experimental until it has been green.
+  tests), but packaging compiles with the same g++ at `-O3`, so a break here
+  is a break there. It runs on every push and on every pull request that
+  changes what the C++ build compiles or is configured by (`changes_cxx` in
+  `tools/ci_profile.py`: C/C++ sources and headers, `.proto`, `meson.build`
+  and options, `deps/`, `env/`, and the CI lane definitions; changes that
+  cannot be listed count). A failure fails the run (user decision,
+  2026-10-24): while it was push-only, g++ 14's `-O3` diagnostics broke
+  `develop` from `9b68a07f` to `459a18f4` with every pull request green. It
+  is not a required check, because a pull request without C++ changes does
+  not run it.
 - **Which lanes gate.** `gcc`, `clang`, `clang-tsan` (TSan over
   `tools/sanitizers/tsan_tests.txt`), `clang-asan` (ASan and UBSan, and
   clang-tidy; required since its first fully green run, 5c409d37),
@@ -90,10 +99,11 @@ for it (`CPU_FLOOR`). `--arch` only shows another architecture's commands
 - **Which lanes run when.** The lane table is `LANES` in `tools/ci_profile.py`;
   the workflow's `Lanes` job turns it into the matrix
   (`ci_profile.py lanes --event <event>`). Pull requests run the gating pair
-  (`gcc`, `clang`), the arm64 pair and the sanitizer lanes; pushes to
-  `develop`/`master` and tags run every lane, adding generic, release-semantics
-  and ubuntu-26.04 (`push_only`).
-  A break those lanes catch shows up on the push and is fixed forward. A new
+  (`gcc`, `clang`), the arm64 pair and the sanitizer lanes, plus
+  release-semantics when they change C++ (`cxx_pull_requests`); pushes to
+  `develop`/`master` and tags run every lane, adding generic and ubuntu-26.04
+  (`push_only`).
+  A break the push-only lanes catch shows up on the push and is fixed forward. A new
   push cancels the older run it supersedes: per pull request, per branch
   for pushes to `develop` and `master` (the tip's run covers every merged
   commit), and the nightly run its predecessor. Tag (release) runs always
