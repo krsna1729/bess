@@ -282,7 +282,8 @@ entries go in as one `PipelineBuilder` transaction, the same path a controller u
 - **F, framework (cross-cutting):** `F.floor` (Source -> Sink), `F.hop/N` (N Bypass hops; the slope is the cost
   of one module hop, including the Track hook every output gate has by default), `F.hopnt/16` (the same with
   those hooks removed: the hop alone), `F.fanout/4`, `F.split/2`, `F.fanin/4`, `F.tc/N` (scheduler with N
-  leaves), `F.size/1500`, `F.queue` (cross-worker Queue).
+  leaves), `F.size/1500`, `F.queue` (cross-worker Queue), `F.flowgen` (FlowGen -> Sink: a source module, so
+  `F.floor` is its control, not `M.base`).
 - **M, modules (localised):** each module after the same Source -> Rewrite -> RandomUpdate (1,024 flows) front
   end, reported as ns per packet above `M.base` (the front end with a Bypass); `M.base`'s own row is the
   absolute baseline the others are measured from, so an arm and its control subtract to the module's cost.

@@ -16,6 +16,7 @@
 //        F.tc/N         N Sources under one round_robin traffic class (scheduler cost)
 //        F.size/B       F.floor with B-byte packets (allocation and copy)
 //        F.queue        Source -> Queue | worker 1: Queue -> Sink (cross-worker handoff)
+//        F.flowgen      FlowGen -> Sink: a source module, F.floor is its control
 //   M  module, localised -- ns per packet above M.base (Source -> Rewrite ->
 //        RandomUpdate -> Bypass -> Sink, the headers and flow mix every M test uses).
 //
@@ -335,6 +336,18 @@ std::vector<std::string> FQueue(Build &b) {
   b.Task("src", 0);
   b.Task("q", 1);
   return {"q"};
+}
+
+// FlowGen generating UDP flows from M's 60-byte frame, far above what one
+// worker makes (1,000 concurrent flows, 10^6 packets per second each), so the
+// row is the cost of making a packet; quick_rampup starts every flow at once.
+std::vector<std::string> FFlowGen(Build &b) {
+  b.Mod("FlowGen", "fg",
+        R"({"template": ")" + Base64(Ipv4Udp()) +
+            R"(", "pps": 1e9, "flow_rate": 1e4, "flow_duration": 0.1, "quick_rampup": true})");
+  b.Mod("Sink", "sink");
+  b.Conn("fg", "sink");
+  return {"fg"};
 }
 
 // Source -> Rewrite -> RandomUpdate (kFlows source addresses) -> [rest] -> Sink;
@@ -975,6 +988,7 @@ std::vector<Test> Catalogue() {
       {"F.tc/16", 'F', FTc(16)},
       {"F.size/1500", 'F', [](Build &b) { return FFloor(b, 1500); }},
       {"F.queue", 'F', FQueue, true},
+      {"F.flowgen", 'F', FFlowGen},
       {"M.base", 'M', [](Build &b) { return MBase(b); }},
       {"M.exactmatch", 'M', MExactMatch(0x0a000001, 1)},
       // Every other flow matches: bursts split across two gates.
@@ -1000,6 +1014,13 @@ std::vector<Test> Catalogue() {
        MRouterScale(2560, 1u << 16u, "ROUTE_BACKEND_FIB")},
       {"M.l2forward", 'M', ML2Forward},
       {"M.acl", 'M', MAcl},
+      // The Split module on the IPv4 TOS byte (0): every frame leaves on gate
+      // 0, so the row is the read and the per-packet emit. (M.split/2 is
+      // RoundRobin.)
+      {"M.split_offset", 'M', m("Split", "sp", R"({"size": 1, "offset": 15})", 1)},
+      // Measure looking for an in-packet stamp at 42 (the UDP payload): no
+      // frame carries one, so the row is the per-packet test and the lock.
+      {"M.measure", 'M', m("Measure", "ms", R"({"offset": 42})", 1)},
       {"M.firewall", 'M', MFirewall},
       {"M.firewall/miss", 'M', MFirewallMiss},
       {"M.hashlb", 'M', m("HashLB", "lb", R"({"gates": [0, 1, 2, 3], "mode": "l3"})", 4)},
