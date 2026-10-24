@@ -12,17 +12,11 @@
 
 namespace {
 
-size_t ConfiguredPacketDataRoom() {
-  const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
-  return pool == nullptr ? bess::kDefaultPacketDataSize
-                          : pool->data_room_size();
-}
-
 // set_pkt_size's refusal ("" when `pkt_size` is valid).
 std::string PktSizeError(uint64_t pkt_size) {
-  if (pkt_size == 0 || pkt_size > ConfiguredPacketDataRoom()) {
+  if (pkt_size == 0 || pkt_size > bess::PacketPool::DefaultDataRoomSize()) {
     return bess::utils::Format("Invalid packet size: maximum is %zu",
-                               ConfiguredPacketDataRoom());
+                               bess::PacketPool::DefaultDataRoomSize());
   }
   return "";
 }
@@ -55,9 +49,9 @@ CommandResponse Source::Init(const bess::pb::SourceArg &arg) {
   burst_.store(bess::PacketBatch::kMaxBurst, std::memory_order_relaxed);
 
   if (arg.pkt_size() > 0) {
-    if (arg.pkt_size() > ConfiguredPacketDataRoom()) {
+    if (arg.pkt_size() > bess::PacketPool::DefaultDataRoomSize()) {
       return CommandFailure(EINVAL, "Invalid packet size: maximum is %zu",
-                            ConfiguredPacketDataRoom());
+                            bess::PacketPool::DefaultDataRoomSize());
     }
     pkt_size_.store(arg.pkt_size(), std::memory_order_relaxed);
   }
