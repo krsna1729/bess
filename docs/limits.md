@@ -113,6 +113,7 @@ Columns:
 | FlowGen | smallest TCP packet | 60 B | `kMinTcpPacketSize` (`flowgen.cc`) | No | — |
 | unix_socket port | idle poll interval | 50 µs | `UnixSocketPort::kDefaultMinRxInterval` | port argument `min_rx_interval_ns` | — |
 | VXLANEncap | UDP destination port | 4789 | `VXLANEncap::kDefaultDstPort` | `dstport` | — |
+| VXLANEncap | inner frame | 65,519 B (the UDP length, 16 bits, with the 16 header bytes) | `kMaxInner` (`vxlan_encap.cc`) | No | a longer frame is dropped |
 | Dump | sampling interval | 1 s | `DEFAULT_INTERVAL_NS` (`dump.cc`) | `interval` | — |
 | Router | default route domain | 0 | `kDefaultRouteDomainId` (`route/route_domain.h`) | the route key's `domain` | — |
 | Router | neighbor next-hop updates published per tick | 64 | `Router::kMaxNeighborUpdatesPerTick` (`modules/router.h`) | No | the rest stay pending for the next tick (D-183) |

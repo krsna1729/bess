@@ -1493,6 +1493,13 @@ message VXLANDecapArg {
 /**
  * VXLANEncap module wraps a packet in a VXLAN header with a specified destination port.
  *
+ * The UDP and VXLAN headers go into the packet's headroom. A shared payload
+ * (a clone, an indirect mbuf) is copied first (D-153), as its headroom is
+ * the other holders' buffer too. A packet is dropped, never forwarded
+ * without the headers, when it has no headroom, when the copy fails, or when
+ * it is too long for the UDP length (more than 65,519 bytes before the
+ * headers).
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
