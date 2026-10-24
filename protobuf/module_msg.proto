@@ -1524,6 +1524,15 @@ message ArpResponderEntryValue {
 /**
  * The MPLS pop module removes MPLS labels
  *
+ * A frame whose EtherType is MPLS unicast (0x8847) loses its outermost label
+ * and leaves on output gate 0 with `next_eth_type` (or without its Ethernet
+ * header, with `remove_eth_header`); any other frame leaves on output gate 1
+ * unchanged. A labelled frame whose first segment does not hold the Ethernet
+ * header and the label (18 bytes) is dropped, never forwarded still labelled,
+ * as is a frame shorter than an Ethernet header. Keeping the Ethernet header
+ * rewrites it in place: a frame whose payload is shared (a clone) is copied
+ * first (D-153), and a frame whose copy fails is dropped.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 2
  */
