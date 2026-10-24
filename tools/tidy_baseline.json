@@ -262,9 +262,6 @@
     "core/utils/tcp.h": {
       "misc-redundant-expression": 1
     },
-    "core/utils/tcp_flow_reconstruct.h": {
-      "bugprone-implicit-widening-of-multiplication-result": 3
-    },
     "core/utils/time.h": {
       "cppcoreguidelines-narrowing-conversions": 1
     },

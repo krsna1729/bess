@@ -1345,6 +1345,12 @@ message UpdateArg {
  * The URLFilter performs TCP reconstruction over a flow and blocks
  * connections which mention a banned URL.
  *
+ * Only untagged IPv4 TCP on input gate 0 is analyzed; other frames pass
+ * (gate 0). A frame the checked parse refuses (headers that do not fit the
+ * first segment, lengths that lie) is dropped. A flow's request is
+ * reconstructed from the first 64 KiB after the SYN; data past that is
+ * ignored.
+ *
  * __Input Gates__: 2
  * __Output Gates__: 2
  *

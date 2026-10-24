@@ -186,4 +186,92 @@ TEST(UrlFilterTest, BlacklistResourceReplacesTheList) {
   EXPECT_EQ("", h.ReadBackDiffers(blacklist, {{nullptr, &none}}));
 }
 
+// A request whose payload continues in a second segment is read across the
+// chain and refused. Before, the whole payload was read from the first
+// segment, past its data_len, and the request passed.
+TEST(UrlFilterTest, ChainedRequestIsReadAcrossSegments) {
+  ModuleHarness h;
+  Module *uf = h.Create("UrlFilter", bess::pb::UrlFilterArg(), "uf_chain");
+  ASSERT_NE(nullptr, uf);
+  ASSERT_EQ("", h.SetResource("uf_chain/blacklist", Blacklist({{"www.blacklisted.com", "/"}})));
+
+  const Bytes syn = ToServer("192.168.0.2", "10.0.0.2", Tcp(10001, 80, 0x02, 12345, 0));
+  const Bytes req = ToServer("192.168.0.2", "10.0.0.2", Tcp(10001, 80, 0, 12346, 23456),
+                             "GET / HTTP/1.1\r\nHost: www.blacklisted.com\r\n\r\n");
+  EXPECT_EQ((std::vector<Bytes>{syn}), h.Run(uf, 0, {syn}, {0})[0]);
+  constexpr size_t kHeaders = 14 + 20 + 20;
+  auto out = h.RunPackets(uf, 0, {bess::testing::MakePacket(req, kHeaders + 8)}, uf, {0, 1});
+  ASSERT_EQ(1u, out[0].size()) << "the RST, not the request";
+  EXPECT_NE(req, out[0][0]);
+  EXPECT_EQ(2u, out[1].size()) << "the 403 and the RST";
+}
+
+// A frame the checked parse refuses is dropped: headers longer than the IPv4
+// total length, a total length past the frame, a runt, headers cut by the
+// first segment's end. Frames that are not untagged IPv4 TCP pass. Before,
+// the lying lengths wrapped the payload length to about 4 GiB (a 4 GiB
+// resize and a copy that long), the others were read past data_len, and
+// every frame was read as untagged IPv4.
+TEST(UrlFilterTest, MalformedFramesAreDroppedOthersPass) {
+  ModuleHarness h;
+  Module *uf = h.Create("UrlFilter", bess::pb::UrlFilterArg(), "uf_bounds");
+  ASSERT_NE(nullptr, uf);
+
+  const Bytes syn = ToServer("192.168.0.3", "10.0.0.3", Tcp(10001, 80, 0x02, 12345, 0));
+  const auto data = Tcp(10001, 80, 0, 12346, 23456);
+  Bytes long_tcp = ToServer("192.168.0.3", "10.0.0.3", data, std::string(40, 'x').c_str());
+  long_tcp[46] = 0xf0;            // 60 B of TCP header ...
+  long_tcp[16] = 0, long_tcp[17] = 60;  // ... in 40 B of L4
+  Bytes past_frame = ToServer("192.168.0.3", "10.0.0.3", data, "GET");
+  past_frame[16] = 0x03, past_frame[17] = 0xe8;  // 1000 B
+  Bytes runt = syn;
+  runt.resize(20);
+
+  const Bytes arp = PacketBuilder()
+                        .Ether("ff:ff:ff:ff:ff:ff", kClientMac)
+                        .Arp(1, kClientMac, "192.168.0.3", "00:00:00:00:00:00", "10.0.0.3")
+                        .Build();
+  const Bytes udp = PacketBuilder()
+                        .Ether(kServerMac, kClientMac)
+                        .IPv4("192.168.0.3", "10.0.0.3")
+                        .Udp(1000, 53)
+                        .Payload("q")
+                        .Build();
+  const Bytes tcp6 = PacketBuilder()
+                         .Ether(kServerMac, kClientMac)
+                         .IPv6("fd00::3", "fd00::4")
+                         .Add(Tcp(10001, 80, 0x02, 12345, 0))
+                         .Build();
+  const Bytes tagged = PacketBuilder()
+                           .Ether(kServerMac, kClientMac)
+                           .Dot1Q(7)
+                           .IPv4("192.168.0.3", "10.0.0.3")
+                           .Add(Tcp(10001, 80, 0x02, 12345, 0))
+                           .Build();
+
+  auto out = h.Run(uf, 0, {syn, long_tcp, past_frame, runt, arp, udp, tcp6, tagged}, {0, 1});
+  EXPECT_EQ((std::vector<Bytes>{syn, arp, udp, tcp6, tagged}), out[0]);
+  EXPECT_TRUE(out[1].empty());
+
+  const Bytes req = ToServer("192.168.0.3", "10.0.0.3", data, "GET / HTTP/1.1\r\n");
+  out = h.RunPackets(uf, 0, {bess::testing::MakePacket(req, 30)}, uf, {0, 1});
+  EXPECT_TRUE(out[0].empty()) << "headers past the first segment (D-121)";
+}
+
+// Data far past the SYN's sequence number lies outside the reconstruction
+// window: ignored, the segment passes while the flow is still analyzed.
+// Before, (offset + length) * 2 wrapped in 32 bits, the buffer shrank to
+// 32 B and the copy landed 2 GiB past it.
+TEST(UrlFilterTest, DataPastTheWindowIsIgnored) {
+  ModuleHarness h;
+  Module *uf = h.Create("UrlFilter", bess::pb::UrlFilterArg(), "uf_window");
+  ASSERT_NE(nullptr, uf);
+
+  const Bytes syn = ToServer("192.168.0.4", "10.0.0.4", Tcp(10001, 80, 0x02, 12345, 0));
+  const Bytes far = ToServer("192.168.0.4", "10.0.0.4",
+                             Tcp(10001, 80, 0, 12346 + 0x7ffffff0u, 23456),
+                             std::string(32, 'x').c_str());
+  EXPECT_EQ((std::vector<Bytes>{syn, far}), h.Run(uf, 0, {syn, far}, {0})[0]);
+}
+
 }  // namespace
