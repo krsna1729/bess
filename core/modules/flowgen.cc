@@ -8,6 +8,7 @@
 #include <expected>
 #include <functional>
 #include <string>
+#include <string_view>
 
 #include "utils/checksum.h"
 #include "utils/ether.h"
@@ -43,6 +44,61 @@ std::string BurstError(uint64_t burst) {
   if (burst > bess::PacketBatch::kMaxBurst) {
     return bess::utils::Format("'burst' must be no greater than %zu",
                                bess::PacketBatch::kMaxBurst);
+  }
+  return "";
+}
+
+// Why FlowGen cannot make packets from `t` ("" when it can). Each packet is
+// a copy of the template with new addresses and ports and new checksums, so
+// the template holds whole every header those writes and sums touch:
+// Ethernet, an IPv4 header (its options included), and the UDP or TCP
+// header. The IPv4 total length fits the template (Ethernet padding may
+// follow), and so the TCP checksum, which covers the IPv4 payload, reads
+// only template bytes; the UDP length, which the UDP checksum covers, fits
+// the IPv4 payload. A TCP template is also the source of the 60-byte SYN
+// and FIN, whose IPv4 datagram is 40 bytes: it has no IPv4 or TCP options.
+std::string TemplateError(std::string_view t) {
+  if (t.size() > MAX_TEMPLATE_SIZE) {
+    return "'template' is too big";
+  }
+  if (t.size() < sizeof(Ethernet) + sizeof(Ipv4)) {
+    return bess::utils::Format("'template' of %zu bytes is shorter than an Ethernet and an IPv4 header",
+                               t.size());
+  }
+  const auto *eth = reinterpret_cast<const Ethernet *>(t.data());
+  if (eth->ether_type != be16_t(Ethernet::Type::kIpv4)) {
+    return "'template' is not IPv4";
+  }
+  const auto *ip = reinterpret_cast<const Ipv4 *>(eth + 1);
+  if (ip->protocol != Ipv4::Proto::kUdp && ip->protocol != Ipv4::Proto::kTcp) {
+    return "'template' is not UDP or TCP";
+  }
+  const bool tcp = ip->protocol == Ipv4::Proto::kTcp;
+  const size_t ihl = size_t{ip->header_length} * 4;
+  const size_t l4_header = tcp ? sizeof(Tcp) : sizeof(Udp);
+  if (ip->version != 4 || ihl < sizeof(Ipv4) || sizeof(Ethernet) + ihl + l4_header > t.size()) {
+    return bess::utils::Format("'template' of %zu bytes has no valid IPv4 header (version %u, %zu bytes) followed by the %zu-byte %s header",
+                               t.size(), unsigned{ip->version}, ihl, l4_header, tcp ? "TCP" : "UDP");
+  }
+  const size_t ip_len = ip->length.value();
+  if (ip_len < ihl + l4_header || sizeof(Ethernet) + ip_len > t.size()) {
+    return bess::utils::Format("'template' IPv4 total length %zu is not %zu to %zu (its headers to the end of the template)",
+                               ip_len, ihl + l4_header, t.size() - sizeof(Ethernet));
+  }
+  const char *l4 = t.data() + sizeof(Ethernet) + ihl;
+  if (tcp) {
+    if (t.size() < kMinTcpPacketSize) {
+      return bess::utils::Format("TCP 'template' must be at least %zu bytes", kMinTcpPacketSize);
+    }
+    if (ihl != sizeof(Ipv4) || size_t{reinterpret_cast<const Tcp *>(l4)->offset} * 4 != sizeof(Tcp)) {
+      return "TCP 'template' must have no IPv4 or TCP options: its SYN and FIN are 40-byte IPv4 datagrams";
+    }
+    return "";
+  }
+  const size_t udp_len = reinterpret_cast<const Udp *>(l4)->length.value();
+  if (udp_len < sizeof(Udp) || udp_len > ip_len - ihl) {
+    return bess::utils::Format("'template' UDP length %zu is not %zu to %zu (its IPv4 payload)",
+                               udp_len, sizeof(Udp), ip_len - ihl);
   }
   return "";
 }
@@ -183,25 +239,12 @@ CommandResponse FlowGen::ProcessUpdatableArguments(
     }
   } else {
     // update template
-    if (arg.template_().length() > MAX_TEMPLATE_SIZE) {
-      return CommandFailure(EINVAL, "'template' is too big");
+    if (std::string err = TemplateError(arg.template_()); !err.empty()) {
+      return CommandFailure(EINVAL, "%s", err.c_str());
     }
 
     const char *tmpl = arg.template_().c_str();
-    const Ethernet *eth = reinterpret_cast<const Ethernet *>(tmpl);
-    if (eth->ether_type != be16_t(Ethernet::Type::kIpv4)) {
-      return CommandFailure(EINVAL, "'template' is not IPv4");
-    }
-
-    const Ipv4 *ip = reinterpret_cast<const Ipv4 *>(eth + 1);
-    if (ip->protocol != Ipv4::Proto::kUdp &&
-        ip->protocol != Ipv4::Proto::kTcp) {
-      return CommandFailure(EINVAL, "'template' is not UDP or TCP");
-    }
-    if (ip->protocol == Ipv4::Proto::kTcp &&
-        arg.template_().length() < kMinTcpPacketSize) {
-      return CommandFailure(EINVAL, "TCP 'template' must be at least 60 bytes");
-    }
+    const Ipv4 *ip = reinterpret_cast<const Ipv4 *>(tmpl + sizeof(Ethernet));
 
     if (p->l4_proto == 0) {
       p->l4_proto = ip->protocol;
@@ -441,7 +484,9 @@ bess::PacketRef FlowGen::FillUdpPacket(struct flow *f) {
     bess::PacketFree(pkt.handle());
     return {};
   }
-  bess::utils::Copy(data, params_.tmpl, size, true);
+  // Exactly the template: it holds every header written below and every
+  // byte the checksums read (TemplateError).
+  bess::utils::Copy(data, params_.tmpl, size);
 
   Ethernet *eth = pkt.head_data<Ethernet *>();
   Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
@@ -472,12 +517,13 @@ bess::PacketRef FlowGen::FillTcpPacket(struct flow *f) {
     bess::PacketFree(pkt.handle());
     return {};
   }
-  bess::utils::Copy(data, params_.tmpl, size, true);
+  bess::utils::Copy(data, params_.tmpl, size);
 
   Ethernet *eth = pkt.head_data<Ethernet *>();
   Ipv4 *ip = reinterpret_cast<Ipv4 *>(eth + 1);
 
-  // SYN or FIN?
+  // SYN or FIN? Headers only: the template has no IPv4 or TCP options
+  // (TemplateError), so they are 40 bytes.
   if (f->first_pkt || f->packets_left <= 1) {
     pkt.trim(size - kMinTcpPacketSize);
     ip->length = be16_t(40);

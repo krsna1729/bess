@@ -112,7 +112,7 @@ Columns:
 | Measure | jitter sample probability | 0.05 | `kDefaultIpDvSampleProb` | `jitter_sample_prob` | — |
 | Timestamp | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Timestamp::Init` (`timestamp.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet the stamp cannot be placed in, in its first segment, is dropped (D-172) |
 | Measure | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Measure::Init` (`measure.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet whose first segment ends before the stamp's end is forwarded, not measured |
-| FlowGen | smallest TCP packet | 60 B | `kMinTcpPacketSize` (`flowgen.cc`) | No | — |
+| FlowGen | template headers | UDP: Ethernet, IPv4 (options allowed) and UDP whole, 42 B at least; TCP: 60 B at least (`kMinTcpPacketSize`), no IPv4 or TCP options; the IPv4 total length within the template, the UDP length within the IPv4 payload | `TemplateError` (`flowgen.cc`) | No | EINVAL at init or on an update |
 | unix_socket port | idle poll interval | 50 µs | `UnixSocketPort::kDefaultMinRxInterval` | port argument `min_rx_interval_ns` | — |
 | VXLANEncap | UDP destination port | 4789 | `VXLANEncap::kDefaultDstPort` | `dstport` | — |
 | VXLANEncap | inner frame | 65,519 B (the UDP length, 16 bits, with the 16 header bytes) | `kMaxInner` (`vxlan_encap.cc`) | No | a longer frame is dropped |

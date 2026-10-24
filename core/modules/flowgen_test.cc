@@ -5,16 +5,21 @@
 // task generates; it reads back canonically (every field named), unset fields
 // keep their value as for `update`, what they refuse is refused, it requires
 // paused workers, and `update` and `set_burst` went with the legacy service
-// (D-140).
+// (D-140). A template that does not hold the headers each packet is written
+// and summed through, or whose lengths do not fit it, is refused.
 
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <span>
 #include <string>
 
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "packet_parse.h"
 #include "pb/module_msg.pb.h"
 #include "pktbatch.h"
 #include "runtime/runtime_state.h"
@@ -154,6 +159,133 @@ TEST(FlowGenSettingsTest, RequiresPausedWorkers) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("FlowGen", Arg(), "fg"));
   EXPECT_TRUE(RequiresPausedWorkers("fg/settings"));
+}
+
+// -- the template: refused at Init unless it holds what each packet needs -----
+
+// `tmpl` with byte `at` set to `v`.
+std::string With(std::string tmpl, size_t at, uint8_t v) {
+  tmpl[at] = static_cast<char>(v);
+  return tmpl;
+}
+
+// `tmpl` with the 16-bit big-endian field at `at` set to `v`.
+std::string With16(std::string tmpl, size_t at, uint16_t v) {
+  tmpl[at] = static_cast<char>(unsigned{v} >> 8u);
+  tmpl[at + 1] = static_cast<char>(unsigned{v} & 0xffu);
+  return tmpl;
+}
+
+// Init's refusal of `tmpl` ("" when it accepted it).
+std::string InitError(ModuleHarness &h, const std::string &tmpl) {
+  bess::pb::FlowGenArg arg = Arg();
+  arg.set_template_(tmpl);
+  return h.CreateError("FlowGen", arg);
+}
+
+// The template holds whole the Ethernet, IPv4 and UDP or TCP headers each
+// packet is written and summed through: one cut anywhere short of them is
+// refused, at Init and on an update. The old code accepted every UDP one
+// (reading the EtherType and protocol from a template as short as 24 bytes)
+// and wrote ports past the end of each.
+TEST(FlowGenTemplateTest, ATemplateShorterThanItsHeadersIsRefused) {
+  ModuleHarness h;
+  const std::string udp = Template(false, 42);
+  for (size_t len : {14u, 24u, 33u, 34u, 41u}) {
+    EXPECT_NE("", InitError(h, udp.substr(0, len))) << len << " bytes";
+  }
+  EXPECT_EQ("", InitError(h, udp));
+  ASSERT_NE(nullptr, h.Create("FlowGen", Arg(), "fg"));
+  EXPECT_NE("", h.SetResource("fg/settings", Settings(udp.substr(0, 41), 32)));
+  EXPECT_EQ("", h.SetResource("fg/settings", Settings(udp, 32)));
+}
+
+// The IPv4 header must be one: version 4, an IHL of 5 or more, and all of
+// it in the template before the UDP header. The old code accepted all
+// three, and with IHL 15 wrote the ports 40 bytes past the end of the
+// 42-byte template.
+TEST(FlowGenTemplateTest, AnIpv4HeaderThatDoesNotFitIsRefused) {
+  ModuleHarness h;
+  const std::string udp = Template(false, 60);
+  EXPECT_NE("", InitError(h, With(udp, 14, 0x4f))) << "IHL 15 (60 bytes)";
+  EXPECT_NE("", InitError(h, With(udp, 14, 0x44))) << "IHL 4";
+  EXPECT_NE("", InitError(h, With(udp, 14, 0x65))) << "version 6";
+  EXPECT_NE("", InitError(h, With(Template(false, 42), 14, 0x46)))
+      << "IHL 6: the UDP header ends past the 42-byte template";
+
+  bess::testing::PacketBuilder b;
+  b.Ether("02:00:00:00:00:02", "02:00:00:00:00:01").IPv4("10.0.0.1", "10.0.0.2");
+  b.Last<bess::testing::PacketBuilder::IPv4Hdr>().options = {1, 1, 1, 0};
+  const Bytes options = b.Udp(1000, 2000).PadTo(64).Build();
+  EXPECT_EQ("", InitError(h, std::string(options.begin(), options.end())))
+      << "IPv4 options are allowed in a UDP template";
+}
+
+// The checksums read what the lengths say: the IPv4 total length must fit
+// the template (padding may follow it) and cover the headers, and the UDP
+// length must fit the IPv4 payload. The old code accepted each, and summed
+// up to 64 KiB past the template.
+TEST(FlowGenTemplateTest, LengthsThatDoNotFitAreRefused) {
+  ModuleHarness h;
+  const std::string udp = Template(false, 60);  // IPv4 length 46, UDP 26
+  EXPECT_NE("", InitError(h, With16(udp, 16, 47))) << "IPv4 length past the template";
+  EXPECT_NE("", InitError(h, With16(udp, 16, 65535)));
+  EXPECT_NE("", InitError(h, With16(udp, 16, 27))) << "IPv4 length short of the UDP header";
+  EXPECT_NE("", InitError(h, With16(udp, 38, 27))) << "UDP length past the IPv4 payload";
+  EXPECT_NE("", InitError(h, With16(udp, 38, 65535)));
+  EXPECT_NE("", InitError(h, With16(udp, 38, 7))) << "UDP length short of its header";
+  EXPECT_EQ("", InitError(h, With16(With16(udp, 16, 28), 38, 8)))
+      << "a datagram padded to the template";
+  const std::string tcp = Template(true, 60);  // IPv4 length 46
+  EXPECT_NE("", InitError(h, With16(tcp, 16, 47))) << "TCP: the IPv4 length sets the checksum's span";
+  EXPECT_NE("", InitError(h, With16(tcp, 16, 39)));
+  EXPECT_EQ("", InitError(h, tcp));
+}
+
+// FlowGen's SYN and FIN are 60-byte frames carrying a 40-byte IPv4
+// datagram: a TCP template with IPv4 or TCP options cannot be one and is
+// refused, as is one under 60 bytes. The old code accepted both kinds of
+// options and sent SYNs and FINs whose lengths contradict their headers.
+TEST(FlowGenTemplateTest, ATcpTemplateWithOptionsIsRefused) {
+  ModuleHarness h;
+  const std::string tcp = Template(true, 64);
+  EXPECT_EQ("", InitError(h, tcp));
+  EXPECT_NE("", InitError(h, Template(true, 59)));
+  EXPECT_NE("", InitError(h, With(tcp, 46, 0x60))) << "TCP data offset 6";
+  bess::testing::PacketBuilder b;
+  b.Ether("02:00:00:00:00:02", "02:00:00:00:00:01").IPv4("10.0.0.1", "10.0.0.2");
+  b.Last<bess::testing::PacketBuilder::IPv4Hdr>().options = {1, 1, 1, 0};
+  const Bytes options = b.Tcp(1000, 2000).PadTo(64).Build();
+  EXPECT_NE("", InitError(h, std::string(options.begin(), options.end()))) << "IPv4 options";
+}
+
+// The packets are exactly the template's size, and the checked parse finds
+// each whole, a UDP template with IPv4 options and a TCP template's SYNs
+// included.
+TEST(FlowGenTemplateTest, PacketsAreWholeAndTheTemplateSize) {
+  ModuleHarness h;
+  bess::testing::PacketBuilder b;
+  b.Ether("02:00:00:00:00:02", "02:00:00:00:00:01").IPv4("10.0.0.1", "10.0.0.2");
+  b.Last<bess::testing::PacketBuilder::IPv4Hdr>().options = {1, 1, 1, 0};
+  const Bytes options = b.Udp(1000, 2000).PadTo(70).Build();
+  bess::pb::FlowGenArg arg = Arg();
+  arg.set_template_(std::string(options.begin(), options.end()));
+  Module *udp = h.Create("FlowGen", arg, "fg_udp");
+  ASSERT_NE(nullptr, udp);
+  arg.set_template_(Template(true, 80));
+  Module *tcp = h.Create("FlowGen", arg, "fg_tcp");
+  ASSERT_NE(nullptr, tcp);
+  for (Module *m : {udp, tcp}) {
+    const auto out = h.RunTask(m, {0});
+    ASSERT_EQ(1u, out.count(0));
+    ASSERT_FALSE(out.at(0).empty());
+    for (const Bytes &pkt : out.at(0)) {
+      EXPECT_EQ(m == udp ? 70u : 60u, pkt.size()) << "a new flow starts with a SYN";
+      bess::packet::ParsedFrame parsed;
+      EXPECT_EQ(bess::packet::ParseStatus::kOk,
+                bess::packet::ParseFrame(std::span(pkt.data(), pkt.size()), parsed, pkt.size()));
+    }
+  }
 }
 
 }  // namespace

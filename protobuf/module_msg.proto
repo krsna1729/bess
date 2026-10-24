@@ -691,6 +691,14 @@ message ExactMatchSettings {
  * This module is useful for testing, e.g., a NAT module or other flow-aware code.
  * Packets are generated off a base, "template" packet by modifying the IP src/dst and TCP src/dst. By default, only the ports are changed and will be modified by incrementing the template ports by up to 20000 more than the template values.
  *
+ * The template is an Ethernet frame of at most 1536 bytes carrying IPv4 and
+ * UDP or TCP. It holds whole the IPv4 header (its options included) and the
+ * UDP or TCP header; the IPv4 total length fits the template (Ethernet
+ * padding may follow it); a UDP length fits the IPv4 payload. A TCP template
+ * is at least 60 bytes and has no IPv4 or TCP options: its SYN and FIN are
+ * 60-byte frames with a 40-byte IPv4 datagram. Any other template is refused
+ * (EINVAL), at creation and on an update.
+ *
  * __Input Gates__: 0
  * __Output Gates__: 1
  */
