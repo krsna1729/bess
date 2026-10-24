@@ -401,4 +401,103 @@ TEST(L2ForwardResourceTest, LookupAndPopulateAreActions) {
                                                                   resp.gates().end()}));
 }
 
+// -- the packet path: frames too short for a destination MAC ------------------
+
+using bess::testing::Bytes;
+using bess::testing::MakeShortPacket;
+using bess::testing::PacketBuilder;
+
+// 02:00:00:00:00:02 to gate 1, everything else to the default gate 0.
+Module *CreateMapped(ModuleHarness &h) {
+  bess::pb::L2ForwardArg arg;
+  arg.set_default_gate(0);
+  Module *m = h.Create("L2Forward", arg, "l2p");
+  bess::pb::L2ForwardMacKey key;
+  key.set_addr("02:00:00:00:00:02");
+  bess::pb::L2ForwardMacValue value;
+  value.set_gate(1);
+  EXPECT_EQ("", h.UpsertResource("l2p/macs", key, value));
+  return m;
+}
+
+Bytes Frame(const char *dst = "02:00:00:00:00:02") {
+  return PacketBuilder()
+      .Ether(dst, "02:00:00:00:00:01")
+      .IPv4("10.0.0.1", "10.0.0.2")
+      .Udp(1000, 2000)
+      .PadTo(60)
+      .Build();
+}
+
+// `pkt` through `m`: the gate (0 or 1) it left on, or -1 when it was
+// dropped (counted).
+int GateOf(ModuleHarness &h, Module *m, bess::PacketHandle pkt) {
+  const uint64_t dropped = m->deadends();
+  auto out = h.RunPackets(m, 0, {pkt}, m, {0, 1});
+  for (gate_idx_t g : {0, 1}) {
+    if (!out[g].empty()) {
+      return g;
+    }
+  }
+  EXPECT_EQ(dropped + 1, m->deadends()) << "neither forwarded nor dropped";
+  return -1;
+}
+
+// A frame shorter than an Ethernet header (1-13 bytes) has no destination
+// MAC: it is dropped and counted; the 14-byte header alone is forwarded by
+// its MAC. The old code read 8 bytes from each, past the data, and
+// forwarded each on gate 1.
+TEST(L2ForwardPacketTest, AFrameShorterThanAnEthernetHeaderIsDropped) {
+  ModuleHarness h;
+  Module *m = CreateMapped(h);
+  ASSERT_NE(nullptr, m);
+  const Bytes full = Frame();
+  for (size_t len = 1; len < 14; len++) {
+    EXPECT_EQ(-1, GateOf(h, m, MakeShortPacket(full, len))) << len << " bytes";
+  }
+  EXPECT_EQ(1, GateOf(h, m, MakeShortPacket(full, 14)));
+  EXPECT_EQ(0, GateOf(h, m, MakeShortPacket(Frame("02:00:00:00:00:09"), 14)));
+}
+
+// Only the first segment counts (D-121): a chain whose first segment ends
+// inside the Ethernet header is dropped; one that holds it is forwarded.
+// The old code forwarded each on gate 1.
+TEST(L2ForwardPacketTest, AChainShortInItsFirstSegmentIsDropped) {
+  ModuleHarness h;
+  Module *m = CreateMapped(h);
+  ASSERT_NE(nullptr, m);
+  const Bytes full = Frame();
+  for (size_t split : {3u, 6u, 13u}) {
+    EXPECT_EQ(-1, GateOf(h, m, MakeShortPacket(full, split, true)))
+        << "first segment of " << split << " bytes";
+  }
+  for (size_t split : {14u, 30u}) {
+    EXPECT_EQ(1, GateOf(h, m, MakeShortPacket(full, split, true)))
+        << "first segment of " << split << " bytes";
+  }
+}
+
+// Every packet leaves once: N in = N out + dropped, in a burst with mixed
+// gates and in one of short frames only (a burst to one gate leaves as a
+// whole).
+TEST(L2ForwardPacketTest, EveryPacketIsForwardedOrDropped) {
+  ModuleHarness h;
+  Module *m = CreateMapped(h);
+  ASSERT_NE(nullptr, m);
+  const Bytes mapped = Frame();
+  const std::vector<Bytes> mixed = {mapped, Bytes(5, 0x02), Frame("02:00:00:00:00:09"),
+                                    Bytes(13, 0x02), mapped};
+  auto out = h.Run(m, 0, mixed, {0, 1});
+  EXPECT_EQ(2u, out[1].size());
+  EXPECT_EQ(1u, out[0].size());
+  EXPECT_EQ(mixed.size(), out[0].size() + out[1].size() + m->deadends());
+
+  const uint64_t before = m->deadends();
+  const std::vector<Bytes> runts(3, Bytes(10, 0x02));
+  out = h.Run(m, 0, runts, {0, 1});
+  EXPECT_TRUE(out[0].empty());
+  EXPECT_TRUE(out[1].empty());
+  EXPECT_EQ(runts.size(), m->deadends() - before);
+}
+
 }  // namespace

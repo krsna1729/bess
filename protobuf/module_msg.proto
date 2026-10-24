@@ -816,6 +816,9 @@ enum RouteBackend {
  * Note that this is _not_ a learning switch -- forwards according to fixed
  * routes specified by `add(..)`.
  *
+ * A packet whose first segment is shorter than an Ethernet header (14 bytes)
+ * has no destination address to look up: it is dropped.
+ *
  * __Input Gates__: 1
  * __Ouput Gates__: many (configurable, depending on rules)
  */
