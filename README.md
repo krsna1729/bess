@@ -79,6 +79,8 @@ a portable branch (D-190, `tools/check_arch.py`). For benchmarking, see
 [docs/benchmarking.md](docs/benchmarking.md). Every fixed limit (gates,
 workers, fields, masks, table sizes) and what happens past it is in
 [docs/limits.md](docs/limits.md); `tools/check_limits.py` keeps it complete.
+Before you change code, read [docs/engineering-guide.md](docs/engineering-guide.md):
+the packet-safety, layering, performance and change rules that review checks.
 DPDK is consumed through `pkg-config` and is dynamically linked by default.
 Use `-Ddpdk_link=static` only when a static DPDK link is intentional.
 
