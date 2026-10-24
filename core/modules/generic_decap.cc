@@ -4,6 +4,8 @@
 
 #include "generic_decap.h"
 
+#include "packet_mutation.h"
+
 CommandResponse GenericDecap::Init(const bess::pb::GenericDecapArg &arg) {
   if (arg.bytes() == 0) {
     return CommandSuccess();
@@ -15,12 +17,25 @@ CommandResponse GenericDecap::Init(const bess::pb::GenericDecapArg &arg) {
   return CommandSuccess();
 }
 
+// Strips the first `bytes` of each packet in its first segment
+// (packet::RemovePrefixInPlace; no byte is written, so a shared payload is
+// stripped as it is). A packet whose first segment holds fewer bytes (a
+// short packet, or a chain whose first segment ends inside them, D-121) is
+// dropped (D-172), never sent on with the header still on.
 void GenericDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  int decap_size = decap_size_;
+  const auto decap_size = static_cast<size_t>(decap_size_);
 
-  for (bess::PacketRef pkt : batch->packets()) {
-    pkt.adj(decap_size);
+  const int cnt = batch->cnt();
+  int out_cnt = 0;
+  for (int i = 0; i < cnt; i++) {
+    const bess::PacketRef pkt = batch->packet(i);
+    if (unlikely(!bess::packet::RemovePrefixInPlace(pkt, decap_size))) {
+      DropPacket(ctx, pkt);
+      continue;
+    }
+    batch->handles()[out_cnt++] = pkt.handle();
   }
+  batch->set_cnt(out_cnt);
 
   RunNextModule(ctx, batch);
 }
