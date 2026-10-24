@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <limits>
+#include <utility>
 
 #include "packet_mutation.h"
 
@@ -78,6 +79,35 @@ void CopyPacketHeadMetadata(::bess::PacketHandle destination,
   destination->ol_flags =
       source->ol_flags & ~(RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL);
 }
+
+namespace {
+
+// Replaces `packet` with a direct, exclusive copy of the whole packet,
+// the BESS private area included, and frees the original reference. On
+// failure `packet` is unchanged. rte_pktmbuf_copy copies no packet of
+// length 0, so the copy of an empty packet is a new empty mbuf with the
+// head's metadata.
+std::expected<void, ReshapeError> ReplaceWithCopy(
+    ::bess::PacketHandle &packet) noexcept {
+  ::bess::PacketHandle replacement = nullptr;
+  if (packet->pkt_len == 0) {
+    replacement = rte_pktmbuf_alloc(packet->pool);
+    if (replacement != nullptr) {
+      CopyPacketHeadMetadata(replacement, packet);
+    }
+  } else {
+    replacement = ::bess::PacketCopy(packet);
+  }
+  if (replacement == nullptr) {
+    return std::unexpected(ReshapeError::kAllocationFailed);
+  }
+  CopyBessPacketPrivate(replacement, packet);
+  ::bess::PacketFree(std::exchange(packet, replacement));
+  return {};
+}
+
+}  // namespace
+
 std::expected<::bess::PacketHandle, ReshapeError> CopyPacketPreservingTopology(
     ::bess::PacketHandle source) noexcept {
   ::bess::PacketHandle destination_head = nullptr;
@@ -214,16 +244,7 @@ std::expected<void, ReshapeError> EnsureWritable(
     return {};
   }
 
-  ::bess::PacketHandle replacement = ::bess::PacketCopy(packet);
-  if (replacement == nullptr) {
-    return std::unexpected(ReshapeError::kAllocationFailed);
-  }
-  detail::CopyBessPacketPrivate(replacement, packet);
-
-  ::bess::PacketHandle original = packet;
-  packet = replacement;
-  ::bess::PacketFree(original);
-  return {};
+  return detail::ReplaceWithCopy(packet);
 }
 
 namespace detail {
@@ -244,6 +265,50 @@ std::expected<MutableBytes, ReshapeError> WritableHeadSlow(
     }
   }
   return MutableBytes(rte_pktmbuf_mtod(packet, std::byte *), packet->data_len);
+}
+
+namespace {
+
+ReshapeError FromMutationError(MutationError error) noexcept {
+  switch (error) {
+    case MutationError::kNullPacket:
+      return ReshapeError::kNullPacket;
+    case MutationError::kInsufficientHeadroom:
+      return ReshapeError::kInsufficientHeadroom;
+    default:
+      return ReshapeError::kLengthOutOfRange;
+  }
+}
+
+}  // namespace
+
+std::expected<MutableBytes, ReshapeError> PrependWritableSlow(
+    ::bess::PacketHandle &packet, size_t bytes) noexcept {
+  auto prepended = PrependInPlace(::bess::PacketRef(packet), bytes);
+  if (prepended) {
+    return *prepended;
+  }
+  if (prepended.error() != MutationError::kSharedStorage) {
+    return std::unexpected(FromMutationError(prepended.error()));
+  }
+  // PrependInPlace found the head shared. EnsureWritable is not enough: it
+  // copies for the payload bytes only and leaves an empty shared head (a
+  // clone of an empty packet, or an empty head before exclusive segments)
+  // as it is, and that head's headroom is still the other holders' buffer.
+  // So the whole packet is copied here, after the chain check.
+  const auto chain = ValidateChain(packet);
+  if (!chain) {
+    return std::unexpected(chain.error());
+  }
+  const auto copied = ReplaceWithCopy(packet);
+  if (!copied) {
+    return std::unexpected(copied.error());
+  }
+  prepended = PrependInPlace(::bess::PacketRef(packet), bytes);
+  if (!prepended) {
+    return std::unexpected(FromMutationError(prepended.error()));
+  }
+  return *prepended;
 }
 
 }  // namespace detail
