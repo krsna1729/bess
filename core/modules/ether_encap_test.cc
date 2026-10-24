@@ -6,7 +6,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "module_graph.h"
 #include "modules/ether_encap.h"
@@ -21,8 +23,13 @@
 namespace {
 
 using bess::testing::Bytes;
+using bess::testing::FillHeadroom;
+using bess::testing::HeadroomBytes;
+using bess::testing::MakePacket;
+using bess::testing::MakePacketWithoutHeadroom;
 using bess::testing::ModuleHarness;
 using bess::testing::PacketBuilder;
+using bess::testing::PacketBytes;
 
 void AddAttr(bess::pb::SetMetadataArg &arg, const std::string &name, const std::string &value) {
   auto *a = arg.add_attrs();
@@ -74,7 +81,7 @@ TEST(EtherEncapTest, NoHeadroomIsADropAndWritesNothing) {
 
   bess::utils::Ethernet::Address src;
   bess::utils::Ethernet::Address dst;
-  EXPECT_FALSE(EtherEncap::Encap(pkt, src, dst, bess::utils::be16_t(0x0800)));
+  EXPECT_FALSE(EtherEncap::Encap(handle, src, dst, bess::utils::be16_t(0x0800)));
   EXPECT_EQ(before, pkt.total_len()) << "a refused header writes nothing";
 }
 
@@ -114,6 +121,102 @@ TEST(EtherEncapTest, ANoHeadroomPacketIsDroppedNotForwarded) {
 
   EXPECT_EQ(1u, run(20)[0].size()) << "room for the header: forwarded";
   EXPECT_TRUE(run(31)[0].empty()) << "no headroom: dropped, not forwarded";
+}
+
+// SetMetadata (the header's attributes) -> EtherEncap, in `h`; returns the
+// SetMetadata, and the EtherEncap in `*encap`.
+Module *Pipeline(ModuleHarness &h, Module **encap) {
+  bess::pb::SetMetadataArg md_arg;
+  AddAttr(md_arg, "ether_src", std::string("\xde\xad\xbe\xef\x12\x34", 6));
+  AddAttr(md_arg, "ether_dst", std::string("\x12\x34\xde\xad\xbe\xef", 6));
+  AddAttr(md_arg, "ether_type", std::string("\x08\x00", 2));
+  Module *md = h.Create("SetMetadata", md_arg);
+  *encap = h.Create("EtherEncap", bess::pb::EtherEncapArg());
+  if (md == nullptr || *encap == nullptr) {
+    return nullptr;
+  }
+  EXPECT_EQ(0, ModuleGraph::ConnectModules(md, 0, *encap, 0, true));
+  return md;
+}
+
+// 0, 1, 2, ... as `n` bytes: what EtherEncap wraps (it reads none of them).
+Bytes Inner(size_t n) {
+  Bytes b(n);
+  for (size_t i = 0; i < n; i++) {
+    b[i] = static_cast<uint8_t>(i);
+  }
+  return b;
+}
+
+// `inner` behind Pipeline's header.
+Bytes Wrapped(const Bytes &inner) {
+  Bytes b = {0x12, 0x34, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x08, 0x00};
+  b.insert(b.end(), inner.begin(), inner.end());
+  return b;
+}
+
+// A clone's headroom is its source's buffer, so the header goes into a copy,
+// in one segment and in a chain: the other holder keeps its bytes and its
+// headroom, whichever of the two is sent. The old code wrote the header into
+// the shared headroom.
+TEST(EtherEncapTest, ASharedPacketIsCopiedBeforeTheHeader) {
+  ModuleHarness h;
+  Module *encap = nullptr;
+  Module *md = Pipeline(h, &encap);
+  ASSERT_NE(nullptr, md);
+  const Bytes in = Inner(60);
+  for (bool send_clone : {true, false}) {
+    for (size_t split : {0u, 20u}) {
+      SCOPED_TRACE(::testing::Message() << "clone " << send_clone << ", split " << split);
+      bess::PacketHandle original = MakePacket(in, split);
+      ASSERT_NE(nullptr, original);
+      FillHeadroom(original, 14, 0x11);
+      bess::PacketHandle clone = bess::PacketClone(original);
+      ASSERT_NE(nullptr, clone);
+      bess::PacketHandle sent = send_clone ? clone : original;
+      bess::PacketHandle kept = send_clone ? original : clone;
+      auto out = h.RunPackets(md, 0, {sent}, encap, {0});
+      ASSERT_EQ(1u, out[0].size());
+      EXPECT_EQ(Wrapped(in), out[0][0]);
+      EXPECT_EQ(in, PacketBytes(kept)) << "the other holder's bytes are untouched";
+      EXPECT_EQ(Bytes(14, 0x11), HeadroomBytes(kept, 14))
+          << "the other holder's headroom is untouched";
+      bess::PacketFree(kept);
+    }
+  }
+}
+
+// Every packet leaves wrapped on gate 0 or is dropped: one segment, a chain,
+// a clone, an empty packet (EtherEncap reads nothing of the packet, so an
+// empty one is wrapped too) and one without headroom, which is the one
+// dropped. A shared packet without headroom is dropped too, not copied.
+TEST(EtherEncapTest, EveryPacketIsAccountedFor) {
+  ModuleHarness h;
+  Module *encap = nullptr;
+  Module *md = Pipeline(h, &encap);
+  ASSERT_NE(nullptr, md);
+  const Bytes in = Inner(60);
+  bess::PacketHandle source = MakePacket(in);
+  ASSERT_NE(nullptr, source);
+  bess::PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(nullptr, clone);
+  auto out = h.RunPackets(md, 0,
+                          {MakePacket(in), MakePacket(in, 20), clone, MakePacket(Bytes()),
+                           MakePacketWithoutHeadroom(in)},
+                          encap, {0});
+  EXPECT_EQ((std::vector<Bytes>{Wrapped(in), Wrapped(in), Wrapped(in), Wrapped(Bytes())}), out[0])
+      << "5 in, the one without headroom dropped";
+  EXPECT_EQ(in, PacketBytes(source));
+  bess::PacketFree(source);
+
+  bess::PacketHandle bare = MakePacketWithoutHeadroom(in);
+  ASSERT_NE(nullptr, bare);
+  bess::PacketHandle bare_clone = bess::PacketClone(bare);
+  ASSERT_NE(nullptr, bare_clone);
+  out = h.RunPackets(md, 0, {bare_clone}, encap, {0});
+  EXPECT_TRUE(out[0].empty()) << "a shared packet without headroom is dropped";
+  EXPECT_EQ(in, PacketBytes(bare));
+  bess::PacketFree(bare);
 }
 
 }  // namespace

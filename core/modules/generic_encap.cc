@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstring>
 
+#include "packet_reshape.h"
 #include "utils/endian.h"
 
 static_assert(MAX_FIELD_SIZE <= sizeof(uint64_t),
@@ -106,10 +107,15 @@ CommandResponse GenericEncap::Init(const bess::pb::GenericEncapArg &arg) {
   return CommandSuccess();
 }
 
+// Prepends the header into each packet's headroom with
+// packet::PrependWritable: a shared payload (a clone, an indirect mbuf) is
+// copied first, as its headroom is the other holders' buffer too. A packet
+// without the headroom, or whose copy fails, is dropped, never sent on
+// without its header.
 void GenericEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   int cnt = batch->cnt();
 
-  int encap_size = encap_size_;
+  const auto encap_size = static_cast<size_t>(encap_size_);
 
   alignas(32) char headers[bess::PacketBatch::kMaxBurst][MAX_HEADER_SIZE];
 
@@ -132,17 +138,19 @@ void GenericEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
   }
 
+  int out_cnt = 0;
   for (int i = 0; i < cnt; i++) {
-    bess::PacketRef pkt = batch->packet(i);
-
-    char *p = static_cast<char *>(pkt.prepend(encap_size));
-
-    if (unlikely(!p)) {
+    bess::PacketHandle handle = batch->handles()[i];
+    const auto header = bess::packet::PrependWritable(handle, encap_size);
+    if (unlikely(!header)) {
+      DropPacket(ctx, bess::PacketRef(handle));
       continue;
     }
 
-    bess::utils::CopyInlined(p, headers[i], encap_size);
+    bess::utils::CopyInlined(header->data(), headers[i], encap_size);
+    batch->handles()[out_cnt++] = handle;
   }
+  batch->set_cnt(out_cnt);
 
   RunNextModule(ctx, batch);
 }

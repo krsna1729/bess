@@ -17,6 +17,7 @@ enum class ReshapeError : uint8_t {
   kAllocationFailed,
   kInsufficientContiguousCapacity,
   kMalformedChain,
+  kInsufficientHeadroom,
 };
 
 // Ensures packet payload storage is writable with a semantic deep copy. The
@@ -37,6 +38,11 @@ std::expected<void, ReshapeError> EnsureWritablePreservingTopology(
 // decide.
 std::expected<MutableBytes, ReshapeError> WritableHeadSlow(
     ::bess::PacketHandle &packet, size_t required) noexcept;
+
+// PrependWritable's out-of-line part: everything its inline test does not
+// decide.
+std::expected<MutableBytes, ReshapeError> PrependWritableSlow(
+    ::bess::PacketHandle &packet, size_t bytes) noexcept;
 
 }  // namespace detail
 
@@ -84,6 +90,59 @@ inline std::expected<MutableBytes, ReshapeError> WritableHead(
   auto head = detail::WritableHeadSlow(slow, required);
   packet = slow;
   return head;
+}
+
+// True when `packet`'s first segment has at least `bytes` of headroom and is
+// a direct mbuf held once: the common case PrependWritable decides inline,
+// with no branch (one compare, one flag test and one reference-count compare
+// per packet). False does not mean the packet cannot take the bytes;
+// PrependWritable decides the rest.
+inline bool PrependableInPlace(::bess::PacketRef packet,
+                               size_t bytes) noexcept {
+  const ::rte_mbuf *m = packet.handle();
+  return static_cast<bool>(
+      static_cast<unsigned>(rte_pktmbuf_headroom(m) >= bytes) &
+      static_cast<unsigned>(RTE_MBUF_DIRECT(m)) &  // NOLINT(bugprone-signed-bitwise)
+      static_cast<unsigned>(rte_mbuf_refcnt_read(m) == 1));
+}
+
+// The checked prepend (D-153, D-172): `bytes` new bytes in front of
+// `packet`'s data, writable, for a module that prepends a header. The bytes
+// come from the first segment's headroom. Headroom this packet holds alone
+// is used as it is. The headroom of a shared payload (a clone, an indirect
+// mbuf or an external buffer another mbuf holds) is the other holders'
+// buffer too, so that payload is copied first with EnsureWritable; the copy
+// replaces `packet`, and the bytes come from the copy's headroom.
+//
+// On failure the caller drops the packet `packet` names now (the original or
+// its copy), never forwards it without its header:
+//  - kInsufficientHeadroom: the first segment, or the copy's, has less than
+//    `bytes` of headroom (a shared packet without the headroom is not
+//    copied);
+//  - kLengthOutOfRange: `bytes` would take the packet past its length
+//    fields (PrependInPlace's limits);
+//  - EnsureWritable's errors: the copy failed and `packet` is unchanged.
+//
+// The packet's length is never at risk on the inline path: a chain holds at
+// most 65,535 segments of at most 65,535 bytes, so pkt_len plus a headroom
+// (at most 65,535) fits its 32 bits. `packet` must not be null (a batch's
+// packets never are). The common case, PrependableInPlace, is inline; the
+// rest is out of line.
+inline std::expected<MutableBytes, ReshapeError> PrependWritable(
+    ::bess::PacketHandle &packet, size_t bytes) noexcept {
+  if (likely(PrependableInPlace(::bess::PacketRef(packet), bytes))) {
+    const auto n = static_cast<uint16_t>(bytes);
+    packet->data_off = static_cast<uint16_t>(packet->data_off - n);
+    packet->data_len = static_cast<uint16_t>(packet->data_len + n);
+    packet->pkt_len += n;
+    return MutableBytes(rte_pktmbuf_mtod(packet, std::byte *), bytes);
+  }
+  // Only this branch takes a handle's address, so the caller's handle stays
+  // in a register on the common path.
+  ::bess::PacketHandle slow = packet;
+  auto prepended = detail::PrependWritableSlow(slow, bytes);
+  packet = slow;
+  return prepended;
 }
 
 // Ensures that packet has one segment. The caller must exclusively own the

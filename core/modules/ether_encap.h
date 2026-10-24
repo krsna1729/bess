@@ -21,10 +21,12 @@ class EtherEncap final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  // Writes the Ethernet header into the packet's headroom, or returns false
-  // when there is not enough. Public for the unit test; ProcessBatch drops
-  // such a packet rather than forward its payload bare.
-  static bool Encap(bess::PacketRef pkt,
+  // Writes the Ethernet header into the packet's headroom
+  // (packet::PrependWritable: a shared payload is copied first, and the copy
+  // replaces `pkt`), or returns false when there is not enough headroom or
+  // the copy fails. Public for the unit test; ProcessBatch drops such a
+  // packet (the one `pkt` names then) rather than forward its payload bare.
+  static bool Encap(bess::PacketHandle &pkt,
                     const bess::utils::Ethernet::Address &src,
                     const bess::utils::Ethernet::Address &dst,
                     bess::utils::be16_t ether_type);
