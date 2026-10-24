@@ -12,7 +12,7 @@ class L4Checksum final : public Module {
  public:
  L4Checksum() : Module(), verify_(false) { max_allowed_workers_ = Worker::kMaxWorkers; }
 
-  /* Gates: (0) Default, (1) Drop */
+  // Gates: (0) default, (1) verify failed. Malformed frames are dropped.
   static const gate_idx_t kNumOGates = 2;
   static const gate_idx_t kNumIGates = MAX_GATES;
   // Rewrites or checks each packet's checksum; keeps no state.
