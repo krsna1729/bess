@@ -22,9 +22,10 @@ namespace bess::flow {
 
 // Fixed-width key bytes -> 64-bit value, read lock-free by every worker and
 // written by one thread at a time: SharedFlowTable's directory (D-028). It is
-// the boundary that keeps the backend (ConcurrentExactTable over rte_hash,
-// internal) out of the installed headers (consolidation review, 2026-10-04),
-// so SharedFlowTable can be installed. The read path is inline and is the
+// a narrower boundary over the backend (ConcurrentExactTable over rte_hash):
+// insert-if-absent, erase and the batch lookup, no in-place update and no
+// pending-entry protocol (consolidation review, 2026-10-04; the backend
+// itself is installed since D-191). The read path is inline and is the
 // backend's own (its batch hash, then DPDK's prehashed bulk lookup on the same
 // rte_hash), so a lookup costs what it did before the boundary (measured:
 // out of line, scalar lookups were 5-14% slower); the writer is out of line.

@@ -12,8 +12,8 @@
 namespace bess::classifier {
 
 // One match rule's result: the gate the packet leaves on and the result
-// record the module's result plan places. The record is variable on the
-// resource wire; the module stores it zero-padded to its schema's widest
+// record the owner's result plan places. The record is variable on the
+// resource wire; the owner stores it zero-padded to its schema's widest
 // field, so a byte no field covers reads zero rather than stale data.
 struct RuleResult {
   gate_idx_t gate = DROP_GATE;

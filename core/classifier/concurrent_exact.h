@@ -19,7 +19,7 @@
 #include <cstring>
 #include <utility>
 
-#include "classifier/backend.h"
+#include "classifier/classifier.h"
 #include "rcu/rcu_domain.h"
 #include "utils/common.h"
 #include "utils/dpdk_memory.h"
@@ -172,8 +172,7 @@ inline CmpFn SelectCmp(size_t width) noexcept {
 // when HasRoomForOne() is false: live keys plus deletes still waiting out a
 // grace period must leave Headroom() slots free, because a delete's slot is
 // reusable only after every worker's next quiescent point. `Upsert` reporting
-// kFull remains the backstop. Capacity is
-// larger table (a deliberate, rare, amortized rebuild).
+// kFull remains the backstop.
 class ConcurrentExactTable {
  public:
   enum class UpsertResult : uint8_t { kInserted, kUpdated, kFull };

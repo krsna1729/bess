@@ -186,7 +186,8 @@ ABOVE_CLIENT_ISA = {
 DPDK_PROFILE = 'bess'
 STANDALONE_PLUGINS = ('standalone_pass', 'standalone_macswap',
                       'standalone_range_gate', 'standalone_flow_count',
-                      'standalone_appliance', 'standalone_requests')
+                      'standalone_appliance', 'standalone_requests',
+                      'standalone_rule_tables')
 LOCAL_JOB_CAP = 8
 
 

@@ -60,8 +60,6 @@ INTERNAL_FORBIDDEN = [
     "utils/bpf_program.h",
     "utils/cuckoo_map.h",
     "dataplane/transaction_engine.h",
-    "classifier/concurrent_exact.h",
-    "classifier/concurrent_masked.h",
     # Generated protocol the public headers do not include.
     "pb/control_v2.pb.h",
     "pb/test_msg.pb.h",

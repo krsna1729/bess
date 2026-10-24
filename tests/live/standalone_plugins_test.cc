@@ -209,6 +209,9 @@ TEST_F(StandalonePlugins, ConformancePlugins) {
           {"StandaloneAppliance", "appliance1", UdpFrame(53), 0},
           // Gate 1 only after a request round trip through the maintenance loop.
           {"StandaloneRequests", "requests0", std::nullopt, 1},
+          // Gate 1 only when its exact, masked and rebuilt tables all match.
+          {"StandaloneRuleTables", "ruletables0", UdpFrame(1500), 1},
+          {"StandaloneRuleTables", "ruletables1", UdpFrame(53), 0},
       },
       nullptr);
 }
