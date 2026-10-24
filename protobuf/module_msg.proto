@@ -634,6 +634,11 @@ message DumpArg {
  * For example: `SetMetadata('dst_mac', 11:22:33:44:55) -> EtherEncap()`
  * This is useful when upstream modules wish to assign a MAC address to a packet, e.g., due to an ARP request.
  *
+ * The header goes into the packet's headroom. A shared payload (a clone, an
+ * indirect mbuf) is copied first (D-153), as its headroom is the other
+ * holders' buffer too. A packet without the headroom, or whose copy fails,
+ * is dropped, never forwarded without the header.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
