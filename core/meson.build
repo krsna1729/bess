@@ -846,6 +846,7 @@ unit_test_sources = [
   'modules/l4_checksum_test.cc',
   'modules/replicate_test.cc',
   'modules/ether_encap_test.cc',
+  'modules/ip_encap_test.cc',
   'modules/set_metadata_test.cc',
   'modules/vxlan_decap_test.cc',
   'modules/vxlan_encap_test.cc',
