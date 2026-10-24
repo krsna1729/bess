@@ -69,10 +69,13 @@ plugins do not inherit it). The default, empty, passes none: GCC tunes
 `-march=x86-64-v3` for `generic`, Clang for Haswell, and `-march=native`
 tunes for the build machine. Releases keep the default; D-127 has the
 measurements behind that.
-`-Darch_generic=true` makes `core/arch/` use its portable code paths instead
-of x86/arm64 intrinsics and asm, to build and test on x86 what other
-architectures run; architecture-specific code belongs only in `core/arch/`
-(`tools/check_arch.py`). For benchmarking, see
+`-Darch_generic=true` makes `core/arch/` and the owner kernel files use their
+portable code paths instead of x86/arm64 intrinsics and asm, to build and test
+on x86 what other architectures run. Architecture-specific code belongs in
+`core/arch/` (the platform layer and shared primitives) or in the owner's
+`<owner>_kernels.h`/`.cc` next to the module or library that uses it, which
+tests ISA features only through `arch/cpu.h`'s `BESS_ARCH_*` macros and keeps
+a portable branch (D-190, `tools/check_arch.py`). For benchmarking, see
 [docs/benchmarking.md](docs/benchmarking.md). Every fixed limit (gates,
 workers, fields, masks, table sizes) and what happens past it is in
 [docs/limits.md](docs/limits.md); `tools/check_limits.py` keeps it complete.

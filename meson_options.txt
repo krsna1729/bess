@@ -9,7 +9,7 @@ option('tune',
 option('arch_generic',
        type: 'boolean',
        value: false,
-       description: 'Define BESS_ARCH_GENERIC: core/arch/ uses its portable code paths instead of x86/arm64 intrinsics and asm')
+       description: 'Define BESS_ARCH_GENERIC: core/arch/ and the owners\' *_kernels files (D-190) use their portable code paths instead of x86/arm64 intrinsics and asm')
 option('af_xdp',
        type: 'combo',
        choices: ['auto', 'required'],

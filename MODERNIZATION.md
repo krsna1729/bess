@@ -5105,7 +5105,7 @@ rather than one call site).
      PMD by a throwaway program). 11 tests, 23 mutants caught, 2 equivalent. The
      real-hardware matrix is not run (no NIC here) and stays a separate gate.
 
-159. **M21 portability (D-071).** `core/arch/` is the one place for ISA code; `BESS_ARCH_GENERIC` builds the portable
+159. **M21 portability (D-071).** `core/arch/` is the one place for ISA code (amended by D-190: or the owner's `*_kernels.h`); `BESS_ARCH_GENERIC` builds the portable
      paths on x86. Portable copy, mask, VLAN, packet-pool rearm and CRC; x86 kernels kept where measured (checksum
      bulk sum, L2 probe, tag match, cuckoo AVX2, HTTP scan). Memory ordering moved from x86 TSO assumptions to C++
      atomics. DPDK machine flags filtered; `bess-dev.pc` carries bessd's ISA. `check_arch.py` with a shrink-only
