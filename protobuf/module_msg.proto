@@ -763,6 +763,13 @@ message HashLBArg {
  * by metadata values carried with the packet. Metadata attributes must include:
  * ip_src, ip_dst, ip_proto, ip_nexthop, and ether_type.
  *
+ * The header has no options, identification 0, don't-fragment set and TTL
+ * 64, and goes into the packet's headroom. A shared payload (a clone, an
+ * indirect mbuf) is copied first (D-153), as its headroom is the other
+ * holders' buffer too. A packet is dropped, never forwarded without the
+ * header, when it has no headroom, when the copy fails, or when it is too
+ * long for the total length (more than 65,515 bytes before the header).
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
