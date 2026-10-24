@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <map>
 #include <memory>
@@ -163,7 +164,20 @@ class ConcurrentMaskedTable {
     size_t ranged_upserts = 0;
     std::vector<ChainPtr> spares;
   };
-  using KeyStates = std::map<std::vector<std::byte>, KeyState>;
+  // Orders keys by length, then bytes. Nothing iterates the map, so any strict
+  // weak order serves; this one avoids std::vector's operator<=>, which g++ 14
+  // at -O3 reports as an out-of-bounds memcmp (-Wstringop-overread, a false
+  // positive) and the release build treats as an error.
+  struct KeyBytesLess {
+    bool operator()(const std::vector<std::byte> &a,
+                    const std::vector<std::byte> &b) const noexcept {
+      if (a.size() != b.size()) {
+        return a.size() < b.size();
+      }
+      return !a.empty() && std::memcmp(a.data(), b.data(), a.size()) < 0;
+    }
+  };
+  using KeyStates = std::map<std::vector<std::byte>, KeyState, KeyBytesLess>;
 
  public:
   // One lookup result: the winning rule's gate (out of the packed value) and
