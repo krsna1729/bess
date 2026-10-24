@@ -811,6 +811,11 @@ message L2ForwardSettings {
  * The MACSwap module takes no arguments. It swaps the src/destination MAC addresses
  * within a packet.
  *
+ * A frame whose first segment does not hold the 14-byte Ethernet header is
+ * dropped. A frame whose payload is shared (a clone) is copied first, so the
+ * payload's other holders never see the swap (D-153), and a frame whose copy
+ * fails is dropped.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
