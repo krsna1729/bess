@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "module.h"
+#include "packet.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
@@ -23,8 +24,10 @@
 namespace {
 
 using bess::testing::Bytes;
+using bess::testing::MakePacket;
 using bess::testing::ModuleHarness;
 using bess::testing::PacketBuilder;
+using bess::testing::PacketBytes;
 
 constexpr char kInside[] = "172.16.0.2";
 constexpr char kRemote[] = "8.8.8.8";
@@ -229,6 +232,84 @@ TEST(NatModuleTest, UsageCommandsAreActions) {
   bess::pb::NATUsageResponse resp;
   ASSERT_TRUE(r.data().UnpackTo(&resp));
   EXPECT_EQ(0, resp.records_size());
+}
+
+// The ports (ICMP: the echo id) of `l4`'s outbound test flow, and its frame
+// from kInside to kRemote.
+uint16_t SourcePort(L4 l4) { return l4 == L4::kTcp ? 52428 : l4 == L4::kIcmp ? 7 : 56797; }
+uint16_t DestPort(L4 l4) { return l4 == L4::kTcp ? 80 : l4 == L4::kIcmp ? 0 : 53; }
+Bytes Outbound(L4 l4) { return Frame(l4, kInside, kRemote, SourcePort(l4), DestPort(l4)); }
+
+// `natted` is `l4`'s outbound frame translated: the external address and the
+// port (or echo id) the NAT picked, checksums included.
+void ExpectTranslated(L4 l4, const Bytes &natted) {
+  ASSERT_GE(natted.size(), 42u);
+  const uint16_t mapped = Get16(natted, l4 == L4::kIcmp ? 38 : 34);
+  EXPECT_EQ(Frame(l4, kPublic, kRemote, mapped, DestPort(l4)), natted);
+}
+
+// The rewrite is in place: a clone's payload (or the source a clone shares)
+// is copied first, in one segment and in a chain split after the headers,
+// and the other holder keeps its frame. The old code translated the shared
+// bytes.
+TEST(NatModuleTest, ASharedFrameIsCopiedBeforeTheTranslation) {
+  for (const L4 l4 : {L4::kUdp, L4::kTcp, L4::kIcmp}) {
+    ModuleHarness h;
+    Module *nat = h.Create("NAT", Arg());
+    ASSERT_NE(nullptr, nat);
+    const Bytes frame = Outbound(l4);
+    for (bool send_clone : {true, false}) {
+      for (size_t split : {size_t{0}, frame.size() - 5}) {
+        SCOPED_TRACE(::testing::Message() << "l4 " << static_cast<int>(l4) << ", clone "
+                                          << send_clone << ", split " << split);
+        bess::PacketHandle original = MakePacket(frame, split);
+        ASSERT_NE(nullptr, original);
+        bess::PacketHandle clone = bess::PacketClone(original);
+        ASSERT_NE(nullptr, clone);
+        auto out = h.RunPackets(nat, 0, {send_clone ? clone : original}, nat, {0, 1});
+        bess::PacketHandle kept = send_clone ? original : clone;
+        EXPECT_TRUE(out[0].empty());
+        ASSERT_EQ(1u, out[1].size());
+        ExpectTranslated(l4, out[1][0]);
+        EXPECT_EQ(frame, PacketBytes(kept)) << "the other holder's frame is untouched";
+        bess::PacketFree(kept);
+      }
+    }
+  }
+}
+
+// Every packet leaves translated on gate 1 or is dropped: UDP in one
+// segment, TCP in a chain split after its headers, an ICMP echo in a clone;
+// a runt, a chain split inside the IPv4 header, one split inside the TCP
+// header and an ARP frame are dropped.
+TEST(NatModuleTest, EveryPacketIsAccountedFor) {
+  ModuleHarness h;
+  Module *nat = h.Create("NAT", Arg());
+  ASSERT_NE(nullptr, nat);
+  const Bytes udp = Outbound(L4::kUdp);
+  const Bytes tcp = Outbound(L4::kTcp);
+  const Bytes icmp = Outbound(L4::kIcmp);
+  const Bytes arp = PacketBuilder()
+                        .Ether("ff:ff:ff:ff:ff:ff", "02:00:00:00:00:01")
+                        .Arp(1, "02:00:00:00:00:01", "10.0.0.1", "00:00:00:00:00:00", "10.0.0.2")
+                        .PadTo(60)
+                        .Build();
+  bess::PacketHandle source = MakePacket(icmp);
+  ASSERT_NE(nullptr, source);
+  bess::PacketHandle clone = bess::PacketClone(source);
+  ASSERT_NE(nullptr, clone);
+  auto out = h.RunPackets(nat, 0,
+                          {MakePacket(udp), MakePacket(tcp, 54), clone,
+                           MakePacket(Bytes(udp.begin(), udp.begin() + 30)), MakePacket(udp, 30),
+                           MakePacket(tcp, 44), MakePacket(arp)},
+                          nat, {0, 1});
+  EXPECT_TRUE(out[0].empty());
+  ASSERT_EQ(3u, out[1].size()) << "7 in, 4 dropped";
+  ExpectTranslated(L4::kUdp, out[1][0]);
+  ExpectTranslated(L4::kTcp, out[1][1]);
+  ExpectTranslated(L4::kIcmp, out[1][2]);
+  EXPECT_EQ(icmp, PacketBytes(source));
+  bess::PacketFree(source);
 }
 
 }  // namespace
