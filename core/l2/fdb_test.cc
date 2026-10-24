@@ -7,6 +7,7 @@
 
 #include "l2/fdb.h"
 #include "l2/mac_table.h"
+#include "l2/packed_mac_table.h"
 
 #include <gtest/gtest.h>
 
@@ -193,6 +194,61 @@ TEST(FdbTest, AReservationWithoutASlotIsRefused) {
   MacAddress bcast{{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
   EXPECT_FALSE(fdb->ReserveStatic(kD0, bcast));
   EXPECT_FALSE(fdb->ReserveStatic(BridgeDomainId(16), Mac(3)));
+}
+
+// What the Bridge's statics rely on: at capacity, the table still makes a key
+// it holds static in place (a learned entry, a reservation, a static), and
+// refuses a new one without changing anything. Aging and flushing learned
+// entries leave a reservation alone (it is static), so the AddStatic that
+// publishes it replaces it rather than adding the key again.
+template <typename F>
+void FullTableProgramsTheKeysItHolds(F &fdb) {
+  ASSERT_EQ(LearnResult::kLearned, fdb.Learn(kD0, Mac(1), InterfaceId(1), 0));
+  ASSERT_EQ(LearnResult::kLearned, fdb.Learn(kD0, Mac(2), InterfaceId(2), 0));
+  ASSERT_TRUE(fdb.ReserveStatic(kD0, Mac(3)));
+  ASSERT_EQ(ProgramResult::kAdded, fdb.AddStatic(kD0, Mac(4), InterfaceId(4)));
+  ASSERT_EQ(4u, fdb.size());
+  ASSERT_EQ(fdb.capacity(), fdb.size());
+
+  EXPECT_FALSE(fdb.ReserveStatic(kD0, Mac(5)));
+  EXPECT_EQ(ProgramResult::kFull, fdb.AddStatic(kD0, Mac(5), InterfaceId(5)));
+  EXPECT_EQ(4u, fdb.size());
+  EXPECT_EQ(kInvalidInterfaceId, fdb.Lookup(kD0, Mac(5)));
+
+  EXPECT_EQ(ProgramResult::kReplaced, fdb.AddStatic(kD0, Mac(1), InterfaceId(7)));
+  EXPECT_EQ(1u, fdb.dynamic_entries());  // Mac(1)'s timer was cancelled
+  EXPECT_EQ(ProgramResult::kReplaced, fdb.AddStatic(kD0, Mac(4), InterfaceId(9)));
+  EXPECT_EQ(4u, fdb.size());
+
+  EXPECT_EQ(1u, fdb.Age(kAging + 1, 1u << 20u));  // Mac(2) only
+  fdb.Flush(/*static_too=*/false);
+  EXPECT_EQ(3u, fdb.size());
+  EXPECT_EQ(ProgramResult::kReplaced, fdb.AddStatic(kD0, Mac(3), InterfaceId(8)));
+  EXPECT_EQ(InterfaceId(7), fdb.Lookup(kD0, Mac(1)));
+  EXPECT_EQ(InterfaceId(8), fdb.Lookup(kD0, Mac(3)));
+  EXPECT_EQ(InterfaceId(9), fdb.Lookup(kD0, Mac(4)));
+  EXPECT_EQ(3u, fdb.size());
+}
+
+TEST(FdbTest, AFullTableProgramsTheKeysItHolds) {
+  auto fdb = Make(4);
+  FullTableProgramsTheKeysItHolds(*fdb);
+}
+
+// The same on the Bridge's storage (Bridge::Fdb). Capacity 4 is two buckets
+// of four slots: with at most four keys, a key's own bucket always has a free
+// slot, so placement decides nothing (the seed is fixed regardless).
+TEST(FdbTest, AFullPackedTableProgramsTheKeysItHolds) {
+  using PackedFdb = BasicFdb<PackedMacTable<dataplane::ExpiryHandle>>;
+  PackedFdb::Config c;
+  c.capacity = 4;
+  c.aging = kAging;
+  c.granularity_shift = 0;
+  c.max_domains = 1;
+  c.hash_seed = 0x5EED;
+  auto fdb = PackedFdb::Create(c);
+  ASSERT_TRUE(fdb.has_value());
+  FullTableProgramsTheKeysItHolds(**fdb);
 }
 
 TEST(FdbTest, BatchLookupMatchesScalar) {
