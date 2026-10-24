@@ -75,11 +75,13 @@ TSAN_DPDK_ARGS = '-DRTE_USE_C11_MEM_MODEL -DRTE_FORCE_INTRINSICS'
 # others are experimental and must not block a merge: the ubuntu-26.04 lanes
 # show toolchain and library drift (GCC 15, Clang 22) before it reaches the
 # gating lanes; the arm64 lanes gate and run on pull requests (develop requires
-# them), while the generic and release-semantics lanes are experimental.
+# them), while the generic lane is experimental.
 # `push_only` lanes run on pushes to develop/master and tags,
 # not on pull requests: they catch drift and portability breaks a release
 # later, and leaving them out halves a pull request's runner time. The
-# sanitizer lanes run on pull requests.
+# sanitizer lanes run on pull requests. A `cxx_pull_requests` lane runs on a
+# pull request only when it changes what the C++ build compiles (changes_cxx),
+# and on every push.
 LANES = [
     # GCC 14 (Ubuntu 24.04 noble-updates): the distro default is 13, which
     # lacks C++23 features the codebase may use (deducing this).
@@ -117,9 +119,12 @@ LANES = [
     # (-O3, NDEBUG: no assert(), no _GLIBCXX_ASSERTIONS, flow-owner checks
     # off; meson.build), so a test that passes only because a check stops it,
     # or code that misbehaves only at -O3, shows before a release. Separate
-    # from packaging (`release`, no tests).
+    # from packaging (`release`, no tests), which builds with the same g++ at
+    # -O3 and so fails with it. It gates a pull request that changes C++: a
+    # push-only release lane let g++ 14's -O3 diagnostics break develop from
+    # 9b68a07f to 459a18f4 with every pull request green.
     {'name': 'gcc-release', 'os': 'ubuntu-24.04', 'cc': 'gcc-14', 'cxx': 'g++-14',
-     'lane_args': '--release-semantics', 'experimental': True, 'push_only': True},
+     'lane_args': '--release-semantics', 'cxx_pull_requests': True},
     {'name': 'gcc-u26', 'os': 'ubuntu-26.04', 'cc': 'gcc-15', 'cxx': 'g++-15',
      'experimental': True, 'push_only': True},
     {'name': 'clang-u26', 'os': 'ubuntu-26.04', 'cc': 'clang-22', 'cxx': 'clang++-22',
@@ -669,9 +674,26 @@ def pull_request_changes(root=ROOT):
     out = subprocess.run(['git', 'diff', '--name-only', 'HEAD^1', 'HEAD'], cwd=root,
                          capture_output=True, text=True)
     if out.returncode != 0:
-        print('could not list the pull request\'s changes; checking everything')
+        # stderr: the Lanes step writes stdout to $GITHUB_OUTPUT.
+        print('could not list the pull request\'s changes; checking everything',
+              file=sys.stderr)
         return None
     return [line for line in out.stdout.splitlines() if line]
+
+
+# What the C++ build compiles or is configured by: a pull request changing
+# none of these cannot change a C++ lane's result.
+CXX_SUFFIXES = ('.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.inc', '.proto')
+CXX_NAMES = ('meson.build', 'meson.options', 'meson_options.txt')
+CXX_PREFIXES = ('deps/', 'env/', 'tools/ci_profile.py', '.github/workflows/ci.yml')
+
+
+def changes_cxx(changed):
+    """Whether a pull request's changed files (None: unknown) touch CXX_INPUTS;
+    unknown counts as changed."""
+    return changed is None or any(
+        path.endswith(CXX_SUFFIXES) or Path(path).name in CXX_NAMES
+        or path.startswith(CXX_PREFIXES) for path in changed)
 
 
 STEPS = [
@@ -873,11 +895,18 @@ def info(s):
         print(f'  - {d}')
 
 
-def ci_lanes(event):
+def ci_lanes(event, changed=None):
     """The build-and-test matrix for a GitHub event, as the workflow's
-    `matrix=` output."""
-    include = [{k: v for k, v in lane.items() if k != 'push_only'}
-               for lane in LANES if not (event == 'pull_request' and lane.get('push_only'))]
+    `matrix=` output. `changed` is a pull request's changed files (None:
+    unknown)."""
+    def runs(lane):
+        if event != 'pull_request':
+            return True
+        if lane.get('push_only'):
+            return False
+        return not lane.get('cxx_pull_requests') or changes_cxx(changed)
+    include = [{k: v for k, v in lane.items() if k not in ('push_only', 'cxx_pull_requests')}
+               for lane in LANES if runs(lane)]
     for lane in include:
         lane.setdefault('lane_args', '')
         lane.setdefault('experimental', False)
@@ -966,7 +995,7 @@ def main():
     parser.add_argument('--event', help='lanes: the GitHub event (pull_request, push)')
     args = parser.parse_args()
     if args.step == 'lanes':
-        print(ci_lanes(args.event))
+        print(ci_lanes(args.event, pull_request_changes()))
         return 0
     if args.step == 'check-pins':
         check_pins()
