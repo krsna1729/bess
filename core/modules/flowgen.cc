@@ -563,7 +563,9 @@ struct task_result FlowGen::RunTask(Context *ctx, bess::PacketBatch *batch,
   uint32_t cnt = batch->cnt();
   return {.block = (cnt == 0),
           .packets = cnt,
-          .bits = ((params_.template_size + pkt_overhead) * cnt) * 8};
+          .bits = uint64_t{static_cast<uint32_t>(params_.template_size +
+                                                 pkt_overhead)} *
+                  cnt * 8};
 }
 
 std::string FlowGen::GetDesc() const {

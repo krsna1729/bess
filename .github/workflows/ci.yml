@@ -26,6 +26,11 @@ concurrency:
     || github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
+# The token is read-only for every job; a job that writes (publish-release)
+# names what it needs in its own permissions block.
+permissions:
+  contents: read
+
 env:
   # The CPU floor is per architecture and comes from tools/ci_profile.py
   # (x86_64: x86-64-v3, decision D-016; aarch64: armv8.2-a, M21). The first
