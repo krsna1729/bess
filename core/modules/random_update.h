@@ -23,7 +23,7 @@ class RandomUpdate final : public Module {
   static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kPerWorker,
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
-  RandomUpdate() : Module(), num_vars_(), vars_(), rng_() {
+  RandomUpdate() : Module(), num_vars_(), required_len_(), vars_(), rng_() {
     max_allowed_workers_ = Worker::kMaxWorkers;
   }
 
@@ -33,27 +33,44 @@ class RandomUpdate final : public Module {
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
  private:
+  // One field: `size` bytes at `offset`, big-endian, written exactly (the
+  // bytes around it are neither read nor written).
   struct Var {
-    bess::utils::be32_t mask;  // bits with 1 won't be updated
     uint32_t min;
     uint32_t range;  // max - min + 1
     size_t offset;
-    size_t bit_shift;
+    uint8_t size;  // 1, 2 or 4
   };
 
-  // A "<name>/fields" value, converted: the variables and the
-  // RandomUpdateArg they came from (read back as given).
+  // A "<name>/fields" value, converted: the variables, the first-segment
+  // length they need, and the RandomUpdateArg they came from (read back as
+  // given).
   struct Staged {
     size_t num_vars = 0;
+    size_t required_len = 0;
     Var vars[kMaxVariable] = {};
     bess::pb::RandomUpdateArg arg;
   };
 
+  // Validates and converts the whole list into `vars` (at most kMaxVariable
+  // of them) and the largest offset + size into *required_len. On failure
+  // *num_vars and *required_len are untouched.
+  static CommandResponse ParseFields(const bess::pb::RandomUpdateArg &arg,
+                                     Var *vars, size_t *num_vars,
+                                     size_t *required_len);
   // Validates and converts one field.
   static CommandResponse ParseField(const bess::pb::RandomUpdateArg::Field &var,
                                     Var *out);
 
+  // The slow path for a batch with a packet that is not
+  // HeadWritableInPlace(packet_reshape.h): drops what is too short, copies
+  // what is shared, and compacts the batch.
+  void PrepareBatch(Context *ctx, bess::PacketBatch *batch);
+
   size_t num_vars_;
+  // The largest offset + size over vars_: a packet's first segment must hold
+  // this many bytes for every field to be written (0 with no fields).
+  size_t required_len_;
 
   Var vars_[kMaxVariable];
 

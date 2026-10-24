@@ -62,22 +62,6 @@ void Update::DeInit() {
   fields_resource_.Release();
 }
 
-// Every field is written into the packet's first segment, so that segment
-// must hold the furthest byte any field names, and its payload must be this
-// packet's alone (D-153): a clone's or a shared external buffer's bytes are
-// seen by every holder. This is the common case only, without a branch, so a
-// batch is checked in one straight pass: a direct mbuf held once is
-// PayloadWriteabilityOf's own fast case. Anything else (including an indirect
-// mbuf or external buffer that happens to be writable) is decided by
-// PrepareBatch.
-inline bool Update::Ready(bess::PacketRef pkt, size_t required) {
-  const ::rte_mbuf *m = pkt.handle();
-  return static_cast<bool>(
-      static_cast<unsigned>(pkt.head_len() >= required) &
-      static_cast<unsigned>(RTE_MBUF_DIRECT(m)) &  // NOLINT(bugprone-signed-bitwise)
-      static_cast<unsigned>(rte_mbuf_refcnt_read(m) == 1));
-}
-
 // A packet that is too short in its first segment -- a runt, or a chain whose
 // first segment ends before a field -- is dropped rather than partly written
 // (D-172's packet destinations). A shared one is copied first; the copy may
@@ -86,7 +70,7 @@ void Update::PrepareBatch(Context *ctx, bess::PacketBatch *batch) {
   const size_t required = required_len_;
   int out_cnt = 0;
   for (bess::PacketRef pkt : batch->packets()) {
-    if (Ready(pkt, required)) {
+    if (bess::packet::HeadWritableInPlace(pkt, required)) {
       batch->handles()[out_cnt++] = pkt.handle();
       continue;
     }
@@ -105,11 +89,18 @@ void Update::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (num_fields_ != 0) {
     // One pass that only reads, and one branch for the batch: a batch whose
     // packets are all long enough and unshared (the common case) is written
-    // as it is.
+    // as it is. Every field is written into the packet's first segment, so
+    // that segment must hold the furthest byte any field names, and its
+    // payload must be this packet's alone (D-153): a clone's or a shared
+    // external buffer's bytes are seen by every holder. HeadWritableInPlace
+    // tests the common case only (a direct mbuf held once), without a branch;
+    // anything else (including an indirect mbuf or external buffer that
+    // happens to be writable) is decided by PrepareBatch.
     const size_t required = required_len_;
     unsigned ready = 1;
     for (bess::PacketRef pkt : batch->packets()) {
-      ready &= static_cast<unsigned>(Ready(pkt, required));
+      ready &= static_cast<unsigned>(
+          bess::packet::HeadWritableInPlace(pkt, required));
     }
     if (unlikely(ready == 0)) {
       PrepareBatch(ctx, batch);
@@ -126,8 +117,8 @@ void Update::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
       // The value is big-endian with the field's bytes at the top of the
       // word, so its first `size` bytes are the field. Writing exactly those
-      // bytes leaves the neighbours alone; Ready() keeps them inside the
-      // first segment's data.
+      // bytes leaves the neighbours alone; HeadWritableInPlace or
+      // PrepareBatch keeps them inside the first segment's data.
       std::memcpy(head + offset, &field.value, size);
     }
   }

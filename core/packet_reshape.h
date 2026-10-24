@@ -33,7 +33,58 @@ namespace detail {
 std::expected<void, ReshapeError> EnsureWritablePreservingTopology(
     ::bess::PacketHandle &packet) noexcept;
 
+// WritableHead's out-of-line part: everything its inline test does not
+// decide.
+std::expected<MutableBytes, ReshapeError> WritableHeadSlow(
+    ::bess::PacketHandle &packet, size_t required) noexcept;
+
 }  // namespace detail
+
+// True when `packet`'s first segment holds at least `required` bytes and is
+// a direct mbuf held once: the common case WritableHead decides inline, with
+// no branch, so a batch can be tested in one straight pass (one length
+// compare, one flag test and one reference-count compare per packet). False
+// does not mean the packet cannot be written; WritableHead decides the rest.
+inline bool HeadWritableInPlace(::bess::PacketRef packet,
+                                size_t required) noexcept {
+  const ::rte_mbuf *m = packet.handle();
+  return static_cast<bool>(
+      static_cast<unsigned>(m->data_len >= required) &
+      static_cast<unsigned>(RTE_MBUF_DIRECT(m)) &  // NOLINT(bugprone-signed-bitwise)
+      static_cast<unsigned>(rte_mbuf_refcnt_read(m) == 1));
+}
+
+// The checked in-place header write (D-121, D-153, D-172): `packet`'s first
+// segment as writable bytes, all of them (at least `required`), for a module
+// that rewrites bytes at fixed offsets of the frame. Only the first segment
+// counts: its bytes must reach `required`. A payload this packet holds alone
+// is written as it is. A shared one (a clone, an indirect mbuf or an external
+// buffer another mbuf holds) is copied first with EnsureWritable; the copy
+// replaces `packet` and may resegment it, so the length is checked again on
+// the copy. Only the first segment's sharing is tested, as only it is
+// written.
+//
+// On failure the caller drops the packet `packet` names now (the original or
+// its copy), never forwards it partly written or unwritten:
+//  - kLengthOutOfRange: the first segment, or the copy's, is shorter than
+//    `required`;
+//  - EnsureWritable's errors: the copy failed and `packet` is unchanged.
+//
+// `packet` must not be null (a batch's packets never are). The common case,
+// HeadWritableInPlace, is inline; the rest is out of line.
+inline std::expected<MutableBytes, ReshapeError> WritableHead(
+    ::bess::PacketHandle &packet, size_t required) noexcept {
+  if (likely(HeadWritableInPlace(::bess::PacketRef(packet), required))) {
+    return MutableBytes(rte_pktmbuf_mtod(packet, std::byte *),
+                        packet->data_len);
+  }
+  // Only this branch takes a handle's address, so the caller's handle stays
+  // in a register on the common path.
+  ::bess::PacketHandle slow = packet;
+  auto head = detail::WritableHeadSlow(slow, required);
+  packet = slow;
+  return head;
+}
 
 // Ensures that packet has one segment. The caller must exclusively own the
 // descriptor chain; payload backing may remain shared when packet is already

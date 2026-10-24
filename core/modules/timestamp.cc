@@ -63,9 +63,7 @@ CommandResponse Timestamp::Init(const bess::pb::TimestampArg &arg) {
   if (arg.offset()) {
     // The stamp must fit the packet data room (the default pool's): the
     // offset is then also a 16-bit one.
-    const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
-    const size_t data_room =
-        pool == nullptr ? bess::kDefaultPacketDataSize : pool->data_room_size();
+    const size_t data_room = bess::PacketPool::DefaultDataRoomSize();
     if (data_room < kStampSize || arg.offset() > data_room - kStampSize) {
       return CommandFailure(EINVAL, "offset %llu leaves no room for the %zu-byte stamp in the %zu-byte packet data room",
                             static_cast<unsigned long long>(arg.offset()), kStampSize, data_room);

@@ -1009,6 +1009,19 @@ std::vector<Test> Catalogue() {
          R"( {"offset": 0, "size": 6, "value": )" +
              std::to_string(0x020000000003ull) + "}]}",
          1)},
+      // The fixed-header rewriters (D-153's checked write, WritableHead):
+      // every frame is long enough and unshared, so each takes the inline
+      // case.
+      {"M.macswap", 'M', m("MACSwap", "ms", "{}", 1)},
+      {"M.ipswap", 'M', m("IPSwap", "ips", "{}", 1)},
+      {"M.update_ttl", 'M', m("UpdateTTL", "ttl", "{}", 1)},
+      // Every source address the front end draws (10.0.0.1 on) is in the
+      // range: each frame is translated, and leaves on gate 1.
+      {"M.static_nat", 'M',
+       m("StaticNAT", "snat",
+         R"({"pairs": [{"int_range": {"start": "10.0.0.0", "end": "10.0.255.255"},)"
+         R"( "ext_range": {"start": "192.0.0.0", "end": "192.0.255.255"}}]})",
+         2)},
       {"M.nat", 'M',
        m("NAT", "nat",
          R"({"ext_addrs": [{"ext_addr": "192.0.2.1", "port_ranges": [{"begin": 1024, "end": 65535}]}]})",

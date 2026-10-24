@@ -74,21 +74,12 @@ void Rewrite::DeInit() {
   templates_resource_.Release();
 }
 
-namespace {
-
-// The payload room of the default pool's packets: what a reset packet can
-// hold (DPDK's reset leaves the default headroom in front of it).
-size_t ConfiguredPacketDataRoom() {
-  const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
-  return pool == nullptr ? bess::kDefaultPacketDataSize : pool->data_room_size();
-}
-
-}  // namespace
-
 CommandResponse Rewrite::Build(const bess::pb::RewriteArg &arg,
                                Templates *out) {
   const size_t num = arg.templates_size();
-  const size_t data_room = ConfiguredPacketDataRoom();
+  // The payload room of the default pool's packets: what a reset packet can
+  // hold (DPDK's reset leaves the default headroom in front of it).
+  const size_t data_room = bess::PacketPool::DefaultDataRoomSize();
   for (size_t i = 0; i < num; i++) {
     const auto &templ = arg.templates(static_cast<int>(i));
 

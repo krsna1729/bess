@@ -226,6 +226,28 @@ std::expected<void, ReshapeError> EnsureWritable(
   return {};
 }
 
+namespace detail {
+
+std::expected<MutableBytes, ReshapeError> WritableHeadSlow(
+    ::bess::PacketHandle &packet, size_t required) noexcept {
+  if (packet->data_len < required) {
+    return std::unexpected(ReshapeError::kLengthOutOfRange);
+  }
+  if (PayloadWriteabilityOf(::bess::PacketRef(packet)) !=
+      PayloadWriteability::kWritable) {
+    const auto copied = EnsureWritable(packet);
+    if (!copied) {
+      return std::unexpected(copied.error());
+    }
+    if (packet->data_len < required) {
+      return std::unexpected(ReshapeError::kLengthOutOfRange);
+    }
+  }
+  return MutableBytes(rte_pktmbuf_mtod(packet, std::byte *), packet->data_len);
+}
+
+}  // namespace detail
+
 std::expected<void, ReshapeError> EnsureLinear(
     ::bess::PacketHandle &packet) noexcept {
   const auto chain = detail::ValidateChain(packet);

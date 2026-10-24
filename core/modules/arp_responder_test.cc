@@ -4,9 +4,15 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "packet.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
@@ -17,7 +23,9 @@ namespace {
 using bess::pb::ArpResponderEntryKey;
 using bess::pb::ArpResponderEntryValue;
 using bess::testing::Bytes;
+using bess::testing::MakePacket;
 using bess::testing::ModuleHarness;
+using bess::testing::PacketBytes;
 using bess::testing::PacketBuilder;
 
 // A request for an address with an entry is answered on the input gate's
@@ -183,6 +191,115 @@ TEST(ArpResponderResourceTest, InitEntryIsAnEntry) {
   const ArpResponderEntryKey key = EntryKey("1.2.3.4");
   const ArpResponderEntryValue value = EntryValue("a0:22:33:44:55:66");
   EXPECT_EQ("", h.ReadBackDiffers(arp->name() + "/entries", {{&key, &value}}));
+}
+
+// The request and its reply for 1.2.3.4 (RequestFor's), each padded to `len`
+// (0: the 42 bytes of the message).
+Bytes Request(size_t len = 0) {
+  PacketBuilder b;
+  b.Ether("ff:ff:ff:ff:ff:ff", "02:1e:67:9f:4d:ae")
+      .Arp(1, "02:1e:67:9f:4d:ae", "10.0.0.1", "00:00:00:00:00:00", "1.2.3.4");
+  if (len != 0) {
+    b.PadTo(len);
+  }
+  return b.Build();
+}
+Bytes Reply(size_t len = 0) {
+  PacketBuilder b;
+  b.Ether("02:1e:67:9f:4d:ae", "a0:22:33:44:55:66")
+      .Arp(2, "a0:22:33:44:55:66", "1.2.3.4", "02:1e:67:9f:4d:ae", "10.0.0.1");
+  if (len != 0) {
+    b.PadTo(len);
+  }
+  return b.Build();
+}
+
+Module *CreateWithEntry(ModuleHarness &h) {
+  bess::pb::ArpResponderArg entry;
+  entry.set_ip("1.2.3.4");
+  entry.set_mac_addr("a0:22:33:44:55:66");
+  return h.Create("ArpResponder", entry);
+}
+
+// `frame` through `m`: what left on gate 0 (empty: dropped).
+Bytes Through(ModuleHarness &h, Module *m, bess::PacketHandle frame) {
+  auto out = h.RunPackets(m, 0, {frame}, m, {0});
+  return out[0].empty() ? Bytes() : out[0][0];
+}
+
+// The message must be whole: a 41-byte request is dropped, the 42-byte one
+// answered. The old code answered both, writing past the 41-byte frame.
+TEST(ArpResponderTest, ARequestShorterThanTheMessageIsDropped) {
+  ModuleHarness h;
+  Module *arp = CreateWithEntry(h);
+  ASSERT_NE(nullptr, arp);
+  const Bytes full = Request();
+  ASSERT_EQ(42u, full.size());
+  EXPECT_TRUE(Through(h, arp, MakePacket(Bytes(full.begin(), full.end() - 1))).empty());
+  EXPECT_EQ(Reply(), Through(h, arp, MakePacket(full)));
+}
+
+// Only the first segment counts (D-121): a chain split inside the message is
+// dropped; one split after it is answered, its padding untouched.
+TEST(ArpResponderTest, AChainSplitInsideTheMessageIsDropped) {
+  ModuleHarness h;
+  Module *arp = CreateWithEntry(h);
+  ASSERT_NE(nullptr, arp);
+  const Bytes request = Request(60);
+  for (size_t split : {14u, 30u, 41u}) {
+    EXPECT_TRUE(Through(h, arp, MakePacket(request, split)).empty())
+        << "first segment of " << split << " bytes";
+  }
+  for (size_t split : {42u, 50u}) {
+    EXPECT_EQ(Reply(60), Through(h, arp, MakePacket(request, split)))
+        << "first segment of " << split << " bytes";
+  }
+}
+
+// A clone's payload is copied before the reply is written: the other holder
+// keeps the request. The old code wrote the reply into the shared bytes.
+TEST(ArpResponderTest, ASharedRequestIsCopiedBeforeTheReply) {
+  ModuleHarness h;
+  Module *arp = CreateWithEntry(h);
+  ASSERT_NE(nullptr, arp);
+  const Bytes request = Request(60);
+  for (size_t split : {0u, 50u}) {
+    bess::PacketHandle original = MakePacket(request, split);
+    ASSERT_NE(nullptr, original);
+    bess::PacketHandle clone = bess::PacketClone(original);
+    ASSERT_NE(nullptr, clone);
+    EXPECT_EQ(Reply(60), Through(h, arp, clone)) << "split " << split;
+    EXPECT_EQ(request, PacketBytes(original)) << "split " << split << ": the original is untouched";
+    bess::PacketFree(original);
+  }
+}
+
+// Only IPv4-over-Ethernet ARP is answered: another hardware type, protocol
+// type or address length is dropped. The old code answered any.
+TEST(ArpResponderTest, ARequestThatIsNotIpv4OverEthernetIsDropped) {
+  ModuleHarness h;
+  Module *arp = CreateWithEntry(h);
+  ASSERT_NE(nullptr, arp);
+  // Offsets in the frame: hardware type 14, protocol type 16, lengths 18, 19.
+  for (size_t at : {15u, 16u, 18u, 19u}) {
+    Bytes request = Request();
+    request[at] = static_cast<uint8_t>(request[at] + 0x10);
+    EXPECT_TRUE(Through(h, arp, MakePacket(request)).empty()) << "byte " << at;
+  }
+}
+
+// The reply goes to the request's sender hardware address (RFC 826), as
+// Vif's responder sends it, even when the frame came from another source.
+TEST(ArpResponderTest, TheReplyGoesToTheSenderHardwareAddress) {
+  ModuleHarness h;
+  Module *arp = CreateWithEntry(h);
+  ASSERT_NE(nullptr, arp);
+  const Bytes request = PacketBuilder()
+                            .Ether("ff:ff:ff:ff:ff:ff", "02:00:00:00:00:99")
+                            .Arp(1, "02:1e:67:9f:4d:ae", "10.0.0.1", "00:00:00:00:00:00",
+                                 "1.2.3.4")
+                            .Build();
+  EXPECT_EQ(Reply(), Through(h, arp, MakePacket(request)));
 }
 
 }  // namespace

@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "packet.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
@@ -23,7 +25,9 @@
 namespace {
 
 using bess::testing::Bytes;
+using bess::testing::MakePacket;
 using bess::testing::ModuleHarness;
+using bess::testing::PacketBytes;
 
 struct F {
   int64_t offset;
@@ -104,6 +108,105 @@ TEST(RandomUpdateTest, FieldsResourceReplacesTheList) {
   EXPECT_EQ("", h.SetResource(fields, none));
   EXPECT_EQ(zeros, Through(h, ru, zeros));
   EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &none}}));
+}
+
+// 0, 1, 2, ... as an `n`-byte frame.
+Bytes Counting(size_t n) {
+  Bytes b(n);
+  for (size_t i = 0; i < n; i++) {
+    b[i] = static_cast<uint8_t>(i);
+  }
+  return b;
+}
+
+// `frame` through `m`: what left on gate 0 (empty: dropped).
+Bytes ThroughPacket(ModuleHarness &h, Module *m, bess::PacketHandle frame) {
+  auto out = h.RunPackets(m, 0, {frame}, m, {0});
+  return out[0].empty() ? Bytes() : out[0][0];
+}
+
+// Exactly `size` bytes are written: a 1-byte field at 59 fits a 60-byte
+// frame and a 2-byte field at 58 too; one byte shorter, the frame is dropped
+// rather than written past its data (the old code wrote 4 bytes at the
+// offset whatever the size, and wrote past the data of both).
+TEST(RandomUpdateTest, AFieldIsWrittenExactlyAndAShortFrameIsDropped) {
+  ModuleHarness h;
+  for (uint64_t size : {1u, 2u}) {
+    const int64_t offset = static_cast<int64_t>(60 - size);
+    const uint64_t value = size == 1 ? 0xcd : 0xabcd;
+    Module *m = h.Create("RandomUpdate", Fields({{.offset = offset, .size = size, .min = value,
+                                                  .max = value}}));
+    ASSERT_NE(nullptr, m);
+    Bytes expected = Counting(60);
+    if (size == 1) {
+      expected[59] = 0xcd;
+    } else {
+      expected[58] = 0xab;
+      expected[59] = 0xcd;
+    }
+    EXPECT_EQ(expected, ThroughPacket(h, m, MakePacket(Counting(60)))) << "size " << size;
+    EXPECT_TRUE(ThroughPacket(h, m, MakePacket(Counting(59))).empty()) << "size " << size;
+  }
+}
+
+// Only the first segment counts (D-121): a chain whose first segment ends
+// inside the field is dropped; one that holds it is written.
+TEST(RandomUpdateTest, AChainSplitInsideAFieldIsDropped) {
+  ModuleHarness h;
+  Module *m = h.Create("RandomUpdate",
+                       Fields({{.offset = 30, .size = 4, .min = 0x01020304, .max = 0x01020304}}));
+  ASSERT_NE(nullptr, m);
+  Bytes expected = Counting(60);
+  expected[30] = 1;
+  expected[31] = 2;
+  expected[32] = 3;
+  expected[33] = 4;
+  for (size_t split : {30u, 33u}) {
+    EXPECT_TRUE(ThroughPacket(h, m, MakePacket(Counting(60), split)).empty())
+        << "first segment of " << split << " bytes";
+  }
+  for (size_t split : {34u, 50u}) {
+    EXPECT_EQ(expected, ThroughPacket(h, m, MakePacket(Counting(60), split)))
+        << "first segment of " << split << " bytes";
+  }
+}
+
+// A clone's payload is copied before the write: the other holder keeps its
+// bytes. The old code wrote the shared bytes.
+TEST(RandomUpdateTest, ASharedFrameIsCopiedBeforeTheWrite) {
+  ModuleHarness h;
+  Module *m = h.Create("RandomUpdate", Fields({{.offset = 30, .size = 2, .min = 7, .max = 7}}));
+  ASSERT_NE(nullptr, m);
+  const Bytes frame = Counting(60);
+  Bytes expected = frame;
+  expected[30] = 0;
+  expected[31] = 7;
+  for (size_t split : {0u, 50u}) {
+    bess::PacketHandle original = MakePacket(frame, split);
+    ASSERT_NE(nullptr, original);
+    bess::PacketHandle clone = bess::PacketClone(original);
+    ASSERT_NE(nullptr, clone);
+    EXPECT_EQ(expected, ThroughPacket(h, m, clone)) << "split " << split;
+    EXPECT_EQ(frame, PacketBytes(original)) << "split " << split << ": the original is untouched";
+    bess::PacketFree(original);
+  }
+}
+
+// Init refuses what the resource refuses: a negative offset (the old check,
+// `offset + size > 2048` in size_t, let -1 through as 0), an offset past the
+// data room, and more than 16 fields (the old Init wrote past its array).
+TEST(RandomUpdateTest, InitRefusesAnOffsetOutsideTheDataRoomAndTooManyFields) {
+  ModuleHarness h;
+  EXPECT_NE("", h.CreateError("RandomUpdate", Fields({{.offset = -1, .size = 1, .min = 1, .max = 1}})));
+  EXPECT_NE("", h.CreateError("RandomUpdate",
+                              Fields({{.offset = 2047, .size = 2, .min = 1, .max = 1}})));
+  EXPECT_EQ("", h.CreateError("RandomUpdate",
+                              Fields({{.offset = 2046, .size = 2, .min = 1, .max = 1}})));
+  bess::pb::RandomUpdateArg too_many;
+  for (int i = 0; i < 17; i++) {
+    too_many.MergeFrom(Fields({{.offset = i, .size = 1, .min = 1, .max = 1}}));
+  }
+  EXPECT_NE("", h.CreateError("RandomUpdate", too_many));
 }
 
 }  // namespace

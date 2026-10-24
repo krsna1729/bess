@@ -68,7 +68,7 @@ Columns:
 | WildcardMatch | rule record size | 4,096 B | `RecordArena::kMaxRecordSize` (`classifier/record_arena.h`) | No | the arena's constructor `CHECK`s; a rule record is far smaller |
 | GenericEncap | fields; bytes per field | 8; 8 | `MAX_FIELDS`, `MAX_FIELD_SIZE` (`generic_encap.h`) | No | EINVAL "at most 8 fields" |
 | Update | fields | 16 | `Update::kMaxFields` | No | EINVAL |
-| RandomUpdate | fields | 16 | `kMaxVariable` (`random_update.h`) | No | EINVAL |
+| RandomUpdate | fields; field size; offset + size | 16; 1, 2 or 4 B; the packet data room (2,048 B by default) | `kMaxVariable` (`random_update.h`), `PacketPool::DefaultDataRoomSize()` | `--packet_data_room` (the room) | EINVAL at init or on a `fields` set; a packet whose first segment is shorter than the largest offset + size is dropped |
 | Rewrite / FlowGen | template | 1,536 B; Rewrite also at most the packet data room | `Rewrite::kMaxTemplateSize`, `MAX_TEMPLATE_SIZE` (`flowgen.h`); the default pool's data room (`--packet_data_room`) | No | EINVAL "template is too big" / "template is larger than the N-byte packet data room"; a packet whose own buffer cannot hold its template is dropped |
 | Replicate | gates | 32 | `Replicate::kMaxGates` | No | EINVAL |
 | HashLB | gates | 16,384 | `HashLB::kMaxGates` | No | EINVAL |

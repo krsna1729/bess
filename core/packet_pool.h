@@ -35,6 +35,14 @@ class PacketPool {
   // The default pool: one, on the memory node (D-123); nullptr before
   // CreateDefaultPools().
   static PacketPool *GetDefaultPool() { return default_pool_; }
+  // The default pool's payload capacity, kDefaultPacketDataSize before
+  // CreateDefaultPools(): the most bytes a packet the dataplane allocates
+  // holds in one segment, which a configured packet offset is checked
+  // against.
+  static size_t DefaultDataRoomSize() {
+    return default_pool_ == nullptr ? kDefaultPacketDataSize
+                                    : default_pool_->data_room_size();
+  }
 
   // Creates the default pool on the memory node.
   static void CreateDefaultPools(

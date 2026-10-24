@@ -60,12 +60,8 @@ class Update final : public Module {
                                      Field *fields, size_t *num_fields,
                                      size_t *required_len);
 
-  // Whether `pkt` is the common case every field can be written into as it
-  // is: its first segment holds `required` bytes and it is a direct mbuf held
-  // once. False also for an indirect mbuf or external buffer that is in fact
-  // writable; PrepareBatch decides those.
-  static bool Ready(bess::PacketRef pkt, size_t required);
-  // The slow path for a batch with a packet that is not Ready(): drops what
+  // The slow path for a batch with a packet that is not
+  // HeadWritableInPlace(packet_reshape.h): drops what
   // is too short, copies what is shared, and compacts the batch.
   void PrepareBatch(Context *ctx, bess::PacketBatch *batch);
 

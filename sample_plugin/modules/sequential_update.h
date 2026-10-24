@@ -21,7 +21,7 @@ public:
   static constexpr ModuleCapabilities kCapabilities{
       ModuleCapabilities::State::kSingleWorker, ModuleCapabilities::FlowAffinity::kNone};
 
-  SequentialUpdate() : Module(), num_vars_(), vars_() {}
+  SequentialUpdate() : Module(), num_vars_(), required_len_(), vars_() {}
 
   CommandResponse Init(const sample::supdate::pb::SequentialUpdateArg &arg);
   void DeInit() override;
@@ -34,19 +34,22 @@ public:
       const sample::supdate::pb::SequentialUpdateArg &arg);
 
 private:
+  // One field: `size` bytes at `offset`, big-endian, written exactly (the
+  // bytes around it are neither read nor written).
   struct Var {
-    bess::utils::be32_t mask; // bits with 1 won't be updated
     uint32_t min;
     uint32_t range; // max - min + 1
     uint32_t cur;
     size_t offset;
-    size_t bit_shift;
+    uint8_t size; // 1, 2 or 4
   };
 
-  // A "<name>/fields" value, converted: the variables and the
-  // SequentialUpdateArg they came from (read back as given).
+  // A "<name>/fields" value, converted: the variables, the first-segment
+  // length they need, and the SequentialUpdateArg they came from (read back
+  // as given).
   struct Staged {
     size_t num_vars = 0;
+    size_t required_len = 0;
     Var vars[kMaxVariable] = {};
     sample::supdate::pb::SequentialUpdateArg arg;
   };
@@ -56,7 +59,15 @@ private:
   ParseField(const sample::supdate::pb::SequentialUpdateArg::Field &var,
              Var *out);
 
+  // The slow path for a batch with a packet that is not
+  // HeadWritableInPlace (packet_reshape.h): drops what is too short, copies
+  // what is shared, and compacts the batch.
+  void PrepareBatch(Context *ctx, bess::PacketBatch *batch);
+
   size_t num_vars_;
+  // The largest offset + size over vars_: a packet's first segment must hold
+  // this many bytes for every field to be written (0 with no fields).
+  size_t required_len_;
 
   Var vars_[kMaxVariable];
 

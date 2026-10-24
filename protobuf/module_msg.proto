@@ -811,6 +811,11 @@ message L2ForwardSettings {
  * The MACSwap module takes no arguments. It swaps the src/destination MAC addresses
  * within a packet.
  *
+ * A frame whose first segment does not hold the 14-byte Ethernet header is
+ * dropped. A frame whose payload is shared (a clone) is copied first, so the
+ * payload's other holders never see the swap (D-153), and a frame whose copy
+ * fails is dropped.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
@@ -966,17 +971,27 @@ message NATUsageResponse {
  * To see an example of NAT in use, see:
  * [`bessctl/conf/samples/nat.yaml`](./bessctl/conf/samples/nat.yaml)
  *
- * Forward direction (from input gate 0 to output gate 0):
+ * Forward direction (from input gate 0 to output gate 1):
  *  - Source IP address is updated, from internal to external address.
- * Reverse direction (from input gate 1 to output gate 1):
+ * Reverse direction (from input gate 1 to output gate 0):
  *  - Destination IP address is updated, from external to internal address.
  * If the original address is outside any of the ranges, packets are forwarded
  * without NAT.
  *
  * Note that address in packet payload (e.g., FTP) are NOT translated.
  *
+ * The headers are found with the checked parse: IPv4 untagged or behind up
+ * to two VLAN tags, with options. A non-first fragment has its address and IP
+ * checksum translated only (it carries no L4 header). A frame that is not
+ * IPv4 (ARP, IPv6) is forwarded without NAT, as an address outside every
+ * range is. A frame whose IP headers do not fit its first segment or are
+ * inconsistent (lengths, TCP data offset, UDP length) is dropped. A frame
+ * translated in place whose payload is shared (a clone) is copied first, so
+ * the payload's other holders never see the translation (D-153), and a frame
+ * whose copy fails is dropped.
+ *
  * __Input Gates__: 2 (0 for internal->external, and 1 for external->internal direction)
- * __Output Gates__: 2 (same as the input gate)
+ * __Output Gates__: 2 (1 for internal->external, and 0 for external->internal direction)
  */
 message StaticNATArg {
   message AddressRange {
@@ -1144,6 +1159,13 @@ message RandomSplitArg {
  * The RandomUpdate module rewrites a specified field (`offset` and `size`) in a packet
  * with a random value between a specified min and max values.
  *
+ * Exactly `size` bytes are written, big-endian; the bytes around the field
+ * are untouched. Fields are written into the packet's first segment: a packet
+ * whose first segment is shorter than the largest `offset` + `size` is dropped
+ * rather than partly written. A packet whose payload is shared (a clone) is
+ * copied first, so the payload's other holders never see the write (D-153),
+ * and a packet whose copy fails is dropped.
+ *
  * __Input Gates__: 1
  * __Output Gates__: 1
  */
@@ -1153,8 +1175,8 @@ message RandomUpdateArg {
    * in each packet processed.
    */
   message Field {
-    int64 offset = 1; /// Offset in bytes of where to rewrite.
-    uint64 size = 2; /// The number of bytes to write.
+    int64 offset = 1; /// Offset in bytes of where to rewrite. 0 or more, and offset + size must fit the packet data room (bessd --packet_data_room, 2048 by default).
+    uint64 size = 2; /// The number of bytes to write: 1, 2 or 4.
     uint64 min = 3; /// The minimum value to insert into the packet.
     uint64 max = 4; /// The maximum value to insert into the packet.
   }
@@ -1484,6 +1506,18 @@ message WildcardMatchArg {
  * The ARP Responder module is responding to ARP requests.
  * It has a function `add(...)` which adds one IP-MAC mapping.
  *
+ * A request for an entry's address is rewritten in place into the reply, as
+ * Vif's local responder answers. The reply's Ethernet destination is the
+ * request's ARP sender hardware address, not its Ethernet source: RFC 826
+ * sends the reply "to the (new) target hardware address", and Linux's
+ * arp_process does the same (arp_send_dst with dest_hw = sha). Only
+ * IPv4-over-Ethernet ARP is answered (hardware type
+ * 1, protocol 0x0800, lengths 6 and 4, the 42-byte message in the frame's
+ * first segment); every other frame is dropped, as are replies, other opcodes
+ * and requests for other addresses. A request whose payload is shared (a
+ * clone) is copied first, so the payload's other holders never see the reply
+ * (D-153), and a request whose copy fails is dropped.
+ *
  * TODO: Dynamic learn new MAC's-IP's mapping
  *
  * __Input Gates__: 1
@@ -1508,6 +1542,15 @@ message ArpResponderEntryValue {
 
 /**
  * The MPLS pop module removes MPLS labels
+ *
+ * A frame whose EtherType is MPLS unicast (0x8847) loses its outermost label
+ * and leaves on output gate 0 with `next_eth_type` (or without its Ethernet
+ * header, with `remove_eth_header`); any other frame leaves on output gate 1
+ * unchanged. A labelled frame whose first segment does not hold the Ethernet
+ * header and the label (18 bytes) is dropped, never forwarded still labelled,
+ * as is a frame shorter than an Ethernet header. Keeping the Ethernet header
+ * rewrites it in place: a frame whose payload is shared (a clone) is copied
+ * first (D-153), and a frame whose copy fails is dropped.
  *
  * __Input Gates__: 1
  * __Output Gates__: 2

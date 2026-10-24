@@ -56,4 +56,27 @@ if get_option('build_tests')
     is_parallel: false,
     timeout: 120,
   )
+  # The module itself in process (core/testing/module_harness.h): its source
+  # linked into the test with the core modules, as a core module test is.
+  sample_plugin_unit = executable(
+    'sample_plugin_sequential_update_test',
+    [
+      'modules/sequential_update.cc',
+      'modules/sequential_update_test.cc',
+      files('../core/gtest_main.cc'),
+      sample_cpp_target,
+      proto_ready_marker,
+    ],
+    include_directories: [core_include, core_pb_inc, sample_pb_inc],
+    cpp_args: unit_test_cpp_args,
+    link_whole: [module_runtime_whole, module_harness_lib],
+    dependencies: runtime_deps + [gtest_dep],
+    build_rpath: runtime_rpath,
+  )
+  test(
+    'sample_plugin_sequential_update',
+    sample_plugin_unit,
+    is_parallel: false,
+    env: {'LD_LIBRARY_PATH': dpdk_libdir},
+  )
 endif
