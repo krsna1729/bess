@@ -48,11 +48,14 @@ Kernels live in `core/arch/` (the shared primitives) or in their owner's
 | `k_vlan_remove` | `RemoveVlanTag` (`modules/vlan_kernels.h`) | `vmovdqu` + `vpslldq $4` + `vmovdqu` | "one 16-byte load, one byte shift, one store" |
 | `k_vlan_insert` | `InsertVlanTag` (`modules/vlan_kernels.h`) | `vmovdqu 4(%rdi)` + `vpinsrd $3` + `vmovdqu` | "one 16-byte load, one lane insert, one store" |
 | `k_maskpair16x2` | `MaskedAddrPair16x2` (`classifier/firewall_kernels.h`) | two `vmovdqu` mask loads, two `vpand` with the address as the memory operand, two `vmovdqu` stores | "one 16-byte load, one AND and one 16-byte store per address" |
+| `k_fast_ipv4` | `CheckFastIpv4` (`packet_parse.h`; not a kernel: the common frame's checks, D-188) | the accept test, for an unfragmented UDP frame: `cmp $0x21` (34 bytes), `cmpw $0x8, 0xc` + `cmpb $0x45, 0xe` (EtherType, version/IHL), `movbe 0x10` (total length) and a `cmov` max of the two lengths, `cmp $0x35` (54 bytes), `testw $0xff3f, 0x14` (MF and the offset), `cmp $0x11` on the protocol, `movbe 0x26` + `cmp $0x7` + `add $0x14`/`cmp` (the UDP length), `lea 0xe`/`cmp` (the total within the packet): 28 instructions and 9 conditional branches to kOk, the wrapper's return aside. TCP tests the data offset instead (`cmp $0x4f`, `shr $4`, `lea 0x14(,%rax,4)`/`cmp`). A frame the test does not accept continues into the checks one at a time (`test $0x1fff`, the protocol switch on `$0x11`/`$0x1`/`$0x6`/`$0x3a`) | "a few whole-field tests"; the protocol switch and the readable-length arithmetic skipped for the usual frame |
 
-Every body is three to forty instructions, with no call, and the only branches
-are the two length loops (`SkipBytesOutsideRanges`, `SumWords32`). The three
-that are a single instruction plus their loads and stores (`Crc32c`,
-`RemoveVlanTag`, `InsertVlanTag`) are as short as the operation allows.
+Every kernel body is three to forty instructions, with no call, and the only
+branches are the two length loops (`SkipBytesOutsideRanges`, `SumWords32`).
+The three that are a single instruction plus their loads and stores
+(`Crc32c`, `RemoveVlanTag`, `InsertVlanTag`) are as short as the operation
+allows. `CheckFastIpv4` is a chain of checks, so it branches by design: what
+its row records is how few of them the usual frame takes.
 
 ## What this settles, and what it does not
 

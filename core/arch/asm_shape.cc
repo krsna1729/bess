@@ -35,6 +35,7 @@
 #include "classifier/firewall_kernels.h"
 #include "l2/mac_table_kernels.h"
 #include "modules/vlan_kernels.h"
+#include "packet_parse.h"
 #include "utils/http_parser_kernels.h"
 
 using namespace bess::arch;
@@ -84,6 +85,15 @@ extern "C" {
                                       const void *dst, const void *mask_src,
                                       const void *mask_dst) {
   MaskedAddrPair16x2(out, src, dst, mask_src, mask_dst);
+}
+
+// Not a kernel but the common frame's checks every IPv4 reader runs first
+// (packet_parse.h, D-188): the accept test, then the checks one at a time.
+// It returns what a reader branches on (the status, or -1 for a frame the
+// general parse takes), so the body is the checks and no result packing.
+[[gnu::noinline]] int k_fast_ipv4(const unsigned char *f, size_t n, size_t total_len) {
+  const bess::packet::FastIpv4 v = bess::packet::CheckFastIpv4({f, n}, total_len);
+  return v.taken ? static_cast<int>(v.status) : -1;
 }
 
 }  // extern "C"
