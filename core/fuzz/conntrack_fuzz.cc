@@ -29,11 +29,13 @@
 // A std::map model (canonical key -> handle, TCP state, initiator, replied,
 // deadline, user stamp) predicts every Track result (status, direction,
 // handle, entry fields; Linux's TCP table is the one input taken from the
-// header), creation refusals (policy, may_create, capacity), ICMP-error
-// relation, TCP reopen after TIME_WAIT/CLOSE (user data reset), and which
-// flows Expire removes: exactly the flows whose deadline (last packet +
-// state timeout, or SetDeadline) is due at the wheel's granularity, a subset
-// of them when the budget is small, never one in the future. After every step:
+// header), creation refusals (policy, may_create, capacity), TCP flag
+// combinations Linux's tcp_error() refuses (invalid: nothing changes, nothing
+// is created), ICMP-error relation, TCP reopen after TIME_WAIT/CLOSE (user
+// data reset), and which flows Expire removes: exactly the flows whose
+// deadline (last packet + state timeout, or SetDeadline) is due at the
+// wheel's granularity, a subset of them when the budget is small, never one
+// in the future. After every step:
 // size == model size <= capacity, every live handle resolves to its key and
 // entry, Find agrees, dead handles and keys stay dead until re-created, and a
 // packet and its reverse map to the same flow.
@@ -666,6 +668,29 @@ class Tracker {
     return kNoFlags;
   }
 
+  // Linux nf_conntrack_proto_tcp.c tcp_error(), written from its
+  // tcp_valid_flags table: with PSH, ECE and CWR ignored, only these
+  // combinations reach the state table. Any other segment is invalid before
+  // it: it changes no connection and starts none (D-067's M22 change).
+  static bool TcpFlagsValid(uint8_t flags) {
+    constexpr uint8_t kUrg = 0x20;
+    constexpr uint8_t kFinAck = kTcpFin | kTcpAck;
+    switch (flags & 0x37u) {  // PSH 0x08, ECE 0x40 and CWR 0x80 do not count
+      case kTcpSyn:
+      case kTcpSyn | kUrg:
+      case kTcpSyn | kTcpAck:
+      case kTcpRst:
+      case kTcpRst | kTcpAck:
+      case kFinAck:
+      case kFinAck | kUrg:
+      case kTcpAck:
+      case kTcpAck | kUrg:
+        return true;
+      default:
+        return false;
+    }
+  }
+
   // The quote of an ICMP error, read from the definition: an IP header
   // (IPv4: options allowed, not a non-initial fragment; IPv6: its extension
   // headers, at most eight, each within the quote, not a non-initial
@@ -784,6 +809,10 @@ class Tracker {
       const Direction dir = src_is_a == f.initiator_is_a ? Direction::kOriginal
                                                           : Direction::kReply;
       if (p.l4 == L4Kind::kTcp) {
+        if (!TcpFlagsValid(p.tcp_flags)) {
+          ExpectNone(r, TrackStatus::kInvalid, dir);
+          return;
+        }
         const uint8_t next = ct_internal::kTcpTable[static_cast<int>(dir)][ClassOf(p.tcp_flags)]
                                                    [static_cast<int>(f.tcp)];
         if (next == ct_internal::kIv) {
@@ -823,6 +852,10 @@ class Tracker {
     TcpState tcp = TcpState::kNone;
     if (p.l4 == L4Kind::kTcp) {
       const Cls c = ClassOf(p.tcp_flags);
+      if (!TcpFlagsValid(p.tcp_flags)) {
+        ExpectNone(r, TrackStatus::kInvalid);
+        return;
+      }
       if (c == kSyn) {
         tcp = TcpState::kSynSent;
       } else if (c == kAck && policy_.tcp_pickup) {
