@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -139,6 +140,32 @@ TEST(GenericDecapTest, EveryPacketIsAccountedFor) {
   EXPECT_EQ((std::vector<Bytes>{want, want, want}), out[0])
       << "5 in, the runt and the chain split inside the header dropped";
   bess::PacketFree(source);
+}
+
+// The stripped packets leave in their order and none is lost or repeated,
+// wherever the dropped ones (runts) sit in the batch: nowhere, first, in the
+// middle, last, at both ends.
+TEST(GenericDecapTest, StrippedPacketsKeepTheirOrderAroundDrops) {
+  ModuleHarness h;
+  Module *gd = Create(h, 14);
+  ASSERT_NE(nullptr, gd);
+  const std::vector<std::vector<size_t>> patterns = {{}, {0}, {2}, {4}, {0, 4}};
+  for (const std::vector<size_t> &runts : patterns) {
+    SCOPED_TRACE(::testing::PrintToString(runts));
+    std::vector<Bytes> in;
+    std::vector<Bytes> want;
+    for (size_t i = 0; i < 5; i++) {
+      if (std::find(runts.begin(), runts.end(), i) != runts.end()) {
+        in.push_back(Bytes(10, 0xee));
+      } else {
+        // Packet i: 20 bytes of i, 6 left after the strip.
+        in.push_back(Bytes(20, static_cast<uint8_t>(i)));
+        want.push_back(Bytes(6, static_cast<uint8_t>(i)));
+      }
+    }
+    auto out = h.Run(gd, 0, in, {0});
+    EXPECT_EQ(want, out[0]);
+  }
 }
 
 }  // namespace

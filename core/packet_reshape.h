@@ -34,30 +34,49 @@ namespace detail {
 std::expected<void, ReshapeError> EnsureWritablePreservingTopology(
     ::bess::PacketHandle &packet) noexcept;
 
+// WritableHead's and PrependWritable's result before it becomes a
+// std::expected: the bytes when `ok`, else the error. The inline fast path
+// and the out-of-line slow path each give one, in registers (a std::expected
+// of a span is returned through memory), and the two meet as these scalars,
+// so the caller's use of the bytes on the fast path stays in registers.
+struct BytesResult {
+  std::byte *data;
+  uint32_t size;
+  ReshapeError error;
+  bool ok;
+};
+
+inline std::expected<MutableBytes, ReshapeError> ToExpected(BytesResult r) noexcept {
+  if (!r.ok) {
+    return std::unexpected(r.error);
+  }
+  return MutableBytes(r.data, r.size);
+}
+
 // WritableHead's out-of-line part: everything its inline test does not
 // decide.
-std::expected<MutableBytes, ReshapeError> WritableHeadSlow(
-    ::bess::PacketHandle &packet, size_t required) noexcept;
+BytesResult WritableHeadSlow(::bess::PacketHandle &packet,
+                             size_t required) noexcept;
 
 // PrependWritable's out-of-line part: everything its inline test does not
 // decide.
-std::expected<MutableBytes, ReshapeError> PrependWritableSlow(
-    ::bess::PacketHandle &packet, size_t bytes) noexcept;
+BytesResult PrependWritableSlow(::bess::PacketHandle &packet,
+                                size_t bytes) noexcept;
 
 }  // namespace detail
 
 // True when `packet`'s first segment holds at least `required` bytes and is
-// a direct mbuf held once: the common case WritableHead decides inline, with
-// no branch, so a batch can be tested in one straight pass (one length
-// compare, one flag test and one reference-count compare per packet). False
-// does not mean the packet cannot be written; WritableHead decides the rest.
+// a direct mbuf held once: the common case WritableHead decides inline. Three
+// compares, each its own branch: in a per-packet loop that is fewer
+// instructions than combining the three results, and each branch is
+// predicted. False does not mean the packet cannot be written; WritableHead
+// decides the rest.
 inline bool HeadWritableInPlace(::bess::PacketRef packet,
                                 size_t required) noexcept {
   const ::rte_mbuf *m = packet.handle();
-  return static_cast<bool>(
-      static_cast<unsigned>(m->data_len >= required) &
-      static_cast<unsigned>(RTE_MBUF_DIRECT(m)) &  // NOLINT(bugprone-signed-bitwise)
-      static_cast<unsigned>(rte_mbuf_refcnt_read(m) == 1));
+  return m->data_len >= required &&
+         RTE_MBUF_DIRECT(m) &&  // NOLINT(bugprone-signed-bitwise)
+         rte_mbuf_refcnt_read(m) == 1;
 }
 
 // The checked in-place header write (D-121, D-153, D-172): `packet`'s first
@@ -80,30 +99,29 @@ inline bool HeadWritableInPlace(::bess::PacketRef packet,
 // HeadWritableInPlace, is inline; the rest is out of line.
 inline std::expected<MutableBytes, ReshapeError> WritableHead(
     ::bess::PacketHandle &packet, size_t required) noexcept {
-  if (likely(HeadWritableInPlace(::bess::PacketRef(packet), required))) {
-    return MutableBytes(rte_pktmbuf_mtod(packet, std::byte *),
-                        packet->data_len);
+  detail::BytesResult head;
+  if (HeadWritableInPlace(::bess::PacketRef(packet), required)) [[likely]] {
+    head = {rte_pktmbuf_mtod(packet, std::byte *), packet->data_len, ReshapeError{}, true};
+  } else {
+    // Only this branch takes a handle's address, so the caller's handle
+    // stays in a register on the common path.
+    ::bess::PacketHandle slow = packet;
+    head = detail::WritableHeadSlow(slow, required);
+    packet = slow;
   }
-  // Only this branch takes a handle's address, so the caller's handle stays
-  // in a register on the common path.
-  ::bess::PacketHandle slow = packet;
-  auto head = detail::WritableHeadSlow(slow, required);
-  packet = slow;
-  return head;
+  return detail::ToExpected(head);
 }
 
 // True when `packet`'s first segment has at least `bytes` of headroom and is
 // a direct mbuf held once: the common case PrependWritable decides inline,
-// with no branch (one compare, one flag test and one reference-count compare
-// per packet). False does not mean the packet cannot take the bytes;
-// PrependWritable decides the rest.
+// with three compares (as HeadWritableInPlace's). False does not mean the
+// packet cannot take the bytes; PrependWritable decides the rest.
 inline bool PrependableInPlace(::bess::PacketRef packet,
                                size_t bytes) noexcept {
   const ::rte_mbuf *m = packet.handle();
-  return static_cast<bool>(
-      static_cast<unsigned>(rte_pktmbuf_headroom(m) >= bytes) &
-      static_cast<unsigned>(RTE_MBUF_DIRECT(m)) &  // NOLINT(bugprone-signed-bitwise)
-      static_cast<unsigned>(rte_mbuf_refcnt_read(m) == 1));
+  return rte_pktmbuf_headroom(m) >= bytes &&
+         RTE_MBUF_DIRECT(m) &&  // NOLINT(bugprone-signed-bitwise)
+         rte_mbuf_refcnt_read(m) == 1;
 }
 
 // The checked prepend (D-153, D-172): `bytes` new bytes in front of
@@ -133,19 +151,23 @@ inline bool PrependableInPlace(::bess::PacketRef packet,
 // rest is out of line.
 inline std::expected<MutableBytes, ReshapeError> PrependWritable(
     ::bess::PacketHandle &packet, size_t bytes) noexcept {
-  if (likely(PrependableInPlace(::bess::PacketRef(packet), bytes))) {
+  ::rte_mbuf *m = packet;
+  detail::BytesResult prepended;
+  if (PrependableInPlace(::bess::PacketRef(m), bytes)) [[likely]] {
+    // The headroom bounds `bytes` by 65,535.
     const auto n = static_cast<uint16_t>(bytes);
-    packet->data_off = static_cast<uint16_t>(packet->data_off - n);
-    packet->data_len = static_cast<uint16_t>(packet->data_len + n);
-    packet->pkt_len += n;
-    return MutableBytes(rte_pktmbuf_mtod(packet, std::byte *), bytes);
+    m->data_off = static_cast<uint16_t>(m->data_off - n);
+    m->data_len = static_cast<uint16_t>(m->data_len + n);
+    m->pkt_len += n;
+    prepended = {rte_pktmbuf_mtod(m, std::byte *), n, ReshapeError{}, true};
+  } else {
+    // Only this branch takes a handle's address, so the caller's handle
+    // stays in a register on the common path.
+    ::bess::PacketHandle slow = packet;
+    prepended = detail::PrependWritableSlow(slow, bytes);
+    packet = slow;
   }
-  // Only this branch takes a handle's address, so the caller's handle stays
-  // in a register on the common path.
-  ::bess::PacketHandle slow = packet;
-  auto prepended = detail::PrependWritableSlow(slow, bytes);
-  packet = slow;
-  return prepended;
+  return detail::ToExpected(prepended);
 }
 
 // Ensures that packet has one segment. The caller must exclusively own the

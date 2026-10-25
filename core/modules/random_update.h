@@ -62,10 +62,9 @@ class RandomUpdate final : public Module {
   static CommandResponse ParseField(const bess::pb::RandomUpdateArg::Field &var,
                                     Var *out);
 
-  // The slow path for a batch with a packet that is not
-  // HeadWritableInPlace(packet_reshape.h): drops what is too short, copies
-  // what is shared, and compacts the batch.
-  void PrepareBatch(Context *ctx, bess::PacketBatch *batch);
+  // Check all fields while writing the first, keeping field-major RNG order.
+  template <size_t size>
+  void WriteFirstField(Context *ctx, bess::PacketBatch *batch, Random &rng);
 
   size_t num_vars_;
   // The largest offset + size over vars_: a packet's first segment must hold

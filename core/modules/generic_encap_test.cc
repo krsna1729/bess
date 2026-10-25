@@ -173,6 +173,58 @@ TEST_F(GenericEncapTest, AnUnreadableAttributeIsZeros) {
   }
 }
 
+// Each packet's header is built from its own metadata, and a packet dropped
+// in the middle of the batch (no headroom) does not shift the headers of the
+// packets after it: each survivor carries its own attribute.
+TEST_F(GenericEncapTest, SurvivorsAfterADropKeepTheirOwnAttributes) {
+  GenericEncapArg arg;
+  AddAttribute(arg, 4, "a");
+  Module *ge = CreateEncap(arg);
+  ASSERT_NE(nullptr, ge);
+  ge->set_attr_offset(0, 0);
+
+  const std::vector<uint8_t> payload = Payload();
+  constexpr size_t kPackets = 5;
+  constexpr size_t kBare = 2;  // no headroom: dropped
+  PacketBatch batch;
+  batch.clear();
+  for (size_t i = 0; i < kPackets; i++) {
+    bess::PacketHandle h = pool_.Alloc();
+    ASSERT_NE(nullptr, h);
+    if (i == kBare) {
+      h->data_off = 0;
+    }
+    PacketRef ref(h);
+    std::memcpy(ref.append(payload.size()), payload.data(), payload.size());
+    const uint8_t attr[4] = {0xa0, 0xa1, 0xa2, static_cast<uint8_t>(i)};
+    std::memcpy(ref.metadata<uint8_t *>(), attr, sizeof(attr));
+    batch.add(ref);
+  }
+  Task task(ge, nullptr);
+  Context ctx = {};
+  ctx.task = &task;
+  ge->ProcessBatch(&ctx, &batch);
+
+  std::vector<std::vector<uint8_t>> want;
+  for (size_t i = 0; i < kPackets; i++) {
+    if (i == kBare) {
+      continue;
+    }
+    std::vector<uint8_t> bytes = {0xa0, 0xa1, 0xa2, static_cast<uint8_t>(i)};
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    want.push_back(bytes);
+  }
+  std::vector<std::vector<uint8_t>> out;
+  for (PacketRef ref : batch.packets()) {
+    const auto *p = ref.head_data<const uint8_t *>();
+    out.emplace_back(p, p + ref.data_len());
+  }
+  bess::PacketFreeBatch(&batch);
+  EXPECT_EQ(want, out);
+  EXPECT_EQ(1, task.dead_batch()->cnt()) << "the bare packet is dropped";
+  bess::PacketFreeBatch(task.dead_batch());
+}
+
 TEST_F(GenericEncapTest, MoreFieldsThanItHoldsIsAnError) {
   GenericEncapArg arg;
   for (int i = 0; i < MAX_FIELDS + 1; i++) {

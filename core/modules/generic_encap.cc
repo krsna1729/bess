@@ -138,19 +138,17 @@ void GenericEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
   }
 
-  int out_cnt = 0;
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketHandle handle = batch->handles()[i];
+  const char (*next_header)[MAX_HEADER_SIZE] = headers;
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
+    const auto &packet_header = *next_header++;
     const auto header = bess::packet::PrependWritable(handle, encap_size);
     if (unlikely(!header)) {
       DropPacket(ctx, bess::PacketRef(handle));
-      continue;
+      return false;
     }
-
-    bess::utils::CopyInlined(header->data(), headers[i], encap_size);
-    batch->handles()[out_cnt++] = handle;
-  }
-  batch->set_cnt(out_cnt);
+    bess::utils::CopyInlined(header->data(), packet_header, encap_size);
+    return true;
+  });
 
   RunNextModule(ctx, batch);
 }

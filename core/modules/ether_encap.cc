@@ -56,10 +56,7 @@ void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const auto dst_off = attr_offset(ATTR_R_ETHER_DST);
   const auto type_off = attr_offset(ATTR_R_ETHER_TYPE);
 
-  const int cnt = batch->cnt();
-  int out_cnt = 0;
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketHandle pkt = batch->handles()[i];
+  batch->KeepIf([&](bess::PacketHandle &pkt, int) {
     const bess::PacketRef ref(pkt);
     const Ethernet::Address ether_src =
         get_attr_with_offset<Ethernet::Address>(src_off, ref);
@@ -76,12 +73,11 @@ void EtherEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       // payload would put a frame on the wire without the header the graph
       // configured. Drop and keep the rest.
       DropPacket(ctx, bess::PacketRef(pkt));
-      continue;
+      return false;
     }
     WriteHeader(*header, ether_src, ether_dst, ether_type);
-    batch->handles()[out_cnt++] = pkt;
-  }
-  batch->set_cnt(out_cnt);
+    return true;
+  });
 
   RunNextModule(ctx, batch);
 }

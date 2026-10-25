@@ -28,10 +28,10 @@ using bess::packet::ParseStatus;
 // frame whose copy fails is dropped. An expiring frame is dropped before
 // that, without a copy.
 void UpdateTTL::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  // Every survivor leaves on gate 0: they are compacted into the batch and
-  // passed on at once, the drops going one by one.
-  int out_cnt = 0;
-  for (bess::PacketRef pkt : batch->packets()) {
+  // Every survivor leaves on gate 0: they stay in the batch and are passed
+  // on at once, the drops going one by one.
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
+    const bess::PacketRef pkt(handle);
     const std::span<const uint8_t> frame(pkt.head_data<const uint8_t *>(),
                                          pkt.head_len());
     size_t l3;
@@ -40,7 +40,7 @@ void UpdateTTL::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     if (likely(fast.taken)) {
       if (unlikely(fast.status == ParseStatus::kMalformed)) {
         DropPacket(ctx, pkt);
-        continue;
+        return false;
       }
       l3 = 14;
     } else {
@@ -49,11 +49,10 @@ void UpdateTTL::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
           bess::packet::ParseFrame(frame, parsed, pkt.total_len());
       if (status == ParseStatus::kMalformed) {
         DropPacket(ctx, pkt);
-        continue;
+        return false;
       }
       if (parsed.l3 != bess::packet::L3Kind::kIpv4) {
-        batch->handles()[out_cnt++] = pkt.handle();
-        continue;
+        return true;
       }
       l3 = parsed.l3_offset;
     }
@@ -61,21 +60,19 @@ void UpdateTTL::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     // The parse found the whole IPv4 header in `frame`.
     if (frame[l3 + 8] <= 1) {
       DropPacket(ctx, pkt);
-      continue;
+      return false;
     }
-    bess::PacketHandle handle = pkt.handle();
     const auto head =
         bess::packet::WritableHead(handle, l3 + sizeof(bess::utils::Ipv4));
     if (unlikely(!head)) {
       DropPacket(ctx, bess::PacketRef(handle));
-      continue;
+      return false;
     }
     // TTL 2 or more: kForward.
     bess::route::DecrementTtl(
         *reinterpret_cast<bess::utils::Ipv4 *>(head->data() + l3));
-    batch->handles()[out_cnt++] = handle;
-  }
-  batch->set_cnt(out_cnt);
+    return true;
+  });
 
   RunNextModule(ctx, batch);
 }

@@ -60,10 +60,8 @@ class Update final : public Module {
                                      Field *fields, size_t *num_fields,
                                      size_t *required_len);
 
-  // The slow path for a batch with a packet that is not
-  // HeadWritableInPlace(packet_reshape.h): drops what
-  // is too short, copies what is shared, and compacts the batch.
-  void PrepareBatch(Context *ctx, bess::PacketBatch *batch);
+  [[gnu::cold, gnu::noinline]] bool PreparePacket(
+      Context *ctx, bess::PacketHandle &handle, size_t required);
 
   size_t num_fields_;
   // The largest offset + size over fields_: a packet's first segment must

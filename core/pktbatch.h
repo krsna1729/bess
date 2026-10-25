@@ -61,6 +61,26 @@ class PacketBatch {
                              cnt_ * sizeof(PacketHandle));
   }
 
+  // Calls `keep(handle, i)` on each packet in order (`i` its index on entry)
+  // and keeps, in order, the packets it returns true for. `keep` may replace
+  // the handle (with a copy, say), and disposes of a packet it returns false
+  // for (drops it or emits it to a gate) before it returns. A single call
+  // site lets large packet operations remain inline. An output pointer
+  // avoids a separate compaction index and its per-packet conversion.
+  template <typename Keep>
+  void KeepIf(Keep &&keep) {
+    PacketHandle *const first = pkts_;
+    PacketHandle *const last = pkts_ + cnt_;
+    PacketHandle *out = first;
+    for (PacketHandle *in = first; in != last; ++in) {
+      PacketHandle pkt = *in;
+      if (keep(pkt, static_cast<int>(in - first))) [[likely]] {
+        *out++ = pkt;
+      }
+    }
+    cnt_ = static_cast<int>(out - first);
+  }
+
   inline static const size_t kMaxBurst = 32;
 
  private:
