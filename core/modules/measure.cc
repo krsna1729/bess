@@ -4,8 +4,10 @@
 
 #include "measure.h"
 
+#include <cstring>
 #include <iterator>
 
+#include "packet_pool.h"
 #include "timestamp.h"
 #include "utils/common.h"
 #include "utils/ether.h"
@@ -17,11 +19,18 @@ using bess::utils::Ethernet;
 using bess::utils::Ipv4;
 using bess::utils::Udp;
 
+// Whether `pkt` carries Timestamp's in-packet stamp at `offset`, and its
+// time. The stamp is read only from the first segment (D-121): a packet
+// whose first segment ends before the stamp's end has none.
 static bool IsTimestamped(bess::PacketRef pkt, size_t offset, uint64_t *time) {
-  auto *marker = pkt.head_data<Timestamp::MarkerType *>(offset);
-
-  if (*marker == Timestamp::kMarker) {
-    *time = *reinterpret_cast<uint64_t *>(marker + 1);
+  if (pkt.head_len() < offset + Timestamp::kStampSize) {
+    return false;
+  }
+  const auto *stamp = pkt.head_data<const char *>() + offset;
+  Timestamp::MarkerType marker;
+  std::memcpy(&marker, stamp, sizeof(marker));
+  if (marker == Timestamp::kMarker) {
+    std::memcpy(time, stamp + sizeof(marker), sizeof(*time));
     return true;
   }
   return false;
@@ -58,6 +67,15 @@ CommandResponse Measure::Init(const bess::pb::MeasureArg &arg) {
   jitter_hist_.Resize(num_buckets, latency_ns_resolution);
 
   if (arg.offset()) {
+    // The stamp must fit the packet data room (the default pool's), as
+    // Timestamp requires: no packet could carry one past it. A DPDK data
+    // room fits 16 bits, so the offset does too.
+    const size_t data_room = bess::PacketPool::DefaultDataRoomSize();
+    if (data_room < Timestamp::kStampSize || arg.offset() > data_room - Timestamp::kStampSize) {
+      return CommandFailure(EINVAL, "offset %llu leaves no room for the %zu-byte stamp in the %zu-byte packet data room",
+                            static_cast<unsigned long long>(arg.offset()), Timestamp::kStampSize,
+                            data_room);
+    }
     offset_ = arg.offset();
   } else {
     std::string attr_name = "timestamp";

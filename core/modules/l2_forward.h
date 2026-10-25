@@ -40,7 +40,8 @@ class L2Forward final : public Module {
   void DeInit() override;
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
-  // ProcessBatch's decision: gates[i], the output gate of packet i.
+  // ProcessBatch's decision: gates[i], the output gate of packet i, or
+  // DROP_GATE when its first segment is shorter than an Ethernet header.
   void ClassifyBatch(const bess::PacketBatch *batch, gate_idx_t *gates) const;
 
   CommandResponse CommandLookup(const bess::pb::L2ForwardCommandLookupArg &arg);

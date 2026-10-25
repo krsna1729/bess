@@ -852,6 +852,7 @@ unit_test_sources = [
   'modules/vxlan_encap_test.cc',
   'modules/vlan_split_test.cc',
   'modules/random_split_test.cc',
+  'modules/split_test.cc',
   'modules/url_filter_test.cc',
   'modules/random_update_test.cc',
   'modules/rewrite_test.cc',

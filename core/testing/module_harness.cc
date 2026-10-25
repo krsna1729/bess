@@ -193,6 +193,30 @@ void FillHeadroom(bess::PacketHandle packet, size_t n, uint8_t value) {
   std::fill_n(bess::PacketRef(packet).head_data<uint8_t *>() - n, n, value);
 }
 
+bess::PacketHandle MakeShortPacket(const Bytes &bytes, size_t len, bool chain) {
+  if (len == 0 || len > bytes.size() || (chain && len == bytes.size())) {
+    ADD_FAILURE() << "cannot end the first segment of a " << bytes.size() << "-byte packet at "
+                  << len;
+    return nullptr;
+  }
+  bess::PacketHandle head = Segment(bytes.data(), bytes.size());
+  if (head == nullptr) {
+    return nullptr;
+  }
+  bess::PacketRef(head).trim(static_cast<uint16_t>(bytes.size() - len));
+  if (!chain) {
+    return head;
+  }
+  bess::PacketHandle tail = Segment(bytes.data() + len, bytes.size() - len);
+  if (tail == nullptr || rte_pktmbuf_chain(head, tail) != 0) {
+    ADD_FAILURE() << "cannot chain a test packet";
+    bess::PacketFree(head);
+    bess::PacketFree(tail);
+    return nullptr;
+  }
+  return head;
+}
+
 void InitModuleTests() {
   static const bool done = [] {
     FLAGS_m = 0;  // malloc-backed pools: no hugepages, no root

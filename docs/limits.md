@@ -74,6 +74,7 @@ Columns:
 | HashLB | gates | 16,384 | `HashLB::kMaxGates` | No | EINVAL |
 | HashLB | custom-tuple fields; bytes per field; packet offset | 8; 8; 0-1,024 | `HashLB::kMaxFields`, `kMaxFieldSize`, `kMaxFieldOffset` | No | EINVAL |
 | RandomSplit / RoundRobin | gates | 16,384 | `MAX_SPLIT_GATES`, `MAX_RR_GATES` | No | EINVAL |
+| Split | value size; packet offset | 1-8 B; 0-1,024, and `offset` + `size` at most the packet data room | `Split::Init` (`split.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet whose first segment ends before `offset` + `size` is dropped |
 | VLANSplit | gates | 4,096 (one per VID) | `kNumOGates` | No | — |
 | WorkerSplit | gates | 64 (one per worker) | `kNumOGates` | No | — |
 | L2Forward | table size; bucket | 64M (default 1,024); 4 | `kMaxTableSize`, `kDefaultTableSize`, `kMaxBucketSize` (`l2_forward.cc`) | `size`, `bucket` | EINVAL |
@@ -110,7 +111,8 @@ Columns:
 | DRR | default quantum; per-flow queue | 1,500 B; 2,048 growing ×2 to 8,192 | `kDefaultQuantum`, `kFlowQueueSize`, `kFlowQueueMax` | `quantum`, `max_flow_queue_size` | — |
 | Measure | jitter sample probability | 0.05 | `kDefaultIpDvSampleProb` | `jitter_sample_prob` | — |
 | Timestamp | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Timestamp::Init` (`timestamp.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet the stamp cannot be placed in, in its first segment, is dropped (D-172) |
-| FlowGen | smallest TCP packet | 60 B | `kMinTcpPacketSize` (`flowgen.cc`) | No | — |
+| Measure | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Measure::Init` (`measure.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet whose first segment ends before the stamp's end is forwarded, not measured |
+| FlowGen | template headers | UDP: Ethernet, IPv4 (options allowed) and UDP whole, 42 B at least; TCP: 60 B at least (`kMinTcpPacketSize`), no IPv4 or TCP options; the IPv4 total length within the template, the UDP length within the IPv4 payload | `TemplateError` (`flowgen.cc`) | No | EINVAL at init or on an update |
 | unix_socket port | idle poll interval | 50 µs | `UnixSocketPort::kDefaultMinRxInterval` | port argument `min_rx_interval_ns` | — |
 | VXLANEncap | UDP destination port | 4789 | `VXLANEncap::kDefaultDstPort` | `dstport` | — |
 | VXLANEncap | inner frame | 65,519 B (the UDP length, 16 bits, with the 16 header bytes) | `kMaxInner` (`vxlan_encap.cc`) | No | a longer frame is dropped |

@@ -2,6 +2,7 @@
 // Copyright (c) 2016-2017, Nefeli Networks, Inc.
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <format>
@@ -14,6 +15,7 @@
 
 #include "dataplane/transaction_engine.h"
 #include "utils/endian.h"
+#include "utils/ether.h"
 
 namespace {
 
@@ -207,11 +209,19 @@ void L2Forward::ClassifyBatch(const bess::PacketBatch *batch, gate_idx_t *gates)
   const int cnt = batch->cnt();
   uint64_t keys[bess::PacketBatch::kMaxBurst];
   uint16_t values[bess::PacketBatch::kMaxBurst];
+  // A packet whose first segment is shorter than an Ethernet header (as
+  // Bridge checks) has no destination MAC to look up: it is dropped.
+  uint64_t runts = 0;
   for (int i = 0; i < cnt; i++) {
     // The destination MAC (first 6 bytes, little endian) as a key word: the
-    // shift drops the two bytes past it.
-    uint64_t head;
-    std::memcpy(&head, batch->packet(i).head_data<const char *>(), sizeof(head));
+    // shift drops the two bytes past it, which the length check covers.
+    const bess::PacketRef pkt = batch->packet(i);
+    uint64_t head = 0;
+    if (likely(pkt.head_len() >= sizeof(bess::utils::Ethernet))) {
+      std::memcpy(&head, pkt.head_data<const char *>(), sizeof(head));
+    } else {
+      runts |= uint64_t{1} << static_cast<unsigned>(i);
+    }
     keys[i] = head << 16;
   }
 
@@ -219,6 +229,9 @@ void L2Forward::ClassifyBatch(const bess::PacketBatch *batch, gate_idx_t *gates)
       table_->LookupBatch(std::span<const uint64_t>(keys, static_cast<size_t>(cnt)), values);
   for (int i = 0; i < cnt; i++) {
     gates[i] = (hits >> i) & 1 ? static_cast<gate_idx_t>(values[i] - 1) : default_gate;
+  }
+  for (uint64_t r = runts; r != 0; r &= r - 1) {
+    gates[std::countr_zero(r)] = DROP_GATE;
   }
 }
 

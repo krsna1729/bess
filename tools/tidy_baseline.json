@@ -139,9 +139,6 @@
     "core/modules/source.cc": {
       "cppcoreguidelines-narrowing-conversions": 3
     },
-    "core/modules/split.cc": {
-      "cppcoreguidelines-narrowing-conversions": 1
-    },
     "core/modules/wildcard_match.cc": {
       "cppcoreguidelines-narrowing-conversions": 2
     },

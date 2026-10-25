@@ -64,6 +64,14 @@ bess::PacketHandle MakePacketWithoutHeadroom(const Bytes &bytes);
 Bytes HeadroomBytes(bess::PacketHandle packet, size_t n);
 void FillHeadroom(bess::PacketHandle packet, size_t n, uint8_t value);
 
+// `bytes` as a packet whose first segment holds only the first `len` bytes
+// (0 < len <= bytes.size(), below it with `chain`). The rest stays in that
+// segment's buffer past its data and, with `chain`, also follows in a second
+// segment. Code that reads past the first segment's data then reads the
+// frame's own bytes, not garbage: a test that a short packet is dropped fails
+// on such code every time.
+bess::PacketHandle MakeShortPacket(const Bytes &bytes, size_t len, bool chain = false);
+
 // A packet's bytes, across its segments.
 Bytes PacketBytes(bess::PacketHandle packet);
 

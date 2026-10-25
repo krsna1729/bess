@@ -499,8 +499,21 @@ message WildcardMatchSettings {
 }
 
 /**
- * The module ACL creates an access control module which by default blocks all traffic, unless it contains a rule which specifies otherwise.
+ * The module ACL creates an access control module: the rules are checked in
+ * order, the first rule that matches a packet forwards or drops it, and a
+ * packet that no rule matches is dropped.
  * Examples of ACL can be found in [`bessctl/conf/samples/acl.yaml`](./bessctl/conf/samples/acl.yaml)
+ *
+ * A rule constrains only the fields it names. A packet's addresses and ports
+ * come from the checked parse (core/packet_parse.h, D-188): IPv4, untagged or
+ * behind up to two VLAN tags, with options. The ports are those of TCP and
+ * UDP; ICMP, other protocols and a non-first fragment are judged with ports
+ * 0, which only a rule with wildcard ports matches. A rule whose four fields
+ * are all wildcards ("" or a /0 prefix, port 0) matches every packet, IPv4 or
+ * not; any other rule matches only IPv4. So a packet that is not IPv4 (ARP,
+ * IPv6, ...) takes the first all-wildcard rule, or is dropped when there is
+ * none. A packet whose headers do not fit its first segment or lie about
+ * their lengths is dropped before any rule, even an all-wildcard one.
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -515,7 +528,7 @@ message ACLArg {
     uint32 src_port = 3;  /// TCP/UDP source port. Wildcard if 0.
     uint32 dst_port = 4;  /// TCP/UDP Destination port. Wildcard if 0.
     bool established = 5; /// Not implemented
-    bool drop = 6;        /// Drop matched packets if true, forward if false. By default ACL drops all traffic.
+    bool drop = 6;        /// Drop matched packets if true, forward if false. A packet no rule matches is dropped.
   }
   repeated Rule rules = 1; ///A list of ACL rules.
 }
@@ -678,6 +691,14 @@ message ExactMatchSettings {
  * This module is useful for testing, e.g., a NAT module or other flow-aware code.
  * Packets are generated off a base, "template" packet by modifying the IP src/dst and TCP src/dst. By default, only the ports are changed and will be modified by incrementing the template ports by up to 20000 more than the template values.
  *
+ * The template is an Ethernet frame of at most 1536 bytes carrying IPv4 and
+ * UDP or TCP. It holds whole the IPv4 header (its options included) and the
+ * UDP or TCP header; the IPv4 total length fits the template (Ethernet
+ * padding may follow it); a UDP length fits the IPv4 payload. A TCP template
+ * is at least 60 bytes and has no IPv4 or TCP options: its SYN and FIN are
+ * 60-byte frames with a 40-byte IPv4 datagram. Any other template is refused
+ * (EINVAL), at creation and on an update.
+ *
  * __Input Gates__: 0
  * __Output Gates__: 1
  */
@@ -803,6 +824,9 @@ enum RouteBackend {
  * Note that this is _not_ a learning switch -- forwards according to fixed
  * routes specified by `add(..)`.
  *
+ * A packet whose first segment is shorter than an Ethernet header (14 bytes)
+ * has no destination address to look up: it is dropped.
+ *
  * __Input Gates__: 1
  * __Ouput Gates__: many (configurable, depending on rules)
  */
@@ -850,6 +874,12 @@ message MACSwapArg {
  * The measure module will log how long (in nanoseconds) it has been for each packet it received since it was timestamped.
  * This module is somewhat experimental and undergoing various changes.
  * There is a test for the Measure module (with Timestamp) in [`tests/live/module_traffic_test.cc`](./tests/live/module_traffic_test.cc).
+ *
+ * With `offset`, Measure looks for Timestamp's 12-byte in-packet stamp at
+ * `offset` in the packet's first segment; `offset` + 12 must fit the packet
+ * data room (`--packet_data_room`), or the module is refused (EINVAL). A
+ * packet whose first segment ends before the stamp's end carries no stamp:
+ * it is counted and forwarded, not measured. Measure forwards every packet.
  *
  * __Input Gates__: 1
  * __Output Gates__: 1
@@ -1359,6 +1389,12 @@ message L4ChecksumArg {
  * The Split module is a basic classifier which directs packets out a gate
  * based on data in the packet (e.g., if the read in value is 3, the packet
  * is directed out output gate 3).
+ *
+ * With `offset`, the value is the `size` bytes at `offset` in the packet's
+ * first segment. `offset` is at most 1024, and `offset` + `size` must fit
+ * the packet data room (`--packet_data_room`); otherwise the module is
+ * refused (EINVAL). A packet whose first segment ends before `offset` +
+ * `size` has no value: it is dropped.
  *
  * __Input Gates__: 1
  * __Output Gates__: many (up to 2^(size * 8))
