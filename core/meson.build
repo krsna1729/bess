@@ -880,6 +880,7 @@ unit_test_sources = [
   'packet_checksum_test.cc',
   'packet_tx_checksum_test.cc',
   'packet_mutation_test.cc',
+  'packet_parse_test.cc',
   'packet_edit_plan_test.cc',
   'packet_reshape_test.cc',
   'port_test.cc',
