@@ -58,7 +58,7 @@ crash-<sha1>` (or with the GCC replay binary), minimise it with
 | `classifier_schema` | `RuntimeClassifierSchema::Validate`, `ExtractPlan`, `ResultPlan` | naive per-field copy and mask; batch equals scalar |
 | `resource_codec` | `framework::TypedCodec` with resource protobufs | round trip of accepted values; type-URL rule |
 | `route_prefix` | `utils::Ipv4Prefix::Parse`, `utils::ParseIpv4Address`, `route::Ipv4Prefix::Make` | reference grammar parser; format/reparse round trip |
-| `conntrack` | `packet::ParseFrame`, `Conntrack` Track/Expire/Remove | offsets within the frame; flow-table invariants and a key model |
+| `conntrack` | `packet::ParseFrame`, `CheckFastIpv4`, `Conntrack` Track/Expire/Remove | offsets within the frame; the fast path field for field against the general path; flow-table invariants and a key model |
 | `nat` | `Nat::Translate`, `TranslateBatch`, `Expire` | checksums valid after translation; batch equals scalar; reply restores the tuple |
 | `tunnel_decap` | VXLAN/Geneve/GRE/GTP-U decapsulation | inner offsets within the frame; `Write*` then `Decap*` recovers the fields |
 | `control_transaction` | `control::DataplaneTransactions` decoding `ApplyTransactionRequest` | model of the committed resource state; all-or-nothing |

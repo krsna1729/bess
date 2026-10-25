@@ -13073,7 +13073,10 @@ tracker and another to the policy or the balancer.
   `ParseFrame` runs it (`parse_internal::FastFrame<true>`, which also fills the descriptor). Firewall and
   HashLB call it first and, when it takes the frame, read addresses and ports at the fixed offsets without
   building a `ParsedFrame`; anything else falls back to `ParseFrame`. The L4 checks are one switch
-  (`parse_internal::CheckL4<kFill>`) for both.
+  (`parse_internal::CheckL4<kFill>`) for both. (Amended 2026-10-25: `FastFrame` first accepts an unfragmented
+  TCP or UDP frame with whole-field tests that restate the TCP and UDP length rules; `packet_parse_test` holds
+  that test to `CheckL4`'s decisions on the parse corpus, every value of every header byte and random
+  common-shaped frames.)
 
 **Test.** `PacketParseTest.Ipv6AuthenticationHeaderIsWalked` (AH alone and behind hop-by-hop, AH longer than
 the packet or cut short, ESP, IPv4 AH, and an AH packet joining its flow's connection); `conntrack_fuzz`

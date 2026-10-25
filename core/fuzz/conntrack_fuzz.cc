@@ -14,7 +14,9 @@
 // function (called twice; total_len 0 and total_len <= size agree), reads
 // nothing past the headers it accepted (the frame cut to the headers' extent
 // gives the same result, one byte less is refused), agrees with ParseIpPacket
-// on the IP packet, and with the same frame zero-padded up to total_len.
+// on the IP packet, and with the same frame zero-padded up to total_len. On
+// every frame, the parse (the common frame's fast path included) agrees with
+// its general path field for field, and CheckFastIpv4 with the parse.
 //
 // Stage B, tracker (bit 0 set): [capacity u8][config u8][start u16] then
 // steps [op u8][tick delta u8][operands]. A Conntrack<uint32_t> of capacity
@@ -216,6 +218,21 @@ void CheckParse(std::span<const uint8_t> frame, size_t total_len) {
     FUZZ_CHECK(ParseFrame(frame, b) == s && Same(a, b));
   }
   const size_t total = std::max(total_len, frame.size());
+  // The common frame's checks (the fast path, its accept test first) decide
+  // as the general path, field for field; CheckFastIpv4 as ParseFrame.
+  ParsedFrame g;
+  FUZZ_CHECK(packet::parse_internal::ParseFrameGeneral(frame, g, total) == s && Same(a, g));
+  const packet::FastIpv4 fast = packet::CheckFastIpv4(frame, total_len);
+  if (fast.taken) {
+    FUZZ_CHECK(fast.status == s && a.l3_offset == 14);
+    FUZZ_CHECK(fast.header_ok == (a.l3 == L3Kind::kIpv4));
+    if (fast.header_ok) {
+      FUZZ_CHECK(fast.protocol == a.protocol && fast.first_fragment == a.first_fragment);
+    }
+    if (s == ParseStatus::kOk) {
+      FUZZ_CHECK(size_t{fast.total} == size_t{a.l4_length} + 20 && a.l4_offset == 34);
+    }
+  }
   uint16_t type = 0;
   const size_t l2 = L2Length(frame, type);
   switch (s) {
