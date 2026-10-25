@@ -453,3 +453,24 @@ GCC's generic text is 6% larger than its three CPU tunes. Per object against ald
 control-plane, startup, protobuf and SDK code (`control_transaction`, `control_pipeline_spec`,
 `stats_metric_registry`, `runtime_startup`, ...) and 41 KB is modules (`exact_match` +9 KB, `ip_lookup` +5 KB,
 `wildcard_match` +3 KB); Source, Sink, Bypass and Rewrite are within 50 bytes.
+
+## ACL checked-key path
+
+ACL keeps the common checked IPv4 key path inline; the general parse stays out of line and returns a
+16-byte result by value. The rule list is a contiguous array of masked address-pair and port-pair
+comparisons, in first-match order. Init and rule replacement cache the first all-wildcard rule's verdict
+as the fallback and omit the unreachable rules after it. A non-IPv4 frame uses that fallback without
+scanning named-field rules; a malformed frame is still dropped before any rule.
+
+Release measurement on the i9-13900H, GCC 16.2.1, `-O3 -march=x86-64-v3`, NDEBUG, shared DPDK 25.11.3,
+ld.bfd 2.47, balanced profile, turbo off: 8 paired palindromic `live_perf --counters` rounds, workers on
+4/6, control on 2, under `omarchy-benchmark --isolate --diagnose`, 1 s samples and 0.3 s warmup. The
+table is the median of each round's excess over its own M.base (not the difference of two medians).
+
+| row | instructions/packet above M.base | cycles/packet above M.base | ns/packet above M.base |
+|---|---:|---:|---:|
+| M.acl | 106.15 | 51.38 | 19.84 |
+
+IRQ/softirq contamination was observed. The unchanged controls retain their instruction counts but can
+move in cycles and ns with code placement; do not attribute every time change to the key path. The A/B
+table and before/after codegen are in the change's commit message. No architecture-specific kernel is used.

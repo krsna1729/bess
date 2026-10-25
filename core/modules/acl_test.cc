@@ -10,20 +10,24 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "packet_parse.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
+#include "testing/rng.h"
 
 namespace {
 
@@ -303,6 +307,149 @@ TEST(AclTest, FirstMatchWins) {
       "ACL", Rules({{.src_ip = "10.1.0.0/16"}, {.src_ip = "10.0.0.0/8", .drop = true}}));
   ASSERT_NE(nullptr, pass_first);
   EXPECT_TRUE(Passes(h, pass_first, a));
+}
+
+// A rule of the reference below: a prefix length of -1 is "" (a wildcard,
+// as /0 is), a port of 0 a wildcard.
+struct RefRule {
+  uint32_t src = 0, dst = 0;
+  int src_len = -1, dst_len = -1;
+  uint16_t src_port = 0, dst_port = 0;
+  bool drop = false;
+};
+
+std::string Dotted(uint32_t a) {
+  return std::to_string(a >> 24u) + "." + std::to_string((a >> 16u) & 0xffu) + "." +
+         std::to_string((a >> 8u) & 0xffu) + "." + std::to_string(a & 0xffu);
+}
+
+bool PrefixMatches(uint32_t want, int len, uint32_t addr) {
+  return len <= 0 || ((want ^ addr) >> (32u - static_cast<unsigned>(len))) == 0;
+}
+
+// ACL's decision on `frame` as PR #92 states it, one rule at a time: a
+// malformed frame is dropped; a frame that is not IPv4 takes the first rule
+// naming no field; an IPv4 frame the first rule all of whose named fields
+// match (ports: TCP's and UDP's, else 0); no match drops.
+bool ReferencePasses(const std::vector<RefRule> &rules, const Bytes &frame) {
+  using bess::packet::ParseStatus;
+  bess::packet::ParsedFrame p;
+  const ParseStatus status = bess::packet::ParseFrame(std::span(frame), p, frame.size());
+  if (status == ParseStatus::kMalformed) {
+    return false;
+  }
+  const bool ipv4 = status != ParseStatus::kNotIp && p.l3 == bess::packet::L3Kind::kIpv4;
+  const bool ports = p.l4 == bess::packet::L4Kind::kTcp || p.l4 == bess::packet::L4Kind::kUdp;
+  const auto be = [](const auto &b) {
+    return uint32_t{b[0]} << 24u | uint32_t{b[1]} << 16u | uint32_t{b[2]} << 8u | b[3];
+  };
+  for (const RefRule &r : rules) {
+    bool match;
+    if (!ipv4) {
+      match = r.src_len <= 0 && r.dst_len <= 0 && r.src_port == 0 && r.dst_port == 0;
+    } else {
+      match = PrefixMatches(r.src, r.src_len, be(p.src)) &&
+              PrefixMatches(r.dst, r.dst_len, be(p.dst)) &&
+              (r.src_port == 0 || r.src_port == (ports ? p.src_port : 0)) &&
+              (r.dst_port == 0 || r.dst_port == (ports ? p.dst_port : 0));
+    }
+    if (match) {
+      return !r.drop;
+    }
+  }
+  return false;
+}
+
+// Random rule lists against random frames (IPv4 TCP, UDP and ICMP, fragments,
+// VLAN tags, options, ARP, IPv6, frames cut short or lying about their
+// length), from small pools of addresses and ports so that rules match: ACL
+// forwards exactly the frames the reference does, in order.
+TEST(AclTest, RandomRulesAndFramesDecideAsTheReference) {
+  std::mt19937 rng = bess::testing::SeededRng(20261025);
+  const auto pick = [&rng](auto... v) {
+    const std::array pool{v...};
+    return pool[std::uniform_int_distribution<size_t>(0, pool.size() - 1)(rng)];
+  };
+  const auto addr = [&] {
+    return pick(0x0a000001u, 0x0a000002u, 0x0a000101u, 0x0a010001u, 0x0b000001u, 0xc0a80101u);
+  };
+  const auto port = [&] { return static_cast<uint16_t>(pick(80, 1000, 2000, 53)); };
+
+  ModuleHarness h;
+  Module *acl = h.Create("ACL", PassAll(), "acl_eq");
+  ASSERT_NE(nullptr, acl);
+  size_t passed = 0, dropped = 0;
+  for (int round = 0; round < 400; round++) {
+    std::vector<RefRule> rules(std::uniform_int_distribution<size_t>(0, 6)(rng));
+    bess::pb::ACLArg arg;
+    for (RefRule &r : rules) {
+      const auto prefix = [&](uint32_t *a, int *len) {
+        *len = pick(-1, -1, 0, 8, 16, 24, 31, 32);
+        // Sometimes with host bits past the length set ("sloppy").
+        *a = addr() ^ (rng() & 1u ? 0u : (rng() & 0xffu));
+        return *len < 0 ? std::string() : Dotted(*a) + "/" + std::to_string(*len);
+      };
+      auto *rule = arg.add_rules();
+      rule->set_src_ip(prefix(&r.src, &r.src_len));
+      rule->set_dst_ip(prefix(&r.dst, &r.dst_len));
+      r.src_port = rng() % 3u == 0 ? port() : 0;
+      r.dst_port = rng() % 3u == 0 ? port() : 0;
+      r.drop = rng() % 3u == 0;
+      rule->set_src_port(r.src_port);
+      rule->set_dst_port(r.dst_port);
+      rule->set_drop(r.drop);
+    }
+    ASSERT_EQ("", h.SetResource("acl_eq/rules", arg));
+
+    std::vector<Bytes> in, want;
+    for (int i = 0; i < 24; i++) {
+      PacketBuilder b;
+      b.Ether("02:00:00:00:00:02", "02:00:00:00:00:01");
+      const uint32_t kind = rng() % 10u;
+      if (kind == 0) {
+        b.Arp(1, "02:00:00:00:00:01", Dotted(addr()), "00:00:00:00:00:00", Dotted(addr()));
+      } else if (kind == 1) {
+        b.IPv6("2001:db8::a00:5", "2001:db8::1").Udp(port(), port());
+      } else {
+        if (kind == 2) {
+          b.Dot1Q(7);
+        }
+        b.IPv4(Dotted(addr()), Dotted(addr()));
+        b.Last<PacketBuilder::IPv4Hdr>().frag =
+            static_cast<uint16_t>(pick(0, 0, 0x4000, 0x2000, 0x0010));
+        if (kind == 3) {
+          b.Last<PacketBuilder::IPv4Hdr>().options = Bytes{1, 1, 1, 0};
+        }
+        switch (rng() % 4u) {
+          case 0:
+            b.Tcp(port(), port());
+            break;
+          case 1:
+            b.Icmp(8, 0);
+            break;
+          default:
+            b.Udp(port(), port());
+        }
+      }
+      Bytes frame = b.PadTo(60 + (rng() % 2u) * 4).Build();
+      if (rng() % 8u == 0) {
+        frame.resize(std::uniform_int_distribution<size_t>(1, frame.size())(rng));
+      } else if (rng() % 16u == 0 && kind >= 2) {
+        frame[kind == 2 ? 20 : 16] = 0x03;  // IPv4 total length past the frame
+      }
+      if (ReferencePasses(rules, frame)) {
+        want.push_back(frame);
+      }
+      in.push_back(std::move(frame));
+    }
+    auto out = h.Run(acl, 0, in, {0});
+    ASSERT_EQ(want, out[0]) << "round " << round;
+    passed += want.size();
+    dropped += in.size() - want.size();
+  }
+  // Both verdicts occur often enough to mean something.
+  EXPECT_GT(passed, 1000u);
+  EXPECT_GT(dropped, 1000u);
 }
 
 // Whether the codec bound to `resource` requires paused workers.

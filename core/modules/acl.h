@@ -4,10 +4,8 @@
 #ifndef BESS_MODULES_ACL_H_
 #define BESS_MODULES_ACL_H_
 
-#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <vector>
 
 #include "framework/singleton_resource.h"
@@ -22,47 +20,54 @@ using bess::utils::Ipv4Prefix;
 
 class ACL final : public Module {
  public:
+  // A rule as given: a "" prefix or port 0 is a wildcard.
   struct ACLRule {
-    bool Match(be32_t sip, be32_t dip, be16_t sport, be16_t dport) const {
-      return src_ip.Match(sip) && dst_ip.Match(dip) &&
-             (src_port == be16_t(0) || src_port == sport) &&
-             (dst_port == be16_t(0) || dst_port == dport);
-    }
-
     Ipv4Prefix src_ip;
     Ipv4Prefix dst_ip;
     be16_t src_port;
     be16_t dst_port;
     bool drop;
-    // Every field is a wildcard (both prefixes /0 or "", both ports 0): the
-    // rule names no IPv4 field, so it matches any frame, IPv4 or not.
-    bool any;
   };
 
-  // What the rules match, from the checked parse (core/packet_parse.h,
-  // D-188): IPv4, untagged or behind up to two VLAN tags, options allowed.
-  // The ports are TCP's or UDP's; ICMP, other protocols and a non-first
-  // fragment (no transport header) have ports 0, which only a rule with
-  // wildcard ports matches.
+  // What a rule tests on a frame: its IPv4 source and destination and its
+  // TCP or UDP source and destination ports, each as its bytes on the wire
+  // (`addrs` is bytes 12-19 of the IPv4 header, `ports` bytes 0-3 of the
+  // transport header). From the checked parse (core/packet_parse.h, D-188):
+  // IPv4, untagged or behind up to two VLAN tags, options allowed. ICMP,
+  // other protocols and a non-first fragment (no transport header) have ports
+  // 0, which only a rule with wildcard ports matches.
   struct Key {
-    be32_t src;
-    be32_t dst;
-    be16_t src_port;
-    be16_t dst_port;
+    uint64_t addrs;
+    uint32_t ports;
   };
 
-  // KeyOf's verdict on a frame.
-  enum class Frame : uint8_t {
-    kIpv4,       // `key` is filled: every rule can match
-    kNotIpv4,    // a valid frame that is not IPv4 (ARP, IPv6, ...): only
-                 // a rule with every field a wildcard matches
-    kMalformed,  // headers that do not fit the frame or lie about their
-                 // lengths: dropped before any rule
+  // A rule as the packet path tests it: the key's bits it names (a wildcard
+  // field's mask is 0) and the values they must have. A rule constrains only
+  // the fields it names.
+  struct MatchRule {
+    bool Match(const Key &key) const {
+      return (key.addrs & addr_mask) == addr_want && (key.ports & port_mask) == port_want;
+    }
+
+    uint64_t addr_mask;
+    uint64_t addr_want;
+    uint32_t port_mask;
+    uint32_t port_want;
+    bool pass;
   };
 
-  // The common frame is read at its fixed offsets after CheckFastIpv4, so it
-  // decides as ParseFrame would. `frame` and `total_len` as ParseFrame's.
-  static Frame KeyOf(std::span<const uint8_t> frame, size_t total_len, Key *key);
+  // The rule list the packet path scans, from the rules as given (in order).
+  // A rule with every field a wildcard matches every frame, IPv4 or not, so
+  // the first such rule decides every frame no earlier rule matched, and
+  // the rules after it are never reached: `named` holds the rules before it,
+  // `otherwise_pass` its verdict (drop when there is none). A frame that is
+  // not IPv4 matches no rule of `named` (each names an IPv4 field).
+  struct Rules {
+    static Rules Compile(const std::vector<ACLRule> &rules);
+
+    std::vector<MatchRule> named;
+    bool otherwise_pass = false;
+  };
 
   static const Commands cmds;
   static const ResourceTables resource_tables;
@@ -80,15 +85,6 @@ class ACL final : public Module {
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
  private:
-  // The rule list is one immutable object published through an RcuPtr: init
-  // and the "<name>/rules" resource publish a replacement
-  // while workers keep processing (G1.2 mode G; ACLs here are small,
-  // scanned first-match). A batch reads it once. Decision D-017
-  // (docs/decisions.md)
-  struct Rules {
-    std::vector<ACLRule> rules;
-  };
-
   // A "<name>/rules" value, converted: the rule list to publish and the
   // ACLArg it came from (read back as given).
   struct Staged {
@@ -99,8 +95,13 @@ class ACL final : public Module {
   // Validates and converts every rule of `arg`; nothing is kept on error.
   CommandResponse ParseRules(const bess::pb::ACLArg &arg,
                              std::vector<ACLRule> *out) const;
-  void Install(std::vector<ACLRule> rules);
+  void Install(const std::vector<ACLRule> &rules);
 
+  // The rule list is one immutable object published through an RcuPtr: init
+  // and the "<name>/rules" resource publish a replacement
+  // while workers keep processing (G1.2 mode G; ACLs here are small,
+  // scanned first-match). A batch reads it once. Decision D-017
+  // (docs/decisions.md)
   bess::rcu::RcuPtr<Rules> rules_;
   // The rules as given, in order (control side): "<name>/rules" reads it
   // back.
