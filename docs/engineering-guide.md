@@ -98,7 +98,11 @@ whole frame cost 4-5.5 ns more.
   in a separate, out-of-line function. `WritableHead` and `PrependWritable`
   have this shape.
 - **Do not add a pass over the batch.** Drop in the same loop that
-  processes the packet, not in a second compaction pass.
+  processes the packet, not in a second compaction pass. `PacketBatch::KeepIf`
+  is an optional ordered, in-loop compaction helper; direct loops are equally
+  valid. For multi-field writes, the first field's loop can check the extent
+  of every field before writing anything, then later fields reuse that proof.
+  Keep field-major order when random draws or sequence state depend on it.
 - **Parse once per module.** Pass the `ParsedFrame` to the functions that
   need it; do not parse again in a helper. After a copy, use its offsets,
   not pointers taken before the copy.

@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -168,6 +169,37 @@ TEST(RandomUpdateTest, AChainSplitInsideAFieldIsDropped) {
   for (size_t split : {34u, 50u}) {
     EXPECT_EQ(expected, ThroughPacket(h, m, MakePacket(Counting(60), split)))
         << "first segment of " << split << " bytes";
+  }
+}
+
+// Every field's bytes are checked before the first is written: a frame that
+// holds the first field but not the second is dropped, wherever it sits in
+// the batch, and the written frames leave in order with both fields set.
+TEST(RandomUpdateTest, AFrameShortOfALaterFieldIsDroppedAnywhereInTheBatch) {
+  ModuleHarness h;
+  Module *m = h.Create("RandomUpdate", Fields({{.offset = 0, .size = 1, .min = 0x42, .max = 0x42},
+                                               {.offset = 40, .size = 2, .min = 0x1234,
+                                                .max = 0x1234}}));
+  ASSERT_NE(nullptr, m);
+  const std::vector<std::vector<size_t>> patterns = {{}, {0}, {2}, {4}, {0, 4}};
+  for (const std::vector<size_t> &shorts : patterns) {
+    SCOPED_TRACE(::testing::PrintToString(shorts));
+    std::vector<Bytes> in;
+    std::vector<Bytes> want;
+    for (size_t i = 0; i < 5; i++) {
+      const bool short_frame = std::find(shorts.begin(), shorts.end(), i) != shorts.end();
+      // 41 bytes hold the first field, not the second (it ends at 42).
+      Bytes frame(short_frame ? 41 : 60, static_cast<uint8_t>(i + 1));
+      in.push_back(frame);
+      if (!short_frame) {
+        frame[0] = 0x42;
+        frame[40] = 0x12;
+        frame[41] = 0x34;
+        want.push_back(frame);
+      }
+    }
+    auto out = h.Run(m, 0, in, {0});
+    EXPECT_EQ(want, out[0]);
   }
 }
 

@@ -62,52 +62,38 @@ void Update::DeInit() {
   fields_resource_.Release();
 }
 
-// A packet that is too short in its first segment -- a runt, or a chain whose
-// first segment ends before a field -- is dropped rather than partly written
-// (D-172's packet destinations). A shared one is copied first; the copy may
-// replace the mbuf and resegment it, so the length is checked again on it.
-void Update::PrepareBatch(Context *ctx, bess::PacketBatch *batch) {
-  const size_t required = required_len_;
-  int out_cnt = 0;
-  for (bess::PacketRef pkt : batch->packets()) {
-    if (bess::packet::HeadWritableInPlace(pkt, required)) {
-      batch->handles()[out_cnt++] = pkt.handle();
-      continue;
-    }
-    bess::PacketHandle handle = pkt.handle();
-    if (pkt.head_len() < required || !bess::packet::EnsureWritable(handle) ||
-        bess::PacketRef(handle).head_len() < required) {
-      EmitPacket(ctx, bess::PacketRef(handle), DROP_GATE);
-      continue;
-    }
-    batch->handles()[out_cnt++] = handle;
+// Preserves the checked path's chain-wide COW and length recheck.
+bool Update::PreparePacket(Context *ctx, bess::PacketHandle &handle,
+                           size_t required) {
+  if (bess::PacketRef(handle).head_len() < required ||
+      !bess::packet::EnsureWritable(handle) ||
+      bess::PacketRef(handle).head_len() < required) {
+    EmitPacket(ctx, bess::PacketRef(handle), DROP_GATE);
+    return false;
   }
-  batch->set_cnt(out_cnt);
+  return true;
 }
 
 void Update::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (num_fields_ != 0) {
-    // One pass that only reads, and one branch for the batch: a batch whose
-    // packets are all long enough and unshared (the common case) is written
-    // as it is. Every field is written into the packet's first segment, so
-    // that segment must hold the furthest byte any field names, and its
-    // payload must be this packet's alone (D-153): a clone's or a shared
-    // external buffer's bytes are seen by every holder. HeadWritableInPlace
-    // tests the common case only (a direct mbuf held once), without a branch;
-    // anything else (including an indirect mbuf or external buffer that
-    // happens to be writable) is decided by PrepareBatch.
+    // Check the furthest field before writing the first: a short packet
+    // must never leave partially updated. Later fields need no new check.
     const size_t required = required_len_;
-    unsigned ready = 1;
-    for (bess::PacketRef pkt : batch->packets()) {
-      ready &= static_cast<unsigned>(
-          bess::packet::HeadWritableInPlace(pkt, required));
-    }
-    if (unlikely(ready == 0)) {
-      PrepareBatch(ctx, batch);
-    }
+    const Field &first = fields_[0];
+    const size_t offset = first.offset;
+    const uint8_t size = first.size;
+    batch->KeepIf([&](bess::PacketHandle &handle, int) {
+      if (!bess::packet::HeadWritableInPlace(bess::PacketRef(handle), required) &&
+          !PreparePacket(ctx, handle, required)) {
+        return false;
+      }
+      char *head = bess::PacketRef(handle).head_data<char *>();
+      std::memcpy(head + offset, &first.value, size);
+      return true;
+    });
   }
 
-  for (size_t i = 0; i < num_fields_; i++) {
+  for (size_t i = 1; i < num_fields_; i++) {
     const Field &field = fields_[i];
     const size_t offset = field.offset;
     const uint8_t size = field.size;
@@ -115,10 +101,8 @@ void Update::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     for (bess::PacketRef snb : batch->packets()) {
       char *head = snb.head_data<char *>();
 
-      // The value is big-endian with the field's bytes at the top of the
-      // word, so its first `size` bytes are the field. Writing exactly those
-      // bytes leaves the neighbours alone; HeadWritableInPlace or
-      // PrepareBatch keeps them inside the first segment's data.
+      // The value's first `size` bytes are the big-endian field; the first
+      // field's loop proved every field is within writable first-segment data.
       std::memcpy(head + offset, &field.value, size);
     }
   }

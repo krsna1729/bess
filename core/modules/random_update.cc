@@ -139,66 +139,65 @@ CommandResponse RandomUpdate::ParseField(
   return CommandSuccess();
 }
 
-// A packet that is too short in its first segment -- a runt, or a chain whose
-// first segment ends before a field -- is dropped rather than partly written
-// (D-172). A shared one is copied first (D-153); WritableHead checks the
-// length again on the copy.
-void RandomUpdate::PrepareBatch(Context *ctx, bess::PacketBatch *batch) {
-  const size_t required = required_len_;
-  int out_cnt = 0;
-  for (bess::PacketRef pkt : batch->packets()) {
-    bess::PacketHandle handle = pkt.handle();
-    if (!bess::packet::WritableHead(handle, required)) {
-      EmitPacket(ctx, bess::PacketRef(handle), DROP_GATE);
-      continue;
-    }
-    batch->handles()[out_cnt++] = handle;
-  }
-  batch->set_cnt(out_cnt);
-}
-
 namespace {
 
-// Writes a fresh value into every packet's `size`-byte field, big-endian.
+template <size_t size, typename Var>
+inline void WriteValue(const Var &var, Random &rng, char *data) {
+  const uint32_t value = var.min + rng.GetRange(var.range);
+  char *field = data + var.offset;
+  if constexpr (size == 1) {
+    *field = static_cast<char>(value);
+  } else if constexpr (size == 2) {
+    const be16_t v(static_cast<uint16_t>(value));
+    std::memcpy(field, &v, sizeof(v));
+  } else {
+    const be32_t v(value);
+    std::memcpy(field, &v, sizeof(v));
+  }
+}
+
 template <size_t size, typename Var>
 inline void WriteField(const Var &var, Random &rng, bess::PacketBatch *batch) {
   for (bess::PacketRef pkt : batch->packets()) {
-    const uint32_t value = var.min + rng.GetRange(var.range);
-    char *field = pkt.head_data<char *>() + var.offset;
-    if constexpr (size == 1) {
-      *field = static_cast<char>(value);
-    } else if constexpr (size == 2) {
-      const be16_t v(static_cast<uint16_t>(value));
-      std::memcpy(field, &v, sizeof(v));
-    } else {
-      const be32_t v(value);
-      std::memcpy(field, &v, sizeof(v));
-    }
+    WriteValue<size>(var, rng, pkt.head_data<char *>());
   }
 }
 
 }  // namespace
 
-void RandomUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  if (num_vars_ != 0) {
-    // Every field is written into the packet's first segment, so that
-    // segment must hold the furthest byte any field names, and its payload
-    // must be this packet's alone (D-153). One pass that only reads, and one
-    // branch for the batch: a batch whose packets are all long enough and
-    // unshared (the common case) is written as it is.
-    const size_t required = required_len_;
-    unsigned ready = 1;
-    for (bess::PacketRef pkt : batch->packets()) {
-      ready &= static_cast<unsigned>(
-          bess::packet::HeadWritableInPlace(pkt, required));
+// Validate every field's extent before the first write. Draw only for kept
+// packets, in packet order, exactly as the former preparation pass did.
+template <size_t size>
+void RandomUpdate::WriteFirstField(Context *ctx, bess::PacketBatch *batch, Random &rng) {
+  const Var &var = vars_[0];
+  const size_t required = required_len_;
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
+    const auto head = bess::packet::WritableHead(handle, required);
+    if (!head) {
+      EmitPacket(ctx, bess::PacketRef(handle), DROP_GATE);
+      return false;
     }
-    if (unlikely(ready == 0)) {
-      PrepareBatch(ctx, batch);
+    WriteValue<size>(var, rng, reinterpret_cast<char *>(head->data()));
+    return true;
+  });
+}
+
+void RandomUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
+  Random &rng = rng_[ctx->wid];
+  if (num_vars_ != 0) {
+    switch (vars_[0].size) {
+      case 1:
+        WriteFirstField<1>(ctx, batch, rng);
+        break;
+      case 2:
+        WriteFirstField<2>(ctx, batch, rng);
+        break;
+      default:
+        WriteFirstField<4>(ctx, batch, rng);
+        break;
     }
   }
-
-  Random &rng = rng_[ctx->wid];
-  for (size_t i = 0; i < num_vars_; i++) {
+  for (size_t i = 1; i < num_vars_; i++) {
     const Var &var = vars_[i];
     switch (var.size) {
       case 1:
