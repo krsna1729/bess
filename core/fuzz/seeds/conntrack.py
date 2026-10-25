@@ -4,9 +4,10 @@
 Stage A (parser): valid frames of each protocol, VLAN tags, IPv4 options,
 IPv6 extension headers, fragments, truncations and lies, each with a
 total_len mode. Stage B (tracker): scripted connection lives -- a TCP
-handshake, data and close (IPv4/IPv6), reset, reopen after TIME_WAIT, UDP
-request/reply, ICMP echo and errors quoting tracked flows, fragments, zones,
-a full table, Remove/SetDeadline and expiry with small and full budgets.
+handshake, data and close (IPv4/IPv6), reset, reopen after TIME_WAIT, flag
+combinations Linux refuses, UDP request/reply, ICMP echo and errors quoting
+tracked flows, fragments, zones, a full table, Remove/SetDeadline and expiry
+with small and full budgets.
 """
 
 import struct
@@ -168,6 +169,13 @@ def stage_b():
                                                tcp(SYN | ACK), tcp(ACK, reply=True)]),
         "b_tcp_pickup": tracker(4, [tcp(ACK), tcp(ACK, reply=True), expire(60)], config=4),
         "b_tcp_invalid_starts": tracker(4, [tcp(ACK), tcp(SYN | ACK), tcp(FIN), tcp(0)]),
+        # Flag combinations Linux's tcp_error() refuses: SYN|FIN starts
+        # nothing (the fuzzer's crash, minimised); a bare FIN, SYN|FIN or
+        # SYN|RST moves no state; PSH, ECE and CWR do not count.
+        "b_tcp_invalid_flags_create": tracker(4, [tcp(SYN | FIN, ends=0)], start=10),
+        "b_tcp_invalid_flags_existing": tracker(4, handshake + [
+            tcp(FIN), tcp(SYN | FIN, reply=True), tcp(SYN | RST), tcp(0x20),
+            tcp(ACK | 0xc8), tcp(FIN | ACK), expire(16)]),
         "b_udp_request_reply": tracker(4, [udp(), expire(3), udp(delta=2), expire(4),
                                            udp(), udp(reply=True), expire(22, full=False, budget=1),
                                            expire(2)]),
