@@ -13465,3 +13465,50 @@ does not allocate; the replaced table outlives a reader until it quiesces; readb
 
 **Revisit when:** a rebuilt table's values must reference other resources (the adapter carries no references),
 or a table should be rebuilt in parts (one group at a time, so an update costs its group, not the table).
+
+## D-192 Reduce check cost locally; cross-module shortcuts require independent proof
+
+**Status:** accepted (2026-10-26). Clarifies D-180 and D-188; does not add a runtime contract.
+**Code:** `core/packet_parse.h`, `core/packet_reshape.{h,cc}`, `core/packet_mutation.h`, `core/pktbatch.h`,
+`core/modules/acl.{h,cc}`, `core/modules/{update,random_update}.cc`, `core/nat/nat.h`.
+**Guidance:** [engineering-guide.md §3](engineering-guide.md#3-the-cost-of-checks-check-cheaply-do-expensive-work-once).
+
+**Context.** Packet-safety checks have a measured cost. Their removal must not make module composition
+unsafe or require each author to adopt one framework mechanism. Sharing the parser implementation
+(D-188) does not make one parsed value valid across arbitrary modules.
+
+**Decision.**
+- **Cheaper local checks are the primary approach.** Keep the existing checked outcomes, reduce
+  call and return traffic, reuse a proof within the same operation, and combine batch passes where
+  measurements support it. A direct loop and an optional helper are equally valid.
+- **Cross-module parse reuse remains unproven.** `ParsedFrame` stores addresses, ports and TCP flags
+  as well as offsets. NAT rewrites packet bytes in place and updates checksums incrementally.
+  Its parsed argument is const: the rewrite does not refresh those cached fields. A stamp made
+  from the packet handle, data pointer and lengths would therefore accept stale fields. Any
+  future carried parse needs an independently proven mutation-free region, not this stamp.
+- **Graph-proven variants are optional and not implemented by this decision.** Before choosing
+  such a variant, prove each omitted check's precondition on every incoming path. The D-180
+  descriptors describe state, affinity and updates; they are not a payload-ownership or length
+  proof. An unspecified descriptor is the worst case: shared or chained packets may arrive.
+  Missing proof selects the ordinary checked path.
+- **NIC receive packet-type and checksum flags are hints, not packet-content proofs.** Any future
+  check-elision path using them is opt-in per port and keeps a checked software fallback when the
+  hint is absent, unsupported or insufficient for the consumer's precondition.
+- **No new module-author obligation.** No mandatory Parse module, forced fusion, required
+  annotation or rewrite notification is introduced. Reshapers need not participate in a
+  framework-wide invalidation protocol. Existing modules and plugins keep their checked paths.
+
+**Evidence.** PR #94 reduced the fast IPv4 check's measured cost; PR #96 removed ACL's key
+round trip through the stack. PR #97 retained scalar checked-helper and batch-loop changes
+after eight paired release rounds against its own base (`dfa75eb0` to `09509d0f`):
+M.base used 3.88 fewer instructions per packet (paired median), with instruction reductions
+on the changed module rows in all eight pairs. Per-row timing changes did not clear the
+layout variation on unchanged rows, so they are not claimed as time wins. These are local
+optimizations, not evidence for graph-wide parse reuse.
+
+**Consequences.** Safety and composition remain the default. Cross-module shortcuts need their
+own correctness proof and paired performance evidence before adoption; this decision ships no
+parse cache, graph variant or new NIC fast path.
+
+**Revisit when:** profiling still shows a material repeated-check cost and a concrete graph or
+port configuration supplies the proof the checked path currently provides.

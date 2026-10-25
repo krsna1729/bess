@@ -113,8 +113,22 @@ whole frame cost 4-5.5 ns more.
   at resume. No graph mechanism proves a packet's length, parse or
   exclusivity, and a value that another module computed can be stale: a
   module between the two can rewrite the packet in place.
+- **Prefer cheaper local checks to graph-wide assumptions** (D-192).
+  Cross-module parse reuse is unproven: `ParsedFrame` caches addresses, ports
+  and flags, not just offsets. NAT rewrites addresses and ports in place
+  without changing the packet handle, data pointer or length. Reuse needs a
+  proven mutation-free region; a descriptor stamp alone is not proof.
+- **Keep graph specializations optional.** No module must use a Parse module,
+  fuse with another module or notify the framework of every rewrite. A
+  future specialization must prove its preconditions on every incoming path
+  and fall back to the checked path when it cannot. No D-180 descriptor
+  proves private storage, contiguity or length; an unspecified one is the
+  worst case, where shared or chained packets may arrive.
 - **Use what the hardware gives you,** for example NIC checksum offload,
-  when a port reports it. Keep the software path for ports that do not.
+  when a port reports it. Receive packet-type and checksum flags are hints,
+  not proof of the bytes a module reads. Any use to avoid software work must
+  be opt-in per port, with a checked software fallback for absent or
+  unsupported hints. None of these options replaces the normal checked path.
 
 ## 4. Layering and reuse
 
