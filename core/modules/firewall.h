@@ -6,14 +6,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <map>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "classifier/firewall_table.h"
-#include "dataplane/resource.h"
+#include "dataplane/rebuild_resource.h"
 #include "framework/resource_bindings.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
@@ -49,9 +48,6 @@ class Firewall final : public Module {
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
 
-  // The module's "<name>/rules" resource (D-179).
-  class RulesResource;
-
   // The packet's 5-tuple, from the checked parse (packet_parse.h, D-188): up
   // to two VLAN tags, IPv4 options, up to eight IPv6 extension headers (AH
   // included). False for a packet this table cannot judge: not IPv4 or IPv6,
@@ -66,8 +62,6 @@ class Firewall final : public Module {
                     bess::classifier::FirewallKey *key);
 
  private:
-  friend class RulesResource;
-
   // One immutable rule set, published whole: changing the policy publishes a
   // new table and the old one is retired a grace period later, so workers
   // keep running (no paused workers) - the shape ACL's rule list uses
@@ -86,7 +80,7 @@ class Firewall final : public Module {
     bess::pb::FirewallArg::Rule given;
     bess::classifier::FirewallRule parsed;
   };
-  using RuleMap = std::map<uint32_t, KeyedRule>;
+  using RuleView = bess::dataplane::RebuildRules<uint32_t, KeyedRule>;
 
   // A rule as the policy orders it.
   struct Ranked {
@@ -95,16 +89,20 @@ class Firewall final : public Module {
     const bess::classifier::FirewallRule *rule;
   };
 
-  // The table `rules` make, in policy order: priority, highest first, equal
-  // priorities by id, lowest first.
+  // The table `rules` (in id order) make, in policy order: priority, highest
+  // first, equal priorities by id, lowest first.
   static std::expected<std::unique_ptr<const Published>, std::string>
-  BuildPublished(std::vector<Ranked> rules);
+  BuildPublished(const RuleView &rules);
+
+  // The module's "<name>/rules" resource (D-179): keyed by rule id, the
+  // policy rebuilt once per transaction (D-191). It holds the committed rules
+  // by id: what the published table was built from, and what it reads back.
+  using RulesResource =
+      bess::dataplane::RebuildResource<uint32_t, KeyedRule, Published,
+                                       decltype(&BuildPublished)>;
 
   bess::rcu::RcuPtr<Published> published_;
-  // The committed rules by id (control side): the policy the published table
-  // was built from, and what "<name>/rules" reads back.
-  RuleMap rules_;
-  std::unique_ptr<bess::dataplane::Resource> resource_;
+  std::unique_ptr<RulesResource> resource_;
   bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
   // The packet's "action_id" (D-141): written for every packet the policy
   // passes, 0 when its rule names no action, so a module downstream selects

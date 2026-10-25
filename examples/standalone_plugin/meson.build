@@ -14,9 +14,11 @@ bess_dep = dependency('bess-dev', required: true)
 # manipulates packets, standalone_range_gate uses the public classifier, and
 # standalone_flow_count keeps per-flow state in the public flow table, and
 # standalone_appliance shares an application-owned object graph between its
-# instances through the InstanceRegistry (M23, personas C and D).
+# instances through the InstanceRegistry (M23, personas C and D), and
+# standalone_rule_tables holds in-place and rebuilt table resources (D-191).
 foreach plugin : ['standalone_pass', 'standalone_macswap', 'standalone_range_gate',
-                  'standalone_flow_count', 'standalone_appliance', 'standalone_requests']
+                  'standalone_flow_count', 'standalone_appliance', 'standalone_requests',
+                  'standalone_rule_tables']
   shared_module(
     plugin,
     plugin + '.cc',

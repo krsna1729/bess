@@ -71,6 +71,8 @@ class ExactRuleResource final : public dataplane::Resource {
             Hooks{.table = [&table]() -> ConcurrentExactTable & {
                     return table;
                   },
+                  .check_value = {},
+                  .make_room = {},
                   .references = std::move(references),
                   .records = records,
                   .may_reference = std::move(may_reference)}) {}
@@ -153,9 +155,10 @@ class ExactRuleResource final : public dataplane::Resource {
       Reservation erase{
           std::make_unique<EraseOp>(table_, op.key, RecordIdOf(*previous),
                                     records_),
-          {}};
-      erase.existed = true;
-      erase.previous_references = std::move(previous_references);
+          {},
+          {},
+          /*existed=*/true,
+          std::move(previous_references)};
       return erase;
     }
     const Value *value = std::any_cast<Value>(&op.value);
@@ -196,10 +199,9 @@ class ExactRuleResource final : public dataplane::Resource {
       records_->ReserveRetirement(1);  // publication must not allocate
       upsert->RetireOnPublish(RecordIdOf(*previous));
     }
-    Reservation reservation{std::move(upsert), std::move(references), {}};
-    reservation.existed = previous.has_value();
-    reservation.previous_references = std::move(previous_references);
-    return reservation;
+    return Reservation{std::move(upsert), std::move(references), {},
+                       /*existed=*/previous.has_value(),
+                       std::move(previous_references)};
   }
 
  private:

@@ -16,7 +16,10 @@ This document formalizes the supported C++ and build contract for out-of-tree BE
   `bess/core/{classifier,dataplane,flow,meter,rcu,route,stats}`, the wire
   codec facade (`framework/resource_codec.h`, `framework/resource_bindings.h`,
   D-094), the classifier-table helpers (`framework/table_fields.h`,
-  `framework/table_batch.h`, D-189), and the static archives of section 6
+  `framework/table_batch.h`, D-189), the table resources and the tables under
+  them (`classifier/{exact,masked}_rule_resource.h`,
+  `classifier/concurrent_{exact,masked}.h`, `dataplane/rebuild_resource.h`,
+  D-191), and the static archives of section 6
   (D-095). Their interfaces may
   change without preserving source compatibility. (`flow/` is
   the flow-state library, see `docs/flow-state.md`; a plugin that uses it
@@ -658,9 +661,51 @@ The generation struct is the module's: it holds a `CompiledKey` per table key, a
 `CompiledResult` per record layout, its tables and whatever else its packet path
 reads (a default gate, a specialised kernel). The packet-path helpers are inline
 and take the caller's stack scratch: no allocation and no indirect call per
-batch. The table classes and their rule resources
-(`classifier/concurrent_{exact,masked}.h`, `classifier/{exact,masked}_rule_resource.h`)
-are not installed yet.
+batch. The tables and their rule resources are installed too (next section).
+
+### Table resources: in place or rebuilt (experimental, D-191)
+
+A table a controller writes is a `dataplane::Resource` (`<module>/<table>`).
+Two kinds come ready-made; pick by whether the table can change one entry at a
+time while workers read it:
+
+| | In place | Rebuilt |
+|---|---|---|
+| Adapter | `classifier::ExactRuleResource` (`exact_rule_resource.h`), `classifier::MaskedRuleResource` (`masked_rule_resource.h`) | `dataplane::RebuildResource<Id, Rule, Table, Build>` (`rebuild_resource.h`) |
+| Table | `ConcurrentExactTable` (rte_hash, lock-free readers), `ConcurrentMaskedTable` (tuple space over it, with ranges) | yours: any immutable structure `Build` makes from the rules, read through your `RcuPtr<Table>` |
+| Key, value | the key bytes (masked: mask, value, ranges) to a gate and a result record (`RuleResult`, `MaskedRuleResource::Value`, records in a `RecordArena`) | `EncodeKey(Id)` to your `Rule` |
+| Cost of a transaction | per operation, flat in table size: `Reserve()` places a pending entry, `Publish()` stores it | one `Build` of the whole table, however many operations it carries |
+| References | values may name other resources (`references`, `may_reference`) | none |
+| Readback | the table's own `ForEach` | `rules()`: the committed rules by id |
+
+Use the in-place kind when the table is an exact or ternary match on key bytes
+and updates must stay cheap at any size. Use the rebuilt kind for a structure
+that cannot change in place: a sorted list, a compiled trie, a
+first-match-wins policy whose order is derived from all its rules. Declare such
+a table `.Rebuilds()` in `resource_tables`, so `GetSchema` and
+`ValidatePipeline` report what an update costs. A rebuilt resource
+(`Firewall`'s `<name>/rules` is one):
+
+```cpp
+// Every rule, in id order ({id, rule} entries, size()), to the table they
+// make, or why they make none.
+static std::expected<std::unique_ptr<const MyTable>, std::string> BuildTable(
+    const bess::dataplane::RebuildRules<uint32_t, MyRule> &rules);
+using Rules = bess::dataplane::RebuildResource<uint32_t, MyRule, MyTable,
+                                               decltype(&BuildTable)>;
+
+bess::rcu::RcuPtr<MyTable> table_{init_context().rcu()};  // the packet path reads it
+auto rules = std::make_unique<Rules>(name() + "/rules", table_, &BuildTable, "a rule");
+rules->Initialize({});  // the first table, before Register()
+```
+
+`Reserve()` records each operation (an upsert's map node is allocated there),
+`Prepare()` builds once from the committed rules and the operations merged in
+id order (a view, not a copy), and the transaction's first `Publish()`
+exchanges the pointer, retires the old table and moves the nodes without
+allocating; a refused build leaves the published table untouched.
+`examples/standalone_plugin/standalone_rule_tables.cc` holds one table of each
+kind from the installed headers.
 
 ---
 

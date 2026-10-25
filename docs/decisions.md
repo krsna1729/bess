@@ -12269,6 +12269,9 @@ of 10,000 rules or more (then an incremental backend, measured against this benc
 50,000 rules (or shard it by domain or direction, D-147), or a controller needs scope-snapshot consistency
 across the Firewall and another resource.
 
+**Change (D-191).** The resource is the library's `dataplane::RebuildResource`, which holds the committed rules;
+`Firewall::RulesResource` is gone. The behaviour, error text and readback are the same.
+
 ## D-180 Module capability descriptors: state ownership, flow affinity, update model, consistency
 
 **Status:** accepted (2026-10-23; the roadmap item "module capability descriptors: state ownership, flow
@@ -13321,3 +13324,141 @@ guard is a single `defined(BESS_ARCH_*)`.
 
 **Revisit when:** a kernel file grows a second unrelated owner (promote it), or a kernel file passes the guard
 check while its generic build is broken (then build the generic lane per kernel file instead).
+
+## D-191 Table resources for plugins: the in-place rule adapters installed, a rebuild adapter in the library
+
+**Status:** accepted (2026-10-24). Changes D-074 (`ConcurrentExactTable` is no longer internal) and D-189 (the
+table classes and rule resources were left internal).
+**Code:** `core/dataplane/rebuild_resource.h` (new), `core/dataplane/rebuild_resource_test.cc` (new),
+`core/classifier/mask_batch.h` (new, from `masked_exact.h`), `core/classifier/{concurrent_exact,concurrent_masked,
+exact_rule_resource,masked_rule_resource,rule_result,masked_exact}.h`,
+`core/modules/firewall.{h,cc}`, `core/modules/firewall_rules.cc` (new), `core/modules/firewall_path_bench.cc`
+(new), `core/flow/shared_exact_index.h` (comment), `core/meson.build`, `tools/api_classes.json`,
+`tools/check_installed_headers.py`, `tools/ci_profile.py`, `examples/standalone_plugin/meson.build`,
+`examples/standalone_plugin/standalone_rule_tables.cc` (new), `tests/live/standalone_plugins_test.cc`.
+**Analysis:** [plugin-api.md](plugin-api.md) ("Table resources: in place or rebuilt"), [architecture.md](architecture.md)
+section 3.
+
+**Context.** A table a controller writes is a `dataplane::Resource`, and BESS had two ways to make one. *In
+place*: `ExactRuleResource` and `MaskedRuleResource` change one entry of a concurrent table per operation (D-021,
+D-024), which `ExactMatch` and `WildcardMatch` use. *Rebuilt*: `Firewall`'s `RulesResource` (D-179) records a
+transaction's operations, builds one immutable table from all of them in `Prepare()` and publishes it by one RCU
+exchange. Neither reached plugins. The in-place adapters and their tables were not installed (D-189 left them
+out; D-074 had kept `ConcurrentExactTable` behind `flow::SharedExactIndex`, which has no in-place update and no
+pending-entry protocol), and the rebuild adapter was about 130 lines private to `modules/firewall.cc`. A plugin
+holding a table had to copy one or the other.
+
+**Decision.**
+
+- **Installed, experimental**, by D-147's procedure (`core/meson.build`, `tools/api_classes.json`, this record):
+  `classifier/concurrent_exact.h`, `classifier/concurrent_masked.h`, `classifier/exact_rule_resource.h`,
+  `classifier/masked_rule_resource.h`, `classifier/rule_result.h`, `classifier/mask_batch.h` and
+  `dataplane/rebuild_resource.h`. `concurrent_exact.h` and `concurrent_masked.h` leave the installed-header
+  checker's list of files that must never be installed. Their out-of-line code is `bess_classifier`'s, which
+  `bessd` exports (D-189).
+- **Only what they need.** `ConcurrentMaskedTable` used two things from `masked_exact.h`: the key-width bound
+  and the per-width masking kernel. Those move to `classifier/mask_batch.h` (unchanged code), so the masked
+  table no longer pulls in the immutable `RuntimeMaskedBackend`, the cuckoo backend and `utils/cuckoo_map.h`,
+  which stay internal. `concurrent_exact.h` includes `classifier.h` instead of `backend.h`, which it did not use.
+- **No behaviour change in the in-place adapters.** Their `Reservation` and `Hooks` aggregates are now fully
+  initialised, because the installed-header check compiles every installed header with `-Wextra -Werror`
+  (`-Wmissing-field-initializers`), and two comments lost the module names. `WildcardMatch` and `ExactMatch` use
+  them unchanged: their `ProcessBatch` disassembles the same except for alignment padding.
+- **`dataplane::RebuildResource<Id, Rule, Table, Build>`** is `Firewall`'s resource made generic. The key is
+  `EncodeKey(Id)` (trivially copyable, ordered); the value is `Rule`; `Build` is any callable from
+  `const RebuildRules<Id, Rule> &` to `std::expected<std::unique_ptr<const Table>, std::string>`. `RebuildRules`
+  is a forward range of `{id, rule}` entries in id order, with its size: the committed rules merged on the fly with
+  the transaction's operations, so nothing is copied before the build. `Reserve()` checks the key and value and
+  records the operation, allocating an upsert's `std::map` node there; the transaction's first operation declares
+  the one retirement. `Prepare()` builds once.
+  The first `Publish()` exchanges the owner's `RcuPtr<Table>`, retires the old table and moves the nodes into
+  the committed rules without allocating; the other operations find nothing left to do. `EndTransaction()`
+  frees what was replaced, or what was never published. `Initialize(rules)` builds and publishes the first
+  table before registration, and `rules()` is the committed rules by id, for readback. Its values hold no
+  references and its erases take effect at once, so nothing may reference it.
+- **Where it lives.** The adapter is a header-only template in `dataplane/`, beside `SlotResource`. It needs
+  only `Resource` and `RcuPtr`, so any library may use it, not only the classifier's users. The owner keeps
+  the `RcuPtr` its packet path reads, so the packet path still makes one acquire load per batch.
+- **`Firewall` runs on it** with the same behaviour. `RulesResource` and the committed-rule map are gone from
+  the module. `BuildPublished` takes the entries and ranks them (priority, then id). `Init` publishes through
+  `Initialize`. The readback visits `rules()`. Refusals keep their text: `invalid rule id key`, `not found`,
+  and `wrong value type (want a firewall rule)`, where the adapter takes the value's name from its owner. Every
+  existing `Firewall` test passes unmodified, and so do D-179's semantics: one build per transaction, one
+  retirement, workers never paused.
+- **`Firewall`'s packet path is a translation unit of its own.** `firewall.cc` holds only `KeyOfParsed`, `KeyOf`
+  and `ProcessBatch`; the control side (`Init`, the commands, `BuildPublished`, the resource, `ADD_MODULE`) is
+  `firewall_rules.cc`. With the adapter's templates in the same unit, GCC 16 at `-O3` spent the unit's inline
+  budget (`--param inline-unit-growth`) before it reached the packet path: `ProcessBatch` called
+  `Task::AllocPacketBatch` twice instead of inlining it (develop's made one such call; 76 call sites refused for
+  unit growth, 108 with the adapter). Split, the packet path's unit refuses none and makes no such call.
+- **The firewall table is unchanged.** Its small-policy lookup moves with heap placement alone:
+  `BM_Process/16/1/1` (16 rules, every packet falling to the catch-all) took 2951 to 4306 cycles per batch on
+  develop as an `LD_PRELOAD` shim moved the heap's start by 0 to 256 bytes. Line-aligned arrays with one entry
+  array for every group removed that spread (3448 to 3737), but cost `FirewallTable::LookupBatch` 3 to 7% at 10
+  rules and a build up to twice as long at 10,000 rules (one large zero-filled array per build, and introsort
+  on near-sorted entries where develop's merge sort is cheaper). A layout change is its own decision.
+- **Route's IPv6 `Stage`/`Commit` stays.** `Ipv6RouteTable` keeps a spare `rte_fib6` and edits it by deltas.
+  A transaction edits the spare (cost in proportion to its changes) and commits by one exchange. The lag is
+  replayed onto the old instance after `Committed(token)`, so DPDK instances are reused. `RebuildResource`
+  would build a whole `rte_fib6` from every route per transaction: a cost in proportion to the table, plus a
+  DPDK allocation per transaction. That is not zero cost. `RouteResource` also keys `(domain, prefix)` across
+  IPv4 (updated in place in `rte_lpm`) and IPv6, and its values name next hops, which this adapter does not
+  carry.
+- **A conformance plugin proves both kinds from the installed tree.** `standalone_rule_tables` holds one
+  table of each kind for UDP port 1500: an exact table behind `ExactRuleResource`, a masked table behind
+  `MaskedRuleResource`, and a port-range table behind `RebuildResource`. It registers the three resources and
+  sends a packet that all three match to gate 1. CI builds it from the staged `bess-dev` and loads it into the
+  staged `bessd` (`StandalonePlugins.ConformancePlugins`).
+
+**Measured.** `tools/ab_bench.py`, ABBA, 16 rounds, i9-13900H pinned to one P-core (CPU 11), GCC 16.2.1, release
+(`-O3 -march=x86-64-v3`), DPDK 25.11.3; A is develop at `10583448` with the new bench, B this change on it. The
+WildcardMatch and ExactMatch sets ran before the firewall table went back to develop's (they do not call it).
+
+| benchmark | cases | no clear difference | B faster | B slower |
+|---|---|---|---|---|
+| `modules_match_path_bench` (WildcardMatch and ExactMatch `ProcessBatch`, `RuleUpdate`) | 28 | 22 | 6 (3.0-4.4%) | 0 |
+| `modules_exact_match_transaction_bench` (`ModuleClassify` to 1M rules, `ClassifyUnderTransactions` to the max rate) | 18 | 18 | 0 | 0 |
+| `modules_exact_match_update_bench` | 24 | 24 | 0 | 0 |
+| `modules_wildcard_match_update_bench` (lookups to 1M rules, `UpsertErase` to 128K) | 54 | 50 | 2 (3.3-4.6%, 1M rules) | 2 |
+| `modules_firewall_update_bench` (`BM_RuleTransaction`, 1K-50K rules) | 9 | 9 | 0 | 0 |
+| `classifier_range_vs_firewall_bench` `BM_TableUpdate`, `BM_ModuleUpdate` | 36 | 36 | 0 | 0 |
+| `classifier_range_vs_firewall_bench` `BM_Lookup` | 90 | 87 | 3 (3.0-3.2%) | 0 |
+| `modules_firewall_path_bench` | 8 | 5 | 0 | 3 |
+
+Every case B reads slower is placement, by builds of each side with 0 to 3136 bytes of padding added to the
+bench's text (eight layouts each, four interleaved rounds, each side pooled over its own layouts): the two
+WildcardMatch cases (`BM_Lookup/1/1/{1000,16000}/13`, +4.2 and +3.1% in one layout) pool to 0.997 and 0.998, and
+all eight firewall cases have no clear difference, B/A of the medians 0.992 to 1.027, where the 1024-rule cases
+that read +3.2 to +4.3% in one layout spread from 2952 to 3306 ns across A's own layouts. `UpsertErase/1` pools
+to 1.014-1.016, no clear difference: `ConcurrentMaskedTable::Upsert` is the same code in both, and `Erase` differs
+only in GCC inlining `Prepared`'s destructor (its unit includes `mask_batch.h` instead of `masked_exact.h`).
+
+Live (`live_transaction_bench`, 100,000 sessions, one upsert and one erase per transaction, three clients on
+E-cores, bessd under `taskset -c 9,11` with the worker on 11, four rounds each, A B B A A B B A); medians with
+ranges:
+
+| transactions/s asked | A Mpps | B Mpps | A transactions/s | B transactions/s | A p99 us | B p99 us |
+|---|---|---|---|---|---|---|
+| 0 | 23.71 (23.39-23.77) | 23.80 (23.52-23.86) | 0 | 0 | - | - |
+| 1,000 | 23.57 (23.11-23.64) | 23.66 (23.37-23.70) | 999 | 999 | 924 (754-1619) | 802 (772-898) |
+| 10,000 | 23.66 (23.52-23.71) | 23.74 (23.47-23.75) | 7030 | 7080 | 592 (588-625) | 583 (582-588) |
+| max | 23.66 (23.53-23.71) | 23.70 (23.48-23.73) | 7000 | 7002 | 600 (591-608) | 594 (589-615) |
+
+The packet rate is flat on both under transactions. The transaction rate is the clients' (a fourth client
+reaches 8.0K/s on both, A 7973 and B 7981-7991, with the packet rate flat at 23.2-23.3 Mpps); one of those runs,
+on A, stalled in setup and was dropped. One million sessions does not fit this host's 1 GB of hugepages on
+either side (`rte_hash_create failed (capacity 6291456)`); the in-process cases at 1M rules above stand for it.
+
+`live_perf` (`M.firewall`, `M.firewall/miss` and their `M.base`, eight ABBA rounds, worker on CPU 11, control
+on CPU 9, `--counters`): 38.05 against 37.64 ns per packet above `M.base` (-1.1%, 3/8 pairs B slower) and 18.25
+against 18.23 (-0.1%), with the same instructions per packet (470.5 and 470.5; 386.9 and 386.8) and cycles 126.5
+against 125.3 and 75.3 against 75.2.
+
+**Consequences.** `Firewall` goes from 694 lines (`firewall.{h,cc}`) to 574 (`firewall.h` 119, `firewall.cc` 148,
+`firewall_rules.cc` 307). The adapter is 339 lines and its tests 282 (one transaction of several operations
+builds once; a refused build or reservation leaves the published table as it was, the same object; publication
+does not allocate; the replaced table outlives a reader until it quiesces; readback is in id order).
+`SharedExactIndex` stays as `SharedFlowTable`'s narrower boundary over `ConcurrentExactTable`.
+
+**Revisit when:** a rebuilt table's values must reference other resources (the adapter carries no references),
+or a table should be rebuilt in parts (one group at a time, so an update costs its group, not the table).

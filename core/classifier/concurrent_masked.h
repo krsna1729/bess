@@ -17,9 +17,9 @@
 #include <string>
 #include <vector>
 
-#include "classifier/backend.h"
+#include "classifier/classifier.h"
 #include "classifier/concurrent_exact.h"
-#include "classifier/masked_exact.h"
+#include "classifier/mask_batch.h"
 #include "classifier/record_arena.h"
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
@@ -67,7 +67,7 @@ namespace bess::classifier {
 // A lookup masks the batch once per tuple, looks it up, and keeps the best
 // rule per packet: higher priority, then the later command (sequence). Adding
 // the same (mask, value) again replaces the rule, and the replacement counts
-// as the later command -- the semantics WildcardMatch promises.
+// as the later command.
 //
 // Rule records are write-once. Changing a rule writes a new record under a
 // new id and swaps the table value to it atomically; the old id is recycled

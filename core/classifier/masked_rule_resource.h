@@ -163,11 +163,12 @@ class MaskedRuleResource final : public dataplane::Resource {
         retire_guard.Transfer();
       }
       staged->Arm(std::move(*prepared), 0);
-      Reservation erase{std::move(staged), {}};
-      erase.footprint.removals = 1;  // the freed id, a grace period later
-      erase.existed = true;
-      erase.previous_references = std::move(previous_references);
-      return erase;
+      // The freed id is removed a grace period later.
+      return Reservation{std::move(staged),
+                         {},
+                         {.retires = 0, .removals = 1, .callbacks = 0},
+                         /*existed=*/true,
+                         std::move(previous_references)};
     }
     const Value *v = std::any_cast<Value>(&op.value);
     if (v == nullptr) {
@@ -230,11 +231,10 @@ class MaskedRuleResource final : public dataplane::Resource {
     }
     staged->Arm(std::move(*prepared), record_id);
     record_id = 0;  // owned by the staged rule now
-    Reservation upsert{std::move(staged), std::move(references)};
-    upsert.footprint.removals = replaces ? 1 : 0;
-    upsert.existed = previous.has_value();
-    upsert.previous_references = std::move(previous_references);
-    return upsert;
+    return Reservation{std::move(staged), std::move(references),
+                       {.retires = 0, .removals = replaces ? 1U : 0U, .callbacks = 0},
+                       /*existed=*/previous.has_value(),
+                       std::move(previous_references)};
   }
 
  private:
