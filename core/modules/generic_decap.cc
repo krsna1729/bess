@@ -25,17 +25,14 @@ CommandResponse GenericDecap::Init(const bess::pb::GenericDecapArg &arg) {
 void GenericDecap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const auto decap_size = static_cast<size_t>(decap_size_);
 
-  const int cnt = batch->cnt();
-  int out_cnt = 0;
-  for (int i = 0; i < cnt; i++) {
-    const bess::PacketRef pkt = batch->packet(i);
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
+    const bess::PacketRef pkt(handle);
     if (unlikely(!bess::packet::RemovePrefixInPlace(pkt, decap_size))) {
       DropPacket(ctx, pkt);
-      continue;
+      return false;
     }
-    batch->handles()[out_cnt++] = pkt.handle();
-  }
-  batch->set_cnt(out_cnt);
+    return true;
+  });
 
   RunNextModule(ctx, batch);
 }

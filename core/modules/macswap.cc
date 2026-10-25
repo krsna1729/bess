@@ -15,21 +15,18 @@
 void MACSwap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::Ethernet;
 
-  int out_cnt = 0;
-  for (bess::PacketRef pkt : batch->packets()) {
-    bess::PacketHandle handle = pkt.handle();
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
     const auto head = bess::packet::WritableHead(handle, sizeof(Ethernet));
     if (unlikely(!head)) {
       EmitPacket(ctx, bess::PacketRef(handle), DROP_GATE);
-      continue;
+      return false;
     }
     auto *eth = reinterpret_cast<Ethernet *>(head->data());
     const Ethernet::Address tmp = eth->dst_addr;
     eth->dst_addr = eth->src_addr;
     eth->src_addr = tmp;
-    batch->handles()[out_cnt++] = handle;
-  }
-  batch->set_cnt(out_cnt);
+    return true;
+  });
 
   RunNextModule(ctx, batch);
 }

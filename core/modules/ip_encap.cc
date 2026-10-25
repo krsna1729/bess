@@ -50,10 +50,7 @@ void IPEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const auto nexthop_off = attr_offset(ATTR_W_IP_NEXTHOP);
   const auto type_off = attr_offset(ATTR_W_ETHER_TYPE);
 
-  const int cnt = batch->cnt();
-  int out_cnt = 0;
-  for (int i = 0; i < cnt; i++) {
-    bess::PacketHandle handle = batch->handles()[i];
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
     const bess::PacketRef inner(handle);
     const be32_t ip_src = get_attr_with_offset<be32_t>(src_off, inner);
     const be32_t ip_dst = get_attr_with_offset<be32_t>(dst_off, inner);
@@ -62,13 +59,13 @@ void IPEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     const size_t inner_len = inner.total_len();
     if (unlikely(inner_len > kMaxInner)) {
       DropPacket(ctx, inner);
-      continue;
+      return false;
     }
     const auto header = bess::packet::PrependWritable(handle, sizeof(Ipv4));
     const bess::PacketRef pkt(handle);
     if (unlikely(!header)) {
       DropPacket(ctx, pkt);
-      continue;
+      return false;
     }
 
     auto *iph = reinterpret_cast<Ipv4 *>(header->data());
@@ -87,9 +84,8 @@ void IPEncap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 
     set_attr_with_offset<be32_t>(nexthop_off, pkt, ip_dst);
     set_attr_with_offset<be16_t>(type_off, pkt, be16_t(Ethernet::Type::kIpv4));
-    batch->handles()[out_cnt++] = handle;
-  }
-  batch->set_cnt(out_cnt);
+    return true;
+  });
 
   RunNextModule(ctx, batch);
 }

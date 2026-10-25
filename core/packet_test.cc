@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -9,6 +11,7 @@
 
 #include "packet.h"
 #include "packet_pool.h"
+#include "pktbatch.h"
 #include "utils/copy.h"
 
 namespace {
@@ -576,6 +579,101 @@ TEST(PacketCloneTest, ExternalBufferCallbackWaitsForLastClone) {
   bess::PacketFree(clone);
   EXPECT_EQ(free_count, 1);
   EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+// A batch of `mbufs`' addresses, in order. KeepIf never dereferences a
+// handle, so these need no buffer.
+template <size_t n>
+bess::PacketBatch BatchOf(std::array<rte_mbuf, n> &mbufs) {
+  bess::PacketBatch batch;
+  batch.clear();
+  for (rte_mbuf &m : mbufs) {
+    batch.add(&m);
+  }
+  return batch;
+}
+
+std::vector<bess::PacketHandle> Handles(const bess::PacketBatch &batch) {
+  return {batch.handles(), batch.handles() + batch.cnt()};
+}
+
+// Every packet goes through `keep` once, in order and with its index, and the
+// kept ones stay in order with the count right, wherever the drops are: none,
+// first, middle, last, at both ends, a run, and all of them.
+TEST(PacketBatchTest, KeepIfKeepsOrderAndCountWhereverPacketsDrop) {
+  std::array<rte_mbuf, 6> mbufs{};
+  const int n = static_cast<int>(mbufs.size());
+  const std::vector<std::vector<int>> patterns = {
+      {}, {0}, {2}, {5}, {0, 5}, {1, 2, 3}, {0, 1, 2, 3, 4, 5}};
+  for (const std::vector<int> &drop : patterns) {
+    SCOPED_TRACE(::testing::PrintToString(drop));
+    bess::PacketBatch batch = BatchOf(mbufs);
+    std::vector<int> seen;
+    std::vector<bess::PacketHandle> dropped;
+    batch.KeepIf([&](bess::PacketHandle &pkt, int i) {
+      EXPECT_EQ(&mbufs[static_cast<size_t>(i)], pkt);
+      seen.push_back(i);
+      if (std::find(drop.begin(), drop.end(), i) != drop.end()) {
+        dropped.push_back(pkt);
+        return false;
+      }
+      return true;
+    });
+    std::vector<int> all;
+    std::vector<bess::PacketHandle> want_kept;
+    std::vector<bess::PacketHandle> want_dropped;
+    for (int i = 0; i < n; i++) {
+      all.push_back(i);
+      const bool drops = std::find(drop.begin(), drop.end(), i) != drop.end();
+      (drops ? want_dropped : want_kept).push_back(&mbufs[static_cast<size_t>(i)]);
+    }
+    EXPECT_EQ(all, seen);
+    EXPECT_EQ(want_dropped, dropped);
+    EXPECT_EQ(want_kept, Handles(batch));
+  }
+}
+
+// A handle `keep` replaces (with a copy, say) is the one kept, before the
+// first drop and after it.
+TEST(PacketBatchTest, KeepIfKeepsTheHandleKeepLeaves) {
+  std::array<rte_mbuf, 5> mbufs{};
+  std::array<rte_mbuf, 5> copies{};
+  bess::PacketBatch batch = BatchOf(mbufs);
+  batch.KeepIf([&](bess::PacketHandle &pkt, int i) {
+    if (i == 2) {
+      return false;
+    }
+    if (i == 1 || i == 3) {
+      pkt = &copies[static_cast<size_t>(i)];
+    }
+    return true;
+  });
+  EXPECT_EQ((std::vector<bess::PacketHandle>{&mbufs[0], &copies[1], &copies[3], &mbufs[4]}),
+            Handles(batch));
+
+  bess::PacketBatch untouched = BatchOf(mbufs);
+  untouched.KeepIf([&](bess::PacketHandle &pkt, int i) {
+    if (i == 4) {
+      pkt = &copies[4];
+    }
+    return true;
+  });
+  EXPECT_EQ((std::vector<bess::PacketHandle>{&mbufs[0], &mbufs[1], &mbufs[2], &mbufs[3],
+                                             &copies[4]}),
+            Handles(untouched));
+}
+
+// An empty batch calls nothing and stays empty.
+TEST(PacketBatchTest, KeepIfOnAnEmptyBatch) {
+  bess::PacketBatch batch;
+  batch.clear();
+  int calls = 0;
+  batch.KeepIf([&](bess::PacketHandle &, int) {
+    calls++;
+    return true;
+  });
+  EXPECT_EQ(0, calls);
+  EXPECT_EQ(0, batch.cnt());
 }
 
 }  // namespace
