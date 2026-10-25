@@ -249,7 +249,18 @@ std::expected<void, ReshapeError> EnsureWritable(
 
 namespace detail {
 
-std::expected<MutableBytes, ReshapeError> WritableHeadSlow(
+namespace {
+
+BytesResult ToBytesResult(const std::expected<MutableBytes, ReshapeError> &r) noexcept {
+  if (!r) {
+    return BytesResult{nullptr, 0, r.error(), false};
+  }
+  // Both callers' spans are at most 65,535 bytes: a first segment, or a
+  // prepend PrependInPlace bounded.
+  return BytesResult{r->data(), static_cast<uint32_t>(r->size()), ReshapeError{}, true};
+}
+
+std::expected<MutableBytes, ReshapeError> WritableHeadOutOfLine(
     ::bess::PacketHandle &packet, size_t required) noexcept {
   if (packet->data_len < required) {
     return std::unexpected(ReshapeError::kLengthOutOfRange);
@@ -267,6 +278,13 @@ std::expected<MutableBytes, ReshapeError> WritableHeadSlow(
   return MutableBytes(rte_pktmbuf_mtod(packet, std::byte *), packet->data_len);
 }
 
+}  // namespace
+
+BytesResult WritableHeadSlow(::bess::PacketHandle &packet,
+                             size_t required) noexcept {
+  return ToBytesResult(WritableHeadOutOfLine(packet, required));
+}
+
 namespace {
 
 ReshapeError FromMutationError(MutationError error) noexcept {
@@ -280,9 +298,7 @@ ReshapeError FromMutationError(MutationError error) noexcept {
   }
 }
 
-}  // namespace
-
-std::expected<MutableBytes, ReshapeError> PrependWritableSlow(
+std::expected<MutableBytes, ReshapeError> PrependWritableOutOfLine(
     ::bess::PacketHandle &packet, size_t bytes) noexcept {
   auto prepended = PrependInPlace(::bess::PacketRef(packet), bytes);
   if (prepended) {
@@ -309,6 +325,13 @@ std::expected<MutableBytes, ReshapeError> PrependWritableSlow(
     return std::unexpected(FromMutationError(prepended.error()));
   }
   return *prepended;
+}
+
+}  // namespace
+
+BytesResult PrependWritableSlow(::bess::PacketHandle &packet,
+                                size_t bytes) noexcept {
+  return ToBytesResult(PrependWritableOutOfLine(packet, bytes));
 }
 
 }  // namespace detail

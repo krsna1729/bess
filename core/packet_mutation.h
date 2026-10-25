@@ -147,25 +147,34 @@ inline std::expected<MutableBytes, MutationError> AppendInPlace(
   return MutableBytes(reinterpret_cast<std::byte *>(data), bytes);
 }
 
+// The common case, `bytes` within the first segment's data and the packet's
+// length, is two compares (the first also bounds `bytes` by a segment's
+// 65,535). Otherwise the removal fails: kLengthOutOfRange when `bytes` is
+// past the packet's length or 65,535, else kCrossesSegment.
 inline std::expected<void, MutationError> RemovePrefixInPlace(
     ::bess::PacketRef packet, size_t bytes) noexcept {
   ::rte_mbuf *mbuf = packet.handle();
   if (mbuf == nullptr) {
     return std::unexpected(MutationError::kNullPacket);
   }
+  if (bytes <= mbuf->data_len && bytes <= mbuf->pkt_len) [[likely]] {
+    // rte_pktmbuf_adj's update, without its length test (done above).
+    const auto n = static_cast<uint16_t>(bytes);
+    mbuf->data_off = static_cast<uint16_t>(mbuf->data_off + n);
+    mbuf->data_len = static_cast<uint16_t>(mbuf->data_len - n);
+    mbuf->pkt_len -= n;
+    // Keep adj's null-data result as well as its descriptor updates.
+    const void *data = rte_pktmbuf_mtod(mbuf, const void *);
+    if (bytes != 0 && data == nullptr) {
+      return std::unexpected(MutationError::kCrossesSegment);
+    }
+    return {};
+  }
   if (!detail::MutationRemovalLengthFits(mbuf, bytes)) {
     return detail::LengthOutOfRange();
   }
-  if (bytes == 0) {
-    return {};
-  }
-  if (bytes > mbuf->data_len) {
-    return std::unexpected(MutationError::kCrossesSegment);
-  }
-  if (rte_pktmbuf_adj(mbuf, static_cast<uint16_t>(bytes)) == nullptr) {
-    return std::unexpected(MutationError::kCrossesSegment);
-  }
-  return {};
+  // `bytes` is within the packet but past the first segment's data.
+  return std::unexpected(MutationError::kCrossesSegment);
 }
 
 inline std::expected<void, MutationError> TrimSuffixInPlace(

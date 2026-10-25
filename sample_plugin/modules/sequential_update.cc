@@ -206,9 +206,10 @@ void SequentialUpdate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   if (num_vars_ != 0) {
     // Every field is written into the packet's first segment, so that
     // segment must hold the furthest byte any field names, and its payload
-    // must be this packet's alone. One pass that only reads, and one branch
-    // for the batch: a batch whose packets are all long enough and unshared
-    // (the common case) is written as it is.
+    // must be this packet's alone. One pass that only reads tests every
+    // packet first: a batch whose packets are all long enough and unshared
+    // (the common case) is written as it is, and any other batch goes to
+    // PrepareBatch.
     const size_t required = required_len_;
     unsigned ready = 1;
     for (bess::PacketRef pkt : batch->packets()) {
