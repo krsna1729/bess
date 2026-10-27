@@ -150,10 +150,10 @@ class PacketStore final : public Module {
 
   // Packets the `drop` command freed (the owner's count) and packets the
   // ingress ring refused because it was full (any worker's count: a batch had
-  // nowhere to go). Each has its own metric, because each is a different loss:
-  // bess_packet_store_dropped_packets_total is what a client asked for,
-  // bess_packet_store_ingress_dropped_packets_total is the owner falling
-  // behind. The first has one writer at a time (the owner, or control while no
+  // nowhere to go). Shared observations keep the losses distinct:
+  // requested_drop_packets is what a client asked for;
+  // ingress_dropped_packets is the owner falling behind.
+  // The first has one writer at a time (the owner, or control while no
   // worker runs), so both are plain stores; only the second is a real
   // multi-writer atomic.
   std::atomic<uint64_t> dropped_packets_{0};

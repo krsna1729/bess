@@ -1007,6 +1007,22 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
         init_context().ticks(), std::chrono::steady_clock::duration::zero(),
         [this](bess::framework::TickContext &ctx) { ResolverTick(ctx); });
   }
+  observations_ = init_context().metrics().Register(
+      [this](bess::stats::MetricWriter &writer) {
+        WriteObservation(writer, "header_write_failures", header_write_failures());
+        WriteObservation(writer, "not_ip_frames", not_ip_frames());
+        WriteObservation(writer, "malformed_frames", malformed_frames());
+        WriteObservation(writer, "non_initial_fragments", non_initial_fragments());
+        WriteObservation(writer, "no_route_frames", no_route_frames());
+        WriteObservation(writer, "unresolved_frames", unresolved_frames());
+        WriteObservation(writer, "ttl_expired_frames", ttl_expired_frames());
+        WriteObservation(writer, "blackholed_frames", blackholed_frames());
+        WriteObservation(writer, "local_frames", local_frames());
+        WriteObservation(writer, "family_disabled_frames", family_disabled_frames());
+        WriteObservation(writer, "link_scope_frames", link_scope_frames());
+        WriteObservation(writer, "neighbor_requests", neighbor_requests());
+        WriteObservation(writer, "neighbor_input_drops", neighbor_input_drops());
+      });
   return CommandSuccess();
 }
 
@@ -1041,6 +1057,7 @@ void Router::CleanupNeighborResolver() {
 }
 
 void Router::DeInit() {
+  observations_.Reset();
   CleanupNeighborResolver();
   if (router_ == nullptr) {
     return;

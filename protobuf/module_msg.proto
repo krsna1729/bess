@@ -1937,7 +1937,7 @@ message BridgeStaticValue {
  * no-op - and a full request ring is ENOSPC, which may be retried. The memory
  * bound is `max_packets` stored, plus the ingress ring's in-flight packets
  * (4095; when the ring is full they are freed, and
- * bess_packet_store_ingress_dropped_packets_total counts them), plus the
+ * the ingress_dropped_packets observation counts them), plus the
  * packets a release has queued for the owner to emit. Erasing a
  * "<module>/flows" entry leaves that flow's packets in the store: `drop` is the
  * action that frees them.

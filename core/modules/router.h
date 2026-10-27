@@ -20,6 +20,7 @@
 #include "route/forward.h"
 #include "route/neighbor_resolver.h"
 #include "route/router.h"
+#include "stats/metric_registry.h"
 
 // K7's route table and next hops as a module, enrolled in the transaction
 // engine (D-023).
@@ -369,6 +370,7 @@ class Router final : public Module {
   std::atomic<uint64_t> neighbor_requests_{0};
   // Resolver input dropped before the resolver saw it.
   std::atomic<uint64_t> neighbor_input_drops_{0};
+  bess::stats::MetricSource observations_;
 };
 
 #endif  // BESS_MODULES_ROUTER_H_
