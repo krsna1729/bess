@@ -474,3 +474,129 @@ table is the median of each round's excess over its own M.base (not the differen
 IRQ/softirq contamination was observed. The unchanged controls retain their instruction counts but can
 move in cycles and ns with code placement; do not attribute every time change to the key path. The A/B
 table and before/after codegen are in the change's commit message. No architecture-specific kernel is used.
+
+## Packet-safety clawback: final checked paths
+
+Final product code: `95797b46`. The same run measured the pre-safety baseline
+`39bffa06`, the PR base `c04e6b08`, and the final code: 35 rows, eight
+palindromic rounds, one fresh daemon per build and round. Raw data:
+`.scratch/p7-kernel-runs/final.json`; retained binaries:
+`.scratch/p7-bin/<commit>/`. Old-to-new comparisons are in the evidence commit.
+
+i9-13900H P-cores; GCC 16.2.1, release `-O3 -march=x86-64-v3`, NDEBUG,
+ld.bfd 2.47, shared DPDK 25.11.3. Balanced profile, powersave governor,
+EPP balance_performance, turbo off. Workers on 4/6, control on 2, isolated
+with SMT siblings 3/5/7 offline during the run. Samples were 1 s after
+0.3 s warmup, with worker instruction and cycle counters.
+
+These are **final values**, not the difference of column medians. For every
+M row except M.base, subtract that build's M.base in the same round, then
+take the median. M.base and F rows are absolute. Other tables in this
+document describe separate runs; do not combine their columns.
+
+| row | instructions/packet | cycles/packet | ns/packet |
+|---|---:|---:|---:|
+| F.floor | 34.61 | 7.32 | 2.82 |
+| F.flowgen | 554.93 | 284.49 | 109.51 |
+| M.base | 129.67 | 26.75 | 10.32 |
+| M.exactmatch | 161.77 | 31.46 | 12.15 |
+| M.exactmatch/miss | 97.87 | 18.67 | 7.20 |
+| M.split/2 | 47.61 | 8.71 | 3.36 |
+| M.wildcardmatch | 228.67 | 46.30 | 17.83 |
+| M.wildcardmatch/13b | 334.39 | 70.06 | 27.02 |
+| M.session | 592.55 | 210.66 | 81.32 |
+| M.router | 351.63 | 69.87 | 26.98 |
+| M.l2forward | 85.79 | 15.45 | 5.94 |
+| M.acl | 106.01 | 50.97 | 19.69 |
+| M.split_offset | 63.40 | 12.77 | 4.95 |
+| M.measure | 13.33 | 2.87 | 1.10 |
+| M.firewall | 310.74 | 92.78 | 35.82 |
+| M.firewall/miss | 227.24 | 42.32 | 16.32 |
+| M.hashlb | 126.56 | 36.01 | 13.92 |
+| M.update | 62.26 | 12.53 | 4.83 |
+| M.macswap | 21.36 | 3.91 | 1.53 |
+| M.ipswap | 66.48 | 13.53 | 5.21 |
+| M.update_ttl | 80.67 | 16.26 | 6.27 |
+| M.static_nat | 171.20 | 28.79 | 11.11 |
+| M.ip_checksum | 128.14 | 22.32 | 8.62 |
+| M.ip_checksum/verify | 116.23 | 24.34 | 9.38 |
+| M.l4_checksum | 198.39 | 32.41 | 12.51 |
+| M.l4_checksum/verify | 116.43 | 20.82 | 8.03 |
+| M.nat | 297.75 | 57.17 | 22.03 |
+| M.vlan | 71.68 | 12.89 | 4.97 |
+| M.genericencap | 49.26 | 9.97 | 3.84 |
+| M.ether_encap | 45.71 | 8.73 | 3.37 |
+| M.vxlan_encap | 207.81 | 36.35 | 14.02 |
+| M.ip_encap | 62.63 | 32.52 | 12.56 |
+| M.generic_decap | 26.55 | 3.72 | 1.44 |
+| M.metadata | 78.28 | 15.14 | 5.84 |
+| M.bpf | 84.54 | 19.23 | 7.43 |
+
+IRQ/softirq contamination was observed, including Wi-Fi/storage interrupts
+on worker 4. F.floor remains bimodal across fresh daemons. Untouched rows
+can move in cycles and ns without a corresponding instruction change:
+ACL did so between this PR's base and final code. Instruction reductions
+and the isolated kernel probe support the retained kernels; this is not
+a broad timing-win claim.
+
+### Parser
+
+Eight paired `ab_bench.py --filter BM_Parse --rounds 8 --min-time 0.2s`
+rounds, CPU 4 isolated, with the same build and power settings. The
+busy-machine preflight was explicitly overridden; IRQ/softirq activity
+was observed. PMU counts came from a separate eight-round paired run,
+explicitly selecting `cpu_core/{instructions,cycles,branches}/u` on this
+hybrid CPU. Each sample used exactly 10,000,000 iterations; subtract the
+one-repetition process count from six repetitions and divide by 50,000,000.
+All counters ran at 100%; this removes process-startup work instead of
+charging it to each parse. Raw counts:
+`.scratch/p7-kernel-runs/parser-final-counts.json`.
+
+| case | instructions/parse | cycles/parse | branches/parse | ns/parse |
+|---|---:|---:|---:|---:|
+| /0 TCP/IPv4 | 52.01 | 9.02 | 13.00 | 3.477 |
+| /1 two-tag UDP | 91.01 | 15.55 | 20.00 | 5.988 |
+| /2 IPv6 + two extension headers | 128.01 | 20.33 | 34.00 | 7.852 |
+| /3 truncated | 24.01 | 4.02 | 7.00 | 1.545 |
+
+### Residuals and rejected candidates
+
+Safety checks remain. Several writer rows still cost more than the
+pre-safety code; this report does not claim full recovery.
+
+- **M.base:** Rewrite keeps its template/tail bounds; RandomUpdate keeps
+  writable-head ownership and length checks. The first update is fused
+  into the checked pass, but the checks are not removed. Every absolute
+  M pipeline pays this base; the table removes it from module rows.
+- **HashLB, IPSwap, UpdateTTL and StaticNAT:** the emitted fast paths
+  retain EtherType/IHL, IP total-length, fragment and TCP/UDP length checks.
+  Writers also retain direct-buffer/refcount/COW checks. The IPv6 walk is
+  only in ParseIp's version-6 branch, never on the IPv4 path.
+- **ACL:** the key is inline and rules use compiled masks, but checked
+  IPv4/L4 extraction and malformed-frame rejection still precede the
+  first-match rule loop. This is not the old unchecked packet-field loop.
+- **Checksums:** IPChecksum and L4Checksum retain checked parsing,
+  datagram coverage and protocol/fragment handling. Non-verify modes
+  also prove writability. The existing checksum kernel is unchanged;
+  the residual is validation and packet mutation, not a new sum loop.
+- **Update, VLAN and MACSwap:** checked length and ownership branches
+  remain. VLAN proves all 16 bytes touched by its kernel. MACSwap's
+  length branch selects a three-instruction load/shuffle/store or an
+  exact-width scalar tail.
+- **Encapsulation/decapsulation and metadata:** headroom, ownership and
+  removal bounds remain before mutation; KeepIf avoids redundant survivor
+  stores but cannot remove failure checks. M.metadata includes Timestamp
+  bounds and GenericEncap, so it is not an untouched control.
+- **Split offset, L2Forward and Measure:** the short-head guards remain.
+  Split still has its pre-existing per-packet EmitPacket call.
+- **Parser /2:** the general IPv6 walk retains AH recognition and the
+  shared L4 validation; its extra branches explain the remaining cost.
+  /3 retains fixed-layout dispatch and length rejection, with timing
+  within noise. /1 is within noise: the source tests 802.1Q first, but no
+  new compiler-ordering hint or forced branch sequence is needed.
+- **Rejected work:** IPSwap rotations did not give a reliable runtime
+  improvement. HashLB's existing scalar L3/L4 folds emit two/six
+  instructions; the byte-vector candidates emitted three/eight and
+  agreed on 100,000 randomized identities on this host. Keep scalar.
+  Firewall's native gather is retained only with the portable/scalar
+  identities and the dependency-probe evidence in its kernel header.
