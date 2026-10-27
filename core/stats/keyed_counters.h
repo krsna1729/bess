@@ -8,8 +8,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "arch/cpu.h"
 #include "dataplane/worker_id.h"
-#include "stats/worker_local.h"
 #include "utils/common.h"
 
 namespace bess::stats {
@@ -58,6 +58,8 @@ namespace bess::stats {
 // either records the value it saw and subtracts it, or keeps its keys
 // monotonic. Zeroing a plane from the control side would race its writer.
 class KeyedCounters {
+  struct Line;
+
  public:
   // `keys`, `cells_per_key` and `workers` are all at least 1, and `workers` is
   // at most dataplane::kMaxWorkers: the owner's key space, the cells per key,
@@ -90,32 +92,34 @@ class KeyedCounters {
     // Adds `n` to cell `cell` of key `key`.
     void Add(size_t key, size_t cell, uint64_t n) const noexcept {
       promise(key < keys_);
-      std::atomic<uint64_t> &c = plane_[cell + key * cells_per_key_];
+      // Each Line owns a separate words array; never index across its end.
+      const size_t word = cell + key * cells_per_key_;
+      std::atomic<uint64_t> &c =
+          plane_[word / kWordsPerLine].words[word % kWordsPerLine];
       c.store(c.load(std::memory_order_relaxed) + n,
               std::memory_order_relaxed);
     }
 
    private:
     friend class KeyedCounters;
-    Plane(std::atomic<uint64_t> *plane, size_t keys, size_t cells_per_key)
+    Plane(Line *plane, size_t keys, size_t cells_per_key)
         : plane_(plane), keys_(keys), cells_per_key_(cells_per_key) {}
 
-    std::atomic<uint64_t> *plane_;
+    Line *plane_;
     size_t keys_;
     size_t cells_per_key_;
   };
 
-  Plane ForWorker(WorkerId worker) noexcept {
+  Plane ForWorker(dataplane::WorkerId worker) noexcept {
     promise(worker.value() < workers_);
-    return Plane(&planes_[worker.value() * words_per_plane_ / kWordsPerLine]
-                         .words[0],
+    return Plane(&planes_[worker.value() * words_per_plane_ / kWordsPerLine],
                  keys_, cells_per_key_);
   }
 
   // Control side. Both are safe to call while the workers are adding, and
   // both read one cell per plane: `Read` is one plane's cell, `Total` the sum
   // over every plane. A cell never written reads 0.
-  uint64_t Read(WorkerId worker, size_t key, size_t cell) const noexcept {
+  uint64_t Read(dataplane::WorkerId worker, size_t key, size_t cell) const noexcept {
     promise(worker.value() < workers_);
     return Word(worker, key, cell).load(std::memory_order_relaxed);
   }
@@ -123,7 +127,7 @@ class KeyedCounters {
   uint64_t Total(size_t key, size_t cell) const noexcept {
     uint64_t sum = 0;
     for (size_t w = 0; w < workers_; w++) {
-      sum += Word(WorkerId(static_cast<uint16_t>(w)), key, cell)
+      sum += Word(dataplane::WorkerId(static_cast<uint16_t>(w)), key, cell)
                  .load(std::memory_order_relaxed);
     }
     return sum;
@@ -139,7 +143,7 @@ class KeyedCounters {
   // The byte offset of one cell inside the allocation, relative to its start.
   // Each worker's plane begins on a cache line of its own, so no two workers
   // share one; the footprint report and the layout tests read this.
-  size_t CellOffset(WorkerId worker, size_t key, size_t cell) const noexcept {
+  size_t CellOffset(dataplane::WorkerId worker, size_t key, size_t cell) const noexcept {
     promise(worker.value() < workers_);
     promise(key < keys_);
     promise(cell < cells_per_key_);
@@ -148,21 +152,21 @@ class KeyedCounters {
   }
 
  private:
-  static constexpr size_t kWordsPerLine = kCacheLine / sizeof(uint64_t);
+  static constexpr size_t kWordsPerLine = arch::kCacheLineSize / sizeof(uint64_t);
 
   // One cache line of cells. The storage is a flat run of these and each
   // worker's plane is padded to whole lines, so two planes never share one.
-  struct alignas(kCacheLine) Line {
+  struct alignas(arch::kCacheLineSize) Line {
     std::atomic<uint64_t> words[kWordsPerLine] = {};
   };
-  static_assert(sizeof(Line) == kCacheLine);
+  static_assert(sizeof(Line) == arch::kCacheLineSize);
 
   static constexpr size_t RoundUpToLine(size_t words) noexcept {
     return ((words + kWordsPerLine - 1) / kWordsPerLine) * kWordsPerLine;
   }
 
-  const std::atomic<uint64_t> &Word(WorkerId worker, size_t key,
-                                    size_t cell) const noexcept {
+  const std::atomic<uint64_t> &Word(dataplane::WorkerId worker, size_t key,
+                                   size_t cell) const noexcept {
     promise(cell < cells_per_key_);
     promise(key < keys_);
     const size_t word =

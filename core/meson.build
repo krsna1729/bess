@@ -700,6 +700,7 @@ core_public_subdir_headers = {
     'stats/crossing_notifier.h',
     'stats/event_hub.h',
     'stats/event_throttle.h',
+    # Public counter primitive used by module.h (D-193).
     'stats/keyed_counters.h',
     'stats/metric_registry.h',
     'stats/worker_histogram.h',

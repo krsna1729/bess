@@ -241,6 +241,29 @@ TEST(KeyedCountersTest, KeysAndCellsDoNotAlias) {
   EXPECT_EQ(7u, counters.Total(4, 2));
 }
 
+TEST(KeyedCountersTest, LineBoundariesAndPartialPlanesStayIndependent) {
+  constexpr size_t kWords = arch::kCacheLineSize / sizeof(uint64_t);
+  KeyedCounters counters(/*keys=*/2 * kWords + 1, /*cells_per_key=*/1,
+                         /*workers=*/2);
+  const auto first = counters.ForWorker(W(0));
+  first.Add(kWords - 1, 0, 7);  // last word of the first line
+  first.Add(kWords, 0, 11);     // first word of the second line
+  counters.ForWorker(W(1)).Add(2 * kWords, 0, 13);  // partial last line
+
+  for (size_t key = 0; key < counters.keys(); ++key) {
+    uint64_t first_expected = 0;
+    if (key == kWords - 1) {
+      first_expected = 7;
+    } else if (key == kWords) {
+      first_expected = 11;
+    }
+    const uint64_t second_expected = key == 2 * kWords ? 13 : 0;
+    EXPECT_EQ(first_expected, counters.Read(W(0), key, 0));
+    EXPECT_EQ(second_expected, counters.Read(W(1), key, 0));
+    EXPECT_EQ(first_expected + second_expected, counters.Total(key, 0));
+  }
+}
+
 // One plane per worker, each starting on a cache line of its own: no two
 // workers share a line, whatever the key space rounds to.
 TEST(KeyedCountersTest, PlanesStartOnTheirOwnCacheLine) {

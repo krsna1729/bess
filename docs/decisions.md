@@ -13573,6 +13573,21 @@ limit 7 and capacity 8, through its HTTP event stream.
 Raw probes, including `fill-runtime-smoke-results.json`, are under `.scratch/`
 in the development workspace; no throughput improvement is claimed.
 
+**Installed API boundary.** `module.h` is public, so its counter primitive is
+public too: promote `stats/keyed_counters.h` from experimental to supported
+source API. It includes only public dependencies, using
+`dataplane::WorkerId` and `arch::kCacheLineSize` directly instead of importing
+the experimental `WorkerLocal` header for those names. WorkerLocal itself
+remains experimental. Plane layout, update operations and the single-writer
+contract do not change. The installed-header gate remains unchanged.
+Independent review also found that a multi-line Plane indexed through the first
+Line's words pointer as if adjacent arrays were one array. Plane now keeps a
+Line pointer and indexes the line and its word separately, as the reader does.
+A boundary regression covers adjacent lines, a partial last line and distinct
+worker planes. This corrects C++ undefined behavior; no failing-before runtime
+result is claimed. CI also confirmed the former fold-initializer warning is
+gone, so its obsolete clang-tidy baseline entry is removed rather than waived.
+
 **Consequences.** Base drop accounting allocates no packet-path memory and uses
 no locked RMW. It reserves a cache-line-separated plane for each possible worker
 slot, rather than deriving storage from the currently active worker count.
