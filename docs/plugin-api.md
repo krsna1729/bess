@@ -476,8 +476,10 @@ not seen: this samples. The sweep runs with the control-plane lock held, like a 
 filling up is reported without a controller polling `GetResourceStatus`.
 The sweep resumes after its last examined name when its slice expires, rather
 than restarting at the first resource. Unbound names also consume the slice.
-Names inserted before the cursor are visited in the next pass; crossing history
-for surviving resources is retained across partial passes (D-193).
+Names inserted before the cursor are visited in the next pass. History pruning
+also resumes within the slice; surviving resources retain their crossing history.
+Stop checks are cooperative, not a hard latency bound: preparing the sorted
+registry snapshot is still control-plane work (D-193).
 
 **Where a module's counters live.** A module's counters are per key and per worker, and the shared
 structure for them is `stats::KeyedCounters` (`stats/keyed_counters.h`, experimental, D-154):

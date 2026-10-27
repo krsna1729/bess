@@ -23,12 +23,11 @@
 //
 // The sweep runs on the maintenance thread with the control-plane lock held,
 // beside the modules' tick endpoints. `stop()` is checked every
-// kStopCheckEvery registered resources, including unbound ones. A pass that
-// runs out of time resumes after its last examined
-// name next tick, so repeated short slices still reach the tail. Names added
-// before that cursor are visited in the next pass. Completed passes forget
-// resources that are no longer reachable; incomplete passes retain their
-// crossing history.
+// kStopCheckEvery registry names or history entries, including unbound names.
+// Traversal resumes after its last examined name; names added before that
+// cursor are visited in the next pass. History pruning also resumes within
+// the slice, without rescanning resources until it finishes. Surviving
+// resources retain their crossing history across partial passes.
 //
 //   // built once, beside the maintenance loop:
 //   control::ResourceFillWatch fills(engine, bindings);
@@ -65,7 +64,7 @@ inline constexpr const char *kResourceFillEvent = "bess.resource_fill";
 
 class ResourceFillWatch {
  public:
-  // Resources between two looks at the stop condition.
+  // Registry names or history entries between stop checks.
   static constexpr size_t kStopCheckEvery = 32;
   // The fill a resource is reported at, as a percentage of what it states.
   // A table that is 80% full still has room to plan with; a report at 100%
@@ -87,6 +86,8 @@ class ResourceFillWatch {
   ResourceFillWatch(dataplane::TransactionEngine &engine,
                     const framework::ResourceBindings &bindings)
       : engine_(engine), bindings_(bindings) {}
+  ResourceFillWatch(const ResourceFillWatch &) = delete;
+  ResourceFillWatch &operator=(const ResourceFillWatch &) = delete;
 
   // The level is a percentage of the stated capacity, so this is the base the
   // arithmetic below rounds in.
@@ -106,10 +107,14 @@ class ResourceFillWatch {
 
   // Visits every reachable resource once, firing for each one that is at or
   // past its level and forgetting one that has fallen below it. `stop` is
-  // asked whether the tick's slice is spent, every kStopCheckEvery names.
+  // asked every kStopCheckEvery registry names or history entries.
   template <typename Stop>
   Result Sweep(Stop &&stop) {
     Result result;
+    if (pruning_) {
+      Prune(stop, 0, result);
+      return result;
+    }
     const auto names = engine_.ResourceNames();
     auto next = resume_after_.empty()
                     ? names.begin()
@@ -155,16 +160,10 @@ class ResourceFillWatch {
       }
     }
     resume_after_.clear();
-    // Reachability may change between slices. Check the current registry,
-    // not only names seen in the final slice, before forgetting old history.
-    for (auto it = fired_.begin(); it != fired_.end();) {
-      const dataplane::Resource *resource = engine_.FindResource(*it);
-      if (resource != nullptr && bindings_.Find(*resource) != nullptr) {
-        ++it;
-      } else {
-        it = fired_.erase(it);
-      }
-    }
+    // No inserts occur during pruning, so this iterator survives later ticks.
+    pruning_ = true;
+    prune_next_ = fired_.begin();
+    Prune(stop, examined, result);
     return result;
   }
 
@@ -172,11 +171,32 @@ class ResourceFillWatch {
   size_t fired() const noexcept { return fired_.size(); }
 
  private:
+  template <typename Stop>
+  void Prune(Stop &stop, size_t examined, Result &result) {
+    // Check current reachability, not only names in the traversal's last slice.
+    while (prune_next_ != fired_.end()) {
+      if (examined != 0 && examined % kStopCheckEvery == 0 && stop()) {
+        result.incomplete = true;
+        return;
+      }
+      ++examined;
+      const dataplane::Resource *resource = engine_.FindResource(*prune_next_);
+      if (resource != nullptr && bindings_.Find(*resource) != nullptr) {
+        ++prune_next_;
+      } else {
+        prune_next_ = fired_.erase(prune_next_);
+      }
+    }
+    pruning_ = false;
+  }
+
   dataplane::TransactionEngine &engine_;
   const framework::ResourceBindings &bindings_;
   // Names that have fired, and the last name examined in an incomplete pass.
   std::unordered_set<std::string> fired_;
   std::string resume_after_;
+  bool pruning_ = false;
+  std::unordered_set<std::string>::iterator prune_next_;
 };
 
 // The module a resource belongs to: the part of "<module>/<table>" before the

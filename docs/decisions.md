@@ -13542,8 +13542,10 @@ of the resource list.
   `DataplaneTransactions`, including services constructed with a private engine.
 - Resume a stopped fill sweep after its last examined resource name. Charge
   unbound names to the slice too. Names inserted before the cursor wait for the
-  next pass; a completed pass removes history for resources no longer reachable.
-  Keep surviving resources' history across partial passes. The existing level,
+  next pass. Resume history pruning too, charging its entries to the same slice
+  checkpoints, and retain surviving resources' history across partial passes.
+  These checks are cooperative, not a hard latency bound: preparing a sorted
+  registry snapshot still takes control-plane work. The existing level,
   once-per-crossing event and sampling limitations are unchanged.
 
 **Evidence.** Before/after runtime probes:
@@ -13556,10 +13558,15 @@ of the resource list.
 Six focused Meson suites passed: module, statistics, resource fill, maintenance
 loop, dataplane transactions and the control API. The fill tests also cover
 removal and insertion before a live cursor, history retention, and unbound-name
-budgeting. A private real daemon, configured through the native CLI, reported
+budgeting. A pruning regression first reproduced an exhausted slice removing
+all stale history at once; pruning now yields and resumes without repeating a
+surviving resource's event. A private real daemon, configured through the native CLI, reported
 traffic drops, one entry in a configured 32-entry table, and no capacity sample
-for a growable ExactMatch resource. Raw probes are under `.scratch/` in the
-development workspace; no throughput improvement is claimed.
+for a growable ExactMatch resource. The final daemon also emitted all 40 expected
+`bess.resource_fill` events for 40 real L2Forward tables, each with count 7,
+limit 7 and capacity 8, through its HTTP event stream.
+Raw probes, including `fill-runtime-smoke-results.json`, are under `.scratch/`
+in the development workspace; no throughput improvement is claimed.
 
 **Consequences.** Base drop accounting allocates no packet-path memory and uses
 no locked RMW. It reserves a cache-line-separated plane for each possible worker
