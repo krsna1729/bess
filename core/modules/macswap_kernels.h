@@ -31,9 +31,9 @@ inline void SwapScalar(void *data) noexcept {
 // With >= 16 bytes, a portable byte shuffle exchanges the addresses and keeps
 // bytes 12..15: one unaligned load, one shuffle, one unaligned store on x86-v3.
 // A 12..15-byte head and BESS_ARCH_GENERIC use the exact-width scalar path.
-// GCC 16.2, x86-64-v3 release: M.macswap used 2.91 fewer instructions per
-// packet in eight paired rounds (all eight lower) than the former Address
-// temporary. Timing did not give a stable win beyond the layout controls.
+// GCC 16.2, x86-64-v3 release: final code 95797b46 vs base c04e6b08 used
+// 3.18 fewer instructions per packet in eight paired rounds (all eight lower).
+// Timing did not give a stable win beyond the layout controls.
 inline void Swap(void *data, size_t head_len) noexcept {
 #if !defined(BESS_ARCH_GENERIC)
   if (head_len >= 16) {
