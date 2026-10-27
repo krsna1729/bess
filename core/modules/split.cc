@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "gate.h"
 #include "packet_pool.h"
 #include "utils/bits.h"
 #include "utils/endian.h"
@@ -69,7 +70,9 @@ void Split::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     for (bess::PacketRef pkt : batch->packets()) {
       uint64_t val = get_attr_with_offset<be64_t>(offset, pkt).value();
       val = (val >> shift_) & mask_;
-      EmitPacket(ctx, pkt, val);
+      const bess::gate_idx_t gate =
+          bess::IsValidGateValue(val) ? static_cast<bess::gate_idx_t>(val) : DROP_GATE;
+      EmitPacket(ctx, pkt, gate);
     }
   } else {
     // The value is read from the first segment (D-121). A packet whose first
@@ -91,7 +94,9 @@ void Split::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         DropPacket(ctx, pkt);
         continue;
       }
-      EmitPacket(ctx, pkt, val);
+      const bess::gate_idx_t gate =
+          bess::IsValidGateValue(val) ? static_cast<bess::gate_idx_t>(val) : DROP_GATE;
+      EmitPacket(ctx, pkt, gate);
     }
   }
 }
