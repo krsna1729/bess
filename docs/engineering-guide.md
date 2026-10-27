@@ -64,6 +64,9 @@ or writes; it never trusts that an upstream module checked it.
    subtraction and each narrowing to `uint16_t`. For prepends and strips,
    `PrependWritable` and `RemovePrefixInPlace` check the lengths for you.
    Validate configured offsets and templates at `Init`, not per packet.
+   Validate output-gate values with `IsValidGateValue` before converting to
+   `gate_idx_t`, not after. Split applies this to packet and metadata values;
+   an out-of-range value drops instead of wrapping to another output.
 7. **Follow the protocol, not the common case.** Verify a checksum by
    summing over the field and comparing with all ones (RFC 1071), so that a
    checksum stored as -0 (0xffff for 0x0000, RFC 1624) passes. A UDP

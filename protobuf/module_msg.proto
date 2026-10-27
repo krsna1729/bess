@@ -1396,8 +1396,12 @@ message L4ChecksumArg {
  * refused (EINVAL). A packet whose first segment ends before `offset` +
  * `size` has no value: it is dropped.
  *
+ * In both packet-offset and metadata modes, the decoded value is checked
+ * before narrowing to a gate index. Values 0-8191 select an output;
+ * DROP_GATE (8192) and all larger values drop instead of wrapping.
+ *
  * __Input Gates__: 1
- * __Output Gates__: many (up to 2^(size * 8))
+ * __Output Gates__: 0-8191
  */
 message SplitArg {
   uint64 size = 1; /// The size of the value to read in bytes

@@ -7,12 +7,18 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
+#include <span>
+#include <utility>
 #include <vector>
 
+#include "gate.h"
 #include "module.h"
+#include "module_graph.h"
 #include "pb/module_msg.pb.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
@@ -41,10 +47,11 @@ Bytes Frame(size_t len, size_t at, std::initializer_list<uint8_t> value) {
   return b;
 }
 
-// `pkt` through `m`: the gate (0-15) it left on, or -1 when it was dropped.
-int GateOf(ModuleHarness &h, Module *m, bess::PacketHandle pkt) {
+// The selected output gate, or -1 when the packet was dropped.
+int GateOf(ModuleHarness &h, Module *m, bess::PacketHandle pkt,
+           std::vector<bess::gate_idx_t> gates = {}) {
   const uint64_t dropped = m->deadends();
-  for (const auto &[gate, out] : h.RunPackets(m, 0, {pkt}, m)) {
+  for (const auto &[gate, out] : h.RunPackets(m, 0, {pkt}, m, std::move(gates))) {
     if (!out.empty()) {
       EXPECT_EQ(1u, out.size());
       return gate;
@@ -134,6 +141,81 @@ TEST(SplitTest, EveryPacketIsForwardedOrDropped) {
   }
   EXPECT_EQ(3u, out);
   EXPECT_EQ(in.size(), out + m->deadends());
+}
+
+struct GateCase {
+  uint64_t value;
+  int gate;
+};
+
+std::span<const GateCase> GateCases(size_t width) {
+  static constexpr auto cases = std::to_array<GateCase>({
+      {0, 0}, {1, 1}, {MAX_GATES - 1, MAX_GATES - 1}, {DROP_GATE, -1},
+      {MAX_GATES + 1, -1}, {65535, -1}, {65536, -1}, {65537, -1}, {0xff0001, -1},
+      {(uint64_t{1} << 32u) | 1u, -1}, {std::numeric_limits<uint64_t>::max(), -1}});
+  return std::span(cases).first(width == 8 ? cases.size() : cases.size() - 2);
+}
+
+Bytes EncodeValue(uint64_t value, size_t width) {
+  Bytes bytes(width);
+  for (size_t i = 0; i < width; ++i) {
+    bytes[width - i - 1] = static_cast<uint8_t>(value);
+    value >>= 8u;
+  }
+  return bytes;
+}
+
+TEST(SplitTest, PacketValuesAreCheckedBeforeGateNarrowing) {
+  // Three-byte narrow tail, three-byte wide read, and full eight-byte read.
+  const std::array<std::pair<size_t, size_t>, 3> layouts{{{3, 23}, {3, 60}, {8, 28}}};
+  for (const auto &[width, length] : layouts) {
+    ModuleHarness h;
+    Module *split = h.Create("Split", Arg(width, 20));
+    ASSERT_NE(nullptr, split);
+    for (const GateCase &test : GateCases(width)) {
+      const Bytes encoded = EncodeValue(test.value, width);
+      Bytes frame(length, 0);
+      for (size_t i = 0; i < width; ++i) {
+        frame[20 + i] = encoded[i];
+      }
+      EXPECT_EQ(test.gate, GateOf(h, split, MakePacket(frame), {0, 1, MAX_GATES - 1}))
+          << "width=" << width << " length=" << length << " value=" << test.value;
+    }
+  }
+}
+
+TEST(SplitTest, MetadataValuesAreCheckedBeforeGateNarrowing) {
+  for (size_t width : {3u, 8u}) {
+    for (const GateCase &test : GateCases(width)) {
+      ModuleHarness h;
+      const Bytes encoded = EncodeValue(test.value, width);
+      bess::pb::SetMetadataArg metadata_arg;
+      auto *attr = metadata_arg.add_attrs();
+      attr->set_name("selected_gate");
+      attr->set_size(width);
+      attr->set_value_bin(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+      auto split_arg = Arg(width, 0);
+      split_arg.set_attribute("selected_gate");
+      Module *metadata = h.Create("SetMetadata", metadata_arg);
+      Module *split = h.Create("Split", split_arg);
+      ASSERT_NE(nullptr, metadata);
+      ASSERT_NE(nullptr, split);
+      ASSERT_EQ(0, ModuleGraph::ConnectModules(metadata, 0, split, 0, true));
+      const Bytes frame = Frame(60, 0, {0xaa});
+      const auto out = h.RunPipeline(metadata, 0, {frame}, split, {0, 1, MAX_GATES - 1});
+      size_t forwarded = 0;
+      for (const auto &[gate, packets] : out) {
+        forwarded += packets.size();
+        if (!packets.empty()) {
+          EXPECT_EQ(test.gate, gate) << "width=" << width << " value=" << test.value;
+          EXPECT_EQ(std::vector<Bytes>{frame}, packets);
+        }
+      }
+      EXPECT_EQ(test.gate < 0 ? 0u : 1u, forwarded)
+          << "width=" << width << " value=" << test.value;
+      EXPECT_EQ(test.gate < 0 ? 1u : 0u, split->deadends());
+    }
+  }
 }
 
 }  // namespace
