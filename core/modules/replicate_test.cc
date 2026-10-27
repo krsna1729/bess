@@ -14,6 +14,7 @@
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "module_graph.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
 #include "testing/module_harness.h"
@@ -67,6 +68,36 @@ TEST(ReplicateTest, TheOriginalLeavesOnTheFirstConfiguredGate) {
   EXPECT_EQ(pkt, out[2][0]);
   ASSERT_EQ(1u, out[3].size()) << "the copy";
   EXPECT_EQ(pkt, out[3][0]);
+}
+
+TEST(ReplicateTest, MetadataReachesTheConsumerOnBothBranches) {
+  ModuleHarness h;
+  const std::string tag("\x12\x34\x56\x78\x9a\xbc\xde\xf0", 8);
+  bess::pb::SetMetadataArg metadata_arg;
+  auto *attribute = metadata_arg.add_attrs();
+  attribute->set_name("conformance_tag");
+  attribute->set_size(8);
+  attribute->set_value_bin(tag);
+  bess::pb::GenericEncapArg encap_arg;
+  auto *field = encap_arg.add_fields();
+  field->set_size(8);
+  field->set_attribute("conformance_tag");
+  Module *writer = h.Create("SetMetadata", metadata_arg);
+  Module *rep = h.Create("Replicate", Gates({0, 1}));
+  Module *reader = h.Create("GenericEncap", encap_arg);
+  ASSERT_NE(nullptr, writer);
+  ASSERT_NE(nullptr, rep);
+  ASSERT_NE(nullptr, reader);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rep, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(rep, 0, reader, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(rep, 1, reader, 0, true));
+
+  const std::vector<Bytes> packets = {{0x01, 0x02}};
+  Bytes encapsulated(tag.begin(), tag.end());
+  encapsulated.insert(encapsulated.end(), packets[0].begin(), packets[0].end());
+  const std::vector<Bytes> expected = {encapsulated, encapsulated};
+  auto out = h.RunPipeline(writer, 0, packets, reader, {0});
+  EXPECT_EQ(expected, out[0]);
 }
 
 // Gates are int64 on the wire and were narrowed unchecked: each must name
