@@ -482,7 +482,7 @@ Stop checks are cooperative, not a hard latency bound: preparing the sorted
 registry snapshot is still control-plane work (D-193).
 
 **Where a module's counters live.** A module's counters are per key and per worker, and the shared
-structure for them is `stats::KeyedCounters` (`stats/keyed_counters.h`, experimental, D-154):
+structure for them is `stats::KeyedCounters` (`stats/keyed_counters.h`, public, D-154/D-193):
 `keys` x `cells_per_key` 64-bit cells in one plane per worker, sized to the worker count the
 module passes, so a module on 8 workers pays 8 planes and not the 64 worker slots the daemon
 reserves. `CounterSet` is the other shape: a small fixed schema of cells, not a key space. A
