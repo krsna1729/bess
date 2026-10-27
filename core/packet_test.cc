@@ -202,12 +202,16 @@ TEST(PacketCopyTest, CopyAndCloneWithMetadataCarryThePrivateBytes) {
     metadata[i] = static_cast<uint8_t>(17 * i + 3);
   }
   std::copy(metadata.begin(), metadata.end(), src_ref.metadata<uint8_t *>());
+  src_ref.scratchpad<uint32_t *>()[0] = 0x9abcdef0u;
 
   const auto check_metadata = [&](bess::PacketHandle duplicate) {
     ASSERT_NE(duplicate, nullptr);
     bess::PacketRef duplicate_ref(duplicate);
     EXPECT_TRUE(std::equal(metadata.begin(), metadata.end(),
                            duplicate_ref.metadata<uint8_t *>()));
+    EXPECT_NE(src_ref.scratchpad<uint32_t *>()[0],
+              duplicate_ref.scratchpad<uint32_t *>()[0])
+        << "module-owned scratch must not propagate with metadata";
     duplicate_ref.metadata<uint8_t *>()[SNBUF_METADATA - 1] ^= 0xffu;
     EXPECT_TRUE(std::equal(metadata.begin(), metadata.end(),
                            src_ref.metadata<uint8_t *>()))
