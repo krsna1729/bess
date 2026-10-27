@@ -32,9 +32,20 @@ CommandResponse EtherEncap::Init(
     const bess::pb::EtherEncapArg &arg[[maybe_unused]]) {
   using AccessMode = bess::metadata::Attribute::AccessMode;
 
-  AddMetadataAttr("ether_src", sizeof(Ethernet::Address), AccessMode::kRead);
-  AddMetadataAttr("ether_dst", sizeof(Ethernet::Address), AccessMode::kRead);
-  AddMetadataAttr("ether_type", 2, AccessMode::kRead);
+  if (const int id = AddMetadataAttr("ether_src", sizeof(Ethernet::Address),
+                                     AccessMode::kRead);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ether_src) failed");
+  }
+  if (const int id = AddMetadataAttr("ether_dst", sizeof(Ethernet::Address),
+                                     AccessMode::kRead);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ether_dst) failed");
+  }
+  if (const int id = AddMetadataAttr("ether_type", 2, AccessMode::kRead);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ether_type) failed");
+  }
 
   return CommandSuccess();
 };

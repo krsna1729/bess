@@ -498,7 +498,11 @@ CommandResponse PacketStore::Init(const bess::pb::PacketStoreArg &arg) {
   }
   key_attr_ids_.clear();
   for (const std::string &name : key_attrs_) {
-    const int attr_id = AddMetadataAttr(name, sizeof(be32_t), AccessMode::kRead);
+    // These are alternatives: use the first bound key, or flow 0 if none is
+    // provided. An absent alternative must not invalidate the graph.
+    const int attr_id =
+        AddMetadataAttr(name, sizeof(be32_t), AccessMode::kRead,
+                        bess::metadata::Attribute::Contract::kBestEffort);
     if (attr_id < 0) {
       // Without this the id is an error code, and the packet path would index
       // attr_offsets_ with it: a duplicate, an empty name, more than

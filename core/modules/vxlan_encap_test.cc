@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // VXLANEncap in process: the UDP and VXLAN headers it prepends, the headroom
-// of a shared packet, and the UDP length limit. No upstream writer: the
-// tunnel attributes read as zeros (VNI 0).
+// of a shared packet, and the UDP length limit. A real metadata producer
+// supplies the tunnel inputs; VNI 42 must reach the encapsulated frame.
+
+#include <arpa/inet.h>
 
 #include <gtest/gtest.h>
 
@@ -11,9 +13,11 @@
 #include <cstdint>
 #include <map>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "module.h"
+#include "module_graph.h"
 #include "packet.h"
 #include "pb/module_msg.pb.h"
 #include "testing/module_harness.h"
@@ -44,7 +48,7 @@ Bytes Inner(size_t n) {
       .Build();
 }
 
-// `inner` behind the UDP (to 4789, no checksum) and VXLAN (VNI 0) headers.
+// `inner` behind the UDP (to 4789, no checksum) and VXLAN (VNI 42) headers.
 // The source port is the flow entropy of the inner frame's first `head`
 // bytes (all of them by default): the first segment's, for a chain.
 Bytes Encapsulated(const Bytes &inner, size_t head = SIZE_MAX) {
@@ -53,11 +57,28 @@ Bytes Encapsulated(const Bytes &inner, size_t head = SIZE_MAX) {
   b.Udp(bess::tunnel::FlowEntropyPort(std::span<const uint8_t>(inner.data(), n)),
         bess::tunnel::kVxlanPort);
   b.Last<PacketBuilder::UdpHdr>().checksum = 0;
-  return b.Vxlan(0).Payload(inner).Build();
+  return b.Vxlan(42).Payload(inner).Build();
 }
 
 Gates Through(ModuleHarness &h, Module *m, const std::vector<bess::PacketHandle> &packets) {
-  return h.RunPackets(m, 0, packets, m, {0});
+  bess::pb::SetMetadataArg arg;
+  for (const auto &[name, value] :
+       {std::pair{"tun_ip_src", 0x0a000001u},
+        std::pair{"tun_ip_dst", 0x0a000002u}, std::pair{"tun_id", 42u}}) {
+    auto *attr = arg.add_attrs();
+    attr->set_name(name);
+    attr->set_size(4);
+    const uint32_t encoded = htonl(value);
+    attr->set_value_bin(reinterpret_cast<const char *>(&encoded),
+                        sizeof(encoded));
+  }
+  Module *writer = h.Create("SetMetadata", arg);
+  EXPECT_NE(nullptr, writer);
+  if (writer == nullptr) {
+    return {};
+  }
+  EXPECT_EQ(0, ModuleGraph::ConnectModules(writer, 0, m, 0, true));
+  return h.RunPackets(writer, 0, packets, m, {0});
 }
 
 TEST(VXLANEncapTest, PrependsTheUdpAndVxlanHeaders) {

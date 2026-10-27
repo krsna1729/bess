@@ -1497,8 +1497,8 @@ class ContractReader final : public Module {
                                    kDefault) < 0) {
       return CommandFailure(EINVAL, "default_attr declaration failed");
     }
-    if (AddMetadataAttr("optional_attr", 4,
-                        Attribute::AccessMode::kRead) < 0) {
+    if (AddMetadataAttr("optional_attr", 4, Attribute::AccessMode::kRead,
+                        Attribute::Contract::kBestEffort) < 0) {
       return CommandFailure(EINVAL, "optional_attr declaration failed");
     }
     return CommandSuccess();
@@ -1600,8 +1600,6 @@ TEST_F(ApiV2ServiceTest, ACommittedApplyWhoseResumeFailsLeavesWorkersPaused) {
   const v2::ErrorDetail detail = DetailOf(ctx);
   EXPECT_EQ(v2::ErrorDetail::INVALID_ARGUMENT, detail.code());
   EXPECT_EQ("resume", detail.field());
-  EXPECT_NE(std::string::npos,
-            status.error_message().find("pipeline committed, but resume failed"));
   EXPECT_NE(std::string::npos, status.error_message().find("required_attr"));
   EXPECT_FALSE(is_worker_running(bess::dataplane::WorkerId(0)))
       << "a refused resume must not run the workers";

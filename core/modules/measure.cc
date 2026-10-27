@@ -83,7 +83,14 @@ CommandResponse Measure::Init(const bess::pb::MeasureArg &arg) {
       attr_name = arg.attr_name();
 
     using AccessMode = bess::metadata::Attribute::AccessMode;
-    attr_id_ = AddMetadataAttr(attr_name, sizeof(uint64_t), AccessMode::kRead);
+    // An absent metadata stamp falls back to the checked in-packet stamp.
+    attr_id_ =
+        AddMetadataAttr(attr_name, sizeof(uint64_t), AccessMode::kRead,
+                        bess::metadata::Attribute::Contract::kBestEffort);
+    if (attr_id_ < 0) {
+      return CommandFailure(-attr_id_, "add_metadata_attr(%s) failed",
+                            attr_name.c_str());
+    }
   }
 
   if (arg.jitter_sample_prob()) {

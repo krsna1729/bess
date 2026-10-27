@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -196,8 +197,29 @@ TEST_F(ModuleTrafficTest, Replicate) {
   }
 }
 
-TEST_F(ModuleTrafficTest, VXLANEncap) {
-  EXPECT_GT(RunFor("VXLANEncap", "bess.pb.VXLANEncapArg", R"({"dstport": 4789})", {0})[0], 0);
+TEST_F(ModuleTrafficTest, VXLANEncapRefusesResumeWithoutTunnelInputs) {
+  daemon().Reset();
+  Types types(client());
+  auto arg = types.Make("bess.pb.VXLANEncapArg", R"({"dstport": 4789})");
+  bess::sdk::PipelineBuilder builder;
+  builder.Worker(0, 0, "").Module("mut", "VXLANEncap", arg.get());
+  auto pipeline = builder.Build();
+  ASSERT_TRUE(pipeline) << pipeline.error().message;
+  auto applied = client().ApplyPipeline(*pipeline);
+  ASSERT_TRUE(applied) << applied.error().message;
+
+  const auto resumed = client().ResumeWorkers();
+  ASSERT_FALSE(resumed);
+  auto snapshot = client().Pipeline({.include_metadata = true});
+  ASSERT_TRUE(snapshot) << snapshot.error().message;
+  std::set<std::string> unresolved;
+  for (const auto &declaration : snapshot->metadata.unsatisfied_required()) {
+    EXPECT_EQ("mut", declaration.module());
+    EXPECT_EQ("required", declaration.contract());
+    unresolved.insert(declaration.attribute());
+  }
+  EXPECT_EQ((std::set<std::string>{"tun_ip_src", "tun_ip_dst", "tun_id"}),
+            unresolved);
 }
 
 // Untagged packets on gate 0, VID 7 on gate 7.

@@ -277,7 +277,7 @@ class MetadataConflictReport(_message.Message):
     def __init__(self, attribute: _Optional[str] = ..., reason: _Optional[str] = ..., modules: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class MetadataReport(_message.Message):
-    __slots__ = ("declarations", "resolved", "writers_without_reader", "readers_without_writer", "unsatisfied_required", "defaults_applied", "conflicts")
+    __slots__ = ("declarations", "resolved", "writers_without_reader", "readers_without_writer", "unsatisfied_required", "defaults_applied", "conflicts", "allocation_failures")
     DECLARATIONS_FIELD_NUMBER: _ClassVar[int]
     RESOLVED_FIELD_NUMBER: _ClassVar[int]
     WRITERS_WITHOUT_READER_FIELD_NUMBER: _ClassVar[int]
@@ -285,6 +285,7 @@ class MetadataReport(_message.Message):
     UNSATISFIED_REQUIRED_FIELD_NUMBER: _ClassVar[int]
     DEFAULTS_APPLIED_FIELD_NUMBER: _ClassVar[int]
     CONFLICTS_FIELD_NUMBER: _ClassVar[int]
+    ALLOCATION_FAILURES_FIELD_NUMBER: _ClassVar[int]
     declarations: int
     resolved: int
     writers_without_reader: _containers.RepeatedCompositeFieldContainer[MetadataAttributeReport]
@@ -292,7 +293,8 @@ class MetadataReport(_message.Message):
     unsatisfied_required: _containers.RepeatedCompositeFieldContainer[MetadataAttributeReport]
     defaults_applied: _containers.RepeatedCompositeFieldContainer[MetadataAttributeReport]
     conflicts: _containers.RepeatedCompositeFieldContainer[MetadataConflictReport]
-    def __init__(self, declarations: _Optional[int] = ..., resolved: _Optional[int] = ..., writers_without_reader: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., readers_without_writer: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., unsatisfied_required: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., defaults_applied: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., conflicts: _Optional[_Iterable[_Union[MetadataConflictReport, _Mapping]]] = ...) -> None: ...
+    allocation_failures: _containers.RepeatedCompositeFieldContainer[MetadataAttributeReport]
+    def __init__(self, declarations: _Optional[int] = ..., resolved: _Optional[int] = ..., writers_without_reader: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., readers_without_writer: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., unsatisfied_required: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., defaults_applied: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ..., conflicts: _Optional[_Iterable[_Union[MetadataConflictReport, _Mapping]]] = ..., allocation_failures: _Optional[_Iterable[_Union[MetadataAttributeReport, _Mapping]]] = ...) -> None: ...
 
 class GetPipelineRequest(_message.Message):
     __slots__ = ("include_resources", "resources", "include_metadata")

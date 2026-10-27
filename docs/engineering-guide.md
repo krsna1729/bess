@@ -112,10 +112,11 @@ whole frame cost 4-5.5 ns more.
 - **Remove a check only when it is proven in the same code.** A type, or an
   earlier check in the same module, can prove a precondition (for example,
   `EditPlan::ApplyTrusted` after the caller's own parse, D-063). A `kRequired`
-  metadata contract (D-177) proves only that a writer of the attribute exists
-  at resume. No graph mechanism proves a packet's length, parse or
-  exclusivity, and a value that another module computed can be stale: a
-  module between the two can rewrite the packet in place.
+  metadata contract (D-177, D-195) checks declared writers on every incoming
+  path and usable packet-metadata storage. It does not prove that a conditional
+  producer wrote the value for each packet. No graph mechanism proves a
+  packet's length, parse or exclusivity. A value another module computed can
+  be stale: a module between the two can rewrite the packet in place.
 - **Prefer cheaper local checks to graph-wide assumptions** (D-192).
   Cross-module parse reuse is unproven: `ParsedFrame` caches addresses, ports
   and flags, not just offsets. NAT rewrites addresses and ports in place

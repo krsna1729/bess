@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <any>
 #include <atomic>
@@ -84,6 +85,33 @@ struct ModuleCase {
 template <typename M>
 std::shared_ptr<M> Msg() {
   return std::make_shared<M>();
+}
+
+TEST(MetadataDeclarationConformanceTest, WidthConflictsRefuseInitialization) {
+  struct Case {
+    const char *mclass;
+    const char *attribute;
+    uint64_t width;
+    std::shared_ptr<google::protobuf::Message> arg;
+  };
+  const Case cases[] = {
+      {"EtherEncap", "ether_src", 4, Msg<pb::EtherEncapArg>()},
+      {"IPEncap", "ip_proto", 8, Msg<pb::IPEncapArg>()},
+      {"VXLANEncap", "ip_proto", 8, Msg<pb::VXLANEncapArg>()},
+      {"VXLANDecap", "tun_id", 8, Msg<pb::VXLANDecapArg>()},
+      {"Timestamp", "timestamp", 4, Msg<pb::TimestampArg>()},
+  };
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.mclass);
+    ModuleHarness harness;
+    pb::SetMetadataArg writer;
+    auto *attr = writer.add_attrs();
+    attr->set_name(test.attribute);
+    attr->set_size(test.width);
+    attr->set_value_int(1);
+    ASSERT_NE(nullptr, harness.Create("SetMetadata", writer));
+    EXPECT_EQ(EINVAL, harness.CreateFailure(test.mclass, *test.arg).code());
+  }
 }
 
 pb::FieldData BytesField(const std::string &bytes) {

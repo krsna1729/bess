@@ -60,6 +60,20 @@ bool Measured(ModuleHarness &h, Module *m, bess::PacketHandle pkt) {
   return TakeLatencyCount(h, m) == 1;
 }
 
+TEST(MeasureTest, AConflictingTimestampWidthIsRejectedAtInitialization) {
+  ModuleHarness h;
+  bess::pb::SetMetadataArg writer_arg;
+  auto *stamp = writer_arg.add_attrs();
+  stamp->set_name("probe_stamp");
+  stamp->set_size(4);
+  stamp->set_value_int(1);
+  ASSERT_NE(nullptr, h.Create("SetMetadata", writer_arg));
+
+  bess::pb::MeasureArg reader_arg;
+  reader_arg.set_attr_name("probe_stamp");
+  EXPECT_EQ(EINVAL, h.CreateFailure("Measure", reader_arg).code());
+}
+
 // Packets pass through and are counted; with no timestamp attribute writer
 // and no timestamp in the payload none is sampled for latency.
 TEST(MeasureTest, GetSummaryAndClearAreActions) {

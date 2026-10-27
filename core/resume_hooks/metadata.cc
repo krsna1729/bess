@@ -20,12 +20,22 @@ std::optional<CommandResponse> SetupMetadata::Run() {
     return std::nullopt;
   }
 
+  const auto *allocation =
+      bess::metadata::default_pipeline.first_blocking_allocation_failure();
+  if (allocation != nullptr) {
+    return CommandFailure(ENOSPC,
+                          "metadata storage exhausted for attribute '%s' of "
+                          "module '%s'",
+                          allocation->attribute.c_str(),
+                          allocation->module.c_str());
+  }
+
   const bess::metadata::MetadataDeclaration *missing =
       bess::metadata::default_pipeline.first_unsatisfied_required();
   if (missing != nullptr) {
     return CommandFailure(EINVAL,
                           "required metadata attribute '%s' of module '%s' has "
-                          "no provider: no upstream module writes it",
+                          "no usable graph binding",
                           missing->attribute.c_str(), missing->module.c_str());
   }
   return CommandFailure(-ret, "metadata offset computation failed");

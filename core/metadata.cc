@@ -125,6 +125,17 @@ void Pipeline::ApplyContractsAndBuildReport() {
       } else {
         has_reader[attr.name] = true;
       }
+      if (attr.mode != AccessMode::kWrite && offset == kMetadataOffsetNoSpace) {
+        report_.allocation_failures.push_back(declaration);
+      }
+      if (attr.mode != AccessMode::kWrite &&
+          attr.contract == Contract::kRequired && !IsValidOffset(offset)) {
+        report_.unsatisfied_required.push_back(declaration);
+        LOG(ERROR) << "Required metadata attr " << attr.name << "/" << attr.size
+                   << " of module " << m->name()
+                   << " has no usable metadata binding (offset "
+                   << static_cast<int>(offset) << ")";
+      }
       if (attr.mode == AccessMode::kWrite) {
         if (offset == kMetadataOffsetNoWrite) {
           report_.writers_without_reader.push_back(declaration);
@@ -134,12 +145,7 @@ void Pipeline::ApplyContractsAndBuildReport() {
         }
       } else if (offset == kMetadataOffsetNoRead) {
         report_.readers_without_writer.push_back(declaration);
-        if (attr.contract == Contract::kRequired) {
-          report_.unsatisfied_required.push_back(declaration);
-          LOG(ERROR) << "Required metadata attr " << attr.name << "/"
-                     << attr.size << " of module " << m->name()
-                     << " has no upstream module that writes it";
-        } else {
+        if (attr.contract != Contract::kRequired) {
           LOG(WARNING) << "Metadata attr " << attr.name << "/" << attr.size
                        << " of module " << m->name()
                        << " has no upstream module that sets the value!";
@@ -192,8 +198,8 @@ void Pipeline::ApplyContractsAndBuildReport() {
     if (reason.empty() &&
         (writer_counts[name] > 1 && has_reader[name])) {
       reason =
-          "more than one writer scope declares the attribute for a reader; "
-          "each scope has its own offset";
+          "multiple writers declare the attribute; upstream paths determine "
+          "the value seen by a reader";
     }
     if (reason.empty()) {
       const auto providers = multiple_provider_readers.find(name);
@@ -619,7 +625,11 @@ int Pipeline::ComputeMetadataOffsets() {
 
   ApplyContractsAndBuildReport();
 
-  ret = first_unsatisfied_required() != nullptr ? -EINVAL : 0;
+  if (first_blocking_allocation_failure() != nullptr) {
+    ret = -ENOSPC;
+  } else {
+    ret = first_unsatisfied_required() != nullptr ? -EINVAL : 0;
+  }
 
   CleanupMetadataComputation();
   return ret;

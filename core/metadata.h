@@ -158,12 +158,16 @@ struct MetadataReport {
   // required declarations; see unsatisfied_required for the ones that failed.
   std::vector<MetadataDeclaration> readers_without_writer;
 
-  // Required declarations whose reader got no provider; resume fails for
-  // these.
+  // Required declarations without a usable packet offset: a missing provider,
+  // invalid scope or exhausted metadata storage. Resume fails for these.
   std::vector<MetadataDeclaration> unsatisfied_required;
 
   // Default declarations that resolved to kMetadataOffsetDefault.
   std::vector<MetadataDeclaration> defaults_applied;
+
+  // Read/update live ranges that did not fit in packet metadata. Best-effort
+  // entries are diagnostic; required and default contracts block resume.
+  std::vector<MetadataDeclaration> allocation_failures;
 
   // Declarations of one name that disagree (contract or default bytes), or a
   // reader's attribute declared by more than one writer scope.
@@ -238,7 +242,8 @@ class Pipeline {
         registered_attrs_() {}
 
   // Main entry point for calculating metadata offsets.
-  // Returns 0 on success, -EINVAL if a required contract has no provider.
+  // Returns 0 on success, -EINVAL for an unsatisfied required contract, or
+  // -ENOSPC when a required/default reader has no packet metadata storage.
   int ComputeMetadataOffsets();
 
   // The categories of the last ComputeMetadataOffsets() call. Read-only: it
@@ -246,12 +251,20 @@ class Pipeline {
   // it while workers run.
   const MetadataReport &report() const { return report_; }
 
-  // The first unsatisfied required declaration, or nullptr. ComputeMetadata
-  // Offsets() returns -EINVAL exactly when this is non-null.
+  // The first unsatisfied required declaration, or nullptr.
   const MetadataDeclaration *first_unsatisfied_required() const {
     return report_.unsatisfied_required.empty()
                ? nullptr
                : &report_.unsatisfied_required.front();
+  }
+
+  const MetadataDeclaration *first_blocking_allocation_failure() const {
+    for (const auto &declaration : report_.allocation_failures) {
+      if (declaration.contract != Attribute::Contract::kBestEffort) {
+        return &declaration;
+      }
+    }
+    return nullptr;
   }
 
   // Registers attr and returns 0 if no attribute named @attr_name with size

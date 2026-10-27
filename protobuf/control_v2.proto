@@ -223,6 +223,9 @@ message MetadataReport {
   repeated MetadataAttributeReport unsatisfied_required = 3;
   repeated MetadataAttributeReport defaults_applied = 4;
   repeated MetadataConflictReport conflicts = 5;
+  // Reader/update live ranges that exceeded packet metadata storage. Required
+  // and default entries block resume; best-effort entries remain diagnostic.
+  repeated MetadataAttributeReport allocation_failures = 8;
 }
 
 // With include_resources, the pipeline lists its resources' contents too

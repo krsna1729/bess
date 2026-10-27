@@ -211,6 +211,7 @@ class Cli {
     print("readers without a writer", report.readers_without_writer());
     print("required, unsatisfied", report.unsatisfied_required());
     print("defaults applied", report.defaults_applied());
+    print("metadata storage exhausted", report.allocation_failures());
     if (!report.conflicts().empty()) {
       any = true;
       std::println("conflicting declarations:");

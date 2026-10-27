@@ -15,7 +15,9 @@ CommandResponse MetadataTest::AddAttributes(
     const char *attr_name = kv.first.c_str();
     int attr_size = kv.second;
 
-    ret = AddMetadataAttr(attr_name, attr_size, mode);
+    // This diagnostic adapter observes allocation, not the packet value.
+    ret = AddMetadataAttr(attr_name, attr_size, mode,
+                          Attribute::Contract::kBestEffort);
     if (ret < 0)
       return CommandFailure(-ret, "invalid metadata declaration");
 

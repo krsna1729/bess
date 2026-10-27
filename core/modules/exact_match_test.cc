@@ -733,9 +733,7 @@ TEST(ExactMatchPacketTest, UnreadResultFieldIsSkippedAndTheRuleGateApplies) {
 TEST(ExactMatchPacketTest, ResultFieldFollowsItsReaderAcrossResumes) {
   ModuleHarness h;
   Module *em = ResultEm(h, "em_moving_attr");
-  Module *check = MatchAttr(h, "em_moving_attr", std::string("\x00\x00\x00\x07", 4));
   ASSERT_NE(nullptr, em);
-  ASSERT_NE(nullptr, check);
   const size_t id = AttrIndex(em, "em_moving_attr");
   ASSERT_LT(id, em->all_attrs().size());
 
@@ -743,6 +741,10 @@ TEST(ExactMatchPacketTest, ResultFieldFollowsItsReaderAcrossResumes) {
   const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
   EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(h.Run(em, 0, {pkt}, {0, 1})));
   EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(id));
+
+  Module *check =
+      MatchAttr(h, "em_moving_attr", std::string("\x00\x00\x00\x07", 4));
+  ASSERT_NE(nullptr, check);
 
   // Skipped -> read: the downstream match sees the record's value.
   ModuleGraph::DisconnectModule(em, 1);
@@ -753,6 +755,7 @@ TEST(ExactMatchPacketTest, ResultFieldFollowsItsReaderAcrossResumes) {
 
   // Read -> skipped: still the rule's gate.
   ModuleGraph::DisconnectModule(em, 1);
+  ModuleGraph::DestroyModule(check);
   EXPECT_EQ((std::map<gate_idx_t, size_t>{{1, 1}}), Counts(h.Run(em, 0, {pkt}, {0, 1})));
   EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, em->attr_offset(id));
 }
