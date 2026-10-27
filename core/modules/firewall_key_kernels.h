@@ -13,8 +13,9 @@ namespace bess::firewall_key {
 
 // Preconditions: an untagged IPv4 frame with IHL 5, at least 38 contiguous
 // readable bytes, and checked TCP/UDP ports. src and dst each hold 16 writable
-// bytes; neither output overlaps the input. IPv4 addresses occupy bytes 0..3
-// of each output, with the other bytes zero; ports are returned in host order.
+// bytes with unrestricted alignment. All outputs occupy disjoint storage and
+// do not overlap the input. IPv4 addresses occupy bytes 0..3 of each address
+// output, with the other bytes zero; ports are returned in host order.
 inline void GatherScalar(const uint8_t *frame, void *src, void *dst,
                          uint16_t &src_port, uint16_t &dst_port) noexcept {
   std::memset(src, 0, 16);

@@ -23,7 +23,9 @@ TEST(FirewallKeyKernelsTest, GathersExactWireFieldsAndPreservesOutputGuards) {
       // the end even when the Ethernet frame begins at an unaligned offset.
       std::vector<uint8_t> input(offset + 38);
       for (auto &byte : input) {
-        byte = static_cast<uint8_t>(rng());
+        byte = sample == 0   ? uint8_t{0}
+               : sample == 1 ? uint8_t{255}
+                             : static_cast<uint8_t>(rng());
       }
       const uint8_t *frame = input.data() + offset;
       std::array<uint8_t, 48> want{};
