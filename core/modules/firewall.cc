@@ -13,6 +13,7 @@
 #include <cstring>
 #include <span>
 
+#include "firewall_key_kernels.h"
 #include "packet_parse.h"
 #include "utils/endian.h"
 
@@ -68,15 +69,19 @@ bool Firewall::KeyOf(std::span<const uint8_t> frame, size_t total_len,
   }
   key->family = FirewallFamily::kIpv4;
   key->proto = f.protocol;
-  key->src = {};
-  key->dst = {};
-  std::memcpy(key->src.data(), frame.data() + bess::packet::kFastIpv4Src, 4);
-  std::memcpy(key->dst.data(), frame.data() + bess::packet::kFastIpv4Dst, 4);
   const bool ports =
       f.status == ParseStatus::kOk && (f.protocol == 6 || f.protocol == 17);
-  const uint8_t *l4 = frame.data() + bess::packet::kFastIpv4L4;
-  key->src_port = ports ? static_cast<uint16_t>(unsigned{l4[0]} << 8u | unsigned{l4[1]}) : 0;
-  key->dst_port = ports ? static_cast<uint16_t>(unsigned{l4[2]} << 8u | unsigned{l4[3]}) : 0;
+  if (ports) {
+    bess::firewall_key::Gather(frame.data(), key->src.data(), key->dst.data(),
+                               key->src_port, key->dst_port);
+  } else {
+    key->src = {};
+    key->dst = {};
+    std::memcpy(key->src.data(), frame.data() + bess::packet::kFastIpv4Src, 4);
+    std::memcpy(key->dst.data(), frame.data() + bess::packet::kFastIpv4Dst, 4);
+    key->src_port = 0;
+    key->dst_port = 0;
+  }
   return true;
 }
 

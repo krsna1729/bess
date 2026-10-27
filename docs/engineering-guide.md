@@ -225,3 +225,9 @@ The layers and the enforced edges are in architecture.md §1-2;
 - **A `.proto` change** regenerates the Go and Python SDKs
   (`tools/gen_go_sdk.sh`, `tools/gen_python_sdk.sh`) in the same change.
 - **A flaky test** gets its timing fixed, not its assertion loosened.
+  Use an injected monotonic clock for deadline/state-transition checks, not
+  sleeps. `utils::Codel<T, Clock>` accepts a clock as its last constructor
+  argument; it returns nanoseconds and is stored by value. The default
+  `CodelClock` still uses the calibrated cycle counter, with no type-erased
+  call or extra state. CoDel's delay/drop tests advance a manual clock and
+  keep their delivery/drop assertions, including the exact window boundary.

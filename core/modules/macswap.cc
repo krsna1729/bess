@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "macswap.h"
+#include "macswap_kernels.h"
 
 #include "packet_reshape.h"
 #include "utils/ether.h"
@@ -21,10 +22,7 @@ void MACSwap::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       EmitPacket(ctx, bess::PacketRef(handle), DROP_GATE);
       return false;
     }
-    auto *eth = reinterpret_cast<Ethernet *>(head->data());
-    const Ethernet::Address tmp = eth->dst_addr;
-    eth->dst_addr = eth->src_addr;
-    eth->src_addr = tmp;
+    bess::macswap::Swap(head->data(), head->size());
     return true;
   });
 

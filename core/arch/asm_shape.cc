@@ -34,6 +34,8 @@
 #include "arch/tag_match.h"
 #include "classifier/firewall_kernels.h"
 #include "l2/mac_table_kernels.h"
+#include "modules/firewall_key_kernels.h"
+#include "modules/macswap_kernels.h"
 #include "modules/vlan_kernels.h"
 #include "packet_parse.h"
 #include "utils/http_parser_kernels.h"
@@ -94,6 +96,15 @@ extern "C" {
 [[gnu::noinline]] int k_fast_ipv4(const unsigned char *f, size_t n, size_t total_len) {
   const bess::packet::FastIpv4 v = bess::packet::CheckFastIpv4({f, n}, total_len);
   return v.taken ? static_cast<int>(v.status) : -1;
+}
+
+[[gnu::noinline]] void k_macswap(void *p, size_t head_len) {
+  bess::macswap::Swap(p, head_len);
+}
+
+[[gnu::noinline]] void k_firewall_key(const uint8_t *frame, void *src, void *dst,
+                                    uint16_t &src_port, uint16_t &dst_port) {
+  bess::firewall_key::Gather(frame, src, dst, src_port, dst_port);
 }
 
 }  // extern "C"
