@@ -22,15 +22,13 @@
 // either: there is nothing for it to be full of.
 //
 // The sweep runs on the maintenance thread with the control-plane lock held,
-// beside the modules' tick endpoints, and may block like them. The walk is a
-// few hundred virtual calls, well inside the slice it is given; `stop()` (that
-// slice) is checked every kStopCheckEvery resources, and a pass that runs out
-// stops there and the next sweep starts again from the beginning. Visiting a
-// resource twice is harmless: what has fired is remembered by name, and the
-// state is small (the resources currently at or past the level). The limit of
-// having no cursor is that a daemon whose resource count made a full walk
-// exceed one slice would never reach the tail of it; a cursor is the change to
-// make if a graph ever gets there.
+// beside the modules' tick endpoints. `stop()` is checked every
+// kStopCheckEvery registered resources, including unbound ones. A pass that
+// runs out of time resumes after its last examined
+// name next tick, so repeated short slices still reach the tail. Names added
+// before that cursor are visited in the next pass. Completed passes forget
+// resources that are no longer reachable; incomplete passes retain their
+// crossing history.
 //
 //   // built once, beside the maintenance loop:
 //   control::ResourceFillWatch fills(engine, bindings);
@@ -42,6 +40,7 @@
 #ifndef BESS_CONTROL_RESOURCE_FILL_H_
 #define BESS_CONTROL_RESOURCE_FILL_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -107,22 +106,28 @@ class ResourceFillWatch {
 
   // Visits every reachable resource once, firing for each one that is at or
   // past its level and forgetting one that has fallen below it. `stop` is
-  // asked whether the tick's slice is spent, every kStopCheckEvery resources.
+  // asked whether the tick's slice is spent, every kStopCheckEvery names.
   template <typename Stop>
   Result Sweep(Stop &&stop) {
     Result result;
-    seen_.clear();
-    for (const std::string &name : engine_.ResourceNames()) {
-      if (result.visited != 0 && result.visited % kStopCheckEvery == 0 && stop()) {
+    const auto names = engine_.ResourceNames();
+    auto next = resume_after_.empty()
+                    ? names.begin()
+                    : std::upper_bound(names.begin(), names.end(), resume_after_);
+    size_t examined = 0;
+    for (; next != names.end(); ++next) {
+      if (examined != 0 && examined % kStopCheckEvery == 0 && stop()) {
+        resume_after_ = *std::prev(next);
         result.incomplete = true;
         return result;
       }
+      ++examined;
+      const std::string &name = *next;
       const dataplane::Resource *resource = engine_.FindResource(name);
       if (resource == nullptr || bindings_.Find(*resource) == nullptr) {
         continue;  // not reachable, as GetResourceStatus and List have it
       }
       result.visited++;
-      seen_.insert(name);
       // The level is the resource's own count when it states one (a module
       // knows its table), and otherwise a fraction of the capacity it states.
       // A resource that states neither is not watched: D-149's "not stated"
@@ -149,14 +154,16 @@ class ResourceFillWatch {
         result.crossed.push_back({name, count, limit, capacity});
       }
     }
-    // A pass that saw every resource also saw which names are gone (a module
-    // unloaded, a table unregistered). Forgetting them here keeps a later
-    // resource of the same name from arriving already fired, and keeps the
-    // state bounded by the resources that exist rather than by every name
-    // that has ever fired. A pass the slice cut short forgets nothing: it did
-    // not see the resources it never reached.
+    resume_after_.clear();
+    // Reachability may change between slices. Check the current registry,
+    // not only names seen in the final slice, before forgetting old history.
     for (auto it = fired_.begin(); it != fired_.end();) {
-      it = seen_.contains(*it) ? std::next(it) : fired_.erase(it);
+      const dataplane::Resource *resource = engine_.FindResource(*it);
+      if (resource != nullptr && bindings_.Find(*resource) != nullptr) {
+        ++it;
+      } else {
+        it = fired_.erase(it);
+      }
     }
     return result;
   }
@@ -167,11 +174,9 @@ class ResourceFillWatch {
  private:
   dataplane::TransactionEngine &engine_;
   const framework::ResourceBindings &bindings_;
-  // The names at or past their level (fired once, until they fall below), and
-  // the names the current pass has seen -- a pass that reaches every resource
-  // uses it to forget the names that are gone.
+  // Names that have fired, and the last name examined in an incomplete pass.
   std::unordered_set<std::string> fired_;
-  std::unordered_set<std::string> seen_;
+  std::string resume_after_;
 };
 
 // The module a resource belongs to: the part of "<module>/<table>" before the

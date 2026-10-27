@@ -2,6 +2,7 @@
 
 #include "control/resource_fill.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -298,7 +299,7 @@ TEST_F(ResourceFillWatchTest, AStatedLevelOfZeroIsReadAsNone) {
   EXPECT_EQ(80u, fired.crossed[0].limit);
 }
 
-TEST(ResourceFillWatchSlice, APassOverMoreThanABatchStopsAndTheNextOneCompletes) {
+TEST(ResourceFillWatchSlice, BoundedPassesReachTheTailAndHandleRegistryChanges) {
   rcu::RcuDomain domain(1, 8);
   dataplane::TransactionEngine engine(domain);
   framework::ResourceBindings bindings;
@@ -313,30 +314,66 @@ TEST(ResourceFillWatchSlice, APassOverMoreThanABatchStopsAndTheNextOneCompletes)
   }
   ResourceFillWatch fills(engine, bindings);
 
-  // The stop is asked every kStopCheckEvery resources, so a pass over more
-  // than a batch stops after one and says the pass was incomplete. What it
-  // walked it fired for: the sweep reports as it goes.
+  // Every slice is exhausted at its first checkpoint, not only the first.
   const ResourceFillWatch::Result stopped = fills.Sweep([] { return true; });
   EXPECT_TRUE(stopped.incomplete);
   EXPECT_EQ(ResourceFillWatch::kStopCheckEvery, stopped.visited);
-  EXPECT_EQ(ResourceFillWatch::kStopCheckEvery, stopped.crossed.size());
-  EXPECT_EQ(ResourceFillWatch::kStopCheckEvery, fills.fired());
-
-  // The next sweep starts again from the beginning and reaches every one. The
-  // batch it fired for in the first pass is remembered by name, so only the
-  // rest cross this time -- which is why visiting a resource twice is
-  // harmless.
-  const ResourceFillWatch::Result finished = fills.Sweep([] { return false; });
+  const ResourceFillWatch::Result finished = fills.Sweep([] { return true; });
   EXPECT_FALSE(finished.incomplete);
-  EXPECT_EQ(ResourceFillWatch::kStopCheckEvery + 8, finished.visited);
-  EXPECT_EQ(8u, finished.crossed.size());
+  EXPECT_EQ(8u, finished.visited);
+  std::vector<std::string> reported;
+  reported.reserve(stopped.crossed.size() + finished.crossed.size());
+  for (const auto &crossing : stopped.crossed) {
+    reported.push_back(crossing.resource);
+  }
+  for (const auto &crossing : finished.crossed) {
+    reported.push_back(crossing.resource);
+  }
+  std::sort(reported.begin(), reported.end());
+  EXPECT_EQ(engine.ResourceNames(), reported);
   EXPECT_EQ(ResourceFillWatch::kStopCheckEvery + 8, fills.fired());
 
-  // A pass the slice cuts short forgets nothing: it did not see the resources
-  // it never reached, and only a complete pass may conclude that one is gone.
+  // An incomplete pass must not forget the tail's already-fired history.
   const ResourceFillWatch::Result cut = fills.Sweep([] { return true; });
-  EXPECT_TRUE(cut.incomplete);
+  ASSERT_TRUE(cut.incomplete);
+  EXPECT_TRUE(cut.crossed.empty());
   EXPECT_EQ(ResourceFillWatch::kStopCheckEvery + 8, fills.fired());
+
+  ASSERT_TRUE(engine.Unregister(resources[0]->name()).has_value());
+  bindings_kept[0].Reset();
+  resources.push_back(std::make_unique<FillResource>("mod/aaa", &count, &capacity));
+  ASSERT_TRUE(engine.Register(resources.back().get()).has_value());
+  bindings_kept.push_back(bindings.Bind(*resources.back(), std::make_shared<StubCodec>()));
+  const ResourceFillWatch::Result tail = fills.Sweep([] { return true; });
+  EXPECT_FALSE(tail.incomplete);
+  EXPECT_TRUE(tail.crossed.empty());
+  EXPECT_EQ(ResourceFillWatch::kStopCheckEvery + 7, fills.fired());
+  const ResourceFillWatch::Result next_pass = fills.Sweep([] { return true; });
+  ASSERT_EQ(1u, next_pass.crossed.size());
+  EXPECT_EQ("mod/aaa", next_pass.crossed[0].resource);
+}
+
+TEST(ResourceFillWatchSlice, UnboundResourcesAlsoConsumeTheSlice) {
+  rcu::RcuDomain domain(1, 8);
+  dataplane::TransactionEngine engine(domain);
+  framework::ResourceBindings bindings;
+  uint64_t count = 100;
+  std::optional<uint64_t> capacity = 100;
+  std::vector<std::unique_ptr<FillResource>> resources;
+  for (size_t i = 0; i < ResourceFillWatch::kStopCheckEvery + 1; i++) {
+    resources.push_back(
+        std::make_unique<FillResource>("mod/t" + std::to_string(i), &count, &capacity));
+    ASSERT_TRUE(engine.Register(resources.back().get()).has_value());
+  }
+  ResourceFillWatch fills(engine, bindings);
+  const auto first = fills.Sweep([] { return true; });
+  EXPECT_TRUE(first.incomplete);
+  EXPECT_EQ(0u, first.visited);
+  EXPECT_TRUE(first.crossed.empty());
+  const auto tail = fills.Sweep([] { return true; });
+  EXPECT_FALSE(tail.incomplete);
+  EXPECT_EQ(0u, tail.visited);
+  EXPECT_TRUE(tail.crossed.empty());
 }
 
 TEST(ResourceFillWatchLevel, IsTheFirstCountThatReachesTheLevel) {

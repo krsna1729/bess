@@ -3,6 +3,7 @@
 
 #include "module.h"
 #include "module_graph.h"
+#include "packet_pool.h"
 #include "traffic_class.h"
 
 #include <stdlib.h>
@@ -444,4 +445,36 @@ TEST_F(ModuleTester, SetIGatePriority) {
   EXPECT_EQ(6, m5->igates()[0]->global_gate_index());
   EXPECT_EQ(7, m6->igates()[0]->global_gate_index());
 }
+
+TEST_F(ModuleTester, WorkerBookkeepingDoesNotErasePacketDrops) {
+  pb_error_t error;
+  Module *module = create_acme("drop_history", &error);
+  ASSERT_NE(nullptr, module);
+  bess::PlainPacketPool pool(16);
+  bess::PacketBatch batch;
+  batch.clear();
+  for (int i = 0; i < 3; i++) {
+    const auto packet = pool.Alloc();
+    ASSERT_NE(nullptr, packet);
+    batch.add(bess::PacketRef(packet));
+  }
+  Context context{};
+  context.wid = bess::dataplane::WorkerId(0);
+  module->RunChooseModule(&context, 0, &batch);  // no connected output
+  ASSERT_EQ(0, batch.cnt());
+  ASSERT_EQ(3u, module->deadends());
+
+  ModuleGraph::PropagateActiveWorker();
+  EXPECT_EQ(3u, module->deadends());
+
+  // A later placement can use a sparse slot without losing the former plane.
+  const auto packet = pool.Alloc();
+  ASSERT_NE(nullptr, packet);
+  batch.add(bess::PacketRef(packet));
+  context.wid =
+      bess::dataplane::WorkerId(static_cast<uint16_t>(Worker::kMaxWorkers - 1));
+  module->RunChooseModule(&context, 0, &batch);
+  EXPECT_EQ(4u, module->deadends());
+}
+
 }  // namespace

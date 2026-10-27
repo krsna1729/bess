@@ -442,6 +442,27 @@ The SDKs' `WatchCounters` (Go) and `watch_counters` (Python) narrow the stream t
 crossings and parse their fields (`docs/control-sdk.md`), so a controller need not know this
 shape; a gap in the log or a restart ends that watch with an error rather than passing it over.
 
+**Shared observation.** `ListMetrics`, `bessctl metrics` and HTTP `/metrics`
+include these framework observations without a module registering a source:
+
+| Metric | Kind | Label | Meaning |
+|---|---|---|---|
+| `bess_module_drops_total` | counter | `module` | Packets recorded by the module's drop and forwarding helpers, including unconnected outputs |
+| `bess_resource_entries` | gauge | `resource` | The reachable resource's `LiveCount()` |
+| `bess_resource_capacity` | gauge | `resource` | Its stated `Capacity()`; omitted, not zero, when no capacity is stated |
+
+The drop total lasts for the module instance's lifetime. Placement bookkeeping
+does not reset it. The base uses `KeyedCounters` with one aggregate key and cell,
+and a plane for every possible worker slot: worker IDs can be sparse and old
+workers' contributions must survive later placement changes. Reads are safe
+while workers count; the total is a sum of per-worker observations, not one
+global instant. Module-specific loss reports remain separate; this does not
+assign a common drop-reason taxonomy.
+
+Resource metrics and `GetResourceStatus` use the same codec-bound reachability.
+They report configured resources, not an inferred ceiling for every runtime
+flow table.
+
 **Fill levels.** A resource is watched by the daemon itself, with no module involvement: on its maintenance
 tick it reads every reachable resource's `LiveCount()` against its level -- the count the resource states in
 `FillLevel()`, or the first count that reaches 80% of its `Capacity()` when `FillLevel()` is unstated (D-165,
@@ -453,6 +474,10 @@ reachable and come back, which is a new table). A resource that states neither a
 tuple space that grows with the workload) is not watched, and a table that fills and drains inside one tick is
 not seen: this samples. The sweep runs with the control-plane lock held, like a module's tick, so a table
 filling up is reported without a controller polling `GetResourceStatus`.
+The sweep resumes after its last examined name when its slice expires, rather
+than restarting at the first resource. Unbound names also consume the slice.
+Names inserted before the cursor are visited in the next pass; crossing history
+for surviving resources is retained across partial passes (D-193).
 
 **Where a module's counters live.** A module's counters are per key and per worker, and the shared
 structure for them is `stats::KeyedCounters` (`stats/keyed_counters.h`, experimental, D-154):

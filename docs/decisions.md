@@ -168,6 +168,7 @@ file is the reasoning.
 | D-146 | C++, Python and Go are all first-class control_v2 SDKs, and the Python one is rebuilt clean-room: a fresh client taking `pybess.sdk`'s place - the same transaction discipline (one request id per logical transaction, recovery through `GetTransaction`, the daemon epoch, typed resources and typed outcomes) over the same wire, with no legacy service and no place in the runtime package (D-135). It amends D-104's count of two supported SDKs | accepted |
 | D-147 | The firewall table: a masked 5-tuple policy where a port range costs no tuple (the ports are checked after the group's masked key, so a range adds no group, no mask and no entry - what WildcardMatch cannot do without spending 2n-2 prefixes per field of its budget, D-102), IPv4 and IPv6 in one table (the family is part of a group's identity, so a v4 rule never sees a v6 packet and a rule with no prefix sees both), the first match in rule order wins, and a packet the table cannot judge is dropped rather than passed by a catch-all; the module publishes the whole policy as one `<name>/rules` singleton (D-129). Amended 2026-10-18: the same policy can be **scanned** (`FirewallScan`) rather than indexed, sharing the index's predicate, validation and normalization so the two cannot drift | accepted; the module's singleton superseded by D-179 |
 | D-148 | The desired-state clear is bounded in the daemon, not in the client: a listed resource owns its contents, so an empty list clears a map, and today that is one transaction with one op per entry - refused whole by the engine's retire budget (`retire_high_water()/2`, "split it"). `TransactionEngine::ApplyBatched` applies what fits and halves on the budget refusal, and `ApplyResourcesLocked` calls it; convergence rather than atomicity, and the busy retry moves inside it because a caller looping over the whole request would re-apply batches that already applied, an erase of an already-erased key being refused ("not found"), not ignored | accepted |
+| D-193 | Shared module-drop and resource-occupancy metrics; lifetime drop counters use KeyedCounters, and bounded resource-fill sweeps resume by name | accepted |
 
 
 ---
@@ -11422,7 +11423,7 @@ which compare `route_count()`/`route_writes()` across a neighbor move and still 
 
 ## D-165 The daemon watches every resource's fill against its stated capacity
 
-**Status:** accepted (2026-10-19; the plan's item: "the built-in fill-level watch for every resource").
+**Status:** accepted (2026-10-19; the plan's item: "the built-in fill-level watch for every resource"). The restart-at-beginning walk is **superseded by D-193**; the level and event contract remain.
 
 **Decision.** The maintenance loop sweeps the registered resources every tick, under the control-plane lock,
 in a time slice of its own taken after the modules' tick endpoints have run (`control/resource_fill.h`,
@@ -13512,3 +13513,57 @@ parse cache, graph variant or new NIC fast path.
 
 **Revisit when:** profiling still shows a material repeated-check cost and a concrete graph or
 port configuration supplies the proof the checked path currently provides.
+
+## D-193 Shared observations and resumable resource-fill sweeps
+
+**Status:** accepted (2026-10-27). Extends D-076 and D-116; supersedes D-165's
+restart-at-beginning walk, not its level or event semantics.
+**Code:** `core/module.h`, `core/control/{api_v2,dataplane_transactions}.{h,cc}`,
+`core/control/resource_fill.h`.
+**Reference:** [plugin-api.md](plugin-api.md), shared observation and fill levels.
+
+**Context.** Operational counters and resource status were separate surfaces.
+The framework's module-drop array was read while workers wrote plain cells,
+and active-worker bookkeeping cleared it even when workers could be running.
+A permanently short fill-watch slice repeatedly visited only the same prefix
+of the resource list.
+
+**Decision.**
+- Expose `bess_module_drops_total{module}` as a counter and
+  `bess_resource_entries{resource}` / `bess_resource_capacity{resource}` as gauges
+  through the existing `ListMetrics` API and exporters. An unstated capacity is
+  omitted, never invented as zero.
+- Reuse the existing `KeyedCounters` primitive for the base module's aggregate
+  drop count. Workers own their planes; control reads relaxed atomic cells.
+  Count for the instance's lifetime, including contributions from worker slots
+  that no longer run the module. Updating placement does not erase history.
+  No new counter API or module-author registration is required.
+- Resource status and resource metrics share one codec-bound traversal in
+  `DataplaneTransactions`, including services constructed with a private engine.
+- Resume a stopped fill sweep after its last examined resource name. Charge
+  unbound names to the slice too. Names inserted before the cursor wait for the
+  next pass; a completed pass removes history for resources no longer reachable.
+  Keep surviving resources' history across partial passes. The existing level,
+  once-per-crossing event and sampling limitations are unchanged.
+
+**Evidence.** Before/after runtime probes:
+
+| Probe | Before | After |
+|---|---:|---:|
+| Resources reported after three always-exhausted slices, 40 real scope resources | 32 | 40 |
+| Drop total after active-worker propagation, three packets dropped | 0 | 3 |
+
+Six focused Meson suites passed: module, statistics, resource fill, maintenance
+loop, dataplane transactions and the control API. The fill tests also cover
+removal and insertion before a live cursor, history retention, and unbound-name
+budgeting. A private real daemon, configured through the native CLI, reported
+traffic drops, one entry in a configured 32-entry table, and no capacity sample
+for a growable ExactMatch resource. Raw probes are under `.scratch/` in the
+development workspace; no throughput improvement is claimed.
+
+**Consequences.** Base drop accounting allocates no packet-path memory and uses
+no locked RMW. It reserves a cache-line-separated plane for each possible worker
+slot, rather than deriving storage from the currently active worker count.
+Framework drops do not replace module-specific loss reports or define a shared
+reason taxonomy. The protobuf schema and SDK generation are unchanged.
+

@@ -55,6 +55,18 @@ class DataplaneTransactions {
   // resource without a codec is not reported.
   pb::v2::GetResourceStatusResponse ResourceStatus() const;
 
+  // Observation uses the same codec-bound reachability as the control API.
+  // The visitor runs under the caller's control-plane lock.
+  template <typename Visit>
+  void VisitReachableResources(Visit &&visit) const {
+    for (const std::string &name : engine_.ResourceNames()) {
+      const dataplane::Resource *resource = engine_.FindResource(name);
+      if (resource != nullptr && bindings_.Find(*resource) != nullptr) {
+        visit(*resource);
+      }
+    }
+  }
+
   uint64_t epoch() const { return epoch_; }
   size_t records() const { return records_.size(); }
 
