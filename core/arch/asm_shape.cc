@@ -34,6 +34,7 @@
 #include "arch/tag_match.h"
 #include "classifier/firewall_kernels.h"
 #include "l2/mac_table_kernels.h"
+#include "modules/firewall_key_kernels.h"
 #include "modules/macswap_kernels.h"
 #include "modules/vlan_kernels.h"
 #include "packet_parse.h"
@@ -99,6 +100,11 @@ extern "C" {
 
 [[gnu::noinline]] void k_macswap(void *p, size_t head_len) {
   bess::macswap::Swap(p, head_len);
+}
+
+[[gnu::noinline]] void k_firewall_key(const uint8_t *frame, void *src, void *dst,
+                                    uint16_t &src_port, uint16_t &dst_port) {
+  bess::firewall_key::Gather(frame, src, dst, src_port, dst_port);
 }
 
 }  // extern "C"

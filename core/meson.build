@@ -818,6 +818,7 @@ unit_test_sources = [
   'module_test.cc',
   'modules/acl_test.cc',
   'modules/firewall_test.cc',
+  'modules/firewall_key_kernels_test.cc',
   'modules/arp_responder_test.cc',
   'modules/bridge_test.cc',
   'modules/bpf_test.cc',
