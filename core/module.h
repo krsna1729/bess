@@ -10,6 +10,7 @@
 #include <expected>
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -30,6 +31,10 @@
 #include "task.h"
 #include "packet_pool.h"
 #include "worker.h"
+
+namespace bess::stats {
+class MetricWriter;
+}  // namespace bess::stats
 
 using bess::gate_idx_t;
 
@@ -557,6 +562,13 @@ class alignas(bess::arch::kCacheLineSize) Module {
   bess::stats::KeyedCounters deadends_;
 
  protected:
+  // Common reporting shape for owner-specific operational counters. An
+  // observation can include punts or task runs; it is not necessarily a loss.
+  void WriteObservation(
+      bess::stats::MetricWriter &writer, std::string_view observation,
+      uint64_t value,
+      std::optional<bess::dataplane::WorkerId> worker = std::nullopt) const;
+
   // Set of active workers accessing this module.
   std::vector<bool> active_workers_;
   // Set of tasks we have already accounted for when propagating workers.

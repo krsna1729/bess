@@ -16,6 +16,7 @@
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "stats/event_throttle.h"
+#include "stats/metric_registry.h"
 
 class Queue : public Module {
  public:
@@ -128,6 +129,7 @@ class Queue : public Module {
     std::atomic<uint64_t> dequeued;
     std::atomic<uint64_t> dropped;
   } stats_;
+  bess::stats::MetricSource observations_;
 
   bess::pb::QueueArg init_arg_;
   // Packets dropped because the ring was full (M25, D-089).

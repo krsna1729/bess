@@ -169,6 +169,7 @@ file is the reasoning.
 | D-147 | The firewall table: a masked 5-tuple policy where a port range costs no tuple (the ports are checked after the group's masked key, so a range adds no group, no mask and no entry - what WildcardMatch cannot do without spending 2n-2 prefixes per field of its budget, D-102), IPv4 and IPv6 in one table (the family is part of a group's identity, so a v4 rule never sees a v6 packet and a rule with no prefix sees both), the first match in rule order wins, and a packet the table cannot judge is dropped rather than passed by a catch-all; the module publishes the whole policy as one `<name>/rules` singleton (D-129). Amended 2026-10-18: the same policy can be **scanned** (`FirewallScan`) rather than indexed, sharing the index's predicate, validation and normalization so the two cannot drift | accepted; the module's singleton superseded by D-179 |
 | D-148 | The desired-state clear is bounded in the daemon, not in the client: a listed resource owns its contents, so an empty list clears a map, and today that is one transaction with one op per entry - refused whole by the engine's retire budget (`retire_high_water()/2`, "split it"). `TransactionEngine::ApplyBatched` applies what fits and halves on the budget refusal, and `ApplyResourcesLocked` calls it; convergence rather than atomicity, and the busy retry moves inside it because a caller looping over the whole request would re-apply batches that already applied, an erase of an already-erased key being refused ("not found"), not ignored | accepted |
 | D-193 | Shared module-drop and resource-occupancy metrics; lifetime drop counters use KeyedCounters, and bounded resource-fill sweeps resume by name | accepted |
+| D-194 | Shared owner-counter reporting with module/observation labels; preserve drop, punt and task-run meanings without packet-path changes | accepted |
 
 
 ---
@@ -9756,6 +9757,10 @@ two-operation transaction publishing both entries; live, a daemon with a two-wor
 workers ran, `release` moved the store's gate 0 from 0 to 64, an erase applied with `0 operation(s)` and read back as
 `[]`, and `ps/flows` was listed without the paused flag while `rewrite0/templates` still carries it.
 
+**Metric-name update (2026-10-27):** D-194 supersedes the two PacketStore
+metric names in this historical amendment. Its recorded runtime evidence keeps
+the names that were actually observed; new consumers use shared observations.
+
 **Amendment (2026-10-18): expiry is enforced on the owner's run, at a bounded cost.** The timeout was checked
 only when the store was at its `max_packets` bound, so a held packet could outlive its flow's timeout
 indefinitely while the store stayed under the bound - which is what a client that buffers against a policy
@@ -13573,4 +13578,55 @@ no locked RMW. It reserves a cache-line-separated plane for each possible worker
 slot, rather than deriving storage from the currently active worker count.
 Framework drops do not replace module-specific loss reports or define a shared
 reason taxonomy. The protobuf schema and SDK generation are unchanged.
+
+## D-194 Shared reporting for owner-specific counters
+
+**Status:** accepted (2026-10-27). Extends D-076 and D-193; supersedes the
+DRR and PacketStore metric-family names, not their counter meanings.
+**Code:** `core/module.{h,cc}`, `core/modules/{drr,packet_store,queue,router}`.
+**Reference:** [plugin-api.md](plugin-api.md), owner observations.
+
+**Context.** Queue and Router kept useful atomic counters behind owner-specific
+status or description interfaces. DRR and PacketStore already registered metric
+sources, but every owner chose a different family. A universal label called
+"drop reason" would also be wrong: Router counts misses that can be punted and
+local frames that are delivered, while DRR counts task executions.
+
+**Decision.** Report these existing counters through
+`bess_module_observations_total{module,observation}`. Preserve DRR's worker
+dimension. The base's protected `WriteObservation` formats the common family;
+the owner registers and owns its `MetricSource`. Register only after successful
+initialization and reset before teardown releases the observed state.
+
+Queue exports accepted, drained and ring-full packet counts. PacketStore keeps
+requested drops separate from ingress refusal. Router exports its thirteen
+existing diagnostic counters, including punts and local delivery under their
+own names. DRR keeps historical per-worker task-run contributions. No packet
+processing, counter update, ownership or reset policy changes.
+
+The prior DRR and PacketStore families are removed with no aliases. Live
+placement consumers migrate to the new family and observation label. Existing
+wire messages and SDK schemas do not change. Per-flow NAT usage still uses its
+bounded usage-report interface; it is not expanded into unbounded metric labels.
+
+**Evidence.** Seven focused native programs passed: Queue, Router, PacketStore,
+DRR, module, metric registry and control API. The complete live metrics program
+passed, including moving DRR's task between workers and retaining the former
+worker's count. Both the API suite and the live gate test require CPU 0; runs
+used six-CPU affinity sets that include it.
+
+A separate real daemon ran Source -> Queue -> DRR -> PacketStore and a Router
+input. CLI and HTTP exposed the same 19 unique owner samples. A requested drop
+freed 64 stored packets; ring-full losses, Router rejects and worker-1 DRR runs
+were observed. The old metric families were absent. The daemon shut down
+cleanly. Raw evidence is `.scratch/owner-observations-smoke-results.json`.
+No throughput improvement is claimed.
+
+**Consequences.** A controller can collect fixed owner counters through the
+same metrics surface and label shape without parsing descriptions or invoking
+module actions. Observation names retain owner semantics: they are not a global
+drop taxonomy, and adding them together does not produce a packet-loss total.
+Collection neither resets counters nor promises one global instant. The
+framework drop total remains a separate observation with its narrower helper
+coverage (D-193).
 

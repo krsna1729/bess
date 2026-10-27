@@ -463,6 +463,30 @@ Resource metrics and `GetResourceStatus` use the same codec-bound reachability.
 They report configured resources, not an inferred ceiling for every runtime
 flow table.
 
+**Owner observations.** Module-specific counters use
+`bess_module_observations_total{module,observation}` (D-194). DRR also keeps
+its `worker` label: those series are per worker, not an aggregate to add again.
+The built-in owners report:
+
+| Owner | Observations | Meaning |
+|---|---|---|
+| Queue | `enqueued_packets`, `dequeued_packets`, `queue_full_packets` | Accepted, drained, or refused because the ring was full |
+| PacketStore | `requested_drop_packets`, `ingress_dropped_packets` | Freed by a requested drop, or refused by a full ingress ring |
+| DRR | `task_runs` | Task executions on the named worker, including its historical contribution after placement moves |
+| Router | `header_write_failures`, `not_ip_frames`, `malformed_frames`, `non_initial_fragments`, `no_route_frames`, `unresolved_frames`, `ttl_expired_frames`, `blackholed_frames`, `local_frames`, `family_disabled_frames`, `link_scope_frames`, `neighbor_requests`, `neighbor_input_drops` | The owner's existing diagnostic counts; several include punts or local delivery, not only drops |
+
+Do not sum all observations as packet losses: a queue can enqueue and dequeue
+the same packet, and a router can count a lookup miss that it punts. Nor should
+these be added blindly to the framework drop total. Owners keep their meanings
+and synchronization; collection does not reset their counters. Reads do not
+promise a globally simultaneous snapshot.
+
+A module registers its callback through `init_context().metrics()` and calls
+the protected `WriteObservation(writer, observation, count, optional_worker)`.
+Its `MetricSource` must be declared after the counters it reads and reset before
+teardown releases them. Packet processing does not register sources or format
+metrics. The old DRR and PacketStore metric families are replaced, not aliased.
+
 **Fill levels.** A resource is watched by the daemon itself, with no module involvement: on its maintenance
 tick it reads every reachable resource's `LiveCount()` against its level -- the count the resource states in
 `FillLevel()`, or the first count that reaches 80% of its `Capacity()` when `FillLevel()` is unstated (D-165,

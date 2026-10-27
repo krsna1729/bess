@@ -14,6 +14,7 @@
 #include "gate.h"
 #include "module_graph.h"
 #include "scheduler.h"
+#include "stats/metric_registry.h"
 #include "task.h"
 #include "utils/pcap.h"
 
@@ -132,6 +133,21 @@ CommandResponse Module::Init(const bess::pb::EmptyArg &) {
 }
 
 void Module::DeInit() {}
+
+void Module::WriteObservation(
+    bess::stats::MetricWriter &writer, std::string_view observation,
+    uint64_t value, std::optional<bess::dataplane::WorkerId> worker) const {
+  std::vector<std::pair<std::string, std::string>> labels;
+  labels.reserve(worker ? 3 : 2);
+  labels.emplace_back("module", name());
+  labels.emplace_back("observation", observation);
+  if (worker) {
+    labels.emplace_back("worker", std::to_string(worker->value()));
+  }
+  writer.Counter("bess_module_observations_total",
+                 "Owner-defined operational counts; not necessarily packet drops",
+                 static_cast<double>(value), std::move(labels));
+}
 
 struct task_result Module::RunTask(Context *, bess::PacketBatch *, void *) {
   CHECK(0);  // You must override this function
