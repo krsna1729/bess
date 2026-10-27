@@ -190,29 +190,36 @@ TEST(PacketCopyTest, CopiesBytesWithoutBessPrivateMetadata) {
   bess::PacketFree(src);
 }
 
-// The explicit variants carry the private metadata; the payload-only ones
-// above leave it zeroed. The scratchpad is never copied.
+// Both explicit variants carry all metadata in an independent private area.
 TEST(PacketCopyTest, CopyAndCloneWithMetadataCarryThePrivateBytes) {
   bess::PlainPacketPool pool(16);
   bess::PacketHandle src = pool.Alloc();
   ASSERT_NE(src, nullptr);
   bess::PacketRef src_ref(src);
   ASSERT_NE(src_ref.append(4), nullptr);
-  src_ref.metadata<uint32_t *>()[0] = 0x12345678;
-  src_ref.scratchpad<uint32_t *>()[0] = 0x9abcdef0;
+  std::array<uint8_t, SNBUF_METADATA> metadata;
+  for (size_t i = 0; i < metadata.size(); i++) {
+    metadata[i] = static_cast<uint8_t>(17 * i + 3);
+  }
+  std::copy(metadata.begin(), metadata.end(), src_ref.metadata<uint8_t *>());
+  src_ref.scratchpad<uint32_t *>()[0] = 0x9abcdef0u;
 
-  bess::PacketHandle copied = bess::PacketCopyWithMetadata(src);
-  ASSERT_NE(copied, nullptr);
-  bess::PacketRef copied_ref(copied);
-  EXPECT_EQ(copied_ref.metadata<uint32_t *>()[0], 0x12345678);
-  EXPECT_EQ(copied_ref.scratchpad<uint32_t *>()[0], 0) << "scratch is not copied";
-  bess::PacketFree(copied);
-
-  bess::PacketHandle cloned = bess::PacketCloneWithMetadata(src);
-  ASSERT_NE(cloned, nullptr);
-  bess::PacketRef cloned_ref(cloned);
-  EXPECT_EQ(cloned_ref.metadata<uint32_t *>()[0], 0x12345678);
-  bess::PacketFree(cloned);
+  const auto check_metadata = [&](bess::PacketHandle duplicate) {
+    ASSERT_NE(duplicate, nullptr);
+    bess::PacketRef duplicate_ref(duplicate);
+    EXPECT_TRUE(std::equal(metadata.begin(), metadata.end(),
+                           duplicate_ref.metadata<uint8_t *>()));
+    EXPECT_NE(src_ref.scratchpad<uint32_t *>()[0],
+              duplicate_ref.scratchpad<uint32_t *>()[0])
+        << "module-owned scratch must not propagate with metadata";
+    duplicate_ref.metadata<uint8_t *>()[SNBUF_METADATA - 1] ^= 0xffu;
+    EXPECT_TRUE(std::equal(metadata.begin(), metadata.end(),
+                           src_ref.metadata<uint8_t *>()))
+        << "changing a copy's metadata must not change the source";
+    bess::PacketFree(duplicate);
+  };
+  check_metadata(bess::PacketCopyWithMetadata(src));
+  check_metadata(bess::PacketCloneWithMetadata(src));
 
   bess::PacketFree(src);
 }

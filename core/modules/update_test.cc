@@ -106,28 +106,41 @@ TEST(UpdateTest, FieldsResourceReplacesTheList) {
   EXPECT_EQ("", h.ReadBackDiffers(fields, {{nullptr, &none}}));
 }
 
-// The init path and the resource path refuse the same lists. Init used to
-// index fields_ (16 entries) with no limit check, so a longer list walked
-// past it; the other two were accepted here and refused by the resource.
-TEST(UpdateTest, InitRefusesWhatTheResourceRefuses) {
+// The same fields must produce the same bytes through either configuration
+// path. Refused replacements must leave the last accepted fields active.
+TEST(UpdateTest, InitAndResourceAgreeOnBehaviorAndValidation) {
   ModuleHarness h;
+  const auto fields = Fields({{.offset = 0, .size = 2, .value = 0xabcd},
+                              {.offset = 59, .size = 1, .value = 0x81}});
+  Module *initialized = h.Create("Update", fields);
+  Module *transactional = h.Create("Update", bess::pb::UpdateArg());
+  ASSERT_NE(nullptr, initialized);
+  ASSERT_NE(nullptr, transactional);
+  const std::string resource = transactional->name() + "/fields";
+  ASSERT_EQ("", h.SetResource(resource, fields));
+  const Bytes input(60, 0x55);
+  Bytes expected = input;
+  expected[0] = 0xab;
+  expected[1] = 0xcd;
+  expected[59] = 0x81;
+  EXPECT_EQ(expected, Through(h, initialized, input));
+  EXPECT_EQ(expected, Through(h, transactional, input));
+
   bess::pb::UpdateArg too_many;
   for (int i = 0; i < 17; i++) {
     too_many.MergeFrom(Fields({{.offset = i, .size = 1, .value = 1}}));
   }
-  EXPECT_NE("", h.CreateError("Update", too_many)) << "17 fields";
-  EXPECT_NE("", h.CreateError(
-                    "Update", Fields({{.offset = -1, .size = 1, .value = 1}})))
-      << "negative offset";
-  EXPECT_NE("", h.CreateError(
-                    "Update", Fields({{.offset = 0, .size = 1, .value = 0x142}})))
-      << "value wider than size";
-  // The top bound must not be `offset + size`: this one overflows int64_t and
-  // used to be accepted.
-  EXPECT_NE("", h.CreateError(
-                    "Update",
-                    Fields({{.offset = INT64_MAX, .size = 8, .value = 1}})))
-      << "offset at INT64_MAX";
+  const std::vector<bess::pb::UpdateArg> invalid = {
+      too_many,
+      Fields({{.offset = -1, .size = 1, .value = 1}}),
+      Fields({{.offset = 0, .size = 1, .value = 0x142}}),
+      Fields({{.offset = INT64_MAX, .size = 8, .value = 1}})};
+  for (const auto &configuration : invalid) {
+    SCOPED_TRACE(configuration.ShortDebugString());
+    EXPECT_NE("", h.CreateError("Update", configuration));
+    EXPECT_NE("", h.SetResource(resource, configuration));
+    EXPECT_EQ(expected, Through(h, transactional, input));
+  }
 }
 
 // A field writes its own bytes and nothing else, including at the last byte

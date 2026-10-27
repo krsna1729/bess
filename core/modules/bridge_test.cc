@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <any>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "l2/fdb.h"
 #include "module.h"
 #include "module_graph.h"
 #include "modules/bridge.h"
@@ -199,53 +201,6 @@ TEST_F(BridgeTest, DynamicMacLearningAndForwarding) {
   }
 }
 
-TEST_F(BridgeTest, HairpinFiltering) {
-  BridgeArg arg;
-  Bridge *br = CreateBridge(arg);
-  ASSERT_NE(nullptr, br);
-
-  const auto &builders = ModuleBuilder::all_module_builders();
-  Module *sink0 = ModuleGraph::CreateModule(builders.find("Sink")->second,
-                                            "sink0", {}, nullptr);
-  ASSERT_EQ(0, ModuleGraph::ConnectModules(br, 0, sink0, 0));
-
-  PlainPacketPool pool(16);
-  Task task(br, nullptr);
-
-  // Add static entry for Host A on Gate 0
-  ModuleHarness h;
-  EXPECT_EQ("", h.UpsertResource(br->name() + "/statics",
-                                 StaticKey("02:00:00:00:00:01"),
-                                 StaticValue(0)));
-
-  // Packet arrives on Gate 0 destined for Host A (same gate) -> Hairpin filter drops it!
-  bess::PacketHandle pkt = pool.Alloc();
-  ASSERT_NE(nullptr, pkt);
-  PacketRef ref(pkt);
-  uint8_t raw[64];
-  std::memset(raw, 0, sizeof(raw));
-  Ethernet::Address host_a;
-  host_a.FromString("02:00:00:00:00:01");
-  Ethernet::Address other;
-  other.FromString("02:00:00:00:00:99");
-  std::memcpy(raw, host_a.bytes, 6);
-  std::memcpy(raw + 6, other.bytes, 6);
-  raw[12] = 0x08;
-  raw[13] = 0x00;
-  std::memcpy(ref.append(sizeof(raw)), raw, sizeof(raw));
-
-  PacketBatch batch;
-  batch.clear();
-  batch.add(ref);
-
-  Context ctx{};
-  ctx.current_tsc = rdtsc();
-  ctx.wid = bess::dataplane::WorkerId(0);
-  ctx.task = &task;
-  ctx.current_igate = 0;
-  br->ProcessBatch(&ctx, &batch);
-  // Packet was dropped by hairpin filtering
-}
 
 // Static programming through the resource: DROP_GATE is accepted (a
 // blackholed MAC), a multicast MAC is refused, and statics beyond `size` plus
@@ -320,6 +275,50 @@ TEST(BridgeResourceTest, StaticsSteerTrafficAndReadBack) {
   EXPECT_EQ(1u, out[2].size());
   EXPECT_EQ("", h.ReadBackDiffers(statics, {}));
   EXPECT_NE("", h.EraseResource(statics, key));  // not found
+}
+
+// Compare the packed-table module with the standalone FDB's other storage
+// implementation. Gate zero is a real interface; the drop gate is a blackhole.
+TEST(BridgeResourceTest, StandaloneFdbAndModuleAgreeAcrossStaticTransitions) {
+  ModuleHarness h;
+  Module *bridge = h.Create("Bridge", BridgeArg());
+  ASSERT_NE(nullptr, bridge);
+  const std::string statics = bridge->name() + "/statics";
+  auto created = bess::l2::Fdb::Create({.capacity = 16, .max_domains = 1});
+  ASSERT_TRUE(created.has_value());
+  auto &reference = **created;
+  const bess::l2::BridgeDomainId domain(0);
+  const bess::l2::MacAddress destination{{0x02, 0, 0, 0, 0, 0x02}};
+  const BridgeStaticKey key = StaticKey("02:00:00:00:00:02");
+  const std::vector<Bytes> packet = {AToB()};
+  const std::vector<Bytes> empty;
+  const std::vector<gate_idx_t> captured = {0, 1, MAX_GATES - 1};
+  constexpr gate_idx_t ingress = 1;
+  const auto check = [&] {
+    const auto interface = reference.Lookup(domain, destination);
+    auto out = h.Run(bridge, ingress, packet, captured);
+    for (const gate_idx_t gate : captured) {
+      const bool delivered =
+          gate != ingress &&
+          (interface == bess::dataplane::kInvalidInterfaceId ||
+           interface == bess::dataplane::InterfaceId(
+                            static_cast<uint16_t>(gate + 1)));
+      EXPECT_EQ(delivered ? packet : empty, out[gate]) << "gate " << gate;
+    }
+  };
+  check();  // A miss floods, excluding the ingress.
+  for (const gate_idx_t gate :
+       std::array<gate_idx_t, 4>{0, MAX_GATES - 1, DROP_GATE, ingress}) {
+    const bess::dataplane::InterfaceId interface(
+        static_cast<uint16_t>(gate + 1));
+    (void)reference.AddStatic(domain, destination, interface);
+    ASSERT_EQ(interface, reference.Lookup(domain, destination));
+    ASSERT_EQ("", h.UpsertResource(statics, key, StaticValue(gate)));
+    check();  // Includes a blackhole and a static hairpin.
+  }
+  ASSERT_TRUE(reference.Remove(domain, destination));
+  ASSERT_EQ("", h.EraseResource(statics, key));
+  check();  // Removing the static restores flooding.
 }
 
 // The read-back is canonical: a MAC upserted in upper case reads back in

@@ -231,3 +231,30 @@ The layers and the enforced edges are in architecture.md §1-2;
   `CodelClock` still uses the calibrated cycle counter, with no type-erased
   call or extra state. CoDel's delay/drop tests advance a manual clock and
   keep their delivery/drop assertions, including the exact window boundary.
+
+## 7. Shared conformance checks
+
+Use the existing in-process module harness to exercise packet outcomes and
+the real resource codecs and transaction engine. Compare against an explicit
+expected result, not only agreement between two paths that could both be wrong.
+
+| Contract | Existing coverage |
+|---|---|
+| Init and resource configuration agree | `core/modules/update_test.cc`: identical fields produce identical packet bytes; both paths reject the same invalid lists, and a refused replacement leaves the accepted fields active |
+| Accepted publication cannot partly fail | `core/modules/transaction_conformance_test.cc`: staging-allocation failures abort reservations and publication allocates nothing; `core/modules/bridge_test.cc` covers full-table reservation and rollback |
+| Metadata survives copying | `core/packet_test.cc`: all metadata bytes survive copy and clone, with independent private storage; `core/modules/replicate_test.cc`: a real SetMetadata → Replicate → GenericEncap graph preserves the value on both branches |
+| Packet bounds and ownership hold | The Update, RandomUpdate and SetMetadata module suites exercise short and chained packets; mutation tests also retain the shared original's bytes |
+| A library and its adapter agree | `core/modules/bridge_test.cc`: standalone FDB and packed-table Bridge decisions agree across misses, static moves, gate zero, the highest normal gate, blackholes, hairpins and removal |
+
+The Bridge comparison keeps the adapter's existing contract: one private
+bridge domain per module instance, with gate `g` represented as interface
+`g + 1`. It does not add per-packet bridge-domain selection.
+
+Run these suites with the configured build:
+
+```
+meson test -C build/fast --print-errorlogs \
+  modules_update_test modules_random_update_test modules_set_metadata_test \
+  modules_transaction_conformance_test modules_bridge_test \
+  modules_replicate_test packet_test metadata_test
+```
