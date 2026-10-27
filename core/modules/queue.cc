@@ -193,10 +193,20 @@ CommandResponse Queue::Init(const bess::pb::QueueArg &arg) {
   if (!registered) {
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
+  observations_ = init_context().metrics().Register(
+      [this](bess::stats::MetricWriter &writer) {
+        WriteObservation(writer, "enqueued_packets",
+                         stats_.enqueued.load(std::memory_order_relaxed));
+        WriteObservation(writer, "dequeued_packets",
+                         stats_.dequeued.load(std::memory_order_relaxed));
+        WriteObservation(writer, "queue_full_packets",
+                         stats_.dropped.load(std::memory_order_relaxed));
+      });
   return CommandSuccess();
 }
 
 void Queue::DeInit() {
+  observations_.Reset();
   settings_.Release();
 
   bess::PacketHandle pkt;

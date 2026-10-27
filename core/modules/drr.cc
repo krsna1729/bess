@@ -196,10 +196,9 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
           if (runs == 0) {
             continue;  // a worker that never ran the task is not a series
           }
-          writer.Counter("bess_drr_task_runs_total",
-                         "Runs of the module's task, by the worker that ran it",
-                         static_cast<double>(runs),
-                         {{"module", name()}, {"worker", std::to_string(wid)}});
+          WriteObservation(
+              writer, "task_runs", runs,
+              bess::dataplane::WorkerId(static_cast<uint16_t>(wid)));
         }
       });
   return CommandSuccess();

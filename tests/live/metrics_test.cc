@@ -181,8 +181,8 @@ TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   const auto paused_first = client().PauseWorkers();
   ASSERT_TRUE(paused_first) << paused_first.error().message;
 
-  const auto before = Value(Metrics(), "bess_drr_task_runs_total",
-                            {{"module", "drr"}, {"worker", "0"}});
+  const auto before = Value(Metrics(), "bess_module_observations_total",
+                            {{"module", "drr"}, {"observation", "task_runs"}, {"worker", "0"}});
   ASSERT_TRUE(before) << "the DRR's task ran on worker 0";
   EXPECT_GT(before.value_or(-1), 0);
 
@@ -201,11 +201,11 @@ TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   const auto paused_after_move = client().PauseWorkers();
   ASSERT_TRUE(paused_after_move) << paused_after_move.error().message;
 
-  const auto settled = Value(Metrics(), "bess_drr_task_runs_total",
-                             {{"module", "drr"}, {"worker", "0"}});
+  const auto settled = Value(Metrics(), "bess_module_observations_total",
+                             {{"module", "drr"}, {"observation", "task_runs"}, {"worker", "0"}});
   ASSERT_TRUE(settled) << "the worker-0 series went away";
-  const auto moved = Value(Metrics(), "bess_drr_task_runs_total",
-                           {{"module", "drr"}, {"worker", "1"}});
+  const auto moved = Value(Metrics(), "bess_module_observations_total",
+                           {{"module", "drr"}, {"observation", "task_runs"}, {"worker", "1"}});
   ASSERT_TRUE(moved) << "the DRR's task did not run on worker 1 after the move";
   EXPECT_GT(moved.value_or(-1), 0);
 
@@ -214,8 +214,8 @@ TEST_F(MetricsTest, TaskRunsFollowThePlacement) {
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   const auto paused_after = client().PauseWorkers();
   ASSERT_TRUE(paused_after) << paused_after.error().message;
-  const auto after0 = Value(Metrics(), "bess_drr_task_runs_total",
-                            {{"module", "drr"}, {"worker", "0"}});
+  const auto after0 = Value(Metrics(), "bess_module_observations_total",
+                            {{"module", "drr"}, {"observation", "task_runs"}, {"worker", "0"}});
   EXPECT_EQ(settled.value_or(-1), after0.value_or(-2))
       << "the worker the task left kept running it";
   EXPECT_TRUE(daemon().Alive());

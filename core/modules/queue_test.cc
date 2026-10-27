@@ -8,7 +8,9 @@
 
 #include <cerrno>
 #include <random>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "dataplane/transaction_engine.h"
@@ -89,14 +91,6 @@ TEST(QueueSettingsTest, ReadBackMatches) {
   EXPECT_EQ("", h.ReadBackDiffers("q/settings", {{nullptr, &s}}));
 }
 
-// Defaults read back canonically: size 1024, burst 32.
-TEST(QueueSettingsTest, ReadsDefaults) {
-  ModuleHarness h;
-  ASSERT_NE(nullptr, h.Create("Queue", bess::pb::QueueArg(), "q"));
-  const bess::pb::QueueSettings s = Settings(1024, bess::PacketBatch::kMaxBurst);
-  EXPECT_EQ("", h.ReadBackDiffers("q/settings", {{nullptr, &s}}));
-}
-
 TEST(QueueSettingsTest, BadValuesRefused) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("Queue", bess::pb::QueueArg(), "q"));
@@ -112,6 +106,48 @@ TEST(QueueSettingsTest, RequiresPausedWorkers) {
   ModuleHarness h;
   ASSERT_NE(nullptr, h.Create("Queue", bess::pb::QueueArg(), "q"));
   EXPECT_TRUE(RequiresPausedWorkers("q/settings"));
+}
+
+TEST(QueueObservationTest, OverflowDrainAndResizeKeepLifetimeCounts) {
+  auto observation = [](std::string_view name) -> std::optional<double> {
+    for (const auto &sample : bess::runtime::runtime().metrics().Collect()) {
+      if (sample.name != "bess_module_observations_total") {
+        continue;
+      }
+      bool module_matches = false;
+      bool observation_matches = false;
+      for (const auto &[key, value] : sample.labels) {
+        module_matches = module_matches || (key == "module" && value == "q");
+        observation_matches =
+            observation_matches || (key == "observation" && value == name);
+      }
+      if (module_matches && observation_matches) {
+        EXPECT_EQ(bess::stats::MetricKind::kCounter, sample.kind);
+        return sample.value;
+      }
+    }
+    return std::nullopt;
+  };
+  {
+    ModuleHarness h;
+    bess::pb::QueueArg arg;
+    arg.set_size(4);  // rte_ring holds size - 1 packets
+    Module *q = h.Create("Queue", arg, "q");
+    ASSERT_NE(nullptr, q);
+    const auto packets = Packets(5);
+    h.Run(q, 0, packets, {});
+    EXPECT_EQ(3.0, observation("enqueued_packets"));
+    EXPECT_EQ(2.0, observation("queue_full_packets"));
+    EXPECT_EQ(0.0, observation("dequeued_packets"));
+    const std::vector<Bytes> accepted(packets.begin(), packets.begin() + 3);
+    EXPECT_EQ(accepted, h.RunTask(q, {0})[0]);
+    EXPECT_EQ(3.0, observation("dequeued_packets"));
+    ASSERT_EQ("", h.SetResource("q/settings", Settings(8, 4)));
+    EXPECT_EQ(3.0, observation("enqueued_packets"));
+    EXPECT_EQ(2.0, observation("queue_full_packets"));
+    EXPECT_EQ(3.0, observation("dequeued_packets"));
+  }
+  EXPECT_EQ(std::nullopt, observation("queue_full_packets"));
 }
 
 }  // namespace

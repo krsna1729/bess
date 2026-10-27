@@ -605,20 +605,13 @@ CommandResponse PacketStore::Init(const bess::pb::PacketStoreArg &arg) {
   // resource whose operations may drop.
   dropped_metric_ = init_context().metrics().Register(
       [this](stats::MetricWriter &writer) {
-        writer.Counter("bess_packet_store_dropped_packets_total",
-                       "Packets freed by the drop command",
-                       static_cast<double>(dropped_packets_.load()),
-                       {{"module", name()}});
+        WriteObservation(writer, "requested_drop_packets", dropped_packets_.load());
         // A second loss, and a different one: a worker's batch the ingress ring
         // had no room for, which the module freed rather than holding. Before
         // this change an overflow of the store went out on gate 1; a batch the
         // ring refuses cannot (downstream runs on the owner's worker only), so
         // it is freed and counted here instead.
-        writer.Counter("bess_packet_store_ingress_dropped_packets_total",
-                       "Packets a full ingress ring refused (freed, not "
-                       "stored)",
-                       static_cast<double>(ingress_dropped_.load()),
-                       {{"module", name()}});
+        WriteObservation(writer, "ingress_dropped_packets", ingress_dropped_.load());
       });
 
   return CommandSuccess();
