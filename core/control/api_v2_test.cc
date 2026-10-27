@@ -37,6 +37,7 @@
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
 #include "pb/module_msg.pb.h"
+#include "module_graph.h"
 #include "worker.h"
 
 namespace {
@@ -1222,11 +1223,14 @@ TEST_F(ApiV2ServiceTest, ResetResourcesErasesOnlyTheNamedTables) {
 // what the resources hold, the daemon's own memory, the reclamation budget it
 // would draw on, and the workers that would carry the change. One call, so a
 // controller needs no second round trip to decide whether it can proceed.
-TEST_F(ApiV2ServiceTest, ResourceStatusReportsWhatTheDaemonHolds) {
+TEST_F(ApiV2ServiceTest, ResourceObservationsReportEntriesCapacityAndPacketDrops) {
   // A resource with an entry: L2Forward's l2/macs, written through the
   // resource as a client does (the same write InvokeAction makes).
+  bess::pb::L2ForwardArg l2_arg;
+  l2_arg.set_size(8);
+  l2_arg.set_bucket(4);
   google::protobuf::Any arg;
-  ASSERT_TRUE(arg.PackFrom(bess::pb::L2ForwardArg()));
+  ASSERT_TRUE(arg.PackFrom(l2_arg));
   ASSERT_TRUE(control_plane_->CreateModule({"l2", "L2Forward", arg}));
   bess::pb::ExactMatchArg em;
   bess::pb::Field *em_field = em.add_fields();
@@ -1252,6 +1256,18 @@ TEST_F(ApiV2ServiceTest, ResourceStatusReportsWhatTheDaemonHolds) {
     const grpc::Status status = stub_->ApplyTransaction(&ctx, req, &applied);
     ASSERT_TRUE(status.ok()) << status.error_message();
   }
+
+  bess::PlainPacketPool pool(16);
+  bess::PacketBatch dropped;
+  dropped.clear();
+  for (int i = 0; i < 3; i++) {
+    const auto packet = pool.Alloc();
+    ASSERT_NE(nullptr, packet);
+    dropped.add(bess::PacketRef(packet));
+  }
+  Context packet_context{};
+  packet_context.wid = bess::dataplane::WorkerId(0);
+  ModuleGraph::GetAllModules().at("l2")->RunChooseModule(&packet_context, DROP_GATE, &dropped);
 
   grpc::ClientContext ctx;
   v2::GetResourceStatusResponse resp;
@@ -1292,6 +1308,33 @@ TEST_F(ApiV2ServiceTest, ResourceStatusReportsWhatTheDaemonHolds) {
   EXPECT_NE(0u, resp.rss_bytes());
   EXPECT_NE(0u, resp.heap_total_bytes());
   EXPECT_NE(0u, resp.rcu_high_water());
+
+  grpc::ClientContext metrics_context;
+  v2::ListMetricsResponse metrics;
+  ASSERT_TRUE(stub_->ListMetrics(&metrics_context, {}, &metrics).ok());
+  const auto find_metric = [&](const char *name, const char *label, const char *value)
+      -> const v2::MetricSample * {
+    for (const auto &sample : metrics.samples()) {
+      const auto it = sample.labels().find(label);
+      if (sample.name() == name && it != sample.labels().end() && it->second == value) {
+        return &sample;
+      }
+    }
+    return nullptr;
+  };
+  const auto *entries = find_metric("bess_resource_entries", "resource", "l2/macs");
+  ASSERT_NE(nullptr, entries);
+  EXPECT_EQ(v2::MetricSample::KIND_GAUGE, entries->kind());
+  EXPECT_EQ(1.0, entries->value());
+  const auto *capacity = find_metric("bess_resource_capacity", "resource", "l2/macs");
+  ASSERT_NE(nullptr, capacity);
+  EXPECT_EQ(32.0, capacity->value());
+  EXPECT_EQ(nullptr, find_metric("bess_resource_capacity", "resource", "em/rules"))
+      << "a growable resource must not report an invented zero capacity";
+  const auto *drops = find_metric("bess_module_drops_total", "module", "l2");
+  ASSERT_NE(nullptr, drops);
+  EXPECT_EQ(v2::MetricSample::KIND_COUNTER, drops->kind());
+  EXPECT_EQ(3.0, drops->value());
 }
 
 // An action not marked thread-safe is refused (EBUSY) while a worker runs

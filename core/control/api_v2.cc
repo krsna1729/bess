@@ -1178,6 +1178,10 @@ grpc::Status ControlV2Service::ListMetrics(grpc::ServerContext *,
                          static_cast<double>(totals.pkts)});
     };
     for (const auto &[name, module] : runtime::runtime().modules().All()) {
+      samples.push_back({"bess_module_drops_total", stats::MetricKind::kCounter,
+                         "Packets recorded by module drop and forwarding helpers",
+                         {{"module", name}},
+                         static_cast<double>(module->deadends())});
       for (bess::IGate *g : module->igates()) {
         if (g != nullptr) {
           add(module.get(), g, "in");
@@ -1189,6 +1193,18 @@ grpc::Status ControlV2Service::ListMetrics(grpc::ServerContext *,
         }
       }
     }
+    transactions_.VisitReachableResources([&](const dataplane::Resource &resource) {
+      const std::vector<std::pair<std::string, std::string>> labels = {
+          {"resource", resource.name()}};
+      samples.push_back({"bess_resource_entries", stats::MetricKind::kGauge,
+                         "Live entries in a reachable resource", labels,
+                         static_cast<double>(resource.LiveCount())});
+      if (const auto capacity = resource.Capacity()) {
+        samples.push_back({"bess_resource_capacity", stats::MetricKind::kGauge,
+                           "Stated entry capacity of a reachable resource", labels,
+                           static_cast<double>(*capacity)});
+      }
+    });
   }
   std::sort(samples.begin(), samples.end(),
             [](const stats::MetricSample &a, const stats::MetricSample &b) {

@@ -5,13 +5,11 @@
 #ifndef BESS_MODULE_H_
 #define BESS_MODULE_H_
 
-#include <array>
 #include <atomic>
 #include <cstring>
 #include <expected>
 #include <functional>
 #include <map>
-#include <numeric>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,6 +26,7 @@
 #include "message.h"
 #include "framework/module_init_context.h"
 #include "metadata.h"
+#include "stats/keyed_counters.h"
 #include "task.h"
 #include "packet_pool.h"
 #include "worker.h"
@@ -249,7 +248,7 @@ class alignas(bess::arch::kCacheLineSize) Module {
         tasks_(),
         igates_(),
         ogates_(),
-        deadends_(),
+        deadends_(/*keys=*/1, /*cells_per_key=*/1, Worker::kMaxWorkers),
         active_workers_(Worker::kMaxWorkers, false),
         visited_tasks_(),
         is_task_(false),
@@ -424,9 +423,8 @@ class alignas(bess::arch::kCacheLineSize) Module {
 
   const std::vector<bess::OGate *> &ogates() const { return ogates_; }
 
-  uint64_t deadends() const {
-    return std::accumulate(deadends_.begin(), deadends_.end(), 0);
-  }
+  // Lifetime total for this instance, safe to read while workers count drops.
+  uint64_t deadends() const { return deadends_.Total(0, 0); }
 
   // Compute placement constraints based on the current module and all
   // downstream modules (i.e., modules connected to out ports.
@@ -437,7 +435,6 @@ class alignas(bess::arch::kCacheLineSize) Module {
   void ResetActiveWorkerSet() {
     std::fill(active_workers_.begin(), active_workers_.end(), false);
     visited_tasks_.clear();
-    deadends_.fill(0);
   }
 
   const std::vector<bool> &active_workers() const { return active_workers_; }
@@ -557,7 +554,7 @@ class alignas(bess::arch::kCacheLineSize) Module {
 
   std::vector<bess::IGate *> igates_;
   std::vector<bess::OGate *> ogates_;
-  std::array<uint64_t, Worker::kMaxWorkers> deadends_;
+  bess::stats::KeyedCounters deadends_;
 
  protected:
   // Set of active workers accessing this module.
@@ -619,7 +616,7 @@ inline void Module::RunChooseModule(Context *ctx, gate_idx_t ogate_idx,
   }
 
   if (unlikely(ogate_idx >= ogates_.size())) {
-    deadends_[ctx->wid.value()] += batch->cnt();
+    deadends_.ForWorker(ctx->wid).Add(0, 0, batch->cnt());
     deadend(ctx, batch);
     return;
   }
@@ -627,7 +624,7 @@ inline void Module::RunChooseModule(Context *ctx, gate_idx_t ogate_idx,
   ogate = ogates_[ogate_idx];
 
   if (unlikely(!ogate)) {
-    deadends_[ctx->wid.value()] += batch->cnt();
+    deadends_.ForWorker(ctx->wid).Add(0, 0, batch->cnt());
     deadend(ctx, batch);
     return;
   }
@@ -645,7 +642,7 @@ inline void Module::RunNextModule(Context *ctx, bess::PacketBatch *batch) {
 
 inline void Module::DropPacket(Context *ctx, bess::PacketRef pkt) {
   ctx->task->dead_batch()->add(pkt);
-  deadends_[ctx->wid.value()]++;
+  deadends_.ForWorker(ctx->wid).Add(0, 0, 1);
   if (static_cast<size_t>(ctx->task->dead_batch()->cnt()) >=
       bess::PacketBatch::kMaxBurst) {
     deadend(ctx, ctx->task->dead_batch());
