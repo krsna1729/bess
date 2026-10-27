@@ -8,6 +8,7 @@
 #include <cmath>
 #include <deque>
 #include <functional>
+#include <utility>
 
 #include "utils/logging.h"
 
@@ -16,6 +17,11 @@
 
 namespace bess {
 namespace utils {
+
+struct CodelClock {
+  uint64_t operator()() const noexcept { return tsc_to_ns(rdtsc()); }
+};
+
 // Codel(Controlled Delay Management) is an Queue controller based on this
 // article http://queue.acm.org/detail.cfm?id=2209336
 
@@ -24,8 +30,9 @@ namespace utils {
 // target queue delay. The equation used to calculate drop intervals is based on TCP
 // throughput response to drop probability.
 
-// template argument T is the type that is going to be enqueued/dequeued.
-template <typename T>
+// T is the queued type. Clock returns monotonic nanoseconds; the default uses
+// the calibrated cycle counter. A supplied clock is stored by value.
+template <typename T, typename Clock = CodelClock>
 class Codel final: public Queue<T> {
  public:
   // default delay target for codel
@@ -43,8 +50,9 @@ class Codel final: public Queue<T> {
   // target is the target delay in nanoseconds and the window is the buffer time u
   // in nanosecond before changing into drop state.
   Codel(void (*drop_func)(T)= NULL, size_t max_entries=0, uint64_t target = kDefaultTarget,
-      uint64_t window = kDefaultWindow)
-      : delay_target_(target),
+      uint64_t window = kDefaultWindow, Clock clock = {})
+      : clock_(std::move(clock)),
+        delay_target_(target),
         window_(window),
         time_above_target_(0),
         next_drop_time_(NanoSecondTime() + window),
@@ -241,11 +249,10 @@ class Codel final: public Queue<T> {
     return 0;
   }
 
-  // Returns the current time in microseconds.
-  uint64_t NanoSecondTime() {
-    return tsc_to_ns(rdtsc());
-  }
+  // Returns the current time in nanoseconds.
+  uint64_t NanoSecondTime() { return clock_(); }
 
+  [[no_unique_address]] Clock clock_;
   uint64_t delay_target_;  // the delay that codel will adjust for
   uint64_t window_;        // minimum time before changing state
 
