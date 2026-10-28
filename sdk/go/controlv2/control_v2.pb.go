@@ -2064,8 +2064,11 @@ type MetadataReport struct {
 	UnsatisfiedRequired  []*MetadataAttributeReport `protobuf:"bytes,3,rep,name=unsatisfied_required,json=unsatisfiedRequired,proto3" json:"unsatisfied_required,omitempty"`
 	DefaultsApplied      []*MetadataAttributeReport `protobuf:"bytes,4,rep,name=defaults_applied,json=defaultsApplied,proto3" json:"defaults_applied,omitempty"`
 	Conflicts            []*MetadataConflictReport  `protobuf:"bytes,5,rep,name=conflicts,proto3" json:"conflicts,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Reader/update live ranges that exceeded packet metadata storage. Required
+	// and default entries block resume; best-effort entries remain diagnostic.
+	AllocationFailures []*MetadataAttributeReport `protobuf:"bytes,8,rep,name=allocation_failures,json=allocationFailures,proto3" json:"allocation_failures,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *MetadataReport) Reset() {
@@ -2143,6 +2146,13 @@ func (x *MetadataReport) GetDefaultsApplied() []*MetadataAttributeReport {
 func (x *MetadataReport) GetConflicts() []*MetadataConflictReport {
 	if x != nil {
 		return x.Conflicts
+	}
+	return nil
+}
+
+func (x *MetadataReport) GetAllocationFailures() []*MetadataAttributeReport {
+	if x != nil {
+		return x.AllocationFailures
 	}
 	return nil
 }
@@ -6623,7 +6633,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x16MetadataConflictReport\x12\x1c\n" +
 	"\tattribute\x18\x01 \x01(\tR\tattribute\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\x18\n" +
-	"\amodules\x18\x03 \x03(\tR\amodules\"\xf0\x03\n" +
+	"\amodules\x18\x03 \x03(\tR\amodules\"\xc6\x04\n" +
 	"\x0eMetadataReport\x12\"\n" +
 	"\fdeclarations\x18\x06 \x01(\rR\fdeclarations\x12\x1a\n" +
 	"\bresolved\x18\a \x01(\rR\bresolved\x12Y\n" +
@@ -6631,7 +6641,8 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x16readers_without_writer\x18\x02 \x03(\v2#.bess.pb.v2.MetadataAttributeReportR\x14readersWithoutWriter\x12V\n" +
 	"\x14unsatisfied_required\x18\x03 \x03(\v2#.bess.pb.v2.MetadataAttributeReportR\x13unsatisfiedRequired\x12N\n" +
 	"\x10defaults_applied\x18\x04 \x03(\v2#.bess.pb.v2.MetadataAttributeReportR\x0fdefaultsApplied\x12@\n" +
-	"\tconflicts\x18\x05 \x03(\v2\".bess.pb.v2.MetadataConflictReportR\tconflicts\"\x8a\x01\n" +
+	"\tconflicts\x18\x05 \x03(\v2\".bess.pb.v2.MetadataConflictReportR\tconflicts\x12T\n" +
+	"\x13allocation_failures\x18\b \x03(\v2#.bess.pb.v2.MetadataAttributeReportR\x12allocationFailures\"\x8a\x01\n" +
 	"\x12GetPipelineRequest\x12+\n" +
 	"\x11include_resources\x18\x01 \x01(\bR\x10includeResources\x12\x1c\n" +
 	"\tresources\x18\x02 \x03(\tR\tresources\x12)\n" +
@@ -7260,113 +7271,114 @@ var file_control_v2_proto_depIdxs = []int32{
 	29,  // 22: bess.pb.v2.MetadataReport.unsatisfied_required:type_name -> bess.pb.v2.MetadataAttributeReport
 	29,  // 23: bess.pb.v2.MetadataReport.defaults_applied:type_name -> bess.pb.v2.MetadataAttributeReport
 	30,  // 24: bess.pb.v2.MetadataReport.conflicts:type_name -> bess.pb.v2.MetadataConflictReport
-	23,  // 25: bess.pb.v2.GetPipelineResponse.pipeline:type_name -> bess.pb.v2.Pipeline
-	28,  // 26: bess.pb.v2.GetPipelineResponse.workers:type_name -> bess.pb.v2.WorkerPlacement
-	31,  // 27: bess.pb.v2.GetPipelineResponse.metadata:type_name -> bess.pb.v2.MetadataReport
-	21,  // 28: bess.pb.v2.ResourcePage.entries:type_name -> bess.pb.v2.ResourceEntry
-	23,  // 29: bess.pb.v2.ValidatePipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	23,  // 30: bess.pb.v2.ValidatePipelineResponse.normalized:type_name -> bess.pb.v2.Pipeline
-	99,  // 31: bess.pb.v2.ValidatePipelineResponse.capabilities:type_name -> bess.pb.v2.ValidatePipelineResponse.CapabilitiesEntry
-	3,   // 32: bess.pb.v2.ModuleCapabilities.state:type_name -> bess.pb.v2.ModuleCapabilities.State
-	4,   // 33: bess.pb.v2.ModuleCapabilities.flow_affinity:type_name -> bess.pb.v2.ModuleCapabilities.FlowAffinity
-	5,   // 34: bess.pb.v2.ModuleCapabilities.updates:type_name -> bess.pb.v2.ModuleCapabilities.Updates
-	7,   // 35: bess.pb.v2.ModuleCapabilities.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
-	23,  // 36: bess.pb.v2.DiffPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	26,  // 37: bess.pb.v2.DiffPipelineResponse.diff:type_name -> bess.pb.v2.PipelineDiff
-	23,  // 38: bess.pb.v2.PlanPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	27,  // 39: bess.pb.v2.PlanPipelineResponse.steps:type_name -> bess.pb.v2.PlanStep
-	23,  // 40: bess.pb.v2.ApplyPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
-	6,   // 41: bess.pb.v2.ErrorDetail.code:type_name -> bess.pb.v2.ErrorDetail.Code
-	104, // 42: bess.pb.v2.TransactionOp.key:type_name -> google.protobuf.Any
-	104, // 43: bess.pb.v2.TransactionOp.value:type_name -> google.protobuf.Any
-	48,  // 44: bess.pb.v2.ApplyTransactionRequest.ops:type_name -> bess.pb.v2.TransactionOp
-	7,   // 45: bess.pb.v2.ApplyTransactionRequest.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
-	8,   // 46: bess.pb.v2.TransactionOpResult.status:type_name -> bess.pb.v2.TransactionOpResult.Status
-	9,   // 47: bess.pb.v2.TransactionRecord.outcome:type_name -> bess.pb.v2.TransactionRecord.Outcome
-	50,  // 48: bess.pb.v2.TransactionRecord.ops:type_name -> bess.pb.v2.TransactionOpResult
-	10,  // 49: bess.pb.v2.TransactionRecord.visibility:type_name -> bess.pb.v2.TransactionRecord.Visibility
-	51,  // 50: bess.pb.v2.ApplyTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
-	51,  // 51: bess.pb.v2.GetTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
-	11,  // 52: bess.pb.v2.TransactionResource.kind:type_name -> bess.pb.v2.TransactionResource.Kind
-	56,  // 53: bess.pb.v2.ListTransactionResourcesResponse.resources:type_name -> bess.pb.v2.TransactionResource
-	59,  // 54: bess.pb.v2.GetCapabilitiesResponse.plugins:type_name -> bess.pb.v2.PluginInfo
-	60,  // 55: bess.pb.v2.GetCapabilitiesResponse.ports:type_name -> bess.pb.v2.PortInfo
-	56,  // 56: bess.pb.v2.GetCapabilitiesResponse.resources:type_name -> bess.pb.v2.TransactionResource
-	11,  // 57: bess.pb.v2.ResourceSchema.kind:type_name -> bess.pb.v2.TransactionResource.Kind
-	64,  // 58: bess.pb.v2.ModuleClassSchema.actions:type_name -> bess.pb.v2.ActionSchema
-	63,  // 59: bess.pb.v2.ModuleClassSchema.resources:type_name -> bess.pb.v2.ResourceSchema
-	65,  // 60: bess.pb.v2.GetSchemaResponse.module_classes:type_name -> bess.pb.v2.ModuleClassSchema
-	66,  // 61: bess.pb.v2.GetSchemaResponse.port_drivers:type_name -> bess.pb.v2.PortDriverSchema
-	105, // 62: bess.pb.v2.GetSchemaResponse.descriptors:type_name -> google.protobuf.FileDescriptorSet
-	100, // 63: bess.pb.v2.Event.fields:type_name -> bess.pb.v2.Event.FieldsEntry
-	12,  // 64: bess.pb.v2.MetricSample.kind:type_name -> bess.pb.v2.MetricSample.Kind
-	101, // 65: bess.pb.v2.MetricSample.labels:type_name -> bess.pb.v2.MetricSample.LabelsEntry
-	71,  // 66: bess.pb.v2.ListMetricsResponse.samples:type_name -> bess.pb.v2.MetricSample
-	104, // 67: bess.pb.v2.InvokeActionRequest.arg:type_name -> google.protobuf.Any
-	104, // 68: bess.pb.v2.InvokeActionResponse.result:type_name -> google.protobuf.Any
-	76,  // 69: bess.pb.v2.GetResourceStatusResponse.resources:type_name -> bess.pb.v2.ResourceOccupancy
-	77,  // 70: bess.pb.v2.GetResourceStatusResponse.workers:type_name -> bess.pb.v2.WorkerStatus
-	102, // 71: bess.pb.v2.PortStatus.link:type_name -> bess.pb.v2.PortStatus.Link
-	103, // 72: bess.pb.v2.PortStatus.rx:type_name -> bess.pb.v2.PortStatus.Counters
-	103, // 73: bess.pb.v2.PortStatus.tx:type_name -> bess.pb.v2.PortStatus.Counters
-	84,  // 74: bess.pb.v2.GetPortStatusResponse.ports:type_name -> bess.pb.v2.PortStatus
-	87,  // 75: bess.pb.v2.GetPacketPoolsResponse.pools:type_name -> bess.pb.v2.PacketPool
-	13,  // 76: bess.pb.v2.SetCaptureRequest.direction:type_name -> bess.pb.v2.SetCaptureRequest.Direction
-	14,  // 77: bess.pb.v2.SetCaptureRequest.format:type_name -> bess.pb.v2.SetCaptureRequest.Format
-	40,  // 78: bess.pb.v2.ValidatePipelineResponse.CapabilitiesEntry.value:type_name -> bess.pb.v2.ModuleCapabilities
-	32,  // 79: bess.pb.v2.Control.GetPipeline:input_type -> bess.pb.v2.GetPipelineRequest
-	34,  // 80: bess.pb.v2.Control.ReadResource:input_type -> bess.pb.v2.ReadResourceRequest
-	36,  // 81: bess.pb.v2.Control.ResetResources:input_type -> bess.pb.v2.ResetResourcesRequest
-	38,  // 82: bess.pb.v2.Control.ValidatePipeline:input_type -> bess.pb.v2.ValidatePipelineRequest
-	41,  // 83: bess.pb.v2.Control.DiffPipeline:input_type -> bess.pb.v2.DiffPipelineRequest
-	43,  // 84: bess.pb.v2.Control.PlanPipeline:input_type -> bess.pb.v2.PlanPipelineRequest
-	45,  // 85: bess.pb.v2.Control.ApplyPipeline:input_type -> bess.pb.v2.ApplyPipelineRequest
-	49,  // 86: bess.pb.v2.Control.ApplyTransaction:input_type -> bess.pb.v2.ApplyTransactionRequest
-	53,  // 87: bess.pb.v2.Control.GetTransaction:input_type -> bess.pb.v2.GetTransactionRequest
-	70,  // 88: bess.pb.v2.Control.ListMetrics:input_type -> bess.pb.v2.ListMetricsRequest
-	58,  // 89: bess.pb.v2.Control.GetCapabilities:input_type -> bess.pb.v2.GetCapabilitiesRequest
-	62,  // 90: bess.pb.v2.Control.GetSchema:input_type -> bess.pb.v2.GetSchemaRequest
-	68,  // 91: bess.pb.v2.Control.WatchEvents:input_type -> bess.pb.v2.WatchEventsRequest
-	55,  // 92: bess.pb.v2.Control.ListTransactionResources:input_type -> bess.pb.v2.ListTransactionResourcesRequest
-	73,  // 93: bess.pb.v2.Control.InvokeAction:input_type -> bess.pb.v2.InvokeActionRequest
-	75,  // 94: bess.pb.v2.Control.GetResourceStatus:input_type -> bess.pb.v2.GetResourceStatusRequest
-	79,  // 95: bess.pb.v2.Admin.ImportPlugin:input_type -> bess.pb.v2.ImportPluginRequest
-	81,  // 96: bess.pb.v2.Admin.UnloadPlugin:input_type -> bess.pb.v2.UnloadPluginRequest
-	83,  // 97: bess.pb.v2.Admin.GetPortStatus:input_type -> bess.pb.v2.GetPortStatusRequest
-	86,  // 98: bess.pb.v2.Admin.GetPacketPools:input_type -> bess.pb.v2.GetPacketPoolsRequest
-	89,  // 99: bess.pb.v2.Admin.SetCapture:input_type -> bess.pb.v2.SetCaptureRequest
-	91,  // 100: bess.pb.v2.Admin.PauseWorkers:input_type -> bess.pb.v2.PauseWorkersRequest
-	93,  // 101: bess.pb.v2.Admin.ResumeWorkers:input_type -> bess.pb.v2.ResumeWorkersRequest
-	95,  // 102: bess.pb.v2.Admin.Shutdown:input_type -> bess.pb.v2.ShutdownRequest
-	33,  // 103: bess.pb.v2.Control.GetPipeline:output_type -> bess.pb.v2.GetPipelineResponse
-	35,  // 104: bess.pb.v2.Control.ReadResource:output_type -> bess.pb.v2.ResourcePage
-	37,  // 105: bess.pb.v2.Control.ResetResources:output_type -> bess.pb.v2.ResetResourcesResponse
-	39,  // 106: bess.pb.v2.Control.ValidatePipeline:output_type -> bess.pb.v2.ValidatePipelineResponse
-	42,  // 107: bess.pb.v2.Control.DiffPipeline:output_type -> bess.pb.v2.DiffPipelineResponse
-	44,  // 108: bess.pb.v2.Control.PlanPipeline:output_type -> bess.pb.v2.PlanPipelineResponse
-	46,  // 109: bess.pb.v2.Control.ApplyPipeline:output_type -> bess.pb.v2.ApplyPipelineResponse
-	52,  // 110: bess.pb.v2.Control.ApplyTransaction:output_type -> bess.pb.v2.ApplyTransactionResponse
-	54,  // 111: bess.pb.v2.Control.GetTransaction:output_type -> bess.pb.v2.GetTransactionResponse
-	72,  // 112: bess.pb.v2.Control.ListMetrics:output_type -> bess.pb.v2.ListMetricsResponse
-	61,  // 113: bess.pb.v2.Control.GetCapabilities:output_type -> bess.pb.v2.GetCapabilitiesResponse
-	67,  // 114: bess.pb.v2.Control.GetSchema:output_type -> bess.pb.v2.GetSchemaResponse
-	69,  // 115: bess.pb.v2.Control.WatchEvents:output_type -> bess.pb.v2.Event
-	57,  // 116: bess.pb.v2.Control.ListTransactionResources:output_type -> bess.pb.v2.ListTransactionResourcesResponse
-	74,  // 117: bess.pb.v2.Control.InvokeAction:output_type -> bess.pb.v2.InvokeActionResponse
-	78,  // 118: bess.pb.v2.Control.GetResourceStatus:output_type -> bess.pb.v2.GetResourceStatusResponse
-	80,  // 119: bess.pb.v2.Admin.ImportPlugin:output_type -> bess.pb.v2.ImportPluginResponse
-	82,  // 120: bess.pb.v2.Admin.UnloadPlugin:output_type -> bess.pb.v2.UnloadPluginResponse
-	85,  // 121: bess.pb.v2.Admin.GetPortStatus:output_type -> bess.pb.v2.GetPortStatusResponse
-	88,  // 122: bess.pb.v2.Admin.GetPacketPools:output_type -> bess.pb.v2.GetPacketPoolsResponse
-	90,  // 123: bess.pb.v2.Admin.SetCapture:output_type -> bess.pb.v2.SetCaptureResponse
-	92,  // 124: bess.pb.v2.Admin.PauseWorkers:output_type -> bess.pb.v2.PauseWorkersResponse
-	94,  // 125: bess.pb.v2.Admin.ResumeWorkers:output_type -> bess.pb.v2.ResumeWorkersResponse
-	96,  // 126: bess.pb.v2.Admin.Shutdown:output_type -> bess.pb.v2.ShutdownResponse
-	103, // [103:127] is the sub-list for method output_type
-	79,  // [79:103] is the sub-list for method input_type
-	79,  // [79:79] is the sub-list for extension type_name
-	79,  // [79:79] is the sub-list for extension extendee
-	0,   // [0:79] is the sub-list for field type_name
+	29,  // 25: bess.pb.v2.MetadataReport.allocation_failures:type_name -> bess.pb.v2.MetadataAttributeReport
+	23,  // 26: bess.pb.v2.GetPipelineResponse.pipeline:type_name -> bess.pb.v2.Pipeline
+	28,  // 27: bess.pb.v2.GetPipelineResponse.workers:type_name -> bess.pb.v2.WorkerPlacement
+	31,  // 28: bess.pb.v2.GetPipelineResponse.metadata:type_name -> bess.pb.v2.MetadataReport
+	21,  // 29: bess.pb.v2.ResourcePage.entries:type_name -> bess.pb.v2.ResourceEntry
+	23,  // 30: bess.pb.v2.ValidatePipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	23,  // 31: bess.pb.v2.ValidatePipelineResponse.normalized:type_name -> bess.pb.v2.Pipeline
+	99,  // 32: bess.pb.v2.ValidatePipelineResponse.capabilities:type_name -> bess.pb.v2.ValidatePipelineResponse.CapabilitiesEntry
+	3,   // 33: bess.pb.v2.ModuleCapabilities.state:type_name -> bess.pb.v2.ModuleCapabilities.State
+	4,   // 34: bess.pb.v2.ModuleCapabilities.flow_affinity:type_name -> bess.pb.v2.ModuleCapabilities.FlowAffinity
+	5,   // 35: bess.pb.v2.ModuleCapabilities.updates:type_name -> bess.pb.v2.ModuleCapabilities.Updates
+	7,   // 36: bess.pb.v2.ModuleCapabilities.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
+	23,  // 37: bess.pb.v2.DiffPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	26,  // 38: bess.pb.v2.DiffPipelineResponse.diff:type_name -> bess.pb.v2.PipelineDiff
+	23,  // 39: bess.pb.v2.PlanPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	27,  // 40: bess.pb.v2.PlanPipelineResponse.steps:type_name -> bess.pb.v2.PlanStep
+	23,  // 41: bess.pb.v2.ApplyPipelineRequest.pipeline:type_name -> bess.pb.v2.Pipeline
+	6,   // 42: bess.pb.v2.ErrorDetail.code:type_name -> bess.pb.v2.ErrorDetail.Code
+	104, // 43: bess.pb.v2.TransactionOp.key:type_name -> google.protobuf.Any
+	104, // 44: bess.pb.v2.TransactionOp.value:type_name -> google.protobuf.Any
+	48,  // 45: bess.pb.v2.ApplyTransactionRequest.ops:type_name -> bess.pb.v2.TransactionOp
+	7,   // 46: bess.pb.v2.ApplyTransactionRequest.consistency:type_name -> bess.pb.v2.ApplyTransactionRequest.Consistency
+	8,   // 47: bess.pb.v2.TransactionOpResult.status:type_name -> bess.pb.v2.TransactionOpResult.Status
+	9,   // 48: bess.pb.v2.TransactionRecord.outcome:type_name -> bess.pb.v2.TransactionRecord.Outcome
+	50,  // 49: bess.pb.v2.TransactionRecord.ops:type_name -> bess.pb.v2.TransactionOpResult
+	10,  // 50: bess.pb.v2.TransactionRecord.visibility:type_name -> bess.pb.v2.TransactionRecord.Visibility
+	51,  // 51: bess.pb.v2.ApplyTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
+	51,  // 52: bess.pb.v2.GetTransactionResponse.record:type_name -> bess.pb.v2.TransactionRecord
+	11,  // 53: bess.pb.v2.TransactionResource.kind:type_name -> bess.pb.v2.TransactionResource.Kind
+	56,  // 54: bess.pb.v2.ListTransactionResourcesResponse.resources:type_name -> bess.pb.v2.TransactionResource
+	59,  // 55: bess.pb.v2.GetCapabilitiesResponse.plugins:type_name -> bess.pb.v2.PluginInfo
+	60,  // 56: bess.pb.v2.GetCapabilitiesResponse.ports:type_name -> bess.pb.v2.PortInfo
+	56,  // 57: bess.pb.v2.GetCapabilitiesResponse.resources:type_name -> bess.pb.v2.TransactionResource
+	11,  // 58: bess.pb.v2.ResourceSchema.kind:type_name -> bess.pb.v2.TransactionResource.Kind
+	64,  // 59: bess.pb.v2.ModuleClassSchema.actions:type_name -> bess.pb.v2.ActionSchema
+	63,  // 60: bess.pb.v2.ModuleClassSchema.resources:type_name -> bess.pb.v2.ResourceSchema
+	65,  // 61: bess.pb.v2.GetSchemaResponse.module_classes:type_name -> bess.pb.v2.ModuleClassSchema
+	66,  // 62: bess.pb.v2.GetSchemaResponse.port_drivers:type_name -> bess.pb.v2.PortDriverSchema
+	105, // 63: bess.pb.v2.GetSchemaResponse.descriptors:type_name -> google.protobuf.FileDescriptorSet
+	100, // 64: bess.pb.v2.Event.fields:type_name -> bess.pb.v2.Event.FieldsEntry
+	12,  // 65: bess.pb.v2.MetricSample.kind:type_name -> bess.pb.v2.MetricSample.Kind
+	101, // 66: bess.pb.v2.MetricSample.labels:type_name -> bess.pb.v2.MetricSample.LabelsEntry
+	71,  // 67: bess.pb.v2.ListMetricsResponse.samples:type_name -> bess.pb.v2.MetricSample
+	104, // 68: bess.pb.v2.InvokeActionRequest.arg:type_name -> google.protobuf.Any
+	104, // 69: bess.pb.v2.InvokeActionResponse.result:type_name -> google.protobuf.Any
+	76,  // 70: bess.pb.v2.GetResourceStatusResponse.resources:type_name -> bess.pb.v2.ResourceOccupancy
+	77,  // 71: bess.pb.v2.GetResourceStatusResponse.workers:type_name -> bess.pb.v2.WorkerStatus
+	102, // 72: bess.pb.v2.PortStatus.link:type_name -> bess.pb.v2.PortStatus.Link
+	103, // 73: bess.pb.v2.PortStatus.rx:type_name -> bess.pb.v2.PortStatus.Counters
+	103, // 74: bess.pb.v2.PortStatus.tx:type_name -> bess.pb.v2.PortStatus.Counters
+	84,  // 75: bess.pb.v2.GetPortStatusResponse.ports:type_name -> bess.pb.v2.PortStatus
+	87,  // 76: bess.pb.v2.GetPacketPoolsResponse.pools:type_name -> bess.pb.v2.PacketPool
+	13,  // 77: bess.pb.v2.SetCaptureRequest.direction:type_name -> bess.pb.v2.SetCaptureRequest.Direction
+	14,  // 78: bess.pb.v2.SetCaptureRequest.format:type_name -> bess.pb.v2.SetCaptureRequest.Format
+	40,  // 79: bess.pb.v2.ValidatePipelineResponse.CapabilitiesEntry.value:type_name -> bess.pb.v2.ModuleCapabilities
+	32,  // 80: bess.pb.v2.Control.GetPipeline:input_type -> bess.pb.v2.GetPipelineRequest
+	34,  // 81: bess.pb.v2.Control.ReadResource:input_type -> bess.pb.v2.ReadResourceRequest
+	36,  // 82: bess.pb.v2.Control.ResetResources:input_type -> bess.pb.v2.ResetResourcesRequest
+	38,  // 83: bess.pb.v2.Control.ValidatePipeline:input_type -> bess.pb.v2.ValidatePipelineRequest
+	41,  // 84: bess.pb.v2.Control.DiffPipeline:input_type -> bess.pb.v2.DiffPipelineRequest
+	43,  // 85: bess.pb.v2.Control.PlanPipeline:input_type -> bess.pb.v2.PlanPipelineRequest
+	45,  // 86: bess.pb.v2.Control.ApplyPipeline:input_type -> bess.pb.v2.ApplyPipelineRequest
+	49,  // 87: bess.pb.v2.Control.ApplyTransaction:input_type -> bess.pb.v2.ApplyTransactionRequest
+	53,  // 88: bess.pb.v2.Control.GetTransaction:input_type -> bess.pb.v2.GetTransactionRequest
+	70,  // 89: bess.pb.v2.Control.ListMetrics:input_type -> bess.pb.v2.ListMetricsRequest
+	58,  // 90: bess.pb.v2.Control.GetCapabilities:input_type -> bess.pb.v2.GetCapabilitiesRequest
+	62,  // 91: bess.pb.v2.Control.GetSchema:input_type -> bess.pb.v2.GetSchemaRequest
+	68,  // 92: bess.pb.v2.Control.WatchEvents:input_type -> bess.pb.v2.WatchEventsRequest
+	55,  // 93: bess.pb.v2.Control.ListTransactionResources:input_type -> bess.pb.v2.ListTransactionResourcesRequest
+	73,  // 94: bess.pb.v2.Control.InvokeAction:input_type -> bess.pb.v2.InvokeActionRequest
+	75,  // 95: bess.pb.v2.Control.GetResourceStatus:input_type -> bess.pb.v2.GetResourceStatusRequest
+	79,  // 96: bess.pb.v2.Admin.ImportPlugin:input_type -> bess.pb.v2.ImportPluginRequest
+	81,  // 97: bess.pb.v2.Admin.UnloadPlugin:input_type -> bess.pb.v2.UnloadPluginRequest
+	83,  // 98: bess.pb.v2.Admin.GetPortStatus:input_type -> bess.pb.v2.GetPortStatusRequest
+	86,  // 99: bess.pb.v2.Admin.GetPacketPools:input_type -> bess.pb.v2.GetPacketPoolsRequest
+	89,  // 100: bess.pb.v2.Admin.SetCapture:input_type -> bess.pb.v2.SetCaptureRequest
+	91,  // 101: bess.pb.v2.Admin.PauseWorkers:input_type -> bess.pb.v2.PauseWorkersRequest
+	93,  // 102: bess.pb.v2.Admin.ResumeWorkers:input_type -> bess.pb.v2.ResumeWorkersRequest
+	95,  // 103: bess.pb.v2.Admin.Shutdown:input_type -> bess.pb.v2.ShutdownRequest
+	33,  // 104: bess.pb.v2.Control.GetPipeline:output_type -> bess.pb.v2.GetPipelineResponse
+	35,  // 105: bess.pb.v2.Control.ReadResource:output_type -> bess.pb.v2.ResourcePage
+	37,  // 106: bess.pb.v2.Control.ResetResources:output_type -> bess.pb.v2.ResetResourcesResponse
+	39,  // 107: bess.pb.v2.Control.ValidatePipeline:output_type -> bess.pb.v2.ValidatePipelineResponse
+	42,  // 108: bess.pb.v2.Control.DiffPipeline:output_type -> bess.pb.v2.DiffPipelineResponse
+	44,  // 109: bess.pb.v2.Control.PlanPipeline:output_type -> bess.pb.v2.PlanPipelineResponse
+	46,  // 110: bess.pb.v2.Control.ApplyPipeline:output_type -> bess.pb.v2.ApplyPipelineResponse
+	52,  // 111: bess.pb.v2.Control.ApplyTransaction:output_type -> bess.pb.v2.ApplyTransactionResponse
+	54,  // 112: bess.pb.v2.Control.GetTransaction:output_type -> bess.pb.v2.GetTransactionResponse
+	72,  // 113: bess.pb.v2.Control.ListMetrics:output_type -> bess.pb.v2.ListMetricsResponse
+	61,  // 114: bess.pb.v2.Control.GetCapabilities:output_type -> bess.pb.v2.GetCapabilitiesResponse
+	67,  // 115: bess.pb.v2.Control.GetSchema:output_type -> bess.pb.v2.GetSchemaResponse
+	69,  // 116: bess.pb.v2.Control.WatchEvents:output_type -> bess.pb.v2.Event
+	57,  // 117: bess.pb.v2.Control.ListTransactionResources:output_type -> bess.pb.v2.ListTransactionResourcesResponse
+	74,  // 118: bess.pb.v2.Control.InvokeAction:output_type -> bess.pb.v2.InvokeActionResponse
+	78,  // 119: bess.pb.v2.Control.GetResourceStatus:output_type -> bess.pb.v2.GetResourceStatusResponse
+	80,  // 120: bess.pb.v2.Admin.ImportPlugin:output_type -> bess.pb.v2.ImportPluginResponse
+	82,  // 121: bess.pb.v2.Admin.UnloadPlugin:output_type -> bess.pb.v2.UnloadPluginResponse
+	85,  // 122: bess.pb.v2.Admin.GetPortStatus:output_type -> bess.pb.v2.GetPortStatusResponse
+	88,  // 123: bess.pb.v2.Admin.GetPacketPools:output_type -> bess.pb.v2.GetPacketPoolsResponse
+	90,  // 124: bess.pb.v2.Admin.SetCapture:output_type -> bess.pb.v2.SetCaptureResponse
+	92,  // 125: bess.pb.v2.Admin.PauseWorkers:output_type -> bess.pb.v2.PauseWorkersResponse
+	94,  // 126: bess.pb.v2.Admin.ResumeWorkers:output_type -> bess.pb.v2.ResumeWorkersResponse
+	96,  // 127: bess.pb.v2.Admin.Shutdown:output_type -> bess.pb.v2.ShutdownResponse
+	104, // [104:128] is the sub-list for method output_type
+	80,  // [80:104] is the sub-list for method input_type
+	80,  // [80:80] is the sub-list for extension type_name
+	80,  // [80:80] is the sub-list for extension extendee
+	0,   // [0:80] is the sub-list for field type_name
 }
 
 func init() { file_control_v2_proto_init() }

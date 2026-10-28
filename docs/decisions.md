@@ -170,6 +170,7 @@ file is the reasoning.
 | D-148 | The desired-state clear is bounded in the daemon, not in the client: a listed resource owns its contents, so an empty list clears a map, and today that is one transaction with one op per entry - refused whole by the engine's retire budget (`retire_high_water()/2`, "split it"). `TransactionEngine::ApplyBatched` applies what fits and halves on the budget refusal, and `ApplyResourcesLocked` calls it; convergence rather than atomicity, and the busy retry moves inside it because a caller looping over the whole request would re-apply batches that already applied, an erase of an already-erased key being refused ("not found"), not ignored | accepted |
 | D-193 | Shared module-drop and resource-occupancy metrics; lifetime drop counters use KeyedCounters, and bounded resource-fill sweeps resume by name | accepted |
 | D-194 | Shared owner-counter reporting with module/observation labels; preserve drop, punt and task-run meanings without packet-path changes | accepted |
+| D-195 | Metadata reads and updates require graph bindings by default; distinguish missing producers from packet-metadata exhaustion | accepted |
 
 
 ---
@@ -12035,6 +12036,9 @@ needs scoped link-local addresses on more than one interface.
 ## D-177 A metadata reader declares its contract: best-effort, required, or optional with a default
 
 **Status:** accepted (2026-10-21; the plan's item: "required vs optional-with-default vs best-effort, plus a graph validation report").
+The best-effort default and required-offset failure policy below are superseded
+by D-195; the declared-default mechanism and read-only report remain.
+
 
 **Decision.** `Attribute` gains a `Contract` beside its access mode. Best-effort is the default and keeps today's
 behavior: an unresolved reader gets `kMetadataOffsetNoRead` and the module decides. Required makes
@@ -13644,4 +13648,70 @@ drop taxonomy, and adding them together does not produce a packet-loss total.
 Collection neither resets counters nor promises one global instant. The
 framework drop total remains a separate observation with its narrower helper
 coverage (D-193).
+
+## D-195 Enforce metadata reader contracts across the graph
+
+**Status:** accepted (2026-10-28). Extends D-177; replaces its best-effort
+compiler default and its missing-provider-only required check.
+**Code:** `core/{module.h,metadata.h,metadata.cc}`,
+`core/resume_hooks/metadata.cc`, `core/control/api_v2.cc`.
+
+**Problem.** Most production consumers used three-argument declarations, so a
+missing producer still started workers and left modules to warn, drop or read
+zero. Even an explicit required declaration could pass validation without a
+usable offset: five simultaneous 32-byte live ranges exceeded the 128-byte
+packet-metadata area, but offset computation returned success with one
+unresolved required reader.
+
+**Decision.**
+- `AddMetadataAttr` defaults reads and updates to `kRequired`. Every incoming
+  path needs a declared writer and the reader needs a usable binding. Writer
+  contracts remain ignored; an unread writer may still skip its write.
+- Optional behavior is explicit. Measure's metadata timestamp is best-effort
+  because it can use its checked in-packet stamp. PacketStore's ordered key
+  alternatives and MTTest's allocation diagnostics are best-effort too.
+  Router's existing route-domain and interface defaults do not change.
+- Reject every unusable required offset, not only `kMetadataOffsetNoRead`.
+  Missing producers refuse resume with `EINVAL`; required/default readers
+  whose live ranges do not fit refuse it with `ENOSPC`. A default is for an
+  absent provider, not a substitute for an unallocatable provider.
+- Add `MetadataReport.allocation_failures` to the existing read RPC and CLI.
+  It includes best-effort failures as diagnostics; those do not block resume.
+  Do not put storage failures in `readers_without_writer` or describe them as
+  missing producers.
+- Keep valid alternative producers. Multiple writers can share one reader
+  binding; their warning does not imply that each has a separate offset.
+- Propagate a failed metadata registration from `Init`. EtherEncap, IPEncap,
+  VXLANEncap, VXLANDecap, Timestamp and Measure must reject a width conflict,
+  not accept missing declarations, shifted attribute indexes or a negative
+  error as an attribute id.
+  Disconnected required readers in test graphs are real invalid graphs:
+  remove an observer when removing its consumer, or supply real producers,
+  rather than suppressing the harness's validation failure.
+
+**Evidence.** The same required-declaration runtime probe changed from return
+0 with one unresolved reader to `-ENOSPC` with that reader diagnosed. Metadata
+regressions cover all three contracts at the storage boundary, provider removal
+and restoration, default restoration after removing a provider, missing paths,
+and packet values from alternative writers.
+
+A real daemon driven by the native CLI refused a 136-byte live-range graph
+made from SetMetadata and GenericEncap modules; its source forwarded no
+packets and its report named storage exhaustion, not a missing writer. Removing
+the extra reader left 128 bytes, cleared the failures and restored forwarding.
+A separate missing-producer graph refused resume; adding its producer cleared
+the report and forwarded identical packet counts through the source, writer
+and reader. Producer-first width-conflict applies were also accepted by all six
+modules above before their fixes; each now refuses preparation and leaves no
+partially created modules. Typed conformance regressions cover the refusal.
+Raw runtime evidence is under `.scratch/` in the development workspace
+(`metadata-contract-after.json`, `metadata-runtime-smoke-results.json`,
+`metadata-declaration-after.json`). No throughput or latency claim is made.
+
+**Limits.** Validation covers declarations and allocation, not the value of
+each packet. It does not prove that a conditional writer initialized every
+packet, a parse result is current, lengths are sufficient or a payload is
+exclusive. Packet-path checks remain. Defaults stay in `ResolvedAttr`, not
+per-packet stamping. No packet-path allocations, synchronization or mandatory
+module-author hook are added.
 

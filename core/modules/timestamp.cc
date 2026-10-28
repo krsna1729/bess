@@ -76,6 +76,10 @@ CommandResponse Timestamp::Init(const bess::pb::TimestampArg &arg) {
 
     using AccessMode = bess::metadata::Attribute::AccessMode;
     attr_id_ = AddMetadataAttr(attr_name, sizeof(uint64_t), AccessMode::kWrite);
+    if (attr_id_ < 0) {
+      return CommandFailure(-attr_id_, "add_metadata_attr(%s) failed",
+                            attr_name.c_str());
+    }
   }
   return CommandSuccess();
 }

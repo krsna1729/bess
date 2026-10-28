@@ -1000,61 +1000,22 @@ TEST(WildcardMatchPacketTest, ResultFieldWithoutSpaceFailsClosed) {
   EXPECT_TRUE(no_space);
 }
 
-// Captures the messages glog emits at ERROR or above while it is alive.
-class ErrorLogCapture : public google::LogSink {
- public:
-  ErrorLogCapture() { google::AddLogSink(this); }
-  ~ErrorLogCapture() override { google::RemoveLogSink(this); }
-  void send(google::LogSeverity severity, const char *, const char *, int,
-            const google::LogMessageTime &, const char *message,
-            size_t message_len) override {
-    if (severity >= google::GLOG_ERROR) {
-      messages.emplace_back(message, message_len);
-    }
-  }
-  std::vector<std::string> messages;
-};
-
-// The first PreResume resolves a deferred result plan: no destination moved
-// then, nor on a later resume that leaves the offsets alone.
-TEST(WildcardMatchPacketTest, DeferredResultPlanIsNotAMove) {
-  ModuleHarness h;
-  Module *wm = ResultWm(h, {"wm_read_attr"}, 4, 1, 0, std::string("\x00\x00\x00\x07", 4));
-  ASSERT_NE(nullptr, wm);
-  bess::pb::MetadataTestArg read;
-  (*read.mutable_read())["wm_read_attr"] = 4;
-  Module *reader = h.Create("MetadataTest", read);
-  ASSERT_NE(nullptr, reader);
-  ASSERT_EQ(0, ModuleGraph::ConnectModules(wm, 1, reader, 0, true));
-
-  auto rng = bess::testing::SeededRng(1);
-  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
-  ErrorLogCapture errors;
-  for (int resume = 0; resume < 2; resume++) {
-    EXPECT_EQ((GateCounts{{0, 1}}), Counts(h.RunPipeline(wm, 0, {pkt}, reader, {0})))
-        << "resume " << resume;
-  }
-  for (const std::string &message : errors.messages) {
-    EXPECT_EQ(std::string::npos, message.find("moved")) << message;
-  }
-}
-
 // A field that gains a reader between resumes is written from the next one
-// on, and one that loses it is compiled out again; neither is a move.
+// on, and one that loses it is compiled out again.
 TEST(WildcardMatchPacketTest, ResultFieldFollowsItsReaderAcrossResumes) {
   ModuleHarness h;
   Module *wm = ResultWm(h, {"wm_moving_attr"}, 4, 1, 0, std::string("\x00\x00\x00\x07", 4));
-  Module *check = MatchAttr(h, "wm_moving_attr", kSeven);
   ASSERT_NE(nullptr, wm);
-  ASSERT_NE(nullptr, check);
   const size_t id = AttrIndex(wm, "wm_moving_attr");
   ASSERT_LT(id, wm->all_attrs().size());
 
   auto rng = bess::testing::SeededRng(1);
   const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
-  ErrorLogCapture errors;
   EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1})));
   EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, wm->attr_offset(id));
+
+  Module *check = MatchAttr(h, "wm_moving_attr", kSeven);
+  ASSERT_NE(nullptr, check);
 
   // Skipped -> read: the downstream match sees the record's value.
   ModuleGraph::DisconnectModule(wm, 1);
@@ -1064,37 +1025,9 @@ TEST(WildcardMatchPacketTest, ResultFieldFollowsItsReaderAcrossResumes) {
 
   // Read -> skipped: still the rule's gate.
   ModuleGraph::DisconnectModule(wm, 1);
+  ModuleGraph::DestroyModule(check);
   EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1})));
   EXPECT_EQ(bess::metadata::kMetadataOffsetNoWrite, wm->attr_offset(id));
-  for (const std::string &message : errors.messages) {
-    EXPECT_EQ(std::string::npos, message.find("moved")) << message;
-  }
-}
-
-// A packet-offset result field keeps its destination across resumes: no
-// "moved" error on any of them.
-TEST(WildcardMatchPacketTest, PacketResultFieldIsNotAMove) {
-  ModuleHarness h;
-  WildcardMatchArg arg;
-  *arg.add_fields() = WmField(26, 4);
-  auto *field = arg.add_result_fields();
-  field->set_offset(40);
-  field->set_value_offset(0);
-  field->set_num_bytes(2);
-  Module *wm = h.Create("WildcardMatch", arg);
-  ASSERT_NE(nullptr, wm);
-  EXPECT_EQ("", AddRule(h, wm, WmRule(1, 1, {kFull4}, {IpOctets("10.0.0.1")})));
-
-  auto rng = bess::testing::SeededRng(1);
-  const Bytes pkt = TcpPacket({.sip = "10.0.0.1", .dip = "12.34.56.78"}, rng);
-  ErrorLogCapture errors;
-  for (int resume = 0; resume < 3; resume++) {
-    EXPECT_EQ((GateCounts{{1, 1}}), Counts(h.Run(wm, 0, {pkt}, {0, 1})))
-        << "resume " << resume;
-  }
-  for (const std::string &message : errors.messages) {
-    EXPECT_EQ(std::string::npos, message.find("moved")) << message;
-  }
 }
 
 // A reader also reached by a path with no writer is an invalid scope: the

@@ -819,15 +819,30 @@ Cross-module state in a pipeline (e.g. classification result $\to$ meter $\to$ r
 
 The access mode says what a module does with an attribute (`kRead`, `kWrite`,
 `kUpdate`). A contract says what a **reader** may assume when the graph does not
-write it; the two are orthogonal, and a writer's contract is ignored. The
-third and fourth arguments of `AddMetadataAttr` select it, so every existing
-declaration is best-effort:
+write it; the two are orthogonal, and a writer's contract is ignored.
+The third argument of `AddMetadataAttr` selects the access mode; the fourth
+selects its contract. Reads and updates are required by default (D-195).
+Choose best-effort or a declared default explicitly for an optional input:
 
 | Contract | Declaration | A reader with no provider |
 |---|---|---|
-| best-effort (default) | `AddMetadataAttr(name, size, kRead)` | `attr_offset()` is `kMetadataOffsetNoRead`; the module decides (drop, fall back to a packet field, inject on resume). Historical behavior, unchanged. |
-| required | `AddMetadataAttr(name, size, kRead, Attribute::Contract::kRequired)` | Resume fails with `EINVAL` naming the module and attribute. `ApplyPipeline` that resumes workers reports the same refusal; the workers stay paused. |
+| required (default) | `AddMetadataAttr(name, size, kRead)` | Resume fails with `EINVAL` naming the module and attribute. `ApplyPipeline` that resumes workers reports the same refusal; the workers stay paused. |
+| best-effort | `AddMetadataAttr(name, size, kRead, Attribute::Contract::kBestEffort)` | `attr_offset()` is `kMetadataOffsetNoRead`; the module uses its intentional fallback or diagnostic behavior. |
 | optional with default | `AddMetadataAttrWithDefault(name, size, kRead, bytes)` (or `kDefault` for a zero default) | `attr_offset()` is `kMetadataOffsetDefault`; `ResolveAttr<T>(id).Get(pkt)` returns the declared value and never touches packet metadata. |
+
+A required reader also needs a usable packet offset. If its live range does
+not fit in packet metadata, resume fails with `ENOSPC`, not a missing-writer
+error. A defaulted reader with a provider fails the same way: it cannot hide an
+unallocatable provider by reading the default instead. Best-effort allocation
+failures remain diagnostic.
+
+Existing three-argument readers now reject incomplete graphs instead of
+starting workers that only log or drop. The intentional optional in-tree reads
+are explicit: Measure can use a checked in-packet timestamp; PacketStore uses
+the first bound key or flow 0; MTTest observes allocation without reading packet
+values. Router's route-domain and neighbor-interface constants remain declared
+defaults. Registration failures must be returned from `Init`, even for an
+optional read; an error code is never an attribute id.
 
 A defaulted attribute needs no provider-side change: if a writer appears in a
 later graph revision, the next resume assigns a real offset and the same
@@ -857,9 +872,15 @@ packet.
 graph's metadata categories. `GetPipeline` returns it with
 `include_metadata: true` as `MetadataReport`, and `bessctl metadata` prints it:
 writers without a reader, readers without a writer, unsatisfied required
-declarations, applied defaults, and declarations of one name that disagree
-about contract or default bytes or have more than one writer scope. A declaration's `size` conflict is already
-refused when the second module is created, so it cannot reach a report.
+declarations, applied defaults, `allocation_failures`, and declarations of one
+name that disagree about contract or default bytes or have multiple writers.
+Multiple writers are not automatically invalid: alternative upstream producers
+can share a valid binding. A declaration's `size` conflict is refused at
+registration, so it cannot become a usable reader.
+
+This validates declared graph coverage and storage, not packet contents.
+It does not prove that a conditional producer wrote a value for every packet,
+nor a packet's parse, length or exclusive ownership.
 
 ---
 

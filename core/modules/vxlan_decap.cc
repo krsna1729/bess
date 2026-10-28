@@ -21,9 +21,17 @@ CommandResponse VXLANDecap::Init(
     const bess::pb::VXLANDecapArg &arg [[maybe_unused]]) {
   using AccessMode = bess::metadata::Attribute::AccessMode;
 
-  AddMetadataAttr("tun_ip_src", 4, AccessMode::kWrite);
-  AddMetadataAttr("tun_ip_dst", 4, AccessMode::kWrite);
-  AddMetadataAttr("tun_id", 4, AccessMode::kWrite);
+  if (const int id = AddMetadataAttr("tun_ip_src", 4, AccessMode::kWrite);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(tun_ip_src) failed");
+  }
+  if (const int id = AddMetadataAttr("tun_ip_dst", 4, AccessMode::kWrite);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(tun_ip_dst) failed");
+  }
+  if (const int id = AddMetadataAttr("tun_id", 4, AccessMode::kWrite); id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(tun_id) failed");
+  }
 
   return CommandSuccess();
 }

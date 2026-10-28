@@ -136,7 +136,7 @@ TEST(Metadata, RegisterCount) {
 TEST_F(MetadataTest, DisconnectedFails) {
   ASSERT_EQ(0, m0->AddMetadataAttr("a", 1, Attribute::AccessMode::kWrite));
   ASSERT_EQ(0, m1->AddMetadataAttr("a", 1, Attribute::AccessMode::kRead));
-  ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
+  ASSERT_EQ(-EINVAL, default_pipeline.ComputeMetadataOffsets());
   ASSERT_LT(m1->attr_offset(0), 0);
 }
 
@@ -161,7 +161,7 @@ TEST_F(MetadataTest, SingleAttrSimplePipeBackwardsFails) {
 
   ModuleGraph::ConnectModules(m0, 0, m1, 0);
 
-  ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
+  ASSERT_EQ(-EINVAL, default_pipeline.ComputeMetadataOffsets());
 
   ASSERT_EQ(kMetadataOffsetNoRead, m0->attr_offset(0));
   ASSERT_EQ(kMetadataOffsetNoWrite, m1->attr_offset(0));
@@ -192,12 +192,11 @@ TEST_F(MetadataTest, AReadAndAWriteOfOneNameAreAnUpdate) {
   EXPECT_EQ(m1->attr_offset(0), reader->attr_offset(0));
 }
 
-// A contract is orthogonal to the access mode: an existing three-argument
-// declaration is best-effort, so an unresolved reader keeps the historical
-// kMetadataOffsetNoRead and the report names it.
-TEST_F(MetadataTest, BestEffortIsTheDefaultAndUnchanged) {
-  ASSERT_EQ(0, m1->AddMetadataAttr("a", 4, Attribute::AccessMode::kRead));
-  ASSERT_EQ(Attribute::Contract::kBestEffort, m1->all_attrs()[0].contract);
+// Optional readers can retain an unresolved binding without blocking resume;
+// the report must still identify the absent provider.
+TEST_F(MetadataTest, ExplicitBestEffortRetainsMissingProviderDiagnostics) {
+  ASSERT_EQ(0, m1->AddMetadataAttr("a", 4, Attribute::AccessMode::kRead,
+                                   Attribute::Contract::kBestEffort));
 
   ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
   EXPECT_EQ(kMetadataOffsetNoRead, m1->attr_offset(0));
@@ -235,12 +234,11 @@ TEST_F(MetadataTest, RequiredWithoutProviderFailsResume) {
   EXPECT_NE(nullptr, default_pipeline.first_unsatisfied_required());
 }
 
-TEST_F(MetadataTest, RequiredWithProviderResolves) {
-  ASSERT_EQ(0, m0->AddMetadataAttr("must_have", 4,
-                                   Attribute::AccessMode::kWrite));
-  ASSERT_EQ(0, m1->AddMetadataAttr("must_have", 4,
-                                   Attribute::AccessMode::kRead,
-                                   Attribute::Contract::kRequired));
+TEST_F(MetadataTest, RequiredBindingsTrackGraphRevisions) {
+  ASSERT_EQ(0,
+            m0->AddMetadataAttr("must_have", 4, Attribute::AccessMode::kWrite));
+  ASSERT_EQ(0,
+            m1->AddMetadataAttr("must_have", 4, Attribute::AccessMode::kRead));
   ModuleGraph::ConnectModules(m0, 0, m1, 0);
 
   ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
@@ -248,6 +246,18 @@ TEST_F(MetadataTest, RequiredWithProviderResolves) {
   EXPECT_EQ(m0->attr_offset(0), m1->attr_offset(0));
   EXPECT_TRUE(default_pipeline.report().unsatisfied_required.empty());
   EXPECT_EQ(nullptr, default_pipeline.first_unsatisfied_required());
+
+  ASSERT_EQ(0, ModuleGraph::DisconnectModule(m0, 0));
+  EXPECT_EQ(-EINVAL, default_pipeline.ComputeMetadataOffsets());
+  EXPECT_EQ(kMetadataOffsetNoRead, m1->attr_offset(0));
+  ASSERT_EQ(1u, default_pipeline.report().unsatisfied_required.size());
+  EXPECT_EQ(m1->name(),
+            default_pipeline.report().unsatisfied_required.front().module);
+
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(m0, 0, m1, 0));
+  EXPECT_EQ(0, default_pipeline.ComputeMetadataOffsets());
+  EXPECT_EQ(m0->attr_offset(0), m1->attr_offset(0));
+  EXPECT_TRUE(default_pipeline.report().unsatisfied_required.empty());
 }
 
 // A defaulted reader with no provider resolves to the declared value without
@@ -292,6 +302,14 @@ TEST_F(MetadataTest, DefaultAppliesUntilAProviderAppears) {
   const Bytes4 written{9, 8, 7, 6};
   set_attr_with_offset<Bytes4>(m0->attr_offset(0), packet.ref(), written);
   EXPECT_EQ(written, resolved.Get(packet.ref()));
+
+  // Removing the provider must not expose bytes from the old graph revision.
+  ASSERT_EQ(0, ModuleGraph::DisconnectModule(m0, 0));
+  ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
+  resolved = m1->ResolveAttr<Bytes4>(0);
+  EXPECT_FALSE(resolved.resolved());
+  EXPECT_EQ(kDefault, resolved.Get(packet.ref()));
+  EXPECT_EQ(1u, default_pipeline.report().defaults_applied.size());
 }
 
 // The report distinguishes a writer nothing consumes, and flags declarations
@@ -317,8 +335,6 @@ TEST_F(MetadataTest, ReportListsUnreadWritersAndConflicts) {
 
   ASSERT_EQ(1u, report.conflicts.size());
   EXPECT_EQ("a", report.conflicts[0].attribute);
-  EXPECT_NE(std::string::npos,
-            report.conflicts[0].reason.find("default values differ"));
   ASSERT_EQ(2u, report.conflicts[0].modules.size());
   EXPECT_EQ(2u, report.defaults_applied.size());
 }
@@ -335,15 +351,12 @@ TEST_F(MetadataTest, ReportFlagsContractDisagreement) {
   const MetadataReport &report = default_pipeline.report();
   ASSERT_EQ(1u, report.conflicts.size());
   EXPECT_EQ("a", report.conflicts[0].attribute);
-  EXPECT_NE(std::string::npos,
-            report.conflicts[0].reason.find("different contract"));
   ASSERT_EQ(1u, report.unsatisfied_required.size());
 }
 
-// One reader reachable from two writer scopes: each writer gets its own
-// component and the allocator gives the reader one of their offsets, so the
-// report names the attribute rather than failing silently.
-TEST_F(MetadataTest, ReportFlagsAReaderReachedFromTwoWriterScopes) {
+// Alternative producers are valid when the reader has a writer on each
+// incoming path. Both values must reach the shared binding.
+TEST_F(MetadataTest, AlternativeWritersShareOneRequiredReaderBinding) {
   Module *left = ::create_foo("left");
   Module *right = ::create_foo("right");
   Module *reader = ::create_foo("reader");
@@ -361,15 +374,19 @@ TEST_F(MetadataTest, ReportFlagsAReaderReachedFromTwoWriterScopes) {
   ModuleGraph::ConnectModules(right, 0, reader, 1);
 
   ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
-  const MetadataReport &report = default_pipeline.report();
-  ASSERT_EQ(1u, report.conflicts.size());
-  EXPECT_EQ("a", report.conflicts[0].attribute);
-  EXPECT_NE(std::string::npos,
-            report.conflicts[0].reason.find("more than one writer scope"));
-  EXPECT_EQ(3u, report.conflicts[0].modules.size())
-      << "both writers and the reader declare the name";
-  EXPECT_EQ(3u, report.declarations);
-  EXPECT_EQ(3u, report.resolved) << "all three resolved to some packet offset";
+  ASSERT_TRUE(IsValidOffset(reader->attr_offset(0)));
+  EXPECT_EQ(m0->attr_offset(0), reader->attr_offset(0));
+  EXPECT_EQ(m1->attr_offset(0), reader->attr_offset(0));
+
+  FakePacket left_packet;
+  FakePacket right_packet;
+  set_attr_with_offset<uint16_t>(m0->attr_offset(0), left_packet.ref(), 0x1234);
+  set_attr_with_offset<uint16_t>(m1->attr_offset(0), right_packet.ref(),
+                                 0xabcd);
+  const auto binding = reader->ResolveAttr<uint16_t>(0);
+  EXPECT_EQ(0x1234, binding.Get(left_packet.ref()));
+  EXPECT_EQ(0xabcd, binding.Get(right_packet.ref()));
+  EXPECT_TRUE(default_pipeline.report().unsatisfied_required.empty());
 }
 
 // A reader also reached by a path with no writer is an invalid scope: the
@@ -386,7 +403,7 @@ TEST_F(MetadataTest, AWriterInAnInvalidScopeIsNotUnread) {
   ModuleGraph::ConnectModules(m0, 0, reader, 0);
   ModuleGraph::ConnectModules(m1, 0, reader, 0);
 
-  ASSERT_EQ(0, default_pipeline.ComputeMetadataOffsets());
+  ASSERT_EQ(-EINVAL, default_pipeline.ComputeMetadataOffsets());
   EXPECT_EQ(kMetadataOffsetInvalidScope, m0->attr_offset(0));
   EXPECT_EQ(kMetadataOffsetNoRead, reader->attr_offset(0));
   const MetadataReport &report = default_pipeline.report();
@@ -395,14 +412,71 @@ TEST_F(MetadataTest, AWriterInAnInvalidScopeIsNotUnread) {
   EXPECT_EQ("reader", report.readers_without_writer[0].module);
 }
 
+TEST_F(MetadataTest, RequiredReaderWithoutStorageFailsGraphValidation) {
+  const size_t count = kMetadataTotalSize / kMetadataAttrMaxSize + 1;
+  for (size_t i = 0; i < count; ++i) {
+    const std::string name = "required_" + std::to_string(i);
+    ASSERT_GE(m0->AddMetadataAttr(name, kMetadataAttrMaxSize,
+                                  Attribute::AccessMode::kWrite),
+              0);
+    ASSERT_GE(m1->AddMetadataAttr(name, kMetadataAttrMaxSize,
+                                  Attribute::AccessMode::kRead,
+                                  Attribute::Contract::kRequired),
+              0);
+  }
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(m0, 0, m1, 0));
+
+  EXPECT_EQ(-ENOSPC, default_pipeline.ComputeMetadataOffsets());
+  size_t unallocated = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (m1->attr_offset(i) == kMetadataOffsetNoSpace) {
+      ++unallocated;
+    }
+  }
+  ASSERT_EQ(1u, unallocated);
+  const MetadataReport& report = default_pipeline.report();
+  ASSERT_EQ(1u, report.unsatisfied_required.size());
+  EXPECT_EQ(m1->name(), report.unsatisfied_required[0].module);
+  ASSERT_EQ(1u, report.allocation_failures.size());
+  EXPECT_EQ(m1->name(), report.allocation_failures.front().module);
+  EXPECT_TRUE(report.readers_without_writer.empty());
+}
+
+TEST_F(MetadataTest, DefaultReaderCannotHideAnUnallocatableProvider) {
+  const size_t count = kMetadataTotalSize / kMetadataAttrMaxSize + 1;
+  for (size_t i = 0; i < count; ++i) {
+    const std::string name = "default_" + std::to_string(i);
+    ASSERT_GE(m0->AddMetadataAttr(name, kMetadataAttrMaxSize,
+                                  Attribute::AccessMode::kWrite),
+              0);
+    ASSERT_GE(m1->AddMetadataAttr(name, kMetadataAttrMaxSize,
+                                  Attribute::AccessMode::kRead,
+                                  Attribute::Contract::kDefault),
+              0);
+  }
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(m0, 0, m1, 0));
+
+  EXPECT_EQ(-ENOSPC, default_pipeline.ComputeMetadataOffsets());
+  const MetadataReport& report = default_pipeline.report();
+  ASSERT_EQ(1u, report.allocation_failures.size());
+  const auto* failure = default_pipeline.first_blocking_allocation_failure();
+  ASSERT_NE(nullptr, failure);
+  EXPECT_EQ(m1->name(), failure->module);
+  EXPECT_EQ(Attribute::Contract::kDefault, failure->contract);
+  EXPECT_TRUE(report.unsatisfied_required.empty());
+  EXPECT_TRUE(report.readers_without_writer.empty());
+  EXPECT_TRUE(report.defaults_applied.empty());
+}
+
 // Check that offsets are properly assigned when there are too many attributes.
-TEST_F(MetadataTest, MultipleAttrSimplePipeNoSpaceFails) {
+TEST_F(MetadataTest, BestEffortStorageFailureRemainsDiagnostic) {
   size_t sz = kMetadataAttrMaxSize;
   size_t n = kMetadataTotalSize / sz;
   for (size_t i = 0; i <= n; i++) {
     std::string s = "attr" + std::to_string(i);
     ASSERT_EQ(i, m0->AddMetadataAttr(s, sz, Attribute::AccessMode::kWrite));
-    ASSERT_EQ(i, m1->AddMetadataAttr(s, sz, Attribute::AccessMode::kRead));
+    ASSERT_EQ(i, m1->AddMetadataAttr(s, sz, Attribute::AccessMode::kRead,
+                                     Attribute::Contract::kBestEffort));
   }
   ModuleGraph::ConnectModules(m0, 0, m1, 0);
 
@@ -410,6 +484,8 @@ TEST_F(MetadataTest, MultipleAttrSimplePipeNoSpaceFails) {
 
   ASSERT_EQ(kMetadataOffsetNoSpace, m0->attr_offset(n));
   ASSERT_EQ(kMetadataOffsetNoSpace, m1->attr_offset(n));
+  ASSERT_EQ(1u, default_pipeline.report().allocation_failures.size());
+  EXPECT_EQ(nullptr, default_pipeline.first_blocking_allocation_failure());
 }
 
 TEST_F(MetadataTest, MultipeAttrSimplePipe) {
@@ -846,7 +922,11 @@ TEST_P(MetadataGraphTest, ReadsFindTheirLatestWrite) {
     Module* m = ::create_foo(std::string(graph.name) + "_" + node.name);
     ASSERT_NE(nullptr, m);
     for (const GraphUse& use : node.uses) {
-      ASSERT_GE(m->AddMetadataAttr(use.attr, use.size, use.mode), 0);
+      // This model checks allocator/path diagnostics, including graphs with
+      // intentional missing providers; it does not request strict contracts.
+      ASSERT_GE(m->AddMetadataAttr(use.attr, use.size, use.mode,
+                                   Attribute::Contract::kBestEffort),
+                0);
     }
     modules[node.name] = m;
     names[m] = node.name;

@@ -245,6 +245,8 @@ v2::MetadataReport ToProto(const bess::metadata::MetadataReport &report) {
                           report.unsatisfied_required);
   AddMetadataDeclarations(out.mutable_defaults_applied(),
                           report.defaults_applied);
+  AddMetadataDeclarations(out.mutable_allocation_failures(),
+                          report.allocation_failures);
   for (const auto &conflict : report.conflicts) {
     v2::MetadataConflictReport *out_conflict = out.add_conflicts();
     out_conflict->set_attribute(conflict.attribute);

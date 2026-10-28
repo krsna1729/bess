@@ -346,6 +346,12 @@ class RouterTest : public ::testing::Test {
                               static_cast<uint8_t>(id >> 8),
                               static_cast<uint8_t>(id)};
     attr->set_value_bin(reinterpret_cast<const char *>(bytes), sizeof(bytes));
+    // These control packets do not use a selected hop, but the next-hop-mode
+    // graph still needs a producer for its declared read.
+    auto *hop = arg.add_attrs();
+    hop->set_name("next_hop_id");
+    hop->set_size(4);
+    hop->set_value_int(0);
     return h_.Create("SetMetadata", arg,
                      "neighbor_vif" + std::to_string(next_writer_++));
   }
@@ -386,6 +392,10 @@ class RouterTest : public ::testing::Test {
   Router *CreateResolver(const bess::pb::RouterArg &arg, uint32_t bindings = 1,
                          const std::string &name = "rt") {
     auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, name));
+    if (rt != nullptr) {
+      Module *writer = MakeNeighborInterfaceWriter(2);
+      EXPECT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
+    }
     for (uint32_t id = 1; rt != nullptr && id <= bindings; id++) {
       EXPECT_EQ("", BindNeighbor(name, id, 2, "192.0.2.2"));
     }
@@ -948,18 +958,18 @@ TEST_F(RouterTest, TheMetadataIdIsIgnoredInDestinationMode) {
   EXPECT_TRUE(out[0].empty());
 }
 
-// The default mode keeps failing closed: with no writer the module drops every
-// packet; it has no FIB to route by destination with (D-155, D-183).
-TEST_F(RouterTest, TheIdModeStillFailsClosedWithoutAWriter) {
+// The next-hop mode cannot start without the classifier/metadata producer it
+// requires. Reject the graph, instead of starting a worker that only drops.
+TEST_F(RouterTest, TheIdModeRefusesResumeWithoutAWriter) {
   Router *rt = dynamic_cast<Router *>(h_.Create("Router", NextHopArg(), "rt"));
   ASSERT_NE(nullptr, rt);
-  EXPECT_FALSE(rt->routes_by_destination());
   MakeHop(rt, 1, 1, "02:00:00:00:00:bb", "02:00:00:00:00:aa");
 
-  auto out = h_.RunPipeline(rt, 0, {FrameTo("10.1.2.3")}, rt, {0, 1});
-
-  EXPECT_TRUE(out[0].empty());
-  EXPECT_TRUE(out[1].empty()) << "dropped, not routed by destination";
+  EXPECT_EQ(-EINVAL, bess::metadata::default_pipeline.ComputeMetadataOffsets());
+  const auto &report = bess::metadata::default_pipeline.report();
+  ASSERT_EQ(1u, report.unsatisfied_required.size());
+  EXPECT_EQ("rt", report.unsatisfied_required.front().module);
+  EXPECT_EQ("next_hop_id", report.unsatisfied_required.front().attribute);
 }
 
 TEST_F(RouterTest, AnUnknownModeIsRefused) {
@@ -2044,6 +2054,8 @@ TEST_F(RouterTest, TheNextHopModeReadsTheInterfacesFamilies) {
   bess::pb::RouterArg arg = ResolverArg(3);
   auto *dual = dynamic_cast<Router *>(h_.Create("Router", arg, "dual"));
   ASSERT_NE(nullptr, dual);
+  Module *dual_input = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(dual_input, 0, dual, 0, true));
   EXPECT_EQ("", BindNeighbor("dual", 1, 2, "192.0.2.2"));
   EXPECT_EQ("", BindNeighbor("dual", 2, 2, "fe80::2"));
 
@@ -2320,6 +2332,8 @@ TEST_F(RouterTest, ASolicitationLeavesFromTheAddressOnTheNeighborsPrefix) {
   arg.set_neighbor_first_probe_ms(0);
   auto *rt = dynamic_cast<Router *>(h_.Create("Router", arg, "rt"));
   ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
   ASSERT_EQ("", BindNeighbor("rt", 1, 2, "198.51.100.2"));
   ASSERT_EQ("", BindNeighbor("rt", 2, 2, "2001:db8::2"));
   (void)bess::runtime::runtime().ticks().Run(std::chrono::milliseconds(1), 1);
@@ -2420,6 +2434,8 @@ TEST_F(RouterTest, ABroadcastArpReplyResolvesABoundNeighbor) {
 TEST_F(RouterTest, NeighborBindingsComeAndGoAtRuntime) {
   auto *rt = dynamic_cast<Router *>(h_.Create("Router", ResolverArg(0), "rt"));
   ASSERT_NE(nullptr, rt);
+  Module *writer = MakeNeighborInterfaceWriter(2);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(writer, 0, rt, 0, true));
   EXPECT_EQ(nullptr, rt->router()->LookupNextHop(bess::route::NextHopId(5)));
   ASSERT_EQ("", BindNeighbor("rt", 5, 2, "192.0.2.7"));
   const auto *bound = rt->router()->LookupNextHop(bess::route::NextHopId(5));

@@ -38,13 +38,28 @@ CommandResponse VXLANEncap::Init(const bess::pb::VXLANEncapArg &arg) {
 
   using AccessMode = bess::metadata::Attribute::AccessMode;
 
-  AddMetadataAttr("tun_ip_src", 4, AccessMode::kRead);
-  AddMetadataAttr("tun_ip_dst", 4, AccessMode::kRead);
-  AddMetadataAttr("tun_id", 4, AccessMode::kRead);
+  if (const int id = AddMetadataAttr("tun_ip_src", 4, AccessMode::kRead);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(tun_ip_src) failed");
+  }
+  if (const int id = AddMetadataAttr("tun_ip_dst", 4, AccessMode::kRead);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(tun_ip_dst) failed");
+  }
+  if (const int id = AddMetadataAttr("tun_id", 4, AccessMode::kRead); id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(tun_id) failed");
+  }
 
-  AddMetadataAttr("ip_src", 4, AccessMode::kWrite);
-  AddMetadataAttr("ip_dst", 4, AccessMode::kWrite);
-  AddMetadataAttr("ip_proto", 1, AccessMode::kWrite);
+  if (const int id = AddMetadataAttr("ip_src", 4, AccessMode::kWrite); id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ip_src) failed");
+  }
+  if (const int id = AddMetadataAttr("ip_dst", 4, AccessMode::kWrite); id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ip_dst) failed");
+  }
+  if (const int id = AddMetadataAttr("ip_proto", 1, AccessMode::kWrite);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ip_proto) failed");
+  }
 
   return CommandSuccess();
 }

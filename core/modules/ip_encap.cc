@@ -27,11 +27,24 @@ enum {
 CommandResponse IPEncap::Init(const bess::pb::IPEncapArg &arg[[maybe_unused]]) {
   using AccessMode = bess::metadata::Attribute::AccessMode;
 
-  AddMetadataAttr("ip_src", 4, AccessMode::kRead);
-  AddMetadataAttr("ip_dst", 4, AccessMode::kRead);
-  AddMetadataAttr("ip_proto", 1, AccessMode::kRead);
-  AddMetadataAttr("ip_nexthop", 4, AccessMode::kWrite);
-  AddMetadataAttr("ether_type", 2, AccessMode::kWrite);
+  if (const int id = AddMetadataAttr("ip_src", 4, AccessMode::kRead); id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ip_src) failed");
+  }
+  if (const int id = AddMetadataAttr("ip_dst", 4, AccessMode::kRead); id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ip_dst) failed");
+  }
+  if (const int id = AddMetadataAttr("ip_proto", 1, AccessMode::kRead);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ip_proto) failed");
+  }
+  if (const int id = AddMetadataAttr("ip_nexthop", 4, AccessMode::kWrite);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ip_nexthop) failed");
+  }
+  if (const int id = AddMetadataAttr("ether_type", 2, AccessMode::kWrite);
+      id < 0) {
+    return CommandFailure(-id, "add_metadata_attr(ether_type) failed");
+  }
 
   return CommandSuccess();
 }

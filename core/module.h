@@ -349,14 +349,15 @@ class alignas(bess::arch::kCacheLineSize) Module {
   // automatically registered, so only attributes specific to a module
   // 'instance'
   // need this function.
-  // The contract defaults to best-effort, so every existing declaration keeps
-  // its behavior. A Contract::kDefault declaration with no value here means a
-  // zero-filled default; use AddMetadataAttrWithDefault() for any other value.
+  // Reads and updates require a provider on every incoming path by default.
+  // Intentional optional reads declare kDefault or kBestEffort explicitly;
+  // writers ignore this contract. A kDefault with no value means zero-filled
+  // bytes; use AddMetadataAttrWithDefault() for any other value.
   // Returns its allocated ID (>= 0), or a negative number for error */
   int AddMetadataAttr(const std::string &name, size_t size,
                       bess::metadata::Attribute::AccessMode mode,
                       bess::metadata::Attribute::Contract contract =
-                          bess::metadata::Attribute::Contract::kBestEffort);
+                          bess::metadata::Attribute::Contract::kRequired);
 
   // Declares an optional-with-default read attribute and its value (exactly
   // `size` bytes). A provider-less reader then resolves to the value at the
