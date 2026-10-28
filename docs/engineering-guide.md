@@ -23,6 +23,7 @@ capabilities (D-180).
 | A module that reads or writes packet bytes | §2 and §3 of this page; `core/packet_parse.h`, `core/packet_reshape.h`, `core/packet_mutation.h` |
 | A lookup table | [dataplane-tables.md](dataplane-tables.md) |
 | Hot-path performance | §5 of this page; [benchmarking.md](benchmarking.md); [performance-contract.md](performance-contract.md); [assembly-shape.md](assembly-shape.md) |
+| A classifier-to-policy graph | [decisions.md](decisions.md) D-172 and D-196; `core/modules/session_pipeline_test.cc` (UPF, broadband, firewall); `tests/live/usage_report_test.cc` (record-selected quota/events) |
 | An installed header or plugin surface | [plugin-api.md](plugin-api.md); architecture.md §5 |
 | A `.proto` file | [compatibility.md](compatibility.md); [control-sdk.md](control-sdk.md) (regenerate the SDKs) |
 | A fixed limit (`kMax*`, `kMin*`, `kDefault*`, `*Limit*`, `MAX_*`, `MIN_*`, `DEFAULT_*`) | [limits.md](limits.md) |

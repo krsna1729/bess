@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The worked example of the counter-watch pattern (D-150, D-151, D-152, D-154)
-// against a live bessd: the sample plugin's UsageReport meters a key that the
-// graph writes into metadata, a controller arms a quota through the module's
-// own "<name>/quotas" resource, and the crossing arrives as the shared
+// against a live bessd: ExactMatch writes its result's accounting key into
+// metadata, UsageReport meters it, a controller arms a quota through the
+// module's own "<name>/quotas" resource, and the crossing arrives as the shared
 // bess.counter_threshold event.
 //
 // The three ways are each exercised: the packet path's compare reports while
@@ -133,17 +133,30 @@ class UsageReportTest : public ::testing::Test {
     return 0;
   }
 
-  // Source -> Rewrite (the frame) -> SetMetadata (the key) -> UsageReport ->
-  // Sink, on one worker. `quota` octets are armed on kKey through the module's
-  // own resource; 0 leaves the resource unlisted, so nothing is armed.
-  void Apply(sample_pb::UsageReportMode mode, uint64_t quota) {
+  // Source -> Rewrite -> ExactMatch -> UsageReport -> Sink, on one worker.
+  // The classifier's result carries the big-endian accounting key; a miss
+  // drops before accounting. Zero quota leaves the key unarmed.
+  void Apply(sample_pb::UsageReportMode mode, uint64_t quota,
+             bool matches = true) {
     Types types(client());
     auto rewrite = types.Make(
         "bess.pb.RewriteArg", std::string("{\"templates\": [\"") + kFrame + "\"]}");
-    auto key = types.Make("bess.pb.SetMetadataArg",
-                          std::string("{\"attrs\": [{\"name\": \"") + kKeyAttr +
-                              "\", \"size\": 8, \"value_int\": " + std::to_string(kKey) +
-                              "}]}");
+    auto classifier = types.Make(
+        "bess.pb.ExactMatchArg",
+        std::string("{\"fields\": [{\"offset\": 26, \"num_bytes\": 4}], "
+                    "\"result_fields\": [{\"attr_name\": \"") +
+            kKeyAttr + "\", \"value_offset\": 0, \"num_bytes\": 8}]}");
+    auto key = types.Make("bess.pb.ExactMatchRuleKey",
+                          std::string("{\"fields\": [{\"value_bin\": \"") +
+                              (matches ? "wKgBAQ==" : "wAACAQ==") + "\"}]}");
+    auto value = types.Make("bess.pb.ExactMatchRuleValue", "{\"gate\": 0}");
+    std::string record(sizeof(uint64_t), '\0');
+    for (size_t i = 0; i < record.size(); ++i) {
+      record[record.size() - 1 - i] = static_cast<char>(kKey >> (8 * i));
+    }
+    const auto *result = value->GetDescriptor()->FindFieldByName("result");
+    ASSERT_NE(nullptr, result);
+    value->GetReflection()->SetString(value.get(), result, record);
     sample_pb::UsageReportArg arg;
     arg.set_keys(kKeys);
     arg.set_key_attr(kKeyAttr);
@@ -155,11 +168,12 @@ class UsageReportTest : public ::testing::Test {
     b.Worker(0, 0, "")
         .Module("src", "Source", nullptr)
         .Module("frame", "Rewrite", rewrite.get())
-        .Module("key", "SetMetadata", key.get())
+        .Module("key", "ExactMatch", classifier.get())
         .Module(kModule, "UsageReport", &arg)
         .Module("sink", "Sink", nullptr)
         .Chain({"src", "frame", "key", kModule, "sink"})
         .Task(OnWorker("src", 0));
+    b.Entry("key/rules", *key, *value);
     if (quota != 0) {
       sample_pb::UsageQuotas quotas;
       sample_pb::UsageQuota *q = quotas.add_quotas();
@@ -226,6 +240,20 @@ TEST_F(UsageReportTest, AnUnarmedKeyIsNotReported) {
   EXPECT_GT(left, 0) << "no packet left " << kModule;
   const Watched w = Watch(client(), start, {"bess.counter_threshold"}, 1);
   EXPECT_TRUE(w.events.empty()) << "an unarmed key reported a crossing:\n" << daemon_->Log();
+}
+
+TEST_F(UsageReportTest, AClassifierMissCannotSpendOrReportTheArmedQuota) {
+  Apply(sample_pb::USAGE_REPORT_EVENTS, 1, false);
+  const uint64_t start = NextSequence();
+  EXPECT_EQ(0, Run(std::chrono::milliseconds(400)));
+  const auto samples = client().Metrics();
+  ASSERT_TRUE(samples) << samples.error().message;
+  EXPECT_GT(GatePackets(*samples, "frame"), 0)
+      << "the producer must send frames, not merely leave the graph idle";
+  const Watched watched = Watch(client(), start, {"bess.counter_threshold"}, 1);
+  EXPECT_TRUE(watched.events.empty())
+      << "classifier misses must not enter accounting:\n"
+      << daemon_->Log();
 }
 
 }  // namespace
