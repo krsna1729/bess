@@ -354,4 +354,151 @@ TEST_F(StandalonePlugins, Appliances) {
   wire.Check();
 }
 
+// One compound version drives both the DSCP write and egress. Gate-local
+// classifiers accept only that version's complete pair, so any old/new mix
+// becomes a visible bad output rather than a successful forwarding count.
+TEST_F(StandalonePlugins, AppliancesScopeSnapshot) {
+  const auto policy = [](uint32_t dscp, uint32_t gate) {
+    const std::string common =
+        R"("destination":"0.0.0.0","prefix_length":0,"dport_lo":0,)"
+        R"("dport_hi":65535,"protocol":0,)";
+    return R"({"layers":[{"groups":[{"rules":[{)" + common +
+           R"("action":"MARK","dscp":)" + std::to_string(dscp) +
+           R"(,"gate":0}]}]},{"groups":[{"rules":[{)" + common +
+           R"("action":"REDIRECT","dscp":0,"gate":)" + std::to_string(gate) +
+           "}]}]}]}";
+  };
+  auto empty = types_->Make("bess.pb.EmptyArg", "{}");
+  auto frame = types_->Make(
+      "bess.pb.RewriteArg",
+      R"({"templates":[")" + Base64(Ipv4UdpFrame({192, 0, 2, 1})) + R"("]})");
+  auto checker = types_->Make(
+      "bess.pb.ExactMatchArg",
+      R"({"fields":[{"offset":15,"num_bytes":1}],"default_gate":1})");
+  auto old_key =
+      types_->Make("bess.pb.ExactMatchRuleKey",
+                   R"({"fields":[{"value_int":40}]})"); // DSCP 10, ECN 0
+  auto new_key =
+      types_->Make("bess.pb.ExactMatchRuleKey",
+                   R"({"fields":[{"value_int":80}]})"); // DSCP 20, ECN 0
+  auto good = types_->Make("bess.pb.ExactMatchRuleValue", R"({"gate":0})");
+  bess::sdk::PipelineBuilder builder;
+  builder.Worker(0, std::nullopt, "")
+      .Module("vs", "VswitchAppliance", empty.get())
+      .Module("old_shape", "ExactMatch", checker.get())
+      .Module("new_shape", "ExactMatch", checker.get())
+      .Module("good", "Sink", nullptr)
+      .Module("bad", "Sink", nullptr)
+      .Connect("vs", 0, "old_shape", 0)
+      .Connect("vs", 1, "new_shape", 0)
+      .Connect("old_shape", 0, "good", 0)
+      .Connect("old_shape", 1, "bad", 0)
+      .Connect("new_shape", 0, "good", 0)
+      .Connect("new_shape", 1, "bad", 0)
+      .Entry("old_shape/rules", *old_key, *good)
+      .Entry("new_shape/rules", *new_key, *good);
+  for (uint32_t tenant = 0; tenant < 2; ++tenant) {
+    const std::string name = "tenant" + std::to_string(tenant);
+    builder.Module(name, "Source", nullptr)
+        .Module(name + "_frame", "Rewrite", frame.get())
+        .Chain({name, name + "_frame"})
+        .Connect(name + "_frame", 0, "vs", tenant);
+    v2::TaskPlacement task;
+    task.set_module(name);
+    task.set_wid(0);
+    builder.Task(task);
+  }
+  auto pipeline = builder.Build();
+  ASSERT_TRUE(pipeline) << pipeline.error().message;
+  auto installed = client().ApplyPipeline(*pipeline);
+  ASSERT_TRUE(installed) << installed.error().message;
+  auto resource = client().Resource("vs/policies");
+  ASSERT_TRUE(resource) << resource.error().message;
+  const auto replace =
+      [&](uint32_t tenant,
+          const std::string &json) -> bess::sdk::Result<bess::sdk::Applied> {
+    auto tx = client().NewTransaction({.snapshot = true});
+    auto key = types_->Make(resource->key_type,
+                            R"({"id":)" + std::to_string(tenant) + "}");
+    auto value = types_->Make(resource->value_type, json);
+    if (auto staged = tx.Upsert(*resource, *key, *value); !staged) {
+      return std::unexpected(staged.error());
+    }
+    return tx.Commit();
+  };
+  for (uint32_t tenant : {1, 2}) {
+    auto applied = replace(tenant, policy(10, 0));
+    ASSERT_TRUE(applied) << applied.error().message;
+  }
+  ASSERT_TRUE(client().ResumeWorkers());
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  for (uint32_t i = 0; i < 32; ++i) {
+    auto applied = replace(1, i % 2 == 0 ? policy(20, 1) : policy(10, 0));
+    ASSERT_TRUE(applied) << applied.error().message;
+  }
+  auto final = replace(1, policy(20, 1));
+  ASSERT_TRUE(final) << final.error().message;
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ASSERT_TRUE(client().PauseWorkers());
+  EXPECT_GT(GatePackets("old_shape", 0), 0);
+  EXPECT_GT(GatePackets("new_shape", 0), 0);
+  EXPECT_EQ(0, GatePackets("old_shape", 1)) << "new DSCP with old egress";
+  EXPECT_EQ(0, GatePackets("new_shape", 1)) << "old DSCP with new egress";
+
+  // Rejected preparation changes no part of either published compound root.
+  const bess::sdk::PipelineQuery query{.include_resources = true,
+                                       .resources = {"vs/policies"}};
+  auto before = client().Pipeline(query);
+  ASSERT_TRUE(before) << before.error().message;
+  ASSERT_EQ(1, before->pipeline.resources_size());
+  const std::vector<std::string> invalid = {
+      policy(64, 1),
+      policy(20, 2),
+      R"({"layers":[{"groups":[{"rules":[{"action":"ALLOW","dport_lo":80,"dport_hi":79}]}]}]})",
+      R"({"layers":[{"groups":[{"rules":[{"action":"ALLOW","protocol":256}]}]}]})",
+      R"({"layers":[{"groups":[{"rules":[{"action":"ALLOW","prefix_length":33}]}]}]})",
+      R"({"layers":[{"groups":[{"rules":[{"action":"ALLOW","destination":"192.0.2.1","prefix_length":24}]}]}]})",
+      R"({"layers":[{"groups":[{"rules":[{"action":999}]}]}]})",
+  };
+  for (const auto &bad : invalid) {
+    EXPECT_FALSE(replace(1, bad)) << bad;
+  }
+  EXPECT_FALSE(replace(0, policy(10, 0)));
+  EXPECT_FALSE(replace(3, policy(10, 0)));
+  auto after = client().Pipeline(query);
+  ASSERT_TRUE(after) << after.error().message;
+  ASSERT_EQ(1, after->pipeline.resources_size());
+  EXPECT_EQ(before->pipeline.resources(0).SerializeAsString(),
+            after->pipeline.resources(0).SerializeAsString());
+
+  // A cached allow in tenant 2 is replaced by deny without changing tenant 1.
+  const double old_before = GatePackets("old_shape", 0);
+  const double new_before = GatePackets("new_shape", 0);
+  auto denied =
+      replace(2, R"({"layers":[{"groups":[{"rules":[{"action":"DENY"}]}]}]})");
+  ASSERT_TRUE(denied) << denied.error().message;
+  ASSERT_TRUE(client().ResumeWorkers());
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ASSERT_TRUE(client().PauseWorkers());
+  EXPECT_EQ(old_before, GatePackets("old_shape", 0));
+  EXPECT_GT(GatePackets("new_shape", 0), new_before);
+  EXPECT_EQ(0, GatePackets("old_shape", 1));
+  EXPECT_EQ(0, GatePackets("new_shape", 1));
+
+  const double source_before = GatePackets("tenant0_frame", 0);
+  const double kept = GatePackets("new_shape", 0);
+  denied =
+      replace(1, R"({"layers":[{"groups":[{"rules":[{"action":"DENY"}]}]}]})");
+  ASSERT_TRUE(denied) << denied.error().message;
+  ASSERT_TRUE(client().ResumeWorkers());
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ASSERT_TRUE(client().PauseWorkers());
+  EXPECT_GT(GatePackets("tenant0_frame", 0), source_before);
+  EXPECT_EQ(kept, GatePackets("new_shape", 0))
+      << "a new scope must not reuse a cached allow";
+  EXPECT_EQ(old_before, GatePackets("old_shape", 0));
+  EXPECT_EQ(0, GatePackets("old_shape", 1));
+  EXPECT_EQ(0, GatePackets("new_shape", 1));
+}
+
 }  // namespace

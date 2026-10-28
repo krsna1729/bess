@@ -583,7 +583,7 @@ def step_verify_install(s):
     shutil.rmtree(appliances, ignore_errors=True)
     s.run(['meson', 'setup', appliances, 'examples/appliances'], env=env)
     s.run(['meson', 'compile', '-C', appliances], env=env)
-    check_plugins(appliances, 'Appliances')
+    check_plugins(appliances, 'Appliances*')
     # A third-party library on the installed primitives, built and tested
     # without bessd (M23, persona E).
     battery = s.root / 'build' / f'battery-{s.name}'

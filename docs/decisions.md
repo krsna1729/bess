@@ -172,6 +172,7 @@ file is the reasoning.
 | D-194 | Shared owner-counter reporting with module/observation labels; preserve drop, punt and task-run meanings without packet-path changes | accepted |
 | D-195 | Metadata reads and updates require graph bindings by default; distinguish missing producers from packet-metadata exhaustion | accepted |
 | D-196 | Exercise classifier records in UPF, broadband and firewall policy graphs; reuse the shipped generic quota/event consumer | accepted |
+| D-197 | Ship a vSwitch scope-snapshot consumer: bind compound policy and cache revision together; wire-control whole tenant roots | accepted |
 
 
 ---
@@ -13771,4 +13772,62 @@ rate-rejected new connection retains admission. No production mechanism,
 packet-path allocation, synchronization or throughput claim is added. These
 graphs do not establish one atomic policy snapshot across independent
 resources; a scope-snapshot consumer is a separate acceptance item.
+
+
+## D-197 A shipped compound-policy scope-snapshot consumer
+
+**Status:** accepted (2026-10-28). Acceptance consumer for D-050; completes the
+separate coherent-root item identified by D-196.
+
+**Problem.** The reference vSwitch already owns a compound Layer/Group/Rule
+policy, but publishes that policy and invalidates a separate decision-cache
+generation in two steps. It also has no wire-controlled scope resource.
+Generic scope tests alone do not prove that a shipped packet consumer binds
+all covered decisions to one version.
+
+**Decision.** R3 `VswitchAppliance` registers a real
+`ScopeResource<PolicyVersion>` as `<module>/policies`. Its own unique protobuf
+file and typed codec expose one-based tenant keys and complete layered
+policy values. `CONSISTENCY_SCOPE_SNAPSHOT` transactions replace one whole
+root while the worker runs. The same codec reads committed values back;
+invalid keys, prefixes, ranges, protocols, DSCP, gates and actions fail before
+publication. No runtime knows the application's policy vocabulary.
+
+The packet path loads the tenant's scope once, before cache lookup. The
+immutable version contains both policy and an application-minted revision.
+The worker-owned cache stores a decision with that revision; it accepts a
+hit only for the bound version, and compiles a miss from that same version.
+There is no separate generation store or pointer-identity cache tag. A
+missing scope denies before any cached allow is considered. Replacing one
+tenant does not change another tenant's root or invalidate its hits.
+
+Prepared versions share immutable policy storage only off-path, so the
+generic slot reservation does not deep-copy the layered policy. Packets
+borrow the version and never copy a shared owner, allocate, or mint revisions.
+Counters, cached decisions and cold-flow counts remain mutable worker-owned
+state outside the root. Existing checked parsing, COW and DSCP checksum
+updates remain in place.
+
+**R5 boundary.** Generic ScopeResource publication cannot call an
+application's hardware-revocation hook. Do not pretend that it can.
+Enrollment and hierarchical mode refuse their combination in either order.
+The existing private, unenrolled R5 path publishes the same version type
+through RCU and retains promotion/revocation. All Create callers migrate;
+the obsolete private policy RcuPtr/DecisionGeneration pair and its unused
+generation accessor are removed. No generic cache API or hardware callback is added.
+
+**Evidence.** The authentic installed-tree appliance build and original R3/R5
+packet/self-test path pass. The real-daemon
+`StandalonePlugins.AppliancesScopeSnapshot` check also passes: the controller
+alternates two-layer DSCP/egress roots under traffic, and gate-local
+classifiers send any mixed pair to a visible bad output. Rejected updates
+leave both roots' readback unchanged; denying tenant 2 leaves tenant 1
+forwarding; then replacing tenant 1's cached allow with deny stops its output
+while its source remains active. The installed CI filter includes both
+appliance tests, not only the older smoke.
+
+**Limits.** The guarantee covers covered lookups in one bound tenant root,
+not simultaneous publication of several tenants, unrelated resources or NIC
+rules. Erasure follows the framework's grace-period removal cascade.
+This is a correctness/control consumer, not a throughput or latency claim.
 

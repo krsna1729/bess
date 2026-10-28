@@ -14,7 +14,7 @@ project('appliances', 'cpp',
 bess_dep = dependency('bess-dev', required: true)
 modules_dir = get_option('libdir') / 'bess' / 'modules'
 
-foreach appliance : ['router', 'nat', 'vswitch']
+foreach appliance : ['router', 'nat']
   shared_module(
     appliance + '_appliance',
     appliance / appliance + '_appliance.cc',
@@ -45,6 +45,25 @@ session_proto = custom_target(
 shared_module(
   'session_appliance',
   ['session/session_appliance.cc', session_proto[0], session_proto[1]],
+  include_directories: include_directories('.'),
+  dependencies: [bess_dep, protobuf_dep],
+  install: true,
+  install_dir: modules_dir,
+)
+
+# R3 replaces one tenant's complete layered policy through a scope snapshot.
+vswitch_proto = custom_target(
+  'vswitch_proto',
+  input: 'vswitch/vswitch_appliance.proto',
+  output: ['vswitch_appliance.pb.cc', 'vswitch_appliance.pb.h', 'vswitch_appliance.desc'],
+  command: [protoc, '--proto_path=@CURRENT_SOURCE_DIR@/vswitch', '--cpp_out=@OUTDIR@',
+            '--descriptor_set_out=@OUTPUT2@', '@INPUT@'],
+  install: true,
+  install_dir: [false, false, modules_dir],
+)
+shared_module(
+  'vswitch_appliance',
+  ['vswitch/vswitch_appliance.cc', vswitch_proto[0], vswitch_proto[1]],
   include_directories: include_directories('.'),
   dependencies: [bess_dep, protobuf_dep],
   install: true,
