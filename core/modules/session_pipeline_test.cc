@@ -14,13 +14,14 @@
 
 #include <gtest/gtest.h>
 
-#include <array>
 #include <any>
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
-#include <string>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "runtime/runtime_state.h"
@@ -100,6 +101,21 @@ std::any RuleWithBytes(std::string bytes) {
       reinterpret_cast<const std::byte *>(bytes.data()),
       reinterpret_cast<const std::byte *>(bytes.data()) + bytes.size());
   return std::any(bess::classifier::RuleResult{DROP_GATE, std::move(record)});
+}
+
+std::vector<std::byte> PolicyRecord(std::initializer_list<uint32_t> ids) {
+  std::vector<std::byte> record;
+  record.reserve(ids.size() * sizeof(bess::utils::be32_t));
+  for (uint32_t id : ids) {
+    const bess::utils::be32_t wire(id);
+    const auto *first = reinterpret_cast<const std::byte *>(&wire);
+    record.insert(record.end(), first, first + sizeof(wire));
+  }
+  return record;
+}
+
+std::any PolicyRule(gate_idx_t gate, std::initializer_list<uint32_t> ids) {
+  return std::any(bess::classifier::RuleResult{gate, PolicyRecord(ids)});
 }
 
 // A rule's result names the meter that polices the session and the next hop
@@ -359,41 +375,6 @@ TEST_F(SessionPipelineTest, OneTransactionCreatesASession) {
     EXPECT_EQ(hops[0]->egress, bess::dataplane::InterfaceId(7));
     EXPECT_EQ(hops[0]->neighbor, bess::route::NeighborState::kResolved);
   }
-}
-
-// A module registers the metadata name it was configured with: that name is
-// what the graph resolves an offset for, so it is the whole contract between a
-// writer and a reader. The classifier's result field and the meter name the
-// same attribute, and neither module knows the other exists.
-TEST_F(SessionPipelineTest, ConfiguredAttributeNamesAreTheOnesRegistered) {
-  ExactMatch *em = CreateExactMatch("em", "flow/meters", "rt/next_hops",
-                                    "flow_meter_id");
-  Meter *flow = CreateMeterModule("flow", 64, "flow_meter_id");
-  Router *rt = CreateRouterModule("rt");
-  ASSERT_NE(nullptr, em);
-  ASSERT_NE(nullptr, flow);
-  ASSERT_NE(nullptr, rt);
-
-  const auto &meter_attrs = flow->all_attrs();
-  ASSERT_EQ(1u, meter_attrs.size());
-  EXPECT_EQ("flow_meter_id", meter_attrs[0].name);
-  EXPECT_EQ(bess::metadata::Attribute::AccessMode::kRead, meter_attrs[0].mode);
-
-  bool wrote_meter = false;
-  bool wrote_hop = false;
-  for (const auto &attr : em->all_attrs()) {
-    if (attr.name == "flow_meter_id") {
-      wrote_meter = true;
-      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kWrite, attr.mode);
-    }
-    if (attr.name == "next_hop_id") {
-      wrote_hop = true;
-      EXPECT_EQ(bess::metadata::Attribute::AccessMode::kWrite, attr.mode);
-    }
-    EXPECT_NE("meter_id", attr.name) << "the default name was not registered";
-  }
-  EXPECT_TRUE(wrote_meter);
-  EXPECT_TRUE(wrote_hop);
 }
 
 // A transaction that would leave a dangling reference, or a value that names
@@ -1039,8 +1020,8 @@ bess::testing::Bytes SessionPacket(const char *sip, uint16_t sport, std::mt19937
 // What the Router forwards a frame as: the TTL decremented and the checksum
 // that covers it. The library's own function, not a copy -- a test that
 // recomputed the checksum could pass while the packet path wrote a wrong one.
-bess::testing::Bytes Forwarded(bess::testing::Bytes f) {
-  auto *ip = reinterpret_cast<bess::utils::Ipv4 *>(f.data() + 14);
+bess::testing::Bytes Forwarded(bess::testing::Bytes f, size_t l3_offset = 14) {
+  auto *ip = reinterpret_cast<bess::utils::Ipv4 *>(f.data() + l3_offset);
   EXPECT_EQ(bess::route::TtlResult::kForward, bess::route::DecrementTtl(*ip));
   return f;
 }
@@ -1225,6 +1206,291 @@ TEST_F(SessionPipelineTest, AClassFieldComposesTwoClassifiers) {
   ASSERT_EQ(1u, out[8].size()) << "class 2 selected next hop 2";
   EXPECT_EQ(Forwarded(first), out[7][0]);
   EXPECT_EQ(Forwarded(second), out[8][0]);
+}
+
+// Classifier records select both policers. A flow-red packet never reaches
+// its session policer; sibling flows share that session, not another session.
+TEST_F(SessionPipelineTest,
+       UpfFlowAndSessionPoliciesComposeWithoutSharedCharges) {
+  bess::pb::ExactMatchArg arg;
+  auto *field = arg.add_fields();
+  field->set_offset(26);
+  field->set_num_bytes(4);
+  field = arg.add_fields();
+  field->set_offset(34);
+  field->set_num_bytes(2);
+  AddSessionResultFields(&arg, "upf_flow/meters", "upf_router/next_hops",
+                         "upf_flow_id", "upf_next_hop");
+  auto *session = arg.add_result_fields();
+  session->set_attr_name("upf_session_id");
+  session->set_value_offset(8);
+  session->set_num_bytes(4);
+  session->set_reference("upf_session/meters");
+  session->set_reference_key(bess::pb::ResultField::BE32);
+  Module *em = Create("ExactMatch", "upf_rules", Pack(arg));
+  Meter *flow = CreateMeterModule("upf_flow", 16, "upf_flow_id");
+  Meter *aggregate = CreateMeterModule("upf_session", 16, "upf_session_id");
+  Router *rt = CreateRouterModule("upf_router", "upf_next_hop");
+  ASSERT_NE(nullptr, em);
+  ASSERT_NE(nullptr, flow);
+  ASSERT_NE(nullptr, aggregate);
+  ASSERT_NE(nullptr, rt);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 0, flow, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(flow, Meter::kGreenGate, aggregate,
+                                           0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(aggregate, Meter::kGreenGate, rt, 0,
+                                           true));
+
+  const auto packet = [](const char *sip, uint16_t sport) {
+    return bess::testing::PacketBuilder()
+        .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+        .IPv4(sip, "198.51.100.1")
+        .Tcp(sport, 80)
+        .Payload("x")
+        .Build();
+  };
+  const auto a = packet("10.1.0.1", 1001);
+  const auto b = packet("10.1.0.1", 1002);
+  const auto c = packet("10.1.0.1", 1003);
+  const auto other = packet("10.2.0.1", 1001);
+  const auto miss = packet("10.3.0.1", 1001);
+  std::vector<Op> ops;
+  for (uint32_t id = 1; id <= 4; ++id) {
+    ops.push_back(Op::Upsert(
+        "upf_flow/meters", bess::dataplane::EncodeKey(MeterId(id)),
+        std::any(bess::meter::MeterProfileSpec{SlowMeter(a.size())})));
+  }
+  ops.push_back(Op::Upsert(
+      "upf_session/meters", bess::dataplane::EncodeKey(MeterId(1)),
+      std::any(bess::meter::MeterProfileSpec{SlowMeter(2 * a.size())})));
+  ops.push_back(Op::Upsert(
+      "upf_session/meters", bess::dataplane::EncodeKey(MeterId(2)),
+      std::any(bess::meter::MeterProfileSpec{SlowMeter(other.size())})));
+  ops.push_back(rt->router()->SetNextHopOp(
+      NextHopId(1),
+      HopWithEgress(bess::modules::router::InterfaceOf(7).value())));
+  ops.push_back(rt->router()->SetNextHopOp(
+      NextHopId(2),
+      HopWithEgress(bess::modules::router::InterfaceOf(8).value())));
+  ops.push_back(Op::Upsert("upf_rules/rules", WireKey("10.1.0.1", 1001),
+                           PolicyRule(0, {1, 1, 1})));
+  ops.push_back(Op::Upsert("upf_rules/rules", WireKey("10.1.0.1", 1002),
+                           PolicyRule(0, {2, 1, 1})));
+  ops.push_back(Op::Upsert("upf_rules/rules", WireKey("10.1.0.1", 1003),
+                           PolicyRule(0, {3, 1, 1})));
+  ops.push_back(Op::Upsert("upf_rules/rules", WireKey("10.2.0.1", 1001),
+                           PolicyRule(0, {4, 2, 2})));
+  const auto applied = Apply(std::move(ops));
+  ASSERT_EQ(Outcome::kApplied, applied.outcome);
+
+  bess::testing::ModuleHarness h;
+  auto out = h.RunPipeline(em, 0, {a, a, b, c, other, miss}, rt, {7, 8});
+  EXPECT_EQ((std::vector<Bytes>{Forwarded(a), Forwarded(b)}), out[7])
+      << "flow-red must not charge the aggregate; the third admitted flow "
+         "exceeds it";
+  EXPECT_EQ((std::vector<Bytes>{Forwarded(other)}), out[8])
+      << "a different session retains its own budget and next hop";
+}
+
+// The access classifier writes subscriber identity and the aggregate policy;
+// the service classifier matches that identity plus UDP destination port.
+TEST_F(SessionPipelineTest, BroadbandServicesShareOnlyTheirSubscriberBudget) {
+  bess::pb::ExactMatchArg subscriber_arg;
+  auto *vlan = subscriber_arg.add_fields();
+  vlan->set_offset(14);  // 802.1Q TCI; these access VLANs have PCP zero.
+  vlan->set_num_bytes(2);
+  AddSessionResultFields(&subscriber_arg, "subscriber/meters",
+                         "access_router/next_hops", "subscriber_meter",
+                         "access_next_hop");
+  auto *identity = subscriber_arg.add_result_fields();
+  identity->set_attr_name("subscriber_id");
+  identity->set_value_offset(8);
+  identity->set_num_bytes(4);
+  Module *subscriber = Create("ExactMatch", "access", Pack(subscriber_arg));
+
+  bess::pb::WildcardMatchArg service_arg;
+  auto *key = service_arg.add_fields();
+  key->set_attr_name("subscriber_id");
+  key->set_num_bytes(4);
+  key = service_arg.add_fields();
+  key->set_offset(40);  // Ethernet + VLAN + IPv4 + UDP source port.
+  key->set_num_bytes(2);
+  auto *result = service_arg.add_result_fields();
+  result->set_attr_name("service_meter");
+  result->set_value_offset(0);
+  result->set_num_bytes(4);
+  result->set_reference("service/meters");
+  result->set_reference_key(bess::pb::ResultField::BE32);
+  Module *services = Create("WildcardMatch", "services", Pack(service_arg));
+  Meter *service = CreateMeterModule("service", 16, "service_meter");
+  Meter *aggregate = CreateMeterModule("subscriber", 16, "subscriber_meter");
+  Router *rt = CreateRouterModule("access_router", "access_next_hop");
+  ASSERT_NE(nullptr, subscriber);
+  ASSERT_NE(nullptr, services);
+  ASSERT_NE(nullptr, service);
+  ASSERT_NE(nullptr, aggregate);
+  ASSERT_NE(nullptr, rt);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(subscriber, 0, services, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(services, 0, service, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(service, Meter::kGreenGate,
+                                           aggregate, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(aggregate, Meter::kGreenGate, rt, 0,
+                                           true));
+
+  const auto packet = [](uint16_t vid, uint16_t port) {
+    return bess::testing::PacketBuilder()
+        .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+        .Dot1Q(vid)
+        .IPv4("192.0.2.1", "198.51.100.1")
+        .Udp(1001, port)
+        .Payload(std::string(32, 'x'))
+        .Build();
+  };
+  const auto vlan_key = [](uint16_t vid) {
+    const bess::utils::be16_t wire(vid);
+    return std::string(reinterpret_cast<const char *>(&wire), sizeof(wire));
+  };
+  const auto service_key = [&](uint32_t id, uint16_t port) {
+    const bess::utils::be32_t wire(id);
+    const std::string value =
+        std::string(reinterpret_cast<const char *>(&wire), sizeof(wire)) +
+        vlan_key(port);
+    return std::string(value.size(), '\xff') + value;
+  };
+  const auto web = packet(100, 80);
+  const auto tls = packet(100, 443);
+  const auto other = packet(200, 80);
+  const auto denied_service = packet(100, 22);
+  const auto unknown_subscriber = packet(300, 80);
+  const auto applied = Apply({
+      Op::Upsert(
+          "service/meters", bess::dataplane::EncodeKey(MeterId(1)),
+          std::any(bess::meter::MeterProfileSpec{SlowMeter(web.size())})),
+      Op::Upsert(
+          "service/meters", bess::dataplane::EncodeKey(MeterId(2)),
+          std::any(bess::meter::MeterProfileSpec{SlowMeter(3 * tls.size())})),
+      Op::Upsert(
+          "service/meters", bess::dataplane::EncodeKey(MeterId(3)),
+          std::any(bess::meter::MeterProfileSpec{SlowMeter(other.size())})),
+      Op::Upsert(
+          "subscriber/meters", bess::dataplane::EncodeKey(MeterId(1)),
+          std::any(bess::meter::MeterProfileSpec{SlowMeter(2 * web.size())})),
+      Op::Upsert(
+          "subscriber/meters", bess::dataplane::EncodeKey(MeterId(2)),
+          std::any(bess::meter::MeterProfileSpec{SlowMeter(other.size())})),
+      rt->router()->SetNextHopOp(
+          NextHopId(1),
+          HopWithEgress(bess::modules::router::InterfaceOf(7).value())),
+      rt->router()->SetNextHopOp(
+          NextHopId(2),
+          HopWithEgress(bess::modules::router::InterfaceOf(8).value())),
+      Op::Upsert("access/rules", vlan_key(100), PolicyRule(0, {1, 1, 11})),
+      Op::Upsert("access/rules", vlan_key(200), PolicyRule(0, {2, 2, 22})),
+      Op::Upsert("services/rules", service_key(11, 80),
+                 std::any(bess::classifier::MaskedRuleResource::Value{
+                     1, 0, PolicyRecord({1})})),
+      Op::Upsert("services/rules", service_key(11, 443),
+                 std::any(bess::classifier::MaskedRuleResource::Value{
+                     1, 0, PolicyRecord({2})})),
+      Op::Upsert("services/rules", service_key(22, 80),
+                 std::any(bess::classifier::MaskedRuleResource::Value{
+                     1, 0, PolicyRecord({3})})),
+  });
+  ASSERT_EQ(Outcome::kApplied, applied.outcome);
+  bess::testing::ModuleHarness h;
+  auto out = h.RunPipeline(
+      subscriber, 0,
+      {web, web, tls, tls, other, denied_service, unknown_subscriber}, rt,
+      {7, 8});
+  EXPECT_EQ((std::vector<Bytes>{Forwarded(web, 18), Forwarded(tls, 18)}),
+            out[7])
+      << "the service-red frame charges no subscriber bytes; other services "
+         "share the cap";
+  EXPECT_EQ((std::vector<Bytes>{Forwarded(other, 18)}), out[8])
+      << "the same service port on another subscriber selects independent "
+         "policy";
+}
+
+// The classifier's gate selects a connection budget; its record selects the
+// packet policer. Admission precedes rate policing, so full-table rejects do
+// not spend tokens, but a rate-rejected new connection still occupies a slot.
+TEST_F(SessionPipelineTest, FirewallConnectionAndRatePoliciesRemainIsolated) {
+  bess::pb::WildcardMatchArg arg;
+  auto *key = arg.add_fields();
+  key->set_offset(36);  // TCP destination port in an untagged IPv4 frame.
+  key->set_num_bytes(2);
+  auto *field = arg.add_result_fields();
+  field->set_attr_name("firewall_meter");
+  field->set_value_offset(0);
+  field->set_num_bytes(4);
+  field->set_reference("firewall_rate/meters");
+  field->set_reference_key(bess::pb::ResultField::BE32);
+  Module *rules = Create("WildcardMatch", "firewall_rules", Pack(arg));
+  bess::pb::ConnTrackArg web_arg;
+  web_arg.set_capacity(1);
+  Module *web_ct = Create("ConnTrack", "web_connections", Pack(web_arg));
+  bess::pb::ConnTrackArg tls_arg;
+  tls_arg.set_capacity(2);
+  Module *tls_ct = Create("ConnTrack", "tls_connections", Pack(tls_arg));
+  Meter *rate = CreateMeterModule("firewall_rate", 16, "firewall_meter", 0,
+                                  bess::pb::MeterArg::METER_COST_PACKETS);
+  ASSERT_NE(nullptr, rules);
+  ASSERT_NE(nullptr, web_ct);
+  ASSERT_NE(nullptr, tls_ct);
+  ASSERT_NE(nullptr, rate);
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(rules, 0, web_ct, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(rules, 1, tls_ct, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(web_ct, 0, rate, 0, true));
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(tls_ct, 0, rate, 0, true));
+  const auto rule_key = [](uint16_t port) {
+    const bess::utils::be16_t wire(port);
+    return std::string(2, '\xff') +
+           std::string(reinterpret_cast<const char *>(&wire), sizeof(wire));
+  };
+  const auto applied = Apply({
+      Op::Upsert("firewall_rate/meters", bess::dataplane::EncodeKey(MeterId(1)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(2)})),
+      Op::Upsert("firewall_rate/meters", bess::dataplane::EncodeKey(MeterId(2)),
+                 std::any(bess::meter::MeterProfileSpec{SlowMeter(2)})),
+      Op::Upsert("firewall_rules/rules", rule_key(80),
+                 std::any(bess::classifier::MaskedRuleResource::Value{
+                     1, 0, PolicyRecord({1})})),
+      Op::Upsert("firewall_rules/rules", rule_key(443),
+                 std::any(bess::classifier::MaskedRuleResource::Value{
+                     1, 1, PolicyRecord({2})})),
+  });
+  ASSERT_EQ(Outcome::kApplied, applied.outcome);
+  const auto packet = [](uint16_t sport, uint16_t dport) {
+    return bess::testing::PacketBuilder()
+        .Ether("02:00:00:00:00:01", "02:00:00:00:00:02")
+        .IPv4("192.0.2.1", "198.51.100.1")
+        .Tcp(sport, dport, 0x02)
+        .Payload("x")
+        .Build();
+  };
+  const auto web = packet(1001, 80);
+  const auto web_new = packet(1002, 80);
+  const auto denied = packet(1001, 22);
+  bess::testing::ModuleHarness h;
+  auto out = h.RunPipeline(rules, 0, {web, web_new, web, web, denied}, rate,
+                           {0, 1, 2});
+  EXPECT_EQ((std::vector<Bytes>{web, web}), out[Meter::kGreenGate])
+      << "one connection slot allows retransmits; a full-table reject spends "
+         "no tokens";
+  EXPECT_TRUE(out[Meter::kYellowGate].empty());
+  EXPECT_EQ((std::vector<Bytes>{web}), out[Meter::kRedGate]);
+
+  const auto tls = packet(2001, 443);
+  const auto tls_second = packet(2002, 443);
+  const auto tls_full = packet(2003, 443);
+  out = h.RunPipeline(rules, 0, {tls, tls, tls_second, tls_full}, rate,
+                      {0, 1, 2});
+  EXPECT_EQ((std::vector<Bytes>{tls, tls}), out[Meter::kGreenGate])
+      << "the other policy retains its own tokens and two connection slots";
+  EXPECT_TRUE(out[Meter::kYellowGate].empty());
+  EXPECT_EQ((std::vector<Bytes>{tls_second}), out[Meter::kRedGate])
+      << "a rate-rejected new connection keeps its slot, so the third cannot "
+         "reach Meter";
 }
 
 // -- D-129: the resources as a client writes and reads them --------------------
@@ -1466,96 +1732,6 @@ TEST_F(SessionPacketPathTest, DeclaredTablesMatchTheBoundCodecs) {
   }
   EXPECT_EQ(5u, ModuleBuilder::all_module_builders().at("Router").resource_tables().size())
       << "next_hops, neighbors, next_hop_state, groups and routes";
-}
-
-// The configured names are the contract, not the registration: the graph
-// resolves one offset for a writer's name and its reader's, and the packet
-// path is the proof. SessionPacketPathTest runs the defaults.
-TEST_F(SessionPipelineTest, ConfiguredNamesResolveToOneOffset) {
-  ExactMatch *em = CreateExactMatch("em_cfg", "mt_cfg/meters",
-                                    "rt_cfg/next_hops", "flow_meter_id");
-  Meter *mt = CreateMeterModule("mt_cfg", 64, "flow_meter_id");
-  Router *rt = CreateRouterModule("rt_cfg");
-  ASSERT_NE(nullptr, em);
-  ASSERT_NE(nullptr, mt);
-  ASSERT_NE(nullptr, rt);
-  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 0, mt, 0, true));
-  ASSERT_EQ(0, ModuleGraph::ConnectModules(mt, Meter::kGreenGate, rt, 0, true));
-
-  auto r = Apply({
-      Op::Upsert("mt_cfg/meters", bess::dataplane::EncodeKey(MeterId(1)),
-                 std::any(bess::meter::MeterProfileSpec{SlowMeter(100)})),
-      rt->router()->SetNextHopOp(
-          NextHopId(1),
-          HopWithEgress(bess::modules::router::InterfaceOf(kEgressGate).value())),
-      Op::Upsert("em_cfg/rules", WireKey("10.1.2.3", 1234),
-                 Rule(0, 1, 1)),
-  });
-  ASSERT_EQ(Outcome::kApplied, r.outcome)
-      << [&] {
-           std::string all;
-           for (const auto &o : r.ops) { all += o.error; all += " | "; }
-           return all;
-         }();
-
-  // The packet traverses every module: the rule's result writes the meter id
-  // under the configured name, the meter reads that name, and the router
-  // forwards. Two packets against a 100-byte burst: the first is green, the
-  // second red. Had the meter not read the id the rule wrote, it would read 0
-  // ("unmetered") and pass both; the single egress frame is the proof.
-  std::random_device rd;
-  std::mt19937 rng{rd()};
-  const auto pkt1 = SessionPacket("10.1.2.3", 1234, rng);
-  const auto pkt2 = SessionPacket("10.1.2.3", 1234, rng);
-  bess::testing::ModuleHarness h;
-  EXPECT_EQ((std::vector<bess::testing::Bytes>{Forwarded(pkt1)}),
-            h.RunPipeline(em, 0, {pkt1, pkt2}, rt, {kEgressGate})[kEgressGate]);
-
-  // The meter's read and the rule's write resolved to one offset: the names,
-  // not the strings that registered them, are the contract.
-  EXPECT_EQ(mt->attr_offset(AttrIndex(mt, "flow_meter_id")),
-            em->attr_offset(AttrIndex(em, "flow_meter_id")));
-}
-
-// A custom meter and next-hop name need a writer and readers configured to
-// match: the rule writes "flow_meter_id" and "hop_id", and the meter and the
-// router read those. Defaults are covered by SessionPacketPathTest.
-TEST_F(SessionPipelineTest, ConfiguredNextHopNamePairsWithItsReader) {
-  ExactMatch *em = CreateExactMatch("em_names", "mt_names/meters",
-                                    "rt_names/next_hops", "flow_meter_id",
-                                    "hop_id");
-  Meter *mt = CreateMeterModule("mt_names", 64, "flow_meter_id");
-  Router *rt = CreateRouterModule("rt_names", "hop_id");
-  ASSERT_NE(nullptr, em);
-  ASSERT_NE(nullptr, mt);
-  ASSERT_NE(nullptr, rt);
-  ASSERT_EQ(0, ModuleGraph::ConnectModules(em, 0, mt, 0, true));
-  ASSERT_EQ(0, ModuleGraph::ConnectModules(mt, Meter::kGreenGate, rt, 0, true));
-
-  auto r = Apply({
-      Op::Upsert("mt_names/meters", bess::dataplane::EncodeKey(MeterId(1)),
-                 std::any(bess::meter::MeterProfileSpec{SlowMeter(1000)})),
-      rt->router()->SetNextHopOp(
-          NextHopId(1),
-          HopWithEgress(bess::modules::router::InterfaceOf(kEgressGate).value())),
-      Op::Upsert("em_names/rules", WireKey("10.1.2.3", 1234),
-                 Rule(0, 1, 1)),
-  });
-  ASSERT_EQ(Outcome::kApplied, r.outcome)
-      << (r.ops.empty() ? "" : r.ops[0].error);
-
-  std::random_device rd;
-  std::mt19937 rng{rd()};
-  const auto pkt = SessionPacket("10.1.2.3", 1234, rng);
-  bess::testing::ModuleHarness h;
-  EXPECT_EQ((std::vector<bess::testing::Bytes>{Forwarded(pkt)}),
-            h.RunPipeline(em, 0, {pkt}, rt, {kEgressGate})[kEgressGate]);
-
-  // Each configured name paired with the writer's or the reader's.
-  EXPECT_EQ(mt->attr_offset(AttrIndex(mt, "flow_meter_id")),
-            em->attr_offset(AttrIndex(em, "flow_meter_id")));
-  EXPECT_EQ(rt->attr_offset(AttrIndex(rt, "hop_id")),
-            em->attr_offset(AttrIndex(em, "hop_id")));
 }
 
 // Yellow survives: a level that marks a packet yellow must not be reset to

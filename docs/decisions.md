@@ -171,6 +171,7 @@ file is the reasoning.
 | D-193 | Shared module-drop and resource-occupancy metrics; lifetime drop counters use KeyedCounters, and bounded resource-fill sweeps resume by name | accepted |
 | D-194 | Shared owner-counter reporting with module/observation labels; preserve drop, punt and task-run meanings without packet-path changes | accepted |
 | D-195 | Metadata reads and updates require graph bindings by default; distinguish missing producers from packet-metadata exhaustion | accepted |
+| D-196 | Exercise classifier records in UPF, broadband and firewall policy graphs; reuse the shipped generic quota/event consumer | accepted |
 
 
 ---
@@ -13714,4 +13715,60 @@ packet, a parse result is current, lengths are sufficient or a payload is
 exclusive. Packet-path checks remain. Defaults stay in `ResolvedAttr`, not
 per-packet stamping. No packet-path allocations, synchronization or mandatory
 module-author hook are added.
+
+
+## D-196 Classifier records compose appliance policies
+
+**Status:** accepted (2026-10-28). Acceptance evidence for D-021, D-172 and
+D-195; no appliance-specific classifier or accounting API.
+
+**Decision.** Keep policy composition in the controller's graph. Classifiers
+write ordinary metadata and resource references; consumers do not depend on
+the classifier class or learn UPF, subscriber or firewall business models.
+Exercise these three distinct packet paths in `core/modules/session_pipeline_test.cc`:
+
+- **UPF session/flow policing:** ExactMatch writes separate flow-meter,
+  session-meter and next-hop ids. Flow-green reaches the shared session
+  policer, then the Router. A repeated flow-red frame charges no session
+  bytes; sibling flows exhaust the same session; another session keeps its
+  own budget and egress. This is the BESS-side composition, not PFCP or a
+  change to a separate UPF repository.
+- **Broadband subscriber/service limits:** an access-VLAN ExactMatch writes
+  subscriber identity, aggregate-meter id and next hop. WildcardMatch matches
+  that metadata plus UDP destination port and writes a service-meter id.
+  Service-green reaches the subscriber policer, then the Router. A
+  service-red frame does not consume subscriber bytes; different services
+  share the subscriber cap; the same service on another subscriber is
+  independent. Unknown services and subscribers drop. The fixture uses
+  single-tagged IPv4/UDP with PCP zero; it is not a general access parser or
+  an authentication mechanism.
+- **Firewall rate/connection policy:** WildcardMatch's gate selects a
+  per-policy ConnTrack instance; its result selects a shared Meter entry.
+  Only tracked packets reach the packet-rate policer. Existing flows use
+  no new connection slots; full-table rejects spend no tokens; another
+  policy keeps independent slots and tokens. Admission precedes policing:
+  a rate-rejected new connection still occupies its slot. Unmatched policy
+  traffic drops. These bounded tables are per-instance connection limits,
+  not a new transactional or distributed connection-quota API.
+
+**Accounting.** The shipped sample plugin already provides generic keyed
+octet/packet accounting, quota arming and the shared `bess.counter_threshold`
+event through UsageReport, KeyedCounters, CrossingNotifier and ThresholdSweep.
+No real gap requires another quota module. `tests/live/usage_report_test.cc`
+now supplies its big-endian accounting key from an ExactMatch result record.
+The real daemon/plugin reports the correct key and threshold in packet-path
+and sweep modes; an unarmed key stays silent. A classifier miss leaves the
+armed quota unspent and reports no crossing while the upstream frame source
+is active. Match keys use explicit wire bytes, not the legacy integer-field
+encoding. UsageReport reports a crossing; it does not atomically stop traffic
+at the quota. The controller owns the reaction.
+
+**Evidence and limits.** The native session-pipeline program and the live
+UsageReport program pass with these graphs. Packet assertions compare exact
+forwarded bytes or exact green/red outputs, not attribute-registration
+strings or offset equality. The firewall sequence also proves that a
+rate-rejected new connection retains admission. No production mechanism,
+packet-path allocation, synchronization or throughput claim is added. These
+graphs do not establish one atomic policy snapshot across independent
+resources; a scope-snapshot consumer is a separate acceptance item.
 
