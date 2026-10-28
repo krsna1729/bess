@@ -5,27 +5,28 @@
 
 // Reference appliance R3 (roadmap M24): a policy vSwitch, the neutrality test.
 // Its concepts are deliberately its own -- Layer, Group, Rule and
-// CompiledDecision -- and BESS knows none of them. BESS provides the flow
-// table under the decision cache and its generation-based invalidation, RCU
-// publication of immutable policy, and the checked parse.
+// CompiledDecision -- and BESS knows none of them. BESS supplies scope
+// snapshots, worker-owned flow storage, RCU reclamation and the checked parse.
 //
-//   packet -> parse/key -> DecisionCache
-//                -> hit  -> CompiledDecision -> execute
-//                -> miss -> compile (walk the layers) -> install -> execute
+//   packet -> parse/key -> bind one tenant PolicyVersion -> decision cache
+//                -> same version -> CompiledDecision -> execute
+//                -> miss/stale -> compile that bound policy -> install ->
+//                execute
 //
-// Policy is per tenant (a scope): each tenant has its own published policy and
-// its own DecisionGeneration, so switching one tenant's group invalidates that
-// tenant's cached decisions in O(1) and leaves every other tenant's hits alone.
+// A policy and its cache revision are one immutable scope version. A packet
+// never combines a separately published generation with another policy root.
+// Replacing one tenant leaves the other tenant's cached decisions usable.
 //
 // R5, Hoverboard-style hierarchical mode (EnableHierarchy): a cold flow takes
 // the default path -- evaluated per packet, nothing cached -- while the
 // application counts it; when the application's own hotness rule says so, the
 // decision is installed in the cache (the fast path) and handed to the
-// application's promotion hook (a hardware flow, for example). A group switch
-// calls the revocation hook for the tenant: copies of its decisions outside the
-// cache (the hardware rules) follow its generation, as the cache does. Cold
-// counts age: a flow idle for `idle_after` default-path packets is forgotten
-// (an incremental sweep), so one-off flows cannot fill the table. BESS defines
+// application's promotion hook (a hardware flow, for example). Its direct
+// group switch revokes the tenant's promoted decisions. Hierarchical apps
+// are not enrolled as wire resources: a generic scope publisher cannot revoke
+// application-owned hardware copies. Cold counts age: a flow idle for
+// `idle_after` default-path packets is forgotten (an incremental sweep), so
+// one-off flows cannot fill the table. BESS defines
 // neither the rule nor the promotion.
 
 #include <array>
@@ -39,11 +40,11 @@
 #include <string>
 #include <vector>
 
-#include "flow/decision_cache.h"
+#include "dataplane/resource_registry.h"
+#include "dataplane/scope.h"
 #include "flow/worker_flow_table.h"
 #include "packet_parse.h"
 #include "rcu/rcu_domain.h"
-#include "rcu/rcu_ptr.h"
 #include "utils/checksum.h"
 
 namespace appliance {
@@ -70,6 +71,22 @@ struct Policy {
   std::vector<Layer> layers;  // every layer applies; a deny in any wins
 };
 
+// Copying a prepared version only copies this off-path owner. Packets borrow
+// it from ScopeTable and never increment a shared_ptr reference count.
+class PolicyVersion {
+public:
+  uint64_t revision() const noexcept { return revision_; }
+  const Policy &policy() const noexcept { return *policy_; }
+
+private:
+  friend class VswitchApp;
+  PolicyVersion(uint64_t revision, Policy policy)
+      : revision_(revision),
+        policy_(std::make_shared<const Policy>(std::move(policy))) {}
+  uint64_t revision_;
+  std::shared_ptr<const Policy> policy_;
+};
+
 // What a flow compiled to: a value, so the cache holds it as the decision id.
 struct CompiledDecision {
   uint8_t allow = 0;
@@ -91,11 +108,14 @@ class VswitchApp {
  public:
   static constexpr size_t kTenants = 2;
 
-  static std::expected<std::unique_ptr<VswitchApp>, std::string> Create(bess::rcu::RcuDomain &rcu) {
-    std::unique_ptr<VswitchApp> app(new VswitchApp(rcu));
+  static std::expected<std::unique_ptr<VswitchApp>, std::string>
+  Create(std::string name, bess::rcu::RcuDomain &rcu) {
+    std::unique_ptr<VswitchApp> app(new VswitchApp(std::move(name), rcu));
     for (size_t t = 0; t < kTenants; t++) {
-      app->policies_[t]->Initialize(std::make_unique<const Policy>(StaticPolicy()));
-      auto cache = Cache::Create(4096, app->generations_[t]);
+      (void)app->policies_.Publish(ScopeOf(t),
+                                   std::make_unique<const PolicyVersion>(
+                                       app->MakePolicyVersion(StaticPolicy())));
+      auto cache = Cache::Create(4096);
       if (!cache) {
         return std::unexpected(std::string("decision cache"));
       }
@@ -105,9 +125,44 @@ class VswitchApp {
   }
 
   ~VswitchApp() {
-    for (auto &p : policies_) {
-      (void)p->ResetQuiesced();  // the owner destroys it with readers stopped
+    const auto released = Release();
+    CHECK(released) << released.error();
+  }
+
+  // The registry/engine becomes the only publisher. Direct R5 publication has
+  // a hardware-revocation hook; generic ScopeResource publication does not.
+  std::expected<void, std::string>
+  Enroll(bess::dataplane::ResourceRegistry &registry) {
+    if (cold_ != nullptr) {
+      return std::unexpected("hierarchical policies use direct publication");
     }
+    if (auto enrolled = registry.Register(&policy_resource_); !enrolled) {
+      return enrolled;
+    }
+    registry_ = &registry;
+    return {};
+  }
+
+  std::expected<void, std::string> Release() {
+    if (registry_ == nullptr) {
+      return {};
+    }
+    const std::array<std::string, 1> mine = {policy_resource_.name()};
+    auto released = registry_->ReleaseForTeardown(mine);
+    registry_ = nullptr;
+    return released;
+  }
+
+  PolicyVersion MakePolicyVersion(Policy policy) {
+    return PolicyVersion(next_revision_.fetch_add(1, std::memory_order_relaxed),
+                         std::move(policy));
+  }
+  bess::dataplane::Resource &policy_resource() noexcept {
+    return policy_resource_;
+  }
+  const bess::dataplane::ScopeTable<PolicyVersion> &
+  policy_table() const noexcept {
+    return policies_;
   }
 
   struct Hierarchy {
@@ -115,13 +170,16 @@ class VswitchApp {
     uint32_t idle_after = 4096;  // default-path packets after which a cold count is forgotten
     // A hot flow's decision, just cached.
     std::function<void(const VswitchKey &, CompiledDecision)> promote;
-    // A tenant's generation moved: its promoted decisions are stale.
+    // A tenant's policy changed: its promoted decisions are stale.
     std::function<void(size_t tenant)> revoke;
   };
 
   // R5: flows start cold; a flow's decision is cached once it is hot by the
   // application's rule, and the hooks see promotions and revocations.
   bool EnableHierarchy(Hierarchy h) {
+    if (registry_ != nullptr) {
+      return false;
+    }
     auto cold = ColdTable::Create(4096);
     if (!cold) {
       return false;
@@ -150,19 +208,30 @@ class VswitchApp {
     key.dport = p.dst_port;
     key.proto = p.protocol;
     key.tenant = static_cast<uint8_t>(tenant);
+    const auto scope = ScopeOf(tenant);
+    const PolicyVersion *version = policies_.Lookup(scope);
+    if (version == nullptr) {
+      return {}; // an erased scope never reuses a cached allow decision
+    }
     CompiledDecision d;
-    if (caches_[tenant]->Lookup(key, &d) == bess::flow::DecisionLookup::kHit) {
+    const CachedDecision *cached = caches_[tenant]->Find(key);
+    if (cached != nullptr && cached->revision == version->revision()) {
+      d = cached->decision;
       hits_[tenant]++;
     } else {
-      // Generation first, then the policy (published before the generation
-      // moved): an install compiled against older policy is refused.
-      const uint64_t g = generations_[tenant].Current();
-      d = Compile(*policies_[tenant]->Read(), key);
+      d = Compile(version->policy(), key);
       compiles_[tenant]++;
       if (cold_ == nullptr || Hot(key)) {
-        if (caches_[tenant]->Install(key, d, g) != bess::flow::DecisionInstall::kStaleGeneration &&
-            hierarchy_.promote) {
-          hierarchy_.promote(key, d);
+        auto made = caches_[tenant]->Emplace(key);
+        if (made.state != nullptr) {
+          *made.state = CachedDecision{version->revision(), d};
+          if (hierarchy_.promote) {
+            const PolicyVersion *current = policies_.Lookup(scope);
+            if (current != nullptr &&
+                current->revision() == version->revision()) {
+              hierarchy_.promote(key, d);
+            }
+          }
         }
       }
     }
@@ -180,20 +249,26 @@ class VswitchApp {
     return d;
   }
 
-  // The policy compiler's switch (control side): replaces one group of one
-  // tenant's layer, atomically: the whole new policy is built, published
-  // (RCU), and only then is the tenant's generation moved, so its cached
-  // decisions read stale (O(1), no walk) and recompile against the new policy.
-  // Other tenants' scopes are untouched.
+  // Direct, single-writer R5 control path. Enrolled R3 uses ScopeResource
+  // transactions instead; both publish the same whole immutable version.
   bool SwitchGroup(size_t tenant, size_t layer, size_t group, Group replacement) {
-    const Policy &current = *policies_[tenant]->Read();
-    if (layer >= current.layers.size() || group >= current.layers[layer].groups.size()) {
+    if (registry_ != nullptr || tenant >= kTenants) {
       return false;
     }
-    auto next = std::make_unique<Policy>(current);
-    next->layers[layer].groups[group] = std::move(replacement);
-    (void)policies_[tenant]->Publish(std::move(next));
-    generations_[tenant].Invalidate();
+    const auto id = ScopeOf(tenant);
+    const PolicyVersion *current = policies_.Current(id);
+    if (current == nullptr || layer >= current->policy().layers.size() ||
+        group >= current->policy().layers[layer].groups.size()) {
+      return false;
+    }
+    Policy policy = current->policy();
+    policy.layers[layer].groups[group] = std::move(replacement);
+    auto next = std::make_unique<const PolicyVersion>(
+        MakePolicyVersion(std::move(policy)));
+    rcu_.ReserveRetirements(1);
+    auto old = policies_.Publish(id, std::move(next));
+    const auto grace = rcu_.StartGracePeriod();
+    rcu_.Retire(grace, std::move(old));
     if (hierarchy_.revoke) {
       hierarchy_.revoke(tenant);
     }
@@ -204,10 +279,16 @@ class VswitchApp {
   size_t cold_flows() const noexcept { return cold_ != nullptr ? cold_->size() : 0; }
   uint64_t compiles(size_t t) const noexcept { return compiles_[t]; }
   size_t cached(size_t t) const noexcept { return caches_[t]->size(); }
-  uint64_t generation(size_t t) const noexcept { return generations_[t].Current(); }
 
  private:
-  using Cache = bess::flow::DecisionCache<VswitchKey, CompiledDecision>;
+   struct CachedDecision {
+     uint64_t revision = 0;
+     CompiledDecision decision{};
+   };
+   using Cache = bess::flow::WorkerFlowTable<VswitchKey, CachedDecision>;
+   static bess::dataplane::ScopeId ScopeOf(size_t tenant) noexcept {
+     return bess::dataplane::ScopeId(static_cast<uint32_t>(tenant + 1));
+   }
   struct ColdCount {
     uint32_t packets = 0;
     uint32_t last_tick = 0;  // the default-path packet that last saw the flow
@@ -251,11 +332,9 @@ class VswitchApp {
     }
   }
 
-  explicit VswitchApp(bess::rcu::RcuDomain &rcu) {
-    for (auto &p : policies_) {
-      p = std::make_unique<bess::rcu::RcuPtr<Policy>>(rcu);
-    }
-  }
+  VswitchApp(std::string name, bess::rcu::RcuDomain &rcu)
+      : rcu_(rcu), policies_(kTenants),
+        policy_resource_(std::move(name) + "/policies", policies_) {}
 
   // The static policy each tenant starts with. Layer 0 (an ACL): group 0
   // allows web (80) and DNS (53), group 1 denies SSH (22). Layer 1 (QoS):
@@ -313,8 +392,11 @@ class VswitchApp {
     return d;
   }
 
-  std::array<std::unique_ptr<bess::rcu::RcuPtr<Policy>>, kTenants> policies_;
-  std::array<bess::flow::DecisionGeneration, kTenants> generations_;
+  bess::rcu::RcuDomain &rcu_;
+  bess::dataplane::ScopeTable<PolicyVersion> policies_;
+  bess::dataplane::ScopeResource<PolicyVersion> policy_resource_;
+  bess::dataplane::ResourceRegistry *registry_ = nullptr;
+  std::atomic<uint64_t> next_revision_{1};
   std::array<std::unique_ptr<Cache>, kTenants> caches_;
   std::array<uint64_t, kTenants> hits_{}, compiles_{};
   std::unique_ptr<ColdTable> cold_;

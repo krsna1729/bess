@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: BSD-3-Clause
+syntax = "proto3";
+
+package vswitch_appliance;
+
+// Scope ids are one-based: id 1 is input tenant 0, id 2 is tenant 1.
+message TenantKey {
+  uint32 id = 1;
+}
+
+enum RuleAction {
+  RULE_ACTION_UNSPECIFIED = 0;
+  ALLOW = 1;
+  DENY = 2;
+  MARK = 3;
+  REDIRECT = 4;
+}
+
+message Rule {
+  // Empty destination with prefix_length 0 matches every IPv4 destination.
+  // Other destinations must be canonical network addresses.
+  string destination = 1;
+  uint32 prefix_length = 2;
+  uint32 dport_lo = 3;
+  // Absent means 65535, not port zero.
+  optional uint32 dport_hi = 4;
+  // Zero means any IP protocol.
+  uint32 protocol = 5;
+  RuleAction action = 6;
+  uint32 dscp = 7;
+  uint32 gate = 8;
+}
+
+message Group {
+  repeated Rule rules = 1;
+}
+
+message Layer {
+  repeated Group groups = 1;
+}
+
+// One immutable tenant root: first matching group/rule decides each layer;
+// a deny wins, otherwise marks and redirects accumulate (last layer wins).
+// An empty layer has no effect. Missing/erased scopes drop all packets.
+// Upsert the whole value with SCOPE_SNAPSHOT transaction consistency.
+message PolicyValue {
+  repeated Layer layers = 1;
+}
