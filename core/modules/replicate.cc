@@ -79,19 +79,25 @@ void Replicate::DeInit() {
 }
 
 void Replicate::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  for (bess::PacketRef tocopy : batch->packets()) {
-    for (int j = 1; j < ngates_; j++) {
-      // The copy is the same packet on another gate, so the metadata written
-      // upstream is part of it; only the scratchpad starts empty.
-      bess::PacketRef newpkt(bess::PacketCopyWithMetadata(tocopy.handle()));
-      if (newpkt.handle()) {
-        EmitPacket(ctx, newpkt, gates_[j]);
+  const size_t cnt = static_cast<size_t>(batch->cnt());
+  const size_t copies = ngates_ > 1 ? static_cast<size_t>(ngates_ - 1) : 0;
+  // The copy is the same packet on another gate, so the metadata written
+  // upstream is part of it; only the scratchpad starts empty. A copy that
+  // could not be allocated is not sent.
+  bess::PacketHandle dups[bess::PacketBatch::kMaxBurst * (kMaxGates - 1)];
+  bess::PacketCopyBulkWithMetadata(batch->handles(), cnt, copies, dups);
+  // The configured list is the module's whole contract: the original is
+  // the first gate's packet, and the copies fill the rest. With no gate
+  // configured there is no list to read, so the historical gate 0 stands.
+  const gate_idx_t first = ngates_ > 0 ? gates_[0] : gate_idx_t{0};
+  for (size_t i = 0; i < cnt; i++) {
+    const bess::PacketHandle *row = dups + i * copies;
+    for (size_t k = 0; k < copies; k++) {
+      if (row[k] != nullptr) {
+        EmitPacket(ctx, bess::PacketRef(row[k]), gates_[k + 1]);
       }
     }
-    // The configured list is the module's whole contract: the original is
-    // the first gate's packet, and the copies fill the rest. With no gate
-    // configured there is no list to read, so the historical gate 0 stands.
-    EmitPacket(ctx, tocopy, ngates_ > 0 ? gates_[0] : 0);
+    EmitPacket(ctx, batch->packet(i), first);
   }
 }
 
