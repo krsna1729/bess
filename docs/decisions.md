@@ -14249,3 +14249,26 @@ validate or prefix them.
 one module prefix and distinct names register separately; a route written to one does not appear in the other.
 
 **Revisit when:** a third owner of several Routers needs a naming convention enforced rather than chosen.
+
+## D-203 Caller-owned meter state storage
+
+**Status:** proposed (2026-10-25). Extends the experimental meter library.
+**Code:** `core/meter/meter.h`, `core/meter/meter_test.cc`.
+
+**Problem.** Appliance builders cannot co-locate token buckets with their session
+state through the installed API: the existing placement factory was private.
+
+**Decision.** Expose the existing `MeterState::ConstructAt` and destructor.
+The caller supplies at least `sizeof(MeterState)` bytes, aligned to
+`alignof(MeterState)`, and keeps the compiled profile alive until destruction.
+A failed construction leaves no state. Destroy placement-created states explicitly;
+never pass them to `MeterStateDeleter`, which frees standalone DPDK allocations.
+Admission and storage lifetime belong to the owner. Meter sharing rules do not change.
+No allocation or computation is added to a packet check.
+
+**Evidence.** Release `meter_meter_test` and `meter_meter_resource_test` pass.
+The embedded-storage test exhausts committed and peak buckets at one timestamp,
+observes green/yellow/red, destroys the state, then reconstructs fresh buckets in
+the same caller-owned storage.
+
+**Revisit when:** a second embedded owner needs a checked-storage factory.
