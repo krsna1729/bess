@@ -83,7 +83,7 @@ stopping traffic.
 | exact match with a compile-time key type (a struct you own) | `ExactTable<Key, Result, Backend>` | `classifier/typed_exact.h` | rebuild + swap (G) |
 | IPv4 longest-prefix match | `RouteTable<Value>`; `Router` for routes + next hops + groups | `route/route_table.h`, `route/router.h` | in place (C) |
 | id → object (the result of a lookup is a rich object) | `ObjectTable<Id, T>` | `dataplane/object_table.h` | rebuild + swap (G) |
-| rate limiting / policing | `MeterSet` (+ `MeterState`) | `meter/meter_set.h` | set: G; bucket state: per meter, see header |
+| rate limiting / policing | `MeterSet` (+ `MeterState`); `MeterResource` for the set as a transactional resource | `meter/meter_set.h`, `meter/meter_resource.h` | set: G; bucket state: per meter, see header |
 | counters and histograms read by the controller | `CounterSet`, `WorkerHistogram` | `stats/counter_set.h`, `stats/worker_histogram.h` | worker-owned |
 | any other per-worker scratch | `WorkerLocal<T>` | `stats/worker_local.h` | worker-owned |
 | flows the packet path creates (NAT-style learning), with stable ids, aliases and a fixed capacity | `flow::WorkerFlowTable` (worker-owned) or `flow::SharedFlowTable` (shared lookup); see [flow-state.md](flow-state.md) | `flow/worker_flow_table.h`, `flow/shared_flow_table.h` | worker-owned / in place, one writer lock |
@@ -537,9 +537,13 @@ reference to something missing.
   carries several `BE32` ids (a two-level meter) names each of them
   (`reference_count`).
 - **Meter** registers `<module>/meters` (key: `EncodeKey(MeterId)`, value: a
-  profile specification) over a `MeterSetBuilder`: a transaction edits a
+  profile specification), a `meter::MeterResource` (D-199; a plugin can hold
+  one too) over a `MeterSetBuilder`: a transaction edits a
   private clone of the desired state, so unchanged meters keep their token
-  state and a rejected transaction leaves the live builder alone. Erases are
+  state and a rejected transaction leaves the live builder alone. The clone
+  shares the index with the live builder and the published generations, and
+  an edit copies only its meter's path, so a transaction costs what it
+  changes, not what is installed. Erases are
   the two-step removal SlotTable defines -- readable until the removal
   cascade reaches them, unpublishable until then. D-032.
   An erased meter stays in generations published by other upserts of the
@@ -606,6 +610,12 @@ reference to something missing.
     generation-safe publication.
   - A meter's state survives generations, so publishing a change to one
     meter does not refill every bucket.
+  - The id index is a persistent radix tree (64 ids per leaf, 256 children
+    per inner node): a generation shares every node with the one before it
+    except the paths of the ids that changed (D-199). Look a batch up with
+    `MeterSet::Resolve` (or `CheckBatch`), not `Lookup` per packet: it walks
+    the batch stage-major with prefetches, so the tree's depth overlaps
+    instead of queuing behind each check's lock.
 - **Concurrency:** each meter declares who may check it:
   - `kWorkerExclusive` meters are unsynchronized, and running one from two
     workers is a caller bug;

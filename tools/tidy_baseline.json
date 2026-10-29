@@ -70,9 +70,6 @@
     "core/metadata.h": {
       "performance-unnecessary-value-param": 1
     },
-    "core/meter/meter_set.cc": {
-      "bugprone-unchecked-optional-access": 1
-    },
     "core/module.cc": {
       "bugprone-assignment-in-if-condition": 1,
       "cppcoreguidelines-narrowing-conversions": 4

@@ -7,7 +7,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <memory>
 #include <vector>
 
@@ -98,7 +100,6 @@ TEST(MeterSetTest, LookupAndProfileInterning) {
   EXPECT_EQ(&a->profile(), &b->profile()) << "identical specs share one profile";
   EXPECT_NE(&a->profile(), &c->profile());
   EXPECT_NE(a, b) << "every meter has its own state";
-  EXPECT_EQ(2u, set->profile_count());
 }
 
 // The property that makes meters different from other published objects:
@@ -155,7 +156,6 @@ TEST(MeterSetTest, EraseAndReaddIsANewMeter) {
   auto gen2 = builder.Build();
   EXPECT_EQ(nullptr, gen2->Lookup(MeterId(1)));
   EXPECT_EQ(0u, gen2->size());
-  EXPECT_EQ(0u, gen2->profile_count());
 
   MustAdd(builder, 1);
   auto gen3 = builder.Build();
@@ -218,6 +218,85 @@ TEST(MeterSetTest, GenerationOutlivesBuilder) {
   ASSERT_NE(nullptr, meter);
   EXPECT_EQ(MeterColor::kGreen, meter->Check(MeterNow(), 300));
   EXPECT_EQ(MeterColor::kRed, meter->Check(MeterNow(), 1));
+}
+
+// The index is shared, not copied (D-199): a generation and a clone start
+// with the builder's nodes, and an edit copies only its id's path. So no
+// edit -- on either side, across leaves and inner nodes, an erase that
+// empties a leaf included -- may change what a generation or the other side
+// maps.
+TEST(MeterSetTest, EditsNeverChangeASharedIndex) {
+  constexpr size_t kCapacity = 70000;  // two inner levels above the leaves
+  MeterSetBuilder builder(kCapacity);
+  for (uint32_t id = 1; id <= kCapacity; id += 37) {
+    MustAdd(builder, id);
+  }
+  const size_t installed = builder.size();
+  auto gen1 = builder.Build();
+  std::vector<MeterState *> before(kCapacity + 1);
+  for (uint32_t id = 0; id <= kCapacity; id++) {
+    before[id] = gen1->Lookup(MeterId(id));
+  }
+
+  // The clone: a reconfigure, a reset, the erase of both meters of ids
+  // 64..127's leaf, and two adds far apart.
+  auto clone = builder.Clone();
+  ASSERT_TRUE(clone->Reconfigure(MeterId(38), kSlowBig).has_value());
+  ASSERT_TRUE(clone->Reset(MeterId(149)).has_value());
+  ASSERT_TRUE(clone->Erase(MeterId(75)).has_value());
+  ASSERT_TRUE(clone->Erase(MeterId(112)).has_value());
+  MustAdd(*clone, 2);
+  MustAdd(*clone, 69999);
+  // The builder, other edits of the same meters.
+  ASSERT_TRUE(builder.Reconfigure(MeterId(75), kSlowBig).has_value());
+  ASSERT_TRUE(builder.Erase(MeterId(38)).has_value());
+  MustAdd(builder, 3);
+
+  auto cloned = clone->Build();
+  auto built = builder.Build();
+  EXPECT_EQ(installed, cloned->size());
+  EXPECT_EQ(installed, built->size());
+
+  // Every id the other side changed is as gen1 had it.
+  auto unchanged_except = [&](const MeterSet &set,
+                              std::initializer_list<uint32_t> changed) {
+    size_t wrong = 0;
+    for (uint32_t id = 0; id <= kCapacity; id++) {
+      if (std::find(changed.begin(), changed.end(), id) == changed.end() &&
+          set.Lookup(MeterId(id)) != before[id]) {
+        wrong++;
+      }
+    }
+    return wrong;
+  };
+  EXPECT_EQ(0u, unchanged_except(*gen1, {}));
+  EXPECT_EQ(0u, unchanged_except(*cloned, {38, 149, 75, 112, 2, 69999}));
+  EXPECT_EQ(0u, unchanged_except(*built, {75, 38, 3}));
+
+  ASSERT_NE(nullptr, cloned->Lookup(MeterId(38)));
+  EXPECT_NE(before[38], cloned->Lookup(MeterId(38)));
+  EXPECT_TRUE(cloned->Lookup(MeterId(38))->profile().spec() ==
+              MeterProfileSpec(kSlowBig));
+  ASSERT_NE(nullptr, cloned->Lookup(MeterId(149)));
+  EXPECT_NE(before[149], cloned->Lookup(MeterId(149)));
+  EXPECT_EQ(nullptr, cloned->Lookup(MeterId(75)));
+  EXPECT_EQ(nullptr, cloned->Lookup(MeterId(112)));
+  EXPECT_NE(nullptr, cloned->Lookup(MeterId(2)));
+  EXPECT_NE(nullptr, cloned->Lookup(MeterId(69999)));
+  EXPECT_EQ(nullptr, cloned->Lookup(MeterId(3)));
+
+  ASSERT_NE(nullptr, built->Lookup(MeterId(75)));
+  EXPECT_NE(before[75], built->Lookup(MeterId(75)));
+  EXPECT_EQ(nullptr, built->Lookup(MeterId(38)));
+  EXPECT_NE(nullptr, built->Lookup(MeterId(3)));
+  EXPECT_EQ(nullptr, built->Lookup(MeterId(2)));
+  EXPECT_EQ(nullptr, built->Lookup(MeterId(69999)));
+
+  // The builders agree with their generations.
+  EXPECT_FALSE(clone->Contains(MeterId(75)));
+  EXPECT_TRUE(builder.Contains(MeterId(75)));
+  EXPECT_TRUE(clone->Contains(MeterId(38)));
+  EXPECT_FALSE(builder.Contains(MeterId(38)));
 }
 
 TEST(MeterSetTest, CheckBatchReportsResolvedPositions) {
@@ -350,18 +429,20 @@ TEST(MeterSetMemoryTest, GrowthIsAdmittedAndGivenBack) {
   EXPECT_EQ(growth.grown[2], growth.grown_glibc[2]);
   EXPECT_EQ(initial + growth.net, builder.bytes());
 
-  // A generation is admitted when built and given back when destroyed.
+  // A generation and a clone admit nothing: they share the index. The next
+  // edit copies the node it shares (here the root leaf), once.
   auto generation = builder.Build();
-  EXPECT_GT(generation->bytes(), 0u);
-  EXPECT_EQ(initial + growth.net, builder.bytes() + generation->bytes());
-  generation.reset();
-  EXPECT_EQ(initial + growth.net, builder.bytes());
-
-  // So is a clone's copy of the entries.
   auto clone = builder.Clone();
-  EXPECT_EQ(initial + growth.net,
-            builder.bytes() +
-                bess::framework::MemoryCost<MeterSetBuilder>::Bytes(kCapacity));
+  ASSERT_EQ(3u, growth.grown.size());
+  MustAdd(builder, 2);
+  ASSERT_EQ(5u, growth.grown.size()) << "a state control block and the leaf";
+  EXPECT_EQ(detail::kMeterLeafBytes, growth.grown[4]);
+  EXPECT_EQ(0u, growth.grown_glibc[4]);
+  MustAdd(builder, 3);
+  EXPECT_EQ(6u, growth.grown.size()) << "the leaf is the builder's now";
+  EXPECT_EQ(initial + growth.net, builder.bytes());
+  // What only they held is given back when they go.
+  generation.reset();
   clone.reset();
   EXPECT_EQ(initial + growth.net, builder.bytes());
 
@@ -373,29 +454,41 @@ TEST(MeterSetMemoryTest, GrowthIsAdmittedAndGivenBack) {
   EXPECT_EQ(initial + growth.net, builder.bytes());
 }
 
-// MeterSet::Bytes(capacity) bounds what one Build admits, and is exactly it
-// with every id in use; GlibcBytes is its glibc part.
-TEST(MeterSetMemoryTest, GenerationBytesBoundBuild) {
-  constexpr size_t kCapacity = 8;
+// Build admits nothing, and one edit of one meter admits at most
+// MeterSet::Bytes(capacity) of index nodes (DPDK): exactly that when its
+// whole path is shared and its leaf keeps other meters. An erase's removal
+// stage is prepaid that much (D-199).
+TEST(MeterSetMemoryTest, OneEditAdmitsAtMostOnePath) {
+  constexpr size_t kCapacity = 65536;  // two inner levels
   RecordingGrowth growth;
   MeterSetBuilder builder(kCapacity);
   builder.set_memory_growth(&growth);
-  for (uint32_t id = 1; id <= kCapacity; id++) {
-    const size_t before = growth.net, glibc_before = growth.glibc_net;
-    auto generation = builder.Build();
-    const size_t delta = growth.net - before;
-    const size_t glibc_delta = growth.glibc_net - glibc_before;
-    EXPECT_EQ(generation->bytes(), delta);
-    EXPECT_LE(delta, MeterSet::Bytes(kCapacity)) << id;
-    EXPECT_LE(glibc_delta, MeterSet::GlibcBytes(kCapacity)) << id;
-    generation.reset();
+  for (uint32_t id = 1; id <= 300; id++) {
     MustAdd(builder, id);
   }
-  const size_t before = growth.net, glibc_before = growth.glibc_net;
-  auto full = builder.Build();
-  EXPECT_EQ(MeterSet::Bytes(kCapacity), growth.net - before);
-  EXPECT_EQ(MeterSet::GlibcBytes(kCapacity), growth.glibc_net - glibc_before);
-  EXPECT_EQ(MeterSet::Bytes(kCapacity), full->bytes());
+  // The index admitted since `from`, and that it is all DPDK memory.
+  auto index_bytes = [&](size_t from) {
+    size_t bytes = 0;
+    for (size_t i = from; i < growth.grown.size(); i++) {
+      bytes += growth.grown[i] - growth.grown_glibc[i];
+    }
+    return bytes;
+  };
+
+  size_t from = growth.grown.size();
+  auto generation = builder.Build();
+  auto again = builder.Build();
+  EXPECT_EQ(from, growth.grown.size()) << "Build admitted";
+
+  ASSERT_TRUE(builder.Erase(MeterId(1)).has_value());
+  EXPECT_EQ(MeterSet::Bytes(kCapacity), index_bytes(from));
+  from = growth.grown.size();
+  ASSERT_TRUE(builder.Erase(MeterId(2)).has_value());
+  EXPECT_EQ(from, growth.grown.size()) << "the path is the builder's now";
+  // Another leaf under the same, now owned, inner nodes: the leaf only.
+  ASSERT_TRUE(builder.Reset(MeterId(200)).has_value());
+  EXPECT_EQ(detail::kMeterLeafBytes, index_bytes(from));
+  EXPECT_LT(detail::kMeterLeafBytes, MeterSet::Bytes(kCapacity));
 }
 
 TEST(MeterSetMemoryTest, RefusedGrowthLeavesTheBuilderUnchanged) {
@@ -424,15 +517,24 @@ TEST(MeterSetMemoryTest, RefusedGrowthLeavesTheBuilderUnchanged) {
             growth.net);
   EXPECT_EQ(initial + growth.net, builder.bytes());
 
-  // A refused generation or clone is not built.
+  // Build and Clone admit nothing, so a hook refusing everything still
+  // builds and clones; the next edit's copy is refused and changes nothing.
+  growth.allow = SIZE_MAX;
+  MustAdd(builder, 1);
   growth.allow = growth.grown.size();
-  EXPECT_THROW((void)builder.Build(), bess::utils::MemoryRefused);
-  EXPECT_THROW((void)builder.Clone(), bess::utils::MemoryRefused);
+  auto generation = builder.Build();
+  auto clone = builder.Clone();
+  EXPECT_THROW({ [[maybe_unused]] auto erased = builder.Erase(MeterId(1)); },
+               bess::utils::MemoryRefused);
+  EXPECT_TRUE(builder.Contains(MeterId(1)));
+  EXPECT_EQ(1u, builder.size());
+  EXPECT_EQ(generation->Lookup(MeterId(1)), builder.Build()->Lookup(MeterId(1)));
   EXPECT_EQ(initial + growth.net, builder.bytes());
 
   growth.allow = SIZE_MAX;
-  MustAdd(builder, 1);
-  EXPECT_TRUE(builder.Contains(MeterId(1)));
+  ASSERT_TRUE(builder.Erase(MeterId(1)).has_value());
+  EXPECT_FALSE(builder.Contains(MeterId(1)));
+  EXPECT_NE(nullptr, generation->Lookup(MeterId(1)));
   EXPECT_EQ(initial + growth.net, builder.bytes());
 }
 

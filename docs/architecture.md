@@ -69,6 +69,12 @@ Two checkers enforce this in CI. `tools/check_includes.py` rejects forbidden `#i
 
 `core/flow/**` (M9, D-052) is covered by `check_includes.py` too: no `module.h`, `gate.h`, `framework/`, `runtime/`, `control/`, protobuf or gRPC, and no `worker.h` (which also catches `stats/current_worker.h`): a flow table learns who owns it from an injected owner token, not by asking the worker. Link-wise `bess_flow` may use `bess_classifier`, `bess_dataplane_core`, `bess_rcu` and `bess_utils` (`SharedFlowTable` is built on `ConcurrentExactTable`).
 
+`bess_meter` may also use `bess_rcu` directly: `MeterResource` publishes immutable
+`MeterSet` generations through an injected `RcuPtr` and retires replaced
+generations through the transaction's `Retirer`. This is a battery-to-substrate
+dependency, like the classifier and route libraries' RCU edges, not an exception
+to the DAG.
+
 `core/dataplane/**` also may not include `flow/`, `gate.h`, `module.h` or `worker.h` (M10, D-053): the expiry engine (`dataplane/expiry_wheel.h`) is a generic substrate that `flow/` consumes through its `Observer` seam, so the edge runs `flow/ -> dataplane/`, never back, and a tick source (the scheduler's cached TSC, a test clock) is passed in as ticks, not read from a global or from the worker.
 
 `dataplane/handoff.h` and `dataplane/continuation.h` (M11, D-054) are held to one more rule: they may not include the packet view (`packet.h`, `pktbatch.h`, `packet_pool.h`). A handoff channel moves an opaque `PacketHandle` (`packet_handle.h`, an `rte_mbuf *`), frees it only at teardown through `rte_pktmbuf_free`, and never looks inside a packet; the packet substrate stays below it. Both are header-only except `handoff.cc` (the DPDK-heap allocator and the C-linkage ring size call), so no new library and no new link edge: `bess_dataplane_core` already may use `bess_utils`.
