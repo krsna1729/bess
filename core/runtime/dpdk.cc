@@ -28,9 +28,8 @@
 #include <string>
 
 #include "arch/dpdk_simd.h"
-#include "runtime/memory.h"
 #include "runtime/opts.h"
-
+#include "utils/dpdk_memory.h"
 
 namespace bess {
 namespace {
@@ -92,7 +91,14 @@ class CmdLineOpts {
   std::vector<char *> argv_;
 };
 
-void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
+// The EAL arguments follow the memory policy resolved before it
+// (startup::ApplyMemorySettings, D-198): hugepages -> dynamic memory with
+// the --mem_hugepage_mb cap; normal -> --no-huge with a heap sized from the
+// limit. Never auto: resolving auto (hugepages if usable) happened there.
+void init_eal(const utils::MemoryPolicy &policy,
+              std::string nonworker_corelist) {
+  CHECK(policy.backing != utils::MemoryBacking::kAuto)
+      << "the memory policy is resolved before the EAL starts";
   CmdLineOpts rte_args{
       "bessd",
       // DPDK renamed --master-lcore to --main-lcore upstream.
@@ -100,23 +106,10 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
       std::to_string(RTE_MAX_LCORE - 1),
       // DPDK's lcore-affinity ("id@cpuset") option is --lcores (plural);
       // --lcore was accepted in older DPDK but no longer exists.
+      // Commas inside the CPU set must not start separate lcore mappings.
       "--lcores",
-      std::to_string(RTE_MAX_LCORE - 1) + "@" + nonworker_corelist,
+      std::to_string(RTE_MAX_LCORE - 1) + "@(" + nonworker_corelist + ")",
   };
-
-  // -m -1: host-free hugepages within the remaining hugetlb capacity of this
-  // process's cgroup and its ancestors; otherwise normal pages (D-030).
-  if (dpdk_mb_per_socket < 0) {
-    const uint64_t usable = startup::UsableHugepageMB(
-        "/sys/kernel/mm/hugepages", "/sys/fs/cgroup", "/proc/self/cgroup");
-    if (usable == 0) {
-      LOG(WARNING) << "No usable hugepages: DPDK memory is normal pages "
-                      "(512 MB). Give bessd hugepages for production.";
-      dpdk_mb_per_socket = 0;
-    } else {
-      LOG(INFO) << usable << " MB of hugepages usable; mapped as needed";
-    }
-  }
 
   // The NICs DPDK may probe: -pci_allow, else what a device plugin assigned
   // this container; with neither, every device DPDK can use.
@@ -136,7 +129,7 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     rte_args.Append({"-a", address});
   }
 
-  if (dpdk_mb_per_socket == 0) {
+  if (policy.backing == utils::MemoryBacking::kNormal) {
     // Do not bother with /var/run/.rte_config and .rte_hugepage_info,
     // since we don't want to interfere with other DPDK applications.
     rte_args.Append({"--no-shconf"});
@@ -146,13 +139,28 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
 
     // even if we opt out of using hugepages, many DPDK libraries still rely on
     // rte_malloc (e.g., rte_lpm), so we need to reserve some (normal page)
-    // memory in advance. We allocate 512MB (this is shared among nodes).
-    // BESS_DPDK_NOHUGE_MB=<MB> (tests and benchmarks only) sizes this heap;
-    // unset, it is 512.
-    const char *heap_mb = std::getenv("BESS_DPDK_NOHUGE_MB");
-    rte_args.Append({"-m", (heap_mb != nullptr && std::atoi(heap_mb) > 0)
-                               ? std::string(heap_mb)
-                               : std::string("512")});
+    // memory in advance: DPDK's --no-huge heap is fixed at its -m MB. bessd
+    // sizes it to what its memory policy allows (D-198): the limit less the
+    // reserve, so the heap is not what refuses a table -- the limit is, as
+    // DpdkAllocate admits each allocation against it. Without a known limit
+    // (--mem_limit_mb=-1; the library default for tests, benchmarks and
+    // library users bringing DPDK up lazily) it is 512 MB. A benchmark that
+    // needs a bigger heap sets BESSD_MEM_LIMIT_MB (and BESSD_MEM_RESERVE_MB).
+    //
+    // [INFERENCE, to be measured] A heap page untouched is not resident: the
+    // region is mapped (memfd, MAP_SHARED) and only written as allocations
+    // use it, so a large heap costs address space, not memory -- except
+    // DPDK's per-page segment bookkeeping (an rte_memseg per 4 KiB, written
+    // at init, 48 bytes each), about 1/85 of the heap size.
+    size_t heap_mb = 512;
+    if (policy.limit_bytes > policy.reserve_bytes) {
+      heap_mb = (policy.limit_bytes - policy.reserve_bytes) >> 20;
+#if BESS_ADDRESS_SANITIZER
+      // The heap must fit below ASan's shadow (see --base-virtaddr below).
+      heap_mb = std::min<size_t>(heap_mb, 1536);
+#endif
+    }
+    rte_args.Append({"-m", std::to_string(heap_mb)});
 #if BESS_ADDRESS_SANITIZER
     // Under AddressSanitizer the default heap address lands inside ASan's
     // shadow region, so DPDK maps the heap high, above the IOMMU's DMA mask
@@ -173,24 +181,25 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
     // Dynamic memory (D-029): hugepages are mapped as DPDK's heap needs
     // them -- packet pools at startup, tables when they are created -- within
     // whatever the host or a container's hugetlb limit allows, and at most
-    // `dpdk_mb_per_socket` on the memory node when -m sets a cap. Nothing is
+    // --mem_hugepage_mb on the memory node when it sets a cap. Nothing is
     // mapped on the packet path: every dataplane structure is allocated on
     // the control path.
     //
     // DPDK's limit is exclusive: an allocation fails once the heap would
     // reach it (eal_memalloc_mem_alloc_validate: `limit > new_len` passes),
     // so a cap of exactly one 1 GiB page rejected that page and bessd could
-    // not start. -m N means the heap may reach N MB: pass N + 1.
+    // not start. A cap of N MB means the heap may reach N MB: pass N + 1.
     //
     // One memory node per bessd (D-123): every other node gets a 1 MB limit,
     // which no hugepage fits under, so nothing is ever mapped there. (DPDK
-    // reads a limit of 0 as "no limit".) The memory node keeps the -m cap,
-    // or no limit. DPDK takes at most RTE_MAX_NUMA_NODES entries (node ids
+    // reads a limit of 0 as "no limit".) The memory node keeps the cap, or
+    // no limit. DPDK takes at most RTE_MAX_NUMA_NODES entries (node ids
     // past that are not DPDK sockets at all).
+    const size_t cap_mb = policy.hugepage_cap_bytes >> 20;
     const runtime::Placement &placement = runtime::ProcessPlacement();
     const int memory_node = placement.node;
     // A node DPDK cannot name is not confined (the warning says so): every
-    // node gets the -m cap, or no limit, as before D-123.
+    // node gets the cap, or no limit, as before D-123.
     const bool confined = memory_node < RTE_MAX_NUMA_NODES;
     if (!confined) {
       LOG(WARNING) << "memory node " << memory_node << " is beyond DPDK's "
@@ -202,9 +211,8 @@ void init_eal(int dpdk_mb_per_socket, std::string nonworker_corelist) {
       nodes = std::max(nodes, node + 1);
     }
     nodes = std::min(nodes, RTE_MAX_NUMA_NODES);
-    if (dpdk_mb_per_socket > 0 || (confined && nodes > 1)) {
-      const std::string cap =
-          dpdk_mb_per_socket > 0 ? std::to_string(dpdk_mb_per_socket + 1) : "0";
+    if (cap_mb > 0 || (confined && nodes > 1)) {
+      const std::string cap = cap_mb > 0 ? std::to_string(cap_mb + 1) : "0";
       std::string limit;
       for (int i = 0; i < nodes; i++) {
         const bool own = !confined || i == memory_node;
@@ -312,26 +320,33 @@ bool IsDpdkInitialized() {
   return is_initialized;
 }
 
-void InitDpdk(int dpdk_mb_per_socket) {
+void InitDpdk() {
   if (!is_initialized) {
     is_initialized = true;
-    // Test and benchmark binaries bring the EAL up lazily with no hugepages.
-    // BESS_DPDK_HUGEPAGE_MB=<MB per socket> opts them into hugepage memory
-    // (so tables beyond the TLB reach are measured the way a hugepage bessd
-    // runs them). An unprivileged process cannot resolve physical addresses,
-    // so this path uses IOVA-as-VA unless -iova says otherwise.
-    if (dpdk_mb_per_socket == 0) {
-      if (const char *env = std::getenv("BESS_DPDK_HUGEPAGE_MB")) {
-        const int mb = std::atoi(env);
-        if (mb > 0) {
-          dpdk_mb_per_socket = mb;
-          if (FLAGS_iova.empty()) {
-            FLAGS_iova = "va";
-          }
-        }
+    // bessd's main() resolved its --mem_* flags before its first pool. A
+    // process without bessd -- a test, a benchmark, a library user bringing
+    // the EAL up lazily -- resolves the same settings from BESSD_MEM_* here,
+    // starting from normal pages and no limit (a 512 MB --no-huge heap);
+    // BESSD_MEM_BACKING=hugepages opts it into hugepage memory (so tables
+    // beyond the TLB reach are measured the way a hugepage bessd runs
+    // them). An unprivileged process cannot resolve physical addresses, so
+    // that path uses IOVA-as-VA unless -iova says otherwise.
+    if (utils::memory_policy().backing == utils::MemoryBacking::kAuto) {
+      startup::MemorySettings settings = startup::LibraryMemorySettings();
+      std::string error;
+      if (!startup::MemorySettingsFromEnvironment(environ, &settings, &error) ||
+          !startup::ApplyMemorySettings(settings, &error)) {
+        LOG(FATAL) << error;
+      }
+      if (utils::memory_policy().backing == utils::MemoryBacking::kHugepages &&
+          FLAGS_iova.empty()) {
+        FLAGS_iova = "va";
       }
     }
-    init_eal(dpdk_mb_per_socket, GetNonWorkerCoreList());
+    init_eal(utils::memory_policy(), GetNonWorkerCoreList());
+    // The hugepage heap grows only past the validator (D-198): the cap, and
+    // the memory limit where hugepages are charged to memory.max.
+    utils::InstallHeapValidator();
   }
 }
 

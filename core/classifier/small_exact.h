@@ -85,6 +85,11 @@ class SmallExactBackend {
   }
 
   [[nodiscard]] size_t size() const noexcept { return entries_.size(); }
+  // Memory (D-198): the rule array's capacity (glibc); empty when built,
+  // grown by insert up to kMaxRules.
+  [[nodiscard]] size_t bytes() const noexcept {
+    return entries_.capacity() * sizeof(entries_[0]);
+  }
 
   [[nodiscard]] BackendInfo info() const noexcept {
     return BackendInfo{
@@ -160,6 +165,11 @@ class SortedFlatBackend {
   }
 
   [[nodiscard]] size_t size() const noexcept { return entries_.size(); }
+  // Memory (D-198): the rule array's capacity (glibc); empty when built,
+  // grown by insert.
+  [[nodiscard]] size_t bytes() const noexcept {
+    return entries_.capacity() * sizeof(entries_[0]);
+  }
 
   [[nodiscard]] BackendInfo info() const noexcept {
     return BackendInfo{

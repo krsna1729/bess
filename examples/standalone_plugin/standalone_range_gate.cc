@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "classifier/range_backend.h"
+#include "framework/memory_scope.h"
 #include "framework/plugin.h"
 #include "module.h"
 
@@ -36,8 +37,12 @@ class StandaloneRangeGate final : public Module {
     rule.dst_port_offset = 0;
     rule.priority = 1;
     rule.result = 1;
-    classifier_ = bess::classifier::RangeClassifier<uint16_t>(
-        std::vector<RangeRule<uint16_t>>{rule});
+    std::vector<RangeRule<uint16_t>> rules{rule};
+    classifier_lease_ =
+        init_context().memory().LeaseFor<bess::classifier::RangeClassifier<uint16_t>>(
+            "classifier", rules);
+    classifier_ = bess::classifier::RangeClassifier<uint16_t>(std::move(rules));
+    classifier_lease_.Track(classifier_);
     return CommandSuccess();
   }
 
@@ -66,6 +71,7 @@ class StandaloneRangeGate final : public Module {
   }
 
  private:
+  bess::framework::MemoryLease classifier_lease_;
   bess::classifier::RangeClassifier<uint16_t> classifier_;
 };
 

@@ -14,6 +14,7 @@
 #include <numeric>
 #include <vector>
 
+#include "utils/dpdk_memory.h"
 #include "utils/logging.h"
 
 // Class for general purpose histogram. T generally should be an
@@ -39,6 +40,26 @@ class Histogram {
   // "bucket_width".
   Histogram(size_t num_buckets, T bucket_width)
       : bucket_width_(bucket_width), buckets_(num_buckets + 1) {}
+
+  // What the constructor allocates (D-198): the buckets plus the
+  // above-range one, from glibc. Equals bytes().
+  static size_t Bytes(size_t num_buckets, T /*bucket_width*/) noexcept {
+    return (num_buckets + 1) * sizeof(std::atomic<uint64_t>);
+  }
+  static size_t GlibcBytes(size_t num_buckets, T bucket_width) noexcept {
+    return Bytes(num_buckets, bucket_width);
+  }
+  // The buckets held now (glibc).
+  size_t bytes() const noexcept {
+    return buckets_.size() * sizeof(std::atomic<uint64_t>);
+  }
+
+  // The admission Resize asks for its new buckets first (D-198); nullptr:
+  // unadmitted. The hook stays with this object (swap and moves do not
+  // carry it).
+  void set_memory_growth(bess::utils::MemoryGrowth *growth) noexcept {
+    growth_ = growth;
+  }
 
   // Swap operator allows clean summarizing with external lock,
   // when using a histogram on an active data stream.
@@ -163,16 +184,34 @@ class Histogram {
   void Reset() { std::fill(buckets_.begin(), buckets_.end(), T()); }
 
   // Resize the histogram.  Note that this resets it (i.e., this
-  // does not attempt to redistribute existing counts).
+  // does not attempt to redistribute existing counts). With a growth hook
+  // the new buckets are admitted first (MemoryRefused propagates and nothing
+  // changes) and the old ones given back after (D-198).
   void Resize(size_t num_buckets, T bucket_width) {
-    buckets_ = std::vector<std::atomic<uint64_t>>(num_buckets + 1);
+    const size_t new_bytes = Bytes(num_buckets, bucket_width);
+    if (growth_ != nullptr) {
+      growth_->Grow(new_bytes, new_bytes);
+    }
+    const size_t old_bytes = bytes();
+    try {
+      buckets_ = std::vector<std::atomic<uint64_t>>(num_buckets + 1);
+    } catch (...) {
+      if (growth_ != nullptr) {
+        growth_->Shrink(new_bytes, new_bytes);
+      }
+      throw;
+    }
     bucket_width_ = bucket_width;
+    if (growth_ != nullptr) {
+      growth_->Shrink(old_bytes, old_bytes);
+    }
   }
 
  private:
   // TODO(melvin): add support for logarithmic binning
   T bucket_width_;
   std::vector<std::atomic<uint64_t>> buckets_;
+  bess::utils::MemoryGrowth *growth_ = nullptr;  // D-198: admits Resize
 };
 
 #endif  // BESS_UTILS_HISTOGRAM_H_

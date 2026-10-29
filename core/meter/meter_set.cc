@@ -3,104 +3,173 @@
 #include "meter/meter_set.h"
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <type_traits>
 #include <utility>
 #include <variant>
 
-#include <rte_malloc.h>
-
-#include "utils/logging.h"
-
 namespace bess::meter {
 
-// A per-socket pool of cache-line MeterState slots. Chunks are allocated on
-// demand and never freed or moved until the slab itself goes, which happens
-// only after every state carved from it has been released (each state's
-// deleter holds a reference to its slab).
-//
-// Release is called from wherever the last generation holding a state is
-// destroyed -- normally the control thread that reclaims RCU retirements -- so
-// the free list is locked. Nothing here runs on the packet path.
-class MeterStateSlab {
+namespace detail {
+
+// The growth hook a builder, its clones, and the generations and states they
+// make share (D-198). Generations and states are freed after a grace period,
+// on whatever control thread reclaims, possibly after the builder that made
+// them: each holds this, not the hook, and gives its bytes back through it.
+// The hook stays attached while any builder sharing it lives (the owner's
+// admission lives at least that long); once the last one is gone the owner
+// has released everything, and what is freed later gives nothing back.
+class MeterMemory final : public utils::MemoryGrowth {
  public:
-  explicit MeterStateSlab(int socket) : socket_(socket) {}
-
-  ~MeterStateSlab() {
-    for (void *chunk : chunks_) {
-      rte_free(chunk);
+  void Grow(size_t bytes, size_t glibc_bytes = 0) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (hook_ != nullptr) {
+      hook_->Grow(bytes, glibc_bytes);
+    }
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes = 0) noexcept override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (hook_ != nullptr) {
+      hook_->Shrink(bytes, glibc_bytes);
+    }
+  }
+  void Attach(utils::MemoryGrowth *hook) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hook_ = hook;
+  }
+  // A builder sharing this appeared / went away; the last one detaches.
+  void Join() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    builders_++;
+  }
+  void Leave() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (--builders_ == 0) {
+      hook_ = nullptr;
     }
   }
 
-  MeterStateSlab(const MeterStateSlab &) = delete;
-  MeterStateSlab &operator=(const MeterStateSlab &) = delete;
-
-  void *Acquire() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (free_.empty() && !Grow()) {
-      return nullptr;
-    }
-    void *slot = free_.back();
-    free_.pop_back();
-    return slot;
-  }
-
-  void Release(void *slot) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    free_.push_back(slot);
-  }
+  // Glibc bytes AdmittedAllocator holds now (state control blocks,
+  // profiles).
+  std::atomic<size_t> glibc_held{0};
 
  private:
-  // 64 KiB per chunk: large enough that a big set is a handful of
-  // allocations, small enough that a set of a few meters wastes little.
-  static constexpr size_t kSlotsPerChunk = 1024;
-
-  bool Grow() {
-    const size_t bytes = kSlotsPerChunk * sizeof(MeterState);
-    void *chunk = rte_malloc_socket("bess_meter_slab", bytes,
-                                    alignof(MeterState), socket_);
-    if (chunk == nullptr && socket_ != SOCKET_ID_ANY) {
-      // Placement is a preference; see MeterState::Create().
-      static std::once_flag warned;
-      std::call_once(warned, [this] {
-        LOG(WARNING) << "meter slab: DPDK socket " << socket_
-                     << " is out of memory; allocating on any socket";
-      });
-      chunk = rte_malloc_socket("bess_meter_slab", bytes, alignof(MeterState),
-                                SOCKET_ID_ANY);
-    }
-    if (chunk == nullptr) {
-      return false;
-    }
-    chunks_.push_back(chunk);
-    // Pushed in reverse so slots are handed out in address order: meters
-    // added together sit next to each other.
-    auto *slots = static_cast<MeterState *>(chunk);
-    for (size_t i = kSlotsPerChunk; i-- > 0;) {
-      free_.push_back(&slots[i]);
-    }
-    return true;
-  }
-
-  const int socket_;
   std::mutex mutex_;
-  std::vector<void *> chunks_;
-  std::vector<void *> free_;
+  utils::MemoryGrowth *hook_ = nullptr;  // guarded by mutex_
+  size_t builders_ = 0;
 };
 
-MeterSetBuilder::MeterSetBuilder(size_t capacity) : entries_(capacity + 1) {}
+namespace {
 
-MeterSetBuilder::~MeterSetBuilder() = default;
+// Allocates the standard library's part of a state's or profile's shared
+// ownership (a control block per meter state; a profile with its block),
+// glibc and one per meter, admitted through `memory` first and given back
+// when it is freed (D-198).
+template <typename T>
+struct AdmittedAllocator {
+  using value_type = T;
+
+  explicit AdmittedAllocator(std::shared_ptr<MeterMemory> m) noexcept
+      : memory(std::move(m)) {}
+  template <typename U>
+  AdmittedAllocator(const AdmittedAllocator<U> &o) noexcept
+      : memory(o.memory) {}
+
+  T *allocate(size_t n) {
+    const size_t bytes = n * sizeof(T);
+    memory->Grow(bytes, bytes);
+    T *p;
+    try {
+      p = std::allocator<T>().allocate(n);
+    } catch (...) {
+      memory->Shrink(bytes, bytes);
+      throw;
+    }
+    memory->glibc_held.fetch_add(bytes, std::memory_order_relaxed);
+    return p;
+  }
+  void deallocate(T *p, size_t n) noexcept {
+    std::allocator<T>().deallocate(p, n);
+    const size_t bytes = n * sizeof(T);
+    memory->glibc_held.fetch_sub(bytes, std::memory_order_relaxed);
+    memory->Shrink(bytes, bytes);
+  }
+  template <typename U>
+  bool operator==(const AdmittedAllocator<U> &o) const noexcept {
+    return memory == o.memory;
+  }
+
+  std::shared_ptr<MeterMemory> memory;
+};
+
+}  // namespace
+
+}  // namespace detail
+
+MeterSet::~MeterSet() {
+  if (memory_ != nullptr) {
+    memory_->Shrink(bytes(), bytes() - states_.capacity() * sizeof(MeterState *));
+  }
+}
+
+size_t MeterSet::bytes() const noexcept {
+  return states_.capacity() * sizeof(MeterState *) +
+         owners_.capacity() * sizeof(owners_[0]) +
+         profiles_.capacity() * sizeof(profiles_[0]);
+}
+
+MeterSetBuilder::MeterSetBuilder(size_t capacity)
+    : entries_(capacity + 1),
+      memory_(std::make_shared<detail::MeterMemory>()) {
+  memory_->Join();
+}
+
+MeterSetBuilder::~MeterSetBuilder() {
+  // This builder's entries go now (a clone's were admitted by Clone, the
+  // first builder's by its owner); the hook stays with any clone left.
+  memory_->Shrink(entries_.capacity() * sizeof(std::optional<Entry>));
+  memory_->Leave();
+}
 
 MeterSetBuilder::MeterSetBuilder(CloneTag, const MeterSetBuilder &other)
     : entries_(other.entries_),
       size_(other.size_),
       profiles_(other.profiles_),
-      slabs_(other.slabs_) {}
+      slabs_(other.slabs_),
+      memory_(other.memory_) {
+  memory_->Join();
+}
+
+size_t MeterSetBuilder::Bytes(size_t capacity) {
+  return (capacity + 1) * sizeof(std::optional<Entry>);
+}
+
+size_t MeterSetBuilder::bytes() const noexcept {
+  size_t total = entries_.capacity() * sizeof(std::optional<Entry>) +
+                 memory_->glibc_held.load(std::memory_order_relaxed);
+  for (const auto &[socket, slab] : slabs_) {
+    total += slab->bytes();
+  }
+  return total;
+}
+
+void MeterSetBuilder::set_memory_growth(
+    bess::utils::MemoryGrowth *growth) noexcept {
+  memory_->Attach(growth);
+}
 
 std::unique_ptr<MeterSetBuilder> MeterSetBuilder::Clone() const {
-  return std::unique_ptr<MeterSetBuilder>(
-      new MeterSetBuilder(CloneTag{}, *this));
+  // The copy's entries are admitted first; its destructor gives them back.
+  const size_t bytes = entries_.size() * sizeof(std::optional<Entry>);
+  memory_->Grow(bytes);
+  try {
+    return std::unique_ptr<MeterSetBuilder>(
+        new MeterSetBuilder(CloneTag{}, *this));
+  } catch (...) {
+    memory_->Shrink(bytes);
+    throw;
+  }
 }
 
 MeterSetBuilder::ProfileKey MeterSetBuilder::KeyOf(
@@ -148,8 +217,9 @@ MeterSetBuilder::InternProfile(const MeterProfileSpec &spec) {
   if (!compiled) {
     return std::unexpected(compiled.error());
   }
-  auto profile =
-      std::make_shared<const MeterProfile>(std::move(compiled).value());
+  auto profile = std::allocate_shared<const MeterProfile>(
+      detail::AdmittedAllocator<MeterProfile>(memory_),
+      std::move(compiled).value());
 
   // Drop interned entries whose profile is gone, so the map tracks live
   // profiles rather than every specification ever seen.
@@ -161,23 +231,30 @@ MeterSetBuilder::InternProfile(const MeterProfileSpec &spec) {
 std::expected<std::shared_ptr<MeterState>, MeterError>
 MeterSetBuilder::NewState(const std::shared_ptr<const MeterProfile> &profile,
                           MeterSharing sharing, int socket) {
-  std::shared_ptr<MeterStateSlab> &slab = slabs_[socket];
+  auto &slab = slabs_[socket];
   if (slab == nullptr) {
-    slab = std::make_shared<MeterStateSlab>(socket);
+    slab = std::shared_ptr<bess::utils::ObjectSlab<MeterState>>(
+        bess::utils::ObjectSlab<MeterState>::Create(socket));
+    // Each chunk admitted through the shared hook (D-198).
+    slab->set_memory_growth(memory_.get());
   }
-  void *slot = slab->Acquire();
-  if (slot == nullptr) {
-    return std::unexpected(MeterError::kOutOfMemory);
-  }
+  void *slot = slab->Allocate();
   auto state = MeterState::ConstructAt(slot, *profile, sharing);
   if (!state) {
-    slab->Release(slot);
+    slab->Free(slot);
     return std::unexpected(state.error());
   }
-  return std::shared_ptr<MeterState>(*state, [slab](MeterState *s) {
-    s->~MeterState();
-    slab->Release(s);
-  });
+  // Run wherever the last generation holding the state is destroyed --
+  // normally the control thread that reclaims RCU retirements; the slab
+  // locks for that. The control block is admitted (AdmittedAllocator); a
+  // refusal runs the deleter, so the slot goes back.
+  return std::shared_ptr<MeterState>(
+      *state,
+      [slab](MeterState *s) {
+        s->~MeterState();  // private: this builder is a friend, the slab is not
+        slab->Free(s);
+      },
+      detail::AdmittedAllocator<MeterState>(memory_));
 }
 
 std::expected<void, MeterError> MeterSetBuilder::Add(
@@ -256,29 +333,42 @@ std::expected<void, MeterError> MeterSetBuilder::Erase(MeterId id) {
 }
 
 std::unique_ptr<const MeterSet> MeterSetBuilder::Build() const {
-  std::vector<MeterState *> states(entries_.size(), nullptr);
-  std::vector<std::shared_ptr<MeterState>> owners;
-  std::vector<std::shared_ptr<const MeterProfile>> profiles;
-  owners.reserve(size_);
-  profiles.reserve(size_);
+  // The generation is admitted before it is allocated: the state index
+  // (DPDK) and one owner and up to one profile reference per meter (glibc,
+  // reserved exactly). It gives them back when it is destroyed (D-198).
+  // MeterSet::GlibcBytes(size_) is the references of size_ meters; the
+  // index is capacity + 1 pointers whatever the occupancy.
+  const size_t glibc = MeterSet::GlibcBytes(size_);
+  const size_t bytes = entries_.size() * sizeof(MeterState *) + glibc;
+  memory_->Grow(bytes, glibc);
+  try {
+    MeterSet::States states(entries_.size(), nullptr);
+    std::vector<std::shared_ptr<MeterState>> owners;
+    std::vector<std::shared_ptr<const MeterProfile>> profiles;
+    owners.reserve(size_);
+    profiles.reserve(size_);
 
-  for (size_t index = 1; index < entries_.size(); index++) {
-    const std::optional<Entry> &entry = entries_[index];
-    if (!entry.has_value()) {
-      continue;
+    for (size_t index = 1; index < entries_.size(); index++) {
+      const std::optional<Entry> &entry = entries_[index];
+      if (!entry.has_value()) {
+        continue;
+      }
+      states[index] = entry->state.get();
+      owners.push_back(entry->state);
+      profiles.push_back(entry->profile);
     }
-    states[index] = entry->state.get();
-    owners.push_back(entry->state);
-    profiles.push_back(entry->profile);
+
+    // One owning reference per distinct profile is enough.
+    std::sort(profiles.begin(), profiles.end());
+    profiles.erase(std::unique(profiles.begin(), profiles.end()),
+                   profiles.end());
+
+    return std::unique_ptr<const MeterSet>(new MeterSet(
+        std::move(states), std::move(owners), std::move(profiles), memory_));
+  } catch (...) {
+    memory_->Shrink(bytes, glibc);
+    throw;
   }
-
-  // One owning reference per distinct profile is enough.
-  std::sort(profiles.begin(), profiles.end());
-  profiles.erase(std::unique(profiles.begin(), profiles.end()),
-                 profiles.end());
-
-  return std::unique_ptr<const MeterSet>(
-      new MeterSet(std::move(states), std::move(owners), std::move(profiles)));
 }
 
 }  // namespace bess::meter

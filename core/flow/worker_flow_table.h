@@ -160,6 +160,23 @@ class WorkerFlowTable {
     return table;
   }
 
+  // What Create allocates (D-198), all of it from Traits::Allocator (glibc
+  // by default): the directory, the slot array, the free list and the table
+  // itself -- what bytes() counts.
+  static size_t Bytes(size_t capacity, const Hash & = Hash{},
+                      const Equal & = Equal{},
+                      const Observer & = Observer{}) noexcept {
+    return detail::FlowIndex::BucketsFor(capacity * kKeysPerSlot) *
+               sizeof(detail::Bucket) +
+           capacity * (sizeof(Slot) + sizeof(uint32_t)) +
+           sizeof(WorkerFlowTable);
+  }
+  static size_t GlibcBytes(size_t capacity, const Hash &hash = Hash{},
+                           const Equal &equal = Equal{},
+                           const Observer &observer = Observer{}) noexcept {
+    return Bytes(capacity, hash, equal, observer);
+  }
+
   // Destroys every live flow's State (without notifying the observer).
   ~WorkerFlowTable() {
     for (uint32_t slot = 0; slot < capacity_ && slots_ != nullptr; slot++) {
@@ -411,9 +428,10 @@ class WorkerFlowTable {
   Observer &observer() noexcept { return observer_; }
   const Observer &observer() const noexcept { return observer_; }
 
-  // Bytes the table holds for its slots, directory and free list; its
-  // per-flow cost at full occupancy is memory_bytes() / capacity().
-  size_t memory_bytes() const noexcept {
+  // Bytes the table holds for its slots, directory and free list
+  // (Bytes(capacity())); its per-flow cost at full occupancy is bytes() /
+  // capacity().
+  size_t bytes() const noexcept {
     return buckets_block_.bytes() + slots_block_.bytes() +
            free_block_.bytes() + sizeof(*this);
   }

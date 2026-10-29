@@ -11,6 +11,8 @@
 #include <span>
 #include <vector>
 
+#include "framework/memory_scope.h"
+
 namespace bess::classifier {
 namespace {
 
@@ -401,6 +403,41 @@ TEST(RangeBackendTest, CartesianExplosionElimination) {
 
   RangeClassifier<uint32_t> classifier(std::move(rules));
   EXPECT_EQ(classifier.size(), 1u);
+}
+
+// D-198: Bytes(rules) is what the constructors allocate (glibc).
+TEST(RangeBackendTest, BytesMatchesConstruction) {
+  using bess::framework::MemoryCost;
+  for (const size_t n : {size_t{0}, size_t{1}, size_t{37}}) {
+    std::vector<RangeRule<uint32_t>> rules;
+    for (size_t i = 0; i < n; i++) {
+      TestKey k{};
+      TestKey m{};
+      k.src_ip = static_cast<uint32_t>(i);
+      m.src_ip = 0xffffffffu;
+      rules.push_back({
+          .value = ToBytes(k),
+          .mask = ToBytes(m),
+          .src_range = PortRange{.low = 1000, .high = 1020},
+          .src_port_offset = 4,
+          .dst_port_offset = 6,
+          .priority = static_cast<int64_t>(i),
+          .result = static_cast<uint32_t>(i),
+      });
+    }
+    auto for_classifier = rules;
+    const size_t classifier_bytes =
+        MemoryCost<RangeClassifier<uint32_t>>::Bytes(for_classifier);
+    EXPECT_EQ(classifier_bytes,
+              MemoryCost<RangeClassifier<uint32_t>>::GlibcBytes(for_classifier));
+    RangeClassifier<uint32_t> classifier(std::move(for_classifier));
+    EXPECT_EQ(classifier_bytes, classifier.bytes());
+
+    const size_t scalar_bytes =
+        MemoryCost<ScalarRangeBackend<uint32_t>>::Bytes(rules);
+    ScalarRangeBackend<uint32_t> scalar(std::move(rules));
+    EXPECT_EQ(scalar_bytes, scalar.bytes());
+  }
 }
 
 }  // namespace

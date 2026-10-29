@@ -6,8 +6,11 @@
 
 #include <array>
 #include <cstring>
+#include <vector>
 
+#include "framework/memory_scope.h"
 #include "runtime/runtime_state.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::classifier {
 namespace {
@@ -119,6 +122,68 @@ TEST(RecordArenaTest, RecordsAreAlignedAndDistinct) {
   EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(pa) % alignof(std::max_align_t));
   EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(pb) % alignof(std::max_align_t));
   EXPECT_GE(pb - pa, 3);
+}
+
+// D-198: Bytes() is what the constructor allocates, whatever the record
+// size (the published-chunk array); chunks come with Allocate.
+TEST(RecordArenaTest, BytesMatchesConstruction) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  for (const size_t record_size : {size_t{1}, size_t{24}, size_t{4096}}) {
+    RecordArena arena(record_size, domain);
+    EXPECT_EQ(bess::framework::MemoryCost<RecordArena>::Bytes(record_size,
+                                                              domain),
+              arena.bytes());
+    ASSERT_NE(0u, arena.Allocate());
+    EXPECT_EQ(bess::framework::MemoryCost<RecordArena>::Bytes(record_size,
+                                                              domain) +
+                  RecordArena::ChunkBytes(record_size),
+              arena.bytes());
+  }
+}
+
+struct RecordingGrowth final : bess::utils::MemoryGrowth {
+  std::vector<size_t> grown;
+  size_t shrunk = 0;
+  bool refuse = false;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    EXPECT_EQ(0u, glibc_bytes);  // chunks are DPDK memory
+    if (refuse) {
+      throw bess::utils::MemoryRefused(
+          bess::utils::MemoryRefused::Reason::kNormalLimit, bytes, "refused");
+    }
+    grown.push_back(bytes);
+  }
+  void Shrink(size_t bytes, size_t) noexcept override { shrunk += bytes; }
+};
+
+TEST(RecordArenaTest, GrowthAdmitsEachChunkFirst) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  RecordArena arena(sizeof(Bytes), domain);
+  RecordingGrowth growth;
+  arena.set_memory_growth(&growth);
+  const size_t initial = arena.bytes();
+
+  // Refused: the arena is unchanged and nothing was given back twice.
+  growth.refuse = true;
+  EXPECT_THROW((void)arena.Allocate(), bess::utils::MemoryRefused);
+  EXPECT_EQ(initial, arena.bytes());
+  EXPECT_EQ(0u, arena.in_use());
+  EXPECT_TRUE(growth.grown.empty());
+
+  // Admitted: one chunk for the first 1023 ids (id 0 is never a record).
+  growth.refuse = false;
+  for (uint32_t i = 1; i < (1u << RecordArena::kChunkBits); i++) {
+    ASSERT_NE(0u, arena.Allocate());
+  }
+  ASSERT_EQ(1u, growth.grown.size());
+  EXPECT_EQ(RecordArena::ChunkBytes(sizeof(Bytes)), growth.grown[0]);
+  EXPECT_EQ(initial + growth.grown[0], arena.bytes());
+  // The next id opens the second chunk.
+  ASSERT_NE(0u, arena.Allocate());
+  ASSERT_EQ(2u, growth.grown.size());
+  EXPECT_EQ(initial + 2 * RecordArena::ChunkBytes(sizeof(Bytes)),
+            arena.bytes());
+  EXPECT_EQ(0u, growth.shrunk);
 }
 
 }  // namespace

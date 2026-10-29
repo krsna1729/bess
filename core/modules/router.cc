@@ -28,6 +28,7 @@
 #include "utils/ether.h"
 #include "utils/format.h"
 #include "utils/ip.h"
+#include "utils/rte_ring_alloc.h"
 
 namespace dataplane = bess::dataplane;
 namespace route = bess::route;
@@ -419,20 +420,13 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                           route::kMaxRouteDomains);
   }
 
-  auto router = route::Router::Create(name(), config, max_next_hops,
-                                      init_context().rcu(), max_domains,
-                                      max_groups);
-  if (!router) {
-    return CommandFailure(route::RouteErrno(router.error()), "router: %s",
-                          route::RouteErrorName(router.error()));
-  }
-  router_ = std::move(*router);
-  // Domains are not allocated here (D-158): a domain a controller first writes
-  // a route into is created by that write, so `max_domains` bounds the ids
-  // while a router configured for many network instances pays only for the ones
-  // that hold routes. A failure to create one surfaces at the route write, as a
-  // refused transaction.
-  if (arg.interfaces_size() != 0) {
+  // Neighbor resolution's configuration (D-183), checked whole before
+  // anything is admitted or allocated (D-198).
+  const bool resolving = arg.interfaces_size() != 0;
+  route::NeighborResolver::Config resolver_config;
+  std::vector<route::NeighborResolver::Interface> interfaces;
+  uint64_t now = 0;
+  if (resolving) {
     // A binding is a next hop, so there are never more than max_next_hops:
     // the default is 1024 or that, whichever is smaller.
     if (arg.max_neighbors() > max_next_hops) {
@@ -513,7 +507,6 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     if (max_probes == 0 || max_probes > std::numeric_limits<uint32_t>::max()) {
       return CommandFailure(EINVAL, "neighbor_max_probes is out of range");
     }
-    route::NeighborResolver::Config resolver_config;
     resolver_config.capacity = resolver_capacity;
     resolver_config.timing = {
         .first_probe = first_probe,
@@ -527,14 +520,10 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     };
     // The resolver's clock is the maintenance tick count, which runs from
     // daemon start: start it at the current tick.
-    const uint64_t now = init_context().ticks().current_tick();
-    auto resolver = route::NeighborResolver::Create(resolver_config, now);
-    if (!resolver) {
-      return CommandFailure(EINVAL, "%s", resolver.error().c_str());
-    }
-    neighbor_resolver_ = std::move(*resolver);
-    // The interfaces are configuration, fixed here; the bindings are the
-    // "<module>/neighbors" resource, which the policy below admits.
+    now = init_context().ticks().current_tick();
+    // The interfaces are configuration, fixed here (the resolver takes them
+    // once it exists); the bindings are the "<module>/neighbors" resource,
+    // which the policy below admits.
     for (const auto &entry : arg.interfaces()) {
       if (!bess::IsValidGateValue(entry.egress_gate())) {
         return CommandFailure(EINVAL, "interface egress_gate %u is invalid",
@@ -568,7 +557,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
         // Destination mode routes only its enabled families (D-183); the
         // next-hop-id mode forwards both, so it takes addresses of either.
         if (routes_by_destination() &&
-            (v4 ? !router_->has_ipv4() : !router_->has_ipv6())) {
+            (v4 ? !config.ipv4.has_value() : !config.ipv6.has_value())) {
           return CommandFailure(EINVAL,
                                 "interface %u: address '%s' is of a family the "
                                 "router does not enable (set max_%s_routes)",
@@ -581,12 +570,107 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
         return CommandFailure(EINVAL, "interface %u needs at least one address",
                               id);
       }
+      resolver_gates_.emplace(id, static_cast<gate_idx_t>(entry.egress_gate()));
+      interfaces.push_back(std::move(interface));
+    }
+    ingress_interface_attr_name_ = arg.ingress_interface_attr().empty()
+                                       ? "vif_id"
+                                       : arg.ingress_interface_attr();
+  }
+
+  // Each mode declares only the attribute it reads (D-183). A declared read is
+  // a requirement on every upstream path: a destination-mode Router that
+  // declared `next_hop_id` would invalidate that attribute's scope for the
+  // other readers in the graph wherever its own input (ARP/ND, a VIF) has no
+  // writer, and a next-hop-mode Router has no use for the route domain.
+  next_hop_attr_name_ = arg.next_hop_attr().empty() ? "next_hop_id" : arg.next_hop_attr();
+  domain_attr_name_ = arg.domain_attr().empty() ? "route_domain" : arg.domain_attr();
+  if (!routes_by_destination()) {
+    next_hop_id_attr_ = AddMetadataAttr(next_hop_attr_name_,
+                                        sizeof(bess::utils::be32_t),
+                                        bess::metadata::Attribute::AccessMode::kRead);
+    if (next_hop_id_attr_ < 0) {
+      return CommandFailure(-next_hop_id_attr_, "add_metadata_attr() failed");
+    }
+  } else {
+    // Optional (D-155): the route domain a packet arrived in, which the
+    // graph's VIF writes. No writer means domain 0, the default domain -- the
+    // same attribute name the VIF uses, so a graph gets the packet's own
+    // domain with no configuration on either side. Declared with the default
+    // contract: the framework resolves it at PreResume and the packet path
+    // reads the constant without touching packet metadata when no provider
+    // exists.
+    static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
+        kDefaultRouteDomain{};
+    route_domain_attr_ = AddMetadataAttrWithDefault(
+        domain_attr_name_, sizeof(bess::utils::be32_t),
+        bess::metadata::Attribute::AccessMode::kRead, kDefaultRouteDomain);
+    if (route_domain_attr_ < 0) {
+      return CommandFailure(-route_domain_attr_, "add_metadata_attr() failed");
+    }
+  }
+  if (resolving) {
+    static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
+        kNoNeighborInterface{};
+    ingress_interface_attr_ = AddMetadataAttrWithDefault(
+        ingress_interface_attr_name_, sizeof(bess::utils::be32_t),
+        bess::metadata::Attribute::AccessMode::kRead, kNoNeighborInterface);
+    if (ingress_interface_attr_ < 0) {
+      return CommandFailure(-ingress_interface_attr_,
+                            "add_metadata_attr() failed");
+    }
+  }
+
+  // Everything the router holds is admitted before any of it is allocated
+  // (D-198), so a router that does not fit is refused whole: the router (the
+  // default domain's FIBs and the slot tables), the resolver and its rings.
+  bess::framework::MemoryScope &memory = init_context().memory();
+  bess::framework::MemoryLease router_memory = memory.LeaseFor<route::Router>(
+      "router", name(), config, max_next_hops, init_context().rcu(), max_domains,
+      max_groups);
+  bess::framework::MemoryLease resolver_memory;
+  if (resolving) {
+    resolver_memory = memory.LeaseFor<route::NeighborResolver>(
+        "neighbors", resolver_config, now);
+    // DPDK memzone rings: all of it DPDK's heap.
+    neighbor_rings_memory_ = memory.Lease(
+        "rings",
+        bess::utils::RingElemBytes(sizeof(NeighborFrame), kNeighborRxRingSize) +
+            bess::utils::RingElemBytes(sizeof(ArpRequestCopy),
+                                       kNeighborArpRingSize) +
+            bess::utils::RingBytes(kNeighborTxRingSize));
+  }
+
+  auto router = route::Router::Create(name(), config, max_next_hops,
+                                      init_context().rcu(), max_domains,
+                                      max_groups);
+  if (!router) {
+    return CommandFailure(route::RouteErrno(router.error()), "router: %s",
+                          route::RouteErrorName(router.error()));
+  }
+  // The lease's growth hook admits every domain, FIB replacement and slab
+  // chunk the router grows by (D-198).
+  router_ = bess::framework::MemoryScope::Adopt(std::move(router_memory),
+                                                std::move(*router));
+  // Domains are not allocated here (D-158): a domain a controller first writes
+  // a route into is created by that write, so `max_domains` bounds the ids
+  // while a router configured for many network instances pays only for the ones
+  // that hold routes. A failure to create one surfaces at the route write, as a
+  // refused transaction.
+  if (resolving) {
+    auto resolver = route::NeighborResolver::Create(resolver_config, now);
+    if (!resolver) {
+      return CommandFailure(EINVAL, "%s", resolver.error().c_str());
+    }
+    neighbor_resolver_ = bess::framework::MemoryScope::Adopt(
+        std::move(resolver_memory), std::move(*resolver));
+    for (const route::NeighborResolver::Interface &interface : interfaces) {
       auto configured = neighbor_resolver_->ConfigureInterface(interface, now);
       if (!configured) {
-        return CommandFailure(EINVAL, "interface %u: %s", id,
+        return CommandFailure(EINVAL, "interface %u: %s",
+                              static_cast<unsigned>(interface.id.value()),
                               configured.error().c_str());
       }
-      resolver_gates_.emplace(id, static_cast<gate_idx_t>(entry.egress_gate()));
     }
     // A binding must be one the resolver would take (its interface, an
     // address of its family there, not one of the interface's own): checked
@@ -594,7 +678,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
     // refused. The capacity is max_neighbors bindings, so the resolver's own
     // table, sized the same, never fills.
     bess::route::NeighborBindingPolicy policy;
-    policy.capacity = resolver_capacity;
+    policy.capacity = resolver_config.capacity;
     policy.validate = [this](const route::NeighborKey &key)
         -> std::expected<void, std::string> {
       if (routes_by_destination() &&
@@ -603,7 +687,7 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                                    ? "an IPv4 neighbor on a router without IPv4"
                                    : "an IPv6 neighbor on a router without IPv6");
       }
-      if (neighbor_resolver_ == nullptr) {
+      if (!neighbor_resolver_) {
         return std::unexpected("neighbor resolution is shut down");
       }
       return neighbor_resolver_->CheckBind(key);
@@ -612,9 +696,6 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
       return CommandFailure(route::RouteErrno(set.error()), "%s",
                             route::RouteErrorName(set.error()));
     }
-    ingress_interface_attr_name_ = arg.ingress_interface_attr().empty()
-                                       ? "vif_id"
-                                       : arg.ingress_interface_attr();
   }
   if (auto enrolled = router_->Enroll(init_context().resources());
       !enrolled) {
@@ -924,78 +1005,24 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
                   visit(key, value);
                 });
           }));
-
-  // Each mode declares only the attribute it reads (D-183). A declared read is
-  // a requirement on every upstream path: a destination-mode Router that
-  // declared `next_hop_id` would invalidate that attribute's scope for the
-  // other readers in the graph wherever its own input (ARP/ND, a VIF) has no
-  // writer, and a next-hop-mode Router has no use for the route domain.
-  next_hop_attr_name_ = arg.next_hop_attr().empty() ? "next_hop_id" : arg.next_hop_attr();
-  domain_attr_name_ = arg.domain_attr().empty() ? "route_domain" : arg.domain_attr();
-  if (!routes_by_destination()) {
-    next_hop_id_attr_ = AddMetadataAttr(next_hop_attr_name_,
-                                        sizeof(bess::utils::be32_t),
-                                        bess::metadata::Attribute::AccessMode::kRead);
-    if (next_hop_id_attr_ < 0) {
-      auto released = router_->Release();
-      CHECK(released) << released.error();
-      next_hops_binding_.Reset();
-      neighbors_binding_.Reset();
-      next_hop_state_binding_.Reset();
-      groups_binding_.Reset();
-      routes_binding_.Reset();
-      router_.reset();
-      return CommandFailure(-next_hop_id_attr_, "add_metadata_attr() failed");
-    }
-  } else {
-    // Optional (D-155): the route domain a packet arrived in, which the
-    // graph's VIF writes. No writer means domain 0, the default domain -- the
-    // same attribute name the VIF uses, so a graph gets the packet's own
-    // domain with no configuration on either side. Declared with the default
-    // contract: the framework resolves it at PreResume and the packet path
-    // reads the constant without touching packet metadata when no provider
-    // exists.
-    static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
-        kDefaultRouteDomain{};
-    route_domain_attr_ = AddMetadataAttrWithDefault(
-        domain_attr_name_, sizeof(bess::utils::be32_t),
-        bess::metadata::Attribute::AccessMode::kRead, kDefaultRouteDomain);
-    if (route_domain_attr_ < 0) {
-      auto released = router_->Release();
-      CHECK(released) << released.error();
-      next_hops_binding_.Reset();
-      neighbors_binding_.Reset();
-      next_hop_state_binding_.Reset();
-      groups_binding_.Reset();
-      routes_binding_.Reset();
-      router_.reset();
-      return CommandFailure(-route_domain_attr_, "add_metadata_attr() failed");
-    }
-  }
-  if (neighbor_resolver_ != nullptr) {
-    static constexpr std::array<uint8_t, sizeof(bess::utils::be32_t)>
-        kNoNeighborInterface{};
-    ingress_interface_attr_ = AddMetadataAttrWithDefault(
-        ingress_interface_attr_name_, sizeof(bess::utils::be32_t),
-        bess::metadata::Attribute::AccessMode::kRead, kNoNeighborInterface);
-    if (ingress_interface_attr_ < 0) {
-      return CommandFailure(-ingress_interface_attr_,
-                            "add_metadata_attr() failed");
-    }
+  if (neighbor_resolver_) {
     static std::atomic<uint32_t> next_ring_id{0};
     const std::string ring_suffix =
         std::to_string(next_ring_id.fetch_add(1, std::memory_order_relaxed));
     const std::string rx_name = "rrx" + ring_suffix;
     const std::string arp_name = "rarp" + ring_suffix;
     const std::string tx_name = "rtx" + ring_suffix;
+    // On the memory node (D-123), admitted above as "rings" (D-198).
+    const int socket = memory.socket();
     neighbor_rx_ring_ = BessRouterRingCreateElem(
-        rx_name.c_str(), sizeof(NeighborFrame), 1024, SOCKET_ID_ANY, 0);
+        rx_name.c_str(), sizeof(NeighborFrame), kNeighborRxRingSize, socket, 0);
     // Requests have their own ring, so a busy segment's requests cannot take
     // the room replies need.
     neighbor_arp_ring_ = BessRouterRingCreateElem(
-        arp_name.c_str(), sizeof(ArpRequestCopy), 256, SOCKET_ID_ANY, 0);
+        arp_name.c_str(), sizeof(ArpRequestCopy), kNeighborArpRingSize, socket,
+        0);
     neighbor_tx_ring_ =
-        rte_ring_create(tx_name.c_str(), 1024, SOCKET_ID_ANY, 0);
+        rte_ring_create(tx_name.c_str(), kNeighborTxRingSize, socket, 0);
     if (neighbor_rx_ring_ == nullptr || neighbor_arp_ring_ == nullptr ||
         neighbor_tx_ring_ == nullptr) {
       return CommandFailure(ENOMEM, "neighbor resolver ring creation failed");
@@ -1051,6 +1078,7 @@ void Router::CleanupNeighborResolver() {
     rte_ring_free(neighbor_tx_ring_);
     neighbor_tx_ring_ = nullptr;
   }
+  neighbor_rings_memory_.reset();
   neighbor_resolver_.reset();
   resolver_gates_.clear();
   pending_neighbor_updates_.clear();
@@ -1059,7 +1087,7 @@ void Router::CleanupNeighborResolver() {
 void Router::DeInit() {
   observations_.Reset();
   CleanupNeighborResolver();
-  if (router_ == nullptr) {
+  if (!router_) {
     return;
   }
   // Classifier rules reference these next hops, so release rather than
@@ -1079,7 +1107,7 @@ int Router::OnEvent(bess::Event event) {
   if (event != bess::Event::PreResume) {
     return -ENOTSUP;
   }
-  if (neighbor_resolver_ != nullptr &&
+  if (neighbor_resolver_ &&
       !bess::metadata::IsValidOffset(
           attr_offset(ingress_interface_attr_))) {
     LOG(ERROR) << "Router '" << name() << "': the '"
@@ -1225,7 +1253,7 @@ void Router::DivertNeighborFrames(Context *ctx, bess::PacketBatch *batch) {
 }
 
 void Router::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  if (neighbor_resolver_ != nullptr) {
+  if (neighbor_resolver_) {
     DivertNeighborFrames(ctx, batch);
     if (batch->cnt() == 0) {
       return;
@@ -1314,7 +1342,7 @@ CommandResponse Router::CommandGetNeighbors(const bess::pb::EmptyArg &) {
         status->set_ipv4(binding.ipv4());
         status->set_ipv6(binding.ipv6());
         status->set_state(bess::pb::ROUTER_NEIGHBOR_STATE_INCOMPLETE);
-        const auto known = neighbor_resolver_ == nullptr
+        const auto known = !neighbor_resolver_
                                ? std::nullopt
                                : neighbor_resolver_->StatusOf(key);
         if (!known) {
@@ -1414,7 +1442,7 @@ void Router::ApplyNeighborBindingChanges(uint64_t now) {
 }
 
 void Router::ResolverTick(bess::framework::TickContext &ctx) {
-  if (neighbor_resolver_ == nullptr) {
+  if (!neighbor_resolver_) {
     return;
   }
   const uint64_t now = ctx.tick();
@@ -1478,7 +1506,7 @@ void Router::ResolverTick(bess::framework::TickContext &ctx) {
 struct task_result Router::RunTask(Context *ctx, bess::PacketBatch *batch,
                                    void *) {
   batch->clear();
-  if (neighbor_resolver_ == nullptr || neighbor_tx_ring_ == nullptr) {
+  if (!neighbor_resolver_ || neighbor_tx_ring_ == nullptr) {
     return {.block = true, .packets = 0, .bits = 0};
   }
   route::NeighborResolver::Solicitation *items[
@@ -1533,16 +1561,23 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
     return;
   }
   std::array<route::NextHopId, bess::PacketBatch::kMaxBurst> ids;
-  std::array<const route::NextHop *, bess::PacketBatch::kMaxBurst> hops;
   for (int i = 0; i < cnt; i++) {
     ids[i] = route::NextHopId(
         get_attr_with_offset<bess::utils::be32_t>(offset, batch->packet(i))
             .value());
   }
-  const uint64_t resolved = router_->LookupNextHops(
-      std::span(ids).first(static_cast<size_t>(cnt)),
-      std::span(hops).first(static_cast<size_t>(cnt)));
   gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  RouteIds(batch, ids.data(), gates);
+  EmitBatch(ctx, batch, gates);
+}
+
+void Router::RouteIds(bess::PacketBatch *batch, const route::NextHopId *ids,
+                      gate_idx_t *gates) {
+  const int cnt = batch->cnt();
+  std::array<const route::NextHop *, bess::PacketBatch::kMaxBurst> hops;
+  const uint64_t resolved = router_->LookupNextHops(
+      std::span(ids, static_cast<size_t>(cnt)),
+      std::span(hops).first(static_cast<size_t>(cnt)));
   for (int i = 0; i < cnt; i++) {
     const route::NextHop *hop =
         (resolved & (uint64_t{1} << i)) != 0 ? hops[i] : nullptr;
@@ -1624,7 +1659,6 @@ void Router::RouteById(Context *ctx, bess::PacketBatch *batch,
       ttl_expired_frames_.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  EmitBatch(ctx, batch, gates);
 }
 
 // One counter per verdict the chain reports (route/forward.h). kForward is not
@@ -1879,7 +1913,7 @@ std::string Router::GetDesc() const {
                                   punt_local_gate_);
     }
   }
-  if (neighbor_resolver_ != nullptr) {
+  if (neighbor_resolver_) {
     desc += bess::utils::Format(
         ", %zu neighbors (requests: %zu, input drops: %zu, unpublished changes: %zu)",
         neighbor_resolver_->size(), static_cast<size_t>(neighbor_requests()),

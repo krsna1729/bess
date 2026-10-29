@@ -184,6 +184,29 @@ class LpmRouteTable {
   static std::expected<std::unique_ptr<LpmRouteTable>, RouteError> Create(
       std::string name, const Config &config, rcu::RcuDomain &domain);
 
+  // What Create allocates (D-198): one DPDK structure, InstanceBytes(config).
+  // The table object, its Instance and its rule map are small glibc pieces,
+  // not counted.
+  static size_t Bytes(const std::string & /*name*/, const Config &config,
+                      const rcu::RcuDomain & /*domain*/) noexcept {
+    return InstanceBytes(config);
+  }
+  // One rte_lpm or rte_fib of `config`, as DPDK 25.11 allocates it on the
+  // socket asked for (route_table.cc: LpmBytes, FibBytes); the RCU defer
+  // queue is not counted.
+  static size_t InstanceBytes(const Config &config) noexcept;
+  // What the table holds: its live instance. A replaced one is given back
+  // when it is retired (see set_memory_growth), so this does not change.
+  size_t bytes() const noexcept { return InstanceBytes(config_); }
+  // The admission Clear() and ReplaceAll() ask before they build the
+  // replacement instance beside the live one (D-198): a refusal throws
+  // utils::MemoryRefused and changes nothing. The replaced instance goes to
+  // the RCU domain, which takes no callback: its bytes are given back when
+  // it is retired, not when the grace period frees it. Control path only.
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
+    growth_ = growth;
+  }
+
   ~LpmRouteTable();
 
   LpmRouteTable(const LpmRouteTable &) = delete;
@@ -295,6 +318,7 @@ class LpmRouteTable {
   std::optional<uint32_t> default_;
   // rte_fib only: the blocks FibAdmits counts.
   FibBlocks fib_blocks_;
+  utils::MemoryGrowth *growth_ = nullptr;
 };
 
 class LpmRouteTable::View {
@@ -451,6 +475,31 @@ class Ipv6RouteTable {
   static std::expected<std::unique_ptr<Ipv6RouteTable>, RouteError> Create(
       std::string name, const Config &config, rcu::RcuDomain &domain);
 
+  // What Create allocates (D-198): one rte_fib6, InstanceBytes(config). The
+  // table object, its Instance and its rule map are small glibc pieces, not
+  // counted.
+  static size_t Bytes(const std::string & /*name*/, const Config &config,
+                      const rcu::RcuDomain & /*domain*/) noexcept {
+    return InstanceBytes(config);
+  }
+  // One rte_fib6 TRIE of `config` (entry size EntryBytes(config)), as DPDK
+  // 25.11 allocates it on the socket asked for (route_table.cc: Fib6Bytes).
+  static size_t InstanceBytes(const Config &config) noexcept;
+  // What the table holds: its live instance and, after the first change, the
+  // spare (any thread).
+  size_t bytes() const noexcept {
+    return instances_.load(std::memory_order_relaxed) * instance_bytes_;
+  }
+  // The admission a spare asks before it is built (D-198): the first change
+  // builds a second instance, and one built while the old spare is still in
+  // its grace period is briefly a third. A refusal throws
+  // utils::MemoryRefused and changes nothing. A spare dropped or handed to the
+  // RCU domain (which takes no callback) gives its bytes back then, not when
+  // the grace period frees it. Control path only.
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
+    growth_ = growth;
+  }
+
   // The owner guarantees no reader still uses the table and no stage is open.
   ~Ipv6RouteTable();
 
@@ -519,6 +568,7 @@ class Ipv6RouteTable {
       : name_(std::move(name)),
         config_(config),
         entry_bytes_(EntryBytes(config)),
+        instance_bytes_(InstanceBytes(config)),
         domain_(domain),
         live_(domain) {}
 
@@ -535,10 +585,14 @@ class Ipv6RouteTable {
   // ::/0. 0 or -errno; deleting an absent rule is 0.
   static int Apply(Instance &instance, Ipv6Prefix prefix,
                    std::optional<uint32_t> value);
+  // A spare no longer held (dropped, or retired to the RCU domain): its
+  // bytes leave bytes() and the growth hook (D-198).
+  void SpareReleased() noexcept;
 
   const std::string name_;
   const Config config_;
   const size_t entry_bytes_;
+  const size_t instance_bytes_;
   rcu::RcuDomain &domain_;
   rcu::RcuPtr<Instance> live_;
 
@@ -555,6 +609,9 @@ class Ipv6RouteTable {
   std::vector<Ipv6Prefix> spare_lag_;
   bool stage_open_ = false;
   size_t builds_ = 0;
+  // Instances the table holds: the live one and the spare (bytes()).
+  std::atomic<size_t> instances_{0};
+  utils::MemoryGrowth *growth_ = nullptr;
 };
 
 class Ipv6RouteTable::Stage {
@@ -675,6 +732,16 @@ class RouteTable {
       return std::unexpected(table.error());
     }
     return std::unique_ptr<RouteTable>(new RouteTable(std::move(*table)));
+  }
+
+  // The untyped table's (D-198).
+  static size_t Bytes(const std::string &name, const Config &config,
+                      const rcu::RcuDomain &domain) noexcept {
+    return LpmRouteTable::Bytes(name, config, domain);
+  }
+  size_t bytes() const noexcept { return impl_->bytes(); }
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
+    impl_->set_memory_growth(growth);
   }
 
   std::expected<void, RouteError> Upsert(Ipv4Prefix prefix, Value value) {

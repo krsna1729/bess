@@ -380,6 +380,7 @@ struct BessPluginDescriptor {
   | `BESS_CAP_EVENTS` | operational events (`init_context().events()`) |
   | `BESS_CAP_EVENT_SOURCES` | named event sources and the throttled or threshold packet-path events (`EventHub::NamedSource`, `EventHub::Full`, `stats::EventThrottle`, `stats::CrossingNotifier`) |
   | `BESS_CAP_TICKS` | periodic control-side work (`init_context().ticks()`) |
+  | `BESS_CAP_MEMORY` | admitting, leasing and creating tables through the module's memory scope (`init_context().memory()`, D-198) |
 
   The `standalone_*` conformance plugins in `examples/standalone_plugin` use
   `BESS_PLUGIN`; `sample_plugin`'s `SequentialUpdate` uses
@@ -422,6 +423,7 @@ construction or `Init()`:
 | `ticks()` | the daemon's `TickHub` (`framework/module_tick.h`, experimental, D-150). Open a `TickEndpoint` on it: the maintenance loop calls the module's callback under the control-plane lock, no sooner than its `period` after the previous start, with a time slice the callback checks as `ctx.Expired()` and resumes next tick; `ctx.Emit(type, source, fields)` queues an event the loop appends to the log after the lock is released. `interval()` is how much time one tick stands for (zero when the loop is disabled, `--maintenance_interval_us=0`, and then no endpoint is ever called), so `Init` can turn a configured duration into ticks; the daemon starts the loop before it serves RPCs, so `Init` never reads zero while a loop runs. `current_tick()` is the tick count of the latest run, the clock a module started from `Init` should start at. `set_interval()` is for the loop and tests standing in for it; a module never calls it. For work that belongs on a clock on the control side (reading the module's own counters against limits a controller armed, ageing, fill checks): the framework knows nothing about what the callback does, and a controller reaches the module through its own action. For counters against armed limits, `framework::ThresholdTable` (`framework/threshold_table.h`, experimental, D-151) is the table the callback sweeps: level-triggered, one report per arming, bounded by the slice, reported as one `bess.counter_threshold` event (source the module, fields `key`, `value`, `limit`) through `ReportCrossings` |
 | `events()` | register an event type in Init (`RegisterType(name, value names)`); a worker posts with `Post(ctx->wid, WorkerEvent{...})`, never blocking (a full ring refuses and counts); the maintenance loop moves events into the log `WatchEvents` streams (`stats::EventHub`, `stats/event_hub.h`, experimental). `NamedSource(name)` makes the log show a source by name. For a recurring packet-path condition (a full table or queue), `stats::EventThrottle` (`stats/event_throttle.h`) posts at most one event per second per worker carrying the count, called on the failure path only |
 | `codecs()` | bind a wire codec to each resource registered through `resources()`, so `ApplyTransaction` and `ListTransactionResources` reach it (`framework::ResourceBindings`, experimental; below) |
+| `memory()` | this module's own memory scope (`framework::MemoryScope`, `framework/memory_scope.h`, experimental, D-198): every table, pool or ring the module sizes from its arguments is admitted here before it is allocated, and reported per module; no capability bit (below, "Dataplane memory") |
 
 Every type this surface names is installed.
 
@@ -518,6 +520,10 @@ reused key keeps its value: a module that reuses a slot either subtracts the val
 when it re-armed the key, or keeps its keys monotonic. `keys`, `cells_per_key` and `workers` are
 all at least 1, and that is a promise rather than a check: a module that owns a capacity refuses
 a zero one in its own `Init`.
+Allocation and destruction run out of line in `bess_stats` (D-198), so this public
+header does not expose the experimental allocator. The planes remain DPDK-backed;
+packet-path views stay inline. Plugins resolve the constructor and destructor from
+`bessd`; standalone programs link `bess-dev-static`.
 
 The context is bound when the `Module` base is constructed, so it is usable in
 a derived constructor's member initializers (for example
@@ -702,7 +708,7 @@ classifier, so its calls are emitted in the module that uses it):
 | Header | Piece | What it does |
 |---|---|---|
 | `framework/table_fields.h` | `KeyFields` | the key fields (packet offset or metadata attribute) and the module's limits; resolves them against the module's attribute offsets into a `CompiledKey`, optionally with a per-field mask; a fail-closed key; `Changed` at PreResume |
-| | `ResultFields` | parses `result_fields` and `default_result` (registering write attributes), owns the `RecordArena`, checks a rule value (`CheckRule`), compiles the placement (deferred until the first PreResume when it writes metadata), `Compare`s destinations at PreResume |
+| | `ResultFields` | parses `result_fields` and `default_result` (registering write attributes), owns the `RecordArena` (created through the module's `memory()` scope, its chunks admitted as they grow, D-198), checks a rule value (`CheckRule`), compiles the placement (deferred until the first PreResume when it writes metadata), `Compare`s destinations at PreResume |
 | | `PublishGeneration`, `RepublishGeneration`, `RebuildGeneration` | publish a module's own generation struct through its `RcuPtr` and reclaim; the PreResume rebuild that falls back to a fail-closed generation |
 | | `ReleaseTableResource` | the DeInit release of a rules resource (for teardown when its values reference other resources) |
 | `framework/table_batch.h` | `ExtractKeys` | the batch's keys through a `CompiledKey`'s plan, each extracted row written whole, failed rows zeroed |
@@ -778,6 +784,100 @@ The unit of packet transport between modules:
   - `EmitBatch(ctx, batch, gates)`: sends packet `i` to `gates[i]`. When every packet has the same gate, the whole batch goes through `RunChooseModule`; otherwise it emits packet by packet. The batch is consumed. Prefer it to an `EmitPacket` loop whenever bursts are often uniform (D-099).
   - `EmitPacket(ctx, pkt, gate_idx)`: routes an individual packet to `gate_idx`, for paths that decide and emit in one pass.
   - `DropPacket(ctx, pkt)`: places packet in the task's dead batch for batched memory reclamation.
+
+### Dataplane memory (`init_context().memory()`, `framework/memory_scope.h`, experimental, D-029, D-198)
+Anything a worker reads that grows with the configuration -- a table, its
+entries, per-entry state, a ring -- is sized by the module's arguments, so the
+module asks for it through one entry point, `init_context().memory()`, on the
+control path (in `Init`, an action, a resource's `Reserve`, a request handler or
+a tick) and never on the packet path. Argument names stay the module's own
+(entries, tuples, levels, queue depth); the semantics are uniform:
+
+- **Every primitive knows its cost.** `framework::MemoryCost<T>::Bytes(args...)`
+  is what `T`'s constructor (or its static `Create`) allocates from those
+  arguments -- DPDK heap, glibc, the internal tables of `rte_hash`/`rte_lpm`/
+  `rte_fib` -- and `GlibcBytes(args...)` the part of it on glibc's normal pages.
+  The primitives declare it as a static `T::Bytes(...)` next to the
+  constructor, and their unit tests check it equals the object's `bytes()`:
+  `SlotTable`, `ObjectSlab`, `ObjectTableBuilder`, `KeyedCounters`,
+  `WorkerSlots`, `RecordArena`, `MeterSetBuilder`, `ConcurrentExactTable`,
+  `SharedExactIndex`, the `rte_hash` backends, `ConcurrentMaskedTable`, the
+  route tables and `route::Router`, the flow tables, `ExpiryWheel`,
+  `ContinuationTable`, `HandoffChannel`, the MAC tables and FDB, conntrack and
+  NAT, and rings (`utils::RingBytes`, `utils/rte_ring_alloc.h`).
+- **A module admits before it allocates.** `memory().Create<T>("resource",
+  args...)` admits `MemoryCost<T>::Bytes(args...)` for the module's resource
+  `"resource"`, then constructs `T` (with `new`, or through `T::Create` when the
+  constructor is private) and returns a `framework::Sized<T>`: the owner, which
+  releases the admission after the object is destroyed. Where a primitive must
+  stay a by-value member, or a factory does not fit, `memory().Lease(
+  "resource", bytes, glibc_bytes)` admits the same bytes as a `MemoryLease`;
+  `lease.Track(obj)` reports the object's `bytes()`. A DPDK API the module calls
+  itself takes `memory().socket()`, the memory node (D-123) -- never a socket
+  literal. Admission follows the policy (`utils::AdmitTable`): normal pages are
+  admitted against the memory limit, hugepages against `--mem_hugepage_mb`, and
+  past that cap the fallback heap only with `--mem_fallback`. What does not fit
+  is refused whole -- `utils::MemoryRefused` before anything is allocated --
+  never half-built and never an OOM kill.
+- **Growth is admitted too.** A primitive that grows on the control path after
+  construction (slab chunks, a doubled table, a new tuple, a route domain)
+  takes a `utils::MemoryGrowth` hook (`set_memory_growth`; `Create` wires it to
+  the lease) and admits each delta before it allocates; a refusal refuses that
+  command or transaction. A module that replaces a table builds the new one
+  through `Create` and drops the old owner when it is freed.
+- **Accounted and reported.** The scope is the module's own, destroyed with
+  it, releasing whatever is still admitted. `GetResourceStatus.memory.modules`
+  lists every module's resources: `admitted_bytes`, and `current_bytes` from
+  the objects' `bytes()`; the daemon's packet pool is `bessd`/`packet_pool`.
+
+Validate the arguments first, admit second, allocate third:
+
+```cpp
+// A module with a per-session table and a per-session counter plane.
+CommandResponse Sessions::Init(const pb::SessionsArg &arg) {
+  const size_t capacity = arg.capacity() ? arg.capacity() : kDefaultCapacity;
+  if (capacity > kMaxCapacity) {
+    return CommandFailure(EINVAL, "capacity %zu is above %zu", capacity, kMaxCapacity);
+  }
+  auto &memory = init_context().memory();
+  // Each throws utils::MemoryRefused when it does not fit: Init answers
+  // RESOURCE_EXHAUSTED and the destructor releases what was admitted.
+  sessions_ = memory.Create<dataplane::SlotTable<SessionId, Session>>("sessions", capacity);
+  counters_ = memory.Create<stats::KeyedCounters>("counters", capacity, 2, workers);
+  return CommandSuccess();
+}
+// Members: bess::framework::Sized<dataplane::SlotTable<SessionId, Session>> sessions_;
+//          bess::framework::Sized<stats::KeyedCounters> counters_;
+```
+
+The memory underneath is DPDK's heap on bessd's memory node, hugepage-backed
+when bessd has hugepages (`utils/dpdk_memory.h`): `DpdkArray<T>`,
+`DpdkAllocator<T>`, `MakeDpdk<T>` and `ObjectSlab<T>` (`utils/dpdk_slab.h`; one
+`rte_malloc` per small object would cost a header and cache-line rounding each,
+so a `SlotTable` carves its objects from 1024-object chunks that never move,
+and retiring an object after its grace period is the owner's job). A
+primitive's own code uses them; DPDK libraries that allocate internally create
+on the memory node first and, when that fails for lack of memory, on the
+socket `FallbackSocket(estimated_bytes)` returns. Module code does neither
+`AdmitNormalMemory` nor `AdmitTable` itself: `memory()` does.
+
+**Refusal.** When memory cannot be given -- the `--mem_hugepage_mb` cap
+reached or hugepages exhausted and bessd started without `--mem_fallback`, or
+the memory limit reached (the five `--mem_*` flags:
+[running-in-containers.md](running-in-containers.md#memory)) -- admission
+throws `utils::MemoryRefused`, a `std::bad_alloc` whose `what()` names the
+bytes, the heap state and the flag, with `reason()` (`kHugepagesExhausted`,
+`kNormalLimit`) and `bytes()`. Let it propagate: the module's `Init` and
+actions, and the transaction engine's `Reserve`, are caught at the control
+boundary and answered as `RESOURCE_EXHAUSTED` (errno `ENOMEM`), which clients
+do not retry. What a plugin must guarantee is exception safety up to that
+boundary: own allocations through RAII (`Sized`, `MemoryLease`; a throw in
+`Init` is answered as an `Init` that returned an error, so `DeInit` and the
+destructor run on a partially built module), and admit and allocate
+everything a `Reserve` needs before it places anything a later `Abort` would
+not find (D-172). A plugin that returns an error instead should use `ENOMEM`
+for memory: it maps to the same code. `GetResourceStatus.memory` tells a
+controller the limit, what is left and what each module holds before it asks.
 
 ---
 
@@ -902,7 +1002,7 @@ nor a packet's parse, length or exclusive ownership.
 
 The libraries that implement the router and its FIB (`bess_route`), the
 shared flow index and its classifier backend (`bess_flow`, `bess_classifier`),
-the resource and transaction core (`bess_dataplane_core`), the RCU domain
+the keyed counters (`bess_stats`), the resource and transaction core (`bess_dataplane_core`), the RCU domain
 (`bess_rcu`), and the EAL bring-up and utilities they link against
 (`bess_eal`, `bess_utils`) are installed as static archives in
 `${libdir}/bess`, with `bess-dev-static.pc`. A plugin's unit test may link
@@ -911,14 +1011,16 @@ itself never does:
 
 ```sh
 pkg-config --libs bess-dev-static
-# -L${libdir}/bess -lbess_route -lbess_flow -lbess_classifier -lbess_dataplane_core -lbess_eal -lbess_rcu -lbess_utils
+# -L${libdir}/bess -lbess_route -lbess_flow -lbess_classifier -lbess_stats -lbess_dataplane_core -lbess_eal -lbess_rcu -lbess_utils
 # then bess-dev's flags (DPDK's shared libraries, glog, protobuf) and gflags
 ```
 
 A program (no `bessd`, no `Module`, no framework) owns an
 `rcu::RcuDomain` and creates a `route::Router` on it; the first table brings
-the EAL up without hugepages (512 MB of normal pages; `BESS_DPDK_NOHUGE_MB`
-sizes it). `examples/static_router` runs R1's `RouterApp`
+the EAL up without hugepages (512 MB of normal pages; `BESSD_MEM_LIMIT_MB`
+sizes it, `BESSD_MEM_BACKING=hugepages` uses hugepages instead: the
+`BESSD_MEM_*` variables are the library's form of bessd's `--mem_*` flags).
+`examples/static_router` runs R1's `RouterApp`
 (`examples/appliances/router/router_app.h`) this way and checks a forwarded
 frame; CI's install check builds it from the stage and runs it.
 
@@ -928,4 +1030,4 @@ compiled as executable (PIE) code, not `-fPIC` (D-119): a shared library or
 plugin cannot link them. The transaction engine's header stays internal (applying transactions is the
 control plane's, D-074): `bess_dataplane_core` is installed because the router
 needs it (its resources), not as an engine a program can drive. Other
-libraries (classifier, flow, meter, stats) are not installed as archives yet.
+libraries such as the meter are not installed as archives yet.

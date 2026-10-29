@@ -19,43 +19,9 @@ const Commands ACL::cmds = {};
 const ResourceTables ACL::resource_tables = {
     ResourceTable::Singleton<bess::pb::ACLArg>("rules", false).Rebuilds()};
 
-CommandResponse ACL::ParseRules(const bess::pb::ACLArg &arg,
-                                std::vector<ACLRule> *out) const {
-  out->clear();
-  int i = 0;
-  for (const auto &rule : arg.rules()) {
-    // Ports are uint32 on the wire: check before narrowing, or 65616 would
-    // quietly become port 80.
-    if (rule.src_port() > 0xffff || rule.dst_port() > 0xffff) {
-      return CommandFailure(EINVAL, "rule %d: port out of range", i);
-    }
-    // "" is a wildcard (documented); anything else must be "a.b.c.d/len".
-    const auto parse = [](const std::string &text)
-        -> std::optional<Ipv4Prefix> {
-      return text.empty() ? std::optional<Ipv4Prefix>(Ipv4Prefix(""))
-                          : Ipv4Prefix::Parse(text);
-    };
-    const auto src = parse(rule.src_ip());
-    const auto dst = parse(rule.dst_ip());
-    if (!src || !dst) {
-      return CommandFailure(EINVAL, "rule %d: invalid IP prefix '%s'", i,
-                            (!src ? rule.src_ip() : rule.dst_ip()).c_str());
-    }
-    const be16_t src_port(static_cast<uint16_t>(rule.src_port()));
-    const be16_t dst_port(static_cast<uint16_t>(rule.dst_port()));
-    out->push_back({.src_ip = *src,
-                    .dst_ip = *dst,
-                    .src_port = src_port,
-                    .dst_port = dst_port,
-                    .drop = rule.drop()});
-    i++;
-  }
-  return CommandSuccess();
-}
-
-ACL::Rules ACL::Rules::Compile(const std::vector<ACLRule> &rules) {
-  // The masks and values as the key's bytes: each field where the frame
-  // has it, so the key is two loads from the frame on every target.
+namespace {
+bool AppendRule(ACL::Rules &out, const ACL::ACLRule &r) {
+  // Match the checked key's wire-order bytes, including wildcard masks.
   const auto pack = [](be32_t src, be32_t dst) {
     uint32_t half[2];
     std::memcpy(&half[0], &src, sizeof(src));
@@ -73,28 +39,85 @@ ACL::Rules ACL::Rules::Compile(const std::vector<ACLRule> &rules) {
     return v;
   };
   const auto port_mask = [](be16_t port) { return be16_t(port == be16_t(0) ? 0 : 0xffff); };
+  const ACL::MatchRule m{
+      .addr_mask = pack(r.src_ip.mask, r.dst_ip.mask),
+      .addr_want = pack(r.src_ip.addr & r.src_ip.mask, r.dst_ip.addr & r.dst_ip.mask),
+      .port_mask = pack_ports(port_mask(r.src_port), port_mask(r.dst_port)),
+      .port_want = pack_ports(r.src_port, r.dst_port),
+      .pass = !r.drop,
+  };
+  if (m.addr_mask == 0 && m.port_mask == 0) {
+    out.otherwise_pass = m.pass;
+    return false;
+  }
+  out.named.push_back(m);
+  return true;
+}
+}  // namespace
 
+CommandResponse ACL::ParseRules(const bess::pb::ACLArg &arg,
+                                Rules *out) const {
+  out->named.clear();
+  out->otherwise_pass = false;
+  out->lease.reset();
+  // "" is a wildcard (documented); anything else must be "a.b.c.d/len".
+  const auto parse = [](const std::string &text) -> std::optional<Ipv4Prefix> {
+    return text.empty() ? std::optional<Ipv4Prefix>(Ipv4Prefix(""))
+                        : Ipv4Prefix::Parse(text);
+  };
+  // Every rule is checked before the list is admitted (D-198).
+  int i = 0;
+  for (const auto &rule : arg.rules()) {
+    // Ports are uint32 on the wire: check before narrowing, or 65616 would
+    // quietly become port 80.
+    if (rule.src_port() > 0xffff || rule.dst_port() > 0xffff) {
+      return CommandFailure(EINVAL, "rule %d: port out of range", i);
+    }
+    const auto src = parse(rule.src_ip());
+    const auto dst = parse(rule.dst_ip());
+    if (!src || !dst) {
+      return CommandFailure(EINVAL, "rule %d: invalid IP prefix '%s'", i,
+                            (!src ? rule.src_ip() : rule.dst_ip()).c_str());
+    }
+    i++;
+  }
+  // The list (glibc) is admitted before it is allocated; a refusal throws
+  // MemoryRefused and allocates nothing.
+  const size_t bytes = static_cast<size_t>(arg.rules_size()) * sizeof(MatchRule);
+  out->lease = init_context().memory().Lease("rules", bytes, bytes);
+  out->named.reserve(static_cast<size_t>(arg.rules_size()));
+  for (const auto &rule : arg.rules()) {
+    const auto src = parse(rule.src_ip());
+    const auto dst = parse(rule.dst_ip());
+    if (!src || !dst) {  // checked above; kept so a change there cannot crash
+      return CommandFailure(EINVAL, "invalid IP prefix");
+    }
+    const be16_t src_port(static_cast<uint16_t>(rule.src_port()));
+    const be16_t dst_port(static_cast<uint16_t>(rule.dst_port()));
+    if (!AppendRule(*out, {.src_ip = *src,
+                           .dst_ip = *dst,
+                           .src_port = src_port,
+                           .dst_port = dst_port,
+                           .drop = rule.drop()})) {
+      break;
+    }
+  }
+  return CommandSuccess();
+}
+
+ACL::Rules ACL::Rules::Compile(const std::vector<ACLRule> &rules) {
   Rules out;
   out.named.reserve(rules.size());
   for (const ACLRule &r : rules) {
-    const MatchRule m{
-        .addr_mask = pack(r.src_ip.mask, r.dst_ip.mask),
-        .addr_want = pack(r.src_ip.addr & r.src_ip.mask, r.dst_ip.addr & r.dst_ip.mask),
-        .port_mask = pack_ports(port_mask(r.src_port), port_mask(r.dst_port)),
-        .port_want = pack_ports(r.src_port, r.dst_port),
-        .pass = !r.drop,
-    };
-    if (m.addr_mask == 0 && m.port_mask == 0) {
-      out.otherwise_pass = m.pass;
+    if (!AppendRule(out, r)) {
       break;
     }
-    out.named.push_back(m);
   }
   return out;
 }
 
-void ACL::Install(const std::vector<ACLRule> &rules) {
-  auto next = std::make_unique<const Rules>(Rules::Compile(rules));
+void ACL::Install(Rules rules) {
+  auto next = std::make_unique<const Rules>(std::move(rules));
   if (rules_.Read() == nullptr) {
     rules_.Initialize(std::move(next));
     return;
@@ -104,12 +127,12 @@ void ACL::Install(const std::vector<ACLRule> &rules) {
 }
 
 CommandResponse ACL::Init(const bess::pb::ACLArg &arg) {
-  std::vector<ACLRule> rules;
+  Rules rules;
   CommandResponse ret = ParseRules(arg, &rules);
   if (ret.has_error()) {
     return ret;
   }
-  Install(rules);
+  Install(std::move(rules));
   arg_ = arg;
 
   // Stage converts the whole list (a refused rule refuses the transaction);
@@ -121,12 +144,12 @@ CommandResponse ACL::Init(const bess::pb::ACLArg &arg) {
       // std::expected and reports a leak at the closing brace.
       // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
       [this](const bess::pb::ACLArg &v) -> std::expected<Staged, std::string> {
-        std::vector<ACLRule> parsed;
+        Rules parsed;
         CommandResponse r = ParseRules(v, &parsed);
         if (r.has_error()) {
           return std::unexpected(r.error().errmsg());
         }
-        return Staged{std::make_unique<const Rules>(Rules::Compile(parsed)), v};
+        return Staged{std::make_unique<const Rules>(std::move(parsed)), v};
       },
       // NOLINTEND(clang-analyzer-cplusplus.NewDeleteLeaks)
       [this](Staged &s, bess::dataplane::Retirer &retirer) {

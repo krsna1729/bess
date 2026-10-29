@@ -4,6 +4,7 @@
 #define BESS_CONTROL_CONTROL_ERROR_H_
 
 #include <expected>
+#include <new>
 #include <string>
 #include <utility>
 
@@ -20,10 +21,14 @@ enum class ControlErrorCode {
   kConflict,
   kResourceBusy,
   kUnsupportedTransaction,
+  // A failure the daemon could not get past (EIO, EAGAIN): UNAVAILABLE on the
+  // wire, the code gRPC retry policies and generic clients retry.
   kResourceFailure,
-  // A bounded resource is used up (no free CPU for an automatic worker):
-  // RESOURCE_EXHAUSTED on the wire, which clients do not retry as they do a
-  // failure (UNAVAILABLE).
+  // A bounded resource is used up -- no free CPU for an automatic worker, a
+  // message above the size limit, or memory (ENOMEM, a utils::MemoryRefused:
+  // hugepages exhausted without --mem_fallback, or the memory limit,
+  // D-198): RESOURCE_EXHAUSTED on the wire. Clients do not retry it: the same
+  // request fails the same way until the operator frees or adds the resource.
   kResourceExhausted,
   kInternal,
 };
@@ -67,6 +72,28 @@ ControlError Err(int err, const char* fmt, ...);
 
 // Builds an error whose message is strerror(err).
 ControlError Errno(int err);
+
+// D-198: memory a control operation asked for and did not get. A
+// utils::MemoryRefused keeps its message (which names the bytes, the heap
+// state and the flag that would allow a fallback); any other std::bad_alloc
+// is "out of memory". kResourceExhausted, err ENOMEM.
+ControlError OutOfMemory(const std::bad_alloc &e);
+
+// Runs `f`, a control operation returning a ControlResult, and answers memory
+// refused while it ran with OutOfMemory() instead of letting the exception
+// leave the RPC handler. A catch is not a rollback: use it only around code
+// that leaves nothing visible when it unwinds (the transaction engine's
+// Reserve phase, D-172; a module's or port's Init, whose failure tears the
+// object down) or whose caller undoes on the error it returns (ApplyPipeline
+// aborts the transaction). Never on the packet path.
+template <typename F>
+auto RefuseOutOfMemory(F &&f) -> decltype(std::forward<F>(f)()) {
+  try {
+    return std::forward<F>(f)();
+  } catch (const std::bad_alloc &e) {
+    return std::unexpected(OutOfMemory(e));
+  }
+}
 
 }  // namespace control
 }  // namespace bess

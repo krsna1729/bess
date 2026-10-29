@@ -10,8 +10,9 @@
 #include <string>
 
 #include "dataplane/resource.h"
-#include "meter/meter_set.h"
+#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
+#include "meter/meter_set.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "rcu/rcu_ptr.h"
@@ -117,6 +118,44 @@ class Meter final : public Module {
   // Runs one removal-cascade stage after an erase: the id is unpublishable
   // from the erase until this runs, and readable until it does.
   void Unpublish(bess::meter::MeterId id, bess::dataplane::Retirer &later);
+  // An erase's removal-stage generation (MeterSet::Bytes(capacity)), admitted
+  // by its Reserve and given back when that stage has built it, or when the
+  // erase aborts or its stage has nothing to remove.
+  void PrepayErase();
+  void RefundErase() noexcept;
+
+  // The hook the builders get (set on the first; clones and generations
+  // share it): forwards to meters_lease_, except while a removal stage
+  // rebuilds the generation (Unpublish). That step runs in the transaction
+  // engine's removal cascade and cannot refuse, so the erase's Reserve
+  // admits the largest generation the builder can build (MeterSet::Bytes)
+  // up front, refusing the erase if it does not fit, and that Build draws on
+  // it. Prepay/Refund and the Build run on the control path under the
+  // engine's lock; Shrink may come from any thread (RCU frees).
+  class MetersGrowth final : public bess::utils::MemoryGrowth {
+   public:
+    void Grow(size_t bytes, size_t glibc_bytes = 0) override;
+    void Shrink(size_t bytes, size_t glibc_bytes = 0) noexcept override;
+    void Prepay(size_t bytes, size_t glibc_bytes);
+    void Refund(size_t bytes, size_t glibc_bytes) noexcept;
+
+    bess::utils::MemoryGrowth *lease = nullptr;  // meters_lease_.growth()
+    // Admitted by erase reservations whose removal stage has not built yet.
+    size_t prepaid_bytes = 0;
+    size_t prepaid_glibc = 0;
+    bool paying = false;  // Unpublish's Build draws on the prepay
+  };
+
+  // Memory (D-198), resource "meters": Init admits the first builder's
+  // entries (MeterSetBuilder::Bytes(capacity)); through growth_, every
+  // Clone's entries, state slab chunks, state control blocks and profiles,
+  // and every generation Build makes are admitted before they are allocated
+  // and given back when freed, so what is admitted is what the meters hold
+  // (reported as admitted: no one builder's bytes() sees the generations).
+  // Declared before every builder and generation holder: they give bytes
+  // back through the hook from their destructors and RCU frees.
+  bess::framework::MemoryLease meters_lease_;
+  MetersGrowth growth_;
 
   std::unique_ptr<bess::meter::MeterSetBuilder> live_;
   // The transaction's edit copy while one is in flight (see BeginTransaction).

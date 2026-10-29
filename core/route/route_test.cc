@@ -34,6 +34,7 @@
 #include "dpdk.h"
 #include "runtime/runtime_state.h"
 #include "packet_pool.h"
+#include "framework/memory_scope.h"
 #include "route/connected_route.h"
 #include "route/route_table.h"
 #include "route/router.h"
@@ -282,6 +283,72 @@ TEST_P(RouteTableTest, LongNamesSurviveReplacement) {
     ASSERT_TRUE(table->Clear()) << "replacement " << round;
     EXPECT_FALSE(table->Read().Lookup(Ip(10, 1, 1, 1)).has_value());
   }
+}
+
+// Records what a primitive admits (D-198): the bytes held now and the
+// most held at once; refuses every growth while `refuse` is set.
+struct RecordingGrowth final : utils::MemoryGrowth {
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    if (refuse) {
+      throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit,
+                                 bytes, "refused by the test");
+    }
+    grown += bytes;
+    glibc += glibc_bytes;
+    peak = std::max(peak, grown);
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    grown -= bytes;
+    glibc -= glibc_bytes;
+  }
+  bool refuse = false;
+  size_t grown = 0;
+  size_t glibc = 0;
+  size_t peak = 0;
+};
+
+// D-198: what Create allocates is known before it runs.
+TEST_P(RouteTableTest, MemoryCostIsWhatCreateAllocates) {
+  const std::pair<uint32_t, uint32_t> sizes[] = {{1024, 256}, {4096, 1024}, {65536, 64}};
+  for (const auto &[routes, tbl8] : sizes) {
+    LpmRouteTable::Config config = bess::testing::TestRouteConfig();
+    config.max_routes = routes;
+    config.tbl8_groups = tbl8;
+    auto &rcu = bess::runtime::runtime().rcu();
+    auto table = RouteTable<Value>::Create("route_cost", config, rcu);
+    ASSERT_TRUE(table.has_value()) << RouteErrorName(table.error());
+    EXPECT_EQ(framework::MemoryCost<RouteTable<Value>>::Bytes(
+                  std::string("route_cost"), config, rcu),
+              (*table)->bytes());
+    EXPECT_EQ(framework::MemoryCost<LpmRouteTable>::Bytes(
+                  std::string("route_cost"), config, rcu),
+              (*table)->untyped().bytes());
+    EXPECT_GT((*table)->bytes(), size_t{64} << 20) << "a 2^24-entry tbl24";
+  }
+}
+
+// Clear() and ReplaceAll() admit the replacement before they build it and
+// give it back once the replaced instance is retired; a refusal leaves the
+// table as it was.
+TEST_P(RouteTableTest, AReplacementIsAdmittedFirst) {
+  auto table = MakeTable();
+  RecordingGrowth growth;
+  table->set_memory_growth(&growth);
+  const size_t bytes = table->bytes();
+  ASSERT_TRUE(table->Upsert(P(Ip(10, 0, 0, 0), 8), Value(1)));
+  growth.refuse = true;
+  EXPECT_THROW((void)table->Clear(), utils::MemoryRefused);
+  EXPECT_EQ(Value(1), table->Read().Lookup(Ip(10, 1, 1, 1))) << "unchanged";
+  growth.refuse = false;
+  ASSERT_TRUE(table->Clear());
+  EXPECT_FALSE(table->Read().Lookup(Ip(10, 1, 1, 1)).has_value());
+  EXPECT_EQ(bytes, growth.peak) << "one more instance while replacing";
+  EXPECT_EQ(0u, growth.grown) << "the replaced instance is given back";
+  EXPECT_EQ(bytes, table->bytes());
+  const LpmRouteTable::Rule rules[] = {{P(Ip(10, 0, 0, 0), 8), 2}};
+  ASSERT_TRUE(table->untyped().ReplaceAll(rules));
+  EXPECT_EQ(0u, growth.grown);
+  EXPECT_EQ(bytes, table->bytes());
 }
 
 TEST_P(RouteTableTest, BatchMaskWithoutDefault) {
@@ -603,6 +670,64 @@ std::unique_ptr<Router> MakeRouter(size_t next_hops = 64) {
                                bess::runtime::runtime().rcu());
   EXPECT_TRUE(router.has_value()) << RouteErrorName(router.error());
   return std::move(router).value();
+}
+
+// D-198: what Create allocates is known before it runs.
+TEST_P(RouterTest, MemoryCostIsWhatCreateAllocates) {
+  auto &rcu = bess::runtime::runtime().rcu();
+  LpmRouteTable::Config v4 = bess::testing::TestRouteConfig();
+  v4.max_routes = 4096;
+  struct Size {
+    size_t hops, domains, groups;
+    bool v6;
+  };
+  for (const Size s : {Size{64, 1, 0, false}, Size{1000, 4, 16, true},
+                       Size{100000, 64, 0, false}}) {
+    Router::Config config{.ipv4 = v4};
+    if (s.v6) {
+      config.ipv6 = Ipv6RouteTable::Config{.max_routes = 64, .tbl8_groups = 64};
+    }
+    auto router = Router::Create("router_cost", config, s.hops, rcu, s.domains, s.groups);
+    ASSERT_TRUE(router.has_value()) << RouteErrorName(router.error());
+    EXPECT_EQ(framework::MemoryCost<Router>::Bytes(std::string("router_cost"), config,
+                                                   s.hops, rcu, s.domains, s.groups),
+              (*router)->bytes());
+    EXPECT_LT(framework::MemoryCost<Router>::GlibcBytes(std::string("router_cost"), config,
+                                                        s.hops, rcu, s.domains, s.groups),
+              (*router)->bytes());
+  }
+}
+
+// A new domain's FIBs and a new slab chunk are admitted before they are
+// allocated, and a refusal changes nothing; a removed domain's FIBs are
+// given back.
+TEST_P(RouterTest, GrowthIsAdmittedFirst) {
+  LpmRouteTable::Config v4 = bess::testing::TestRouteConfig();
+  const Router::Config config{.ipv4 = v4};
+  auto made = Router::Create("router_growth", config, 8, bess::runtime::runtime().rcu(),
+                             /*max_domains=*/2);
+  ASSERT_TRUE(made.has_value()) << RouteErrorName(made.error());
+  auto &router = *made;
+  RecordingGrowth growth;
+  router->set_memory_growth(&growth);
+  const size_t before = router->bytes();
+  growth.refuse = true;
+  EXPECT_THROW((void)router->CreateDomain(RouteDomainId(1), config), utils::MemoryRefused);
+  EXPECT_FALSE(router->HasDomain(RouteDomainId(1)));
+  EXPECT_THROW((void)router->SetNextHop(NextHopId(1), Hop(1, 1)), utils::MemoryRefused);
+  EXPECT_EQ(before, router->bytes());
+  growth.refuse = false;
+  ASSERT_TRUE(router->CreateDomain(RouteDomainId(1), config));
+  const size_t fib = LpmRouteTable::InstanceBytes(v4);
+  EXPECT_EQ(fib, growth.grown);
+  EXPECT_EQ(before + fib, router->bytes());
+  ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
+  const size_t chunk = utils::ObjectSlab<NextHop>::chunk_bytes();
+  EXPECT_EQ(fib + chunk, growth.grown);
+  EXPECT_EQ(before + fib + chunk, router->bytes());
+  ASSERT_TRUE(router->RemoveDomain(RouteDomainId(1)));
+  EXPECT_EQ(chunk, growth.grown);
+  EXPECT_EQ(before + chunk, router->bytes());
 }
 
 TEST_P(RouterTest, RoutesNeedNextHopsAndPinThem) {
@@ -1639,6 +1764,32 @@ void ExpectAgrees6(const Ipv6RouteTable &table, const std::map<Ipv6Prefix, uint3
       EXPECT_EQ(*want, values[i]) << bess::utils::ToIpv6Address(addrs[i]);
     }
   }
+}
+
+// D-198: Create's cost is one instance; the first change admits the spare
+// before it builds it, and a refusal changes nothing.
+TEST(Ipv6RouteTableTest, MemoryCostAndTheSpareAdmission) {
+  for (const uint32_t tbl8 : {64u, 1024u, 8192u}) {
+    const auto config = Cfg6(64, tbl8);
+    auto &rcu = bess::runtime::runtime().rcu();
+    auto table = MakeTable6(config);
+    EXPECT_EQ(framework::MemoryCost<Ipv6RouteTable>::Bytes(std::string("v6_test"),
+                                                           config, rcu),
+              table->bytes());
+  }
+  auto table = MakeTable6();
+  const size_t one = table->bytes();
+  RecordingGrowth growth;
+  table->set_memory_growth(&growth);
+  growth.refuse = true;
+  EXPECT_THROW((void)table->Upsert(P6("2001:db8::", 32), 7), utils::MemoryRefused);
+  EXPECT_FALSE(table->Find(P6("2001:db8::", 32)).has_value());
+  EXPECT_EQ(one, table->bytes());
+  EXPECT_EQ(1u, table->builds());
+  growth.refuse = false;
+  ASSERT_TRUE(table->Upsert(P6("2001:db8::", 32), 7));
+  EXPECT_EQ(one, growth.grown) << "the spare";
+  EXPECT_EQ(2 * one, table->bytes());
 }
 
 TEST(Ipv6RouteTableTest, LongestPrefixMatchFromTheDefaultToHostRoutesAndTheTopOfTheSpace) {

@@ -5,6 +5,7 @@
 #include "runtime/thread_placement.h"
 #include "runtime/numa_placement.h"
 #include "runtime/simd_width.h"
+#include "runtime/startup.h"
 #include "utils/logging.h"
 
 #include <cstdint>
@@ -29,10 +30,6 @@ DEFINE_string(modules, bess::runtime::ExecutableDirectory() + "modules",
               "Load modules from the specified directory");
 DEFINE_bool(core_dump, false, "Generate a core dump on fatal faults");
 DEFINE_bool(no_crashlog, false, "Disable the generation of a crash log file");
-
-// Note: currently BESS-managed hugepages do not support VFIO driver,
-//       so DPDK is default for now.
-DEFINE_bool(dpdk, true, "Let DPDK manage hugepages");
 
 static bool ValidateIovaMode(const char *, const std::string &value) {
   return (value == "") || (value == "pa") || (value == "va");
@@ -148,25 +145,11 @@ DEFINE_string(http_allowed_hosts, "",
               "Host besides localhost, IP addresses and the --http_addr host, "
               "e.g. the name a scraper uses for a non-loopback --http_addr");
 
-static bool ValidateMegabytesPerSocket(const char *, int32_t value) {
-  if (value < -1) {
-    LOG(ERROR) << "Invalid memory size: " << value;
-    return false;
-  }
-
-  return true;
-}
 // How often the maintenance loop delivers worker-to-control module requests
 // (TP4, D-077): the longest a posted request waits. 0 disables the loop.
 DEFINE_int32(maintenance_interval_us, 1000,
              "Interval of the control-side maintenance loop in microseconds (0: off)");
 
-DEFINE_int32(m, -1,
-             "DPDK memory cap in MB on the memory node (other nodes get "
-             "none, D-123). -1 (default): hugepages if "
-             "any are usable, mapped as needed with no cap beyond the host or "
-             "container limit, else normal pages; 0: no hugepages; N: "
-             "hugepages, at most N MB");
 // Tracing is DPDK's (M25, D-089): its trace points (EAL, ethdev, mempool,
 // ...) written as CTF for babeltrace or Trace Compass, not a BESS tracer.
 DEFINE_string(dpdk_trace, "",
@@ -179,8 +162,70 @@ DEFINE_string(pci_allow, "",
               "Comma-separated PCI addresses DPDK may probe (its -a list). "
               "Empty: the addresses a device plugin assigned "
               "(PCIDEVICE_* environment), else every device DPDK can use");
-static const bool _m_dummy[[maybe_unused]] =
-    google::RegisterFlagValidator(&FLAGS_m, &ValidateMegabytesPerSocket);
+
+// Dataplane memory (D-198): one flag family, resolved once at startup
+// (startup::ApplyMemorySettings) and logged in one line. Each is also
+// BESSD_<FLAG> (D-030), and the same variables configure a process that
+// brings DPDK up without bessd (InitDpdk: tests, benchmarks, library users).
+static bool ValidateMemoryBacking(const char *, const std::string &value) {
+  if (!bess::startup::ParseMemoryBacking(value)) {
+    LOG(ERROR) << "Invalid --mem_backing: '" << value
+               << "' (auto, hugepages or normal)";
+    return false;
+  }
+  return true;
+}
+DEFINE_string(mem_backing, "auto",
+              "What DPDK memory is: 'auto' (default): hugepages if any are "
+              "usable at startup (host-free pages within the cgroup's hugetlb "
+              "limit), mapped as needed, else normal pages with a warning; "
+              "'hugepages': refuse to start without usable hugepages; "
+              "'normal': normal (4 KiB) pages only (DPDK --no-huge, a heap of "
+              "--mem_limit_mb less --mem_reserve_mb, 512 MB with no limit)");
+static const bool _mem_backing_dummy[[maybe_unused]] =
+    google::RegisterFlagValidator(&FLAGS_mem_backing, &ValidateMemoryBacking);
+static bool ValidateHugepageMegabytes(const char *flag, int64_t value) {
+  if (!bess::startup::ValidHugepageMegabytes(value)) {
+    LOG(ERROR) << "Invalid --" << flag << ": " << value;
+    return false;
+  }
+  return true;
+}
+DEFINE_int64(mem_hugepage_mb, 0,
+             "Cap in MB on the hugepage heap on the memory node (other nodes "
+             "get none, D-123); tables past it are refused, or come from "
+             "normal pages with --mem_fallback. 0 (default): no cap beyond "
+             "the host's or container's hugepages. Not with "
+             "--mem_backing=normal");
+static const bool _mem_hugepage_mb_dummy[[maybe_unused]] =
+    google::RegisterFlagValidator(&FLAGS_mem_hugepage_mb,
+                                  &ValidateHugepageMegabytes);
+DEFINE_bool(mem_fallback, false,
+            "When hugepages run out (or reach --mem_hugepage_mb), allocate "
+            "tables from normal pages instead of refusing (slower lookups; "
+            "admitted against the memory limit)");
+static bool ValidateMemoryMegabytes(const char *flag, int64_t value) {
+  if (!bess::startup::ValidMemoryMegabytes(value)) {
+    LOG(ERROR) << "Invalid --" << flag << ": " << value;
+    return false;
+  }
+  return true;
+}
+DEFINE_int64(mem_limit_mb, 0,
+             "Memory limit in MB that table creations and transactions are "
+             "refused past, rather than bessd being OOM-killed; with "
+             "--mem_backing=normal it also sizes DPDK's heap (limit less "
+             "reserve). 0 (default): the cgroup's memory.max, else the host's "
+             "MemTotal; -1: no limit; N: N MB of bessd's resident memory");
+static const bool _mem_limit_mb_dummy[[maybe_unused]] =
+    google::RegisterFlagValidator(&FLAGS_mem_limit_mb, &ValidateMemoryMegabytes);
+DEFINE_int64(mem_reserve_mb, -1,
+             "MB of the memory limit kept free for memory bessd does not "
+             "account (gRPC, glibc, thread stacks). -1 (default): "
+             "max(128, limit/16), at most half the limit");
+static const bool _mem_reserve_mb_dummy[[maybe_unused]] =
+    google::RegisterFlagValidator(&FLAGS_mem_reserve_mb,
+                                  &ValidateMemoryMegabytes);
 
 // One SIMD width for DPDK and BESS's kernels, set before the EAL starts
 // (D-126).

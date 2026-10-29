@@ -74,6 +74,16 @@ class CuckooExactBackend {
 
   [[nodiscard]] size_t size() const noexcept { return map_.Count(); }
 
+  // Memory (D-198), all glibc: the map's (utils::CuckooMap::Bytes at its
+  // default reserve); insert grows it, each growth admitted through
+  // set_memory_growth's hook.
+  static size_t Bytes() { return Map::Bytes(); }
+  static size_t GlibcBytes() { return Map::GlibcBytes(); }
+  [[nodiscard]] size_t bytes() const noexcept { return map_.bytes(); }
+  void set_memory_growth(bess::utils::MemoryGrowth *growth) noexcept {
+    map_.set_memory_growth(growth);
+  }
+
   [[nodiscard]] BackendInfo info() const noexcept {
     return BackendInfo{
         .kind = ExactBackendKind::kCuckoo,
@@ -84,7 +94,8 @@ class CuckooExactBackend {
   }
 
  private:
-  bess::utils::CuckooMap<Key, Result, Hash, Equal> map_;
+  using Map = bess::utils::CuckooMap<Key, Result, Hash, Equal>;
+  Map map_;
 };
 
 template <typename Result>
@@ -418,7 +429,7 @@ ClassifierResult<RuntimeExactBackend<Result>> BuildCuckooBackendImpl(
   const size_t rule_count = state->map.Count();
   // A cuckoo hit walks two dependent lines (bucket, then entry) and branches
   // on which slot matched.
-  const size_t storage = state->map.MemoryBytes();
+  const size_t storage = state->map.bytes();
   const dataplane::LookupBody chosen = dataplane::ResolveLookupBody(
       body, dataplane::LookupShape{.table_bytes = storage,
                                    .dependent_lines = 2,

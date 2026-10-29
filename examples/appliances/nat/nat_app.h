@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "conntrack/conntrack.h"
+#include "framework/memory_scope.h"
 #include "nat/nat.h"
 #include "packet_parse.h"
 
@@ -32,25 +33,35 @@ class NatApp {
   using Tick = uint64_t;  // ns, the caller's clock
 
   // The pool policy: tenant 10.1.0.0/16 leaves from 203.0.113.1, ports
-  // 20000-29999; mappings idle for `timeout` end.
-  static std::expected<std::unique_ptr<NatApp>, std::string> Create(Tick timeout, Tick start) {
+  // 20000-29999; mappings idle for `timeout` end. Both tables are admitted
+  // through `memory` (D-198: "nat", "conntrack") before either is allocated:
+  // a refusal throws utils::MemoryRefused and builds nothing. Released when
+  // the app is destroyed.
+  static std::expected<std::unique_ptr<NatApp>, std::string> Create(
+      Tick timeout, Tick start, bess::framework::MemoryScope &memory) {
     bess::nat::Nat::Config c;
     c.addresses = {{bess::utils::be32_t(kPublic), {{20000, 30000, false}}}};
-    c.capacity = 4096;
+    c.capacity = kCapacity;
     c.timeout = timeout;
     c.granularity_shift = 10;
     c.start = start;
     c.seed = 1;
+    const bess::conntrack::TimeoutPolicy policy =
+        bess::conntrack::TimeoutPolicy{}.Scaled(1000000000ull);  // seconds -> the ns clock
+    constexpr unsigned kCtShift = 10;
+    auto nat_lease = memory.LeaseFor<bess::nat::Nat>("nat", c);
+    auto ct_lease = memory.LeaseFor<Ct>("conntrack", kCapacity, policy, start, kCtShift);
     auto nat = bess::nat::Nat::Create(c);
     if (!nat) {
       return std::unexpected(std::string("nat"));
     }
-    bess::conntrack::TimeoutPolicy policy;  // seconds; scaled to the ns clock
-    auto ct = Ct::Create(4096, policy.Scaled(1000000000ull), start, 10);
+    auto ct = Ct::Create(kCapacity, policy, start, kCtShift);
     if (!ct) {
       return std::unexpected(std::string("conntrack"));
     }
-    return std::unique_ptr<NatApp>(new NatApp(std::move(*nat), std::move(*ct)));
+    return std::unique_ptr<NatApp>(
+        new NatApp(bess::framework::MemoryScope::Adopt(std::move(nat_lease), std::move(*nat)),
+                   bess::framework::MemoryScope::Adopt(std::move(ct_lease), std::move(*ct))));
   }
 
   // Outbound (inside -> outside): the firewall admits it (and may start a
@@ -97,8 +108,9 @@ class NatApp {
 
  private:
   using Ct = bess::conntrack::Conntrack<>;
+  static constexpr size_t kCapacity = 4096;
 
-  NatApp(std::unique_ptr<bess::nat::Nat> nat, std::unique_ptr<Ct> ct)
+  NatApp(bess::framework::Sized<bess::nat::Nat> nat, bess::framework::Sized<Ct> ct)
       : nat_(std::move(nat)), ct_(std::move(ct)) {}
 
   bool Admitted(std::span<const uint8_t> frame, const bess::packet::ParsedFrame &p,
@@ -109,8 +121,8 @@ class NatApp {
            r.status == bess::conntrack::TrackStatus::kRelated;
   }
 
-  std::unique_ptr<bess::nat::Nat> nat_;
-  std::unique_ptr<Ct> ct_;
+  bess::framework::Sized<bess::nat::Nat> nat_;
+  bess::framework::Sized<Ct> ct_;
 };
 
 }  // namespace appliance

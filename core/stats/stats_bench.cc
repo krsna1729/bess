@@ -215,7 +215,7 @@ void BM_SnapshotCounters(benchmark::State &state) {
   for (auto _ : state) {
     benchmark::DoNotOptimize(set.Snapshot());
   }
-  state.counters["storage_bytes"] = static_cast<double>(set.storage_bytes());
+  state.counters["storage_bytes"] = static_cast<double>(set.bytes());
 }
 BENCHMARK(BM_SnapshotCounters)->Arg(3)->Arg(32);
 
@@ -224,7 +224,7 @@ void BM_SnapshotHistogram(benchmark::State &state) {
   for (auto _ : state) {
     benchmark::DoNotOptimize(h.Snapshot());
   }
-  state.counters["storage_bytes"] = static_cast<double>(h.storage_bytes());
+  state.counters["storage_bytes"] = static_cast<double>(h.bytes());
 }
 BENCHMARK(BM_SnapshotHistogram);
 

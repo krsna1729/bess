@@ -17,6 +17,7 @@
 
 #include "dataplane/slot_table.h"
 #include "dataplane/strong_id.h"
+#include "framework/memory_scope.h"
 
 namespace bess::flow {
 namespace {
@@ -57,11 +58,23 @@ std::unique_ptr<DecisionCache<Tuple, Id>> Make(size_t capacity,
   return std::move(*cache);
 }
 
+// D-198: what Create allocates is known before it runs, all of it glibc.
+TEST(DecisionCacheTest, MemoryCostIsWhatCreateAllocates) {
+  DecisionGeneration g;
+  for (const size_t capacity : {size_t{1}, size_t{1000}, size_t{65536}}) {
+    using Cache = DecisionCache<Tuple, VfpId>;
+    auto cache = Make<VfpId>(capacity, g);
+    EXPECT_EQ(framework::MemoryCost<Cache>::Bytes(capacity, g), cache->bytes());
+    EXPECT_EQ(framework::MemoryCost<Cache>::GlibcBytes(capacity, g),
+              cache->bytes());
+  }
+}
+
 TEST(DecisionCacheTest, HitMissAndResolveForTwoUnrelatedDecisionTypes) {
   DecisionGeneration g;
   // VFP: ids resolve through an RCU-published SlotTable.
   dataplane::SlotTable<VfpId, VfpDecision> vfp_decisions(8);
-  (void)vfp_decisions.Publish(VfpId(3), std::make_unique<const VfpDecision>(
+  (void)vfp_decisions.Publish(VfpId(3), vfp_decisions.Make(
                                             VfpDecision{5001, 0x0a000001, 7}));
   auto vfp = Make<VfpId>(16, g);
   EXPECT_EQ(DecisionInstall::kInstalled, vfp->Install(T(1), VfpId(3), g.Current()));
@@ -225,7 +238,7 @@ TEST(DecisionCacheTest, MissPathCompilesAndInstallsWithoutAnyModule) {
   // The application's compiler: rich policy in, immutable decision out.
   auto compile = [&](const Tuple &key) {
     const VfpId id(next_id++);
-    (void)decisions.Publish(id, std::make_unique<const VfpDecision>(
+    (void)decisions.Publish(id, decisions.Make(
                                     VfpDecision{key.src + 1, key.dst, 0}));
     return id;
   };

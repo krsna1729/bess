@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "classifier/firewall_table.h"
+#include "framework/memory_scope.h"
 #include "testing/rng.h"
 
 namespace {
@@ -602,6 +603,31 @@ TEST(FirewallTableTest, TheScanAgreesWithTheIndexOverRandomRuleSets) {
         EXPECT_EQ(0xffffffffu, scanned_matches[i].rule_id);
       }
     }
+  }
+}
+
+// D-198: Bytes(rules) is what Build and Create allocate (glibc).
+TEST(FirewallTableTest, BytesMatchesBuild) {
+  using bess::framework::MemoryCost;
+  const std::vector<std::vector<FirewallRule>> policies = {
+      {},
+      {Rule(k4, "10.0.0.0", 8, "", 0)},
+      {Rule(k4, "10.0.0.0", 8, "", 0, kTcp), Rule(k4, "10.1.0.0", 16, "", 0),
+       Rule(k4, "10.2.0.0", 16, "", 0), Rule(k6, "2001:db8::", 32, "", 0),
+       Rule(kAny, "", 0, "", 0, kUdp, 0, 0xffff, 53, 53),
+       Rule(k4, "10.3.0.0", 16, "192.168.0.0", 24)},
+  };
+  for (const std::vector<FirewallRule> &rules : policies) {
+    auto table = FirewallTable::Build(rules);
+    ASSERT_TRUE(table.has_value()) << table.error();
+    EXPECT_EQ(MemoryCost<FirewallTable>::Bytes(rules), (*table)->bytes());
+    EXPECT_EQ(MemoryCost<FirewallTable>::GlibcBytes(rules), (*table)->bytes());
+
+    std::vector<FirewallRule> moved(rules.begin(), rules.end());
+    const size_t scan_bytes = MemoryCost<FirewallScan>::Bytes(moved);
+    auto scan = FirewallScan::Create(std::move(moved));
+    ASSERT_TRUE(scan.has_value()) << scan.error();
+    EXPECT_EQ(scan_bytes, scan->bytes());
   }
 }
 

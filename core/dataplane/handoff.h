@@ -287,20 +287,13 @@ class HandoffChannel {
   // allocator; every failure frees what it had taken.
   static std::expected<Ptr, HandoffCreateError> Create(
       const HandoffConfig &config = {}) noexcept {
-    if (config.capacity == 0 || config.capacity > kMaxCapacity) {
+    const size_t total = Bytes(config);
+    if (total == 0) {
       return std::unexpected(HandoffCreateError::kInvalidCapacity);
     }
     const HandoffAllocator &allocator = config.allocator != nullptr
                                             ? *config.allocator
                                             : DpdkHandoffAllocator();
-    const size_t slots = std::bit_ceil(config.capacity + 1);
-    const ssize_t ring_bytes =
-        detail::RingMemsize(static_cast<unsigned>(kItemBytes),
-                            static_cast<unsigned>(slots));
-    if (ring_bytes < 0) {
-      return std::unexpected(HandoffCreateError::kInvalidCapacity);
-    }
-    const size_t total = RingOffset() + static_cast<size_t>(ring_bytes);
     int placed = -1;
     void *block = allocator.allocate(total, BlockAlign(), config.socket, &placed);
     if (block == nullptr) {
@@ -320,6 +313,21 @@ class HandoffChannel {
 
   HandoffChannel(const HandoffChannel &) = delete;
   HandoffChannel &operator=(const HandoffChannel &) = delete;
+
+  // What Create(config) allocates (D-198): the one block, the channel object
+  // then the ring; 0 for a capacity Create refuses. From DPDK's heap with the
+  // default allocator; a custom allocator's memory is its own. Equals
+  // bytes(). Create returns std::expected, so an owner admits this with a
+  // lease rather than MemoryScope::Create.
+  static size_t Bytes(const HandoffConfig &config = {}) noexcept {
+    if (config.capacity == 0 || config.capacity > kMaxCapacity) {
+      return 0;
+    }
+    const ssize_t ring_bytes = detail::RingMemsize(
+        static_cast<unsigned>(kItemBytes),
+        static_cast<unsigned>(std::bit_ceil(config.capacity + 1)));
+    return ring_bytes < 0 ? 0 : RingOffset() + static_cast<size_t>(ring_bytes);
+  }
 
   // Frees whatever is still queued (step 4 of the lifecycle). Callers must
   // have stopped every producer and consumer.
@@ -450,8 +458,8 @@ class HandoffChannel {
     return {requested_socket_, placed_socket_, block_bytes_};
   }
   // Bytes of the whole channel; per item at full occupancy it is
-  // memory_bytes() / capacity().
-  size_t memory_bytes() const noexcept { return block_bytes_; }
+  // bytes() / capacity().
+  size_t bytes() const noexcept { return block_bytes_; }
 
   // Testing only: moves the ring's indices to `start` (the channel must be
   // empty), to run the 32-bit index wrap-around without 2^32 items.

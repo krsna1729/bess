@@ -58,6 +58,19 @@ stopping traffic.
    invocation): p99 about 11 µs for ordinary pipelines (D-012). State owned
    by one worker (mode W) needs no grace period at all (D-013). Nothing on
    the packet path takes a lock, counts references or frees memory.
+6. **Memory is admitted before it is allocated (D-198).** Every structure
+   here states its cost from the arguments that size it: a static
+   `T::Bytes(args...)` equal to what its constructor allocates (DPDK heap,
+   glibc, the `rte_*` libraries' own tables; `GlibcBytes` is the glibc part),
+   checked against the object's `bytes()` by its unit test. A module creates
+   it through `init_context().memory().Create<T>(resource, args...)`, which
+   admits those bytes under the memory policy first, so a table that does not
+   fit is refused whole (`RESOURCE_EXHAUSTED`) rather than half-built or
+   OOM-killed, and `GetResourceStatus.memory.modules` reports what each
+   module holds. A structure that grows after construction on the control
+   path (slab chunks, a doubled table, a new tuple or route domain) takes a
+   `utils::MemoryGrowth` hook (`set_memory_growth`) and admits each delta
+   before it allocates it; nothing on the packet path changes.
 
 ## 2. Choosing a structure
 
@@ -374,11 +387,18 @@ refused. An unset port bound is 65535, not 0, because the proto field is
   meter policies) when they change one at a time. It replaces
   `ObjectTable`'s rebuild.
 - **Reader:** `Lookup(id)`, one acquire load.
-- **Writer:** `Publish(id, object)` is one pointer store, and the replaced
-  object is retired after a grace period. Removal has two steps:
+- **Writer:** `Publish(id, table.Make(args...))` is one pointer store, and
+  the replaced object is retired after a grace period. Removal has two steps:
   - `Retire(id)`: absent on the control side, but still readable;
   - `Unpublish(id)`: empties the slot, run later by the transaction
     engine's removal cascade.
+- **Memory:** the slot array and the objects live in DPDK memory on the
+  memory node (D-029): the objects come from a slab the table owns
+  (`utils::ObjectSlab`, `core/utils/dpdk_slab.h`), and `Owned` returns an
+  object to it. Retired objects may outlive the table: it releases the slab,
+  which goes with the last of them. `Bytes(capacity)` is the two slot arrays;
+  the slab's 1024-object chunks are admitted as they are added, through the
+  growth hook the module's memory scope gives the table (D-198).
 - Code: `core/dataplane/slot_table.h`; D-021.
 
 ### `ScopeTable<Version>` (scope id → one immutable policy, mode C)
@@ -806,6 +826,14 @@ pass a stress run by luck.
   `DeInit()`, and make the packet path treat `kPending` as a miss (ExactMatch:
   a vectorized mask pass, not measurable; a compare inside the gate loop
   cost 4% on an E-core; D-022).
+- Size it through the module's memory scope:
+  `init_context().memory().Create<T>("resource", args...)` (or a `Lease` of
+  `T::Bytes(args...)` for a by-value member), after every argument is
+  validated; pass `memory().socket()` wherever a socket is asked for; let a
+  `utils::MemoryRefused` propagate (D-198). A new structure states
+  `static Bytes(...)` (and `GlibcBytes` for glibc parts), a `bytes()`, and a
+  `set_memory_growth` hook if it grows after construction, with a test that
+  `Bytes(args) == bytes()`.
 - For concurrency, write a deterministic test of the invariant (a reader
   held online, then released) rather than relying on a stress test. Check it
   once by removing the protection and watching it fail.
@@ -869,11 +897,13 @@ CPU 0 and worker CPU 4. A runner flag cannot move control threads onto a CPU
 excluded by the cgroup; a CPU-4-only partition reports no reserved control
 CPU and includes control-thread contention.
 
-The runner defaults to daemon `-m 0` (no hugepages). To require hugepages, pass
-an explicit positive memory cap through the build specification, for example
-`--build huge=/path/to/bessd,-m,1024`; do not infer the EAL mode from host free
-hugepages. Set `BESS_DPDK_LIB` to the repository-local DPDK library directory
-when the daemon needs that search path under `sudo`.
+The runner defaults to daemon `--mem_backing=normal` (no hugepages). To require
+hugepages, pass an explicit backing and heap cap through the build
+specification, for example
+`--build huge=/path/to/bessd,--mem_backing=hugepages,--mem_hugepage_mb=1024`; do
+not infer the EAL mode from host free hugepages. Set `BESS_DPDK_LIB` to the
+repository-local DPDK library directory when the daemon needs that search path
+under `sudo`.
 
 #### Final EM/WM placement comparison
 
@@ -886,7 +916,8 @@ accessors, and the existing bucketed `ResultPlan` kernels. The matrix varies:
   uses 8+4+2+1+1-byte fields.
 - Target action/rule ratio R: 100%, 50%, 30%, 20%, 10%, or 5%; mixed layouts
   use 100%, 50%, and 20%. The action count is floor(N×R/100).
-- EAL memory mode: normal pages (`-m 0`) or hugepages (`-m 1024`).
+- EAL memory mode: normal pages (`--mem_backing=normal`) or hugepages
+  (`--mem_backing=hugepages --mem_hugepage_mb=1024`).
 
 All 432 placement cases passed path and result-byte validation in both
 rounds of both EAL modes: 1,728 placement samples. Each round used 1.5 s
@@ -903,7 +934,7 @@ not total pipeline latency. The EAL-mode comparison changes the whole
 daemon's DPDK heap, including hash tables and packet storage; it does not
 isolate the effect of RecordArena allocation alone.
 
-##### Normal-page EAL (`-m 0`)
+##### Normal-page EAL (`--mem_backing=normal`)
 
 | R | geometries | EM inline | EM→EM | WM inline | WM→EM |
 |---:|---:|---:|---:|---:|---:|
@@ -939,7 +970,7 @@ Table-size, result-size, and field-mix sensitivity at R20:
 | 65,536 | mixed8 | 50.65 / 19.55 | 123.14 / 47.43 | 82.98 / 31.97 | 165.42 / 63.76 |
 | 65,536 | mixed16 | 51.96 / 20.03 | 144.51 / 55.62 | 84.63 / 32.60 | 203.84 / 78.45 |
 
-##### Hugepage EAL (`-m 1024`)
+##### Hugepage EAL (`--mem_backing=hugepages --mem_hugepage_mb=1024`)
 
 | R | geometries | EM inline | EM→EM | WM inline | WM→EM |
 |---:|---:|---:|---:|---:|---:|

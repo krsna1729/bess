@@ -2,6 +2,8 @@
 
 #include "framework/threshold_table.h"
 
+#include "framework/memory_scope.h"
+
 #include <chrono>
 #include <map>
 #include <optional>
@@ -258,6 +260,71 @@ TEST(ThresholdTableTest, ATickAndAWorkerReportTheSameEventShape) {
   EXPECT_EQ((std::set<std::string>{"key", "value", "limit"}), tick_fields);
   EXPECT_EQ(4u, from_worker.fields.size()) << "the worker path adds only `worker`";
   EXPECT_EQ("3", from_worker.fields.at("worker"));
+}
+
+// Memory (D-198): an empty table costs nothing; each armed entry is admitted
+// before it is added and given back when it goes.
+struct RecordingGrowth final : utils::MemoryGrowth {
+  size_t held = 0;  // grown less shrunk
+  int grows = 0;
+  bool refuse = false;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    EXPECT_EQ(bytes, glibc_bytes) << "all glibc";
+    if (refuse) {
+      throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit,
+                                 bytes, "refused");
+    }
+    held += bytes;
+    grows++;
+  }
+  void Shrink(size_t bytes, size_t) noexcept override { held -= bytes; }
+};
+
+TEST(ThresholdTableTest, BytesOfAnEmptyTableMatches) {
+  ThresholdTable t;
+  EXPECT_EQ(MemoryCost<ThresholdTable>::Bytes(), t.bytes());
+  EXPECT_EQ(0u, t.bytes());
+  t.Arm(1, 10);
+  EXPECT_GE(t.bytes(), ThresholdTable::kWatchBytes);
+}
+
+TEST(ThresholdTableTest, EachArmedEntryIsAdmittedAndGivenBack) {
+  Counters c;
+  ThresholdTable t;
+  RecordingGrowth growth;
+  t.set_memory_growth(&growth);
+  for (uint64_t k = 1; k <= 5; k++) {
+    t.Arm(k, 10);
+  }
+  t.Arm(3, 20);  // a re-arm replaces the limit: no growth
+  EXPECT_EQ(5, growth.grows);
+  EXPECT_EQ(5 * ThresholdTable::kWatchBytes, growth.held);
+
+  EXPECT_TRUE(t.Disarm(5));
+  EXPECT_EQ(4 * ThresholdTable::kWatchBytes, growth.held);
+
+  c.totals[1] = 10;  // fires; keys 2 and 4 are unknown to the read: gone
+  c.totals[3] = 0;
+  SweepAll(t, c);
+  EXPECT_EQ(1u, t.size());
+  EXPECT_EQ(ThresholdTable::kWatchBytes, growth.held);
+
+  t.Clear();
+  EXPECT_EQ(0u, growth.held);
+}
+
+TEST(ThresholdTableTest, ARefusedArmChangesNothing) {
+  ThresholdTable t;
+  RecordingGrowth growth;
+  t.set_memory_growth(&growth);
+  t.Arm(1, 10);
+  growth.refuse = true;
+  EXPECT_THROW(t.Arm(2, 10), utils::MemoryRefused);
+  EXPECT_EQ(1u, t.size());
+  EXPECT_FALSE(t.limit(2).has_value());
+  EXPECT_EQ(ThresholdTable::kWatchBytes, growth.held);
+  t.Arm(1, 30);  // re-arming needs no admission
+  EXPECT_EQ(30u, t.limit(1));
 }
 
 }  // namespace

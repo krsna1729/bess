@@ -147,10 +147,7 @@ class PackedMacTable {
     if (capacity == 0 || capacity > (size_t{1} << 28)) {
       return nullptr;
     }
-    size_t buckets = 2;
-    while (buckets * kWays < 2 * capacity) {
-      buckets <<= 1;
-    }
+    const size_t buckets = BucketsFor(capacity);
     std::unique_ptr<PackedMacTable> t(
         new (std::nothrow) PackedMacTable(capacity, buckets, (seed != 0 ? seed : NewSeed()) | 1));
     if (t == nullptr) {
@@ -175,6 +172,18 @@ class PackedMacTable {
       }
     }
     return t;
+  }
+
+  // What Create allocates (D-198), all of it glibc: the slot words, the cold
+  // array when Cold is not empty, and the table itself, as bytes() counts
+  // them.
+  static size_t Bytes(size_t capacity, uint64_t /*seed*/ = 0) noexcept {
+    return BucketsFor(capacity) * kWays *
+               (sizeof(uint64_t) + (kHasCold ? sizeof(Cold) : 0)) +
+           sizeof(PackedMacTable);
+  }
+  static size_t GlibcBytes(size_t capacity, uint64_t seed = 0) noexcept {
+    return Bytes(capacity, seed);
   }
 
   ~PackedMacTable() {
@@ -333,7 +342,7 @@ class PackedMacTable {
 
   size_t size() const noexcept { return size_; }
   size_t capacity() const noexcept { return capacity_; }
-  size_t memory_bytes() const noexcept {
+  size_t bytes() const noexcept {
     return nbuckets_ * kWays * (sizeof(uint64_t) + (kHasCold ? sizeof(Cold) : 0)) + sizeof(*this);
   }
 
@@ -343,6 +352,15 @@ class PackedMacTable {
   static constexpr uint64_t kFlagBit = uint64_t{1} << 62;
   static constexpr uint64_t kOccupied = uint64_t{1} << 63;
   static constexpr uint64_t kKeyMask = kOccupied | kMacMask;
+
+  // The smallest power of two (at least 2) giving every entry two slots.
+  static size_t BucketsFor(size_t capacity) noexcept {
+    size_t buckets = 2;
+    while (buckets * kWays < 2 * capacity) {
+      buckets <<= 1;
+    }
+    return buckets;
+  }
 
   PackedMacTable(size_t capacity, size_t buckets, uint64_t seed)
       : capacity_(capacity), nbuckets_(buckets), mask_(buckets - 1), seed_(seed) {}

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "conntrack/conntrack.h"
+#include "framework/memory_scope.h"
 #include "packet_parse.h"
 #include "rcu/rcu_domain.h"
 
@@ -65,6 +66,19 @@ std::vector<uint8_t> Frame(Ep s, Ep d, uint8_t proto, uint8_t flags_or_type) {
 
 using Owned = Conntrack<>;
 using Shared = SharedConntrack<>;
+
+// D-198: what Create allocates is known before it runs (the table's
+// directory from DPDK, the rest from glibc).
+TEST(SharedConntrackTest, MemoryCostIsWhatCreateAllocates) {
+  rcu::RcuDomain domain(2);
+  for (const size_t capacity : {size_t{1}, size_t{4096}, size_t{50000}}) {
+    auto ct = Shared::Create(capacity, domain).value();
+    EXPECT_EQ(framework::MemoryCost<Shared>::Bytes(capacity, domain),
+              ct->bytes());
+    EXPECT_LT(framework::MemoryCost<Shared>::GlibcBytes(capacity, domain),
+              ct->bytes());
+  }
+}
 
 // One thread, a random stream over a few hosts: every packet gets the same
 // status and direction from both trackers, and expiry removes the same number

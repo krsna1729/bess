@@ -35,7 +35,6 @@
 #include "dataplane/cpu_id.h"
 #include "pb/module_msg.pb.h"
 #include "pb/port_msg.pb.h"
-#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "utils/endian.h"
 #include "port.h"
@@ -61,7 +60,7 @@ void InitRuntimeOnce() {
   }
   initialized = true;
 
-  FLAGS_m = 0;  // malloc-backed, sandbox-safe: PlainPacketPool
+  // The library default (D-198): normal pages, PlainPacketPool, sandbox-safe.
   bess::PacketPool::CreateDefaultPools(kPoolCapacity);
   PortBuilder::InitDrivers();
 }

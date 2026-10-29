@@ -128,7 +128,7 @@ void BM_DecisionLookup(benchmark::State &state) {
       benchmark::Counter(lookups, benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
   state.counters["hit_pct"] = 100.0 * static_cast<double>(hits) / lookups;
   state.counters["bytes_per_entry"] =
-      static_cast<double>(f.cache->memory_bytes()) / static_cast<double>(n);
+      static_cast<double>(f.cache->bytes()) / static_cast<double>(n);
 }
 
 void BM_FlowBaseline(benchmark::State &state) {
@@ -186,7 +186,7 @@ void BM_DecisionResolve(benchmark::State &state) {
   Fixture &f = CacheFor(n, false);
   bess::dataplane::SlotTable<DecId, Decision<kBytes>> decisions(n);
   for (uint32_t i = 0; i < n; i++) {
-    auto d = std::make_unique<Decision<kBytes>>();
+    auto d = decisions.Make();
     d->first = i;
     (void)decisions.Publish(DecId(i + 1), std::move(d));
   }

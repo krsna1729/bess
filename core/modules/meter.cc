@@ -144,9 +144,17 @@ class Meter::MetersResource final : public dataplane::Resource {
       // The key stops accepting writes now, but stays in every published
       // generation until the removal cascade: a rule's old result can
       // still hand a reader this meter id. A simultaneous upsert of another
-      // meter must not make this id disappear prematurely.
+      // meter must not make this id disappear prematurely. The cascade's
+      // generation without it is admitted now (MetersGrowth): a removal
+      // stage cannot refuse, so a refusal refuses this erase.
       auto erase = std::make_unique<EraseOp>(owner_, id);
-      owner_.retiring_.insert(id);
+      owner_.PrepayErase();
+      try {
+        owner_.retiring_.insert(id);
+      } catch (...) {
+        owner_.RefundErase();
+        throw;
+      }
       Reservation erase_reservation{std::move(erase), {},
                                     Footprint{.removals = 1}};
       erase_reservation.existed = true;
@@ -214,9 +222,12 @@ class Meter::MetersResource final : public dataplane::Resource {
             owner.Unpublish(id, later);
           });
     }
-    // The reservation marked the meter as retiring; a transaction that will
-    // not publish must put it back.
-    void Abort() noexcept override { owner_.retiring_.erase(id_); }
+    // The reservation marked the meter as retiring and prepaid its removal
+    // stage; a transaction that will not publish must put both back.
+    void Abort() noexcept override {
+      owner_.retiring_.erase(id_);
+      owner_.RefundErase();
+    }
 
    private:
     Meter &owner_;
@@ -265,7 +276,14 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   }
   const size_t capacity =
       arg.capacity() == 0 ? 1024 : static_cast<size_t>(arg.capacity());
+  // Admitted before it is built (D-198); everything the builders and their
+  // generations grow by afterwards, the first generation included, is
+  // admitted through growth_ (see meter.h).
+  meters_lease_ = init_context().memory().LeaseFor<meter::MeterSetBuilder>(
+      "meters", capacity);
+  growth_.lease = meters_lease_.growth();
   live_ = std::make_unique<meter::MeterSetBuilder>(capacity);
+  live_->set_memory_growth(&growth_);
   published_.Initialize(live_->Build());
 
   resource_ = std::make_unique<MetersResource>(*this);
@@ -385,12 +403,77 @@ void Meter::PublishStaged(std::unique_ptr<const meter::MeterSet> generation,
 
 void Meter::Unpublish(meter::MeterId id, dataplane::Retirer &later) {
   if (retiring_.erase(id) == 0) {
+    RefundErase();
     return;  // re-added: the published generation is already the new meter
   }
   auto erased = live_->Erase(id);
   CHECK(erased) << meter::MeterErrorName(erased.error());
   policies_.erase(id);
-  later.Retire(published_.Exchange(live_->Build()));
+
+  // A removal stage cannot refuse: Build is paid from this erase's prepay
+  // (MetersGrowth::Grow), and what it did not use -- or gave back, if it
+  // failed -- is released after.
+  const size_t had = growth_.prepaid_bytes;
+  const size_t had_glibc = growth_.prepaid_glibc;
+  const size_t capacity = live_->capacity();
+  auto settle = [&]() noexcept {
+    growth_.paying = false;
+    growth_.Refund(
+        meter::MeterSet::Bytes(capacity) - (had - growth_.prepaid_bytes),
+        meter::MeterSet::GlibcBytes(capacity) -
+            (had_glibc - growth_.prepaid_glibc));
+  };
+  growth_.paying = true;
+  std::unique_ptr<const meter::MeterSet> generation;
+  try {
+    generation = live_->Build();
+  } catch (...) {
+    settle();
+    throw;
+  }
+  settle();
+  later.Retire(published_.Exchange(std::move(generation)));
+}
+
+void Meter::PrepayErase() {
+  const size_t capacity = live_->capacity();
+  growth_.Prepay(meter::MeterSet::Bytes(capacity),
+                 meter::MeterSet::GlibcBytes(capacity));
+}
+
+void Meter::RefundErase() noexcept {
+  const size_t capacity = live_->capacity();
+  growth_.Refund(meter::MeterSet::Bytes(capacity),
+                 meter::MeterSet::GlibcBytes(capacity));
+}
+
+void Meter::MetersGrowth::Grow(size_t bytes, size_t glibc_bytes) {
+  if (!paying) {
+    lease->Grow(bytes, glibc_bytes);
+    return;
+  }
+  // Already admitted by the erase's Reserve; MeterSet::Bytes bounds every
+  // generation the builder builds.
+  CHECK(bytes <= prepaid_bytes && glibc_bytes <= prepaid_glibc)
+      << "meter generation exceeds its prepaid admission";
+  prepaid_bytes -= bytes;
+  prepaid_glibc -= glibc_bytes;
+}
+
+void Meter::MetersGrowth::Shrink(size_t bytes, size_t glibc_bytes) noexcept {
+  lease->Shrink(bytes, glibc_bytes);
+}
+
+void Meter::MetersGrowth::Prepay(size_t bytes, size_t glibc_bytes) {
+  lease->Grow(bytes, glibc_bytes);
+  prepaid_bytes += bytes;
+  prepaid_glibc += glibc_bytes;
+}
+
+void Meter::MetersGrowth::Refund(size_t bytes, size_t glibc_bytes) noexcept {
+  prepaid_bytes -= bytes;
+  prepaid_glibc -= glibc_bytes;
+  lease->Shrink(bytes, glibc_bytes);
 }
 
 void Meter::EndTransaction() noexcept {

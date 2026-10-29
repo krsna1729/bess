@@ -42,6 +42,7 @@
 
 #include "dataplane/resource_registry.h"
 #include "dataplane/scope.h"
+#include "framework/memory_scope.h"
 #include "flow/worker_flow_table.h"
 #include "packet_parse.h"
 #include "rcu/rcu_domain.h"
@@ -108,18 +109,26 @@ class VswitchApp {
  public:
   static constexpr size_t kTenants = 2;
 
+  // Admit caches and scope storage before allocation. `memory` outlives the app.
   static std::expected<std::unique_ptr<VswitchApp>, std::string>
-  Create(std::string name, bess::rcu::RcuDomain &rcu) {
-    std::unique_ptr<VswitchApp> app(new VswitchApp(std::move(name), rcu));
+  Create(std::string name, bess::rcu::RcuDomain &rcu,
+         bess::framework::MemoryScope &memory) {
+    auto scopes = memory.LeaseFor<bess::dataplane::ScopeTable<PolicyVersion>>(
+        "policies", kTenants);
+    std::array<bess::framework::MemoryLease, kTenants> leases;
+    for (auto &lease : leases) {
+      lease = memory.LeaseFor<Cache>("decision_cache", kCacheCapacity);
+    }
+    std::unique_ptr<VswitchApp> app(
+        new VswitchApp(std::move(name), rcu, memory, std::move(scopes)));
     for (size_t t = 0; t < kTenants; t++) {
-      (void)app->policies_.Publish(ScopeOf(t),
-                                   std::make_unique<const PolicyVersion>(
-                                       app->MakePolicyVersion(StaticPolicy())));
-      auto cache = Cache::Create(4096);
+      (void)app->policies_.Publish(
+          ScopeOf(t), app->policies_.Make(app->MakePolicyVersion(StaticPolicy())));
+      auto cache = Cache::Create(kCacheCapacity);
       if (!cache) {
         return std::unexpected(std::string("decision cache"));
       }
-      app->caches_[t] = std::move(*cache);
+      app->caches_[t] = bess::framework::MemoryScope::Adopt(std::move(leases[t]), std::move(*cache));
     }
     return app;
   }
@@ -133,7 +142,7 @@ class VswitchApp {
   // a hardware-revocation hook; generic ScopeResource publication does not.
   std::expected<void, std::string>
   Enroll(bess::dataplane::ResourceRegistry &registry) {
-    if (cold_ != nullptr) {
+    if (cold_) {
       return std::unexpected("hierarchical policies use direct publication");
     }
     if (auto enrolled = registry.Register(&policy_resource_); !enrolled) {
@@ -180,11 +189,12 @@ class VswitchApp {
     if (registry_ != nullptr) {
       return false;
     }
-    auto cold = ColdTable::Create(4096);
+    auto lease = memory_->LeaseFor<ColdTable>("cold_flows", kColdCapacity);
+    auto cold = ColdTable::Create(kColdCapacity);
     if (!cold) {
       return false;
     }
-    cold_ = std::move(*cold);
+    cold_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*cold));
     hierarchy_ = std::move(h);
     return true;
   }
@@ -221,7 +231,7 @@ class VswitchApp {
     } else {
       d = Compile(version->policy(), key);
       compiles_[tenant]++;
-      if (cold_ == nullptr || Hot(key)) {
+      if (!cold_ || Hot(key)) {
         auto made = caches_[tenant]->Emplace(key);
         if (made.state != nullptr) {
           *made.state = CachedDecision{version->revision(), d};
@@ -263,8 +273,7 @@ class VswitchApp {
     }
     Policy policy = current->policy();
     policy.layers[layer].groups[group] = std::move(replacement);
-    auto next = std::make_unique<const PolicyVersion>(
-        MakePolicyVersion(std::move(policy)));
+    auto next = policies_.Make(MakePolicyVersion(std::move(policy)));
     rcu_.ReserveRetirements(1);
     auto old = policies_.Publish(id, std::move(next));
     const auto grace = rcu_.StartGracePeriod();
@@ -276,19 +285,20 @@ class VswitchApp {
   }
 
   uint64_t hits(size_t t) const noexcept { return hits_[t]; }
-  size_t cold_flows() const noexcept { return cold_ != nullptr ? cold_->size() : 0; }
+  size_t cold_flows() const noexcept { return cold_ ? cold_->size() : 0; }
   uint64_t compiles(size_t t) const noexcept { return compiles_[t]; }
   size_t cached(size_t t) const noexcept { return caches_[t]->size(); }
 
  private:
-   struct CachedDecision {
-     uint64_t revision = 0;
-     CompiledDecision decision{};
-   };
-   using Cache = bess::flow::WorkerFlowTable<VswitchKey, CachedDecision>;
-   static bess::dataplane::ScopeId ScopeOf(size_t tenant) noexcept {
-     return bess::dataplane::ScopeId(static_cast<uint32_t>(tenant + 1));
-   }
+  struct CachedDecision {
+    uint64_t revision = 0;
+    CompiledDecision decision{};
+  };
+  using Cache = bess::flow::WorkerFlowTable<VswitchKey, CachedDecision>;
+  static constexpr size_t kCacheCapacity = 4096, kColdCapacity = 4096;
+  static bess::dataplane::ScopeId ScopeOf(size_t tenant) noexcept {
+    return bess::dataplane::ScopeId(static_cast<uint32_t>(tenant + 1));
+  }
   struct ColdCount {
     uint32_t packets = 0;
     uint32_t last_tick = 0;  // the default-path packet that last saw the flow
@@ -332,9 +342,15 @@ class VswitchApp {
     }
   }
 
-  VswitchApp(std::string name, bess::rcu::RcuDomain &rcu)
-      : rcu_(rcu), policies_(kTenants),
-        policy_resource_(std::move(name) + "/policies", policies_) {}
+  VswitchApp(std::string name, bess::rcu::RcuDomain &rcu,
+             bess::framework::MemoryScope &memory,
+             bess::framework::MemoryLease scopes)
+      : rcu_(rcu), scope_memory_(std::move(scopes)), policies_(kTenants),
+        policy_resource_(std::move(name) + "/policies", policies_),
+        memory_(&memory) {
+    policies_.set_memory_growth(scope_memory_.growth());
+    scope_memory_.Track(policies_);
+  }
 
   // The static policy each tenant starts with. Layer 0 (an ACL): group 0
   // allows web (80) and DNS (53), group 1 denies SSH (22). Layer 1 (QoS):
@@ -393,13 +409,15 @@ class VswitchApp {
   }
 
   bess::rcu::RcuDomain &rcu_;
+  bess::framework::MemoryLease scope_memory_;
   bess::dataplane::ScopeTable<PolicyVersion> policies_;
   bess::dataplane::ScopeResource<PolicyVersion> policy_resource_;
   bess::dataplane::ResourceRegistry *registry_ = nullptr;
   std::atomic<uint64_t> next_revision_{1};
-  std::array<std::unique_ptr<Cache>, kTenants> caches_;
+  std::array<bess::framework::Sized<Cache>, kTenants> caches_;
   std::array<uint64_t, kTenants> hits_{}, compiles_{};
-  std::unique_ptr<ColdTable> cold_;
+  bess::framework::Sized<ColdTable> cold_;
+  bess::framework::MemoryScope *memory_;
   Hierarchy hierarchy_;
   uint32_t tick_ = 0;
   size_t sweep_ = 0;

@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "testing/allocation_faults.h"
 
 namespace bess::l2 {
@@ -479,6 +480,86 @@ TEST(FdbFaultTest, SetFloodGroupFailureAtEveryAllocationLeavesNoTrace) {
     ASSERT_EQ(bigger.size(), fdb->FloodGroup(kD1).size());
   });
   EXPECT_EQ(1u, points);
+}
+
+// D-198: what Create allocates is known before it runs, all of it glibc.
+TEST(FdbMemoryTest, MemoryCostIsWhatCreateAllocates) {
+  using PackedFdb = BasicFdb<PackedMacTable<dataplane::ExpiryHandle>>;
+  using Table = MacTable<uint64_t>;
+  using Packed = PackedMacTable<dataplane::ExpiryHandle>;
+  for (const size_t capacity : {size_t{1}, size_t{64}, size_t{100000}}) {
+    Fdb::Config c;
+    c.capacity = capacity;
+    c.max_domains = 16;
+    auto created = Fdb::Create(c);
+    ASSERT_TRUE(created.has_value());
+    auto fdb = std::move(*created);
+    EXPECT_EQ(framework::MemoryCost<Fdb>::Bytes(c), fdb->bytes());
+    EXPECT_EQ(framework::MemoryCost<Fdb>::GlibcBytes(c), fdb->bytes());
+    PackedFdb::Config p;
+    p.capacity = capacity;
+    p.max_domains = Packed::kMaxDomains;
+    p.hash_seed = 7;
+    auto packed_created = PackedFdb::Create(p);
+    ASSERT_TRUE(packed_created.has_value());
+    auto packed = std::move(*packed_created);
+    EXPECT_EQ(framework::MemoryCost<PackedFdb>::Bytes(p), packed->bytes());
+    EXPECT_EQ(framework::MemoryCost<PackedFdb>::GlibcBytes(p), packed->bytes());
+    auto table = Table::Create(capacity);
+    ASSERT_NE(nullptr, table);
+    EXPECT_EQ(framework::MemoryCost<Table>::Bytes(capacity), table->bytes());
+    EXPECT_EQ(framework::MemoryCost<Table>::GlibcBytes(capacity), table->bytes());
+    auto words = Packed::Create(capacity, 7);
+    ASSERT_NE(nullptr, words);
+    EXPECT_EQ(framework::MemoryCost<Packed>::Bytes(capacity, uint64_t{7}),
+              words->bytes());
+    EXPECT_EQ(framework::MemoryCost<Packed>::GlibcBytes(capacity, uint64_t{7}),
+              words->bytes());
+  }
+}
+
+// Records what a primitive admits (D-198); refuses every growth while
+// `refuse` is set.
+struct RecordingGrowth final : utils::MemoryGrowth {
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    if (refuse) {
+      throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit,
+                                 bytes, "refused by the test");
+    }
+    grown += bytes;
+    glibc += glibc_bytes;
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    grown -= bytes;
+    glibc -= glibc_bytes;
+  }
+  bool refuse = false;
+  size_t grown = 0;
+  size_t glibc = 0;
+};
+
+// A flood group admits the room it grows by before it grows; a refusal
+// leaves the group and the FDB's bytes as they were.
+TEST(FdbMemoryTest, AFloodGroupAdmitsWhatItGrowsBy) {
+  auto fdb = Make();
+  RecordingGrowth growth;
+  fdb->set_memory_growth(&growth);
+  const size_t before = fdb->bytes();
+  const InterfaceId three[] = {InterfaceId(1), InterfaceId(2), InterfaceId(3)};
+  growth.refuse = true;
+  EXPECT_THROW(fdb->SetFloodGroup(kD1, three), utils::MemoryRefused);
+  EXPECT_TRUE(fdb->FloodGroup(kD1).empty());
+  EXPECT_EQ(before, fdb->bytes());
+  growth.refuse = false;
+  ASSERT_TRUE(fdb->SetFloodGroup(kD1, three));
+  EXPECT_EQ(3 * sizeof(InterfaceId), growth.grown);
+  EXPECT_EQ(growth.grown, growth.glibc);
+  EXPECT_EQ(before + growth.grown, fdb->bytes());
+  // A group that fits its room grows nothing.
+  const InterfaceId two[] = {InterfaceId(4), InterfaceId(5)};
+  ASSERT_TRUE(fdb->SetFloodGroup(kD1, two));
+  EXPECT_EQ(3 * sizeof(InterfaceId), growth.grown);
+  EXPECT_EQ(before + growth.grown, fdb->bytes());
 }
 
 // Learning, aging, static programming, removal, flush and lookups never

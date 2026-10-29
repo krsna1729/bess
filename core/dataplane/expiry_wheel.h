@@ -193,6 +193,17 @@ class ExpiryWheel {
     return wheel;
   }
 
+  // What Create allocates (D-198), all of it from glibc: the node array and
+  // the engine itself, as bytes() counts them. Fixed for the engine's life.
+  static size_t Bytes(size_t capacity, Tick /*start*/ = 0,
+                      unsigned /*granularity_shift*/ = 0) noexcept {
+    return (kFirst + capacity) * sizeof(Node) + sizeof(ExpiryWheel);
+  }
+  static size_t GlibcBytes(size_t capacity, Tick start = 0,
+                           unsigned granularity_shift = 0) noexcept {
+    return Bytes(capacity, start, granularity_shift);
+  }
+
   ExpiryWheel(const ExpiryWheel &) = delete;
   ExpiryWheel &operator=(const ExpiryWheel &) = delete;
 
@@ -307,11 +318,9 @@ class ExpiryWheel {
     return node == nullptr ? std::nullopt : std::optional<Tick>(node->deadline);
   }
 
-  // Bytes of engine memory; the per-timer cost at full occupancy is
-  // memory_bytes() / capacity().
-  size_t memory_bytes() const noexcept {
-    return (kFirst + capacity_) * sizeof(Node) + sizeof(*this);
-  }
+  // Bytes of engine memory (Bytes(capacity())); the per-timer cost at full
+  // occupancy is bytes() / capacity().
+  size_t bytes() const noexcept { return Bytes(capacity_); }
   static constexpr size_t node_bytes() noexcept { return sizeof(Node); }
 
   // Testing only: sets the generation of the node the next Schedule will use

@@ -40,6 +40,10 @@ class SharedExactIndex {
   // socket id, or -1 for any); null if it cannot be created.
   static std::unique_ptr<SharedExactIndex> Create(uint32_t key_len, size_t keys,
                                                   rcu::RcuDomain &domain, int socket);
+  // Memory (D-198): what Create allocates on the DPDK heap, the backend's
+  // rte_hash for CapacityFor(keys) slots (ConcurrentExactTable::Bytes).
+  // Fixed: the index never grows.
+  static size_t Bytes(uint32_t key_len, size_t keys, const rcu::RcuDomain &domain, int socket);
   ~SharedExactIndex();
   SharedExactIndex(const SharedExactIndex &) = delete;
   SharedExactIndex &operator=(const SharedExactIndex &) = delete;
@@ -78,6 +82,8 @@ class SharedExactIndex {
   void ReclaimAll();
 
   size_t size() const noexcept;
+  // DPDK memory held: Bytes(key_len, keys) for the `keys` it was created for.
+  size_t bytes() const noexcept;
 
   // Tests only (they include the internal backend header): the backend, to
   // place keys deliberately.

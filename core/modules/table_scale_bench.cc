@@ -161,7 +161,7 @@ void BM_Nat(benchmark::State &st) {
   }
   if (found != st.iterations() * kBatch) st.SkipWithError("NAT lookup missed");
   st.SetItemsProcessed(st.iterations() * kBatch);
-  st.counters["table_bytes"] = static_cast<double>(f.table->memory_bytes());
+  st.counters["table_bytes"] = static_cast<double>(f.table->bytes());
   st.SetLabel("binding table FindBatch");
 }
 // The first argument is kept (0 only) so the row names stay comparable.

@@ -199,10 +199,20 @@ class ConcurrentExactTable {
 
   // `capacity` key slots exactly; pass CapacityFor(rules) for the D-010
   // sizing. On DPDK socket `socket`, by default the memory node (D-123).
+  // Out of memory throws (utils::MemoryRefused for DPDK memory, D-198);
+  // an error is any other failure.
   static std::expected<std::unique_ptr<ConcurrentExactTable>, std::string>
   Create(uint32_t key_len, uint32_t capacity, rcu::RcuDomain &domain,
          int socket = bess::utils::MemoryNode(),
          Writers writers = Writers::kSingle);
+
+  // Memory (D-198): what Create allocates on the DPDK heap, the rte_hash for
+  // max(capacity, 8) keys with its QSBR defer queue (detail::RteHashBytes).
+  // Fixed: the table never grows; owners admit a bigger replacement.
+  static size_t Bytes(uint32_t key_len, uint32_t capacity,
+                      const rcu::RcuDomain &domain,
+                      int socket = bess::utils::MemoryNode(),
+                      Writers writers = Writers::kSingle);
 
   ~ConcurrentExactTable();
 
@@ -257,6 +267,8 @@ class ConcurrentExactTable {
   }
   uint32_t capacity() const noexcept { return capacity_; }
   uint32_t key_len() const noexcept { return key_len_; }
+  // DPDK memory held: Bytes(key_len(), capacity()).
+  size_t bytes() const noexcept;
   // The table's own hash of `key` (rte_hash_hash), for tests that prove the
   // inline kernel identical to it.
   hash_sig_t DpdkHash(ConstBytes key) const noexcept {

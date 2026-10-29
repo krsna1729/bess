@@ -41,11 +41,20 @@ constexpr uint32_t RangeSelect(uint32_t hash, uint32_t n) noexcept {
   return static_cast<uint32_t>((uint64_t{hash} * n) >> 32);
 }
 
+// Selectors are immutable after Build and hold glibc memory only (D-198):
+// Bytes(Build's arguments) is what Build allocates plus the selector itself,
+// equal to bytes() of what it builds (for arguments Build accepts), and
+// GlibcBytes is all of it. Build returns std::optional, so an owner admits
+// them with a lease.
 struct RangeSelector {
   uint32_t n = 0;
   uint32_t operator()(uint32_t hash) const noexcept { return RangeSelect(hash, n); }
   size_t size() const noexcept { return n; }
-  size_t memory_bytes() const noexcept { return sizeof(*this); }
+  static constexpr size_t Bytes(uint32_t /*n*/ = 0) noexcept {
+    return sizeof(RangeSelector);
+  }
+  static constexpr size_t GlibcBytes(uint32_t n = 0) noexcept { return Bytes(n); }
+  size_t bytes() const noexcept { return sizeof(*this); }
 };
 
 // -- weighted ---------------------------------------------------------------------
@@ -114,7 +123,13 @@ class WeightedSelector {
   }
 
   size_t size() const noexcept { return threshold_.size(); }
-  size_t memory_bytes() const noexcept {
+  static size_t Bytes(std::span<const uint32_t> weights) noexcept {
+    return sizeof(WeightedSelector) + weights.size() * sizeof(uint32_t) * 2;
+  }
+  static size_t GlibcBytes(std::span<const uint32_t> weights) noexcept {
+    return Bytes(weights);
+  }
+  size_t bytes() const noexcept {
     return sizeof(*this) + threshold_.size() * sizeof(uint32_t) * 2;
   }
   // For tests: bucket i keeps threshold(i) / 2^32 of its share, the rest is alias(i)'s.
@@ -194,7 +209,15 @@ class MaglevSelector {
 
   size_t size() const noexcept { return members_; }
   size_t table_size() const noexcept { return table_.size(); }
-  size_t memory_bytes() const noexcept { return sizeof(*this) + table_.size() * sizeof(uint16_t); }
+  static size_t Bytes(std::span<const uint64_t> /*member_keys*/,
+                      uint32_t table_size = kDefaultTableSize) noexcept {
+    return sizeof(MaglevSelector) + size_t{table_size} * sizeof(uint16_t);
+  }
+  static size_t GlibcBytes(std::span<const uint64_t> member_keys,
+                           uint32_t table_size = kDefaultTableSize) noexcept {
+    return Bytes(member_keys, table_size);
+  }
+  size_t bytes() const noexcept { return sizeof(*this) + table_.size() * sizeof(uint16_t); }
   uint32_t entry(size_t i) const noexcept { return table_[i]; }
 
  private:
@@ -243,7 +266,13 @@ class RendezvousSelector {
   }
 
   size_t size() const noexcept { return keys_.size(); }
-  size_t memory_bytes() const noexcept { return sizeof(*this) + keys_.size() * sizeof(uint64_t); }
+  static size_t Bytes(std::span<const uint64_t> member_keys) noexcept {
+    return sizeof(RendezvousSelector) + member_keys.size() * sizeof(uint64_t);
+  }
+  static size_t GlibcBytes(std::span<const uint64_t> member_keys) noexcept {
+    return Bytes(member_keys);
+  }
+  size_t bytes() const noexcept { return sizeof(*this) + keys_.size() * sizeof(uint64_t); }
 
  private:
   std::vector<uint64_t> keys_;

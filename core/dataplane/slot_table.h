@@ -5,12 +5,13 @@
 
 #include <atomic>
 #include <cstddef>
-#include <memory>
-#include <vector>
+#include <utility>
 
 #include "utils/logging.h"
 
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
+#include "utils/dpdk_slab.h"
 
 namespace bess {
 namespace dataplane {
@@ -44,31 +45,67 @@ namespace dataplane {
 // with a dependency-ordered cascade of grace periods (Decision D-021).
 //
 // One writer at a time; the caller serializes (the transaction engine does).
+//
+// Memory (Decision D-029): the slot array and the objects are packet-path
+// memory, so both come from DPDK's heap on the memory node -- the array in
+// one allocation, the objects from a slab the table owns (Make). An object
+// is owned by `Owned`, whose deleter returns it to that slab. Objects the
+// table handed out may outlive it -- the retired ones Publish and Unpublish
+// return wait in the RCU queue, an unpublished one in a pending transaction
+// operation -- as they could when they were plain heap objects: the table
+// releases its slab rather than destroying it, and the slab goes with the
+// last of them (utils::ObjectSlab::Owner).
 template <typename Id, typename T>
 class SlotTable {
  public:
   enum class SlotState : uint8_t { kFree, kLive, kRetiring };
+  using Owned = utils::SlabUnique<const T>;
 
   // Ids 1..capacity.
   explicit SlotTable(size_t capacity)
-      : slots_(new std::atomic<const T *>[capacity + 1]),
-        states_(capacity + 1, SlotState::kFree),
-        capacity_(capacity) {
-    for (size_t i = 0; i <= capacity; i++) {
-      slots_[i].store(nullptr, std::memory_order_relaxed);
-    }
+      : objects_(utils::ObjectSlab<T>::Create()),
+        slots_(capacity + 1),
+        states_(capacity + 1),
+        capacity_(capacity) {}
+
+  // What the constructor allocates in DPDK memory (D-198): the slot array
+  // and the states; the slab starts without a chunk. Objects are growth
+  // (set_memory_growth).
+  static size_t Bytes(size_t capacity) noexcept {
+    return (capacity + 1) * (sizeof(std::atomic<const T *>) +
+                             sizeof(SlotState)) +
+           utils::ObjectSlab<T>::Bytes();
+  }
+
+  // The admission each new slab chunk asks first (D-198): Make admits
+  // ObjectSlab<T>::chunk_bytes() whenever the slab adds a chunk.
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
+    objects_->set_memory_growth(growth);
   }
 
   // Destroys the published objects: the owner guarantees no reader remains
-  // (module teardown after workers stopped using it).
+  // (module teardown after workers stopped using it). Then the slab is
+  // released (objects_ goes last).
   ~SlotTable() {
     for (size_t i = 0; i <= capacity_; i++) {
-      delete slots_[i].load(std::memory_order_relaxed);
+      if (const T *object = slots_[i].load(std::memory_order_relaxed)) {
+        objects_->Destroy(object);
+      }
     }
   }
 
   SlotTable(const SlotTable &) = delete;
   SlotTable &operator=(const SlotTable &) = delete;
+
+  // A new object for this table, to Publish. Mutable until then (it converts
+  // to Owned): an owner may finish it in a later reservation step. Throws
+  // MemoryRefused (the growth hook's refusal of a new slab chunk, or
+  // DpdkAllocate's) or std::bad_alloc (control path), or what T's
+  // constructor throws.
+  template <typename... Args>
+  utils::SlabUnique<T> Make(Args &&...args) {
+    return objects_->Make(std::forward<Args>(args)...);
+  }
 
   // -- reader -----------------------------------------------------------------
 
@@ -110,20 +147,20 @@ class SlotTable {
                : nullptr;
   }
 
-  // Makes `object` visible at `id` (free or live; CanPublish must hold) and
-  // returns the object it replaced, which the caller retires after a grace
-  // period. Infallible.
-  std::unique_ptr<const T> Publish(Id id,
-                                   std::unique_ptr<const T> object) noexcept {
+  // Makes `object` (from Make) visible at `id` (free or live; CanPublish must
+  // hold) and returns the object it replaced, which the caller retires after
+  // a grace period. Infallible.
+  Owned Publish(Id id, Owned object) noexcept {
     const size_t index = static_cast<size_t>(id.value());
     CHECK(CanPublish(id));  // a retiring object may still be read (D-061)
+    CHECK(object == nullptr || object.get_deleter().slab == objects_.get());
     const T *old = slots_[index].exchange(object.release(),
                                           std::memory_order_acq_rel);
     if (states_[index] == SlotState::kFree) {
       size_++;
     }
     states_[index] = SlotState::kLive;
-    return std::unique_ptr<const T>(old);
+    return Adopt(old);
   }
 
   // Removes the object at `id` (which must be live) from the control side.
@@ -137,20 +174,30 @@ class SlotTable {
 
   // Empties a retiring slot and returns its object; the caller frees it after
   // a grace period (a reader may have just looked it up). The id is free.
-  std::unique_ptr<const T> Unpublish(Id id) noexcept {
+  Owned Unpublish(Id id) noexcept {
     const size_t index = static_cast<size_t>(id.value());
     CHECK(state(id) == SlotState::kRetiring);  // else a live object is freed (D-061)
     states_[index] = SlotState::kFree;
-    return std::unique_ptr<const T>(
-        slots_[index].exchange(nullptr, std::memory_order_acq_rel));
+    return Adopt(slots_[index].exchange(nullptr, std::memory_order_acq_rel));
   }
 
   size_t size() const noexcept { return size_; }
   size_t capacity() const noexcept { return capacity_; }
+  // DPDK memory held: the slot array, the states and the object slab.
+  size_t bytes() const noexcept {
+    return slots_.size() * sizeof(slots_[0]) +
+           states_.size() * sizeof(states_[0]) + objects_->bytes();
+  }
 
  private:
-  std::unique_ptr<std::atomic<const T *>[]> slots_;  // index = id
-  std::vector<SlotState> states_;                    // control side
+  Owned Adopt(const T *object) noexcept {
+    return Owned(object, utils::SlabDelete<const T>(objects_.get()));
+  }
+
+  // Declared first, released last: the destructor returns objects to it.
+  typename utils::ObjectSlab<T>::Owner objects_;
+  utils::DpdkArray<std::atomic<const T *>> slots_;  // index = id
+  utils::DpdkArray<SlotState> states_;              // control side
   size_t capacity_;
   size_t size_ = 0;
 };

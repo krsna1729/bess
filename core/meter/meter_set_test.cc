@@ -9,10 +9,14 @@
 
 #include <array>
 #include <memory>
+#include <vector>
 
+#include "framework/memory_scope.h"
 #include "runtime/runtime_state.h"
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
+#include "utils/dpdk_memory.h"
+#include "utils/dpdk_slab.h"
 
 namespace bess::meter {
 namespace {
@@ -294,6 +298,142 @@ TEST(MeterSetPublicationTest, PublishRetiresOldGeneration) {
   domain.Unregister(reader);
   published.ResetQuiesced();
   domain.Drain();
+}
+
+// -- memory (D-198) -----------------------------------------------------------
+
+TEST(MeterSetMemoryTest, BytesMatchesConstruction) {
+  for (const size_t capacity : {size_t{1}, size_t{64}, size_t{4096}}) {
+    MeterSetBuilder builder(capacity);
+    EXPECT_EQ(bess::framework::MemoryCost<MeterSetBuilder>::Bytes(capacity),
+              builder.bytes());
+  }
+}
+
+// Admits every growth and records it, refusing once `allow` growths passed.
+// Declared before the builders it serves: it must outlive them.
+struct RecordingGrowth final : bess::utils::MemoryGrowth {
+  std::vector<size_t> grown, grown_glibc;
+  size_t net = 0, glibc_net = 0;
+  size_t allow = SIZE_MAX;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    if (grown.size() >= allow) {
+      throw bess::utils::MemoryRefused(
+          bess::utils::MemoryRefused::Reason::kNormalLimit, bytes, "refused");
+    }
+    grown.push_back(bytes);
+    grown_glibc.push_back(glibc_bytes);
+    net += bytes;
+    glibc_net += glibc_bytes;
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    net -= bytes;
+    glibc_net -= glibc_bytes;
+  }
+};
+
+TEST(MeterSetMemoryTest, GrowthIsAdmittedAndGivenBack) {
+  RecordingGrowth growth;
+  constexpr size_t kCapacity = 16;
+  MeterSetBuilder builder(kCapacity);
+  builder.set_memory_growth(&growth);
+  const size_t initial = builder.bytes();
+
+  // A meter: its profile and state control block (glibc) and the first slab
+  // chunk of states (DPDK).
+  MustAdd(builder, 1);
+  ASSERT_EQ(3u, growth.grown.size());
+  EXPECT_EQ(bess::utils::ObjectSlab<MeterState>::chunk_bytes(),
+            growth.grown[1]);
+  EXPECT_EQ(0u, growth.grown_glibc[1]);
+  EXPECT_EQ(growth.grown[0], growth.grown_glibc[0]);
+  EXPECT_EQ(growth.grown[2], growth.grown_glibc[2]);
+  EXPECT_EQ(initial + growth.net, builder.bytes());
+
+  // A generation is admitted when built and given back when destroyed.
+  auto generation = builder.Build();
+  EXPECT_GT(generation->bytes(), 0u);
+  EXPECT_EQ(initial + growth.net, builder.bytes() + generation->bytes());
+  generation.reset();
+  EXPECT_EQ(initial + growth.net, builder.bytes());
+
+  // So is a clone's copy of the entries.
+  auto clone = builder.Clone();
+  EXPECT_EQ(initial + growth.net,
+            builder.bytes() +
+                bess::framework::MemoryCost<MeterSetBuilder>::Bytes(kCapacity));
+  clone.reset();
+  EXPECT_EQ(initial + growth.net, builder.bytes());
+
+  // An erased meter's state goes with its last reference; its slab chunk
+  // stays.
+  const size_t glibc_with_meter = growth.glibc_net;
+  ASSERT_TRUE(builder.Erase(MeterId(1)).has_value());
+  EXPECT_LT(growth.glibc_net, glibc_with_meter);
+  EXPECT_EQ(initial + growth.net, builder.bytes());
+}
+
+// MeterSet::Bytes(capacity) bounds what one Build admits, and is exactly it
+// with every id in use; GlibcBytes is its glibc part.
+TEST(MeterSetMemoryTest, GenerationBytesBoundBuild) {
+  constexpr size_t kCapacity = 8;
+  RecordingGrowth growth;
+  MeterSetBuilder builder(kCapacity);
+  builder.set_memory_growth(&growth);
+  for (uint32_t id = 1; id <= kCapacity; id++) {
+    const size_t before = growth.net, glibc_before = growth.glibc_net;
+    auto generation = builder.Build();
+    const size_t delta = growth.net - before;
+    const size_t glibc_delta = growth.glibc_net - glibc_before;
+    EXPECT_EQ(generation->bytes(), delta);
+    EXPECT_LE(delta, MeterSet::Bytes(kCapacity)) << id;
+    EXPECT_LE(glibc_delta, MeterSet::GlibcBytes(kCapacity)) << id;
+    generation.reset();
+    MustAdd(builder, id);
+  }
+  const size_t before = growth.net, glibc_before = growth.glibc_net;
+  auto full = builder.Build();
+  EXPECT_EQ(MeterSet::Bytes(kCapacity), growth.net - before);
+  EXPECT_EQ(MeterSet::GlibcBytes(kCapacity), growth.glibc_net - glibc_before);
+  EXPECT_EQ(MeterSet::Bytes(kCapacity), full->bytes());
+}
+
+TEST(MeterSetMemoryTest, RefusedGrowthLeavesTheBuilderUnchanged) {
+  RecordingGrowth growth;
+  MeterSetBuilder builder(16);
+  builder.set_memory_growth(&growth);
+  const size_t initial = builder.bytes();
+
+  // The profile refused.
+  growth.allow = 0;
+  EXPECT_THROW((void)builder.Add(MeterId(1), kSlow, MeterSharing::kShared),
+               bess::utils::MemoryRefused);
+  EXPECT_EQ(0u, growth.net);
+  // The profile and the slab chunk admitted, the state refused: the meter
+  // is not added and its slot goes back; the chunk stays with the slab, and
+  // the profile's block with its interned weak reference.
+  growth.allow = 2;
+  EXPECT_THROW((void)builder.Add(MeterId(1), kSlow, MeterSharing::kShared),
+               bess::utils::MemoryRefused);
+  EXPECT_FALSE(builder.Contains(MeterId(1)));
+  EXPECT_EQ(0u, builder.size());
+  ASSERT_EQ(2u, growth.grown.size());
+  EXPECT_EQ(growth.grown[0], growth.glibc_net);
+  EXPECT_EQ(bess::utils::ObjectSlab<MeterState>::chunk_bytes() +
+                growth.grown[0],
+            growth.net);
+  EXPECT_EQ(initial + growth.net, builder.bytes());
+
+  // A refused generation or clone is not built.
+  growth.allow = growth.grown.size();
+  EXPECT_THROW((void)builder.Build(), bess::utils::MemoryRefused);
+  EXPECT_THROW((void)builder.Clone(), bess::utils::MemoryRefused);
+  EXPECT_EQ(initial + growth.net, builder.bytes());
+
+  growth.allow = SIZE_MAX;
+  MustAdd(builder, 1);
+  EXPECT_TRUE(builder.Contains(MeterId(1)));
+  EXPECT_EQ(initial + growth.net, builder.bytes());
 }
 
 }  // namespace

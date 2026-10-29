@@ -701,12 +701,15 @@ TEST_F(PublishConformanceTest, MaskedRuleStagingFailureAtEveryAllocationLeavesNo
     std::optional<dataplane::Resource::Reservation> held;
     bool injected = false;
     bool threw = false;
+    std::string rejected;
     {
       fault_injection::AllocationFaults faults(k);
       try {
         auto reserved = masked_->Reserve(op);
         if (reserved) {
           held.emplace(std::move(*reserved));
+        } else {
+          rejected = std::move(reserved.error());
         }
       } catch (const std::bad_alloc &) {
         threw = true;
@@ -721,6 +724,8 @@ TEST_F(PublishConformanceTest, MaskedRuleStagingFailureAtEveryAllocationLeavesNo
     EXPECT_EQ(masked_table_->ids_in_use(), baseline_ids)
         << "a prepared rule leaked its arena id";
     EXPECT_EQ(MaskedEntries(), 0u) << "a pending entry was left in the table";
+    // A refused allocation is memory (D-198), never a rejected rule.
+    EXPECT_EQ(rejected, "") << "allocation " << k << " answered as a rejection";
     if (!injected) {
       EXPECT_FALSE(threw);
       return;

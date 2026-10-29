@@ -4,6 +4,7 @@
 #define BESS_L2_FDB_H_
 
 #include <array>
+#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include "dataplane/table_policy.h"
 #include "l2/mac_table.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::l2 {
 
@@ -116,7 +118,9 @@ concept FdbStorage = requires(T t, const T ct, uint64_t key, uint32_t slot,
   { t.cold(slot) } -> std::same_as<dataplane::ExpiryHandle &>;
   { ct.size() } -> std::same_as<size_t>;
   { ct.capacity() } -> std::same_as<size_t>;
-  { ct.memory_bytes() } -> std::same_as<size_t>;
+  { ct.bytes() } -> std::same_as<size_t>;
+  { T::Bytes(size_t{}) } -> std::same_as<size_t>;
+  { T::GlibcBytes(size_t{}) } -> std::same_as<size_t>;
   t.Lock();
   { t.TryLock() } -> std::same_as<std::optional<typename T::Guard>>;
   T::kNotFound;
@@ -191,6 +195,29 @@ class BasicFdb {
       return std::unexpected(CreateError::kOutOfMemory);
     }
     return fdb;
+  }
+
+  // What Create allocates (D-198), all of it glibc: the aging wheel, the
+  // table, one (empty) flood group per domain and the FDB itself, as bytes()
+  // counts them. Flood groups grow in SetFloodGroup (set_memory_growth).
+  static size_t Bytes(const Config &config) noexcept {
+    size_t table;
+    if constexpr (requires { Table::Bytes(config.capacity, config.hash_seed); }) {
+      table = Table::Bytes(config.capacity, config.hash_seed);
+    } else {
+      table = Table::Bytes(config.capacity);
+    }
+    return Wheel::Bytes(config.capacity, config.start, config.granularity_shift) +
+           table + config.max_domains * sizeof(FloodGroupList::value_type) +
+           sizeof(BasicFdb);
+  }
+  static size_t GlibcBytes(const Config &config) noexcept { return Bytes(config); }
+
+  // The admission a flood group asks before it grows (D-198): SetFloodGroup
+  // admits the members it adds room for, and refuses (utils::MemoryRefused)
+  // with the group unchanged when that is refused. Control path only.
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
+    growth_ = growth;
   }
 
   // -- lookup -------------------------------------------------------------------
@@ -363,7 +390,24 @@ class BasicFdb {
         return false;
       }
     }
-    flood_[domain.value()].assign(members.begin(), members.end());
+    auto &group = flood_[domain.value()];
+    // assign() reallocates to exactly members.size() when it does not fit.
+    const size_t grown = members.size() > group.capacity()
+                             ? (members.size() - group.capacity()) *
+                                   sizeof(dataplane::InterfaceId)
+                             : 0;
+    if (grown != 0 && growth_ != nullptr) {
+      growth_->Grow(grown, grown);
+    }
+    try {
+      group.assign(members.begin(), members.end());
+    } catch (...) {
+      if (grown != 0 && growth_ != nullptr) {
+        growth_->Shrink(grown, grown);
+      }
+      throw;
+    }
+    flood_member_bytes_.fetch_add(grown, std::memory_order_relaxed);
     return true;
   }
   // The flood group, empty for an unknown domain.
@@ -395,8 +439,12 @@ class BasicFdb {
   // The storage, for an owner that shares it (its readers) or holds its lock.
   Table &table() noexcept { return *table_; }
   size_t dynamic_entries() const noexcept { return wheel_->size(); }
-  size_t memory_bytes() const noexcept {
-    return table_->memory_bytes() + wheel_->memory_bytes() + sizeof(*this);
+  // Bytes the FDB holds (Bytes(config) after Create): the table, the wheel,
+  // the flood groups and the FDB itself.
+  size_t bytes() const noexcept {
+    return table_->bytes() + wheel_->bytes() +
+           flood_.size() * sizeof(FloodGroupList::value_type) +
+           flood_member_bytes_.load(std::memory_order_relaxed) + sizeof(*this);
   }
 
  private:
@@ -427,7 +475,12 @@ class BasicFdb {
   Tick aging_;
   size_t learn_limit_;
   uint32_t max_domains_;
-  std::vector<std::vector<dataplane::InterfaceId>> flood_;
+  using FloodGroupList = std::vector<std::vector<dataplane::InterfaceId>>;
+  FloodGroupList flood_;
+  // The flood groups' member storage (SetFloodGroup's growth); read by
+  // bytes() off the writer's thread.
+  std::atomic<size_t> flood_member_bytes_{0};
+  utils::MemoryGrowth *growth_ = nullptr;
   std::array<BridgeDomainId, 4096> vlan_domain_;
 };
 

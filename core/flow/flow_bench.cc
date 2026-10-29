@@ -256,15 +256,21 @@ void EnsureDpdk() {
   if (bess::IsDpdkInitialized()) return;
   if (std::getenv("FLOW_BENCH_LARGE") != nullptr) {
     // A 10M-flow SharedFlowTable needs about 1.8 GB of EAL heap, more than a
-    // host with one 1 GB hugepage has: use the no-hugepage heap, 3000 MB unless
-    // the caller chose a size (BESS_DPDK_NOHUGE_MB). Untouched pages cost no RAM.
-    // This backs every EAL-backed row of a LARGE run with 4 KB pages, so a
-    // LARGE run compares only with another LARGE run (docs/benchmarking.md).
-    setenv("BESS_DPDK_NOHUGE_MB", "3000", 0);
-    bess::InitDpdk(0);
+    // host with one 1 GB hugepage has: use normal pages and a 3000 MB heap
+    // (the heap is the memory limit less the reserve, D-198) unless the
+    // caller chose BESSD_MEM_* itself. Untouched pages cost no RAM. This
+    // backs every EAL-backed row of a LARGE run with 4 KB pages, so a LARGE
+    // run compares only with another LARGE run (docs/benchmarking.md).
+    setenv("BESSD_MEM_BACKING", "normal", 0);
+    setenv("BESSD_MEM_LIMIT_MB", "3000", 0);
+    setenv("BESSD_MEM_RESERVE_MB", "0", 0);
+    bess::InitDpdk();
     return;
   }
-  bess::InitDpdk(2048);
+  // Hugepages, at most 2048 MB, unless the caller chose BESSD_MEM_* itself.
+  setenv("BESSD_MEM_BACKING", "hugepages", 0);
+  setenv("BESSD_MEM_HUGEPAGE_MB", "2048", 0);
+  bess::InitDpdk();
 }
 
 // Only one fixture lives at a time: a 1M-flow table of any one shape is
@@ -326,7 +332,7 @@ void BM_WorkerLookup(benchmark::State& state) {
   auto& table = *fixture.table;
   const std::vector<K> stream = BuildStream<K>(dist, n);
   const double bytes_per_flow =
-      static_cast<double>(table.memory_bytes()) / static_cast<double>(table.capacity()) +
+      static_cast<double>(table.bytes()) / static_cast<double>(table.capacity()) +
       (std::is_same_v<S, IndirectState> ? sizeof(Record256) : 0);
 
   S* out[64];
@@ -429,7 +435,7 @@ void BM_BaselineCuckoo(benchmark::State& state) {
   const uint64_t ticks = Tsc() - t0;
   benchmark::DoNotOptimize(sum);
   Report(state, state.iterations() * batch, ticks, hits,
-         static_cast<double>(map->MemoryBytes()) / static_cast<double>(n));
+         static_cast<double>(map->bytes()) / static_cast<double>(n));
 }
 
 // rte_hash in position mode (no concurrency flags, default CRC hash), State in
@@ -732,7 +738,7 @@ void BM_WorkerChurn(benchmark::State& state) {
   state.counters["Mcreate_erase_pairs_s"] =
       benchmark::Counter(static_cast<double>(steps) * 1e-6, benchmark::Counter::kIsRate);
   state.counters["bytes_per_flow"] =
-      static_cast<double>(table.memory_bytes()) / static_cast<double>(table.capacity());
+      static_cast<double>(table.bytes()) / static_cast<double>(table.capacity());
 }
 
 template <typename K, typename S>
@@ -823,7 +829,7 @@ void BM_AliasLookup(benchmark::State& state) {
     for (uint64_t id = 0; id < n; id++) {
       one->EmplaceAliased(MakeKey<K>(id), MakeKey<K>(n + id), id);
     }
-    bytes = static_cast<double>(one->memory_bytes()) / static_cast<double>(n);
+    bytes = static_cast<double>(one->bytes()) / static_cast<double>(n);
   } else {
     fwd = std::move(*Plain::Create(n));
     rev = std::move(*Reverse::Create(n));
@@ -831,7 +837,7 @@ void BM_AliasLookup(benchmark::State& state) {
       StateN<32>* conn = fwd->Emplace(MakeKey<K>(id), id).state;
       rev->Emplace(MakeKey<K>(n + id), conn);
     }
-    bytes = static_cast<double>(fwd->memory_bytes() + rev->memory_bytes()) /
+    bytes = static_cast<double>(fwd->bytes() + rev->bytes()) /
             static_cast<double>(n);
   }
   std::mt19937_64 rng(3);
@@ -1060,7 +1066,7 @@ void BM_SharedReaders(benchmark::State& state) {
     for (uint64_t id = 0; id < n; id++) {
       parts[id % static_cast<size_t>(readers)]->Emplace(MakeKey<SharedKey>(id), id);
     }
-    slab_bytes_per_flow = static_cast<double>(parts[0]->memory_bytes()) /
+    slab_bytes_per_flow = static_cast<double>(parts[0]->bytes()) /
                           static_cast<double>(parts[0]->capacity());
   }
 

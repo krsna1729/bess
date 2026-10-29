@@ -201,6 +201,15 @@ class ExactMatchTable {
 
   size_t Size() const { return table_.Count(); }
 
+  // Memory (D-198): the rule map's, all glibc (CuckooMap::Bytes); it grows
+  // with AddRule, each growth admitted through set_memory_growth's hook.
+  static size_t Bytes() { return EmTable::Bytes(); }
+  static size_t GlibcBytes() { return EmTable::GlibcBytes(); }
+  size_t bytes() const noexcept { return table_.bytes(); }
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
+    table_.set_memory_growth(growth);
+  }
+
   // Extract an ExactMatchKey from `buf` based on the fields that have been
   // added to this table.
   ExactMatchKey MakeKey(const void *buf) const {

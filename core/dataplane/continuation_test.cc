@@ -25,6 +25,7 @@
 
 #include "dataplane/expiry_wheel.h"
 #include "dataplane/interface_id.h"
+#include "framework/memory_scope.h"
 #include "testing/allocation_faults.h"
 
 namespace bess::dataplane {
@@ -103,6 +104,19 @@ TEST(ContinuationTableTest, CreateRefusesBadCapacities) {
   EXPECT_EQ(0u, (*one)->size());
   EXPECT_NE(std::string(ToString(ContinuationError::kOutOfMemory)),
             std::string(ToString(ContinuationError::kInvalidCapacity)));
+}
+
+// What Create allocates (all glibc) is what the table reports (D-198).
+TEST(ContinuationTableTest, BytesMatchesCreate) {
+  for (size_t capacity : {size_t{1}, size_t{64}, size_t{10000}}) {
+    auto table = Make(capacity);
+    EXPECT_EQ(bess::framework::MemoryCost<Table>::Bytes(capacity),
+              table->bytes());
+    EXPECT_EQ(bess::framework::MemoryCost<Table>::Bytes(capacity),
+              bess::framework::MemoryCost<Table>::GlibcBytes(capacity));
+    EXPECT_EQ((capacity + 1) * Table::slot_bytes() + sizeof(Table),
+              Table::Bytes(capacity));
+  }
 }
 
 // -- lifecycle ----------------------------------------------------------------------

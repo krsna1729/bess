@@ -65,6 +65,16 @@ class CounterSet {
   CounterSet(const CounterSet &) = delete;
   CounterSet &operator=(const CounterSet &) = delete;
 
+  // What the constructor allocates (D-198): the worker slots (DPDK) and the
+  // Reset baseline, one word per worker and counter (glibc). The names are
+  // the caller's and not counted.
+  static size_t Bytes(const std::vector<std::string> &names) noexcept {
+    return WorkerSlots::Bytes(names.size()) + GlibcBytes(names);
+  }
+  static size_t GlibcBytes(const std::vector<std::string> &names) noexcept {
+    return BaselineBytes(names.size());
+  }
+
   size_t size() const noexcept { return names_.size(); }
   const std::vector<std::string> &names() const noexcept { return names_; }
 
@@ -100,9 +110,16 @@ class CounterSet {
   CounterSnapshot Snapshot(bool per_worker = false) const;
   void Reset();
 
-  size_t storage_bytes() const noexcept { return slots_.bytes(); }
+  // What the set holds: Bytes(names()), fixed for its life.
+  size_t bytes() const noexcept {
+    return slots_.bytes() + BaselineBytes(names_.size());
+  }
 
  private:
+  static constexpr size_t BaselineBytes(size_t counters) noexcept {
+    return dataplane::kMaxWorkers * counters * sizeof(uint64_t);
+  }
+
   // Raw per-worker cells, workers x counters.
   std::vector<uint64_t> ReadAll() const;
 

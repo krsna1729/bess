@@ -171,7 +171,10 @@ class ExactMatch final : public Module {
   // size against the configuration.
   Error PackKey(const std::vector<std::vector<uint8_t>> &fields,
                 std::vector<std::byte> *key) const;
-  // A new, empty table sized for `rules` entries plus headroom (D-010).
+  // A new, empty table sized for `rules` entries plus headroom (D-010),
+  // admitted as "rules" before it is built (D-198; refusal throws
+  // MemoryRefused). The returned pointer owns the admission too: it is
+  // released when the last generation mapping the table is reclaimed.
   std::expected<std::shared_ptr<bess::classifier::ConcurrentExactTable>, Error>
   NewTable(size_t rules) const;
   // A table for at least `rules` rules, filled by `fill` (false = an insert

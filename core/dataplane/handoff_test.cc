@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include "dataplane/continuation.h"
+#include "framework/memory_scope.h"
 #include "packet.h"
 #include "packet_pool.h"
 #include "testing/allocation_faults.h"
@@ -756,6 +757,7 @@ TEST(HandoffCreateTest, RefusesBadCapacitiesBeforeAllocatingAnything) {
     EXPECT_EQ(HandoffCreateError::kInvalidCapacity, created.error());
   }
   EXPECT_EQ(0, TestAllocator::allocations);
+  EXPECT_EQ(0u, HandoffChannel<Ctx8>::Bytes(config)) << "nothing to admit";
   EXPECT_NE(std::string(ToString(HandoffCreateError::kOutOfMemory)),
             std::string(ToString(HandoffCreateError::kInvalidCapacity)));
   EXPECT_NE(std::string(ToString(HandoffError::kFull)),
@@ -783,13 +785,32 @@ TEST(HandoffCreateTest, AllocatorRefusalIsAnErrorAndAllocationIsOneBlock) {
     ASSERT_TRUE(created.has_value());
     EXPECT_EQ(2, TestAllocator::allocations) << "one block per channel";
     EXPECT_EQ(0, TestAllocator::deallocations);
-    EXPECT_EQ(TestAllocator::last_bytes, (*created)->memory_bytes());
-    EXPECT_GE((*created)->memory_bytes(),
+    EXPECT_EQ(TestAllocator::last_bytes, (*created)->bytes());
+    EXPECT_GE((*created)->bytes(),
               size_t{64} * (HandoffChannel<Ctx8, kMpSc>::kItemBytes));
     EXPECT_EQ(64u, (*created)->capacity());
   }
   EXPECT_EQ(2, TestAllocator::allocations);
   EXPECT_EQ(1, TestAllocator::deallocations) << "one block freed, none leaked";
+}
+
+// What Create allocates -- the one block -- is what Bytes says and what the
+// channel reports (D-198).
+TEST(HandoffCreateTest, BytesMatchesCreate) {
+  TestAllocator::Reset();
+  HandoffConfig config;
+  config.allocator = &TestAllocator::Get();
+  for (const size_t capacity : {size_t{1}, size_t{64}, size_t{1000}}) {
+    config.capacity = capacity;
+    using Channel = HandoffChannel<Ctx16, kMpMc>;
+    auto created = Channel::Create(config);
+    ASSERT_TRUE(created.has_value());
+    EXPECT_EQ(bess::framework::MemoryCost<Channel>::Bytes(config),
+              (*created)->bytes());
+    EXPECT_EQ(TestAllocator::last_bytes, Channel::Bytes(config));
+  }
+  EXPECT_EQ(HandoffChannel<Ctx8>::Create().value()->bytes(),
+            HandoffChannel<Ctx8>::Bytes());
 }
 
 // Creation has exactly one failure point, the allocator seam above (refused
@@ -846,7 +867,7 @@ TEST(HandoffCreateTest, PlacementReportsWhereTheMemoryLanded) {
   ASSERT_TRUE(any.has_value());
   EXPECT_EQ(-1, (*any)->placement().requested_socket);
   EXPECT_FALSE((*any)->placement().misplaced());
-  EXPECT_EQ((*any)->memory_bytes(), (*any)->placement().bytes);
+  EXPECT_EQ((*any)->bytes(), (*any)->placement().bytes);
 }
 
 TEST(HandoffCreateTest, DefaultAllocatorPlacesOnTheDpdkHeapAndAdmitsAFallback) {
@@ -857,7 +878,7 @@ TEST(HandoffCreateTest, DefaultAllocatorPlacesOnTheDpdkHeapAndAdmitsAFallback) {
   EXPECT_GE((*local)->placement().placed_socket, 0)
       << "DPDK's heap knows which node it gave";
   EXPECT_FALSE((*local)->placement().misplaced());
-  EXPECT_GE((*local)->memory_bytes(), 256 * sizeof(PuntItem<Ctx16>));
+  EXPECT_GE((*local)->bytes(), 256 * sizeof(PuntItem<Ctx16>));
 
   // This machine has one node: a request for another one is served from the
   // heap that exists, and the channel says it was not placed as asked.

@@ -26,7 +26,6 @@
 #include "runtime/runtime_state.h"
 #include "runtime/numa_placement.h"
 #include "runtime/worker_manager.h"
-#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "worker.h"
@@ -63,7 +62,7 @@ void InitRuntimeOnce() {
     return;
   }
   initialized = true;
-  FLAGS_m = 0;  // malloc-backed, sandbox-safe
+  // The library default (D-198): normal pages, malloc-backed, sandbox-safe.
   bess::PacketPool::CreateDefaultPools(32767);
   PortBuilder::InitDrivers();
 }
@@ -116,7 +115,7 @@ TEST(ThreadPlacementTest, LazyEalBringUpKeepsTheInheritedSet) {
 // one normal-page heap is socket 0, so every table asks for socket 0 there
 // and its allocation succeeds.
 TEST(ThreadPlacementTest, WithoutHugepagesTablesAllocateOnSocketZero) {
-  InitRuntimeOnce();  // FLAGS_m = 0: --no-huge
+  InitRuntimeOnce();  // the library default, normal pages: --no-huge
   ASSERT_EQ(0, rte_eal_has_hugepages());
   EXPECT_EQ(0, bess::utils::MemoryNode());
   void *p = bess::utils::DpdkAllocate(4096, 64);

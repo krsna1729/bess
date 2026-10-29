@@ -16,6 +16,7 @@
 #include <bit>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <stack>
 #include <type_traits>
 #include <utility>
@@ -27,6 +28,7 @@
 #include "common.h"
 #include "dataplane/batch_tuning.h"
 #include "stacktrace.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess {
 namespace utils {
@@ -336,9 +338,11 @@ class CuckooMap {
   // changes afterwards -- including inserts that reallocate.
   template <typename KeyRange>
   void PrefetchBatch(const KeyRange& keys, const H& hasher = H()) const {
+    // What a lookup's misses spread over: the buckets and entries in use.
     const bess::dataplane::LookupBody body = bess::dataplane::ResolveLookupBody(
         bess::dataplane::LookupBody::kAuto,
-        {.table_bytes = MemoryBytes(),
+        {.table_bytes = buckets_.size() * sizeof(Bucket) +
+                        entries_.size() * sizeof(Entry),
          .dependent_lines = 2,
          .branches_on_loaded_data = true});
     if (body != bess::dataplane::LookupBody::kStaged) {
@@ -349,15 +353,37 @@ class CuckooMap {
     }
   }
 
-  // Bytes of bucket and entry storage: what a lookup's misses spread over.
-  size_t MemoryBytes() const {
-    return buckets_.size() * sizeof(Bucket) + entries_.size() * sizeof(Entry);
+  // Memory (D-198), all glibc: the bucket array, the entry array and the
+  // free-entry stack, counted at one index per entry slot (its size when
+  // every slot is free). The constructor allocates Bytes(reserve_buckets,
+  // reserve_entries); Insert grows it on the control path (ExpandEntries,
+  // ExpandBuckets), each growth admitted through set_memory_growth's hook
+  // before it is allocated. Clear keeps the arrays' capacity.
+  static size_t Bytes(size_t reserve_buckets = kInitNumBucket,
+                      size_t reserve_entries = kInitNumEntries) {
+    return reserve_buckets * sizeof(Bucket) +
+           reserve_entries * EntrySlotBytes();
   }
+  static size_t GlibcBytes(size_t reserve_buckets = kInitNumBucket,
+                           size_t reserve_entries = kInitNumEntries) {
+    return Bytes(reserve_buckets, reserve_entries);
+  }
+  // Held now (the arrays' capacity).
+  size_t bytes() const noexcept {
+    return buckets_.capacity() * sizeof(Bucket) +
+           entries_.capacity() * EntrySlotBytes();
+  }
+  // Without a hook (nullptr) the map grows unadmitted. Moves with the map.
+  void set_memory_growth(MemoryGrowth* growth) noexcept { growth_ = growth; }
 
  protected:
   // Tunable macros
   static const int kInitNumBucket = 4;
   static const int kInitNumEntries = 16;
+  // An entry slot: the entry and its index on the free-entry stack.
+  static constexpr size_t EntrySlotBytes() noexcept {
+    return sizeof(Entry) + sizeof(EntryIndex);
+  }
   static const int kEntriesPerBucket = detail::kCuckooHashSlots;
 
   // 4^kMaxCuckooPath buckets will be considered to make a empty slot,
@@ -632,11 +658,34 @@ class CuckooMap {
     return eq(lhs, rhs);
   }
 
+  void AdmitGrowth(size_t bytes) {
+    if (growth_ != nullptr) {
+      growth_->Grow(bytes, bytes);
+    }
+  }
+  void ReleaseGrowth(size_t bytes) noexcept {
+    if (growth_ != nullptr) {
+      growth_->Shrink(bytes, bytes);
+    }
+  }
+
   // Resize the space of entries. Grow less aggressively than buckets.
+  // Reserved to exactly the new size, so the growth admitted first is the
+  // growth allocated (D-198). Throws MemoryRefused, unchanged, when refused.
   void ExpandEntries() {
     size_t old_size = entries_.size();
     size_t new_size = old_size + old_size / 2;
 
+    if (new_size > entries_.capacity()) {
+      const size_t delta = (new_size - entries_.capacity()) * EntrySlotBytes();
+      AdmitGrowth(delta);
+      try {
+        entries_.reserve(new_size);
+      } catch (...) {
+        ReleaseGrowth(delta);
+        throw;
+      }
+    }
     entries_.resize(new_size);
 
     for (EntryIndex i = new_size - 1; i >= old_size; --i) {
@@ -644,25 +693,45 @@ class CuckooMap {
     }
   }
 
-  // Resize the space of buckets, and rehash existing entries
+  // Resize the space of buckets, and rehash existing entries.
+  // The bigger map is admitted whole before it is built (old and new exist
+  // side by side while entries move over), its own growth meanwhile (a
+  // recursive expansion) through the same hook; the map dropped gives its
+  // bytes back. Throws MemoryRefused, unchanged, when the map is refused.
   template <typename VV>
   void ExpandBuckets(const H& hasher, const E& eq) {
-    CuckooMap<K, V, H, E> bigger(buckets_.size() * 2, entries_.size());
+    const size_t bigger_bytes = Bytes(buckets_.size() * 2, entries_.size());
+    AdmitGrowth(bigger_bytes);
+    std::optional<CuckooMap<K, V, H, E>> bigger;
+    try {
+      bigger.emplace(buckets_.size() * 2, entries_.size());
+    } catch (...) {
+      ReleaseGrowth(bigger_bytes);
+      throw;
+    }
+    bigger->growth_ = growth_;
 
-    for (auto& e : *this) {
-      // While very unlikely, this DoEmplace() may cause recursive expansion
-      Entry* ret =
-          bigger.DoEmplace(e.first, hasher, eq, std::forward<VV>(e.second));
-      if (!ret) {
-        return;
+    try {
+      for (auto& e : *this) {
+        // While very unlikely, this DoEmplace() may cause recursive expansion
+        Entry* ret =
+            bigger->DoEmplace(e.first, hasher, eq, std::forward<VV>(e.second));
+        if (!ret) {
+          ReleaseGrowth(bigger->bytes());
+          return;
+        }
       }
+    } catch (...) {
+      ReleaseGrowth(bigger->bytes());
+      throw;
     }
 
-    bucket_mask_ = std::move(bigger.bucket_mask_);
-    num_entries_ = bigger.num_entries_;
-    buckets_ = std::move(bigger.buckets_);
-    entries_ = std::move(bigger.entries_);
-    free_entry_indices_ = std::move(bigger.free_entry_indices_);
+    ReleaseGrowth(bytes());  // the storage the moves below free
+    bucket_mask_ = std::move(bigger->bucket_mask_);
+    num_entries_ = bigger->num_entries_;
+    buckets_ = std::move(bigger->buckets_);
+    entries_ = std::move(bigger->entries_);
+    free_entry_indices_ = std::move(bigger->free_entry_indices_);
   }
 
   // # of buckets == mask + 1
@@ -677,6 +746,9 @@ class CuckooMap {
 
   // Stack of free entries
   std::stack<EntryIndex> free_entry_indices_;
+
+  // Admits growth (set_memory_growth); nullptr: none.
+  MemoryGrowth* growth_ = nullptr;
 };
 
 }  // namespace utils

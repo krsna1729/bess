@@ -29,7 +29,6 @@
 #include "runtime/runtime_state.h"
 #include "runtime/numa_placement.h"
 #include "runtime/simd_width.h"
-#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "dataplane/resource.h"
@@ -53,7 +52,7 @@ void InitRuntimeOnce() {
     return;
   }
   initialized = true;
-  FLAGS_m = 0;  // malloc-backed, sandbox-safe
+  // The library default (D-198): normal pages, malloc-backed, sandbox-safe.
   bess::PacketPool::CreateDefaultPools(32767);
   PortBuilder::InitDrivers();
 }
@@ -1335,6 +1334,21 @@ TEST_F(ApiV2ServiceTest, ResourceObservationsReportEntriesCapacityAndPacketDrops
   ASSERT_NE(nullptr, drops);
   EXPECT_EQ(v2::MetricSample::KIND_COUNTER, drops->kind());
   EXPECT_EQ(3.0, drops->value());
+  // What each module admitted before it allocated (D-198): L2Forward's MAC
+  // table and ExactMatch's table, under the modules' names, with what the
+  // objects hold now.
+  for (const char *module : {"l2", "em"}) {
+    uint64_t admitted = 0, current = 0;
+    for (const v2::ModuleMemory &use : resp.memory().modules()) {
+      EXPECT_FALSE(use.resource().empty());
+      if (use.module() == module) {
+        admitted += use.admitted_bytes();
+        current += use.current_bytes();
+      }
+    }
+    EXPECT_NE(0u, admitted) << module << " admitted its table";
+    EXPECT_NE(0u, current) << module << " holds its table";
+  }
 }
 
 // An action not marked thread-safe is refused (EBUSY) while a worker runs

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // R1's application without bessd (D-095, Appendix J "direct appliance build
-// does not require framework"): RouterApp (examples/appliances/router) over
-// BESS's router, linked from the installed static archives (bess-dev-static)
-// and DPDK. No daemon, no Module, no framework: a program owns its RCU domain
-// and calls the application on frames. The EAL comes up on the first table's
-// creation, without hugepages (512 MB of normal pages).
+// does not require framework services"): RouterApp (examples/appliances/router)
+// over BESS's router, linked from the installed static archives
+// (bess-dev-static) and DPDK. No daemon or Module: a program owns its RCU
+// domain and memory scope and calls the application on frames. The EAL comes
+// up on the first table's creation, without hugepages (512 MB of normal pages).
 //
 // One thread reads and writes here, so the domain needs no reader: every
 // grace period is complete at once. A program with packet threads registers
@@ -14,8 +14,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "rcu/rcu_domain.h"
 #include "router/router_app.h"
 
@@ -47,8 +49,12 @@ int Fail(const char *what) {
 
 int main() {
   bess::rcu::RcuDomain rcu(/*max_readers=*/1);
+  // The program's memory account (D-198): the router is admitted here before
+  // it is allocated, and released when the app is destroyed.
+  const std::string owner = "static_router";
+  bess::framework::MemoryScope memory(&owner);
   {
-    auto made = RouterApp::Create(rcu);
+    auto made = RouterApp::Create(rcu, memory);
     if (!made) {
       std::fprintf(stderr, "static_router: %s\n", made.error().c_str());
       return 1;

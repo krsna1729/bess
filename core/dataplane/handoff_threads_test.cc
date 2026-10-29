@@ -573,7 +573,7 @@ TEST(HandoffThreadsTest, ConsumerThatNeverDrainsBoundsTheQueueAndTeardownFreesIt
   Env env(1024);
   Ledger ledger(kProducers, kPerProducer);
   auto channel = MakeChannel<kMpSc>(kCapacity);
-  const size_t bytes = channel->memory_bytes();
+  const size_t bytes = channel->bytes();
   const Deadline deadline;
   std::vector<ProducerResult> produced(kProducers);
   {
@@ -600,7 +600,7 @@ TEST(HandoffThreadsTest, ConsumerThatNeverDrainsBoundsTheQueueAndTeardownFreesIt
   EXPECT_EQ(kCapacity, stats.enqueued);
   EXPECT_EQ(dropped, stats.refused_full) << "every refusal was counted";
   EXPECT_EQ(0u, stats.dequeued);
-  EXPECT_EQ(bytes, channel->memory_bytes()) << "no growth";
+  EXPECT_EQ(bytes, channel->bytes()) << "no growth";
   EXPECT_EQ(kCapacity, env.Outstanding()) << "only the queued packets are out";
   channel.reset();
   EXPECT_EQ(0u, env.Outstanding()) << "teardown freed what was queued";

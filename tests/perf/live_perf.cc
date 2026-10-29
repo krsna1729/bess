@@ -1399,8 +1399,8 @@ std::map<std::string, Sample> RunRound(const BuildSpec &spec, const std::vector<
   } else if (const char *ld2 = std::getenv("LD_LIBRARY_PATH")) {
     cmd.push_back(std::string("LD_LIBRARY_PATH=") + ld2);
   }
-  cmd.insert(cmd.end(), {spec.bessd, "-f", "-p", std::to_string(port), "--skip_root_check", "-m",
-                         "0", "-i", pidfile, "-c", std::to_string(o.cpus.back())});
+  cmd.insert(cmd.end(), {spec.bessd, "-f", "-p", std::to_string(port), "--skip_root_check",
+                         "--mem_backing=normal", "-i", pidfile, "-c", std::to_string(o.cpus.back())});
   cmd.insert(cmd.end(), spec.flags.begin(), spec.flags.end());
   if (!o.plugin.empty()) {
     cmd.push_back("--modules=" + o.plugin);
@@ -1466,7 +1466,9 @@ std::map<std::string, Sample> RunRound(const BuildSpec &spec, const std::vector<
 // 'current' (the bessd of this build directory), 'current:<tree>[:<builddir>
 // [:<bessd flags, comma-separated>]]' (builddir default build/perf-release;
 // the same binary under other flags is a build of its own), or
-// 'name=<bessd>[,flag...]'.
+// 'name=<bessd>[,flag...]'. The daemon starts with --mem_backing=normal; build
+// flags come after it, so e.g. 'huge=<bessd>,--mem_backing=hugepages,
+// --mem_hugepage_mb=1024' overrides it.
 BuildSpec ParseBuild(const std::string &text) {
   if (text == "current") {
     const fs::path self = fs::read_symlink("/proc/self/exe");

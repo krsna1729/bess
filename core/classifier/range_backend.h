@@ -150,6 +150,31 @@ class ScalarRangeBackend {
 
   [[nodiscard]] size_t size() const noexcept { return rules_.size(); }
 
+  // Memory (D-198), all glibc: the rule array and each rule's value and
+  // mask, which the constructor takes over from `rules` with their capacity
+  // (exact when `rules` is moved in; an upper bound when it is copied, as a
+  // copy holds only the size). Immutable once built.
+  static size_t Bytes(const std::vector<RangeRule<Result, Priority>> &rules) {
+    size_t total = rules.size() * sizeof(RuleEntry);
+    for (const auto &r : rules) {
+      total += r.value.capacity() + r.mask.capacity();
+    }
+    return total;
+  }
+  static size_t GlibcBytes(
+      const std::vector<RangeRule<Result, Priority>> &rules) {
+    return Bytes(rules);
+  }
+  [[nodiscard]] size_t bytes() const noexcept { return EntriesBytes(rules_); }
+  // The bytes held by an array of rule entries and their values and masks.
+  static size_t EntriesBytes(const std::vector<RuleEntry> &entries) noexcept {
+    size_t total = entries.capacity() * sizeof(RuleEntry);
+    for (const RuleEntry &e : entries) {
+      total += e.value.capacity() + e.mask.capacity();
+    }
+    return total;
+  }
+
  private:
   std::vector<RuleEntry> rules_;
 };
@@ -262,6 +287,28 @@ class RangeClassifier {
   }
 
   [[nodiscard]] size_t size() const noexcept { return rules_.size(); }
+
+  // Memory (D-198), all glibc: two copies of the rules -- the reference's
+  // (copied, so exactly their sizes) and the fast path's, which takes over
+  // the values and masks of `rules` with their capacity (exact when `rules`
+  // is moved in, an upper bound when copied). Immutable once built.
+  static size_t Bytes(const std::vector<RangeRule<Result, Priority>> &rules) {
+    using Entry = typename ScalarRangeBackend<Result, Priority>::RuleEntry;
+    size_t total = 2 * rules.size() * sizeof(Entry);
+    for (const auto &r : rules) {
+      total += r.value.size() + r.mask.size() + r.value.capacity() +
+               r.mask.capacity();
+    }
+    return total;
+  }
+  static size_t GlibcBytes(
+      const std::vector<RangeRule<Result, Priority>> &rules) {
+    return Bytes(rules);
+  }
+  [[nodiscard]] size_t bytes() const noexcept {
+    return reference_.bytes() +
+           ScalarRangeBackend<Result, Priority>::EntriesBytes(rules_);
+  }
 
  private:
   ScalarRangeBackend<Result, Priority> reference_;

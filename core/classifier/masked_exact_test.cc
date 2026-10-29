@@ -348,4 +348,21 @@ TEST(MaskedExactTest, MaskKernelMatchesByteWiseReferenceForEveryWidth) {
   }
 }
 
+// D-198: an empty backend holds nothing; a built one its candidates, tuples,
+// masks and each tuple's cuckoo storage.
+TEST(MaskedExactTest, BytesCoversEveryTuple) {
+  EXPECT_EQ(0u, Backend().bytes());
+  RuleSet one;
+  one.Add({0x12, 0x34}, {0xff, 0xff}, 1, 100u);
+  RuleSet two;
+  two.Add({0x12, 0x34}, {0xff, 0xff}, 1, 100u)
+      .Add({0x10, 0x00}, {0xf0, 0x00}, 2, 200u);
+  auto single = Backend::Build(2, one.rules());
+  auto pair = Backend::Build(2, two.rules());
+  ASSERT_TRUE(single.has_value());
+  ASSERT_TRUE(pair.has_value());
+  EXPECT_GT(single->bytes(), 0u);
+  EXPECT_GT(pair->bytes(), single->bytes());
+}
+
 }  // namespace

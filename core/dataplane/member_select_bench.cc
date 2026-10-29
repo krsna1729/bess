@@ -134,24 +134,24 @@ void BM_Select(benchmark::State &state) {
   size_t bytes = 0;
   if (kind == 0) {
     RangeSelector s{static_cast<uint32_t>(n)};
-    bytes = s.memory_bytes();
+    bytes = s.bytes();
     loop(s);
   } else if (kind == 1) {
     auto s = WeightedSelector::Build(Weights(n)).value();
-    bytes = s.memory_bytes();
+    bytes = s.bytes();
     loop(s);
   } else if (kind == 2 || kind == 3) {
     auto s = kind == 2 ? MaglevSelector::Build(Keys(n)).value()
                        : MaglevSelector::Build(Keys(n), NextPrime(static_cast<uint32_t>(101 * n))).value();
-    bytes = s.memory_bytes();
+    bytes = s.bytes();
     loop(s);
   } else if (kind == 4) {
     auto s = RendezvousSelector::Build(Keys(n)).value();
-    bytes = s.memory_bytes();
+    bytes = s.bytes();
     loop(s);
   } else {
     uint32_t out[32];
-    bytes = MaglevSelector::Build(Keys(n)).value().memory_bytes();
+    bytes = MaglevSelector::Build(Keys(n)).value().bytes();
     for (auto _ : state) {
       any.SelectBatch(std::span<const uint32_t>(&hashes[pos], 32), out);
       sink += out[0] + out[31];

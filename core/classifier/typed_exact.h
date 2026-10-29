@@ -15,6 +15,10 @@
 
 #include "utils/common.h"
 
+namespace bess::utils {
+class MemoryGrowth;
+}  // namespace bess::utils
+
 namespace bess::classifier {
 
 namespace detail {
@@ -129,6 +133,20 @@ class ExactTable {
 
   [[nodiscard]] size_t size() const noexcept {
     return static_cast<size_t>(backend_.size());
+  }
+
+  // Memory (D-198): the backend's; the wrapper allocates nothing.
+  [[nodiscard]] size_t bytes() const noexcept
+    requires requires(const Backend &b) { b.bytes(); }
+  {
+    return backend_.bytes();
+  }
+  void set_memory_growth(bess::utils::MemoryGrowth *growth) noexcept
+    requires requires(Backend &b, bess::utils::MemoryGrowth *g) {
+      b.set_memory_growth(g);
+    }
+  {
+    backend_.set_memory_growth(growth);
   }
 
   [[nodiscard]] const Backend &backend() const noexcept { return backend_; }

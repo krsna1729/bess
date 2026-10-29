@@ -57,7 +57,7 @@ class RouterAppliance final : public Module {
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
-    auto made = RouterApp::Create(init_context().rcu());
+    auto made = RouterApp::Create(init_context().rcu(), init_context().memory());
     if (!made) {
       return CommandFailure(EINVAL, "%s", made.error().c_str());
     }
@@ -90,9 +90,10 @@ class RouterAppliance final : public Module {
   }
 
   // On a private RouterApp: the self test moves a neighbor, which must not
-  // change what the module forwards.
+  // change what the module forwards. The private router is admitted to the
+  // module's memory too and released when it is dropped at return.
   CommandResponse CommandSelfTest(const bess::pb::EmptyArg &) {
-    auto made = RouterApp::Create(init_context().rcu());
+    auto made = RouterApp::Create(init_context().rcu(), init_context().memory());
     if (!made) {
       return CommandFailure(EINVAL, "%s", made.error().c_str());
     }
@@ -183,7 +184,7 @@ const Commands RouterAppliance::cmds = {
      Command::THREAD_UNSAFE},  // the private RouterApp is destroyed with workers paused
 };
 
-BESS_PLUGIN_REQUIRES("router_appliance", "1.0.0", BESS_CAP_INIT_CONTEXT);
+BESS_PLUGIN_REQUIRES("router_appliance", "1.0.0", BESS_CAP_INIT_CONTEXT | BESS_CAP_MEMORY);
 
 ADD_MODULE(RouterAppliance, "router_appliance",
            "Reference appliance R1: VRFs, ECMP and neighbors over BESS's route library")

@@ -11,6 +11,7 @@
 #include <memory>
 
 #include "flow/worker_flow_table.h"
+#include "framework/memory_scope.h"
 #include "framework/plugin.h"
 #include "module.h"
 
@@ -52,11 +53,12 @@ class StandaloneFlowCount final : public Module {
   StandaloneFlowCount() { max_allowed_workers_ = 1; }
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
+    auto lease = init_context().memory().LeaseFor<Table>("flows", 4096);
     auto table = Table::Create(4096);
     if (!table) {
       return CommandFailure(ENOMEM, "flow table");
     }
-    table_ = std::move(*table);
+    table_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*table));
     return CommandSuccess();
   }
 
@@ -86,7 +88,7 @@ class StandaloneFlowCount final : public Module {
   }
 
  private:
-  std::unique_ptr<Table> table_;
+  bess::framework::Sized<Table> table_;
 };
 
 const Commands StandaloneFlowCount::cmds = {};

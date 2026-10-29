@@ -13,9 +13,9 @@
 //     from it, i.e. a self-loopback. Measures a full TX->RX round trip
 //     through real rte_eth_rx/tx_burst calls.
 //
-// EAL is initialized with InitDpdk(0) (--no-huge, malloc-backed), the same
-// no-hugepage fallback `bessd -m 0` uses, so this runs in the sandbox and
-// in CI. Default pools are PlainPacketPool for the same reason; absolute
+// EAL is initialized with InitDpdk() (--no-huge, malloc-backed: the library
+// default), as `bessd --mem_backing=normal` runs, so this runs in the sandbox
+// and in CI. Default pools are PlainPacketPool for the same reason; absolute
 // Mpps here is not comparable to hugepage-backed production numbers, but
 // *relative* comparisons between runs of this binary (the actual use case:
 // before/after a refactor, same machine) are valid.
@@ -44,7 +44,6 @@
 #include <vector>
 
 #include "drivers/pmd.h"
-#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "pktbatch.h"
 #include "port.h"
@@ -61,9 +60,8 @@ struct PmdFixture {
   PMDPort ring_port;
 
   PmdFixture() {
-    // Sandbox-safe EAL: --no-huge, malloc-backed (bessd -m 0 equivalent).
-    // FLAGS_m = 0 makes CreateDefaultPools() pick PlainPacketPool.
-    FLAGS_m = 0;
+    // Sandbox-safe EAL: --no-huge, malloc-backed (`bessd --mem_backing=normal`;
+    // the library default), so CreateDefaultPools() picks PlainPacketPool.
     bess::PacketPool::CreateDefaultPools(kPoolCapacity);
 
     InitPort(&null_port, "net_null0");

@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "rcu/rcu_domain.h"
 #include "testing/allocation_faults.h"
 
@@ -99,6 +100,21 @@ TEST_F(SharedFlowTableTest, CreateFindEraseWithStateLargerThanTheBackendValue) {
   EXPECT_EQ(nullptr, t->Find(5));
   EXPECT_EQ(nullptr, t->Lookup(created.handle));
   EXPECT_EQ(0u, t->size());
+}
+
+// D-198: what Create allocates is known before it runs: the directory from
+// DPDK, the rest from glibc.
+TEST_F(SharedFlowTableTest, MemoryCostIsWhatCreateAllocates) {
+  for (const size_t capacity : {size_t{1}, size_t{1000}, size_t{50000}}) {
+    auto t = Make<Table>(capacity);
+    EXPECT_EQ(framework::MemoryCost<Table>::Bytes(capacity, domain_),
+              t->bytes());
+    EXPECT_EQ(framework::MemoryCost<Table>::GlibcBytes(capacity, domain_),
+              t->bytes() - t->directory().bytes());
+    auto aliased = Make<AliasTable>(capacity);
+    EXPECT_EQ(framework::MemoryCost<AliasTable>::Bytes(capacity, domain_),
+              aliased->bytes());
+  }
 }
 
 TEST_F(SharedFlowTableTest, CapacityExhaustionAndRecovery) {

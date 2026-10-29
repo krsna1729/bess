@@ -210,6 +210,10 @@ void DRR::DeInit() {
 }
 
 CommandResponse DRR::AllocateRings() {
+  // Both rings admitted before either is allocated (D-198).
+  const size_t bytes = bess::utils::RingBytes(max_number_flows_) +
+                       bess::utils::RingBytes(kIngressSize);
+  rings_lease_ = init_context().memory().Lease("rings", bytes, bytes);
   int err_num = 0;
   flow_ring_ = AddQueue(max_number_flows_, &err_num);
   if (err_num != 0) {

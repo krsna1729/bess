@@ -6,7 +6,11 @@
 
 #include <gtest/gtest.h>
 
+#include <vector>
+
+#include "framework/memory_scope.h"
 #include "packet_pool.h"
+#include "utils/dpdk_memory.h"
 #include "utils/endian.h"
 
 using bess::framework::Error;
@@ -138,4 +142,69 @@ TEST(EmTableTest, FindMakeKeysPktBatch) {
     // Packets are bogus, shouldn't match anything.
     ASSERT_EQ(0xDEAD, em.Find(keys[i], 0xDEAD));
   }
+}
+
+// -- memory (D-198) -----------------------------------------------------------
+
+namespace {
+
+// Admits every growth (all glibc), refusing once `allow` growths passed.
+struct RecordingGrowth final : bess::utils::MemoryGrowth {
+  size_t grows = 0;
+  size_t net = 0;
+  size_t allow = SIZE_MAX;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    EXPECT_EQ(bytes, glibc_bytes);
+    if (grows >= allow) {
+      throw bess::utils::MemoryRefused(
+          bess::utils::MemoryRefused::Reason::kNormalLimit, bytes, "refused");
+    }
+    grows++;
+    net += bytes;
+  }
+  void Shrink(size_t bytes, size_t) noexcept override { net -= bytes; }
+};
+
+ExactMatchRuleFields RuleFor(uint32_t i) {
+  return {{static_cast<uint8_t>(i), static_cast<uint8_t>(i >> 8),
+           static_cast<uint8_t>(i >> 16), static_cast<uint8_t>(i >> 24)}};
+}
+
+}  // namespace
+
+TEST(EmTableTest, BytesMatchesConstruction) {
+  ExactMatchTable<uint16_t> em;
+  EXPECT_EQ(bess::framework::MemoryCost<ExactMatchTable<uint16_t>>::Bytes(),
+            em.bytes());
+  EXPECT_EQ(
+      bess::framework::MemoryCost<ExactMatchTable<uint16_t>>::GlibcBytes(),
+      em.bytes());
+}
+
+TEST(EmTableTest, RuleGrowthIsAdmittedThroughTheHook) {
+  RecordingGrowth growth;
+  ExactMatchTable<uint16_t> em;
+  em.AddField(0, 4, 0, 0);
+  em.set_memory_growth(&growth);
+  const size_t initial = em.bytes();
+  for (uint32_t i = 0; i < 1000; i++) {
+    ASSERT_EQ(0, em.AddRule(1, RuleFor(i)).first);
+  }
+  EXPECT_GT(growth.grows, 0u);
+  EXPECT_EQ(initial + growth.net, em.bytes());
+
+  // Refused: the rule is not added and the table holds what it held.
+  growth.allow = growth.grows;
+  const size_t held = em.bytes();
+  uint32_t i = 1000;
+  for (;; i++) {
+    try {
+      ASSERT_EQ(0, em.AddRule(1, RuleFor(i)).first);
+    } catch (const bess::utils::MemoryRefused &) {
+      break;
+    }
+  }
+  EXPECT_EQ(i, em.Size());
+  EXPECT_EQ(held, em.bytes());
+  EXPECT_EQ(initial + growth.net, em.bytes());
 }

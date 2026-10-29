@@ -45,6 +45,11 @@ This contract defines the performance, memory, and concurrency invariants for al
    - Strong identifiers (`StrongId`) are scalar wrappers: trivially copyable, register-passable, the size of their representation, and compiled to the same code as the raw integer (checked for `InterfaceId`, D-049). An identifier is as narrow as its range allows when it is stored in a hot per-packet structure, and 32 bits when it is a handle's slot or can appear in packet metadata or a hardware mark (`ActionId`, `NextHopId`, `RouteDomainId`). `InterfaceId` is 16 bits because every `route::NextHop` holds one and 32 bits made a next hop 20 bytes (D-060); a runtime that puts an interface in a hardware mark widens it at that boundary. `WorkerId` is 16 bits because it never leaves the process. `GenerationHandle<Id>` is a 32-bit id plus a 32-bit generation: 8 bytes, one 64-bit compare.
    - Bounded packet buffers (`PacketStore`) must enforce strict global and per-flow capacity caps to prevent unconstrained memory ballooning under network congestion or paging delays.
 
+3. **Memory Backing and Limits** (D-029, D-198):
+   - Every N-scaled structure a worker reads lives in DPDK's heap on the memory node, allocated on the control path; small per-entry objects come from an `ObjectSlab` (1024-object chunks), never one `rte_malloc` each. The packet path is unchanged by the policy: a lookup is the same loads, with no branch on which heap backs the table.
+   - Hugepages first: `--mem_backing=auto` (the default) takes hugepages whenever any are usable at startup, `hugepages` refuses to start without them, `normal` never uses them; `--mem_hugepage_mb` caps the hugepage heap. When hugepages run out or reach the cap a creation is refused (`RESOURCE_EXHAUSTED`) unless `--mem_fallback` was given; then the table comes from the normal-page heap `bess-normal` on the same node. Normal pages cost TLB reach on large tables (D-029's table: up to 2x fewer lookups/s at 4M-8M entries on an E-core); no number is promised for a fallback-backed or normal-backed table, and `GetResourceStatus.memory` (`hugepages`, `fallback_heap_bytes`) says when one exists. The five flags and their defaults: [running-in-containers.md](running-in-containers.md#memory).
+   - Normal-page memory is admitted against the process's memory limit (`--mem_limit_mb`, by default cgroup v2 `memory.max`, else `MemTotal`) less a reserve (`--mem_reserve_mb`); crossing it refuses the creation or transaction, non-retryably, with nothing visible. It is never an OOM kill and never a packet-path event. The admission is control-path only (one `memory.current`/`memory.stat` read per admitted chunk or normal-backing allocation). Each module admits its tables' bytes before it allocates them, so an `Init` is refused whole, never half built.
+
 ---
 
 ## 3. Concurrency and Mutation Under Load
@@ -108,8 +113,8 @@ Roadmap §23.1 Gate C and Appendix J ("update-under-load matrix complete"). One 
 
 Everything above is a bench binary calling the machinery in-process. The live
 path -- a client, gRPC, protobuf, the daemon's control thread -- is a different
-number, and it was measured on this host (20 lcores, `bessd 612cbff1`, `-m 0`
-so no hugepages) with `tests/perf/live_transaction_bench`, 512 sessions, three
+number, and it was measured on this host (20 lcores, `bessd 612cbff1` on normal
+pages, no hugepages) with `tests/perf/live_transaction_bench`, 512 sessions, three
 rounds:
 
 | measurement | result |
@@ -198,7 +203,7 @@ with `--daemon-pid`, the daemon's process-wide CPU from `/proc/<pid>/stat`
 (utime+stime, which includes threads that have exited) minus its long-lived
 packet workers. Measured on this host (20 lcores, 10 physical cores,
 `powersave`, daemon confined to CPUs 2 and 4 -- control 2, worker 4 -- clients on
-every other CPU, 512 sessions a client, 5 s a point, `-m 0`):
+every other CPU, 512 sessions a client, 5 s a point, normal pages, today's `--mem_backing=normal`):
 
 | clients | transactions/s | p50 | p99 | packet rate | client CPU/tx |
 |---|---|---|---|---|---|
@@ -282,7 +287,7 @@ cost.
 A re-run of the two subsections above, on `develop` at `487dc0c9` plus the
 bench's multi-client arm, to check that their claims still hold rather than to
 replace their numbers: the recipes differ (this one: `build/clang`, clang
-`-O2 -g -march=x86-64-v3`, `bessd -m 0`, profile `balanced`, the client pinned to
+`-O2 -g -march=x86-64-v3`, `bessd` on normal pages (today's `--mem_backing=normal`), profile `balanced`, the client pinned to
 one E-core -- cpu 12 -- for the single-client arms and to the E-cores 12-19 for
 the client-count arms, a fresh daemon per arm, load 3.3-4.2).
 
@@ -358,7 +363,7 @@ Roadmap §23.1 Gate D, §24 and Appendix J ("memory-at-scale matrix complete"). 
 | Classifier rules: `ConcurrentExactTable` (ExactMatch's table), measured as a flow backend | 152 B/flow including a 32 B State slab (16 B key; EAL heap + slab); bare `rte_hash` + slab 109 B; `EXT_TABLE` would add 8 B/entry (D-002) | 64K, 1M | not stated. ExactMatch module total (free-slot ring, defer queue, allocator overhead) not measured (D-010) | D-002, D-010, D-052 |
 | Classifier rules: WildcardMatch | not measured | not measured | not measured | D-014, D-024 |
 | Meters (`MeterSet`) | 64 B state + 8 B pointer per id | 1; 1,024; 16,384; 262,144; 1,048,576 meters | 1,048,576 meters: 64 MiB of state (pointer table not stated); 1,024 meters: `state_bytes` 65,536 | MODERNIZATION §10 K5, `docs/baselines/m0-baseline.json` |
-| Stats / counters (`CounterSet`, histograms) | 3 counters × 64 worker slots: 4 KiB; 32 counters: 20 KiB; log2 histogram: 36 KiB | 64 worker slots | 36 KiB (histogram) | MODERNIZATION §10 K6, `docs/baselines/m0-baseline.json` (`storage_bytes` 4,096) |
+| Stats / counters (`CounterSet`, histograms) | 3 counters × 64 worker slots: 4 KiB; 32 counters: 20 KiB; log2 histogram: 36 KiB (the worker slots; `bytes()` and the bench's `storage_bytes` now also count the glibc reset baseline, 8 B per cell per slot: 3 counters 5,632 B, D-198) | 64 worker slots | 36 KiB (histogram) | MODERNIZATION §10 K6, `docs/baselines/m0-baseline.json` (`storage_bytes` 4,096, recorded before D-198) |
 | Event hub (worker rings + log) | 64 B per ring event; about 0.5 KiB per logged event | 256 events per worker ring; 16,384 logged events (the record's memory line; its Decision says the log keeps the last 65,536) | 1 MiB of rings; log about 8 MiB full | D-084 |
 | Action / object tables (`ObjectTable`) | 64 B/object; next hop 16 B (D-060) | 10,240 objects | 696,388 B `storage_bytes`; 544 B `touched_bytes` (`BM_ObjectTableLookup<64>/10240/0`) | `docs/baselines/m0-baseline.json` (`object_table_bench`), D-060 |
 | Routes (`rte_lpm`) | fixed 64 MiB tbl24 per table; per route 98 KB (1K routes), 1.5 KB (64K), 200 B (512K); `bytes_route` 98,321 at 1,024 routes | 1K, 64K, 512K routes | not stated (200 B/route at 512K); `Clear()` briefly holds two tbl24 | MODERNIZATION entry 34, §10 K7, `docs/baselines/m0-baseline.json` |

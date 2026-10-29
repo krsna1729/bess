@@ -418,8 +418,8 @@ TEST(HttpDefaultTest, OffWithoutTheFlag) {
 TEST(HttpDefaultTest, AddressWithoutHostIsRefused) {
   for (const char *address : {":8080", "8080"}) {
     const auto ran = bess::live::RunProgram(
-        {bess::live::Env("BESSD"), "-f", "-m", "0", "-p", std::to_string(bess::live::FreePort()),
-         "-skip_root_check", "-dpdk=false", std::string("--http_addr=") + address},
+        {bess::live::Env("BESSD"), "-f", "--mem_backing=normal", "-p", std::to_string(bess::live::FreePort()),
+         "-skip_root_check", std::string("--http_addr=") + address},
         "", std::chrono::seconds(30));
     EXPECT_NE(0, ran.status) << address;
     EXPECT_NE(std::string::npos, ran.err.find("expected HOST:PORT")) << ran.err;

@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <iterator>
+#include <utility>
 
 #include "packet_pool.h"
 #include "timestamp.h"
@@ -62,9 +63,14 @@ CommandResponse Measure::Init(const bess::pb::MeasureArg &arg) {
                           "excessive latency_ns_max / latency_ns_resolution");
   }
 
-  size_t num_buckets = quotient;
-  rtt_hist_.Resize(num_buckets, latency_ns_resolution);
-  jitter_hist_.Resize(num_buckets, latency_ns_resolution);
+  // Both histograms admitted before either is sized (D-198).
+  num_buckets_ = quotient;
+  bucket_width_ = latency_ns_resolution;
+  const size_t bytes =
+      2 * Histogram<uint64_t>::Bytes(num_buckets_, bucket_width_);
+  hist_lease_ = init_context().memory().Lease("histograms", bytes, bytes);
+  rtt_hist_.Resize(num_buckets_, bucket_width_);
+  jitter_hist_.Resize(num_buckets_, bucket_width_);
 
   if (arg.offset()) {
     // The stamp must fit the packet data room (the default pool's), as
@@ -165,19 +171,24 @@ static void SetHistogram(
 }
 
 void Measure::Clear() {
+  // The replacements are admitted first; the old histograms' admission is
+  // released after them (`lease` is declared first, so it goes last).
+  const size_t bytes =
+      2 * Histogram<uint64_t>::Bytes(num_buckets_, bucket_width_);
+  bess::framework::MemoryLease lease =
+      init_context().memory().Lease("histograms", bytes, bytes);
   // vector initialization is expensive thus should be out of critical section
-  decltype(rtt_hist_) new_rtt_hist(rtt_hist_.num_buckets(),
-                                   rtt_hist_.bucket_width());
-  decltype(jitter_hist_) new_jitter_hist(jitter_hist_.num_buckets(),
-                                         jitter_hist_.bucket_width());
+  decltype(rtt_hist_) new_rtt_hist(num_buckets_, bucket_width_);
+  decltype(jitter_hist_) new_jitter_hist(num_buckets_, bucket_width_);
 
-  // Use move semantics to minimize critical section
+  // Swap to minimize critical section; the old buckets are freed after it.
   mcslock_node_t mynode;
   mcs_lock(&lock_, &mynode);
   pkt_cnt_ = 0;
   bytes_cnt_ = 0;
-  rtt_hist_ = std::move(new_rtt_hist);
-  jitter_hist_ = std::move(new_jitter_hist);
+  rtt_hist_.swap(new_rtt_hist);
+  jitter_hist_.swap(new_jitter_hist);
+  std::swap(hist_lease_, lease);
   mcs_unlock(&lock_, &mynode);
 }
 

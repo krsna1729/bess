@@ -138,10 +138,7 @@ std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     return std::unexpected(RouteError::kValueOutOfRange);
   }
   // The largest route value is the last group's: the IPv6 entry size follows.
-  Config sized = config;
-  if (sized.ipv6) {
-    sized.ipv6->max_value = static_cast<uint32_t>(max_next_hops + max_groups);
-  }
+  const Config sized = SizedConfig(config, max_next_hops, max_groups);
   auto default_domain = MakeDomain(name, sized, domain);
   if (!default_domain) {
     return std::unexpected(default_domain.error());
@@ -152,7 +149,61 @@ std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
                                             max_groups, domain));
 }
 
-std::expected<std::unique_ptr<const Router::Domain>, RouteError>
+Router::Config Router::SizedConfig(const Config &config, size_t max_next_hops,
+                                   size_t max_groups) {
+  Config sized = config;
+  if (sized.ipv6) {
+    sized.ipv6->max_value = static_cast<uint32_t>(max_next_hops + max_groups);
+  }
+  return sized;
+}
+
+size_t Router::DomainBytes(const Config &config) noexcept {
+  return (config.ipv4 ? LpmRouteTable::InstanceBytes(*config.ipv4) : 0) +
+         (config.ipv6 ? Ipv6RouteTable::InstanceBytes(*config.ipv6) : 0);
+}
+
+size_t Router::Bytes(const std::string &name, const Config &config,
+                     size_t max_next_hops, const rcu::RcuDomain &domain,
+                     size_t max_domains, size_t max_groups) {
+  // The constructor publishes the default domain's object: the domain
+  // slab's first chunk.
+  return DomainBytes(SizedConfig(config, max_next_hops, max_groups)) +
+         dataplane::SlotTable<DomainSlot, Domain>::Bytes(max_domains) +
+         utils::ObjectSlab<Domain>::chunk_bytes() +
+         dataplane::SlotTable<NextHopId, NextHop>::Bytes(max_next_hops) +
+         dataplane::SlotTable<NextHopGroupId, NextHopGroup>::Bytes(
+             std::max<size_t>(max_groups, 1)) +
+         GlibcBytes(name, config, max_next_hops, domain, max_domains,
+                    max_groups);
+}
+
+size_t Router::GlibcBytes(const std::string &, const Config &,
+                          size_t max_next_hops, const rcu::RcuDomain &, size_t,
+                          size_t max_groups) {
+  // references_, member_references_, hop_states_ and bindings_ per next-hop
+  // id, group_references_ per group id, and the router.
+  return (max_next_hops + 1) *
+             (2 * sizeof(uint32_t) + sizeof(HopState) +
+              sizeof(std::optional<NeighborKey>)) +
+         (max_groups + 1) * sizeof(uint32_t) + sizeof(Router);
+}
+
+size_t Router::bytes() const noexcept {
+  return fib_memory_.bytes() + domains_.bytes() + next_hops_.bytes() +
+         groups_.bytes() +
+         GlibcBytes(name_, domain_config_, max_next_hops_, rcu_, max_domains_,
+                    group_references_.size() - 1);
+}
+
+void Router::set_memory_growth(utils::MemoryGrowth *growth) noexcept {
+  fib_memory_.set_outer(growth);
+  domains_.set_memory_growth(growth);
+  next_hops_.set_memory_growth(growth);
+  groups_.set_memory_growth(growth);
+}
+
+std::expected<Router::Domain, RouteError>
 Router::MakeDomain(const std::string &name, const Config &config,
                    rcu::RcuDomain &rcu) {
   std::unique_ptr<LpmRouteTable> table;
@@ -171,11 +222,11 @@ Router::MakeDomain(const std::string &name, const Config &config,
     }
     table6 = std::move(*made);
   }
-  return std::make_unique<const Domain>(std::move(table), std::move(table6));
+  return Domain(std::move(table), std::move(table6));
 }
 
 Router::Router(const std::string &name, const Config &config,
-               std::unique_ptr<const Domain> default_domain,
+               Domain default_domain,
                size_t max_next_hops, size_t max_domains, size_t max_groups,
                rcu::RcuDomain &rcu)
     : name_(name),
@@ -183,8 +234,9 @@ Router::Router(const std::string &name, const Config &config,
       max_domains_(max_domains),
       max_next_hops_(static_cast<uint32_t>(max_next_hops)),
       domain_config_(config),
+      fib_memory_(default_domain.bytes()),
       domains_(max_domains),
-      default_routes_(default_domain->table()),
+      default_routes_(default_domain.table()),
       domain_ids_{kDefaultRouteDomainId},
       next_hops_(max_next_hops),
       references_(max_next_hops + 1, 0),
@@ -201,7 +253,9 @@ Router::Router(const std::string &name, const Config &config,
       groups_name_(name + "/groups"),
       bindings_(max_next_hops + 1) {
   // Before any reader can exist: nothing to retire.
-  domains_.Publish(SlotOf(kDefaultRouteDomainId), std::move(default_domain));
+  default_domain.set_memory_growth(&fib_memory_);
+  domains_.Publish(SlotOf(kDefaultRouteDomainId),
+                   domains_.Make(std::move(default_domain)));
 }
 
 // The SlotTables free what is still published (including retiring next hops
@@ -740,7 +794,7 @@ class Router::NeighborResource final : public dataplane::Resource {
       hop.egress = current->interface;
       hop.kind = NextHopKind::kForward;
       Reservation reservation{
-          std::make_unique<PublishOp>(router_, id, std::make_unique<const NextHop>(hop),
+          std::make_unique<PublishOp>(router_, id, router_.next_hops_.Make(hop),
                                       std::nullopt),
           {},
           Footprint{.retires = 1}};
@@ -790,7 +844,7 @@ class Router::NeighborResource final : public dataplane::Resource {
     NextHop hop;
     hop.egress = neighbor->interface;
     hop.neighbor = NeighborState::kIncomplete;
-    auto object = std::make_unique<const NextHop>(hop);
+    auto object = router_.next_hops_.Make(hop);
     StageChange(id, *neighbor);
     Reservation reservation{
         std::make_unique<PublishOp>(router_, id, std::move(object), *neighbor),
@@ -819,7 +873,8 @@ class Router::NeighborResource final : public dataplane::Resource {
   // Publishes a bound id's next hop; with `binding`, also (re)binds the id.
   class PublishOp final : public dataplane::StagedOp {
    public:
-    PublishOp(Router &router, NextHopId id, std::unique_ptr<const NextHop> hop,
+    PublishOp(Router &router, NextHopId id,
+              dataplane::SlotTable<NextHopId, NextHop>::Owned hop,
               std::optional<NeighborKey> binding)
         : router_(router), id_(id), hop_(std::move(hop)), binding_(binding) {}
     void Publish(dataplane::Retirer &retirer) noexcept override {
@@ -837,7 +892,7 @@ class Router::NeighborResource final : public dataplane::Resource {
    private:
     Router &router_;
     NextHopId id_;
-    std::unique_ptr<const NextHop> hop_;
+    dataplane::SlotTable<NextHopId, NextHop>::Owned hop_;
     std::optional<NeighborKey> binding_;
   };
 
@@ -952,7 +1007,7 @@ class Router::GroupResource final
                        Footprint{.retires = previous != nullptr ? 1u : 0u}};
     upsert.existed = previous != nullptr;
     upsert.previous_references = MemberReferences(before, committed);
-    auto staged = std::make_unique<PublishOp>(router_, id, std::make_unique<NextHopGroup>(*group),
+    auto staged = std::make_unique<PublishOp>(router_, id, router_.groups_.Make(*group),
                                               Difference(now, before), Difference(before, now));
     Stage(id);
     Touch(staged->added());
@@ -987,7 +1042,7 @@ class Router::GroupResource final
  private:
   class PublishOp final : public dataplane::StagedOp {
    public:
-    PublishOp(Router &router, NextHopGroupId id, std::unique_ptr<NextHopGroup> group,
+    PublishOp(Router &router, NextHopGroupId id, utils::SlabUnique<NextHopGroup> group,
               std::vector<NextHopId> added, std::vector<NextHopId> removed)
         : router_(router),
           id_(id),
@@ -1006,7 +1061,7 @@ class Router::GroupResource final
    private:
     Router &router_;
     NextHopGroupId id_;
-    std::unique_ptr<NextHopGroup> group_;
+    utils::SlabUnique<NextHopGroup> group_;
     std::vector<NextHopId> added_;    // next hops that become members
     std::vector<NextHopId> removed_;  // next hops that stop being members
   };
@@ -1167,7 +1222,7 @@ class Router::NextHopStateResource final : public dataplane::Resource {
         }
         const NextHopGroup *current = router.groups_.Current(rebuild.id);
         CHECK(current != nullptr) << "the reverse index names a group that is not live";
-        rebuild.group = std::make_unique<NextHopGroup>(*current);
+        rebuild.group = router_.groups_.Make(*current);
         Elect(*rebuild.group, [&router](NextHopId hop) { return router.StagedDown(hop); });
       }
     }
@@ -1183,7 +1238,7 @@ class Router::NextHopStateResource final : public dataplane::Resource {
    private:
     struct Rebuild {
       NextHopGroupId id;
-      std::unique_ptr<NextHopGroup> group;  // null: its own operation publishes it
+      utils::SlabUnique<NextHopGroup> group;  // null: its own operation publishes it
     };
     Router &router_;
     NextHopId id_;
@@ -1327,8 +1382,8 @@ std::expected<void, std::string> Router::Release() {
 size_t Router::CompleteRetirementsLocked() {
   // Room first, for everything that may complete: an object unpublished
   // below must reach the retire queue, never be dropped by a failed push.
-  std::vector<std::unique_ptr<const NextHopGroup>> emptied_groups;
-  std::vector<std::unique_ptr<const NextHop>> emptied;
+  std::vector<dataplane::SlotTable<NextHopGroupId, NextHopGroup>::Owned> emptied_groups;
+  std::vector<dataplane::SlotTable<NextHopId, NextHop>::Owned> emptied;
   emptied_groups.reserve(retiring_groups_.size());
   emptied.reserve(retiring_.size());
   rcu_.ReserveRetirements(retiring_groups_.size() + retiring_.size());
@@ -1392,7 +1447,7 @@ std::expected<void, RouteError> Router::SetNextHop(NextHopId id,
   // One pointer store; a reader holding the previous object keeps it until
   // its next quiescent state. Room in the retire queue first: once the new
   // object is visible nothing may fail.
-  auto hop_object = std::make_unique<const NextHop>(hop);
+  auto hop_object = next_hops_.Make(hop);
   rcu_.ReserveRetirements(1);
   auto replaced = next_hops_.Publish(id, std::move(hop_object));
   if (replaced) {
@@ -1456,13 +1511,24 @@ std::expected<void, RouteError> Router::CreateDomainLocked(
   if (domains_.Contains(slot)) {
     return std::unexpected(RouteError::kDomainExists);
   }
-  auto object =
-      MakeDomain(name_ + "_d" + std::to_string(domain.value()), config, rcu_);
-  if (!object) {
-    return std::unexpected(object.error());
+  // The domain's FIB set is admitted before it is built (D-198), and given
+  // back if anything below fails (the FIBs are freed by then).
+  const size_t fib_bytes = DomainBytes(config);
+  fib_memory_.Grow(fib_bytes, 0);
+  try {
+    auto object =
+        MakeDomain(name_ + "_d" + std::to_string(domain.value()), config, rcu_);
+    if (!object) {
+      fib_memory_.Shrink(fib_bytes, 0);
+      return std::unexpected(object.error());
+    }
+    object->set_memory_growth(&fib_memory_);
+    ReserveOneMore(domain_ids_);
+    domains_.Publish(slot, domains_.Make(std::move(*object)));
+  } catch (...) {
+    fib_memory_.Shrink(fib_bytes, 0);
+    throw;
   }
-  ReserveOneMore(domain_ids_);
-  domains_.Publish(slot, std::move(*object));
   domain_ids_.insert(
       std::lower_bound(domain_ids_.begin(), domain_ids_.end(), domain), domain);
   return {};
@@ -1500,7 +1566,11 @@ std::expected<void, RouteError> Router::RemoveDomain(RouteDomainId domain) {
   domains_.Retire(slot);
   // Unpublished first, then the grace period that covers it (as RcuPtr does).
   auto removed = domains_.Unpublish(slot);
+  // The RCU domain takes no callback: the FIBs' bytes (an IPv6 spare
+  // included) are given back as they are retired (D-198).
+  const size_t fib_bytes = removed->bytes();
   rcu_.Retire(rcu_.StartGracePeriod(), std::move(removed));
+  fib_memory_.Shrink(fib_bytes, 0);
   domain_ids_.erase(
       std::lower_bound(domain_ids_.begin(), domain_ids_.end(), domain));
   rcu_.ReclaimReady();
@@ -1605,7 +1675,7 @@ std::expected<void, RouteError> Router::SetNextHopGroup(
   if (!groups_.CanPublish(id)) {
     return std::unexpected(RouteError::kNextHopRetiring);
   }
-  auto group = std::make_unique<NextHopGroup>();
+  auto group = groups_.Make();
   group->size = static_cast<uint32_t>(members.size());
   group->standby_size = static_cast<uint32_t>(standby.size());
   const auto standbys = std::ranges::copy(members, group->members.begin()).out;
@@ -1640,7 +1710,7 @@ std::expected<void, RouteError> Router::SetNextHopGroup(
     member_references_[m.value()]++;
   }
   // One pointer store; the members were published before.
-  auto replaced = groups_.Publish(id, std::unique_ptr<const NextHopGroup>(std::move(group)));
+  auto replaced = groups_.Publish(id, std::move(group));
   AddMemberships(id, added);
   RemoveMemberships(id, removed);
   EraseEmptyMemberships(removed);
@@ -1702,13 +1772,13 @@ std::expected<void, RouteError> Router::SetNextHopDown(NextHopId id, bool down) 
   }
   // Every group holding the next hop, built before the first is visible: an
   // allocation that fails changes nothing.
-  std::vector<std::pair<NextHopGroupId, std::unique_ptr<NextHopGroup>>> rebuilt;
-  std::vector<std::unique_ptr<const NextHopGroup>> replaced;
+  std::vector<std::pair<NextHopGroupId, utils::SlabUnique<NextHopGroup>>> rebuilt;
+  std::vector<dataplane::SlotTable<NextHopGroupId, NextHopGroup>::Owned> replaced;
   if (auto it = memberships_.find(id); it != memberships_.end()) {
     rebuilt.reserve(it->second.size());
     replaced.reserve(it->second.size());
     for (const NextHopGroupId group : it->second) {
-      auto object = std::make_unique<NextHopGroup>(*groups_.Current(group));
+      auto object = groups_.Make(*groups_.Current(group));
       Elect(*object, [&](NextHopId hop) { return hop == id ? down : IsDown(hop); });
       rebuilt.emplace_back(group, std::move(object));
     }

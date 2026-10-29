@@ -289,7 +289,7 @@ int main(int argc, char **argv) {
       batches = {16};
     }
   }
-  bess::InitDpdk(0);
+  bess::InitDpdk();
 
   Table table;
   Service service(table);

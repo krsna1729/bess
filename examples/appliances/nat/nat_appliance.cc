@@ -66,7 +66,7 @@ class NatAppliance final : public Module {
   CommandResponse Init(const bess::pb::EmptyArg &) {
     // The wheels start at the packet clock's now: a wheel far behind it would
     // refuse every deadline as beyond its horizon.
-    auto made = NatApp::Create(300 * kSecond, tsc_to_ns(rdtsc()));
+    auto made = NatApp::Create(300 * kSecond, tsc_to_ns(rdtsc()), init_context().memory());
     if (!made) {
       return CommandFailure(ENOMEM, "%s", made.error().c_str());
     }
@@ -98,16 +98,17 @@ class NatAppliance final : public Module {
   }
 
   CommandResponse CommandSelfTest(const bess::pb::EmptyArg &) {
-    if (std::string failed = SelfTest(); !failed.empty()) {
+    if (std::string failed = SelfTest(init_context().memory()); !failed.empty()) {
       return CommandFailure(EINVAL, "R2 direct path: %s", failed.c_str());
     }
     return CommandSuccess();
   }
 
  private:
-  static std::string SelfTest() {
+  static std::string SelfTest(bess::framework::MemoryScope &memory) {
     using V = NatApp::Verdict;
-    auto made = NatApp::Create(10 * kSecond, 0);  // its own instance and clock
+    // Its own instance and clock: admitted too, released with the private app.
+    auto made = NatApp::Create(10 * kSecond, 0, memory);
     if (!made) {
       return "create";
     }
@@ -162,7 +163,7 @@ const Commands NatAppliance::cmds = {
      Command::THREAD_SAFE},
 };
 
-BESS_PLUGIN_REQUIRES("nat_appliance", "1.0.0", 0);
+BESS_PLUGIN_REQUIRES("nat_appliance", "1.0.0", BESS_CAP_MEMORY);
 
 ADD_MODULE(NatAppliance, "nat_appliance",
            "Reference appliance R2: a stateful NAT gateway over BESS's conntrack and NAT")

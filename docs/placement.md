@@ -37,15 +37,41 @@ memory bessd may use.
   remote CPUs are only slower.
 
 Then, once: DPDK's `--socket-limit` gives every other node a 1 MB limit, which
-no hugepage fits under (DPDK reads 0 as "no limit"), and the memory node `-m`
-or no limit (DPDK takes 32 nodes, `RTE_MAX_NUMA_NODES`; the list stops
-there); `set_mempolicy(MPOL_PREFERRED, node)` makes normal (libc) memory
--- rings, the no-hugepage DPDK heap -- follow (refused by a seccomp profile:
-a warning, and only libc memory loses the preference); the one default packet
-pool is created there; every table (route, exact match, flow, meters, handoff
-channels, DPDK arrays) is allocated there. Under `--no-huge` DPDK labels its
-whole heap socket 0, so tables ask DPDK for socket 0 while the pages
+no hugepage fits under (DPDK reads 0 as "no limit"), and the memory node the
+`--mem_hugepage_mb` cap or no limit (DPDK takes 32 nodes,
+`RTE_MAX_NUMA_NODES`; the list stops there); `set_mempolicy(MPOL_PREFERRED,
+node)` makes normal (libc) memory -- rings, the normal-backing DPDK heap --
+follow (refused by a seccomp profile: a warning, and only libc memory loses
+the preference); the one default packet pool is created there; every table
+(route, exact match, flow, meters, handoff channels, DPDK arrays) is
+allocated there. With `--mem_backing=normal` (DPDK `--no-huge`) DPDK labels
+its whole heap socket 0, so tables ask DPDK for socket 0 while the pages
 physically follow the memory policy.
+
+**Memory policy (D-198).** Every table a worker reads -- slot tables and
+their object slabs, rule records, meter states, counters, route, hash and
+flow tables -- comes from DPDK's heap on the memory node (D-029), never from
+glibc; what backs that heap is `--mem_backing` (hugepages when usable, by
+default). When that heap cannot give the bytes (hugepages exhausted or at the
+`--mem_hugepage_mb` cap, or the node full and no other socket either), the
+creation is **refused** with `RESOURCE_EXHAUSTED`, naming the bytes, the heap
+and the flag below, unless bessd was started with `--mem_fallback`: then the
+table comes from `bess-normal`, a DPDK external heap of normal (4 KiB) pages
+that bessd grows in chunks of at least 64 MB, first touched by the control
+thread and so placed by the same `MPOL_PREFERRED` node preference: the table
+still lives on the memory node, only on smaller pages (more TLB misses on
+large tables). With normal backing that heap backs the fixed DPDK heap when
+it fills, without the flag. Normal-page memory -- the normal-backing heap,
+every `bess-normal` chunk and a normal-page packet pool -- is admitted
+against the memory limit first (`--mem_limit_mb`, by default cgroup v2
+`memory.max`, else the host's `MemTotal`, minus `--mem_reserve_mb`): a
+creation or transaction that would cross it is refused, non-retryably, and
+nothing of it becomes visible, instead of the kernel OOM-killing bessd.
+`GetResourceStatus.memory` reports the limit, its source, what is used and
+available, both heaps, the refusals so far and the bytes per module and
+resource; [running-in-containers.md](running-in-containers.md#memory) lists
+the five `--mem_*` flags, their `BESSD_MEM_*` forms and defaults, and covers
+sizing the limit.
 
 **Control CPU.** `--control_cpus=auto` reserves one CPU: the first CPU of the
 memory node in bessd's set; none when the set has one CPU (control threads
@@ -105,6 +131,9 @@ followed by a WARNING for each finding. The same line is `GetCapabilities`
 | two workers on one CPU | explicit core | WARNING at launch |
 | cross-NUMA NIC | `rte_eth_dev_socket_id` is another node | WARNING once per port; `GetPortStatus` `numa_node`, `cross_numa` |
 | NIC node unknown | `rte_eth_dev_socket_id` is -1 (VMs, some virtual devices) | `numa_node` -1, "unknown"; no warning |
+| normal pages at startup | `--mem_backing=auto` and no usable hugepages | startup WARNING; the startup `Memory:` line; `GetResourceStatus.memory.hugepages` false |
+| table on normal pages | hugepages exhausted or at `--mem_hugepage_mb`, `--mem_fallback` given | WARNING once; INFO per `bess-normal` growth; `GetResourceStatus.memory.fallback_heap_bytes` |
+| memory refused | hugepages exhausted or at the cap without `--mem_fallback`, or the memory limit | `RESOURCE_EXHAUSTED` on the creating call; `GetResourceStatus.memory.refusals` |
 
 ### Degraded performance: cross-NUMA
 

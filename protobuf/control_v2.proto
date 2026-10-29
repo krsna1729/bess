@@ -797,6 +797,49 @@ message WorkerStatus {
   uint32 cpu = 1;   // the core this worker runs on
 }
 
+// The daemon's memory policy and where it stands against it (D-198). Dataplane
+// memory comes from DPDK's heap on the memory node; when hugepages run out, a
+// creation is refused unless the daemon was started with --mem_fallback,
+// which lets it use a heap of normal pages ("bess-normal") instead.
+// Normal-page memory is admitted against a limit -- cgroup v2 memory.max, or
+// --mem_limit_mb -- and a creation that would cross it is refused with
+// RESOURCE_EXHAUSTED, never retried and never OOM-killed. Every module admits
+// its tables' bytes before it allocates them (init_context().memory()); what
+// each admitted is listed in `modules`. All counts are bytes; limit_bytes 0
+// means no limit is known.
+message MemoryStatus {
+  bool hugepages = 1;              // the native heap is hugepage-backed
+  bool fallback = 2;               // --mem_fallback was given
+  uint64 limit_bytes = 3;          // the limit normal-page memory is admitted against
+  string limit_source = 4;         // where limit_bytes came from (memory.max, a flag)
+  uint64 reserve_bytes = 5;        // kept free for memory the daemon does not account
+  uint64 used_bytes = 6;           // the working set: memory.current - inactive_file, else RSS
+  uint64 available_bytes = 7;      // limit - reserve - used, floored at 0; 0 when no limit
+  uint64 dpdk_heap_bytes = 8;      // the native DPDK heap(s)
+  uint64 dpdk_heap_alloc_bytes = 9;
+  uint64 fallback_heap_bytes = 10; // the "bess-normal" fallback heap
+  uint64 fallback_heap_alloc_bytes = 11;
+  uint64 refusals = 12;            // creations refused for memory since startup
+  uint64 hugepage_cap_bytes = 13;  // --mem_hugepage_mb; 0: no cap
+  uint64 hugepage_table_bytes = 14; // tables admitted against the hugepage cap
+  repeated ModuleMemory modules = 15;
+  // Hugepages are charged to memory.max here (cgroup2
+  // memory_hugetlb_accounting): hugepage growth is admitted against
+  // limit_bytes as well, and a limit must include the hugepages.
+  bool hugetlb_charged = 16;
+  string hugepage_cap_source = 17; // "--mem_hugepage_mb" or the cgroup's hugetlb.<size>.max
+}
+
+// What one module admitted for one of its resources (a table, a pool, a
+// ring), by name inside the module; the daemon's own packet pool is module
+// "bessd", resource "packet_pool".
+message ModuleMemory {
+  string module = 1;
+  string resource = 2;
+  uint64 admitted_bytes = 3;  // admitted before allocation, released with the object
+  uint64 current_bytes = 4;   // what the objects hold now (their bytes()), else admitted
+}
+
 message GetResourceStatusResponse {
   repeated ResourceOccupancy resources = 1;
   uint64 generation = 2;        // the resource generation (D-129)
@@ -807,6 +850,7 @@ message GetResourceStatusResponse {
   uint64 rcu_high_water = 7;    // past it, retiring waits (the engine uses half)
   repeated WorkerStatus workers = 8;
   uint64 daemon_epoch = 9;
+  MemoryStatus memory = 10;
 }
 
 service Control {

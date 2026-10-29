@@ -6,6 +6,7 @@
 #include <cstdarg>
 #include <cstring>
 
+#include "utils/dpdk_memory.h"
 #include "utils/format.h"
 
 namespace bess {
@@ -25,6 +26,9 @@ ControlErrorCode CodeFromErrno(int err) {
     case EBUSY:
       return ControlErrorCode::kResourceBusy;
     case ENOMEM:
+      // Memory is a bounded resource (D-198): the same request is refused the
+      // same way until memory is freed, so it is not a failure to retry.
+      return ControlErrorCode::kResourceExhausted;
     case EIO:
     case EAGAIN:
       return ControlErrorCode::kResourceFailure;
@@ -55,6 +59,18 @@ ControlError Errno(int err) {
   error.code = CodeFromErrno(err);
   error.err = err;
   error.message = strerror(err);
+  return error;
+}
+
+ControlError OutOfMemory(const std::bad_alloc &e) {
+  ControlError error;
+  error.code = ControlErrorCode::kResourceExhausted;
+  error.err = ENOMEM;
+  if (const auto *refused = dynamic_cast<const utils::MemoryRefused *>(&e)) {
+    error.message = refused->what();
+  } else {
+    error.message = "out of memory";
+  }
   return error;
 }
 

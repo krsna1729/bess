@@ -3,7 +3,6 @@
 
 #include "usage_report.h"
 
-#include <algorithm>
 #include <chrono>
 #include <expected>
 #include <string>
@@ -42,14 +41,22 @@ const ResourceTables UsageReport::resource_tables = {
 
 std::expected<UsageReport::Staged, std::string> UsageReport::StageQuotas(
     const sample::usage::pb::UsageQuotas &v) {
-  Staged staged;
-  staged.quotas.reserve(v.quotas_size());
   for (const sample::usage::pb::UsageQuota &q : v.quotas()) {
     if (q.octets() == 0) {
       return std::unexpected("quota for key " + std::to_string(q.key()) +
                              " is zero: leave the key out to disarm it");
     }
+  }
+  Staged staged;
+  staged.watches_lease =
+      init_context().memory().LeaseFor<bess::framework::ThresholdTable>("quotas");
+  staged.watches.set_memory_growth(staged.watches_lease.growth());
+  staged.quotas.reserve(v.quotas_size());
+  for (const sample::usage::pb::UsageQuota &q : v.quotas()) {
     staged.quotas.emplace_back(q.key(), q.octets());
+    if (q.key() < keys_) {
+      staged.watches.Arm(q.key(), q.octets());
+    }
   }
   staged.set = v;
   return staged;
@@ -84,9 +91,17 @@ CommandResponse UsageReport::Init(const sample::usage::pb::UsageReportArg &arg) 
   const size_t workers =
       arg.workers() == 0 ? bess::dataplane::kMaxWorkers : arg.workers();
   max_allowed_workers_ = static_cast<int>(workers);
+  // Admit first, allocate second (D-198): a refusal leaves nothing built.
+  bess::framework::MemoryScope &memory = init_context().memory();
+  quota_slots_lease_ = memory.LeaseFor<bess::utils::DpdkArray<std::atomic<uint64_t>>>(
+      "quota_slots", keys_);
+  watches_lease_ = memory.LeaseFor<bess::framework::ThresholdTable>("quotas");
   counters_ =
-      std::make_unique<bess::stats::KeyedCounters>(keys_, kCells, workers);
-  quotas_ = std::make_unique<std::atomic<uint64_t>[]>(keys_);
+      memory.Create<bess::stats::KeyedCounters>("counters", keys_, kCells, workers);
+  quotas_ = bess::utils::DpdkArray<std::atomic<uint64_t>>(keys_, memory.socket());
+  quota_slots_lease_.Track(quotas_);
+  watches_lease_.Track(watches_);
+  watches_.set_memory_growth(watches_lease_.growth());
   for (size_t key = 0; key < keys_; key++) {
     quotas_[key].store(kNoQuota, std::memory_order_relaxed);
   }
@@ -104,29 +119,29 @@ CommandResponse UsageReport::Init(const sample::usage::pb::UsageReportArg &arg) 
 
   auto registered = quotas_resource_.Register(
       init_context().resources(), init_context().codecs(), name() + "/quotas",
-      [](const sample::usage::pb::UsageQuotas &v)
+      [this](const sample::usage::pb::UsageQuotas &v)
           -> std::expected<Staged, std::string> { return StageQuotas(v); },
       [this](Staged &s) {
         // A key the previous set armed and this one leaves out is disarmed; a
         // key in both keeps its limit, so it never reads zero in between. The
         // packet path is not held by the control-plane lock, so that window
         // would be a missed compare (the sweep is the backstop for one).
-        std::vector<uint64_t> keep;
-        keep.reserve(s.quotas.size());
-        for (const auto &[key, limit] : s.quotas) {
-          keep.push_back(key);
-        }
-        std::sort(keep.begin(), keep.end());
         for (const sample::usage::pb::UsageQuota &q : arg_.quotas()) {
-          if (q.key() < keys_ &&
-              !std::binary_search(keep.begin(), keep.end(), q.key())) {
+          if (q.key() < keys_ && !s.watches.limit(q.key())) {
             quotas_[q.key()].store(kNoQuota, std::memory_order_relaxed);
           }
         }
-        watches_.Clear();
         for (const auto &[key, limit] : s.quotas) {
-          Arm(key, limit);
+          if (key < keys_) {
+            quotas_[key].store(limit, std::memory_order_relaxed);
+          }
         }
+        // All allocation and admission happened in StageQuotas. Move the
+        // table and its lease together, then point current_bytes at its new
+        // address. The hook already points at this lease's stable node.
+        watches_ = std::move(s.watches);
+        watches_lease_ = std::move(s.watches_lease);
+        watches_lease_.Track(watches_);
         arg_.Swap(&s.set);
       },
       [this] { return arg_; }, nullptr);
@@ -144,8 +159,8 @@ void UsageReport::Arm(uint64_t key, uint64_t limit) {
   if (key >= keys_) {
     return;  // outside the key space: nothing to watch
   }
-  quotas_[key].store(limit, std::memory_order_relaxed);
   watches_.Arm(key, limit);
+  quotas_[key].store(limit, std::memory_order_relaxed);
 }
 
 void UsageReport::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {

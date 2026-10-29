@@ -62,6 +62,11 @@ class RuntimeExactBackend {
   }
 
   BackendInfo info() const noexcept { return ops_.info; }
+  // Memory (D-198): what the built backend's state holds (its info's
+  // storage_bytes). Immutable once built. No Bytes(): the builder's size
+  // comes from the table's growth while it inserts the rules (a cuckoo map
+  // expands on collisions), not from the rule count alone.
+  [[nodiscard]] size_t bytes() const noexcept { return ops_.info.storage_bytes; }
 
   explicit operator bool() const noexcept {
     return ops_.lookup_batch != nullptr &&

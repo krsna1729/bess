@@ -7,13 +7,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <vector>
 
 #include <rte_pause.h>
 
 #include "dataplane/worker_id.h"
 #include "stats/worker_local.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::stats {
 
@@ -53,6 +53,14 @@ class WorkerSlots {
 
   WorkerSlots(const WorkerSlots &) = delete;
   WorkerSlots &operator=(const WorkerSlots &) = delete;
+
+  // What the constructor allocates in DPDK memory (D-198): a slot of
+  // `cells` cells plus the sequence word, in whole cache lines, per possible
+  // worker. Equals bytes().
+  static size_t Bytes(size_t cells) noexcept {
+    return (cells + 1 + kWordsPerLine - 1) / kWordsPerLine *
+           dataplane::kMaxWorkers * sizeof(Line);
+  }
 
   size_t cells() const noexcept { return cells_; }
   size_t bytes() const noexcept { return lines_.size() * sizeof(Line); }
@@ -125,7 +133,8 @@ class WorkerSlots {
  private:
   const size_t cells_;
   const size_t lines_per_slot_;
-  std::vector<Line> lines_;
+  // Packet-path memory: DPDK's heap on the memory node (D-029, D-123).
+  utils::DpdkArray<Line> lines_;
 };
 
 // Why a delta between two snapshots cannot be computed.

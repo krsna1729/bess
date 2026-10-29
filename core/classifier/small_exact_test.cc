@@ -221,4 +221,18 @@ TEST(SortedFlat, InsertAndBinarySearch) {
   EXPECT_EQ(info.rule_count, 9u);
 }
 
+// D-198: empty when built; bytes() is the rule array's capacity.
+TEST(SmallExact, BytesIsTheRuleArray) {
+  SmallExactBackend<FlowKey, uint32_t> small;
+  SortedFlat flat;
+  EXPECT_EQ(0u, small.bytes());
+  EXPECT_EQ(0u, flat.bytes());
+  for (uint32_t i = 0; i < 9; i++) {
+    ASSERT_TRUE(small.insert({.tenant = i, .port = 80}, i));
+    flat.insert({.tenant = i, .port = 80}, i);
+  }
+  EXPECT_GE(small.bytes(), 9 * sizeof(std::pair<FlowKey, uint32_t>));
+  EXPECT_GE(flat.bytes(), 9 * sizeof(std::pair<FlowKey, uint32_t>));
+}
+
 }  // namespace

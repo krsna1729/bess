@@ -23,6 +23,7 @@
 
 #include "dataplane/interface_id.h"
 #include "dataplane/transaction_engine.h"
+#include "framework/memory_scope.h"
 #include "route/l3_packet.h"
 #include "route/neighbor_resolver.h"
 #include "route/neighbor_table.h"
@@ -139,6 +140,21 @@ void SetSenderMac(std::array<uint8_t, kArpFrameSize> *frame,
 NeighborTable::Neighbor State(const NeighborResolver &resolver,
                               NeighborResolver::Key key) {
   return resolver.Find(key).value_or(NeighborTable::Neighbor{});
+}
+
+// D-198: what Create allocates is known before it runs, all of it glibc.
+TEST(NeighborResolverTest, MemoryCostIsWhatCreateAllocates) {
+  for (const size_t capacity : {size_t{1}, size_t{1024}, size_t{100000}}) {
+    NeighborResolver::Config config = TestConfig();
+    config.capacity = capacity;
+    config.granularity_shift = 4;
+    auto resolver = NeighborResolver::Create(config, 77);
+    ASSERT_TRUE(resolver.has_value()) << resolver.error();
+    EXPECT_EQ(framework::MemoryCost<NeighborResolver>::Bytes(config, uint64_t{77}),
+              (*resolver)->bytes());
+    EXPECT_EQ(framework::MemoryCost<NeighborResolver>::GlibcBytes(config, uint64_t{77}),
+              (*resolver)->bytes());
+  }
 }
 
 // -- solicitation, retry, failure, recovery ------------------------------------

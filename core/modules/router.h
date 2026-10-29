@@ -13,6 +13,7 @@
 #include <vector>
 #include <rte_ring.h>
 
+#include "framework/memory_scope.h"
 #include "framework/module_tick.h"
 #include "framework/resource_bindings.h"
 #include "module.h"
@@ -155,6 +156,7 @@ class Router final : public Module {
   // The enrolled router, for tests and for the module's own introspection.
   const bess::route::Router *router() const { return router_.get(); }
 
+
   // True when the module decides each packet's next hop itself, from the
   // packet's destination address in its route domain (D-155).
   bool routes_by_destination() const {
@@ -243,10 +245,8 @@ class Router final : public Module {
   // Mode 2 (D-155): look each packet's destination address up in its domain's
   // FIB, then run the forwarding chain the appliance runs.
   void RouteByDestination(Context *ctx, bess::PacketBatch *batch);
-  // Resolves frames [begin, end) of `batch`, all in `domain`, and fills their
-  // gates: one batched lookup for a run of more than one (route/forward.h's
-  // ResolveFrames; a run of one takes the scalar ResolveFrame), then the
-  // per-frame verdict handling below.
+  void RouteIds(bess::PacketBatch *batch, const bess::route::NextHopId *ids,
+                gate_idx_t *gates);
   void ResolveRun(bess::PacketBatch *batch, int begin, int end,
                   bess::route::RouteDomainId domain, gate_idx_t *gates);
   // One counter per verdict the chain reports (route/forward.h). kForward is
@@ -293,18 +293,28 @@ class Router final : public Module {
   };
   static_assert(sizeof(ArpRequestCopy) % 4 == 0, "an rte_ring element size");
   static constexpr size_t kMaxNeighborUpdatesPerTick = 64;
+  // The neighbor rings' slots (receive, ARP request copies, solicitations):
+  // admitted ("rings") and created from these (D-198).
+  static constexpr unsigned kNeighborRxRingSize = 1024;
+  static constexpr unsigned kNeighborArpRingSize = 256;
+  static constexpr unsigned kNeighborTxRingSize = 1024;
   // At most one publication warning per this many maintenance ticks.
   static constexpr uint64_t kNeighborWarningInterval = 1000;
 
-  std::unique_ptr<bess::route::Router> router_;
+  // Admitted as "router" (D-198); its growth hook admits each new domain,
+  // FIB replacement and slab chunk.
+  bess::framework::Sized<bess::route::Router> router_;
   // After router_, which owns the resources they bind (D-044).
   bess::framework::ResourceBinding next_hops_binding_;
   bess::framework::ResourceBinding neighbors_binding_;
   bess::framework::ResourceBinding next_hop_state_binding_;
   bess::framework::ResourceBinding groups_binding_;
   bess::framework::ResourceBinding routes_binding_;
-  std::unique_ptr<bess::route::NeighborResolver> neighbor_resolver_;
+  bess::framework::Sized<bess::route::NeighborResolver> neighbor_resolver_;
   bess::framework::TickEndpoint neighbor_tick_;
+  // The three rings' DPDK bytes, released when CleanupNeighborResolver frees
+  // them (D-198). Before the rings it admits.
+  bess::framework::MemoryLease neighbor_rings_memory_;
   rte_ring *neighbor_rx_ring_ = nullptr;  // NeighborFrame elements
   rte_ring *neighbor_arp_ring_ = nullptr;  // ArpRequestCopy elements
   rte_ring *neighbor_tx_ring_ = nullptr;

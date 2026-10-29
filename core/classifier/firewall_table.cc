@@ -249,14 +249,52 @@ void NormalizeRule(FirewallRule &rule) {
                       rule.dst_port_low != 0 || rule.dst_port_high != 0xffff;
 }
 
+namespace {
+
+// Group identity: family, protocol, then the two prefix lengths.
+using GroupKey = std::tuple<uint8_t, uint8_t, uint8_t, uint8_t>;
+
+GroupKey GroupOf(const FirewallRule &rule) {
+  return {static_cast<uint8_t>(rule.family), rule.proto, rule.src_len,
+          rule.dst_len};
+}
+
+// How many rules each group of `rules` holds.
+std::map<GroupKey, size_t> GroupSizes(const std::vector<FirewallRule> &rules) {
+  std::map<GroupKey, size_t> sizes;
+  for (const FirewallRule &rule : rules) {
+    sizes[GroupOf(rule)]++;
+  }
+  return sizes;
+}
+
+}  // namespace
+
+size_t FirewallTable::Bytes(const std::vector<FirewallRule> &rules) {
+  return sizeof(FirewallTable) + rules.size() * sizeof(FirewallRule) +
+         GroupSizes(rules).size() * sizeof(Group) +
+         rules.size() * sizeof(Entry);
+}
+
+size_t FirewallTable::bytes() const noexcept {
+  size_t total = sizeof(FirewallTable) +
+                 rules_.capacity() * sizeof(FirewallRule) +
+                 groups_.capacity() * sizeof(Group);
+  for (const Group &group : groups_) {
+    total += group.entries.capacity() * sizeof(Entry);
+  }
+  return total;
+}
+
 std::expected<std::unique_ptr<const FirewallTable>, std::string>
 FirewallTable::Build(std::vector<FirewallRule> rules) {
   auto table = std::unique_ptr<FirewallTable>(new FirewallTable());
   table->rules_.reserve(rules.size());
 
-  // Group identity: family, protocol, then the two prefix lengths. The map's
-  // order is irrelevant - the groups are sorted by first_rule below.
-  using GroupKey = std::tuple<uint8_t, uint8_t, uint8_t, uint8_t>;
+  // The map's order is irrelevant - the groups are sorted by first_rule
+  // below. Each group's entries are reserved to its size, so the table holds
+  // exactly Bytes(rules) (D-198).
+  const std::map<GroupKey, size_t> sizes = GroupSizes(rules);
   std::map<GroupKey, Group> by_key;
 
   uint32_t index = 0;  // 0 is "no rule", so rules are 1-based
@@ -267,8 +305,7 @@ FirewallTable::Build(std::vector<FirewallRule> rules) {
       return std::unexpected(*refused);
     }
 
-    const GroupKey group_key{static_cast<uint8_t>(rule.family), rule.proto,
-                             rule.src_len, rule.dst_len};
+    const GroupKey group_key = GroupOf(rule);
     Group &group = by_key[group_key];
     group.family = rule.family;
     group.proto = rule.proto;
@@ -284,6 +321,7 @@ FirewallTable::Build(std::vector<FirewallRule> rules) {
     // in Lookup() rests on it.
     if (group.entries.empty()) {
       group.first_rule = index;
+      group.entries.reserve(sizes.at(group_key));
     }
 
     // A sloppy prefix means its network (the same reading the UPF gives an SDF

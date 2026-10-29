@@ -199,6 +199,24 @@ class SharedFlowTable {
     return table;
   }
 
+  // What Create allocates (D-198): the rte_hash directory (DPDK, on
+  // `socket`), the slot array, free list and pending ring (Traits::Allocator,
+  // glibc by default), and the table itself -- what bytes() counts. Fixed for
+  // the table's life: owners grow by copying into a larger table.
+  static size_t Bytes(size_t capacity, const rcu::RcuDomain &domain,
+                      int socket = bess::utils::MemoryNode(),
+                      const Observer & = Observer{}) {
+    return SharedExactIndex::Bytes(static_cast<uint32_t>(sizeof(Key)),
+                                   capacity * kKeysPerSlot, domain, socket) +
+           GlibcBytes(capacity, domain, socket);
+  }
+  static size_t GlibcBytes(size_t capacity, const rcu::RcuDomain &,
+                           int = bess::utils::MemoryNode(),
+                           const Observer & = Observer{}) noexcept {
+    return capacity * (sizeof(Slot) + 2 * sizeof(uint32_t)) +
+           sizeof(SharedFlowTable);
+  }
+
   // Destroys every State, live or waiting out a grace period. No worker may be
   // using the table: the caller stops them first, as for any RCU-protected
   // object.
@@ -447,9 +465,11 @@ class SharedFlowTable {
 
   size_t size() const noexcept { return size_.load(std::memory_order_relaxed); }
   size_t capacity() const noexcept { return capacity_; }
-  // Bytes of the slots and free lists (the rte_hash directory not counted:
-  // DPDK does not report it).
-  size_t memory_bytes() const noexcept { return block_bytes_; }
+  // Bytes the table holds (Bytes(capacity, ...)): the directory, the slots
+  // and free lists, and the table itself.
+  size_t bytes() const noexcept {
+    return directory_->bytes() + block_bytes_ + sizeof(*this);
+  }
   // Erased flows whose State has not been destroyed yet: the reclamation
   // backlog. A stalled reader makes it grow until the table is full.
   size_t pending_reclaim() const noexcept {

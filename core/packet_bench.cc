@@ -7,7 +7,7 @@
 //
 // Uses PlainPacketPool (see packet_pool.h): the only pool backend that
 // doesn't require real hugepages, which this sandbox doesn't have. Not
-// representative of DpdkPacketPool/BessPacketPool's absolute numbers, but
+// representative of DpdkPacketPool's absolute numbers, but
 // the operations benchmarked here (Alloc/Free bookkeeping, accessor
 // arithmetic, batch pointer-array copies) don't depend on which pool
 // backend supplied the underlying memory.

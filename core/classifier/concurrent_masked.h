@@ -12,6 +12,7 @@
 #include <expected>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -23,6 +24,7 @@
 #include "classifier/record_arena.h"
 #include "rcu/rcu_domain.h"
 #include "rcu/rcu_ptr.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::classifier {
 
@@ -129,12 +131,20 @@ class ConcurrentMaskedTable {
     uint32_t entry_capacity;
     uint32_t range_capacity;
 
-    // Frees what New allocated: one raw ::operator new block holding the
-    // header and its trailing arrays (the header is trivially destructible).
+    // Frees what NewChain allocated: one raw ::operator new block holding
+    // the header and its trailing arrays (the header is trivially
+    // destructible), and gives its bytes back to `owner`'s growth hook
+    // (D-198). Chains are freed only by their table's writer, while the
+    // table lives.
     struct Free {
-      void operator()(Chain *chain) const noexcept { ::operator delete(chain); }
+      ConcurrentMaskedTable *owner;
+      void operator()(Chain *chain) const noexcept;
     };
-    static std::unique_ptr<Chain, Free> New(uint32_t entries, uint32_t ranges);
+    // The block for `entries` entries and `ranges` ranges.
+    static size_t Bytes(uint32_t entries, uint32_t ranges) noexcept {
+      return sizeof(Chain) + size_t{entries} * sizeof(ChainEntry) +
+             size_t{ranges} * sizeof(KeyRange);
+    }
 
     const ChainEntry *entries() const noexcept {
       return reinterpret_cast<const ChainEntry *>(this + 1);
@@ -205,6 +215,24 @@ class ConcurrentMaskedTable {
 
   static std::expected<std::unique_ptr<ConcurrentMaskedTable>, std::string>
   Create(uint32_t key_len, size_t max_tuples, rcu::RcuDomain &domain);
+
+  // Memory (D-198). Create allocates the rule records' published-chunk array
+  // (RecordArena::Bytes); max_tuples only bounds the tuples, which come later
+  // with their rules. What grows on the writer's path is admitted through
+  // set_memory_growth's hook before it is allocated: record chunks (the
+  // arena), tuple tables -- a new mask's, and each larger replacement Grown
+  // builds (rte_hash, ConcurrentExactTable::Bytes) -- and range chains
+  // (glibc). A tuple table is given back when it is freed, after the grace
+  // period of the last tuple list holding it (on whichever control thread
+  // reclaims), a chain when it is freed; so the hook must stay valid while
+  // the table lives (destroy the table before its lease). The destructor
+  // detaches it first and gives nothing back.
+  static size_t Bytes(uint32_t key_len, size_t max_tuples,
+                      const rcu::RcuDomain &domain);
+  // Held now: the record arena, every tuple table not yet freed (live and
+  // waiting out a grace period) and every chain (live, spare and retiring).
+  size_t bytes() const noexcept;
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept;
 
   ~ConcurrentMaskedTable();
 
@@ -405,6 +433,30 @@ class ConcurrentMaskedTable {
   ConcurrentMaskedTable(uint32_t key_len, size_t max_tuples,
                         rcu::RcuDomain &domain);
 
+  // The growth hook (shared by tuple tables and chains) and the tuple
+  // tables' bytes, shared with each table's deleter (TupleTableFree): a
+  // replaced or dropped table is freed with the last tuple list that holds
+  // it, after a grace period, possibly once this table is gone (its lists
+  // wait in the domain's queue) -- so a table gives its bytes back when it
+  // is actually freed, while the owner's hook is still attached; after
+  // ~ConcurrentMaskedTable detached it, the owner has released everything
+  // already. The mutex orders a deleter on a reclaiming thread against
+  // detaching.
+  struct TupleMemory {
+    std::mutex mutex;
+    utils::MemoryGrowth *growth = nullptr;  // guarded by mutex
+    std::atomic<size_t> table_bytes{0};     // tuple tables not yet freed
+    // The hook's Grow / Shrink (no hook: nothing). Grow throws
+    // MemoryRefused when the growth is refused.
+    void Grow(size_t n, size_t glibc = 0);
+    void Shrink(size_t n, size_t glibc = 0) noexcept;
+  };
+  struct TupleTableFree {
+    std::shared_ptr<TupleMemory> memory;
+    size_t bytes;
+    void operator()(ConcurrentExactTable *table) const noexcept;
+  };
+
   static RuleId IdOf(uint64_t value) noexcept {
     return static_cast<RuleId>(value);
   }
@@ -505,7 +557,11 @@ class ConcurrentMaskedTable {
   }
 
   // Writer helpers.
+  // Throws MemoryRefused when the growth hook refuses the table or DPDK has
+  // no memory for it (never nullptr for memory: kFull is capacity).
   std::shared_ptr<ConcurrentExactTable> NewTupleTable(size_t rules) const;
+  // A chain for `entries` entries and `ranges` ranges, admitted first (glibc).
+  ChainPtr NewChain(uint32_t entries, uint32_t ranges);
   // A copy of `from` at least twice its capacity; nullptr on failure.
   std::shared_ptr<ConcurrentExactTable> Grown(
       const ConcurrentExactTable &from) const;
@@ -565,6 +621,8 @@ class ConcurrentMaskedTable {
   const size_t max_tuples_;
   rcu::RcuDomain &domain_;
   detail::MaskBatchFn mask_batch_;
+  // Before tuples_: retired lists' deleters keep it alive past this table.
+  std::shared_ptr<TupleMemory> tuple_memory_;
   rcu::RcuPtr<TupleList> tuples_;
   // Rule records live here, addressed by RuleId (write-once; grace-period
   // recycling). A reader's load is an acquire load of the chunk base.
@@ -584,6 +642,8 @@ class ConcurrentMaskedTable {
     rcu::GracePeriod token;
   };
   std::vector<RetiredChain> retired_chains_;
+  // Bytes of every chain allocated and not yet freed (writer only).
+  size_t chain_bytes_ = 0;
 };
 
 }  // namespace bess::classifier

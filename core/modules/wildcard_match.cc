@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "dataplane/transaction_engine.h"
+#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "framework/table_batch.h"
 #include "utils/endian.h"
@@ -136,29 +137,31 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
     }
   }
 
+  if (arg.has_default_gate() && !bess::IsValidGateValue(arg.default_gate())) {
+    return CommandFailure(EINVAL, "Invalid default gate: %llu",
+                          static_cast<unsigned long long>(arg.default_gate()));
+  }
+  // The record arena ("results") and the rule table ("rules") are admitted
+  // after every argument check (D-198).
+  if (CommandResponse results = results_.Init(
+          *this, arg.result_fields(),
+          arg.has_default_result()
+              ? std::optional<std::string_view>(arg.default_result())
+              : std::nullopt,
+          init_context().rcu(), init_context().memory(), "results");
+      results.error().code() != 0) {
+    return results;
+  }
   auto table = NewTable();
   if (!table) {
     return CommandFailure(table.error().first, "%s",
                           table.error().second.c_str());
   }
   Error err;
-  if (arg.has_default_gate() && !bess::IsValidGateValue(arg.default_gate())) {
-    return CommandFailure(EINVAL, "Invalid default gate: %llu",
-                          static_cast<unsigned long long>(arg.default_gate()));
-  }
   const gate_idx_t default_gate =
       arg.has_default_gate() ? static_cast<gate_idx_t>(arg.default_gate()) : DROP_GATE;
   if (arg.has_default_gate()) {
     initial_default_gate_ = arg.default_gate();
-  }
-  if (CommandResponse results = results_.Init(
-          *this, arg.result_fields(),
-          arg.has_default_result()
-              ? std::optional<std::string_view>(arg.default_result())
-              : std::nullopt,
-          init_context().rcu());
-      results.error().code() != 0) {
-    return results;
   }
   GenerationPtr gen = Build(*table, default_gate, &err);
   if (gen == nullptr) {
@@ -355,14 +358,26 @@ Error WildcardMatch::PackRule(const Rule &rule, std::vector<std::byte> *value,
 
 std::expected<std::shared_ptr<bess::classifier::ConcurrentMaskedTable>, Error>
 WildcardMatch::NewTable() const {
-  auto table = bess::classifier::ConcurrentMaskedTable::Create(
-      static_cast<uint32_t>(keys_.key_size()), max_tuples_,
-      init_context().rcu());
+  using bess::classifier::ConcurrentMaskedTable;
+  const auto key_len = static_cast<uint32_t>(keys_.key_size());
+  // Admitted before it is built (D-198): a refusal throws MemoryRefused and
+  // builds nothing. The table then admits what it grows by (record chunks,
+  // tuple tables, chains) through the lease's hook, and gives back tuple
+  // tables and chains as RCU frees them. The admission travels with the
+  // table: it is released after the table is destroyed (the last generation
+  // or retire callback holding it), so the hook outlives every free.
+  bess::framework::MemoryLease lease =
+      init_context().memory().LeaseFor<ConcurrentMaskedTable>(
+          "rules", key_len, max_tuples_, init_context().rcu());
+  auto table =
+      ConcurrentMaskedTable::Create(key_len, max_tuples_, init_context().rcu());
   if (!table) {
     return std::unexpected(std::make_pair(EINVAL, table.error()));
   }
-  return std::shared_ptr<bess::classifier::ConcurrentMaskedTable>(
-      std::move(*table));
+  auto owner = std::make_shared<bess::framework::Sized<ConcurrentMaskedTable>>(
+      bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*table)));
+  ConcurrentMaskedTable *raw = owner->get();
+  return std::shared_ptr<ConcurrentMaskedTable>(std::move(owner), raw);
 }
 
 WildcardMatch::GenerationPtr WildcardMatch::Build(
