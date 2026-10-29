@@ -260,7 +260,9 @@ Two more shapes are refused rather than guessed at: a rule naming both families
 round. A *buffering* PDR is not a rule shape: the module forwards on the gate
 it arrived on, and the module the action selects names the next hop -
 including a packet store's input gate - so `firewall -> packet_store` carries
-it, with the store's own `flows` entry holding the duration.
+it, with the store's own `flows` entry holding the duration (the store and that
+table are the installed `dataplane::PacketStore` and `PacketStoreFlowsResource`,
+D-201, for a plugin that buffers without the module).
 
 **Sharding is the convention, not a workaround.** The key is a concrete struct,
 so a holder cannot add a dimension to it. A field that *partitions* the policy -

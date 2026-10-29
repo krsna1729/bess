@@ -14138,3 +14138,93 @@ tests (`router_test`), unmodified, for "no behaviour change".
 
 **Revisit when:** an owner needs an expected generation or a scope snapshot for its own writes, or ownership must
 be delegated (one module applying to resources another registered).
+
+## D-201 The packet store as an installed library; PacketStore is its adapter
+
+**Status:** proposed (2026-10-25). Amends D-129's amendment (the store's container) and applies D-198 to it.
+**Code:** `core/dataplane/packet_store.{h,cc}` (new), `core/framework/packet_store_codec.h` (new),
+`core/dataplane/packet_store_test.cc` (new), `core/modules/packet_store.{h,cc}`, `core/meson.build`,
+`tools/api_classes.json`, `docs/plugin-api.md`, `docs/dataplane-tables.md`.
+
+**Context.** Holding packets until a signal (paging, a pending session) is generic, but the only implementation was
+private to `modules/packet_store.cc`: a `std::map<uint32_t, std::deque<StoredPacket>>`, the per-flow limits table and
+its resource, the bounded expiry sweep and the release/drop/clear bodies, all members of the module. A plugin that
+runs a whole user plane in one module (no graph behind it) had to copy them. The container also allocated on the
+packet path (a map node per new flow, a deque chunk every 32 packets) and was not admitted (D-198 left it as
+"glibc, bounded by max_packets").
+
+**Decision.**
+
+- **`dataplane::PacketStore`** (installed, experimental): a single-owner store of packet handles in per-flow FIFOs,
+  keyed by a `uint32_t` flow id, configured by `PacketStoreConfig{max_packets, max_packets_per_flow, timeout_ns}`.
+  `Create(config)` refuses a zero bound or cap or a bound above 2^30 (with the reason) and returns null only when
+  its arrays cannot be allocated. `Store(handles, flow_ids, n, limits, now_ns, evict)`, `Release(id, sink)`,
+  `Drop(id)`, `Clear()`, `ExpireAll(limits, now_ns)` and `ExpireBounded(limits, now_ns)` are the module's old
+  bodies; `packets()` and `flows()` are relaxed loads any thread may make. `evict` and `sink` are template
+  callables taking a `PacketHandle` the caller then owns, so the module's gate-1 `EmitPacket` and its release
+  queue are inlined into the loop: no virtual call, no copy.
+- **Fixed memory, admitted.** Create allocates everything once: `max_packets` slots (handle, timestamp, next),
+  linked per flow and on a free list, and an open-addressing flow table of `FlowCapacity(max_packets)` entries (a
+  power of two at least twice the bound; linear probing, backward-shift erase, no tombstones). A flow is held only
+  while it holds a packet, so the table is at most half full. `Bytes(config)` (= `GlibcBytes`) is exactly that and
+  `bytes()` reports it; the module admits it as `"store"` with `LeaseFor` before `Create`, then `Adopt`s it.
+  Storing, releasing, dropping and expiring allocate nothing.
+- **Limits and resource.** `PacketStoreLimits{optional timeout_ns, optional max_packets_per_flow}` is the value,
+  `PacketStoreLimitsMap` the published table, `LimitsFor` the resolution (an absent field is the config's; a cap of
+  0 is the config's cap; a timeout of 0 never expires). `dataplane::PacketStoreFlowsResource(name, RcuPtr&)` is the
+  module's former `FlowsResource`: one private copy per transaction, swapped in by the first `Publish`, erase of an
+  absent id a no-op, no paused workers. `MakePacketStoreFlowsCodec(published)` (`packet_store_codec.h`, header-only,
+  as `meter_resource_codec.h` in D-199) is the BESS wire codec, `bess.pb.PacketStoreFlowKey ->
+  PacketStoreFlowValue`, refusing flow id 0 and keeping field presence. The library itself does not include
+  protobuf, so it stays in `bess_dataplane_core` (low-level deps only).
+- **Expiry on the owner's tick.** `ExpireBounded` visits up to 256 held flows, as the old module did,
+  independent of hash-table sparsity. Intrusive links in the fixed flow entries survive backward-shift
+  deletion; no separate allocation or empty-slot scan is needed. A sparse flow therefore expires on the
+  next sweep instead of waiting for a capacity-sized table rotation. Not `expiry_wheel.h`: a flow's timeout
+  changes when its `flows` entry does, so each upsert would have to re-arm every packet of that flow;
+  a FIFO's head is always its oldest, so one head check per visited flow is enough.
+- **The module is an adapter.** `PacketStore` keeps the ingress MPSC ring, the request SPSC ring, the snapshot
+  ordering, the release queue and gates, the counters and metrics, the commands and `resource_tables`
+  (`flows`, `.Rebuilds()`). Its store, limits resolution, sweep, request bodies and resource class are gone.
+- **Discard observer.** `SetDiscardObserver(opaque, fn)` (default none) is called once before each internal free
+  (`kExpired`, `kDropped`, `kCleared`, the destructor's Clear included), never for an eviction or release sink, so a
+  caller can retire state keyed by the handle. It must not free, throw, reenter or change itself; `opaque` outlives
+  the store or is detached after a Clear.
+- **Flows map admitted (D-198).** `PacketStoreLimitsMap` is a map with an admitting allocator (`PacketStoreMemory`
+  shared state): each node and the map header are admitted through the resource's `utils::MemoryGrowth` before they
+  are allocated and given back when freed, so a transaction's clone, its inserts and a retired map (freed a grace
+  period later) are all counted exactly; a refusal throws `MemoryRefused` from `Reserve` with the published table
+  untouched. `PacketStoreFlowsResource(name, published, growth)` publishes the first empty map itself; `Bytes()`
+  is the object, `bytes()` what it holds now; the module admits it as `"flows"`.
+- **Bounded release handoff (D-198).** The adapter's release FIFO is a single-owner circular buffer over
+  `DpdkArray<ReleasedPacket>` with exactly `max_packets` entries, admitted as `"release_queue"` before allocation.
+  No release allocates on the worker. Before consuming a release request, the owner peeks at the SPSC request
+  ring and reserves space conservatively for every currently held packet (`free >= store.packets()`). If it
+  cannot fit, the request remains at the head; no packet is discarded, and later drop/clear requests cannot pass
+  it. Each run subtracts only applied requests from its snapshot, emits at most one burst, and retries later.
+  Once the ingress snapshot is satisfied, newer ingress stays queued until those requests finish, rather than
+  filling/evicting the store ahead of a blocked release. The paused-worker direct command path follows the same
+  ordering and queues behind blocked requests. Clear and teardown free both held and released packets.
+  Since held packets and released-but-not-emitted packets coexist, Init requires the packet pool to carry
+  `2 * max_packets + 4096` buffers (both fixed bounds and the ingress ring).
+
+**Behaviour.** Unchanged at the module's surface (commands, gates, GetDesc text, metrics, resource name and codec),
+except that an arrival a full store cannot retain no longer leaves an empty held-flow entry until the next sweep.
+The bounded sweep still visits 256 held flows per run, not empty hash slots.
+
+**Evidence.** The release build and both `dataplane_packet_store_test` and `modules_packet_store_test`
+passed in the 235/236 suite run (the sole failure was Go workspace selection in `live_conformance`).
+Both new headers also compiled standalone with `-Wall -Wextra -Werror`.
+The dataplane test checks: Create's refusals and `Bytes == bytes()`; per-flow FIFO release; per-flow cap
+eviction with entry overrides and a lowered cap; a full store evicting the arrival and not counting an emptied
+flow; drop/clear/destructor freeing every packet (pool count); per-flow timeouts including 0; the bounded sweep
+covering all held flows in one rotation; 4000 random operations against a map-of-deques model (counts and FIFO
+contents, colliding ids exercising backward-shift erase); the flows resource through the transaction engine (one
+publish per transaction, field presence, absent erase a no-op, a refused transaction publishes nothing); and the
+codec. The module consumer tests also cover release backpressure across repeated arrivals/releases with exact
+payload/gate order and pool balance, a blocked snapshot preceding newer ingress, ordered control drop/clear
+behind a blocked release, and teardown with both queued releases and ingress packets. These follow-up checks
+are added but not yet run; the build/suite evidence above predates the bounded release FIFO.
+
+**Revisit when:** a store needs more than 2^30 packets, per-packet timestamps finer than one per batch, or a second
+owner thread (the store is single-owner by design; the module's rings are the handoff).
