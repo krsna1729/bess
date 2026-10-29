@@ -77,8 +77,8 @@ or writes; it never trusts that an upstream module checked it.
    checksum covers `udp->length`, not the IP payload (RFC 768). Over IPv4, a
    received UDP checksum of 0 means none was computed, and verify accepts it;
    a computed UDP checksum of 0 is sent as 0xffff (RFC 768).
-8. **A copy keeps its metadata.** Use `PacketCopyWithMetadata` or
-   `PacketCloneWithMetadata`.
+8. **A copy keeps its metadata.** Use `PacketCopyWithMetadata` (for a
+   burst, `PacketCopyBulkWithMetadata`) or `PacketCloneWithMetadata`.
 
 **Tests for a packet module.** Include these cases:
 - short frames at every length up to the bytes the module touches;
@@ -261,7 +261,7 @@ expected result, not only agreement between two paths that could both be wrong.
 |---|---|
 | Init and resource configuration agree | `core/modules/update_test.cc`: identical fields produce identical packet bytes; both paths reject the same invalid lists, and a refused replacement leaves the accepted fields active |
 | Accepted publication cannot partly fail | `core/modules/transaction_conformance_test.cc`: staging-allocation failures abort reservations and publication allocates nothing; `core/modules/bridge_test.cc` covers full-table reservation and rollback |
-| Metadata survives copying | `core/packet_test.cc`: all metadata bytes survive copy and clone, with independent private storage; `core/modules/replicate_test.cc`: a real SetMetadata → Replicate → GenericEncap graph preserves the value on both branches |
+| Metadata survives copying | `core/packet_test.cc`: all metadata bytes survive copy and clone, with independent private storage, and each bulk copy equals `PacketCopyWithMetadata`'s field for field; `core/modules/replicate_test.cc`: a real SetMetadata → Replicate → GenericEncap graph preserves the value on both branches |
 | Packet bounds and ownership hold | The Update, RandomUpdate and SetMetadata module suites exercise short and chained packets; mutation tests also retain the shared original's bytes |
 | A library and its adapter agree | `core/modules/bridge_test.cc`: standalone FDB and packed-table Bridge decisions agree across misses, static moves, gate zero, the highest normal gate, blackholes, hairpins and removal |
 

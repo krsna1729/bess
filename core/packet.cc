@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
+#include "utils/copy.h"
 #include "utils/format.h"
 
 namespace bess {
@@ -61,6 +63,81 @@ PacketHandle PacketCopyWithMetadata(PacketHandle src) {
   PacketHandle dst = PacketCopy(src);
   CopyMetadata(src, dst);
   return dst;
+}
+
+namespace {
+
+// A packet PacketCopyBulkWithMetadata copies from the bulk allocation: one
+// segment with bytes (rte_pktmbuf_copy copies no empty packet), from `pool`.
+bool CopiesFromBulk(PacketHandle src, const rte_mempool *pool) {
+  return src->nb_segs == 1 && src->pkt_len != 0 && src->pool == pool;
+}
+
+// rte_pktmbuf_copy of a one-segment `src` into `dst`, fresh from
+// rte_pktmbuf_alloc_bulk (rte_pktmbuf_alloc's reset), plus the metadata:
+// the header fields __rte_pktmbuf_copy_hdr copies, ol_flags without the
+// indirect and external bits, and the bytes at dst's default headroom. A
+// packet longer than that room gets PacketCopyWithMetadata's chain instead,
+// and `dst` is freed.
+PacketHandle CopyLinearInto(PacketHandle src, PacketHandle dst) {
+  const uint32_t len = src->pkt_len;
+  if (unlikely(len > rte_pktmbuf_tailroom(dst))) {
+    rte_pktmbuf_free(dst);
+    return PacketCopyWithMetadata(src);
+  }
+  __rte_pktmbuf_copy_hdr(dst, src);
+  dst->ol_flags = src->ol_flags & ~(RTE_MBUF_F_INDIRECT | RTE_MBUF_F_EXTERNAL);
+  utils::CopyInlined(rte_pktmbuf_mtod(dst, void *),
+                     rte_pktmbuf_mtod(src, const void *), len);
+  dst->data_len = static_cast<uint16_t>(len);
+  dst->pkt_len = len;
+  CopyMetadata(src, dst);
+  return dst;
+}
+
+}  // namespace
+
+void PacketCopyBulkWithMetadata(const PacketHandle *srcs, size_t cnt,
+                                size_t copies, PacketHandle *dsts) {
+  if (cnt == 0 || copies == 0) {
+    return;
+  }
+  DCHECK(srcs != nullptr && dsts != nullptr);
+  rte_mempool *const pool = srcs[0]->pool;
+  size_t from_bulk = 0;
+  for (size_t i = 0; i < cnt; i++) {
+    if (CopiesFromBulk(srcs[i], pool)) {
+      from_bulk++;
+    }
+  }
+
+  // The bulk fills dsts' last slots. Packet i's copies land at i * copies
+  // on, never past the bulk slots not yet taken, so each bulk slot is read
+  // before a copy overwrites it.
+  const size_t total = cnt * copies;
+  const size_t bulk_count = from_bulk * copies;
+  PacketHandle *bulk = dsts + (total - bulk_count);
+  if (bulk_count == 0 || bulk_count > std::numeric_limits<unsigned>::max() ||
+      rte_pktmbuf_alloc_bulk(pool, bulk, static_cast<unsigned>(bulk_count)) !=
+          0) {
+    for (size_t slot = 0; slot < total; slot++) {
+      dsts[slot] = PacketCopyWithMetadata(srcs[slot / copies]);
+    }
+    return;
+  }
+  for (size_t i = 0; i < cnt; i++) {
+    PacketHandle src = srcs[i];
+    PacketHandle *out = dsts + i * copies;
+    const bool bulk_src = CopiesFromBulk(src, pool);
+    for (size_t k = 0; k < copies; k++) {
+      if (bulk_src) {
+        PacketHandle fresh = *bulk++;
+        out[k] = CopyLinearInto(src, fresh);
+      } else {
+        out[k] = PacketCopyWithMetadata(src);
+      }
+    }
+  }
 }
 
 std::string PacketRef::Dump() const {

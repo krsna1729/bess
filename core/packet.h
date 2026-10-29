@@ -271,6 +271,17 @@ PacketHandle PacketCopy(PacketHandle src);
 PacketHandle PacketCloneWithMetadata(PacketHandle src);
 PacketHandle PacketCopyWithMetadata(PacketHandle src);
 
+// PacketCopyWithMetadata for each of `cnt` packets, `copies` times:
+// dsts[i * copies + k] is srcs[i]'s copy k, the same packet that function
+// returns, nullptr included (allocation failure; an empty packet, which
+// rte_pktmbuf_copy does not copy). `dsts` has cnt * copies slots and `srcs`
+// holds no null. The copies of one-segment packets from srcs[0]'s pool come
+// from one bulk allocation and are built inline; the other packets, and all
+// of them when that allocation fails, go through PacketCopyWithMetadata in
+// order.
+void PacketCopyBulkWithMetadata(const PacketHandle *srcs, size_t cnt,
+                                size_t copies, PacketHandle *dsts);
+
 // Defined here because both PacketRef and PacketBatch must be complete.
 inline PacketRef PacketBatch::packet(size_t i) { return PacketRef(handles()[i]); }
 

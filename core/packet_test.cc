@@ -255,6 +255,235 @@ TEST(PacketCopyTest, CopiesChainedBytesIntoIndependentSegments) {
   bess::PacketFree(src);
 }
 
+// A packet of `len` bytes (and `prepend` more in front, so less headroom)
+// whose bytes, header fields, offload flags, dynamic fields and metadata all
+// differ from a fresh mbuf's and from another seed's.
+bess::PacketHandle MarkedPacket(bess::PacketPool *pool, size_t len,
+                                uint8_t seed, uint16_t prepend = 0) {
+  bess::PacketHandle pkt = pool->Alloc(len);
+  if (pkt == nullptr) {
+    return nullptr;
+  }
+  if (prepend != 0 && rte_pktmbuf_prepend(pkt, prepend) == nullptr) {
+    bess::PacketFree(pkt);
+    return nullptr;
+  }
+  bess::PacketRef ref(pkt);
+  auto *bytes = ref.head_data<uint8_t *>();
+  for (size_t i = 0; i < ref.total_len(); i++) {
+    bytes[i] = static_cast<uint8_t>(seed + 7 * i);
+  }
+  pkt->port = seed;
+  pkt->vlan_tci = static_cast<uint16_t>(0x100 + seed);
+  pkt->vlan_tci_outer = static_cast<uint16_t>(0x200 + seed);
+  pkt->tx_offload = UINT64_C(0x0123456789ab0000) + seed;
+  std::memset(&pkt->hash, seed + 1, sizeof(pkt->hash));
+  pkt->packet_type = RTE_PTYPE_L2_ETHER | RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
+  pkt->ol_flags |= RTE_MBUF_F_RX_RSS_HASH | RTE_MBUF_F_RX_VLAN;
+  std::memset(pkt->dynfield1, seed + 2, sizeof(pkt->dynfield1));
+  auto *metadata = ref.metadata<uint8_t *>();
+  for (size_t i = 0; i < SNBUF_METADATA; i++) {
+    metadata[i] = static_cast<uint8_t>(seed ^ i);
+  }
+  return pkt;
+}
+
+std::vector<uint8_t> AllBytes(bess::PacketHandle pkt) {
+  std::vector<uint8_t> out(pkt->pkt_len);
+  const void *read = rte_pktmbuf_read(pkt, 0, pkt->pkt_len, out.data());
+  if (read != nullptr && read != out.data()) {
+    std::memcpy(out.data(), read, out.size());
+  }
+  return out;
+}
+
+// `copy` is `expected` (PacketCopyWithMetadata's copy of `src`) in every
+// field a consumer sees, and changing it leaves `src` as it was.
+void ExpectSameCopy(bess::PacketHandle expected, bess::PacketHandle copy,
+                    bess::PacketHandle src) {
+  ASSERT_NE(expected, nullptr);
+  ASSERT_NE(copy, nullptr);
+  EXPECT_EQ(copy->pool, expected->pool);
+  EXPECT_EQ(copy->nb_segs, expected->nb_segs);
+  EXPECT_EQ(copy->pkt_len, expected->pkt_len);
+  EXPECT_EQ(copy->data_off, expected->data_off);
+  for (bess::PacketHandle c = copy, e = expected; c != nullptr && e != nullptr;
+       c = c->next, e = e->next) {
+    EXPECT_EQ(c->data_len, e->data_len);
+  }
+  EXPECT_EQ(copy->port, expected->port);
+  EXPECT_EQ(copy->vlan_tci, expected->vlan_tci);
+  EXPECT_EQ(copy->vlan_tci_outer, expected->vlan_tci_outer);
+  EXPECT_EQ(copy->tx_offload, expected->tx_offload);
+  EXPECT_EQ(std::memcmp(&copy->hash, &expected->hash, sizeof(copy->hash)), 0);
+  EXPECT_EQ(copy->packet_type, expected->packet_type);
+  EXPECT_EQ(copy->ol_flags, expected->ol_flags);
+  EXPECT_EQ(std::memcmp(copy->dynfield1, expected->dynfield1,
+                        sizeof(copy->dynfield1)),
+            0);
+  EXPECT_EQ(rte_mbuf_refcnt_read(copy), 1);
+  EXPECT_TRUE(RTE_MBUF_DIRECT(copy));
+  EXPECT_EQ(AllBytes(copy), AllBytes(expected));
+  EXPECT_EQ(std::memcmp(bess::PacketRef(copy).metadata(),
+                        bess::PacketRef(expected).metadata(), SNBUF_METADATA),
+            0);
+
+  const std::vector<uint8_t> src_bytes = AllBytes(src);
+  const uint8_t src_metadata = bess::PacketRef(src).metadata<uint8_t *>()[0];
+  EXPECT_NE(copy->buf_addr, src->buf_addr);
+  bess::PacketRef(copy).head_data<uint8_t *>()[0] ^= 0xffu;
+  bess::PacketRef(copy).metadata<uint8_t *>()[0] ^= 0xffu;
+  EXPECT_EQ(AllBytes(src), src_bytes);
+  EXPECT_EQ(bess::PacketRef(src).metadata<uint8_t *>()[0], src_metadata);
+}
+
+// One-segment packets take the bulk path: each copy equals the one
+// PacketCopyWithMetadata makes -- bytes, lengths, the default headroom
+// whatever the source's, header fields, ol_flags without the indirect bit
+// (the clone), dynamic fields, metadata -- and owns its storage.
+TEST(PacketCopyBulkTest, LinearCopiesMatchPacketCopyWithMetadata) {
+  bess::PlainPacketPool pool(64);
+  std::vector<bess::PacketHandle> srcs = {
+      MarkedPacket(&pool, 1, 1),    MarkedPacket(&pool, 60, 2),
+      MarkedPacket(&pool, 64, 3),   MarkedPacket(&pool, 65, 4),
+      MarkedPacket(&pool, 1514, 5), MarkedPacket(&pool, 60, 6, 40)};
+  for (bess::PacketHandle src : srcs) {
+    ASSERT_NE(src, nullptr);
+  }
+  bess::PacketHandle marked = MarkedPacket(&pool, 100, 7);
+  ASSERT_NE(marked, nullptr);
+  bess::PacketHandle clone = bess::PacketCloneWithMetadata(marked);
+  ASSERT_NE(clone, nullptr);
+  ASSERT_NE(clone->ol_flags & RTE_MBUF_F_INDIRECT, 0u);
+  srcs.push_back(clone);
+
+  constexpr size_t kCopies = 3;
+  std::vector<bess::PacketHandle> dsts(srcs.size() * kCopies, nullptr);
+  bess::PacketCopyBulkWithMetadata(srcs.data(), srcs.size(), kCopies,
+                                   dsts.data());
+  for (bess::PacketHandle dst : dsts) {
+    ASSERT_NE(dst, nullptr);
+  }
+  for (size_t i = 0; i < srcs.size(); i++) {
+    for (size_t k = 0; k < kCopies; k++) {
+      SCOPED_TRACE(testing::Message() << "packet " << i << " copy " << k);
+      bess::PacketHandle expected = bess::PacketCopyWithMetadata(srcs[i]);
+      ExpectSameCopy(expected, dsts[i * kCopies + k], srcs[i]);
+      if (k > 0) {
+        EXPECT_NE(dsts[i * kCopies + k]->buf_addr,
+                  dsts[i * kCopies + k - 1]->buf_addr);
+      }
+      bess::PacketFree(expected);
+    }
+  }
+
+  bess::PacketFreeBulk(dsts.data(), dsts.size());
+  bess::PacketFreeBulk(srcs.data(), srcs.size());
+  bess::PacketFree(marked);
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
+// The packets the bulk cannot copy keep PacketCopyWithMetadata's copy in
+// their own slots, between bulk-copied ones: a chain (also first, so not
+// what picks the pool), an empty packet (no copy), another pool's packet,
+// and one too long for a fresh mbuf's headroom (a chain copy).
+TEST(PacketCopyBulkTest, OtherPacketsKeepPacketCopyWithMetadata) {
+  bess::PlainPacketPool pool(64);
+  bess::PlainPacketPool other_pool(16);
+  std::vector<uint8_t> chain_bytes(pool.data_room_size() + 64);
+  for (size_t i = 0; i < chain_bytes.size(); i++) {
+    chain_bytes[i] = static_cast<uint8_t>(0xff - i);
+  }
+  bess::PacketHandle chain =
+      pool.AllocCopy(chain_bytes.data(), chain_bytes.size());
+  ASSERT_NE(chain, nullptr);
+  ASSERT_EQ(chain->nb_segs, 2);
+  bess::PacketRef(chain).metadata<uint32_t *>()[0] = 0xdeadbeef;
+  bess::PacketHandle empty = MarkedPacket(&pool, 0, 9);
+  ASSERT_NE(empty, nullptr);
+  ASSERT_EQ(bess::PacketCopyWithMetadata(empty), nullptr);
+  const std::vector<bess::PacketHandle> srcs = {
+      chain,
+      MarkedPacket(&pool, 60, 10),
+      empty,
+      MarkedPacket(&other_pool, 60, 11),
+      MarkedPacket(&pool, 61, 12),
+      MarkedPacket(&pool, pool.data_room_size(), 13, 64)};
+  for (bess::PacketHandle src : srcs) {
+    ASSERT_NE(src, nullptr);
+  }
+
+  constexpr size_t kCopies = 2;
+  std::vector<bess::PacketHandle> dsts(srcs.size() * kCopies, nullptr);
+  bess::PacketCopyBulkWithMetadata(srcs.data(), srcs.size(), kCopies,
+                                   dsts.data());
+  for (size_t i = 0; i < srcs.size(); i++) {
+    for (size_t k = 0; k < kCopies; k++) {
+      SCOPED_TRACE(testing::Message() << "packet " << i << " copy " << k);
+      bess::PacketHandle copy = dsts[i * kCopies + k];
+      if (srcs[i] == empty) {
+        EXPECT_EQ(copy, nullptr);
+        continue;
+      }
+      ASSERT_NE(copy, nullptr);
+      if (srcs[i] == srcs.back()) {
+        EXPECT_EQ(srcs[i]->nb_segs, 1);
+        EXPECT_EQ(copy->nb_segs, 2);
+      }
+      bess::PacketHandle expected = bess::PacketCopyWithMetadata(srcs[i]);
+      ExpectSameCopy(expected, copy, srcs[i]);
+      bess::PacketFree(expected);
+      bess::PacketFree(copy);
+    }
+  }
+
+  for (bess::PacketHandle src : srcs) {
+    bess::PacketFree(src);
+  }
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+  EXPECT_EQ(other_pool.Size(), other_pool.Capacity());
+}
+
+// When the pool cannot give every copy at once, the copies are made one at
+// a time in order, as PacketCopyWithMetadata makes them: the first ones get
+// the packets left, the rest are nullptr.
+TEST(PacketCopyBulkTest, BulkFailureCopiesOneAtATimeInOrder) {
+  bess::PlainPacketPool pool(8);
+  const std::vector<bess::PacketHandle> srcs = {MarkedPacket(&pool, 60, 1),
+                                                MarkedPacket(&pool, 60, 2),
+                                                MarkedPacket(&pool, 60, 3)};
+  for (bess::PacketHandle src : srcs) {
+    ASSERT_NE(src, nullptr);
+  }
+  constexpr size_t kCopies = 3;
+  const size_t left = pool.Size();
+  ASSERT_GT(left, 0u);
+  ASSERT_LT(left, srcs.size() * kCopies);
+
+  std::vector<bess::PacketHandle> dsts(srcs.size() * kCopies, nullptr);
+  bess::PacketCopyBulkWithMetadata(srcs.data(), srcs.size(), kCopies,
+                                   dsts.data());
+  for (size_t slot = 0; slot < dsts.size(); slot++) {
+    SCOPED_TRACE(testing::Message() << "slot " << slot);
+    if (slot >= left) {
+      EXPECT_EQ(dsts[slot], nullptr);
+      continue;
+    }
+    bess::PacketHandle src = srcs[slot / kCopies];
+    ASSERT_NE(dsts[slot], nullptr);
+    EXPECT_EQ(AllBytes(dsts[slot]), AllBytes(src));
+    EXPECT_EQ(std::memcmp(bess::PacketRef(dsts[slot]).metadata(),
+                          bess::PacketRef(src).metadata(), SNBUF_METADATA),
+              0);
+    bess::PacketFree(dsts[slot]);
+  }
+
+  for (bess::PacketHandle src : srcs) {
+    bess::PacketFree(src);
+  }
+  EXPECT_EQ(pool.Size(), pool.Capacity());
+}
+
 TEST(PacketPoolTest, AllocationRejectsOversizeAndBulkFailureIsAtomic) {
   bess::PlainPacketPool pool(4);
 

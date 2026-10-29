@@ -25,6 +25,8 @@ namespace {
 using bess::testing::Bytes;
 using bess::testing::FlowSpec;
 using bess::testing::ModuleHarness;
+using bess::testing::MakePacket;
+using bess::testing::PacketBytes;
 
 bess::pb::ReplicateArg Gates(const std::vector<int64_t> &gates) {
   bess::pb::ReplicateArg arg;
@@ -68,6 +70,37 @@ TEST(ReplicateTest, TheOriginalLeavesOnTheFirstConfiguredGate) {
   EXPECT_EQ(pkt, out[2][0]);
   ASSERT_EQ(1u, out[3].size()) << "the copy";
   EXPECT_EQ(pkt, out[3][0]);
+}
+
+// One burst of every kind of packet keeps its order on every gate: one
+// segment, a chain, a clone. An empty packet has no copy (rte_pktmbuf_copy
+// makes none); the original still leaves on the first gate.
+TEST(ReplicateTest, AMixedBurstReachesEveryGateInOrder) {
+  ModuleHarness h;
+  Module *rep = h.Create("Replicate", Gates({0, 1, 2}));
+  ASSERT_NE(nullptr, rep);
+  std::mt19937 rng(2);
+  const Bytes a =
+      bess::testing::TcpPacket(FlowSpec{.sip = "10.0.0.1", .dip = "10.0.0.2"}, rng);
+  const Bytes b =
+      bess::testing::TcpPacket(FlowSpec{.sip = "10.0.0.3", .dip = "10.0.0.4"}, rng);
+  const Bytes c =
+      bess::testing::TcpPacket(FlowSpec{.sip = "10.0.0.5", .dip = "10.0.0.6"}, rng);
+  bess::PacketHandle original = MakePacket(c);
+  ASSERT_NE(nullptr, original);
+  bess::PacketHandle clone = bess::PacketClone(original);
+  ASSERT_NE(nullptr, clone);
+
+  auto out = h.RunPackets(
+      rep, 0, {MakePacket(a), MakePacket(b, 20), clone, MakePacket(Bytes()), MakePacket(a)},
+      rep, {0, 1, 2});
+  const std::vector<Bytes> originals = {a, b, c, Bytes(), a};
+  const std::vector<Bytes> copies = {a, b, c, a};
+  EXPECT_EQ(originals, out[0]);
+  EXPECT_EQ(copies, out[1]);
+  EXPECT_EQ(copies, out[2]);
+  EXPECT_EQ(c, PacketBytes(original)) << "the clone's parent is untouched";
+  bess::PacketFree(original);
 }
 
 TEST(ReplicateTest, MetadataReachesTheConsumerOnBothBranches) {
