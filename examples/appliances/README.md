@@ -67,6 +67,16 @@ two-layer policies while a worker runs. Gate-local classifiers reject mixed
 DSCP/egress pairs. It also checks rejected-update readback, tenant isolation
 and replacement of a cached allow with deny.
 
+Each application's `Create` takes its module's `init_context().memory()`
+scope (D-198) as well as its other inputs. Before allocating, it admits the
+router, slot tables, decision caches, cold-flow table, NAT and conntrack with
+their primitive `Bytes`/`GlibcBytes` costs. Router domains and slot-table slab
+chunks admit control-path growth through the same leases. A `self_test`'s
+private applications use that scope too: their additional tables are accounted
+while the command runs and released when the private applications are dropped.
+Memory refusal propagates to the control boundary as `RESOURCE_EXHAUSTED`;
+it does not publish a partially built application. The direct static-router
+program owns a `MemoryScope` for the same application API.
 
 Build and check against a staged install (as CI's install check does):
 

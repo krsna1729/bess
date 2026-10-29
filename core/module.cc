@@ -16,7 +16,23 @@
 #include "scheduler.h"
 #include "stats/metric_registry.h"
 #include "task.h"
+#include "framework/memory_scope.h"
+#include "utils/dpdk_memory.h"
 #include "utils/pcap.h"
+
+namespace {
+
+// D-198: memory a module's Init or command asked for and did not get. A
+// utils::MemoryRefused keeps its message (the bytes, the heap state, the flag
+// that would allow a fallback); any other std::bad_alloc is "out of memory".
+// ENOMEM: RESOURCE_EXHAUSTED on the wire, which clients do not retry.
+CommandResponse MemoryFailure(const std::bad_alloc &e) {
+  const auto *refused = dynamic_cast<const bess::utils::MemoryRefused *>(&e);
+  return CommandFailure(ENOMEM, "%s",
+                        refused != nullptr ? refused->what() : "out of memory");
+}
+
+}  // namespace
 
 const Commands Module::cmds;
 const ResourceTables Module::resource_tables;
@@ -97,7 +113,16 @@ CommandResponse ModuleBuilder::RunCommand(Module *m, const std::string &user_cmd
                               cmd.cmd.c_str());
       }
 
-      return cmd.func(m, arg);
+      // A command runs on the control path; memory it cannot get is refused
+      // as its error (D-198). A command promises no more after a throw than
+      // after an error return: what it published before the allocation stays
+      // (D-129 advances the resource generation either way), and the
+      // dataplane tables build a new structure before they publish it.
+      try {
+        return cmd.func(m, arg);
+      } catch (const std::bad_alloc &e) {
+        return MemoryFailure(e);
+      }
     }
   }
 
@@ -107,7 +132,15 @@ CommandResponse ModuleBuilder::RunCommand(Module *m, const std::string &user_cmd
 
 CommandResponse ModuleBuilder::RunInit(Module *m,
                                        const google::protobuf::Any &arg) const {
-  CommandResponse ret = init_func_(m, arg);
+  CommandResponse ret;
+  try {
+    ret = init_func_(m, arg);
+  } catch (const std::bad_alloc &e) {
+    // Unwound out of Init: answered as an Init that returned an error, so
+    // ModuleGraph::CreateModule tears the module down (Destroy, then the
+    // destructor frees what its members own) and nothing of it is registered.
+    ret = MemoryFailure(e);
+  }
   if (!ret.has_error()) {
     m->initial_arg_ = arg;
   }
@@ -122,6 +155,38 @@ Module *ModuleBuilder::CreateModule(const std::string &name,
   m->set_pipeline(pipeline);
   return m;
 }
+
+Module::Module()
+    : memory_(),
+      init_context_(),
+      name_(),
+      module_builder_(),
+      initial_arg_(),
+      pipeline_(),
+      attrs_(),
+      attr_offsets_(),
+      tasks_(),
+      igates_(),
+      ogates_(),
+      deadends_(/*keys=*/1, /*cells_per_key=*/1, Worker::kMaxWorkers),
+      active_workers_(Worker::kMaxWorkers, false),
+      visited_tasks_(),
+      is_task_(false),
+      parent_tasks_(),
+      children_overload_(0),
+      overload_(false),
+      node_constraints_(UNCONSTRAINED_SOCKET),
+      min_allowed_workers_(1),
+      max_allowed_workers_(1),
+      propagate_workers_(true) {
+  // The scope is listed under the module's name, which is set after
+  // construction (ModuleBuilder::CreateModule) and read when listed.
+  memory_ = std::make_unique<bess::framework::MemoryScope>(&name_);
+  init_context_.reset(new bess::framework::ModuleInitContext(
+      bess::framework::ModuleInitContext::ProcessDefault(), *memory_));
+}
+
+Module::~Module() = default;
 
 // -------------------------------------------------------------------------
 CommandResponse Module::InitWithGenericArg(const google::protobuf::Any &arg) {

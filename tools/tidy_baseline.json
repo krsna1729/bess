@@ -166,13 +166,6 @@
       "cppcoreguidelines-narrowing-conversions": 4,
       "performance-unnecessary-value-param": 1
     },
-    "core/runtime/memory.cc": {
-      "cppcoreguidelines-narrowing-conversions": 4,
-      "performance-no-int-to-ptr": 3
-    },
-    "core/runtime/memory.h": {
-      "performance-no-int-to-ptr": 1
-    },
     "core/runtime/runtime_state.cc": {
       "bugprone-unused-return-value": 2
     },
@@ -207,8 +200,7 @@
       "bugprone-assignment-in-if-condition": 2,
       "bugprone-multi-level-implicit-pointer-conversion": 2,
       "bugprone-use-after-move": 3,
-      "cppcoreguidelines-narrowing-conversions": 2,
-      "performance-move-const-arg": 1
+      "cppcoreguidelines-narrowing-conversions": 2
     },
     "core/utils/endian.h": {
       "misc-redundant-expression": 3

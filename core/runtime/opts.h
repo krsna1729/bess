@@ -21,7 +21,11 @@ DECLARE_int32(p);
 DECLARE_string(grpc_url);
 DECLARE_string(http_addr);
 DECLARE_string(http_allowed_hosts);
-DECLARE_int32(m);
+DECLARE_string(mem_backing);
+DECLARE_int64(mem_hugepage_mb);
+DECLARE_bool(mem_fallback);
+DECLARE_int64(mem_limit_mb);
+DECLARE_int64(mem_reserve_mb);
 DECLARE_int32(maintenance_interval_us);
 DECLARE_string(pci_allow);
 DECLARE_string(dpdk_trace);
@@ -33,7 +37,6 @@ DECLARE_bool(core_dump);
 DECLARE_bool(no_crashlog);
 DECLARE_int32(buffers);
 DECLARE_uint32(packet_data_room);
-DECLARE_bool(dpdk);
 DECLARE_string(iova);
 
 #endif  // BESS_RUNTIME_OPTS_H_

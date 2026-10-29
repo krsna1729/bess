@@ -34,31 +34,112 @@ ConcurrentMaskedTable::ConcurrentMaskedTable(uint32_t key_len,
       max_tuples_(max_tuples),
       domain_(domain),
       mask_batch_(detail::SelectMaskBatch(key_len)),
+      tuple_memory_(std::make_shared<TupleMemory>()),
       tuples_(domain),
       records_(sizeof(Rule), domain) {
   tuples_.Initialize(std::make_unique<TupleList>());
 }
 
 ConcurrentMaskedTable::~ConcurrentMaskedTable() {
+  // Detached first: nothing freed from here on gives bytes back -- the
+  // owner releases what this table admitted with it (D-198), and its hook
+  // may already be gone (a lease declared after the table). Tuple tables
+  // that retired lists still hold are freed later, unadmitted, the same way.
+  {
+    const std::lock_guard<std::mutex> lock(tuple_memory_->mutex);
+    tuple_memory_->growth = nullptr;
+  }
   // The table is destroyed with the last generation that maps it, which is
   // itself retired past a grace period: no reader can hold the tuple list,
   // nor a chain one of its values names.
   for (const Tuple &tuple : tuples_.Read()->tuples) {
-    tuple.table->ForEach([](ConstBytes, uint64_t packed) {
+    tuple.table->ForEach([this](ConstBytes, uint64_t packed) {
       if (IsChain(packed)) {
-        Chain::Free{}(const_cast<Chain *>(&ChainOf(packed)));
+        Chain::Free{this}(const_cast<Chain *>(&ChainOf(packed)));
       }
     });
   }
+  // Every chain goes before chain_bytes_, which their Free updates.
+  retired_chains_.clear();
+  pending_keys_.clear();
   tuples_.ResetQuiesced();
+}
+
+size_t ConcurrentMaskedTable::Bytes(uint32_t /*key_len*/,
+                                    size_t /*max_tuples*/,
+                                    const rcu::RcuDomain &domain) {
+  return RecordArena::Bytes(sizeof(Rule), domain);
+}
+
+size_t ConcurrentMaskedTable::bytes() const noexcept {
+  return records_.bytes() +
+         tuple_memory_->table_bytes.load(std::memory_order_relaxed) +
+         chain_bytes_;
+}
+
+void ConcurrentMaskedTable::set_memory_growth(
+    utils::MemoryGrowth *growth) noexcept {
+  records_.set_memory_growth(growth);
+  const std::lock_guard<std::mutex> lock(tuple_memory_->mutex);
+  tuple_memory_->growth = growth;
+}
+
+void ConcurrentMaskedTable::TupleMemory::Grow(size_t n, size_t glibc) {
+  const std::lock_guard<std::mutex> lock(mutex);
+  if (growth != nullptr) {
+    growth->Grow(n, glibc);
+  }
+}
+
+void ConcurrentMaskedTable::TupleMemory::Shrink(size_t n,
+                                                size_t glibc) noexcept {
+  const std::lock_guard<std::mutex> lock(mutex);
+  if (growth != nullptr) {
+    growth->Shrink(n, glibc);
+  }
+}
+
+void ConcurrentMaskedTable::TupleTableFree::operator()(
+    ConcurrentExactTable *table) const noexcept {
+  delete table;
+  memory->table_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+  memory->Shrink(bytes);
+}
+
+void ConcurrentMaskedTable::Chain::Free::operator()(
+    Chain *chain) const noexcept {
+  const size_t bytes = Bytes(chain->entry_capacity, chain->range_capacity);
+  ::operator delete(chain);
+  owner->chain_bytes_ -= bytes;
+  owner->tuple_memory_->Shrink(bytes, bytes);
 }
 
 std::shared_ptr<ConcurrentExactTable> ConcurrentMaskedTable::NewTupleTable(
     size_t rules) const {
-  auto table = ConcurrentExactTable::Create(
-      key_len_, ConcurrentExactTable::CapacityFor(rules), domain_);
-  return table ? std::shared_ptr<ConcurrentExactTable>(std::move(*table))
-               : nullptr;
+  const uint32_t capacity = ConcurrentExactTable::CapacityFor(rules);
+  const size_t bytes = ConcurrentExactTable::Bytes(key_len_, capacity, domain_);
+  // Admitted first; from here every way out gives it back -- a failed
+  // create directly, a table through its deleter when it is freed.
+  tuple_memory_->Grow(bytes);
+  std::unique_ptr<ConcurrentExactTable> table;
+  try {
+    auto made = ConcurrentExactTable::Create(key_len_, capacity, domain_);
+    if (made) {
+      table = std::move(*made);
+    }
+  } catch (...) {
+    tuple_memory_->Shrink(bytes);
+    throw;
+  }
+  if (table == nullptr) {
+    tuple_memory_->Shrink(bytes);
+    return nullptr;
+  }
+  // Counted before the deleter can run: a throwing shared_ptr constructor
+  // frees the table through it.
+  tuple_memory_->table_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  return std::shared_ptr<ConcurrentExactTable>(
+      table.release(), TupleTableFree{tuple_memory_, bytes});
 }
 
 std::shared_ptr<ConcurrentExactTable> ConcurrentMaskedTable::Grown(
@@ -121,14 +202,23 @@ std::optional<uint64_t> ConcurrentMaskedTable::FindValue(
   return packed;
 }
 
-ConcurrentMaskedTable::ChainPtr ConcurrentMaskedTable::Chain::New(
+ConcurrentMaskedTable::ChainPtr ConcurrentMaskedTable::NewChain(
     uint32_t entries, uint32_t ranges) {
-  const size_t bytes = sizeof(Chain) + size_t{entries} * sizeof(ChainEntry) +
-                       size_t{ranges} * sizeof(KeyRange);
-  auto *chain = new (::operator new(bytes)) Chain{0, 0, entries, ranges};
+  const size_t bytes = Chain::Bytes(entries, ranges);
+  tuple_memory_->Grow(bytes, bytes);  // glibc (D-198)
+  void *block;
+  try {
+    block = ::operator new(bytes);
+  } catch (...) {
+    tuple_memory_->Shrink(bytes, bytes);
+    throw;
+  }
+  auto *chain = new (block) Chain{0, 0, entries, ranges};
+  chain_bytes_ += bytes;
+  ChainPtr owned(chain, Chain::Free{this});
   // Its table value carries the 0xFFFF tag in bits 48-63 (ChainValue).
   CHECK_EQ(reinterpret_cast<uintptr_t>(chain) & kChainTag, uintptr_t{0});
-  return ChainPtr(chain);
+  return owned;
 }
 
 ConcurrentMaskedTable::RuleId ConcurrentMaskedTable::IdentityIn(
@@ -201,11 +291,11 @@ ConcurrentMaskedTable::KeyStates::iterator ConcurrentMaskedTable::PrepareKey(
           RangesIn(live) + state.upsert_ranges + (upsert ? new_ranges : 0));
       for (ChainPtr &spare : state.spares) {
         if (spare->entry_capacity < entries || spare->range_capacity < ranges) {
-          spare = Chain::New(entries, ranges);
+          spare = NewChain(entries, ranges);
         }
       }
       while (state.spares.size() < state.changes + 1) {
-        state.spares.push_back(Chain::New(entries, ranges));
+        state.spares.push_back(NewChain(entries, ranges));
       }
     }
   } catch (...) {
@@ -292,7 +382,7 @@ void ConcurrentMaskedTable::BuildChain(uint64_t live, RuleId drop, uint64_t add,
 
 void ConcurrentMaskedTable::RetireChain(const Chain *chain) noexcept {
   retired_chains_.push_back(
-      {ChainPtr(const_cast<Chain *>(chain)),
+      {ChainPtr(const_cast<Chain *>(chain), Chain::Free{this}),
        domain_.StartGracePeriod()});
 }
 
@@ -401,7 +491,12 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
   RaiseCeiling(ceiling->value, priority);
   if (table->Upsert(value, Pack(id, gate)) ==
       ConcurrentExactTable::UpsertResult::kFull) {
-    table = Grown(*table);
+    try {
+      table = Grown(*table);
+    } catch (...) {
+      records_.Abort(id);  // never published: reusable at once
+      throw;
+    }
     if (table == nullptr || table->Upsert(value, Pack(id, gate)) ==
                                 ConcurrentExactTable::UpsertResult::kFull) {
       records_.Abort(id);  // never published: reusable at once
@@ -540,7 +635,13 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
   // failure below drops the key state again).
   const KeyStates::iterator key =
       PrepareKey(mask, value, live.value_or(0), ranges.size(), true);
-  const RuleId id = records_.Allocate();
+  RuleId id;
+  try {
+    id = records_.Allocate();  // a new chunk may be refused (D-198)
+  } catch (...) {
+    Untrack(key);
+    throw;
+  }
   if (id == 0) {
     Untrack(key);
     return std::unexpected(UpsertResult::kFull);

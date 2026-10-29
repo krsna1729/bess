@@ -13,6 +13,7 @@
 
 #include "classifier/firewall_table.h"
 #include "dataplane/rebuild_resource.h"
+#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
@@ -67,6 +68,11 @@ class Firewall final : public Module {
   // keep running (no paused workers) - the shape ACL's rule list uses
   // (D-017).
   struct Published {
+    // The table's and action_ids' admission (D-198), "rules": taken before
+    // they are built, released with this object -- after the grace period
+    // when it is retired, at once when a transaction never publishes it.
+    // Before `table`, so it is released after the table is freed.
+    bess::framework::MemoryLease lease;
     std::unique_ptr<const bess::classifier::FirewallTable> table;
     // The ActionId of the table's rule k at index k - 1, so the packet path
     // names the action a matching rule carries (D-141) without holding the
@@ -90,16 +96,24 @@ class Firewall final : public Module {
   };
 
   // The table `rules` (in id order) make, in policy order: priority, highest
-  // first, equal priorities by id, lowest first.
-  static std::expected<std::unique_ptr<const Published>, std::string>
-  BuildPublished(const RuleView &rules);
+  // first, equal priorities by id, lowest first. Admitted as "rules" before
+  // it is built (D-198: refusal throws utils::MemoryRefused, builds nothing).
+  std::expected<std::unique_ptr<const Published>, std::string> BuildPublished(
+      const RuleView &rules) const;
+  // The rebuild callable: BuildPublished on this module's memory scope.
+  struct Builder {
+    const Firewall *owner;
+    std::expected<std::unique_ptr<const Published>, std::string> operator()(
+        const RuleView &rules) const {
+      return owner->BuildPublished(rules);
+    }
+  };
 
   // The module's "<name>/rules" resource (D-179): keyed by rule id, the
   // policy rebuilt once per transaction (D-191). It holds the committed rules
   // by id: what the published table was built from, and what it reads back.
   using RulesResource =
-      bess::dataplane::RebuildResource<uint32_t, KeyedRule, Published,
-                                       decltype(&BuildPublished)>;
+      bess::dataplane::RebuildResource<uint32_t, KeyedRule, Published, Builder>;
 
   bess::rcu::RcuPtr<Published> published_;
   std::unique_ptr<RulesResource> resource_;

@@ -165,14 +165,14 @@ TEST(FlowGenSettingsTest, RequiresPausedWorkers) {
 
 // `tmpl` with byte `at` set to `v`.
 std::string With(std::string tmpl, size_t at, uint8_t v) {
-  tmpl[at] = static_cast<char>(v);
+  tmpl.at(at) = static_cast<char>(v);
   return tmpl;
 }
 
 // `tmpl` with the 16-bit big-endian field at `at` set to `v`.
 std::string With16(std::string tmpl, size_t at, uint16_t v) {
-  tmpl[at] = static_cast<char>(unsigned{v} >> 8u);
-  tmpl[at + 1] = static_cast<char>(unsigned{v} & 0xffu);
+  tmpl.at(at) = static_cast<char>(unsigned{v} >> 8u);
+  tmpl.at(at + 1) = static_cast<char>(unsigned{v} & 0xffu);
   return tmpl;
 }
 

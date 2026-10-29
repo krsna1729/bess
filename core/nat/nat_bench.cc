@@ -121,7 +121,7 @@ void BM_Lookup(benchmark::State &st) {
       static_cast<double>(st.iterations()) * kBatch,
       benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
   st.counters["bytes_per_mapping"] =
-      static_cast<double>(impl == 0 ? legacy->MemoryBytes() : table->memory_bytes()) / n;
+      static_cast<double>(impl == 0 ? legacy->bytes() : table->bytes()) / n;
 }
 
 void BM_Allocate(benchmark::State &st) {
@@ -330,7 +330,7 @@ void TranslateImpl(benchmark::State &st) {
   st.counters["ns_per_packet"] = benchmark::Counter(
       static_cast<double>(st.iterations()) * per,
       benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
-  st.counters["bytes_per_mapping"] = static_cast<double>(nat->memory_bytes()) / c.capacity;
+  st.counters["bytes_per_mapping"] = static_cast<double>(nat->bytes()) / c.capacity;
   if constexpr (N::kShared) {
     domain.Offline(1);  // first: the table's destructor waits for a grace period
     nat.reset();

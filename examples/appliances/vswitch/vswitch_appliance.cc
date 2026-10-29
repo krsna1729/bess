@@ -195,7 +195,7 @@ class VswitchAppliance final : public Module {
   VswitchAppliance() : Module() { max_allowed_workers_ = 1; }  // one worker's caches
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
-    auto made = VswitchApp::Create(name(), init_context().rcu());
+    auto made = VswitchApp::Create(name(), init_context().rcu(), init_context().memory());
     if (!made) {
       return CommandFailure(ENOMEM, "%s", made.error().c_str());
     }
@@ -243,10 +243,11 @@ class VswitchAppliance final : public Module {
   }
 
   CommandResponse CommandSelfTest(const bess::pb::EmptyArg &) {
-    auto r3 =
-        VswitchApp::Create(name() + "_r3_self_test", init_context().rcu());
-    auto r5 =
-        VswitchApp::Create(name() + "_r5_self_test", init_context().rcu());
+    // Private switches retain separate scoped resources and memory leases.
+    auto r3 = VswitchApp::Create(name() + "_r3_self_test", init_context().rcu(),
+                                 init_context().memory());
+    auto r5 = VswitchApp::Create(name() + "_r5_self_test", init_context().rcu(),
+                                 init_context().memory());
     if (!r3 || !r5) {
       return CommandFailure(ENOMEM, "decision cache");
     }
@@ -430,7 +431,7 @@ const ResourceTables VswitchAppliance::resource_tables = {
                        vswitch_appliance::PolicyValue>("policies"),
 };
 
-BESS_PLUGIN_REQUIRES("vswitch_appliance", "1.0.0", BESS_CAP_INIT_CONTEXT);
+BESS_PLUGIN_REQUIRES("vswitch_appliance", "1.0.0", BESS_CAP_INIT_CONTEXT | BESS_CAP_MEMORY);
 
 ADD_MODULE(VswitchAppliance, "vswitch_appliance",
            "Reference appliance R3: a policy vSwitch (layers, groups, compiled decisions)")

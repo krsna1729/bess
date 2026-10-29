@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 
+#include "framework/memory_scope.h"
 #include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
@@ -70,8 +71,11 @@ class Queue : public Module {
   using RingPtr = std::unique_ptr<struct rte_ring, RingFree>;
 
   // "<name>/settings" (D-129), staged: the new ring (null: same size)
-  // allocated in stage, swapped in at apply.
+  // allocated in stage, after its bytes were admitted (`lease`, D-198),
+  // swapped in at apply. The lease is declared first so it is released after
+  // the ring it admits is freed.
   struct Staged {
+    bess::framework::MemoryLease lease;
     RingPtr ring;
     uint64_t size = 0;
     int burst = 0;
@@ -99,6 +103,9 @@ class Queue : public Module {
   CommandResponse SetSize(uint64_t size);
 
   struct rte_ring *queue_;
+  // The admission of queue_'s bytes ("ring", D-198), released after the ring
+  // is freed.
+  bess::framework::MemoryLease ring_lease_;
   bool prefetch_;
 
   // Whether backpressure should be applied or not

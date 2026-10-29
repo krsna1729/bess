@@ -301,7 +301,8 @@ class TransactionEngine {
   }
 
   // One transaction's removals, stage by stage (ranks, highest first); the
-  // next stage runs once `token` completes.
+  // next stage runs once `token` completes. `ran` steps of stages[next] have
+  // run: a step refused memory is retried from there, its stage not replayed.
   struct Step {
     const Resource *owner;
     Retirer::Step fn;
@@ -310,6 +311,7 @@ class TransactionEngine {
     rcu::GracePeriod token;
     std::vector<std::vector<Step>> stages;
     size_t next = 0;
+    size_t ran = 0;
   };
 
   // Per-transaction working storage, kept across transactions so its

@@ -34,6 +34,14 @@ class DirectExactBackend {
 
   DirectExactBackend() : entries_(kTableCapacity) {}
 
+  // Memory (D-198), all glibc: the whole key space's slots, allocated by the
+  // constructor; never grows.
+  static size_t Bytes() { return kTableCapacity * sizeof(std::optional<Result>); }
+  static size_t GlibcBytes() { return Bytes(); }
+  [[nodiscard]] size_t bytes() const noexcept {
+    return entries_.capacity() * sizeof(std::optional<Result>);
+  }
+
   DirectExactBackend(DirectExactBackend &&) = default;
   DirectExactBackend &operator=(DirectExactBackend &&) = default;
   DirectExactBackend(const DirectExactBackend &) = delete;
@@ -89,7 +97,7 @@ class DirectExactBackend {
         .rule_count = count_,
         .key_size = sizeof(Key),
         .result_size = sizeof(Result),
-        .storage_bytes = entries_.size() * sizeof(std::optional<Result>),
+        .storage_bytes = bytes(),
     };
   }
 

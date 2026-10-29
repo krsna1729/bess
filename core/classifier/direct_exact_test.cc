@@ -8,6 +8,7 @@
 #include "classifier/classifier.h"
 #include "classifier/direct_exact.h"
 #include "classifier/typed_exact.h"
+#include "framework/memory_scope.h"
 
 namespace {
 
@@ -80,6 +81,21 @@ TEST(DirectExactBackendTest, InfoReportsCorrectMetadata) {
   EXPECT_EQ(1u, info.rule_count);
   EXPECT_EQ(1u, info.key_size);
   EXPECT_EQ(2u, info.result_size);
+}
+
+// D-198: Bytes() is the whole key space's slots (glibc), as constructed.
+TEST(DirectExactBackendTest, BytesMatchesConstruction) {
+  using bess::framework::MemoryCost;
+  using Narrow = DirectExactBackend<uint8_t, uint16_t>;
+  using Wide = DirectExactBackend<uint16_t, uint32_t>;
+  Narrow narrow;
+  Wide wide;
+  EXPECT_EQ(MemoryCost<Narrow>::Bytes(), narrow.bytes());
+  EXPECT_EQ(MemoryCost<Narrow>::GlibcBytes(), narrow.bytes());
+  EXPECT_EQ(MemoryCost<Wide>::Bytes(), wide.bytes());
+  EXPECT_EQ(narrow.bytes(), narrow.info().storage_bytes);
+  narrow.insert(1, 2u);  // fixed: inserts do not grow it
+  EXPECT_EQ(MemoryCost<Narrow>::Bytes(), narrow.bytes());
 }
 
 }  // namespace

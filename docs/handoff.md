@@ -195,8 +195,9 @@ table->Retire(h);                               // the target went away
 
 One allocation in `Create` from `HandoffConfig::allocator` (DPDK's heap on the
 requested node by default): the channel object, then the ring. After it nothing
-allocates. `memory_bytes()` is the whole block; at full occupancy the cost per
-item is `memory_bytes() / capacity()`.
+allocates. `bytes()` is the whole block, and `HandoffChannel::Bytes(config)`
+states it before `Create` (D-198); at full occupancy the cost per item is
+`bytes() / capacity()`.
 
 `placement()` reports the node asked for, the node the memory landed on (the
 default allocator falls back to any node when the one asked for is out of memory)

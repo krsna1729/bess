@@ -15,8 +15,10 @@
 
 #include "framework/module_tick.h"
 #include "framework/singleton_resource.h"
+#include "framework/memory_scope.h"
 #include "framework/threshold_table.h"
 #include "module.h"
+#include "utils/dpdk_memory.h"
 #include "stats/crossing_notifier.h"
 #include "stats/keyed_counters.h"
 
@@ -86,17 +88,20 @@ class UsageReport final : public Module {
   }
 
  private:
-  // What one apply stages: the quota set, converted, and the set itself, for
-  // the read that serves desired state.
+  // What one apply stages: the converted quota set and the complete admitted
+  // watch table. Publication only moves these and stores atomics; a refused
+  // watch allocation cannot leave the live set half applied.
   struct Staged {
     std::vector<std::pair<uint64_t, uint64_t>> quotas;  // key, octet limit
     sample::usage::pb::UsageQuotas set;
+    bess::framework::MemoryLease watches_lease;
+    bess::framework::ThresholdTable watches;
   };
 
   // The quota set a controller wrote, checked and converted. The whole set is
   // one value: setting it replaces every quota (D-129's singleton shape, the
   // one the sample plugin already uses).
-  static std::expected<Staged, std::string> StageQuotas(
+  std::expected<Staged, std::string> StageQuotas(
       const sample::usage::pb::UsageQuotas &v);
 
   // The key space: what the module was built for.
@@ -106,16 +111,20 @@ class UsageReport final : public Module {
   sample::usage::pb::UsageReportMode mode_ = sample::usage::pb::USAGE_REPORT_BOTH;
 
   // The counters: one plane per worker, two cells per key (octets, packets).
-  // Null until Init.
-  std::unique_ptr<bess::stats::KeyedCounters> counters_;
+  // Null until Init; admitted as "counters" (D-198).
+  bess::framework::Sized<bess::stats::KeyedCounters> counters_;
 
   // The packet path's half: one relaxed quota per key (0: no quota) and the
-  // notifier that posts the report. Sized to the key space at Init.
-  std::unique_ptr<std::atomic<uint64_t>[]> quotas_;
+  // notifier that posts the report. Sized to the key space at Init, on the
+  // DPDK heap, admitted by quota_slots_lease_ ("quota_slots").
+  bess::framework::MemoryLease quota_slots_lease_;  // before what it admits
+  bess::utils::DpdkArray<std::atomic<uint64_t>> quotas_;
   bess::stats::CrossingNotifier notifier_;
 
   // The control side's half: the armed keys the tick sweeps and the endpoint
-  // that calls it. The endpoint is open only when the mode sweeps.
+  // that calls it. The endpoint is open only when the mode sweeps. The lease
+  // ("quotas") moves with the staged watch table, retaining its growth hook.
+  bess::framework::MemoryLease watches_lease_;
   bess::framework::ThresholdTable watches_;
   bess::framework::TickEndpoint tick_;
 

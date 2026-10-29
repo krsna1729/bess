@@ -208,7 +208,7 @@ void BM_TableSweep(benchmark::State& state) {
       static_cast<double>(n) * static_cast<double>(state.iterations()),
       benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
   state.counters["bytes_per_flow"] =
-      static_cast<double>(table->memory_bytes()) / static_cast<double>(n);
+      static_cast<double>(table->bytes()) / static_cast<double>(n);
 }
 
 template <int64_t kMode>

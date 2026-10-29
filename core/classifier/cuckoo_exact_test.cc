@@ -6,12 +6,16 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <vector>
 
+#include <rte_hash_crc.h>
 
 #include "classifier/byte_key.h"
 #include "classifier/classifier.h"
 #include "classifier/cuckoo_exact.h"
 #include "classifier/typed_exact.h"
+#include "framework/memory_scope.h"
+#include "utils/dpdk_memory.h"
 
 // ---------------------------------------------------------------------------
 // FlowKey — a simple typed key used across classifier backend tests.
@@ -24,7 +28,8 @@ struct FlowKey {
 
 struct FlowKeyHash {
   size_t operator()(const FlowKey &key) const noexcept {
-    return (static_cast<size_t>(key.tenant) << 16) ^ key.port;
+    // Mix both fields into the low bits used by CuckooMap's bucket mask.
+    return rte_hash_crc_2byte(key.port, rte_hash_crc_4byte(key.tenant, 0));
   }
 };
 
@@ -123,6 +128,97 @@ TEST(CuckooExactBackend, InsertAndLookup) {
 
   // Removing an absent key returns false.
   EXPECT_FALSE(backend.remove(FlowKey{7, 80}));
+}
+
+// D-198: the map's cost as constructed, each insert's growth admitted
+// through the hook first, and the ExactTable wrapper reporting the same.
+struct RecordingGrowth final : bess::utils::MemoryGrowth {
+  size_t net = 0;
+  size_t grows = 0;
+  size_t limit = SIZE_MAX;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    EXPECT_EQ(bytes, glibc_bytes);
+    if (bytes > limit - net) {
+      throw bess::utils::MemoryRefused(
+          bess::utils::MemoryRefused::Reason::kNormalLimit, bytes, "refused");
+    }
+    net += bytes;
+    grows++;
+  }
+  void Shrink(size_t bytes, size_t) noexcept override { net -= bytes; }
+};
+
+TEST(CuckooExactBackend, BytesAndGrowth) {
+  RecordingGrowth growth;
+  growth.limit = size_t{1} << 20;
+  Backend backend;
+  EXPECT_EQ(bess::framework::MemoryCost<Backend>::Bytes(), backend.bytes());
+  EXPECT_EQ(bess::framework::MemoryCost<Backend>::GlibcBytes(),
+            backend.bytes());
+  const size_t initial = backend.bytes();
+  backend.set_memory_growth(&growth);
+  for (uint32_t i = 0; i < 1000; i++) {
+    ASSERT_TRUE(backend.insert(FlowKey{i, 80}, i));
+    EXPECT_EQ(initial + growth.net, backend.bytes());
+  }
+  EXPECT_GT(growth.grows, 0u);
+  EXPECT_EQ(initial + growth.net, backend.bytes());
+
+  const size_t held = backend.bytes();
+  ExactTable<FlowKey, uint32_t, Backend> table(std::move(backend));
+  EXPECT_EQ(held, table.bytes());
+}
+
+TEST(CuckooExactBackend, RefusedGrowthPreservesEntriesAndCanBeRetried) {
+  RecordingGrowth growth;
+  Backend backend;
+  const size_t initial = backend.bytes();
+  backend.set_memory_growth(&growth);
+  size_t refusals = 0;
+  for (uint32_t i = 0; i < 1000; i++) {
+    // Keep the current allocation, but refuse the next request for room.
+    growth.limit = growth.net;
+    const size_t held = backend.bytes();
+    try {
+      ASSERT_TRUE(backend.insert(FlowKey{i, 80}, i));
+    } catch (const bess::utils::MemoryRefused &) {
+      refusals++;
+      EXPECT_EQ(i, backend.size());
+      EXPECT_EQ(held, backend.bytes());
+      EXPECT_EQ(initial + growth.net, held);
+      EXPECT_EQ(nullptr, backend.lookup(FlowKey{i, 80}));
+      for (uint32_t j = 0; j < i; j++) {
+        const auto *value = backend.lookup(FlowKey{j, 80});
+        ASSERT_NE(nullptr, value);
+        EXPECT_EQ(j, *value);
+      }
+      growth.limit = size_t{1} << 20;
+      ASSERT_TRUE(backend.insert(FlowKey{i, 80}, i));
+    }
+    EXPECT_EQ(i + 1, backend.size());
+    EXPECT_EQ(initial + growth.net, backend.bytes());
+  }
+  EXPECT_GT(refusals, 1u);
+  for (uint32_t i = 0; i < 1000; i++) {
+    const auto *value = backend.lookup(FlowKey{i, 80});
+    ASSERT_NE(nullptr, value);
+    EXPECT_EQ(i, *value);
+  }
+}
+
+TEST(CuckooExactBackend, RuntimeBackendReportsItsStorage) {
+  using bess::classifier::BuildRuntimeCuckooBackend;
+  using bess::classifier::RuntimeExactRule;
+  std::vector<std::array<std::byte, 4>> keys(100);
+  std::vector<RuntimeExactRule<uint32_t>> rules;
+  for (uint32_t i = 0; i < keys.size(); i++) {
+    std::memcpy(keys[i].data(), &i, sizeof(i));
+    rules.push_back({.key = bess::classifier::ConstBytes(keys[i]), .result = i});
+  }
+  auto built = BuildRuntimeCuckooBackend<uint32_t>(4, rules);
+  ASSERT_TRUE(built.has_value());
+  EXPECT_GT(built->bytes(), 0u);
+  EXPECT_EQ(built->info().storage_bytes, built->bytes());
 }
 
 TEST(CuckooExactBackend, BackendInfo) {

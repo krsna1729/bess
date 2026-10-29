@@ -21,6 +21,7 @@ namespace {
 
 using bess::classifier::FirewallFamily;
 
+
 // KeyOf's path for every frame but the common one: the checked parse
 // ConnTrack, NAT and Router read (D-188), the headers in the first segment,
 // their lengths checked against the whole packet. Out of line, so the common

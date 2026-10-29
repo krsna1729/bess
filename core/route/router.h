@@ -373,6 +373,31 @@ class Router {
       std::string name, const Config &config, size_t max_next_hops,
       rcu::RcuDomain &domain, size_t max_domains = 1, size_t max_groups = 0);
 
+  // What Create allocates (D-198): the default domain's FIBs (DPDK, the
+  // route tables' InstanceBytes), the three id tables' slots and states
+  // (DPDK, SlotTable::Bytes) with the domain slab's first chunk (the default
+  // domain's object), and the per-id control vectors and the router itself
+  // (glibc, GlibcBytes) -- what bytes() counts after Create. Same arguments
+  // as Create.
+  static size_t Bytes(const std::string &name, const Config &config,
+                      size_t max_next_hops, const rcu::RcuDomain &domain,
+                      size_t max_domains = 1, size_t max_groups = 0);
+  static size_t GlibcBytes(const std::string &name, const Config &config,
+                           size_t max_next_hops, const rcu::RcuDomain &domain,
+                           size_t max_domains = 1, size_t max_groups = 0);
+  // What the router holds now (any thread): every domain's FIBs (an IPv6
+  // table's spare included), the id tables with their slab chunks, and the
+  // control vectors. The sorted domain-id list and the transaction scratch
+  // are not counted.
+  size_t bytes() const noexcept;
+  // The admission everything the router grows by asks first (D-198): a
+  // domain's FIB set before CreateDomain (or a transaction writing into a
+  // new domain) builds it, a FIB's replacement or IPv6 spare, and each new
+  // slab chunk of the domain, next-hop and group tables. A refusal throws
+  // utils::MemoryRefused and changes nothing. A removed domain's FIBs are
+  // given back when they are retired to the RCU domain. Control path only.
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept;
+
   bool has_ipv4() const noexcept { return domain_config_.ipv4.has_value(); }
   bool has_ipv6() const noexcept { return domain_config_.ipv6.has_value(); }
 
@@ -872,6 +897,18 @@ class Router {
     size_t size() const {
       return (table_ ? table_->size() : 0) + (table6_ ? table6_->size() : 0);
     }
+    // What its FIBs hold, and their growth hook (D-198).
+    size_t bytes() const noexcept {
+      return (table_ ? table_->bytes() : 0) + (table6_ ? table6_->bytes() : 0);
+    }
+    void set_memory_growth(utils::MemoryGrowth *growth) const noexcept {
+      if (table_) {
+        table_->set_memory_growth(growth);
+      }
+      if (table6_) {
+        table6_->set_memory_growth(growth);
+      }
+    }
 
    private:
     std::unique_ptr<LpmRouteTable> table_;
@@ -887,12 +924,48 @@ class Router {
   }
 
   Router(const std::string &name, const Config &config,
-         std::unique_ptr<const Domain> default_domain, size_t max_next_hops,
+         Domain default_domain, size_t max_next_hops,
          size_t max_domains, size_t max_groups, rcu::RcuDomain &rcu);
 
   // A domain's FIBs for the router's families, named after `name`.
-  static std::expected<std::unique_ptr<const Domain>, RouteError> MakeDomain(
+  static std::expected<Domain, RouteError> MakeDomain(
       const std::string &name, const Config &config, rcu::RcuDomain &rcu);
+  // `config` as Create sizes it: `ipv6->max_value` is the largest route
+  // value, max_next_hops + max_groups.
+  static Config SizedConfig(const Config &config, size_t max_next_hops,
+                            size_t max_groups);
+  // One domain's FIB set for `config` (D-198): what MakeDomain allocates.
+  static size_t DomainBytes(const Config &config) noexcept;
+
+  // What every domain's FIBs hold, and the hook they grow through (D-198):
+  // each FIB admits its replacement or IPv6 spare here, as CreateDomain
+  // admits a new domain's FIB set and RemoveDomain gives one back. Forwards
+  // to the router's own hook (set_memory_growth) when there is one; counts
+  // either way, so bytes() follows the FIBs without walking the domains.
+  class FibMemory final : public utils::MemoryGrowth {
+   public:
+    explicit FibMemory(size_t bytes) noexcept : bytes_(bytes) {}
+    void Grow(size_t bytes, size_t glibc_bytes) override {
+      if (outer_ != nullptr) {
+        outer_->Grow(bytes, glibc_bytes);
+      }
+      bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+      bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+      if (outer_ != nullptr) {
+        outer_->Shrink(bytes, glibc_bytes);
+      }
+    }
+    size_t bytes() const noexcept {
+      return bytes_.load(std::memory_order_relaxed);
+    }
+    void set_outer(utils::MemoryGrowth *outer) noexcept { outer_ = outer; }
+
+   private:
+    std::atomic<size_t> bytes_;
+    utils::MemoryGrowth *outer_ = nullptr;
+  };
 
   class RouteResource;
   class NextHopResource;
@@ -1042,6 +1115,9 @@ class Router {
   // The families and what a domain created on demand is sized with: the
   // default domain's config (D-158), `ipv6->max_value` set by Create().
   const Config domain_config_;
+  // Every domain's FIBs' bytes and growth (D-198); declared before the
+  // domains, whose FIBs point at it.
+  FibMemory fib_memory_;
   // Slot = domain id + 1. Read lock-free by workers and the engine; written
   // under mutex_ -- by CreateDomain, and by the route resource for a domain a
   // transaction first writes into (D-158).

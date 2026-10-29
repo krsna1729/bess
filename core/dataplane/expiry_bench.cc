@@ -71,7 +71,7 @@ using Clock = std::chrono::steady_clock;
 // is brought up when the first benchmark runs, after flags and logging are
 // initialized, in the no-hugepage mode (a 512 MB heap, a small address space).
 void EnsureDpdk() {
-  if (!bess::IsDpdkInitialized()) bess::InitDpdk(0);
+  if (!bess::IsDpdkInitialized()) bess::InitDpdk();
 }
 
 constexpr uint64_t kNs = 1;
@@ -144,7 +144,7 @@ class WheelAdapter {
     return r.fired;
   }
   size_t work() const { return work_; }
-  size_t bytes(size_t n) const { return wheel_->memory_bytes() / std::max<size_t>(n, 1); }
+  size_t bytes(size_t n) const { return wheel_->bytes() / std::max<size_t>(n, 1); }
   static constexpr size_t owner_bytes() { return sizeof(bess::dataplane::ExpiryHandle); }
   void PrepareDrain(uint64_t) {}
 

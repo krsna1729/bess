@@ -5,8 +5,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "classifier/packed_value_store.h"
+#include "framework/memory_scope.h"
+#include "utils/dpdk_memory.h"
 
 namespace {
 
@@ -141,26 +144,69 @@ TEST(PackedValueStoreTest, RoundTrip13Byte) {
 }
 
 // ---------------------------------------------------------------------------
-// value_size and storage_bytes invariants
+// value_size and bytes invariants
 // ---------------------------------------------------------------------------
 
-TEST(PackedValueStoreTest, ValueSizeAndStorageBytes) {
+TEST(PackedValueStoreTest, ValueSizeAndBytes) {
   PackedValueStore store(7);
 
   EXPECT_EQ(7u, store.value_size());
-  EXPECT_EQ(0u, store.storage_bytes());
+  EXPECT_EQ(bess::framework::MemoryCost<PackedValueStore>::Bytes(size_t{7}),
+            store.bytes());
+  EXPECT_EQ(0u, store.bytes());
   EXPECT_EQ(0u, store.size());
 
   const std::array<std::byte, 7> val{};
   store.Add(val);
-  EXPECT_EQ(7u, store.storage_bytes());
+  EXPECT_EQ(7u, store.bytes());
   EXPECT_EQ(1u, store.size());
-  EXPECT_EQ(store.size() * store.value_size(), store.storage_bytes());
+  EXPECT_EQ(store.size() * store.value_size(), store.bytes());
 
   store.Add(val);
-  EXPECT_EQ(14u, store.storage_bytes());
+  EXPECT_EQ(14u, store.bytes());
   EXPECT_EQ(2u, store.size());
-  EXPECT_EQ(store.size() * store.value_size(), store.storage_bytes());
+  EXPECT_EQ(store.size() * store.value_size(), store.bytes());
+
+  // Storage doubles: a third value takes capacity for four.
+  store.Add(val);
+  EXPECT_EQ(28u, store.bytes());
+  EXPECT_EQ(3u, store.size());
+}
+
+// D-198: each growth is admitted first, glibc, by the capacity it adds; a
+// refused growth adds nothing.
+struct RecordingGrowth final : bess::utils::MemoryGrowth {
+  std::vector<size_t> grown;
+  bool refuse = false;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    EXPECT_EQ(bytes, glibc_bytes);
+    if (refuse) {
+      throw bess::utils::MemoryRefused(
+          bess::utils::MemoryRefused::Reason::kNormalLimit, bytes, "refused");
+    }
+    grown.push_back(bytes);
+  }
+  void Shrink(size_t, size_t) noexcept override { ADD_FAILURE(); }
+};
+
+TEST(PackedValueStoreTest, GrowthIsAdmittedFirst) {
+  RecordingGrowth growth;
+  PackedValueStore store(4);
+  store.set_memory_growth(&growth);
+  const std::array<std::byte, 4> val{std::byte{1}, std::byte{2}, std::byte{3},
+                                     std::byte{4}};
+  EXPECT_EQ(ResultSlot(1), store.Add(val));
+  EXPECT_EQ(ResultSlot(2), store.Add(val));
+  EXPECT_EQ(ResultSlot(3), store.Add(val));
+  EXPECT_EQ(ResultSlot(4), store.Add(val));  // fits: no growth
+  EXPECT_EQ((std::vector<size_t>{4, 4, 8}), growth.grown);
+  EXPECT_EQ(16u, store.bytes());
+
+  growth.refuse = true;
+  EXPECT_THROW(store.Add(val), bess::utils::MemoryRefused);
+  EXPECT_EQ(4u, store.size());
+  EXPECT_EQ(16u, store.bytes());
+  EXPECT_TRUE(store.lookup(ResultSlot(5)).empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +232,7 @@ TEST(PackedValueStoreTest, ZeroValueSizeRejected) {
   EXPECT_FALSE(store.valid());
   EXPECT_EQ(0u, store.value_size());
   EXPECT_EQ(0u, store.size());
-  EXPECT_EQ(0u, store.storage_bytes());
+  EXPECT_EQ(0u, store.bytes());
 
   // lookup on slot 0 must be empty
   EXPECT_TRUE(store.lookup(ResultSlot(0)).empty());

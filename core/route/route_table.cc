@@ -2,6 +2,7 @@
 
 #include "route/route_table.h"
 
+#include <rte_eal.h>
 #include <rte_errno.h>
 
 #include <algorithm>
@@ -106,7 +107,100 @@ std::string InstanceName(const std::string &base) {
   return base.substr(0, room) + suffix;
 }
 
+// A DPDK routing structure under the memory policy (D-029): `create(socket)`
+// makes one of about `bytes`. Under --no-huge the bytes are admitted against
+// the process memory limit first. A creation that fails for lack of memory
+// (rte_errno ENOMEM) on `socket` is retried once on the normal-page fallback
+// heap, which utils::FallbackSocket grants or refuses (MemoryRefused,
+// propagated to the control boundary); other failures return nullptr with
+// rte_errno as the creator left it.
+template <typename Create>
+auto CreateOnPolicy(int socket, size_t bytes, Create create) {
+  if (rte_eal_has_hugepages() == 0) {
+    utils::AdmitNormalMemory(bytes);
+  }
+  rte_errno = 0;
+  auto *made = create(socket);
+  if (made == nullptr && rte_errno == ENOMEM) {
+    made = create(utils::FallbackSocket(bytes));
+  }
+  return made;
+}
+
+// The estimates below are the allocations DPDK 25.11 makes on the socket
+// asked for: a 2^24-entry tbl24 of the entry size, tbl8 groups of 256
+// entries, and the bookkeeping of each library. The RCU defer queues, small
+// and allocated on any native socket by DPDK, are not counted.
+constexpr size_t kTbl24Entries = size_t{1} << 24;
+
+// rte_lpm: tbl24 and tbl8s of 4-byte entries, 8 bytes per rule.
+size_t LpmBytes(const rte_lpm_config &conf) {
+  return kTbl24Entries * 4 + size_t{256} * 4 * conf.number_tbl8s +
+         size_t{8} * conf.max_rules;
+}
+
+// rte_fib DIR24_8 (4-byte entries): tbl24, the tbl8 pool (rounded to 64
+// groups, plus one), its bitmap, the deep24 bitmap (one bit per tbl24 entry),
+// and the RIB's node mempool: one cache line per route (a 40-byte node and
+// its mempool header).
+size_t FibBytes(const rte_fib_conf &conf) {
+  const size_t tbl8s = (size_t{conf.dir24_8.num_tbl8} + 63) / 64 * 64;
+  return kTbl24Entries * 4 + size_t{256} * 4 * (tbl8s + 1) + tbl8s / 8 +
+         kTbl24Entries / 8 + size_t{64} * static_cast<size_t>(conf.max_routes);
+}
+
+// rte_fib6 TRIE (2- or 4-byte entries): tbl24, the tbl8 pool (plus one), its
+// free list (4 bytes per group), and the RIB6 node mempool: two cache lines
+// per route (a 50-byte node and its mempool header).
+size_t Fib6Bytes(const rte_fib6_conf &conf, size_t entry_bytes) {
+  return kTbl24Entries * entry_bytes +
+         size_t{256} * entry_bytes * (size_t{conf.trie.num_tbl8} + 1) +
+         size_t{4} * conf.trie.num_tbl8 +
+         size_t{128} * static_cast<size_t>(conf.max_routes);
+}
+
+// A replacement built beside what it replaces (D-198): `bytes` admitted
+// through `growth` (when set) for the scope, refused by a throw before
+// anything is built, and given back when the scope ends -- the
+// replacement's on failure, or, once it is published, the replaced
+// instance's, retired to the RCU domain (which takes no callback, so its
+// bytes are given back at retirement, not when the grace period frees it).
+class ScopedGrowth {
+ public:
+  ScopedGrowth(utils::MemoryGrowth *growth, size_t bytes)
+      : growth_(growth), bytes_(bytes) {
+    if (growth_ != nullptr) {
+      growth_->Grow(bytes_);
+    }
+  }
+  ~ScopedGrowth() {
+    if (growth_ != nullptr) {
+      growth_->Shrink(bytes_);
+    }
+  }
+  ScopedGrowth(const ScopedGrowth &) = delete;
+  ScopedGrowth &operator=(const ScopedGrowth &) = delete;
+
+ private:
+  utils::MemoryGrowth *const growth_;
+  const size_t bytes_;
+};
+
 }  // namespace
+
+size_t LpmRouteTable::InstanceBytes(const Config &config) noexcept {
+  // The configurations NewInstance creates with.
+  if (config.backend == RouteBackend::kRteFib) {
+    struct rte_fib_conf conf = {};
+    conf.max_routes = static_cast<int>(config.max_routes);
+    conf.dir24_8.num_tbl8 = config.tbl8_groups + 1;
+    return FibBytes(conf);
+  }
+  struct rte_lpm_config conf = {};
+  conf.max_rules = config.max_routes;
+  conf.number_tbl8s = config.tbl8_groups;
+  return LpmBytes(conf);
+}
 
 std::expected<std::unique_ptr<LpmRouteTable::Instance>, RouteError>
 LpmRouteTable::NewInstance(uint32_t default_value) {
@@ -136,7 +230,9 @@ LpmRouteTable::NewInstance(uint32_t default_value) {
       return std::unexpected(RouteError::kBackendFailure);
     }
     conf.dir24_8.num_tbl8 = config_.tbl8_groups + 1;
-    struct rte_fib *fib = rte_fib_create(name.c_str(), config_.socket, &conf);
+    struct rte_fib *fib = CreateOnPolicy(config_.socket, FibBytes(conf), [&](int socket) {
+      return rte_fib_create(name.c_str(), socket, &conf);
+    });
     if (fib == nullptr) {
       return std::unexpected(rte_errno == ENOMEM ? RouteError::kTableFull
                                                  : RouteError::kBackendFailure);
@@ -159,7 +255,9 @@ LpmRouteTable::NewInstance(uint32_t default_value) {
   struct rte_lpm_config conf = {};
   conf.max_rules = config_.max_routes;
   conf.number_tbl8s = config_.tbl8_groups;
-  struct rte_lpm *lpm = rte_lpm_create(name.c_str(), config_.socket, &conf);
+  struct rte_lpm *lpm = CreateOnPolicy(config_.socket, LpmBytes(conf), [&](int socket) {
+    return rte_lpm_create(name.c_str(), socket, &conf);
+  });
   if (lpm == nullptr) {
     return std::unexpected(rte_errno == ENOMEM ? RouteError::kTableFull
                                                : RouteError::kBackendFailure);
@@ -308,6 +406,7 @@ std::expected<void, RouteError> LpmRouteTable::Erase(Ipv4Prefix prefix) {
 
 std::expected<void, RouteError> LpmRouteTable::Clear() {
   std::lock_guard<std::mutex> lock(writer_mutex_);
+  const ScopedGrowth replacement(growth_, InstanceBytes(config_));
   auto fresh = NewInstance(default_.value_or(kNoDefault));
   if (!fresh) {
     return std::unexpected(fresh.error());
@@ -335,6 +434,7 @@ std::expected<void, RouteError> LpmRouteTable::ReplaceAll(
   }
 
   std::lock_guard<std::mutex> lock(writer_mutex_);
+  const ScopedGrowth replacement(growth_, InstanceBytes(config_));
   auto fresh = NewInstance(next_default.value_or(kNoDefault));
   if (!fresh) {
     return std::unexpected(fresh.error());
@@ -421,6 +521,14 @@ size_t Ipv6RouteTable::EntryBytes(const Config &config) noexcept {
              : 4;
 }
 
+size_t Ipv6RouteTable::InstanceBytes(const Config &config) noexcept {
+  // The configuration NewInstance creates with.
+  struct rte_fib6_conf conf = {};
+  conf.max_routes = static_cast<int>(std::max<uint32_t>(config.max_routes, 1));
+  conf.trie.num_tbl8 = config.tbl8_groups;
+  return Fib6Bytes(conf, EntryBytes(config));
+}
+
 Ipv6RouteTable::Instance::~Instance() { rte_fib6_free(fib); }
 
 std::expected<std::unique_ptr<Ipv6RouteTable>, RouteError>
@@ -444,6 +552,7 @@ Ipv6RouteTable::Create(std::string name, const Config &config,
     return std::unexpected(instance.error());
   }
   table->live_.Initialize(std::move(*instance));
+  table->instances_.store(1, std::memory_order_relaxed);
   return table;
 }
 
@@ -466,7 +575,9 @@ Ipv6RouteTable::NewInstance() {
   conf.rib_ext_sz = 0;
   conf.trie.nh_sz = entry_bytes_ == 2 ? RTE_FIB6_TRIE_2B : RTE_FIB6_TRIE_4B;
   conf.trie.num_tbl8 = config_.tbl8_groups;
-  instance->fib = rte_fib6_create(name.c_str(), config_.socket, &conf);
+  instance->fib = CreateOnPolicy(config_.socket, Fib6Bytes(conf, entry_bytes_), [&](int socket) {
+    return rte_fib6_create(name.c_str(), socket, &conf);
+  });
   if (instance->fib == nullptr) {
     return std::unexpected(rte_errno == ENOMEM || rte_errno == ENOSPC
                                ? RouteError::kTableFull
@@ -538,24 +649,49 @@ std::expected<void, RouteError> Ipv6RouteTable::PrepareSpare() {
       // spare is built from the rules.
       domain_.ReserveRetirements(1);
       domain_.Retire(token, std::move(spare_));
+      SpareReleased();
       spare_lag_.clear();
     }
   }
   if (spare_ && !Replay(*spare_)) {
     // A replay may need a transient tbl8 group a fresh build does not.
     spare_.reset();  // unpublished, or past its grace period
+    SpareReleased();
   }
   spare_lag_.clear();
   if (!spare_) {
-    auto built = Build();
+    // Admitted before it is built (D-198); given back if the build fails.
+    if (growth_ != nullptr) {
+      growth_->Grow(instance_bytes_);
+    }
+    std::expected<std::unique_ptr<Instance>, RouteError> built;
+    try {
+      built = Build();
+    } catch (...) {
+      if (growth_ != nullptr) {
+        growth_->Shrink(instance_bytes_);
+      }
+      throw;
+    }
     if (!built) {
+      if (growth_ != nullptr) {
+        growth_->Shrink(instance_bytes_);
+      }
       return std::unexpected(built.error());
     }
     spare_ = std::move(*built);
+    instances_.fetch_add(1, std::memory_order_relaxed);
     spare_token_.reset();
     spare_unpublished_ = true;
   }
   return {};
+}
+
+void Ipv6RouteTable::SpareReleased() noexcept {
+  instances_.fetch_sub(1, std::memory_order_relaxed);
+  if (growth_ != nullptr) {
+    growth_->Shrink(instance_bytes_);
+  }
 }
 
 size_t Ipv6RouteTable::RoutesLocked() const noexcept {
@@ -624,7 +760,10 @@ void Ipv6RouteTable::AbortLocked(Stage &stage) noexcept {
   stage_open_ = false;
   if (stage.broken_) {
     // A refused DPDK edit may have left the trie half written.
-    spare_.reset();
+    if (spare_) {
+      spare_.reset();
+      SpareReleased();
+    }
     spare_lag_.clear();
     spare_token_.reset();
     spare_unpublished_ = false;

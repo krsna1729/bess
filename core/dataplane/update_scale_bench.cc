@@ -583,7 +583,7 @@ int main(int argc, char **argv) {
     }
   }
   WarnIfSharedCores(o);
-  bess::InitDpdk(0);
+  bess::InitDpdk();
   if (o.e1) RunE1(o);
   if (o.e2) RunE2(o);
   if (o.e3) RunE3(o);

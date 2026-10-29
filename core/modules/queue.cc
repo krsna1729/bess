@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include "utils/format.h"
 #include "utils/rte_ring_alloc.h"
@@ -63,6 +64,11 @@ void Queue::MigrateRing(struct rte_ring *from, struct rte_ring *to) {
 }
 
 int Queue::Resize(int slots) {
+  // Admitted before it is allocated (D-198); a refusal (MemoryRefused)
+  // propagates and nothing changes.
+  const size_t bytes = bess::utils::RingBytes(slots);
+  bess::framework::MemoryLease lease =
+      init_context().memory().Lease("ring", bytes, bytes);
   auto ring = AllocRing(slots);
   if (!ring) {
     return -ring.error();
@@ -75,6 +81,8 @@ int Queue::Resize(int slots) {
   }
 
   queue_ = ring->release();
+  // The old ring's admission goes with it.
+  ring_lease_ = std::move(lease);
   size_ = slots;
 
   if (backpressure_) {
@@ -94,7 +102,8 @@ std::expected<void, std::string> Queue::ValidSize(uint64_t size) {
   return {};
 }
 
-// As set_size and set_burst validate; the ring of a new size is allocated
+// As set_size and set_burst validate; the ring of a new size is admitted
+// (D-198: a refusal throws MemoryRefused and refuses the write) and allocated
 // here, so apply only swaps.
 std::expected<Queue::Staged, std::string> Queue::StageSettings(
     const bess::pb::QueueSettings &value) const {
@@ -107,6 +116,8 @@ std::expected<Queue::Staged, std::string> Queue::StageSettings(
   }
   Staged staged;
   if (value.size() != size_) {
+    const size_t bytes = bess::utils::RingBytes(value.size());
+    staged.lease = init_context().memory().Lease("ring", bytes, bytes);
     auto ring = AllocRing(value.size());
     if (!ring) {
       return std::unexpected(
@@ -122,14 +133,15 @@ std::expected<Queue::Staged, std::string> Queue::StageSettings(
   return staged;
 }
 
-// Workers are paused. The old ring goes back into `staged`, freed (empty)
-// with it after the publish.
+// Workers are paused. The old ring and its admission go back into `staged`,
+// freed (empty) and released with it after the publish.
 void Queue::ApplySettings(Staged &staged) {
   if (staged.ring != nullptr) {
     MigrateRing(queue_, staged.ring.get());
     struct rte_ring *old = queue_;
     queue_ = staged.ring.release();
     staged.ring.reset(old);
+    std::swap(ring_lease_, staged.lease);
   }
   size_ = staged.size;
   burst_.store(staged.burst, std::memory_order_relaxed);
@@ -216,7 +228,9 @@ void Queue::DeInit() {
       bess::PacketFree(pkt);
     }
     std::free(queue_);
+    queue_ = nullptr;
   }
+  ring_lease_.reset();
 }
 int Queue::OnEvent(bess::Event event) {
   if (event != bess::Event::PreResume) {

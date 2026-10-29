@@ -10,6 +10,7 @@
 #include <memory>
 
 #include "dataplane/table_policy.h"
+#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "framework/singleton_resource.h"
 #include "l2/mac_table_resource.h"
@@ -55,7 +56,7 @@ class L2Forward final : public Module {
   // No cold word (an empty type allocates none).
   struct NoCold {};
   using Table = bess::l2::PackedMacTable<NoCold, bess::dataplane::SingleWriter>;
-  std::unique_ptr<Table> table_;
+  bess::framework::Sized<Table> table_;
   // "<name>/macs" (D-114): the same table, transactionally.
   std::unique_ptr<bess::l2::MacTableResource<Table>> resource_;
   bess::framework::ResourceBinding binding_;  // after resource_ (D-044)

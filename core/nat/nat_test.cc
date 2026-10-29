@@ -20,6 +20,7 @@
 #include "utils/tcp.h"
 #include "utils/udp.h"
 
+#include "framework/memory_scope.h"
 #include "testing/allocation_faults.h"
 
 namespace bess::nat {
@@ -477,6 +478,48 @@ TEST(NatTest, GrowthNeverLosesABindingWhenCreatesOutrunMigration) {
     EXPECT_TRUE(nat->Find(Endpoint{be32_t(kInside), be16_t(q), 17}) != nullptr) << q;
   }
   EXPECT_TRUE(nat->NeedsGrowth()) << "8 of 8: the next growth (to 16) is due";
+}
+
+// D-198: what Create allocates is known before it runs, all of it glibc.
+template <typename N>
+void ExpectMemoryCost(size_t capacity, size_t max_capacity) {
+  typename N::Config c;
+  c.addresses = {Pub(), Pub(0x01020304, {{1024, 2048, false}, {4096, 8192, false}})};
+  c.capacity = capacity;
+  c.max_capacity = max_capacity;
+  c.usage_log = 1000;
+  auto nat = N::Create(c).value();
+  EXPECT_EQ(framework::MemoryCost<N>::Bytes(c), nat->bytes());
+  EXPECT_EQ(framework::MemoryCost<N>::GlibcBytes(c), nat->bytes());
+}
+
+TEST(NatTest, MemoryCostIsWhatCreateAllocates) {
+  for (const size_t capacity : {size_t{1}, size_t{1000}, size_t{65536}}) {
+    ExpectMemoryCost<Nat>(capacity, 0);
+    ExpectMemoryCost<CountedNat>(capacity, 0);
+    ExpectMemoryCost<GrowableNat>(capacity, capacity * 4);
+    ExpectMemoryCost<CountedGrowableNat>(capacity, capacity * 2);
+  }
+}
+
+// A growable owned NAT's bytes() follow its tables (D-198): Adopt adds the
+// NewTable the control side admitted (TableBytes), and the old table leaves
+// when MigrateSome hands it back.
+TEST(NatTest, GrowthMovesBytesFromTheOldTableToTheNew) {
+  GrowableNat::Config c;
+  c.addresses = {Pub()};
+  c.capacity = 4;
+  c.max_capacity = 16;
+  auto nat = GrowableNat::Create(c).value();
+  const size_t before = nat->bytes();
+  nat->Adopt(GrowableNat::NewTable(8));
+  EXPECT_EQ(before + GrowableNat::TableBytes(8), nat->bytes());
+  std::unique_ptr<GrowableNat::Table> old;
+  while ((old = nat->MigrateSome(1)) == nullptr) {
+  }
+  EXPECT_EQ(GrowableNat::TableBytes(4), old->bytes());
+  EXPECT_EQ(before + GrowableNat::TableBytes(8) - GrowableNat::TableBytes(4),
+            nat->bytes());
 }
 
 // A batch gives what packet-by-packet translation gives, including two

@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "packet_parse.h"
 
 namespace bess::conntrack {
@@ -126,6 +127,17 @@ constexpr uint8_t kSA = kTcpSyn | kTcpAck, kFA = kTcpFin | kTcpAck, kA = kTcpAck
 using Ct = Conntrack<>;
 std::unique_ptr<Ct> Make(TimeoutPolicy policy = {}, size_t capacity = 64) {
   return Ct::Create(capacity, policy).value();
+}
+
+// D-198: what Create allocates is known before it runs, all of it glibc.
+TEST(ConntrackTest, MemoryCostIsWhatCreateAllocates) {
+  for (const size_t capacity : {size_t{1}, size_t{64}, size_t{100000}}) {
+    auto ct = Ct::Create(capacity, TimeoutPolicy{}, 5, 2).value();
+    EXPECT_EQ(framework::MemoryCost<Ct>::Bytes(capacity, TimeoutPolicy{},
+                                               uint64_t{5}, 2u),
+              ct->bytes());
+    EXPECT_EQ(framework::MemoryCost<Ct>::GlibcBytes(capacity), ct->bytes());
+  }
 }
 
 // Tracks a packet built by the caller; returns the result.

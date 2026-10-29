@@ -43,7 +43,9 @@ class RecordArena {
   RecordArena &operator=(const RecordArena &) = delete;
 
   // A free id, or 0 when the arena is exhausted (or the record size invalid).
-  // Reclaims ids whose grace period completed.
+  // Reclaims ids whose grace period completed. A new chunk is admitted
+  // through the growth hook first (D-198): throws MemoryRefused (or
+  // bad_alloc) and allocates nothing when it is refused.
   [[nodiscard]] Id Allocate();
 
   // Writer access to an allocated id, before it is published. Id 0 or an
@@ -81,6 +83,23 @@ class RecordArena {
     return retiring_.size() - retiring_head_;
   }
 
+  // Memory (D-198). The constructor allocates the published-chunk array,
+  // kMaxChunks pointers on the DPDK heap, whatever the record size; records
+  // come in chunks of 1024 (ChunkBytes), added by Allocate on the control
+  // path and kept until the arena is destroyed.
+  static size_t Bytes(size_t record_size, const rcu::RcuDomain &domain);
+  // One chunk: 1024 records at the record size rounded up to 16 bytes.
+  static size_t ChunkBytes(size_t record_size) noexcept;
+  // DPDK memory held: the published array and every chunk.
+  [[nodiscard]] size_t bytes() const noexcept {
+    return published_.size() * sizeof(published_[0]) +
+           chunks_.size() * (stride_ << kChunkBits);
+  }
+  // Allocate admits each new chunk through `growth` (nullptr: unadmitted).
+  void set_memory_growth(bess::utils::MemoryGrowth *growth) noexcept {
+    growth_ = growth;
+  }
+
  private:
   struct ChunkDeleter {
     void operator()(std::byte *p) const noexcept;
@@ -116,6 +135,7 @@ class RecordArena {
   std::vector<Chunk> chunks_;
   // Published chunk bases, so a reader reaches one with an acquire load.
   bess::utils::DpdkArray<std::atomic<const std::byte *>> published_;
+  bess::utils::MemoryGrowth *growth_ = nullptr;
   // Free ids are a LIFO list threaded through each record's first bytes.
   Id free_head_ = 0;
   size_t free_count_ = 0;

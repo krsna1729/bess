@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "testing/allocation_faults.h"
 
 namespace bess::flow {
@@ -397,11 +398,23 @@ TEST_F(WorkerFlowTableTest, ForEachVisitsExactlyTheLiveFlows) {
 TEST_F(WorkerFlowTableTest, ReportsMemoryPerFlow) {
   auto t = Make<Table>(100000);
   const double per_flow =
-      static_cast<double>(t->memory_bytes()) / static_cast<double>(t->capacity());
+      static_cast<double>(t->bytes()) / static_cast<double>(t->capacity());
   const double slot_and_free = Table::slot_bytes() + sizeof(uint32_t);
   EXPECT_GT(per_flow, slot_and_free);
   // The directory costs one 64-byte bucket per four keys.
   EXPECT_LT(per_flow, slot_and_free + 64.0 / 4.0 + 1.0);
+}
+
+// D-198: what Create allocates is known before it runs, all of it glibc.
+TEST_F(WorkerFlowTableTest, MemoryCostIsWhatCreateAllocates) {
+  for (const size_t capacity : {size_t{1}, size_t{1000}, size_t{100000}}) {
+    auto t = Make<Table>(capacity);
+    EXPECT_EQ(framework::MemoryCost<Table>::Bytes(capacity), t->bytes());
+    EXPECT_EQ(framework::MemoryCost<Table>::GlibcBytes(capacity), t->bytes());
+    auto aliased = Make<AliasTable>(capacity);
+    EXPECT_EQ(framework::MemoryCost<AliasTable>::Bytes(capacity),
+              aliased->bytes());
+  }
 }
 
 // -- construction failure -----------------------------------------------------

@@ -23,7 +23,6 @@
 #include "metadata.h"
 #include "module.h"
 #include "module_graph.h"
-#include "runtime/opts.h"
 #include "runtime/runtime_state.h"
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
@@ -219,7 +218,8 @@ bess::PacketHandle MakeShortPacket(const Bytes &bytes, size_t len, bool chain) {
 
 void InitModuleTests() {
   static const bool done = [] {
-    FLAGS_m = 0;  // malloc-backed pools: no hugepages, no root
+    // The library default (D-198): normal pages, malloc-backed pools, no
+    // hugepages, no root.
     bess::PacketPool::CreateDefaultPools(32767);
     PortBuilder::InitDrivers();
     return true;

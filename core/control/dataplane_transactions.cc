@@ -194,16 +194,29 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
     return Op::Upsert(op.resource(), std::move(*key), std::move(*value));
   };
+  // D-198: memory refused while decoding or reserving (a value's storage, a
+  // table's growth) answers RESOURCE_EXHAUSTED with nothing visible. Decoding
+  // touches no table, and the engine allocates only in its Reserve phase,
+  // whose abort guard undoes every reservation on unwind; publication
+  // allocates nothing (D-172). Not recorded under the id, as nothing was
+  // applied. Only these two steps are covered: once the engine has returned,
+  // a throw would report an applied transaction as refused.
   int failed = -1;
   std::string error;
-  for (int i = 0; i < n; i++) {
-    auto op = decode(request.ops(i));
-    if (!op) {
-      failed = i;
-      error = std::move(op.error());
-      break;
+  try {
+    for (int i = 0; i < n; i++) {
+      auto op = decode(request.ops(i));
+      if (!op) {
+        failed = i;
+        error = std::move(op.error());
+        break;
+      }
+      ops.push_back(std::move(*op));
     }
-    ops.push_back(std::move(*op));
+  } catch (const std::bad_alloc &e) {
+    ControlError refused = OutOfMemory(e);
+    refused.field = "ops";
+    return std::unexpected(std::move(refused));
   }
 
   v2::TransactionRecord record;
@@ -214,8 +227,15 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     if (request.has_expected_generation()) {
       expected = request.expected_generation();
     }
-    const TransactionEngine::Result result =
-        engine_.Apply(ops, expected, consistency, on_busy);
+    std::optional<TransactionEngine::Result> applied;
+    try {
+      applied.emplace(engine_.Apply(ops, expected, consistency, on_busy));
+    } catch (const std::bad_alloc &e) {
+      ControlError refused = OutOfMemory(e);
+      refused.field = "ops";
+      return std::unexpected(std::move(refused));
+    }
+    const TransactionEngine::Result &result = *applied;
     if (result.outcome == TransactionEngine::Outcome::kUnsupported) {
       // A typed error, not a record: the request names a promise a resource
       // cannot keep, which retrying will not change. Nothing was attempted,

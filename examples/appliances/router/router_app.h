@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "dataplane/interface_id.h"
+#include "framework/memory_scope.h"
 #include "rcu/rcu_domain.h"
 #include "route/connected_routes.h"
 #include "route/forward.h"
@@ -65,19 +66,28 @@ class RouterApp {
     InterfaceId egress{};
   };
 
-  static std::expected<std::unique_ptr<RouterApp>, std::string> Create(bess::rcu::RcuDomain &rcu) {
+  // The router is admitted through `memory` (D-198, resource "router") before
+  // it is allocated: a refusal throws utils::MemoryRefused and builds nothing.
+  // Domains the static policy adds are growth admitted through the same lease;
+  // all of it is released when the app is destroyed.
+  static std::expected<std::unique_ptr<RouterApp>, std::string> Create(
+      bess::rcu::RcuDomain &rcu, bess::framework::MemoryScope &memory) {
     // IPv4 only: the static policy routes IPv4, so IPv6 frames are
     // kFamilyDisabled and no IPv6 FIB is allocated.
-    auto router = bess::route::Router::Create(
-        "r1_appliance",
-        bess::route::Router::Config{
-            .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 8},
-            .ipv6 = std::nullopt},
-        /*max_next_hops=*/16, rcu, /*max_domains=*/3, /*max_groups=*/4);
+    const std::string name = "r1_appliance";
+    const bess::route::Router::Config config{
+        .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 8},
+        .ipv6 = std::nullopt};
+    constexpr size_t kMaxNextHops = 16, kMaxDomains = 3, kMaxGroups = 4;
+    auto lease = memory.LeaseFor<bess::route::Router>("router", name, config, kMaxNextHops, rcu,
+                                                      kMaxDomains, kMaxGroups);
+    auto router = bess::route::Router::Create(name, config, kMaxNextHops, rcu, kMaxDomains,
+                                              kMaxGroups);
     if (!router) {
       return std::unexpected(std::string("router: ") + bess::route::RouteErrorName(router.error()));
     }
-    std::unique_ptr<RouterApp> app(new RouterApp(std::move(*router)));
+    std::unique_ptr<RouterApp> app(
+        new RouterApp(bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*router))));
     if (std::string err = app->ApplyStaticPolicy(); !err.empty()) {
       return std::unexpected(err);
     }
@@ -141,7 +151,7 @@ class RouterApp {
   static constexpr RouteDomainId kVrf1{1}, kVrf2{2};
 
  private:
-  explicit RouterApp(std::unique_ptr<bess::route::Router> router) : router_(std::move(router)) {}
+  explicit RouterApp(bess::framework::Sized<bess::route::Router> router) : router_(std::move(router)) {}
 
   static Ethernet::Address Mac(uint8_t last) {
     Ethernet::Address a;
@@ -232,7 +242,7 @@ class RouterApp {
                : "neighbor";
   }
 
-  std::unique_ptr<bess::route::Router> router_;
+  bess::framework::Sized<bess::route::Router> router_;
   bess::route::NeighborTable neighbors_;
   std::vector<Interface> interfaces_;
   size_t route_writes_ = 0;

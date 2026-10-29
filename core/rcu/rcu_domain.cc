@@ -241,8 +241,8 @@ void RcuDomain::ReserveRetirements(size_t n) {
   }
 }
 
-void RcuDomain::RetireErased(GracePeriod token, void *object,
-                             void (*destroy)(void *),
+void RcuDomain::RetireErased(GracePeriod token, void *object, void *context,
+                             void (*destroy)(void *object, void *context),
                              std::atomic<size_t> *outstanding) {
   size_t pending = 0;
   if (outstanding != nullptr) {
@@ -250,7 +250,8 @@ void RcuDomain::RetireErased(GracePeriod token, void *object,
   }
   {
     std::lock_guard<std::mutex> lock(retire_mutex_);
-    retired_.push_back(RetiredObject{token, object, destroy, outstanding});
+    retired_.push_back(
+        RetiredObject{token, object, context, destroy, outstanding});
     pending = retired_.size() - head_;
     pending_count_.store(pending, std::memory_order_relaxed);
     stats_.objects_retired++;
@@ -289,7 +290,7 @@ size_t RcuDomain::ReclaimReady() {
       }
       retired = retired_[head_++];
     }
-    retired.destroy(retired.object);
+    retired.destroy(retired.object, retired.context);
     if (retired.outstanding != nullptr) {
       retired.outstanding->fetch_sub(1, std::memory_order_release);
     }

@@ -5,6 +5,7 @@
 #ifndef BESS_MODULES_MEASURE_H_
 #define BESS_MODULES_MEASURE_H_
 
+#include "framework/memory_scope.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "utils/histogram.h"
@@ -13,10 +14,12 @@
 
 class Measure final : public Module {
  public:
-  Measure(uint64_t ns_per_bucket = 1, uint64_t max_ns = 0)
+  // The histograms hold one (above-range) bucket until Init admits and
+  // sizes them (D-198).
+  Measure()
       : Module(),
-        rtt_hist_(max_ns / ns_per_bucket, ns_per_bucket),
-        jitter_hist_(max_ns / ns_per_bucket, ns_per_bucket),
+        rtt_hist_(0, kDefaultNsPerBucket),
+        jitter_hist_(0, kDefaultNsPerBucket),
         rand_(),
         jitter_sample_prob_(),
         last_rtt_ns_(),
@@ -45,10 +48,19 @@ class Measure final : public Module {
   static const uint64_t kDefaultMaxNs = 100'000'000;  // 100 ms
   static constexpr double kDefaultIpDvSampleProb = 0.05;
 
+  // Replaces both histograms with empty ones of Init's size, admitted before
+  // they are built (throws MemoryRefused, nothing changed, when refused).
   void Clear();
 
+  // The admission of both histograms' buckets ("histograms", glibc, D-198):
+  // declared before them, so it is released after they are freed.
+  bess::framework::MemoryLease hist_lease_;
   Histogram<uint64_t> rtt_hist_;
   Histogram<uint64_t> jitter_hist_;
+  // Init's size of each histogram: latency_ns_max / latency_ns_resolution
+  // buckets (plus the above-range one) of latency_ns_resolution ns.
+  size_t num_buckets_ = 0;
+  uint64_t bucket_width_ = kDefaultNsPerBucket;
 
   Random rand_;
   double jitter_sample_prob_;

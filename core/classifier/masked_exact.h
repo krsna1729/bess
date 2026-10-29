@@ -280,6 +280,19 @@ class RuntimeMaskedBackend {
     };
   }
 
+  // Memory (D-198), all glibc: the candidates, the tuples, each tuple's mask
+  // and its cuckoo backend. Immutable once built. No Bytes(): each tuple's
+  // cuckoo map sizes itself by expanding while Build inserts (on hash
+  // collisions too), so the cost is known once built, not from the rules.
+  [[nodiscard]] size_t bytes() const noexcept {
+    size_t total = candidates_.capacity() * sizeof(Candidate) +
+                   tuples_.capacity() * sizeof(Tuple);
+    for (const Tuple &tuple : tuples_) {
+      total += tuple.mask.capacity() + tuple.backend.bytes();
+    }
+    return total;
+  }
+
  private:
   struct Tuple {
     std::vector<std::byte> mask;

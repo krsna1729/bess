@@ -214,12 +214,19 @@ CommandResponse Bridge::Init(const bess::pb::BridgeArg &arg) {
   config.granularity_shift = kGranularityShift;
   config.max_domains = 1;
   config.start = tsc_to_ns(rdtsc());
+  // Validate before admitting (D-198): a capacity the FDB refuses (past
+  // 2^28 entries) fails as it always did, not as an oversized admission.
+  if (config.capacity > (size_t{1} << 28)) {
+    return CommandFailure(ENOMEM, "cannot create the FDB for %u entries",
+                          max_entries_);
+  }
+  bess::framework::MemoryLease lease = init_context().memory().LeaseFor<Fdb>("fdb", config);
   auto fdb = Fdb::Create(config);
   if (!fdb) {
     return CommandFailure(ENOMEM, "cannot create the FDB for %u entries",
                           max_entries_);
   }
-  fdb_ = std::move(*fdb);
+  fdb_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*fdb));
 
   resource_ = std::make_unique<StaticsResource>(*this);
   binding_ = init_context().codecs().Bind(

@@ -97,6 +97,25 @@ class SharedConntrack {
     return ct;
   }
 
+  // What Create allocates (D-198): the shared connection table (its
+  // directory from DPDK, the rest glibc), the timer wheel and the tracker
+  // itself (glibc), as bytes() counts them.
+  static size_t Bytes(size_t capacity, const rcu::RcuDomain &domain,
+                      const TimeoutPolicy & = TimeoutPolicy{}, Tick start = 0,
+                      unsigned granularity_shift = 0) {
+    return Table::Bytes(capacity, domain) +
+           Wheel::Bytes(capacity, start, granularity_shift) +
+           sizeof(SharedConntrack);
+  }
+  static size_t GlibcBytes(size_t capacity, const rcu::RcuDomain &domain,
+                           const TimeoutPolicy & = TimeoutPolicy{},
+                           Tick start = 0,
+                           unsigned granularity_shift = 0) noexcept {
+    return Table::GlibcBytes(capacity, domain) +
+           Wheel::Bytes(capacity, start, granularity_shift) +
+           sizeof(SharedConntrack);
+  }
+
   // As Conntrack::Track.
   Result Track(std::span<const uint8_t> frame, const packet::ParsedFrame &p, Tick now,
                uint16_t zone = 0, bool may_create = true) noexcept {
@@ -165,6 +184,9 @@ class SharedConntrack {
 
   size_t size() const noexcept { return table_->size(); }
   size_t capacity() const noexcept { return table_->capacity(); }
+  size_t bytes() const noexcept {
+    return table_->bytes() + wheel_->bytes() + sizeof(*this);
+  }
   const TimeoutPolicy &policy() const noexcept { return policy_; }
   Entry *Find(const CtKey &key) const noexcept { return table_->Find(key); }
 

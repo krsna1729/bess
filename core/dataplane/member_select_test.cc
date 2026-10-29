@@ -14,6 +14,8 @@
 #include <random>
 #include <vector>
 
+#include "framework/memory_scope.h"
+
 namespace bess::dataplane {
 namespace {
 
@@ -201,6 +203,34 @@ TEST(MemberSelectTest, AnySelectorBatchMatchesTheSelector) {
       ASSERT_EQ(all[k].Select(hashes[i]), out[i]);
       ASSERT_LT(out[i], 4u);
     }
+  }
+}
+
+// What Build allocates, plus the selector, is what it reports (D-198); all
+// of it glibc.
+TEST(MemberSelectTest, BytesMatchesBuild) {
+  using bess::framework::MemoryCost;
+  for (size_t n : {size_t{1}, size_t{7}, size_t{300}}) {
+    const std::vector<uint32_t> weights(n, 3);
+    const auto weighted = WeightedSelector::Build(weights).value();
+    EXPECT_EQ(MemoryCost<WeightedSelector>::Bytes(weights), weighted.bytes());
+    EXPECT_EQ(MemoryCost<WeightedSelector>::Bytes(weights),
+              MemoryCost<WeightedSelector>::GlibcBytes(weights));
+
+    const auto keys = Keys(n);
+    const auto maglev = MaglevSelector::Build(keys).value();
+    EXPECT_EQ(MemoryCost<MaglevSelector>::Bytes(keys), maglev.bytes());
+    const auto small = MaglevSelector::Build(keys, 1009).value();
+    EXPECT_EQ(MemoryCost<MaglevSelector>::Bytes(keys, uint32_t{1009}),
+              small.bytes());
+    EXPECT_EQ(MemoryCost<MaglevSelector>::Bytes(keys, uint32_t{1009}),
+              MemoryCost<MaglevSelector>::GlibcBytes(keys, uint32_t{1009}));
+
+    const auto rendezvous = RendezvousSelector::Build(keys).value();
+    EXPECT_EQ(MemoryCost<RendezvousSelector>::Bytes(keys), rendezvous.bytes());
+
+    const RangeSelector range{static_cast<uint32_t>(n)};
+    EXPECT_EQ(MemoryCost<RangeSelector>::Bytes(range.n), range.bytes());
   }
 }
 

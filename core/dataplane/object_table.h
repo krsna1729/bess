@@ -12,12 +12,19 @@
 #include <vector>
 
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess {
 namespace dataplane {
 
 template <typename Id, typename T>
 class ObjectTableBuilder;
+
+// A generation's slots: packet-path memory, so DPDK's heap on the memory node
+// (D-029, D-123).
+template <typename T>
+using ObjectSlots =
+    std::vector<std::optional<T>, utils::DpdkAllocator<std::optional<T>>>;
 
 // An immutable table mapping a strongly typed id to an object (K2).
 //
@@ -81,19 +88,20 @@ class ObjectTable {
   // Configured number of usable slots (id 1 .. capacity).
   size_t capacity() const noexcept { return slots_.size() - 1; }
 
-  // Control-side introspection for benchmarks and tests; not a packet-path
-  // statistic, and deliberately not maintained per lookup.
-  size_t storage_bytes() const noexcept {
+  // DPDK memory the generation holds: its slots (D-198). Control-side
+  // introspection; not a packet-path statistic, and deliberately not
+  // maintained per lookup.
+  size_t bytes() const noexcept {
     return slots_.size() * sizeof(std::optional<T>);
   }
 
  private:
   friend class ObjectTableBuilder<Id, T>;
 
-  ObjectTable(std::vector<std::optional<T>> slots, size_t size)
+  ObjectTable(ObjectSlots<T> slots, size_t size)
       : slots_(std::move(slots)), size_(size) {}
 
-  std::vector<std::optional<T>> slots_;
+  ObjectSlots<T> slots_;
   size_t size_ = 0;
 };
 
@@ -107,6 +115,14 @@ template <typename Id, typename T>
 class ObjectTableBuilder {
  public:
   explicit ObjectTableBuilder(size_t capacity) : slots_(capacity + 1) {}
+
+  // What the constructor allocates in DPDK memory (D-198): one generation's
+  // slots, which Build() moves into the table, so it is also the table's
+  // bytes(). Each generation is a new builder: admit one per generation and
+  // release it when the retired generation is freed.
+  static size_t Bytes(size_t capacity) noexcept {
+    return (capacity + 1) * sizeof(std::optional<T>);
+  }
 
   ObjectTableBuilder(const ObjectTableBuilder &) = delete;
   ObjectTableBuilder &operator=(const ObjectTableBuilder &) = delete;
@@ -150,6 +166,10 @@ class ObjectTableBuilder {
 
   size_t size() const noexcept { return size_; }
   size_t capacity() const noexcept { return slots_.size() - 1; }
+  // DPDK memory held: the slots (D-198).
+  size_t bytes() const noexcept {
+    return slots_.size() * sizeof(std::optional<T>);
+  }
 
   // Freezes the table. The builder is consumed: it must not be used afterwards.
   std::unique_ptr<const ObjectTable<Id, T>> Build() && {
@@ -158,7 +178,7 @@ class ObjectTableBuilder {
   }
 
  private:
-  std::vector<std::optional<T>> slots_;
+  ObjectSlots<T> slots_;
   size_t size_ = 0;
 };
 

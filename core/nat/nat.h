@@ -28,6 +28,7 @@
 #include "packet_parse.h"
 #include "rcu/rcu_domain.h"
 #include "utils/checksum.h"
+#include "utils/dpdk_memory.h"
 #include "utils/endian.h"
 #include "utils/random.h"
 
@@ -208,7 +209,12 @@ class PortPool {
   bool Used(size_t address, uint16_t protocol, uint16_t port) const noexcept {
     return bits_[address * kClasses + ClassOf(protocol)][port / 64] >> (port % 64) & 1;
   }
-  size_t memory_bytes() const noexcept { return bits_.size() * sizeof(Bitmap); }
+  // What the constructor allocates for `addresses` (D-198), all glibc;
+  // bytes() after it.
+  static size_t Bytes(size_t addresses) noexcept {
+    return addresses * kClasses * sizeof(Bitmap);
+  }
+  size_t bytes() const noexcept { return bits_.size() * sizeof(Bitmap); }
 
  private:
   static constexpr int kClasses = 3;
@@ -325,6 +331,15 @@ class UsageLog {
     return true;
   }
   size_t capacity() const noexcept { return mask_ + 1; }
+  // What a UsageLog of `capacity` records costs (D-198), all glibc: the ring
+  // and the log itself, as bytes() counts them.
+  static size_t Bytes(size_t capacity) noexcept {
+    return std::bit_ceil(std::max<size_t>(capacity, 2)) * sizeof(UsageRecord) +
+           sizeof(UsageLog);
+  }
+  size_t bytes() const noexcept {
+    return (mask_ + 1) * sizeof(UsageRecord) + sizeof(*this);
+  }
 
  private:
   const size_t mask_;
@@ -531,6 +546,36 @@ class BasicNat {
       return std::unexpected(CreateError::kOutOfMemory);
     }
     return nat;
+  }
+
+  // What Create allocates (D-198): the binding table (TableBytes), the
+  // timer wheel, the port bitmaps, the usage log (Counted NATs), the copied
+  // addresses and the engine itself -- what bytes() counts. All of it glibc
+  // but a SharedNat table's rte_hash directory.
+  static size_t Bytes(const Config &config) {
+    return TableBytes(config.capacity, config.rcu) + EngineBytes(config);
+  }
+  static size_t GlibcBytes(const Config &config) {
+    return TableGlibcBytes(config.capacity, config.rcu) + EngineBytes(config);
+  }
+  // One binding table of `capacity` bindings: what Create makes, what a
+  // SharedNat's Grow makes (admitted through set_memory_growth) and what
+  // NewTable makes for a growable owned NAT. `rcu`: a SharedNat's domain
+  // (Config::rcu); unused when owned.
+  static size_t TableBytes(size_t capacity, const rcu::RcuDomain *rcu = nullptr) {
+    if constexpr (kShared) {
+      return rcu != nullptr ? Table::Bytes(capacity, *rcu) : 0;
+    } else {
+      return Table::Bytes(capacity);
+    }
+  }
+  static size_t TableGlibcBytes(size_t capacity,
+                                const rcu::RcuDomain *rcu = nullptr) noexcept {
+    if constexpr (kShared) {
+      return rcu != nullptr ? Table::GlibcBytes(capacity, *rcu) : 0;
+    } else {
+      return Table::GlibcBytes(capacity);
+    }
   }
 
   // The endpoint a packet carries for `dir`: the source going out, the
@@ -816,17 +861,29 @@ class BasicNat {
   // between chunks so workers keep creating; stops lookups in the old table
   // and waits for a grace period; folds refreshes that reached old copies
   // meanwhile; frees the old table. Workers never stop. False (and nothing
-  // changes) when the table cannot be allocated.
+  // changes) when the table cannot be allocated. With a growth hook
+  // (set_memory_growth, D-198) the larger table's TableBytes are admitted
+  // first -- a refusal throws utils::MemoryRefused and nothing changes -- and
+  // the old table's are given back once it is freed.
   bool Grow(size_t capacity)
     requires(kShared)
   {
     if (capacity <= cur()->capacity() || capacity > max_capacity_) {
       return true;
     }
+    const size_t grown = TableBytes(capacity, rcu_);
+    const size_t grown_glibc = TableGlibcBytes(capacity, rcu_);
+    if (growth_ != nullptr) {
+      growth_->Grow(grown, grown_glibc);
+    }
     auto made = Store::CreateTable(capacity, rcu_);
     if (!made) {
+      if (growth_ != nullptr) {
+        growth_->Shrink(grown, grown_glibc);
+      }
       return false;
     }
+    tables_bytes_.fetch_add((*made)->bytes(), std::memory_order_relaxed);
     lock_.Acquire();
     old_ = std::move(table_);
     table_ = std::move(*made);
@@ -889,13 +946,31 @@ class BasicNat {
     std::unique_ptr<Table> retired = std::move(old_);
     migrated_tables_++;
     lock_.Release();
+    const size_t freed = retired->bytes();
+    const size_t freed_glibc = TableGlibcBytes(retired->capacity(), rcu_);
     retired.reset();  // its destructor waits for a grace period again
+    tables_bytes_.fetch_sub(freed, std::memory_order_relaxed);
+    if (growth_ != nullptr) {
+      growth_->Shrink(freed, freed_glibc);
+    }
     return true;
+  }
+  // The admission a SharedNat's Grow asks for its larger table (D-198).
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept
+    requires(kShared)
+  {
+    growth_ = growth;
   }
   // Slots copied per lock hold while a shared NAT grows (about 64 x 50 ns).
   static constexpr size_t kGrowChunk = 64;
   // A new, empty table: the control side calls this (allocation never happens
-  // on the packet path) and hands the result to the owner.
+  // on the packet path) and hands the result to the owner. Memory (D-198):
+  // the table costs TableBytes(capacity). The control side admits that
+  // first, through the growth hook of the lease that tracks this NAT
+  // (MemoryLease::growth()->Grow(TableBytes(c), TableGlibcBytes(c))), so the
+  // admission follows bytes(): Adopt adds the table to bytes(), and the old
+  // table MigrateSome hands back leaves it -- the control side Shrinks its
+  // TableBytes when it frees it, as it does for a table Adopt drops.
   static std::unique_ptr<Table> NewTable(size_t capacity)
     requires(!kShared && kGrowable)
   {
@@ -913,6 +988,7 @@ class BasicNat {
     old_ = std::move(table_);
     table_ = std::move(bigger);
     cursor_ = 0;
+    tables_bytes_.fetch_add(table_->bytes(), std::memory_order_relaxed);
   }
   bool migrating() const noexcept { return prev() != nullptr; }
   // Moves the bindings of the next `slots` slots of the old table to the new
@@ -944,6 +1020,7 @@ class BasicNat {
       return nullptr;
     }
     migrated_tables_++;
+    tables_bytes_.fetch_sub(old_->bytes(), std::memory_order_relaxed);
     return std::move(old_);
   }
   static constexpr size_t kMaxMigrateSlots = 256;
@@ -963,22 +1040,48 @@ class BasicNat {
     return cur()->size() + (o != nullptr ? o->size() : 0);
   }
   const std::vector<ExternalAddress> &addresses() const noexcept { return addresses_; }
-  // Bytes for `capacity` bindings: the table (both keys and the binding; for a
-  // SharedNat its slots, excluding the rte_hash directory), the wheel and the
-  // port bitmaps.
-  size_t memory_bytes() const noexcept {
-    const Table *o = prev();
-    return cur()->memory_bytes() + (o != nullptr ? o->memory_bytes() : 0) +
-           wheel_->memory_bytes() + ports_.memory_bytes();
+  // Bytes the NAT holds (Bytes(config) after Create): its table (both
+  // tables while migrating), the wheel, the port bitmaps, the usage log, the
+  // addresses and the engine itself. Any thread.
+  size_t bytes() const noexcept {
+    size_t bytes = tables_bytes_.load(std::memory_order_relaxed) +
+                   wheel_->bytes() + ports_.bytes() + AddressBytes(addresses_) +
+                   pool_of_.size() * sizeof(uint32_t) + sizeof(*this);
+    if constexpr (kUsage) {
+      bytes += log_->bytes();
+    }
+    return bytes;
   }
 
  private:
+  // What Create allocates besides the table, all glibc.
+  static size_t EngineBytes(const Config &config) noexcept {
+    size_t bytes = Wheel::Bytes(std::max(config.capacity, config.max_capacity),
+                                config.start, config.granularity_shift) +
+                   PortPool::Bytes(config.addresses.size()) +
+                   AddressBytes(config.addresses) +
+                   config.addresses.size() * sizeof(uint32_t) + sizeof(BasicNat);
+    if constexpr (kUsage) {
+      bytes += UsageLog::Bytes(config.usage_log);
+    }
+    return bytes;
+  }
+  // The copied address list and each address's ranges.
+  static size_t AddressBytes(const std::vector<ExternalAddress> &addresses) noexcept {
+    size_t bytes = addresses.size() * sizeof(ExternalAddress);
+    for (const ExternalAddress &a : addresses) {
+      bytes += a.ranges.size() * sizeof(PortRange);
+    }
+    return bytes;
+  }
+
   BasicNat(const Config &config, std::unique_ptr<Table> table, std::unique_ptr<Wheel> wheel)
       : addresses_(config.addresses),
         timeout_(config.timeout),
         table_(std::move(table)),
         wheel_(std::move(wheel)),
         ports_(config.addresses.size()) {
+    tables_bytes_.store(table_->bytes(), std::memory_order_relaxed);
     rng_.SetSeed(config.seed);
     if constexpr (kUsage) {
       log_ = std::make_unique<UsageLog>(config.usage_log);
@@ -1170,6 +1273,10 @@ class BasicNat {
   // Shared: the tables published to lock-free readers (owned: unused).
   std::atomic<Table *> cur_{nullptr};
   std::atomic<Table *> prev_{nullptr};
+  // Memory (D-198): the bytes of the table(s) bytes() counts, read off the
+  // thread that swaps them; and a SharedNat's growth hook.
+  std::atomic<size_t> tables_bytes_{0};
+  utils::MemoryGrowth *growth_ = nullptr;
 };
 
 // The owned NAT (one worker; fixed, or growable) and the shared one (every

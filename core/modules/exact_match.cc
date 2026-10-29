@@ -13,6 +13,7 @@
 
 #include "dataplane/transaction_engine.h"
 #include "event.h"
+#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "framework/table_batch.h"
 #include "metadata.h"
@@ -240,14 +241,30 @@ Error ExactMatch::PackKey(const std::vector<std::vector<uint8_t>> &fields,
 std::expected<std::shared_ptr<classifier::ConcurrentExactTable>, Error>
 ExactMatch::NewTable(size_t rules) const {
   // Decision D-010: room for `rules` plus the grace-period headroom.
+  const auto key_len = static_cast<uint32_t>(keys_.key_size());
+  const uint32_t capacity =
+      classifier::ConcurrentExactTable::CapacityFor(rules);
+  bess::framework::MemoryScope &memory = init_context().memory();
+  // Admitted before it is built (D-198): a refusal throws MemoryRefused and
+  // builds nothing. The admission travels with the table: every generation
+  // that maps it shares the owner, so a table replaced by growth is released
+  // when its last generation is reclaimed after the grace period (the
+  // generation's RCU retire carries it; nothing is released at publish).
+  bess::framework::MemoryLease lease =
+      memory.LeaseFor<classifier::ConcurrentExactTable>(
+          "rules", key_len, capacity, init_context().rcu(), memory.socket());
   auto table = classifier::ConcurrentExactTable::Create(
-      static_cast<uint32_t>(keys_.key_size()),
-      classifier::ConcurrentExactTable::CapacityFor(rules),
-      init_context().rcu());
+      key_len, capacity, init_context().rcu(), memory.socket());
   if (!table) {
     return std::unexpected(std::make_pair(ENOMEM, table.error()));
   }
-  return std::shared_ptr<classifier::ConcurrentExactTable>(std::move(*table));
+  auto owner =
+      std::make_shared<bess::framework::Sized<classifier::ConcurrentExactTable>>(
+          bess::framework::MemoryScope::Adopt(std::move(lease),
+                                              std::move(*table)));
+  classifier::ConcurrentExactTable *raw = owner->get();
+  return std::shared_ptr<classifier::ConcurrentExactTable>(std::move(owner),
+                                                           raw);
 }
 
 std::expected<std::shared_ptr<classifier::ConcurrentExactTable>, Error>
@@ -421,16 +438,22 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
     }
   }
 
+  if (arg.has_default_gate() && !bess::IsValidGateValue(arg.default_gate())) {
+    return CommandFailure(EINVAL, "Invalid default gate: %llu",
+                          static_cast<unsigned long long>(arg.default_gate()));
+  }
+
   // Result placement: each field maps a slice of the rule's record to a
   // metadata attribute (added here, before Build, so the plan bakes its
   // offset) or a packet byte offset. A rule's record is zero-padded to the
-  // widest field's end.
+  // widest field's end. The record arena ("results") and the rule table
+  // ("rules") are admitted after every argument check (D-198).
   if (CommandResponse results = results_.Init(
           *this, arg.result_fields(),
           arg.has_default_result()
               ? std::optional<std::string_view>(arg.default_result())
               : std::nullopt,
-          init_context().rcu());
+          init_context().rcu(), init_context().memory(), "results");
       results.error().code() != 0) {
     return results;
   }
@@ -441,10 +464,6 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
                           table.error().second.c_str());
   }
   Error err;
-  if (arg.has_default_gate() && !bess::IsValidGateValue(arg.default_gate())) {
-    return CommandFailure(EINVAL, "Invalid default gate: %llu",
-                          static_cast<unsigned long long>(arg.default_gate()));
-  }
   const gate_idx_t default_gate =
       arg.has_default_gate() ? static_cast<gate_idx_t>(arg.default_gate()) : DROP_GATE;
   if (arg.has_default_gate()) {

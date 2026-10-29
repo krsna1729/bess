@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "runtime/runtime_state.h"
 namespace bess::classifier {
 namespace {
@@ -531,6 +532,22 @@ TEST(ConcurrentExactTableTest, SharedWritersChurnKeepsExactCount) {
   size_t visited = 0;
   table.ForEach([&](ConstBytes, uint64_t) { visited++; });
   EXPECT_EQ(visited, static_cast<size_t>(kWriters) * kLive);
+}
+
+// D-198: Bytes() is what Create allocates, for the sizes owners ask for.
+TEST(ConcurrentExactTableTest, BytesMatchesCreate) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  for (const uint32_t capacity :
+       {uint32_t{4}, ConcurrentExactTable::CapacityFor(1),
+        ConcurrentExactTable::CapacityFor(5000)}) {
+    const auto bytes = bess::framework::MemoryCost<ConcurrentExactTable>::Bytes(
+        kKeyLen, capacity, domain);
+    auto table = ConcurrentExactTable::Create(kKeyLen, capacity, domain);
+    ASSERT_TRUE(table.has_value()) << table.error();
+    EXPECT_EQ(bytes, (*table)->bytes());
+    EXPECT_EQ(0u, bess::framework::MemoryCost<ConcurrentExactTable>::GlibcBytes(
+                      kKeyLen, capacity, domain));
+  }
 }
 
 }  // namespace

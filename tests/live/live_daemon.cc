@@ -350,9 +350,8 @@ void Daemon::Start(int port) {
   const int log_fd = mkstemp(log_template);
   log_path_ = log_template;
   keep_log_ = false;  // a fresh daemon: this run's log is this run's to remove
-  std::vector<std::string> argv = {Env("BESSD"),       "-f", "-m", "0", "-p",
-                                   std::to_string(port), "-skip_root_check",
-                                   "-dpdk=false"};
+  std::vector<std::string> argv = {Env("BESSD"),       "-f", "--mem_backing=normal", "-p",
+                                   std::to_string(port), "-skip_root_check"};
   argv.insert(argv.end(), flags_.begin(), flags_.end());
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);

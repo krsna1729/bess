@@ -30,6 +30,7 @@ class TickHub;
 }  // namespace framework
 namespace framework {
 class InstanceRegistry;
+class MemoryScope;
 class ResourceBindings;
 }  // namespace framework
 namespace runtime {
@@ -123,15 +124,37 @@ class ModuleInitContext {
   // libraries. A plugin that calls this requires BESS_CAP_RESOURCES (the
   // bindings have been in every bessd that checks a plugin descriptor).
   ResourceBindings &codecs() const noexcept { return resource_bindings_; }
+  // This module's memory (D-198, experimental: framework/memory_scope.h):
+  // every table, pool, ring or other primitive the module sizes from its
+  // arguments is admitted here before it is allocated -- Create<T>(resource,
+  // args...), or Admit/Lease and a primitive built on socket() -- so one
+  // that does not fit is refused whole (RESOURCE_EXHAUSTED) and what each
+  // module holds is reported (GetResourceStatus.memory.modules). Unlike the
+  // other capabilities it is the module's own, destroyed with it, which
+  // releases whatever it still holds. A plugin that calls it requires
+  // BESS_CAP_MEMORY (daemons before D-198 lack the scope's symbols).
+  MemoryScope &memory() const noexcept { return *memory_; }
 
   // The framework gives every module its context; a module reads it through
   // Module::init_context() and cannot construct or look one up itself.
  private:
   // The context for the process's one active runtime. A separate context per
   // runtime is future work; Module's constructor is the only caller, so
-  // ProcessDefault() is not part of the author-facing surface.
+  // ProcessDefault() is not part of the author-facing surface. Each module
+  // gets a copy of it bound to the module's own memory scope.
   friend class ::Module;
   static const ModuleInitContext &ProcessDefault();
+  ModuleInitContext(const ModuleInitContext &shared, MemoryScope &memory) noexcept
+      : resources_(shared.resources_),
+        resource_bindings_(shared.resource_bindings_),
+        instances_(shared.instances_),
+        rcu_(shared.rcu_),
+        ports_(shared.ports_),
+        metrics_(shared.metrics_),
+        requests_(shared.requests_),
+        events_(shared.events_),
+        ticks_(shared.ticks_),
+        memory_(&memory) {}
 
   dataplane::ResourceRegistry &resources_;
   ResourceBindings &resource_bindings_;
@@ -144,6 +167,7 @@ class ModuleInitContext {
   framework::RequestHub &requests_;
   stats::EventHub &events_;
   framework::TickHub &ticks_;
+  MemoryScope *memory_ = nullptr;  // nullptr in ProcessDefault() only
 };
 
 }  // namespace framework

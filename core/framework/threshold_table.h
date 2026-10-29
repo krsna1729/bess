@@ -47,6 +47,14 @@
 // must be bounded, must not allocate or block (a lookup and a sum over the
 // module's planes), and must not modify this table (Arm, Disarm and Clear are
 // the module's actions' and tick's, not the read's).
+//
+// Memory (D-198). An empty table allocates nothing (Bytes() is 0); every
+// armed entry is glibc growth of kWatchBytes (its watch and its index node),
+// admitted through the owner's growth hook (set_memory_growth) before Arm
+// adds it -- MemoryRefused then refuses the arm and changes nothing -- and
+// given back when the entry goes (Disarm, a sweep's removal, Clear). The
+// admitted bytes are the per-entry estimate; bytes() reports the vector's
+// capacity, which does not shrink.
 
 #ifndef BESS_FRAMEWORK_THRESHOLD_TABLE_H_
 #define BESS_FRAMEWORK_THRESHOLD_TABLE_H_
@@ -62,6 +70,7 @@
 
 #include "framework/module_tick.h"
 #include "stats/crossing_notifier.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::framework {
 
@@ -81,15 +90,41 @@ class ThresholdTable {
     size_t evaluated = 0;           // reads made
   };
 
-  // Arms `key` at `limit`, replacing an earlier limit for the key.
+  // What an empty table allocates (D-198): nothing; entries are growth.
+  static constexpr size_t Bytes() noexcept { return 0; }
+
+  // The admission each newly armed entry asks first (D-198); nullptr:
+  // unadmitted.
+  void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
+    growth_ = growth;
+  }
+
+  // Arms `key` at `limit`, replacing an earlier limit for the key. A new key
+  // admits kWatchBytes first through the growth hook (its MemoryRefused
+  // propagates and nothing changes).
   void Arm(uint64_t key, uint64_t limit) {
     auto it = index_.find(key);
     if (it != index_.end()) {
       watches_[it->second].limit = limit;
       return;
     }
-    index_.emplace(key, watches_.size());
-    watches_.push_back({key, limit});
+    if (growth_ != nullptr) {
+      growth_->Grow(kWatchBytes, kWatchBytes);
+    }
+    bool pushed = false;
+    try {
+      watches_.push_back({key, limit});
+      pushed = true;
+      index_.emplace(key, watches_.size() - 1);
+    } catch (...) {
+      if (pushed) {
+        watches_.pop_back();
+      }
+      if (growth_ != nullptr) {
+        growth_->Shrink(kWatchBytes, kWatchBytes);
+      }
+      throw;
+    }
   }
 
   // Removes an armed entry; false if there was none.
@@ -113,9 +148,21 @@ class ThresholdTable {
 
   size_t size() const noexcept { return watches_.size(); }
   void Clear() noexcept {
+    if (growth_ != nullptr) {
+      growth_->Shrink(watches_.size() * kWatchBytes,
+                      watches_.size() * kWatchBytes);
+    }
     watches_.clear();
     index_.clear();
     cursor_ = 0;
+  }
+
+  // glibc held now (D-198): the watch vector's capacity plus an estimate of
+  // the index, one node (link + key/position pair) and one bucket pointer
+  // per entry (libstdc++ keeps at least as many buckets as entries).
+  size_t bytes() const noexcept {
+    return watches_.capacity() * sizeof(Watch) +
+           index_.size() * kIndexEntryBytes;
   }
 
   // Evaluates armed entries round-robin from where the last sweep stopped,
@@ -156,8 +203,18 @@ class ThresholdTable {
     uint64_t limit;
   };
 
+  // An index entry, estimated: the node (next link and the key/position
+  // pair) and a bucket pointer.
+  static constexpr size_t kIndexEntryBytes =
+      2 * sizeof(void *) + sizeof(std::pair<const uint64_t, size_t>);
+
+ public:
+  // What one armed entry admits (D-198): its watch and its index entry.
+  static constexpr size_t kWatchBytes = sizeof(Watch) + kIndexEntryBytes;
+
+ private:
   // Swap with the last entry and pop: O(1). The entry that moves into `pos` is
-  // read next, since the cursor stays on `pos`.
+  // read next, since the cursor stays on `pos`. Gives the entry's bytes back.
   void EraseAt(size_t pos) {
     index_.erase(watches_[pos].key);
     if (pos != watches_.size() - 1) {
@@ -165,11 +222,15 @@ class ThresholdTable {
       index_[watches_[pos].key] = pos;
     }
     watches_.pop_back();
+    if (growth_ != nullptr) {
+      growth_->Shrink(kWatchBytes, kWatchBytes);
+    }
   }
 
   std::vector<Watch> watches_;
   std::unordered_map<uint64_t, size_t> index_;  // key -> position in watches_
   size_t cursor_ = 0;
+  utils::MemoryGrowth *growth_ = nullptr;  // D-198: admits each armed entry
 };
 
 // Queues one bess.counter_threshold event per crossing on the tick's context,

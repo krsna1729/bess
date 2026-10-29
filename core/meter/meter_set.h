@@ -17,11 +17,20 @@
 #include "meter/meter.h"
 #include "utils/common.h"
 #include "utils/dpdk_memory.h"
+#include "utils/dpdk_slab.h"
 
 namespace bess::meter {
 
 class MeterSetBuilder;
-class MeterStateSlab;
+
+namespace detail {
+// The growth hook a builder, its clones, and the generations and states they
+// make share (D-198; meter_set.cc). The definition is final over
+// utils::MemoryGrowth, whose destructor is protected; clang-tidy 19 checks
+// this declaration, which cannot say `final`.
+// NOLINTNEXTLINE(cppcoreguidelines-virtual-class-destructor)
+class MeterMemory;
+}  // namespace detail
 
 // One published generation of meters (K5):
 //
@@ -129,22 +138,45 @@ class MeterSet {
   // introspection: identical specifications share one profile).
   size_t profile_count() const noexcept { return profiles_.size(); }
 
+  // Memory (D-198): the state index (DPDK) and the owning references
+  // (glibc), admitted by Build through the builder's growth hook and given
+  // back when the generation is destroyed (after its grace period).
+  // Bytes(capacity) is the most one generation of a MeterSetBuilder
+  // (capacity) admits: the index (capacity + 1 pointers) and, with every id
+  // in use, one owner and one profile reference per meter (GlibcBytes); a
+  // generation of fewer meters admits less.
+  static size_t Bytes(size_t capacity) {
+    return (capacity + 1) * sizeof(MeterState *) + GlibcBytes(capacity);
+  }
+  static size_t GlibcBytes(size_t capacity) {
+    return capacity * (sizeof(std::shared_ptr<MeterState>) +
+                       sizeof(std::shared_ptr<const MeterProfile>));
+  }
+  size_t bytes() const noexcept;
+  ~MeterSet();
+
  private:
   friend class MeterSetBuilder;
 
-  MeterSet(std::vector<MeterState *> states,
-           std::vector<std::shared_ptr<MeterState>> owners,
-           std::vector<std::shared_ptr<const MeterProfile>> profiles)
+  // Packet-path memory: DPDK's heap on the memory node (D-029, D-123).
+  using States =
+      std::vector<MeterState *, bess::utils::DpdkAllocator<MeterState *>>;
+
+  MeterSet(States states, std::vector<std::shared_ptr<MeterState>> owners,
+           std::vector<std::shared_ptr<const MeterProfile>> profiles,
+           std::shared_ptr<detail::MeterMemory> memory)
       : states_(std::move(states)),
         owners_(std::move(owners)),
-        profiles_(std::move(profiles)) {}
+        profiles_(std::move(profiles)),
+        memory_(std::move(memory)) {}
 
   // Slot 0 is the invalid id and always nullptr.
-  std::vector<MeterState *> states_;
+  States states_;
 
   // Ownership only; never read on the packet path.
   std::vector<std::shared_ptr<MeterState>> owners_;
   std::vector<std::shared_ptr<const MeterProfile>> profiles_;
+  std::shared_ptr<detail::MeterMemory> memory_;  // gives bytes() back
 };
 
 // The control-side desired state of a set of meters. Unlike an
@@ -156,11 +188,12 @@ class MeterSet {
 // older generation keeps updating the old state, which stays alive until that
 // generation is reclaimed.
 //
-// States are carved from per-socket slabs of cache-line slots rather than
-// allocated one by one, so a set's states are dense in memory. A slot returns
-// to its slab only when the last generation referencing its state is
-// destroyed, so RCU reclamation -- not the builder -- decides when a slot can
-// be reused. Slabs grow in fixed chunks and never move.
+// States are carved from per-socket slabs of cache-line slots
+// (utils::ObjectSlab) rather than allocated one by one, so a set's states are
+// dense in memory. A slot returns to its slab only when the last generation
+// referencing its state is destroyed, so RCU reclamation -- not the builder --
+// decides when a slot can be reused. Slabs grow in fixed chunks and never
+// move.
 //
 // Writers are the caller's to serialize (one control thread, or the owning
 // module's command path), as with any builder. Generation destruction may run
@@ -205,6 +238,22 @@ class MeterSetBuilder {
   // generations. Only the control plane may call this.
   std::unique_ptr<MeterSetBuilder> Clone() const;
 
+  // Memory (D-198). The constructor allocates the desired entries, one per
+  // id plus the invalid slot 0, on the DPDK heap: Bytes(capacity). What
+  // grows on the control path afterwards is admitted through
+  // set_memory_growth's hook before it is allocated and given back when it
+  // is freed: meter-state slab chunks (DPDK; utils::ObjectSlab), each
+  // state's shared_ptr control block and each profile (glibc), every
+  // generation Build makes (its index and references) and every Clone's
+  // entries. Clones and generations share the hook; it stays attached while
+  // any builder sharing it lives, so the hook must outlive the builder and
+  // its clones (a Sized<MeterSetBuilder> does).
+  static size_t Bytes(size_t capacity);
+  // Held now: this builder's entries, the slabs' chunks and the control
+  // blocks and profiles still live (shared with clones and generations).
+  size_t bytes() const noexcept;
+  void set_memory_growth(bess::utils::MemoryGrowth *growth) noexcept;
+
  private:
   struct CloneTag {};
   MeterSetBuilder(CloneTag, const MeterSetBuilder &other);
@@ -231,7 +280,10 @@ class MeterSetBuilder {
       const std::shared_ptr<const MeterProfile> &profile, MeterSharing sharing,
       int socket);
 
-  std::vector<std::optional<Entry>> entries_;
+  // Desired entries, one per id: N-scaled, so in DPDK memory too (D-029).
+  std::vector<std::optional<Entry>,
+              bess::utils::DpdkAllocator<std::optional<Entry>>>
+      entries_;
   size_t size_ = 0;
 
   // Profiles are interned by specification so identical meters share one
@@ -241,7 +293,10 @@ class MeterSetBuilder {
 
   // One slab per requested socket. Shared with every state allocated from it,
   // so a slab outlives the builder while any generation still holds a state.
-  std::map<int, std::shared_ptr<MeterStateSlab>> slabs_;
+  std::map<int, std::shared_ptr<bess::utils::ObjectSlab<MeterState>>> slabs_;
+
+  // Shared with clones, generations, slabs and states (their allocator).
+  std::shared_ptr<detail::MeterMemory> memory_;
 };
 
 }  // namespace bess::meter

@@ -154,6 +154,17 @@ class ContinuationTable {
   ContinuationTable(const ContinuationTable &) = delete;
   ContinuationTable &operator=(const ContinuationTable &) = delete;
 
+  // What Create(capacity) allocates (D-198), for a valid capacity: the slots
+  // and the table object, all from glibc (operator new). Equals bytes().
+  // Create returns std::expected, so an owner admits these with a lease
+  // rather than MemoryScope::Create.
+  static size_t Bytes(size_t capacity) noexcept {
+    return (capacity + 1) * sizeof(Slot) + sizeof(ContinuationTable);
+  }
+  static size_t GlibcBytes(size_t capacity) noexcept {
+    return Bytes(capacity);
+  }
+
   // -- the owner's side (one thread at a time) ------------------------------------
 
   // Starts a continuation that resolves to `target`. Returns kNoContinuation,
@@ -233,9 +244,9 @@ class ContinuationTable {
   bool full() const noexcept { return free_head_ == kNil; }
   // Slots retired for good because their generation was exhausted.
   size_t quarantined() const noexcept { return quarantined_; }
-  // Bytes of table memory; the per-continuation cost is memory_bytes() /
+  // Bytes of table memory (glibc); the per-continuation cost is bytes() /
   // capacity().
-  size_t memory_bytes() const noexcept {
+  size_t bytes() const noexcept {
     return (capacity_ + size_t{1}) * sizeof(Slot) + sizeof(*this);
   }
   static constexpr size_t slot_bytes() noexcept { return sizeof(Slot); }

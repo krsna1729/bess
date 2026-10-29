@@ -7,10 +7,11 @@
 
 #include <rte_hash_crc.h>
 
-
 #include <atomic>
+#include <cerrno>
 #include <new>
 
+#include "classifier/rte_hash_exact.h"
 #include "dpdk.h"
 
 namespace bess::classifier {
@@ -35,7 +36,9 @@ ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
   params.hash_func_init_val = 0;
   params.socket_id = socket;
   params.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF;
-  rte_hash *table = rte_hash_create(&params);
+  // On the memory policy: retried on the normal-page fallback heap when the
+  // socket is out of memory (MemoryRefused if that is not allowed).
+  rte_hash *table = detail::CreateRteHash(params);
   if (table == nullptr) {
     return std::unexpected("rte_hash_create failed (capacity " +
                            std::to_string(capacity) + ")");
@@ -46,17 +49,24 @@ ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
   rte_hash_rcu_config rcu{};
   rcu.v = domain.dpdk_qsbr();
   rcu.mode = RTE_HASH_QSBR_MODE_DQ;
+  // The defer queue comes from DPDK's native heaps (SOCKET_ID_ANY), never
+  // the fallback heap: out of them is a memory refusal (D-198), not a
+  // failed table its owner would report as full. rte_errno stays 0 when its
+  // config's rte_zmalloc fails, ENOMEM when its ring's memzone does.
+  rte_errno = 0;
   if (rte_hash_rcu_qsbr_add(table, &rcu) != 0) {
+    const int error = rte_errno;
     rte_hash_free(table);
+    if (error == 0 || error == ENOMEM) {
+      utils::RefuseDpdkMemory(Bytes(key_len, capacity, domain));
+    }
     return std::unexpected("rte_hash_rcu_qsbr_add failed");
   }
-  // Nothrow: a refusal here must free the hash rather than leak it (the
-  // message fits the string's inline buffer, so returning it allocates
-  // nothing).
+  // Nothrow: a refusal here must free the hash rather than leak it.
   auto *wrapper = new (std::nothrow) ConcurrentExactTable(table, key_len, params.entries, writers);
   if (wrapper == nullptr) {
     rte_hash_free(table);
-    return std::unexpected("out of memory");
+    throw std::bad_alloc();
   }
   return std::unique_ptr<ConcurrentExactTable>(wrapper);
 }
@@ -68,6 +78,16 @@ ConcurrentExactTable::~ConcurrentExactTable() {
   // that maps it, itself retired through the same QSBR variable after every
   // delete on the table was enqueued.
   rte_hash_free(table_);
+}
+
+size_t ConcurrentExactTable::Bytes(uint32_t key_len, uint32_t capacity,
+                                   const rcu::RcuDomain & /*domain*/,
+                                   int /*socket*/, Writers /*writers*/) {
+  return detail::RteHashBytes(std::max<uint32_t>(capacity, 8), key_len);
+}
+
+size_t ConcurrentExactTable::bytes() const noexcept {
+  return detail::RteHashBytes(capacity_, key_len_);
 }
 
 ConcurrentExactTable::UpsertResult ConcurrentExactTable::Upsert(

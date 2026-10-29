@@ -10,6 +10,7 @@
 
 #include "conntrack/conntrack.h"
 #include "conntrack/shared_conntrack.h"
+#include "framework/memory_scope.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
 #include "stats/event_throttle.h"
@@ -55,7 +56,10 @@ class ConnTrack final : public Module {
   template <typename T>
   void Track(T &table, Context *ctx, bess::PacketBatch *batch);
 
-  std::unique_ptr<Ct> MakeTable() const;
+  // A table of capacity_, admitted as "flows" (D-198) before it is made
+  // (throws utils::MemoryRefused when refused); empty when the library
+  // cannot make it.
+  bess::framework::Sized<Ct> MakeTable() const;
 
   // status_attr's offset when something reads it (D-182), else an invalid
   // offset: the packet path writes nothing.
@@ -68,9 +72,9 @@ class ConnTrack final : public Module {
   bess::conntrack::TimeoutPolicy policy_;
   // OWNED: tables_[0]. PER_WORKER: one per worker that runs the module,
   // allocated before resume (never on the packet path).
-  std::array<std::unique_ptr<Ct>, Worker::kMaxWorkers> tables_;
+  std::array<bess::framework::Sized<Ct>, Worker::kMaxWorkers> tables_;
   // SHARED, and PER_WORKER with fallback_shared.
-  std::unique_ptr<SharedCt> shared_;
+  bess::framework::Sized<SharedCt> shared_;
   bool fallback_shared_ = false;
   // PER_WORKER: why the inputs are not symmetric (fail closed, or shared_
   // with fallback_shared), or nullopt.

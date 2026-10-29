@@ -55,10 +55,12 @@ Ipv4Prefix P(uint32_t addr, uint8_t len) {
 }
 
 // Tests and benchmarks bring the EAL up with a 512 MB no-hugepage heap; 16
-// real domains (1 GB of tbl24) need more. Ask for 2600 MB unless the caller
-// chose a size (BESS_DPDK_NOHUGE_MB). Untouched anonymous pages cost no RAM.
+// real domains (1 GB of tbl24) need more. Ask for a 2600 MB heap (the memory
+// limit less the reserve, D-198) unless the caller chose BESSD_MEM_* itself.
+// Untouched anonymous pages cost no RAM.
 [[maybe_unused]] const int kHeapRequest =
-    setenv("BESS_DPDK_NOHUGE_MB", "2600", 0);
+    setenv("BESSD_MEM_LIMIT_MB", "2600", 0) |
+    setenv("BESSD_MEM_RESERVE_MB", "0", 0);
 
 constexpr uint32_t kMaxSweep = 64;
 constexpr size_t kBatch = 32;
@@ -94,7 +96,7 @@ Router &SweepRouter() {
     AddNextHops(*r, 128);
     (void)r->SetRoute(P(Ip(10, 0, 0, 0), 8), NextHopId(1));
     // 16 real domains by default (1 GB of tbl24). BESS_DOMAIN_BENCH_MAX=64
-    // asks for 64 (4 GB: also set BESS_DPDK_NOHUGE_MB above that).
+    // asks for 64 (4 GB: also set BESSD_MEM_LIMIT_MB above that).
     const char *max_env = std::getenv("BESS_DOMAIN_BENCH_MAX");
     const uint32_t max_real =
         max_env != nullptr ? static_cast<uint32_t>(std::atoi(max_env)) : 16;

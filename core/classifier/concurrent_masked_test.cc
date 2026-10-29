@@ -18,7 +18,9 @@
 #include <vector>
 
 #include "classifier/range_backend.h"
+#include "framework/memory_scope.h"
 #include "runtime/runtime_state.h"
+#include "utils/dpdk_memory.h"
 namespace bess::classifier {
 namespace {
 
@@ -1147,6 +1149,109 @@ TEST(ConcurrentMaskedTableRangeTest, RandomRangedRulesMatchTheScalarOracle) {
     EXPECT_EQ(0u, t->retiring_chains());
     EXPECT_LE(t->ids_in_use(), base_ids + t->retiring_ids());
   }
+}
+
+// -- memory (D-198) -----------------------------------------------------------
+
+TEST(ConcurrentMaskedTableMemoryTest, BytesMatchesCreate) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  for (const size_t max_tuples : {size_t{1}, size_t{8}, size_t{64}}) {
+    auto t = ConcurrentMaskedTable::Create(kKeyLen, max_tuples, domain);
+    ASSERT_TRUE(t.has_value()) << t.error();
+    EXPECT_EQ(bess::framework::MemoryCost<ConcurrentMaskedTable>::Bytes(
+                  kKeyLen, max_tuples, domain),
+              (*t)->bytes());
+  }
+}
+
+// Admits every growth, records it, and refuses once `allow` growths passed.
+struct RecordingGrowth final : bess::utils::MemoryGrowth {
+  std::vector<size_t> grown;
+  size_t net = 0, glibc_net = 0;
+  size_t allow = SIZE_MAX;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    if (grown.size() >= allow) {
+      throw bess::utils::MemoryRefused(
+          bess::utils::MemoryRefused::Reason::kNormalLimit, bytes, "refused");
+    }
+    grown.push_back(bytes);
+    net += bytes;
+    glibc_net += glibc_bytes;
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    net -= bytes;
+    glibc_net -= glibc_bytes;
+  }
+};
+
+TEST(ConcurrentMaskedTableMemoryTest, GrowthAdmitsTuplesChunksAndChains) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  auto t = MakeTable();
+  RecordingGrowth growth;
+  t->set_memory_growth(&growth);
+  const size_t initial = t->bytes();
+
+  // A new mask: its tuple table first, then the first record chunk.
+  ASSERT_EQ(R::kInserted, t->Upsert(C(kLow4), C(B(1)), 1, 1));
+  ASSERT_EQ(2u, growth.grown.size());
+  EXPECT_EQ(ConcurrentExactTable::Bytes(
+                kKeyLen, ConcurrentExactTable::CapacityFor(1), domain),
+            growth.grown[0]);
+  EXPECT_EQ(RecordArena::ChunkBytes(sizeof(ConcurrentMaskedTable::Rule)),
+            growth.grown[1]);
+  EXPECT_EQ(initial + growth.net, t->bytes());
+  EXPECT_EQ(0u, growth.glibc_net);
+
+  // A ranged rule under another key: its chain is glibc.
+  const ConcurrentMaskedTable::KeyRange range{
+      .offset = 4, .width = 2, .low = 10, .high = 20};
+  ASSERT_EQ(R::kInserted,
+            t->Upsert(C(kLow4), C(B(2)), 1, 2, 0,
+                      ConcurrentMaskedTable::Ranges(&range, 1)));
+  EXPECT_GT(growth.glibc_net, 0u);
+  EXPECT_EQ(initial + growth.net, t->bytes());
+
+  // Erasing every rule drops the tuple: its table is given back once the
+  // tuple list holding it is reclaimed (no reader is online here).
+  ASSERT_TRUE(t->Erase(C(kLow4), C(B(1))));
+  ASSERT_TRUE(t->Erase(C(kLow4), C(B(2)),
+                       ConcurrentMaskedTable::Ranges(&range, 1)));
+  domain.Synchronize();
+  domain.ReclaimReady();
+  t->Recycle(0);  // frees the retired chain
+  EXPECT_EQ(0u, t->tuple_count());
+  EXPECT_EQ(0u, growth.glibc_net);
+  EXPECT_EQ(RecordArena::ChunkBytes(sizeof(ConcurrentMaskedTable::Rule)),
+            growth.net);  // record chunks stay with the table
+  EXPECT_EQ(initial + growth.net, t->bytes());
+}
+
+TEST(ConcurrentMaskedTableMemoryTest, RefusedGrowthLeavesTheTableUnchanged) {
+  auto t = MakeTable();
+  RecordingGrowth growth;
+  t->set_memory_growth(&growth);
+  const size_t initial = t->bytes();
+
+  // The tuple table refused.
+  growth.allow = 0;
+  EXPECT_THROW(t->Upsert(C(kLow4), C(B(1)), 1, 1), bess::utils::MemoryRefused);
+  // The tuple table admitted, the record chunk refused: the table is given
+  // back with nothing published.
+  growth.allow = 1;
+  EXPECT_THROW(t->Upsert(C(kLow4), C(B(1)), 1, 1), bess::utils::MemoryRefused);
+  EXPECT_EQ(1u, growth.grown.size());
+  EXPECT_EQ(0u, growth.net);
+  EXPECT_EQ(initial, t->bytes());
+  EXPECT_EQ(0u, t->size());
+  EXPECT_EQ(0u, t->tuple_count());
+  EXPECT_EQ(0u, t->ids_in_use());
+  EXPECT_EQ(-1, Classify(*t, 1));
+
+  // Admitted, it works as before.
+  growth.allow = SIZE_MAX;
+  ASSERT_EQ(R::kInserted, t->Upsert(C(kLow4), C(B(1)), 1, 1));
+  EXPECT_EQ(1, Classify(*t, 1));
+  EXPECT_EQ(initial + growth.net, t->bytes());
 }
 
 }  // namespace

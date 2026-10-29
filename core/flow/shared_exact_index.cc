@@ -23,6 +23,12 @@ std::unique_ptr<SharedExactIndex> SharedExactIndex::Create(uint32_t key_len, siz
       new (std::nothrow) SharedExactIndex(std::move(*table), key_len));
 }
 
+size_t SharedExactIndex::Bytes(uint32_t key_len, size_t keys, const rcu::RcuDomain &domain,
+                               int socket) {
+  return ConcurrentExactTable::Bytes(key_len, ConcurrentExactTable::CapacityFor(keys), domain,
+                                     socket, ConcurrentExactTable::Writers::kSingle);
+}
+
 SharedExactIndex::SharedExactIndex(std::unique_ptr<ConcurrentExactTable> table,
                                    uint32_t key_len) noexcept
     : table_(std::move(table)),
@@ -52,5 +58,7 @@ bool SharedExactIndex::Erase(const std::byte *key) {
 void SharedExactIndex::ReclaimAll() { table_->ReclaimAll(); }
 
 size_t SharedExactIndex::size() const noexcept { return table_->size(); }
+
+size_t SharedExactIndex::bytes() const noexcept { return table_->bytes(); }
 
 }  // namespace bess::flow

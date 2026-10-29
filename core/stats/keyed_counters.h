@@ -6,7 +6,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 
 #include "arch/cpu.h"
 #include "dataplane/worker_id.h"
@@ -70,20 +69,20 @@ class KeyedCounters {
   // every plane empty and the first `ForWorker` would hand out a pointer into
   // nothing, which is why the module that owns the capacity refuses a zero one
   // in its own Init rather than passing it here.
-  KeyedCounters(size_t keys, size_t cells_per_key, size_t workers)
-      : keys_(keys),
-        cells_per_key_(cells_per_key),
-        workers_(workers),
-        words_per_plane_(RoundUpToLine(keys_ * cells_per_key_)),
-        planes_((words_per_plane_ / kWordsPerLine) * workers_) {
-    promise(keys >= 1);
-    promise(cells_per_key >= 1);
-    promise(workers >= 1);
-    promise(workers <= dataplane::kMaxWorkers);
-  }
+  KeyedCounters(size_t keys, size_t cells_per_key, size_t workers);
+  ~KeyedCounters();
 
   KeyedCounters(const KeyedCounters &) = delete;
   KeyedCounters &operator=(const KeyedCounters &) = delete;
+
+  // What the constructor allocates in DPDK memory (D-198): `workers` planes
+  // of keys x cells_per_key cells, each padded to whole cache lines. Equals
+  // bytes(); the same preconditions as the constructor.
+  static size_t Bytes(size_t keys, size_t cells_per_key,
+                      size_t workers) noexcept {
+    return RoundUpToLine(keys * cells_per_key) / kWordsPerLine * workers *
+           sizeof(Line);
+  }
 
   // One worker's plane. Cheap to copy, valid as long as the KeyedCounters is,
   // and must only be used by that worker.
@@ -138,7 +137,7 @@ class KeyedCounters {
   size_t workers() const noexcept { return workers_; }
 
   // The whole allocation: workers x planes, each padded to whole cache lines.
-  size_t bytes() const noexcept { return planes_.size() * sizeof(Line); }
+  size_t bytes() const noexcept { return line_count_ * sizeof(Line); }
 
   // The byte offset of one cell inside the allocation, relative to its start.
   // Each worker's plane begins on a cache line of its own, so no two workers
@@ -178,7 +177,10 @@ class KeyedCounters {
   const size_t cells_per_key_;
   const size_t workers_;
   const size_t words_per_plane_;  // keys * cells_per_key, rounded to lines
-  std::vector<Line> planes_;      // workers planes, PlaneLines() lines each
+  const size_t line_count_;
+  // Packet-path memory comes from DPDK's heap on the memory node (D-029,
+  // D-123): hugepage-backed when bessd has hugepages.
+  Line *const planes_;  // owned; control-path allocation/destruction is out of line
 };
 
 }  // namespace bess::stats

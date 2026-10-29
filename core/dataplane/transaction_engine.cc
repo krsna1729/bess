@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <new>
 #include <thread>
 #include <utility>
 
@@ -424,29 +425,48 @@ size_t TransactionEngine::ReclaimRetiredLocked() {
     while (cascade.next < cascade.stages.size() &&
            domain_.IsComplete(cascade.token)) {
       std::vector<Step> &stage = cascade.stages[cascade.next];
+      const size_t left = stage.size() - cascade.ran;
       // Each step retires at most one object. Run a stage only if that keeps
       // the RCU queue within budget, so reclamation never pushes it to the
       // point where RetireErased() waits for readers under this lock; a
       // stage that does not fit waits for readers to drain the queue.
-      if (domain_.pending_retired() + stage.size() > retire_budget) {
+      if (domain_.pending_retired() + left > retire_budget) {
         break;
       }
-      domain_.ReserveRetirements(stage.size());
+      domain_.ReserveRetirements(left);
       Retirer retirer;
-      retirer.retire_.reserve(stage.size());
-      for (Step &step : stage) {
+      retirer.retire_.reserve(left);
+      bool refused = false;
+      for (; cascade.ran < stage.size(); cascade.ran++) {
+        Step &step = stage[cascade.ran];
         Registration &owner = RegistrationOf(step.owner);
         retirer.owner_ = step.owner;
         retirer.outstanding_ = &owner.outstanding;
-        step.fn(retirer);
+        try {
+          step.fn(retirer);
+        } catch (const std::bad_alloc &e) {
+          // Memory refused (a stage's edit is DPDK memory, D-198): the step
+          // changed nothing and runs again after another grace period. The
+          // steps before it ran and must not run again (a slot emptied twice).
+          LOG(WARNING) << "removal step of '" << step.owner->name()
+                       << "' refused, retried later: " << e.what();
+          refused = true;
+          break;
+        }
         deferred_objects_--;
         owner.pending_removals--;
       }
-      cascade.next++;
-      // The next stage waits a grace period from here, and what this stage
-      // emptied is freed after it.
+      if (!refused) {
+        cascade.next++;
+        cascade.ran = 0;
+      }
+      // The next stage (or the retry) waits a grace period from here, and
+      // what this stage emptied is freed after it.
       cascade.token = domain_.StartGracePeriod();
       retirer.Finish(domain_, cascade.token);
+      if (refused) {
+        break;
+      }
     }
     if (cascade.next < cascade.stages.size()) {
       if (kept != c) {

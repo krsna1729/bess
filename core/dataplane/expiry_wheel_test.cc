@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include "framework/memory_scope.h"
 #include "testing/allocation_faults.h"
 
 namespace bess::dataplane {
@@ -305,7 +306,21 @@ TEST(ExpiryWheel, NodeSizes) {
   EXPECT_EQ(20u, (ExpiryWheel<uint32_t, uint32_t, 6, 5>::node_bytes()));
   auto wheel = Make<Wheel>(1000, 0);
   // Nodes plus the 2 + levels * slots list heads.
-  EXPECT_EQ(sizeof(Wheel) + (1000 + 6 * 64 + 2) * 32, wheel->memory_bytes());
+  EXPECT_EQ(sizeof(Wheel) + (1000 + 6 * 64 + 2) * 32, wheel->bytes());
+}
+
+// D-198: what Create allocates is known before it runs, all of it glibc.
+TEST(ExpiryWheel, MemoryCostIsWhatCreateAllocates) {
+  using Small = ExpiryWheel<uint32_t, uint32_t, 6, 5>;
+  for (const size_t capacity : {size_t{1}, size_t{1000}, size_t{65536}}) {
+    auto wheel = Make<Wheel>(capacity, 7, 3);
+    EXPECT_EQ(framework::MemoryCost<Wheel>::Bytes(capacity, uint64_t{7}, 3u),
+              wheel->bytes());
+    EXPECT_EQ(framework::MemoryCost<Wheel>::GlibcBytes(capacity, uint64_t{7}, 3u),
+              wheel->bytes());
+    auto small = Make<Small>(capacity);
+    EXPECT_EQ(framework::MemoryCost<Small>::Bytes(capacity), small->bytes());
+  }
 }
 
 // -- the callback -----------------------------------------------------------------

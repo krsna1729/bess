@@ -6,6 +6,7 @@
 #include <string>
 #include <unistd.h>
 
+#include <rte_eal.h>
 #include <rte_launch.h>
 
 #include "utils/logging.h"
@@ -25,6 +26,7 @@
 #include "packet_pool.h"
 #include "runtime/startup.h"
 #include "port.h"
+#include "utils/dpdk_memory.h"
 #include "utils/format.h"
 #include "version.h"
 #include "worker.h"
@@ -128,6 +130,31 @@ int main(int argc, char *argv[]) {
   if (!bess::framework::LoadPlugins(FLAGS_modules)) {
     PLOG(WARNING) << "LoadPlugins() failed to load from directory: "
                   << FLAGS_modules;
+  }
+
+  // Dataplane memory policy (D-198): the --mem_* flags resolved once against
+  // this host -- the backing, the hugepage cap, the fallback, the limit and
+  // the reserve -- logged in one line and set before the EAL starts (which
+  // maps it) and before any pool or table exists. --mem_backing=hugepages
+  // without usable hugepages, or an inconsistent combination, stops here.
+  {
+    bess::startup::MemorySettings settings;
+    // Validated with the flag (opts.cc); checked again rather than assumed.
+    const auto backing = bess::startup::ParseMemoryBacking(FLAGS_mem_backing);
+    if (!backing) {
+      LOG(ERROR) << "Invalid --mem_backing: '" << FLAGS_mem_backing << "'";
+      return 1;
+    }
+    settings.backing = *backing;
+    settings.hugepage_mb = FLAGS_mem_hugepage_mb;
+    settings.fallback = FLAGS_mem_fallback;
+    settings.limit_mb = FLAGS_mem_limit_mb;
+    settings.reserve_mb = FLAGS_mem_reserve_mb;
+    std::string error;
+    if (!bess::startup::ApplyMemorySettings(settings, &error)) {
+      LOG(ERROR) << error;
+      return 1;
+    }
   }
 
   bess::PacketPool::CreateDefaultPools(FLAGS_buffers, FLAGS_packet_data_room);

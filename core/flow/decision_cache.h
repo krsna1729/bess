@@ -133,6 +133,16 @@ class DecisionCache {
     return cache;
   }
 
+  // What Create allocates (D-198), all of it glibc: the flow table and the
+  // cache itself, as bytes() counts them.
+  static size_t Bytes(size_t capacity, const DecisionGeneration &) noexcept {
+    return Table::Bytes(capacity) + sizeof(DecisionCache);
+  }
+  static size_t GlibcBytes(size_t capacity,
+                           const DecisionGeneration &generation) noexcept {
+    return Bytes(capacity, generation);
+  }
+
   // The decision for `key`, or why there is none. One flow lookup and one
   // compare against the generation loaded here.
   DecisionLookup Lookup(const Key &key, DecisionId *out) const noexcept {
@@ -199,9 +209,7 @@ class DecisionCache {
   uint64_t generation() const noexcept { return generation_.Current(); }
   size_t size() const noexcept { return table_->size(); }
   size_t capacity() const noexcept { return table_->capacity(); }
-  size_t memory_bytes() const noexcept {
-    return table_->memory_bytes() + sizeof(*this);
-  }
+  size_t bytes() const noexcept { return table_->bytes() + sizeof(*this); }
 
  private:
   DecisionCache(std::unique_ptr<Table> table,

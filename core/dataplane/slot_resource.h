@@ -104,8 +104,10 @@ class SlotResource : public Resource {
       return std::unexpected("wrong value type");
     }
     const T *previous = table_.Current(id);
+    // Make may add a slab chunk, admitted first through the table's growth
+    // hook (D-198): its MemoryRefused refuses the transaction.
     Reservation reservation{
-        std::make_unique<PublishOp>(table_, id, std::make_unique<const T>(*value)),
+        std::make_unique<PublishOp>(table_, id, table_.Make(*value)),
         {},
         // The object it replaces, if any, is retired.
         Footprint{.retires = previous != nullptr ? 1u : 0u}};
@@ -122,7 +124,8 @@ class SlotResource : public Resource {
  private:
   class PublishOp final : public StagedOp {
    public:
-    PublishOp(SlotTable<Id, T> &table, Id id, std::unique_ptr<const T> object)
+    PublishOp(SlotTable<Id, T> &table, Id id,
+              typename SlotTable<Id, T>::Owned object)
         : table_(table), id_(id), object_(std::move(object)) {}
     void Publish(Retirer &retirer) noexcept override {
       retirer.Retire(table_.Publish(id_, std::move(object_)));
@@ -131,7 +134,7 @@ class SlotResource : public Resource {
    private:
     SlotTable<Id, T> &table_;
     Id id_;
-    std::unique_ptr<const T> object_;
+    typename SlotTable<Id, T>::Owned object_;
   };
 
   class UnpublishOp final : public StagedOp {

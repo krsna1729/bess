@@ -30,6 +30,15 @@ RecordArena::RecordArena(size_t record_size, rcu::RcuDomain &domain)
 
 RecordArena::~RecordArena() = default;
 
+size_t RecordArena::Bytes(size_t /*record_size*/,
+                          const rcu::RcuDomain & /*domain*/) {
+  return kMaxChunks * sizeof(std::atomic<const std::byte *>);
+}
+
+size_t RecordArena::ChunkBytes(size_t record_size) noexcept {
+  return AlignUp(record_size) << kChunkBits;
+}
+
 RecordArena::Id RecordArena::Allocate() {
   Reclaim();
   if (free_head_ != 0) {
@@ -44,8 +53,21 @@ RecordArena::Id RecordArena::Allocate() {
     return 0;
   }
   if (chunk == chunks_.size()) {
-    chunks_.push_back(Chunk(static_cast<std::byte *>(
-        bess::utils::DpdkAllocate(stride_ << kChunkBits, kAlignment))));
+    // Admitted before it is allocated; given back if the allocation fails.
+    // Chunks are never freed before the arena, so nothing shrinks later.
+    const size_t bytes = stride_ << kChunkBits;
+    if (growth_ != nullptr) {
+      growth_->Grow(bytes);
+    }
+    try {
+      chunks_.push_back(Chunk(static_cast<std::byte *>(
+          bess::utils::DpdkAllocate(bytes, kAlignment))));
+    } catch (...) {
+      if (growth_ != nullptr) {
+        growth_->Shrink(bytes);
+      }
+      throw;
+    }
     // Published before any id in it is: a reader reaches a chunk only through
     // an id a table loaded, and the table releases its reference later.
     published_[chunk].store(chunks_.back().get(), std::memory_order_release);

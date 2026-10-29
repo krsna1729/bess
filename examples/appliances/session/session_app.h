@@ -35,6 +35,7 @@
 #include "dataplane/slot_resource.h"
 #include "dataplane/slot_table.h"
 #include "dataplane/strong_id.h"
+#include "framework/memory_scope.h"
 #include "meter/meter.h"
 #include "rcu/rcu_domain.h"
 #include "route/router.h"
@@ -91,19 +92,31 @@ class SessionApp {
   static constexpr size_t kMaxQos = 16, kMaxActions = 16, kMaxRules = 64, kMaxNextHops = 16;
 
   // Resources "<name>/qos", "<name>/actions", "<name>/rules", and the
-  // router's "<name>/next_hops" and "<name>/routes".
-  static std::expected<std::unique_ptr<SessionApp>, std::string> Create(const std::string &name,
-                                                                        bess::rcu::RcuDomain &rcu) {
-    auto router = bess::route::Router::Create(
-        name,
-        bess::route::Router::Config{
-            .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 4},
-            .ipv6 = std::nullopt},
-        kMaxNextHops, rcu);
+  // router's "<name>/next_hops" and "<name>/routes". Every table is admitted
+  // through `memory` (D-198: "router", "qos", "actions", "rules") before any
+  // is allocated: a refusal throws utils::MemoryRefused and builds nothing.
+  // Slab growth is admitted through the same leases; all of it is released
+  // when the app is destroyed.
+  static std::expected<std::unique_ptr<SessionApp>, std::string> Create(
+      const std::string &name, bess::rcu::RcuDomain &rcu, bess::framework::MemoryScope &memory) {
+    const bess::route::Router::Config config{
+        .ipv4 = bess::route::LpmRouteTable::Config{.max_routes = 64, .tbl8_groups = 4},
+        .ipv6 = std::nullopt};
+    Leases leases{
+        .qos = memory.LeaseFor<bess::dataplane::SlotTable<QosId, QosPolicy>>("qos", kMaxQos),
+        .actions = memory.LeaseFor<bess::dataplane::SlotTable<ActionId, SessionAction>>(
+            "actions", kMaxActions),
+        .rules =
+            memory.LeaseFor<bess::dataplane::SlotTable<RuleId, PdrLikeRule>>("rules", kMaxRules)};
+    auto router_lease =
+        memory.LeaseFor<bess::route::Router>("router", name, config, kMaxNextHops, rcu);
+    auto router = bess::route::Router::Create(name, config, kMaxNextHops, rcu);
     if (!router) {
       return std::unexpected(std::string("router: ") + bess::route::RouteErrorName(router.error()));
     }
-    return std::unique_ptr<SessionApp>(new SessionApp(name, std::move(*router)));
+    return std::unique_ptr<SessionApp>(new SessionApp(
+        name, bess::framework::MemoryScope::Adopt(std::move(router_lease), std::move(*router)),
+        std::move(leases)));
   }
 
   // An enrolled application leaves its engine first: its resources before
@@ -249,8 +262,18 @@ class SessionApp {
   static constexpr size_t kInner = 14;  // the inner IPv4 packet's offset in a frame
 
  private:
-  SessionApp(const std::string &name, std::unique_ptr<bess::route::Router> router)
-      : qos_(kMaxQos),
+  // The slot tables' admissions, made before the app (and its by-value
+  // tables) is constructed.
+  struct Leases {
+    bess::framework::MemoryLease qos, actions, rules;
+  };
+
+  SessionApp(const std::string &name, bess::framework::Sized<bess::route::Router> router,
+             Leases leases)
+      : qos_lease_(std::move(leases.qos)),
+        actions_lease_(std::move(leases.actions)),
+        rules_lease_(std::move(leases.rules)),
+        qos_(kMaxQos),
         actions_(kMaxActions),
         rules_(kMaxRules),
         qos_resource_(name + "/qos", qos_),
@@ -269,7 +292,14 @@ class SessionApp {
                   {actions, bess::dataplane::EncodeKey(r.action)}};
             },
             {name + "/actions"}),
-        router_(std::move(router)) {}
+        router_(std::move(router)) {
+    qos_lease_.Track(qos_);
+    qos_.set_memory_growth(qos_lease_.growth());
+    actions_lease_.Track(actions_);
+    actions_.set_memory_growth(actions_lease_.growth());
+    rules_lease_.Track(rules_);
+    rules_.set_memory_growth(rules_lease_.growth());
+  }
 
   template <typename Id, typename T>
   std::expected<void, std::string> Put(bess::dataplane::SlotTable<Id, T> &table, Id id, T value) {
@@ -279,17 +309,20 @@ class SessionApp {
     if (!table.CanPublish(id)) {
       return std::unexpected("invalid id");
     }
-    table.Publish(id, std::make_unique<const T>(std::move(value)));
+    table.Publish(id, table.Make(std::move(value)));
     return {};
   }
 
+  // Before the tables they admit: their slabs Shrink through the hooks when
+  // destroyed (D-198).
+  bess::framework::MemoryLease qos_lease_, actions_lease_, rules_lease_;
   bess::dataplane::SlotTable<QosId, QosPolicy> qos_;
   bess::dataplane::SlotTable<ActionId, SessionAction> actions_;
   bess::dataplane::SlotTable<RuleId, PdrLikeRule> rules_;
   bess::dataplane::SlotResource<QosId, QosPolicy> qos_resource_;
   bess::dataplane::SlotResource<ActionId, SessionAction> action_resource_;
   bess::dataplane::SlotResource<RuleId, PdrLikeRule> rule_resource_;
-  std::unique_ptr<bess::route::Router> router_;
+  bess::framework::Sized<bess::route::Router> router_;
   bess::dataplane::ResourceRegistry *registry_ = nullptr;
 };
 

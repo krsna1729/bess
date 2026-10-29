@@ -170,7 +170,7 @@ std::expected<bess::classifier::FirewallRule, std::string> ParseRule(
 }  // namespace
 
 std::expected<std::unique_ptr<const Firewall::Published>, std::string>
-Firewall::BuildPublished(const RuleView &rules) {
+Firewall::BuildPublished(const RuleView &rules) const {
   std::vector<Ranked> ranked;
   ranked.reserve(rules.size());
   for (const auto &r : rules) {
@@ -181,19 +181,30 @@ Firewall::BuildPublished(const RuleView &rules) {
     return a.priority != b.priority ? a.priority > b.priority : a.id < b.id;
   });
   std::vector<bess::classifier::FirewallRule> parsed;
-  std::vector<uint32_t> action_ids;
   parsed.reserve(ranked.size());
-  action_ids.reserve(ranked.size());
   for (const Ranked &r : ranked) {
     parsed.push_back(*r.rule);
+  }
+  // D-198: the table and the action ids it is published with, all glibc,
+  // admitted before either is built; a refusal throws MemoryRefused and
+  // refuses the Init or transaction with nothing built. The old table's
+  // admission goes with it into the retirer at publish.
+  const size_t bytes = bess::framework::MemoryCost<
+                           bess::classifier::FirewallTable>::Bytes(parsed) +
+                       ranked.size() * sizeof(uint32_t);
+  bess::framework::MemoryLease lease =
+      init_context().memory().Lease("rules", bytes, bytes);
+  std::vector<uint32_t> action_ids;
+  action_ids.reserve(ranked.size());
+  for (const Ranked &r : ranked) {
     action_ids.push_back(r.rule->action_id);
   }
   auto table = bess::classifier::FirewallTable::Build(std::move(parsed));
   if (!table) {
     return std::unexpected(table.error());
   }
-  return std::make_unique<const Published>(
-      Published{std::move(*table), std::move(action_ids)});
+  return std::make_unique<const Published>(Published{
+      std::move(lease), std::move(*table), std::move(action_ids)});
 }
 
 int Firewall::OnEvent(bess::Event event) {
@@ -243,7 +254,7 @@ CommandResponse Firewall::Init(const bess::pb::FirewallArg &arg) {
                   KeyedRule{0, arg.rules(i), *parsed});
   }
   auto resource = std::make_unique<RulesResource>(
-      name() + "/rules", published_, &BuildPublished, "a firewall rule");
+      name() + "/rules", published_, Builder{this}, "a firewall rule");
   if (auto initialized = resource->Initialize(std::move(rules)); !initialized) {
     return CommandFailure(EINVAL, "%s", initialized.error().c_str());
   }

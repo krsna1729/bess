@@ -9,7 +9,9 @@
 
 #include <gtest/gtest.h>
 
+#include "framework/memory_scope.h"
 #include "random.h"
+#include "utils/dpdk_memory.h"
 
 struct CopyConstructorOnly {
   // FIXME: CuckooMap should work without this default constructor
@@ -371,6 +373,93 @@ TEST(CuckooMapTest, PrefetchBatchIsOnlyAHint) {
   for (uint32_t i = 200001; i <= 300000; i++) large.Insert(i, i);
   EXPECT_EQ(300000u, large.Find(300000)->second);
   EXPECT_EQ(nullptr, large.Find(999999));
+}
+
+// -- memory (D-198) -----------------------------------------------------------
+
+using Map = CuckooMap<uint32_t, uint64_t>;
+
+TEST(CuckooMapMemoryTest, BytesMatchesConstruction) {
+  using bess::framework::MemoryCost;
+  Map defaulted;
+  EXPECT_EQ(MemoryCost<Map>::Bytes(), defaulted.bytes());
+  EXPECT_EQ(MemoryCost<Map>::Bytes(), MemoryCost<Map>::GlibcBytes());
+  for (const auto &[buckets, entries] :
+       {std::pair<size_t, size_t>{64, 128}, {1024, 4096}}) {
+    Map m(buckets, entries);
+    EXPECT_EQ(MemoryCost<Map>::Bytes(buckets, entries), m.bytes());
+    EXPECT_EQ(MemoryCost<Map>::GlibcBytes(buckets, entries), m.bytes());
+  }
+}
+
+// Admits every growth (all glibc), records it, refuses once `allow` passed.
+struct RecordingGrowth final : bess::utils::MemoryGrowth {
+  std::vector<size_t> grown;
+  size_t net = 0;
+  size_t allow = SIZE_MAX;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    EXPECT_EQ(bytes, glibc_bytes);
+    if (grown.size() >= allow) {
+      throw bess::utils::MemoryRefused(
+          bess::utils::MemoryRefused::Reason::kNormalLimit, bytes, "refused");
+    }
+    grown.push_back(bytes);
+    net += bytes;
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    EXPECT_EQ(bytes, glibc_bytes);
+    net -= bytes;
+  }
+};
+
+TEST(CuckooMapMemoryTest, GrowthIsAdmittedFirst) {
+  RecordingGrowth growth;
+  Map m;
+  m.set_memory_growth(&growth);
+  const size_t initial = m.bytes();
+  // The first 16 entries fit the initial reserve; the 17th grows the
+  // entries by half.
+  for (uint32_t i = 0; i < 16; i++) {
+    ASSERT_NE(nullptr, m.Insert(i, i));
+  }
+  for (uint32_t i = 16; i < 5000; i++) {
+    ASSERT_NE(nullptr, m.Insert(i, i));
+    ASSERT_EQ(initial + growth.net, m.bytes()) << i;
+  }
+  EXPECT_GT(growth.grown.size(), 1u);  // entries and buckets both grew
+  // Clear keeps the capacity: nothing given back, nothing admitted.
+  const size_t held = m.bytes();
+  m.Clear();
+  EXPECT_EQ(held, m.bytes());
+  EXPECT_EQ(initial + growth.net, m.bytes());
+}
+
+TEST(CuckooMapMemoryTest, RefusedGrowthLeavesTheMapUnchanged) {
+  RecordingGrowth growth;
+  growth.allow = 0;
+  Map m;
+  m.set_memory_growth(&growth);
+  const size_t initial = m.bytes();
+  uint32_t refused = 0;
+  for (;; refused++) {
+    try {
+      ASSERT_NE(nullptr, m.Insert(refused, refused));
+    } catch (const bess::utils::MemoryRefused &) {
+      break;
+    }
+  }
+  EXPECT_EQ(refused, m.Count());
+  EXPECT_EQ(nullptr, m.Find(refused));
+  for (uint32_t i = 0; i < refused; i++) {
+    ASSERT_NE(nullptr, m.Find(i));
+  }
+  EXPECT_EQ(initial, m.bytes());
+  EXPECT_EQ(0u, growth.net);
+
+  growth.allow = SIZE_MAX;
+  ASSERT_NE(nullptr, m.Insert(refused, refused));
+  EXPECT_EQ(refused + 1, m.Count());
+  EXPECT_EQ(initial + growth.net, m.bytes());
 }
 
 }  // namespace

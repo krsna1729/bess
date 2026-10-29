@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "dataplane/resource.h"
+#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "l2/fdb.h"
 #include "l2/packed_mac_table.h"
@@ -67,7 +68,8 @@ class Bridge final : public Module {
              const std::vector<gate_idx_t> &flood_gates);
 
   uint32_t max_entries_ = 1024;
-  std::unique_ptr<Fdb> fdb_;
+  // "<name>/fdb" (D-198); its growth hook admits flood-group growth.
+  bess::framework::Sized<Fdb> fdb_;
   // The static entries the FDB holds, as programmed (add, the resource):
   // the control side's view, which the resource reads back without touching
   // the worker-owned FDB. Learning never creates or moves a static entry and

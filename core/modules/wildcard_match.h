@@ -147,7 +147,9 @@ class WildcardMatch final : public Module {
   // legacy table stored rule bytes verbatim; so does this).
   Error PackRule(const Rule &rule, std::vector<std::byte> *value,
                  std::vector<std::byte> *mask) const;
-  // A new, empty rule table.
+  // A new, empty rule table, admitted as "rules" before it is built (D-198;
+  // refusal throws MemoryRefused) with its growth hook wired. The returned
+  // pointer owns the admission too, released after the table is destroyed.
   std::expected<std::shared_ptr<bess::classifier::ConcurrentMaskedTable>,
                 Error>
   NewTable() const;

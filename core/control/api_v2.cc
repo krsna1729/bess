@@ -35,6 +35,7 @@
 #include "rcu/rcu_domain.h"
 #include "control/pipeline_snapshot.h"
 #include "gate_hooks/track.h"
+#include "framework/memory_scope.h"
 #include "framework/plugin_check.h"
 #include "framework/plugin_loader.h"
 #include "metadata.h"
@@ -1018,6 +1019,11 @@ grpc::Status ControlV2Service::GetResourceStatus(
   rcu::RcuDomain &rcu = runtime::runtime().rcu();
   const uint64_t rcu_pending = rcu.pending_retired();
   const uint64_t rcu_high_water = rcu.retire_high_water();
+  // The memory policy and where the daemon stands against it (D-198): what a
+  // controller compares a table's size with before it asks for one, so a
+  // refusal is predictable rather than discovered. Read without the lock,
+  // like the RSS above.
+  const bess::utils::MemoryStatus memory = bess::utils::GetMemoryStatus();
 
   // The control-plane lock, as ReadPipeline takes it: the resource walk and
   // the worker list are control-plane state.
@@ -1030,6 +1036,36 @@ grpc::Status ControlV2Service::GetResourceStatus(
   }
   response->set_rcu_pending(rcu_pending);
   response->set_rcu_high_water(rcu_high_water);
+  v2::MemoryStatus *out = response->mutable_memory();
+  out->set_hugepages(memory.hugepages);
+  out->set_fallback(memory.fallback);
+  out->set_hugepage_cap_bytes(memory.hugepage_cap_bytes);
+  out->set_hugepage_cap_source(memory.hugepage_cap_source);
+  out->set_hugetlb_charged(memory.hugetlb_charged);
+  out->set_hugepage_table_bytes(memory.hugepage_table_bytes);
+  out->set_limit_bytes(memory.limit_bytes);
+  out->set_limit_source(memory.limit_source);
+  out->set_reserve_bytes(memory.reserve_bytes);
+  out->set_used_bytes(memory.used_bytes);
+  if (memory.limit_bytes > memory.reserve_bytes + memory.used_bytes) {
+    out->set_available_bytes(memory.limit_bytes - memory.reserve_bytes - memory.used_bytes);
+  }
+  out->set_dpdk_heap_bytes(memory.dpdk_heap_bytes);
+  out->set_dpdk_heap_alloc_bytes(memory.dpdk_heap_alloc_bytes);
+  out->set_fallback_heap_bytes(memory.fallback_heap_bytes);
+  out->set_fallback_heap_alloc_bytes(memory.fallback_heap_alloc_bytes);
+  out->set_refusals(memory.refusals);
+  // What each module admitted, by resource (D-198), with what the objects
+  // hold now: their bytes() are read here, under the control-plane lock that
+  // orders every module's creation, growth and destruction.
+  for (const bess::framework::ModuleMemoryUse &use :
+       bess::framework::MemoryAccounts::List()) {
+    v2::ModuleMemory *row = out->add_modules();
+    row->set_module(use.module);
+    row->set_resource(use.resource);
+    row->set_admitted_bytes(use.admitted_bytes);
+    row->set_current_bytes(use.current_bytes);
+  }
 
   for (int core : runtime::runtime().workers().Cores()) {
     response->add_workers()->set_cpu(static_cast<uint32_t>(core));

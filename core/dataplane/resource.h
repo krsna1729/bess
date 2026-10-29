@@ -107,8 +107,8 @@ class Retirer {
   // declared in Reserve() (Resource::Footprint): the engine reserved exactly
   // that, so publication neither allocates nor meets an unplanned stage.
   // Exceeding it is a bug in the resource and fatal.
-  template <typename T>
-  void Retire(std::unique_ptr<T> object) {
+  template <typename T, typename D>
+  void Retire(std::unique_ptr<T, D> object) {
     if (object == nullptr) {
       return;
     }
@@ -125,8 +125,10 @@ class Retirer {
   // -- a grace period after the publish for the highest-rank resource, and a
   // grace period after the rank above for each lower rank (a reader that saw
   // a referrer just before it went away must be done before its referent
-  // goes). The step receives a Retirer for whatever it replaces.
-  // SlotResource's erase uses this to empty its slot.
+  // goes). The step receives a Retirer for whatever it replaces. It may
+  // throw std::bad_alloc (refused memory) only having changed nothing: the
+  // engine runs it again after another grace period, and does not run the
+  // steps before it again. SlotResource's erase uses this to empty its slot.
   void RemoveLater(Step step) {
     CheckRoom(removals_.size(), removals_.capacity(), "RemoveLater");
     removals_.push_back({rank_, owner_, std::move(step)});

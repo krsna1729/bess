@@ -14,6 +14,7 @@
 #include "dataplane/action_id.h"
 #include "dataplane/object_table.h"
 #include "dataplane/strong_id.h"
+#include "framework/memory_scope.h"
 
 namespace {
 
@@ -315,7 +316,21 @@ TEST(ObjectTableTest, ReportsSizeCapacityAndStorage) {
 
   EXPECT_EQ(64u, table->capacity());
   EXPECT_EQ(2u, table->size());
-  EXPECT_GE(table->storage_bytes(), 64u * sizeof(Action));
+  EXPECT_GE(table->bytes(), 64u * sizeof(Action));
+}
+
+// What the builder's constructor allocates is what it holds, and what the
+// table it builds holds (D-198).
+TEST(ObjectTableTest, BytesMatchesTheConstructor) {
+  using Builder = ObjectTableBuilder<ActionId, Action>;
+  for (size_t capacity : {size_t{1}, size_t{64}, size_t{1000}}) {
+    Builder builder(capacity);
+    EXPECT_EQ(bess::framework::MemoryCost<Builder>::Bytes(capacity),
+              builder.bytes());
+    ASSERT_TRUE(builder.Set(ActionId(1), Action{1, "a"}));
+    std::unique_ptr<const Table> table = std::move(builder).Build();
+    EXPECT_EQ(Builder::Bytes(capacity), table->bytes());
+  }
 }
 
 }  // namespace

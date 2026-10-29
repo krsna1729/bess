@@ -24,7 +24,6 @@
 #include "pb/control_v2.grpc.pb.h"
 #include "pb/control_v2.pb.h"
 #include "port.h"
-#include "runtime/opts.h"
 
 namespace {
 
@@ -36,7 +35,7 @@ void InitRuntimeOnce() {
     return;
   }
   initialized = true;
-  FLAGS_m = 0;  // malloc-backed, sandbox-safe
+  // The library default (D-198): normal pages, malloc-backed, sandbox-safe.
   bess::PacketPool::CreateDefaultPools(32767);
   PortBuilder::InitDrivers();
 }

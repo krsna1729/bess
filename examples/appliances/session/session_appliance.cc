@@ -290,7 +290,7 @@ class SessionAppliance final : public Module {
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
   CommandResponse Init(const bess::pb::EmptyArg &) {
-    auto made = SessionApp::Create(name(), init_context().rcu());
+    auto made = SessionApp::Create(name(), init_context().rcu(), init_context().memory());
     if (!made) {
       return CommandFailure(EINVAL, "%s", made.error().c_str());
     }
@@ -357,7 +357,9 @@ class SessionAppliance final : public Module {
   CommandResponse CommandSelfTest(const bess::pb::EmptyArg &) {
     std::string failed;
     {
-      auto made = SessionApp::Create(name() + "_self_test", init_context().rcu());
+      // Admitted to this module's memory, released when it is dropped below.
+      auto made = SessionApp::Create(name() + "_self_test", init_context().rcu(),
+                                     init_context().memory());
       if (!made) {
         return CommandFailure(EINVAL, "%s", made.error().c_str());
       }
@@ -513,7 +515,8 @@ const ResourceTables SessionAppliance::resource_tables = {
     ResourceTable::Map<bess::pb::RouterRouteKey, bess::pb::RouterRouteValue>("routes"),
 };
 
-BESS_PLUGIN_REQUIRES("session_appliance", "1.0.0", BESS_CAP_INIT_CONTEXT | BESS_CAP_RESOURCES);
+BESS_PLUGIN_REQUIRES("session_appliance", "1.0.0",
+                     BESS_CAP_INIT_CONTEXT | BESS_CAP_RESOURCES | BESS_CAP_MEMORY);
 
 ADD_MODULE(SessionAppliance, "session_appliance",
            "Reference appliance R4: a session datapath whose resources are driven over the control API")

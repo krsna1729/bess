@@ -269,7 +269,7 @@ class IndirectSlots {
     return id == 0 || id >= slots_.size() ? nullptr : slots_[id];
   }
 
-  size_t storage_bytes() const { return slots_.size() * sizeof(const T *); }
+  size_t bytes() const { return slots_.size() * sizeof(const T *); }
 
  private:
   std::vector<const T *> slots_;
@@ -309,7 +309,7 @@ class BitmapSlots {
     return Contains(id) ? storage_ + id : nullptr;
   }
 
-  size_t storage_bytes() const {
+  size_t bytes() const {
     return (capacity_ + 1) * sizeof(T) +
            bitmap_.size() * sizeof(uint64_t);
   }
@@ -484,10 +484,10 @@ void BM_ObjectTableLookup(benchmark::State &state) {
   }
   state.SetItemsProcessed(state.iterations() * ids.size());
   state.counters["bytes_per_object"] = static_cast<double>(sizeof(P));
-  state.counters["storage_bytes"] = static_cast<double>(table->storage_bytes());
+  state.counters["storage_bytes"] = static_cast<double>(table->bytes());
   state.counters["touched_bytes"] =
       TouchedBytes(access == Access::kHot ? 8 : table->capacity(),
-                   table->storage_bytes() / (table->capacity() + 1));
+                   table->bytes() / (table->capacity() + 1));
 }
 
 // -- alternative representation: indirect slots ------------------------------
@@ -514,7 +514,7 @@ void BM_IndirectLookup(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * ids.size());
   state.counters["bytes_per_object"] = static_cast<double>(sizeof(P));
   state.counters["storage_bytes"] =
-      static_cast<double>(table.storage_bytes() + capacity * sizeof(P));
+      static_cast<double>(table.bytes() + capacity * sizeof(P));
   // The pointer array is what a lookup walks; the objects are reached through
   // it. Both are reported so the row's residency is readable.
   state.counters["touched_bytes"] =
@@ -559,10 +559,10 @@ void BM_ObjectTableSparseLookup(benchmark::State &state) {
   state.counters["live_objects"] = static_cast<double>(live_ids.size());
   state.counters["distribution"] = static_cast<double>(state.range(2));
   state.counters["bytes_per_object"] = static_cast<double>(sizeof(P));
-  state.counters["storage_bytes"] = static_cast<double>(table->storage_bytes());
+  state.counters["storage_bytes"] = static_cast<double>(table->bytes());
   state.counters["touched_bytes"] =
       TouchedBytes(access == Access::kHot ? 8 : capacity,
-                   table->storage_bytes() / (capacity + 1));
+                   table->bytes() / (capacity + 1));
 }
 
 template <size_t Bytes>
@@ -597,7 +597,7 @@ void BM_BitmapSparseLookup(benchmark::State &state) {
   state.counters["live_objects"] = static_cast<double>(live_ids.size());
   state.counters["distribution"] = static_cast<double>(state.range(2));
   state.counters["bytes_per_object"] = static_cast<double>(sizeof(P));
-  state.counters["storage_bytes"] = static_cast<double>(table.storage_bytes());
+  state.counters["storage_bytes"] = static_cast<double>(table.bytes());
   state.counters["touched_bytes"] =
       TouchedBytes(access == Access::kHot ? 8 : capacity, sizeof(P));
   state.counters["touched_bitmap_bytes"] =
@@ -638,7 +638,7 @@ void BM_IndirectSparseLookup(benchmark::State &state) {
   state.counters["distribution"] = static_cast<double>(state.range(2));
   state.counters["bytes_per_object"] = static_cast<double>(sizeof(P));
   state.counters["storage_bytes"] =
-      static_cast<double>(table.storage_bytes() + live_ids.size() * sizeof(P));
+      static_cast<double>(table.bytes() + live_ids.size() * sizeof(P));
   state.counters["touched_bytes"] =
       TouchedBytes(access == Access::kHot ? 8 : capacity, sizeof(const P *));
   state.counters["touched_object_bytes"] =

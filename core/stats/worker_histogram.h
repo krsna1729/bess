@@ -96,6 +96,15 @@ class WorkerHistogram {
   WorkerHistogram(const WorkerHistogram &) = delete;
   WorkerHistogram &operator=(const WorkerHistogram &) = delete;
 
+  // What the constructor allocates (D-198): the worker slots (DPDK) and the
+  // Reset baseline, one word per worker and cell (glibc).
+  static size_t Bytes(const HistogramLayout &layout) noexcept {
+    return WorkerSlots::Bytes(Cells(layout)) + GlibcBytes(layout);
+  }
+  static size_t GlibcBytes(const HistogramLayout &layout) noexcept {
+    return dataplane::kMaxWorkers * Cells(layout) * sizeof(uint64_t);
+  }
+
   const HistogramLayout &layout() const noexcept { return layout_; }
 
   // Worker side.
@@ -126,12 +135,22 @@ class WorkerHistogram {
   HistogramSnapshot Snapshot() const;
   void Reset();
 
-  size_t storage_bytes() const noexcept { return slots_.bytes(); }
+  // What the histogram holds: the slots and the baseline, fixed for its
+  // life.
+  size_t bytes() const noexcept {
+    return slots_.bytes() +
+           dataplane::kMaxWorkers * slots_.cells() * sizeof(uint64_t);
+  }
 
  private:
   static constexpr size_t kCount = 0;
   static constexpr size_t kSum = 1;
   static constexpr size_t kFirstBucket = 2;
+
+  // Cells per worker: count, sum, then the buckets.
+  static size_t Cells(const HistogramLayout &layout) noexcept {
+    return kFirstBucket + layout.buckets();
+  }
 
   std::vector<uint64_t> ReadAll() const;
 

@@ -6,14 +6,14 @@
 #include <cstring>
 #include <limits>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <rte_errno.h>
 #include <rte_eal.h>
 #include <rte_mempool.h>
 
 #include "dpdk.h"
-#include "runtime/memory.h"
-#include "runtime/opts.h"
+#include "framework/memory_scope.h"
 #include "utils/copy.h"
 #include "utils/dpdk_memory.h"
 #include "worker.h"
@@ -32,18 +32,6 @@ void DoMunmap(rte_mempool_memhdr *memhdr, void *) {
 }
 
 }  // namespace
-class BessPacketPool final : public PacketPool {
- public:
-  BessPacketPool(size_t capacity = kDefaultCapacity, int socket_id = -1,
-                 size_t data_room_size = kDefaultPacketDataSize);
-
-  bool IsVirtuallyContiguous() override { return true; }
-  bool IsPhysicallyContiguous() override { return true; }
-  bool IsPinned() override { return true; }
-
- private:
-  DmaMemoryPool mem_;
-};
 
 static_assert(offsetof(rte_mbuf, data_off) == offsetof(rte_mbuf, rearm_data));
 static_assert(offsetof(rte_mbuf, refcnt) == offsetof(rte_mbuf, rearm_data) + 2);
@@ -69,7 +57,7 @@ PacketPool *PacketPool::default_pool_;
 
 void PacketPool::CreateDefaultPools(size_t capacity, size_t data_room_size) {
   current_worker.SetNonWorker();
-  InitDpdk(FLAGS_dpdk ? FLAGS_m : 0);
+  InitDpdk();
 
   // A debug aid: with normal pages (no hugepages) it is one line per 4 KB
   // segment, tens of MB of log per daemon start.
@@ -80,20 +68,26 @@ void PacketPool::CreateDefaultPools(size_t capacity, size_t data_room_size) {
   // One pool, on the memory node: everything bessd allocates lives there
   // (D-123), so a pool per node would only be memory nobody uses.
   const int sid = bess::utils::MemoryNode();
-  // What the EAL actually did: -m -1 resolves to normal pages when no
-  // hugepages are usable.
-  if (!rte_eal_has_hugepages()) {
-    LOG(WARNING) << "Hugepage is disabled! Creating PlainPacketPool for "
-                 << capacity << " packets on node " << sid;
-    default_pool_ = new PlainPacketPool(capacity, sid, data_room_size);
-  } else if (FLAGS_dpdk) {
-    LOG(INFO) << "Creating DpdkPacketPool for " << capacity
-              << " packets on node " << sid;
-    default_pool_ = new DpdkPacketPool(capacity, sid, data_room_size);
-  } else {
-    LOG(INFO) << "Creating BessPacketPool for " << capacity
-              << " packets on node " << sid;
-    default_pool_ = new BessPacketPool(capacity, sid, data_room_size);
+  // The pool follows the memory backing (--mem_backing, D-198), which the
+  // EAL was brought up with: DPDK's heap with hugepages, normal pages of its
+  // own (mmap) without.
+  try {
+    if (!rte_eal_has_hugepages()) {
+      LOG(WARNING) << "Hugepage is disabled! Creating PlainPacketPool for "
+                   << capacity << " packets on node " << sid;
+      default_pool_ = new PlainPacketPool(capacity, sid, data_room_size);
+    } else {
+      LOG(INFO) << "Creating DpdkPacketPool for " << capacity
+                << " packets on node " << sid;
+      default_pool_ = new DpdkPacketPool(capacity, sid, data_room_size);
+    }
+  } catch (const utils::MemoryRefused &e) {
+    // Admitted like a table (D-198): a pool past the memory limit or the
+    // hugepage cap is refused before its pages are touched, and bessd stops
+    // with the reason rather than being OOM-killed later.
+    LOG(FATAL) << "Packet pool of " << capacity << " packets refused: "
+               << e.what() << ". Lower --buffers (BESSD_BUFFERS) or "
+               << "--packet_data_room, or raise the memory limit or cap.";
   }
   CHECK(default_pool_) << "Packet pool allocation on node " << sid
                        << " failed!";
@@ -103,7 +97,7 @@ PacketPool::PacketPool(size_t capacity, int socket_id, size_t data_room_size)
     : data_room_size_(data_room_size) {
   if (!IsDpdkInitialized()) {
     current_worker.SetNonWorker();
-    InitDpdk(0);
+    InitDpdk();
   }
 
   CHECK_GT(data_room_size_, 0u);
@@ -132,6 +126,19 @@ PacketPool::PacketPool(size_t capacity, int socket_id, size_t data_room_size)
 PacketPool::~PacketPool() {
   // munmap is triggered by the registered callback DoMunmap().
   rte_mempool_free(pool_);
+  if (admitted_bytes_ != 0) {
+    framework::MemoryAccounts::Process().Release("packet_pool",
+                                                 admitted_bytes_);
+  }
+}
+
+void PacketPool::AdmitPoolMemory(size_t bytes) {
+  // The packet memory, admitted like a table's before it is committed
+  // (D-198): against the memory limit with normal backing, against the
+  // hugepage cap with hugepages; reported as bessd/packet_pool. Throws
+  // utils::MemoryRefused, admitting nothing, when it does not fit.
+  framework::MemoryAccounts::Process().Admit("packet_pool", bytes);
+  admitted_bytes_ += bytes;
 }
 
 bool PacketPool::AllocBulk(PacketHandle *pkts, size_t count, size_t len) {
@@ -281,8 +288,8 @@ void PacketPool::PostPopulate() {
 
   LOG(INFO) << name_ << " has been created with " << Capacity() << " packets";
   // Say how far short of the request a pool fell, in the units an operator
-  // can change (D-030): the packet count (-buffers, BESSD_BUFFERS) and the
-  // memory behind it (hugepages, -m / BESSD_M).
+  // can change (D-030): the packet count (--buffers, BESSD_BUFFERS) and the
+  // memory behind it (hugepages, --mem_hugepage_mb / BESSD_MEM_HUGEPAGE_MB).
   const size_t element = pool_->elt_size + pool_->header_size +
                          pool_->trailer_size;
   const size_t wanted = pool_->size;
@@ -292,9 +299,10 @@ void PacketPool::PostPopulate() {
         name_ + " holds " + std::to_string(Capacity()) + " of the " +
         std::to_string(wanted) + " packets asked for (" + mb(Capacity()) +
         " of " + mb(wanted) +
-        " MB): not enough DPDK memory on its socket. Lower -buffers "
-        "(BESSD_BUFFERS), raise the memory cap (-m, BESSD_M) or give bessd "
-        "more hugepages; also check 'ulimit -l'.";
+        " MB): not enough DPDK memory on its socket. Lower --buffers "
+        "(BESSD_BUFFERS), raise the hugepage cap (--mem_hugepage_mb, "
+        "BESSD_MEM_HUGEPAGE_MB) or give bessd more hugepages; also check "
+        "'ulimit -l'.";
     if (Capacity() == 0) {
       LOG(FATAL) << message;
     }
@@ -312,6 +320,7 @@ PlainPacketPool::PlainPacketPool(size_t capacity, int socket_id,
   size_t size = rte_mempool_op_calc_mem_size_default(
       pool_, pool_->size, page_shift, &min_chunk_size, &align);
 
+  AdmitPoolMemory(size);
   void *addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   if (addr == MAP_FAILED) {
@@ -333,44 +342,14 @@ PlainPacketPool::PlainPacketPool(size_t capacity, int socket_id,
   PostPopulate();
 }
 
-BessPacketPool::BessPacketPool(size_t capacity, int socket_id,
-                               size_t data_room_size)
-    : PacketPool(capacity, socket_id, data_room_size),
-      mem_(static_cast<size_t>(FLAGS_m) * 1024 * 1024, socket_id) {
-  size_t page_shift = __builtin_ctzl(getpagesize());
-
-  while (pool_->populated_size < pool_->size) {
-    size_t deficit = pool_->size - pool_->populated_size;
-    size_t min_chunk_size, align;
-    size_t bytes = rte_mempool_op_calc_mem_size_default(
-        pool_, deficit, page_shift, &min_chunk_size, &align);
-
-    auto [addr, alloced_bytes] = mem_.AllocUpto(bytes);
-    if (addr == nullptr) {
-      LOG(WARNING) << "Node " << socket_id << ": " << capacity
-                   << " packets requested, but only " << pool_->populated_size
-                   << " allocated in total";
-      break;
-    }
-
-    int ret = rte_mempool_populate_iova(pool_, static_cast<char *>(addr),
-                                        Virt2Phy(addr), alloced_bytes, nullptr,
-                                        nullptr);
-    if (ret < 0) {
-      LOG(WARNING) << "Node " << socket_id
-                   << ": rte_mempool_populate_iova() returned " << ret;
-    } else {
-      LOG(INFO) << "Node " << socket_id << ": " << ret
-                << " packets added from " << alloced_bytes << " bytes";
-    }
-  }
-
-  PostPopulate();
-}
-
 DpdkPacketPool::DpdkPacketPool(size_t capacity, int socket_id,
                                size_t data_room_size)
     : PacketPool(capacity, socket_id, data_room_size) {
+  // What rte_mempool_populate_default() takes from DPDK's heap, as one
+  // contiguous piece (page_shift 0): the bytes admitted against the cap.
+  size_t min_chunk_size, align;
+  AdmitPoolMemory(rte_mempool_op_calc_mem_size_default(
+      pool_, pool_->size, 0, &min_chunk_size, &align));
   int ret = rte_mempool_populate_default(pool_);
   if (ret < static_cast<ssize_t>(pool_->size)) {
     LOG(WARNING) << "rte_mempool_populate_default() returned " << ret

@@ -9,9 +9,11 @@ namespace bess {
 
 bool IsDpdkInitialized();
 
-// Initialize DPDK, with the specified amount of hugepage memory.
+// Initializes DPDK under the memory policy (D-198): the one bessd resolved
+// from its --mem_* flags, else -- tests, benchmarks, library users -- the
+// same settings from BESSD_MEM_* (default: normal pages, a 512 MB heap).
 // Safe to call multiple times.
-void InitDpdk(int dpdk_mb_per_socket = 0);
+void InitDpdk();
 
 // Writes DPDK's trace (--dpdk_trace) to its directory; nothing when tracing
 // is off. At shutdown, with workers paused and still registered with EAL (a

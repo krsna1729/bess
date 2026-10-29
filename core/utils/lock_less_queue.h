@@ -11,6 +11,7 @@
 
 #include "queue.h"
 #include "rte_ring_alloc.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess {
 namespace utils {
@@ -44,6 +45,25 @@ class LockLessQueue final : public Queue<T> {
       std::free(ring_);
     }
   }
+
+  // What the constructor allocates (D-198): the ring, from glibc
+  // (AllocRingMem). Equals bytes().
+  static size_t Bytes(size_t capacity = kDefaultRingSize,
+                      bool /*single_producer*/ = true,
+                      bool /*single_consumer*/ = true) noexcept {
+    return RingBytes(capacity);
+  }
+  static size_t GlibcBytes(size_t capacity = kDefaultRingSize,
+                           bool single_producer = true,
+                           bool single_consumer = true) noexcept {
+    return Bytes(capacity, single_producer, single_consumer);
+  }
+  // The ring held now (glibc).
+  size_t bytes() const noexcept { return RingBytes(capacity_); }
+
+  // The admission Resize asks for its new ring first (D-198); nullptr:
+  // unadmitted.
+  void set_memory_growth(MemoryGrowth *growth) noexcept { growth_ = growth; }
 
   // error codes: -1 is Quota exceeded. The objects have been enqueued,
   // but the high water mark is exceeded. -2 is not enough room in the
@@ -83,13 +103,23 @@ class LockLessQueue final : public Queue<T> {
 
   bool Full() override { return rte_ring_full(ring_); }
 
+  // Moves the queue to a new ring of `new_capacity`. With a growth hook the
+  // new ring is admitted first (its MemoryRefused propagates and nothing
+  // changes), and the old one is given back once freed (D-198).
   int Resize(size_t new_capacity) override {
     if (new_capacity <= Size() || (new_capacity & (new_capacity - 1))) {
       return -1;
     }
 
+    const size_t new_bytes = RingBytes(new_capacity);
+    if (growth_ != nullptr) {
+      growth_->Grow(new_bytes, new_bytes);
+    }
     rte_ring* new_ring = NewRing(new_capacity, ring_->flags);
     if (!new_ring) {
+      if (growth_ != nullptr) {
+        growth_->Shrink(new_bytes, new_bytes);
+      }
       return -ENOMEM;
     }
 
@@ -98,9 +128,13 @@ class LockLessQueue final : public Queue<T> {
       rte_ring_enqueue(new_ring, obj);
     }
 
+    const size_t old_bytes = bytes();
     free(ring_);
     ring_ = new_ring;
     capacity_ = new_capacity;
+    if (growth_ != nullptr) {
+      growth_->Shrink(old_bytes, old_bytes);
+    }
     return 0;
   }
 
@@ -125,6 +159,7 @@ class LockLessQueue final : public Queue<T> {
 
    struct rte_ring* ring_;  // class's ring buffer
    size_t capacity_;      // the size of the backing ring buffer
+   MemoryGrowth* growth_ = nullptr;  // D-198: admits Resize's new ring
 };
 
 }  // namespace utils

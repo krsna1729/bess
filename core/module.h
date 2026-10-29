@@ -10,6 +10,8 @@
 #include <expected>
 #include <functional>
 #include <map>
+#include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -242,29 +244,9 @@ enum CheckConstraintResult {
 class alignas(bess::arch::kCacheLineSize) Module {
   // overide this section to create a new module -----------------------------
  public:
-  Module()
-      : init_context_(&bess::framework::ModuleInitContext::ProcessDefault()),
-        name_(),
-        module_builder_(),
-        initial_arg_(),
-        pipeline_(),
-        attrs_(),
-        attr_offsets_(),
-        tasks_(),
-        igates_(),
-        ogates_(),
-        deadends_(/*keys=*/1, /*cells_per_key=*/1, Worker::kMaxWorkers),
-        active_workers_(Worker::kMaxWorkers, false),
-        visited_tasks_(),
-        is_task_(false),
-        parent_tasks_(),
-        children_overload_(0),
-        overload_(false),
-        node_constraints_(UNCONSTRAINED_SOCKET),
-        min_allowed_workers_(1),
-        max_allowed_workers_(1),
-        propagate_workers_(true) {}
-  virtual ~Module() {}
+  // Out of line: the module's memory scope is an incomplete type here.
+  Module();
+  virtual ~Module();
 
   CommandResponse Init(const bess::pb::EmptyArg &arg);
 
@@ -543,8 +525,12 @@ class alignas(bess::arch::kCacheLineSize) Module {
     pipeline_ = pipeline;
   }
 
-  // Bound at construction; see D-042.
-  const bess::framework::ModuleInitContext *init_context_;
+  // Bound at construction; see D-042. The module's own copy of the shared
+  // context, carrying its memory scope (D-198). Both are destroyed with the
+  // module after the subclass's members, so whatever those still hold is
+  // released when the scope goes; the scope outlives the context.
+  std::unique_ptr<bess::framework::MemoryScope> memory_;
+  std::unique_ptr<const bess::framework::ModuleInitContext> init_context_;
 
   std::string name_;
 

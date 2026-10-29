@@ -125,6 +125,17 @@ class FirewallTable {
   static std::expected<std::unique_ptr<const FirewallTable>, std::string>
   Build(std::vector<FirewallRule> rules);
 
+  // Memory (D-198), all glibc: what Build allocates for `rules` -- the
+  // table, its copy of the rules, one group per (family, protocol, prefix
+  // lengths) and one entry per rule across the groups (each group reserved
+  // to its size). Immutable once built; the build's temporary map is not
+  // counted.
+  static size_t Bytes(const std::vector<FirewallRule> &rules);
+  static size_t GlibcBytes(const std::vector<FirewallRule> &rules) {
+    return Bytes(rules);
+  }
+  size_t bytes() const noexcept;
+
   // Why Build would refuse `rule`, without naming it (the caller knows which
   // rule it is), or nullopt when the table can express it. Build refuses a
   // list exactly when it refuses one of its rules, so a caller that checks
@@ -246,6 +257,19 @@ class FirewallScan {
 
   size_t rule_count() const noexcept { return rules_.size(); }
   const std::vector<FirewallRule> &rules() const noexcept { return rules_; }
+
+  // Memory (D-198), all glibc: the rules, taken over from `rules` with
+  // their capacity (exact when `rules` is moved in, an upper bound when it
+  // is copied).
+  static size_t Bytes(const std::vector<FirewallRule> &rules) {
+    return rules.capacity() * sizeof(FirewallRule);
+  }
+  static size_t GlibcBytes(const std::vector<FirewallRule> &rules) {
+    return Bytes(rules);
+  }
+  size_t bytes() const noexcept {
+    return rules_.capacity() * sizeof(FirewallRule);
+  }
 
  private:
   FirewallScan() = default;

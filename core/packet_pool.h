@@ -13,17 +13,17 @@
 //                   Backed memory    Virtual  Physical  mlock()ed  fail-free
 // --------------------------------------------------------------------------
 // PlainPacketPool   Plain 4k pages   O        X         X          O
-//   : For standalone benchmarks and unittests. Cannot be used for DMA.
-//
-// BessPacketPool    BESS hugepages   O        O         O          X
-//   : BESS default. It allocates and manages huge pages internally.
-//     No hugetlbfs is required.
+//   : --mem_backing=normal (and standalone benchmarks and unittests).
+//     Cannot be used for DMA.
 //
 // DpdkPacketPool    DPDK hugepages   O/X      O/X       O          O
-//   : It is used as a fallback option if allocation of BessPacketPool has
-//     failed. The memory region will be contiguous in most cases,
-//     but not so if 2MB hugepages are used and scattered. MLX4/5 drivers
-//     will fail in this case.
+//   : hugepage backing. The memory region will be contiguous in most
+//     cases, but not so if 2MB hugepages are used and scattered. MLX4/5
+//     drivers will fail in this case.
+//
+// Either admits its bytes before committing them (D-198): against the
+// memory limit with normal pages, the hugepage cap with hugepages; reported
+// as bessd/packet_pool, released when the pool is destroyed.
 
 namespace bess {
 
@@ -115,6 +115,9 @@ class PacketPool {
 
   // Child classes are expected to call this function in their constructor.
   void PostPopulate();
+  // Child classes call this with the bytes they are about to commit, before
+  // committing them; throws utils::MemoryRefused when they do not fit.
+  void AdmitPoolMemory(size_t bytes);
 
   std::string name_;
   rte_mempool *pool_;
@@ -122,6 +125,7 @@ class PacketPool {
 
  private:
   static PacketPool *default_pool_;
+  size_t admitted_bytes_ = 0;  // released by ~PacketPool
 };
 
 class PlainPacketPool : public PacketPool {

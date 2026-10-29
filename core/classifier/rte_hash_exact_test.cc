@@ -12,6 +12,7 @@
 #include "classifier/packed_value_store.h"
 #include "classifier/rte_hash_exact.h"
 #include "classifier/typed_exact.h"
+#include "framework/memory_scope.h"
 
 namespace {
 
@@ -271,6 +272,24 @@ TEST(RteHashDataBackendTest, LookupBatchPackedStride) {
   EXPECT_EQ(0x5ull, hits);
   EXPECT_EQ(100u, results[0]);
   EXPECT_EQ(200u, results[2]);
+}
+
+// D-198: Bytes() is what the constructor allocates (rte_hash's estimate for
+// max(reserve, 8) keys).
+TEST(RteHashBackendMemoryTest, BytesMatchesConstruction) {
+  using bess::framework::MemoryCost;
+  for (const uint32_t reserve : {1u, 64u, 5000u}) {
+    RteHashPositionBackend position(16, reserve);
+    ASSERT_TRUE(position.valid());
+    EXPECT_EQ(MemoryCost<RteHashPositionBackend>::Bytes(16u, reserve),
+              position.bytes());
+    RteHashDataBackend<uint32_t> data(4, reserve);
+    ASSERT_TRUE(data.valid());
+    EXPECT_EQ(MemoryCost<RteHashDataBackend<uint32_t>>::Bytes(4u, reserve),
+              data.bytes());
+  }
+  RteHashPositionBackend defaulted(8);
+  EXPECT_EQ(MemoryCost<RteHashPositionBackend>::Bytes(8u), defaulted.bytes());
 }
 
 }  // namespace

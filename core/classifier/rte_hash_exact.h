@@ -18,7 +18,10 @@
 #include <type_traits>
 #include <utility>
 
+#include <rte_common.h>
 #include <rte_config.h>
+#include <rte_eal.h>
+#include <rte_errno.h>
 #include <rte_hash.h>
 
 #include "classifier/backend.h"
@@ -34,6 +37,48 @@ namespace detail {
 inline std::string UniqueRteHashName() {
   static std::atomic<uint64_t> counter{0};
   return std::format("bess_hash_{}", counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+// The bytes rte_hash_create allocates for `entries` keys of `key_len` bytes
+// (DPDK 25.11 lib/hash/rte_cuckoo_hash.c), for the memory policy: the
+// buckets (64 B per 8 entries, entries rounded up to a power of two), the key
+// store (one slot more than entries, each the key and an 8-byte data
+// pointer, 16-byte aligned), the free-slot ring (4 B per slot, a power of
+// two) and the RCU defer queue (24 B per entry, a power of two; counted
+// whether or not the table attaches one). An estimate: the per-lcore caches
+// and extendable buckets, off by default, are not counted.
+inline size_t RteHashBytes(uint32_t entries, uint32_t key_len) {
+  const size_t n = entries;
+  return 64 * rte_align64pow2(n) / 8 + RTE_ALIGN_CEIL(8 + key_len, 16) * (n + 1) +
+         4 * rte_align64pow2(n + 1) + 24 * rte_align64pow2(n + 2);
+}
+
+// rte_hash_create under the memory policy (D-029). Under --no-huge the
+// estimate is admitted against the process memory limit first. A creation
+// that fails for lack of memory on `params.socket_id` is retried once on the
+// normal-page fallback heap, which utils::FallbackSocket grants or refuses
+// (MemoryRefused, propagated to the control boundary); a retry that still
+// lacks memory -- DPDK takes the tailq entries from its native heaps, never
+// the fallback heap -- is refused the same way. Any other failure -- bad
+// parameters, a name clash -- returns nullptr as rte_hash_create does.
+inline rte_hash *CreateRteHash(rte_hash_parameters params) {
+  const size_t bytes = RteHashBytes(params.entries, params.key_len);
+  if (rte_eal_has_hugepages() == 0) {
+    bess::utils::AdmitNormalMemory(bytes);
+  }
+  // rte_hash_create leaves rte_errno untouched when an rte_zmalloc fails, and
+  // sets ENOMEM when its ring's memzone does.
+  rte_errno = 0;
+  rte_hash *table = rte_hash_create(&params);
+  if (table == nullptr && (rte_errno == 0 || rte_errno == ENOMEM)) {
+    params.socket_id = bess::utils::FallbackSocket(bytes);
+    rte_errno = 0;
+    table = rte_hash_create(&params);
+    if (table == nullptr && (rte_errno == 0 || rte_errno == ENOMEM)) {
+      bess::utils::RefuseDpdkMemory(bytes);
+    }
+  }
+  return table;
 }
 }  // namespace detail
 
@@ -66,7 +111,7 @@ class RteHashPositionBackend {
     params.hash_func_init_val = 0;
     params.socket_id = bess::utils::MemoryNode();
     params.extra_flag = 0;  // Clean immutable generation, no RW concurrency flags
-    table_ = rte_hash_create(&params);
+    table_ = detail::CreateRteHash(params);
   }
 
   // Move-only semantics.
@@ -97,6 +142,21 @@ class RteHashPositionBackend {
   }
 
   [[nodiscard]] bool valid() const noexcept { return table_ != nullptr; }
+
+  // Memory (D-198): what the constructor allocates, the rte_hash for
+  // max(reserve, 8) keys (detail::RteHashBytes, an estimate that also counts
+  // the defer queue this table does not attach). Fixed: add_key never grows
+  // it (-ENOSPC).
+  [[nodiscard]] static size_t Bytes(uint32_t key_len, uint32_t reserve = 64) {
+    return detail::RteHashBytes(std::max(reserve, 8u), key_len);
+  }
+  [[nodiscard]] size_t bytes() const noexcept {
+    return table_ == nullptr
+               ? 0
+               : detail::RteHashBytes(
+                     static_cast<uint32_t>(rte_hash_max_key_id(table_)),
+                     key_len_);
+  }
 
   // Control path: insert key. Returns non-negative position on success,
   // or negative on error (e.g. -ENOSPC).
@@ -249,7 +309,7 @@ class RteHashDataBackend {
     params.hash_func_init_val = 0;
     params.socket_id = bess::utils::MemoryNode();
     params.extra_flag = 0;
-    table_ = rte_hash_create(&params);
+    table_ = detail::CreateRteHash(params);
   }
 
   // Move-only semantics.
@@ -281,15 +341,28 @@ class RteHashDataBackend {
 
   [[nodiscard]] bool valid() const noexcept { return table_ != nullptr; }
 
+  // Memory (D-198): as RteHashPositionBackend::Bytes / bytes().
+  [[nodiscard]] static size_t Bytes(uint32_t key_len, uint32_t reserve = 64) {
+    return detail::RteHashBytes(std::max(reserve, 8u), key_len);
+  }
+  [[nodiscard]] size_t bytes() const noexcept {
+    return table_ == nullptr
+               ? 0
+               : detail::RteHashBytes(
+                     static_cast<uint32_t>(rte_hash_max_key_id(table_)),
+                     key_len_);
+  }
+
   // Control path: insert key with associated data value.
   bool add_key_data(ConstBytes key, Result result) {
     if (table_ == nullptr || key.size() != key_len_) {
       return false;
     }
-    uintptr_t encoded = 0;
-    std::memcpy(&encoded, &result, sizeof(Result));
-    int ret = rte_hash_add_key_data(table_, key.data(),
-                                    reinterpret_cast<void *>(encoded));
+    // The result's bytes are the data pointer's (memcpy, not an
+    // integer-to-pointer cast); lookups copy them back out.
+    void *data = nullptr;
+    std::memcpy(&data, &result, sizeof(Result));
+    int ret = rte_hash_add_key_data(table_, key.data(), data);
     if (ret == 0) {
       count_ = static_cast<size_t>(rte_hash_count(table_));
       return true;

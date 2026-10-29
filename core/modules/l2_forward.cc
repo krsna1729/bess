@@ -110,10 +110,14 @@ CommandResponse L2Forward::Init(const bess::pb::L2ForwardArg &arg) {
                           "size: '%d' bucket: '%d'",
                           size, bucket);
   }
-  table_ = Table::Create(static_cast<size_t>(size) * static_cast<size_t>(bucket));
-  if (table_ == nullptr) {
+  const size_t entries = static_cast<size_t>(size) * static_cast<size_t>(bucket);
+  bess::framework::MemoryLease lease =
+      init_context().memory().LeaseFor<Table>("macs", entries);
+  std::unique_ptr<Table> table = Table::Create(entries);
+  if (table == nullptr) {
     return CommandFailure(ENOMEM, "cannot allocate a table of %d entries", size * bucket);
   }
+  table_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(table));
 
   // The entries as a transaction resource: a MAC that misses today is placed
   // at the default gate meanwhile, which is what a miss does here.
@@ -301,7 +305,11 @@ CommandResponse L2Forward::CommandPopulate(
   base_u64 = bess::utils::be64_t::swap(base_u64) >> 16;
 
   // Addresses already present are left as they are; the ones this command
-  // adds are taken back if it runs out of space, like add.
+  // adds are taken back if it runs out of space, like add. The undo list is
+  // control-path scratch (glibc), admitted for the command's duration.
+  const size_t added_bytes = static_cast<size_t>(cnt) * sizeof(uint64_t);
+  const bess::framework::MemoryLease added_lease =
+      init_context().memory().Lease("populate", added_bytes, added_bytes);
   std::vector<uint64_t> added;
   added.reserve(static_cast<size_t>(cnt));
   for (int64_t i = 0; i < cnt; i++) {

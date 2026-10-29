@@ -959,8 +959,58 @@ class WorkerStatus(_message.Message):
     cpu: int
     def __init__(self, cpu: _Optional[int] = ...) -> None: ...
 
+class MemoryStatus(_message.Message):
+    __slots__ = ("hugepages", "fallback", "limit_bytes", "limit_source", "reserve_bytes", "used_bytes", "available_bytes", "dpdk_heap_bytes", "dpdk_heap_alloc_bytes", "fallback_heap_bytes", "fallback_heap_alloc_bytes", "refusals", "hugepage_cap_bytes", "hugepage_table_bytes", "modules", "hugetlb_charged", "hugepage_cap_source")
+    HUGEPAGES_FIELD_NUMBER: _ClassVar[int]
+    FALLBACK_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    RESERVE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    USED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    DPDK_HEAP_BYTES_FIELD_NUMBER: _ClassVar[int]
+    DPDK_HEAP_ALLOC_BYTES_FIELD_NUMBER: _ClassVar[int]
+    FALLBACK_HEAP_BYTES_FIELD_NUMBER: _ClassVar[int]
+    FALLBACK_HEAP_ALLOC_BYTES_FIELD_NUMBER: _ClassVar[int]
+    REFUSALS_FIELD_NUMBER: _ClassVar[int]
+    HUGEPAGE_CAP_BYTES_FIELD_NUMBER: _ClassVar[int]
+    HUGEPAGE_TABLE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    MODULES_FIELD_NUMBER: _ClassVar[int]
+    HUGETLB_CHARGED_FIELD_NUMBER: _ClassVar[int]
+    HUGEPAGE_CAP_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    hugepages: bool
+    fallback: bool
+    limit_bytes: int
+    limit_source: str
+    reserve_bytes: int
+    used_bytes: int
+    available_bytes: int
+    dpdk_heap_bytes: int
+    dpdk_heap_alloc_bytes: int
+    fallback_heap_bytes: int
+    fallback_heap_alloc_bytes: int
+    refusals: int
+    hugepage_cap_bytes: int
+    hugepage_table_bytes: int
+    modules: _containers.RepeatedCompositeFieldContainer[ModuleMemory]
+    hugetlb_charged: bool
+    hugepage_cap_source: str
+    def __init__(self, hugepages: _Optional[bool] = ..., fallback: _Optional[bool] = ..., limit_bytes: _Optional[int] = ..., limit_source: _Optional[str] = ..., reserve_bytes: _Optional[int] = ..., used_bytes: _Optional[int] = ..., available_bytes: _Optional[int] = ..., dpdk_heap_bytes: _Optional[int] = ..., dpdk_heap_alloc_bytes: _Optional[int] = ..., fallback_heap_bytes: _Optional[int] = ..., fallback_heap_alloc_bytes: _Optional[int] = ..., refusals: _Optional[int] = ..., hugepage_cap_bytes: _Optional[int] = ..., hugepage_table_bytes: _Optional[int] = ..., modules: _Optional[_Iterable[_Union[ModuleMemory, _Mapping]]] = ..., hugetlb_charged: _Optional[bool] = ..., hugepage_cap_source: _Optional[str] = ...) -> None: ...
+
+class ModuleMemory(_message.Message):
+    __slots__ = ("module", "resource", "admitted_bytes", "current_bytes")
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    RESOURCE_FIELD_NUMBER: _ClassVar[int]
+    ADMITTED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    CURRENT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    module: str
+    resource: str
+    admitted_bytes: int
+    current_bytes: int
+    def __init__(self, module: _Optional[str] = ..., resource: _Optional[str] = ..., admitted_bytes: _Optional[int] = ..., current_bytes: _Optional[int] = ...) -> None: ...
+
 class GetResourceStatusResponse(_message.Message):
-    __slots__ = ("resources", "generation", "rss_bytes", "heap_total_bytes", "heap_alloc_bytes", "rcu_pending", "rcu_high_water", "workers", "daemon_epoch")
+    __slots__ = ("resources", "generation", "rss_bytes", "heap_total_bytes", "heap_alloc_bytes", "rcu_pending", "rcu_high_water", "workers", "daemon_epoch", "memory")
     RESOURCES_FIELD_NUMBER: _ClassVar[int]
     GENERATION_FIELD_NUMBER: _ClassVar[int]
     RSS_BYTES_FIELD_NUMBER: _ClassVar[int]
@@ -970,6 +1020,7 @@ class GetResourceStatusResponse(_message.Message):
     RCU_HIGH_WATER_FIELD_NUMBER: _ClassVar[int]
     WORKERS_FIELD_NUMBER: _ClassVar[int]
     DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_FIELD_NUMBER: _ClassVar[int]
     resources: _containers.RepeatedCompositeFieldContainer[ResourceOccupancy]
     generation: int
     rss_bytes: int
@@ -979,7 +1030,8 @@ class GetResourceStatusResponse(_message.Message):
     rcu_high_water: int
     workers: _containers.RepeatedCompositeFieldContainer[WorkerStatus]
     daemon_epoch: int
-    def __init__(self, resources: _Optional[_Iterable[_Union[ResourceOccupancy, _Mapping]]] = ..., generation: _Optional[int] = ..., rss_bytes: _Optional[int] = ..., heap_total_bytes: _Optional[int] = ..., heap_alloc_bytes: _Optional[int] = ..., rcu_pending: _Optional[int] = ..., rcu_high_water: _Optional[int] = ..., workers: _Optional[_Iterable[_Union[WorkerStatus, _Mapping]]] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
+    memory: MemoryStatus
+    def __init__(self, resources: _Optional[_Iterable[_Union[ResourceOccupancy, _Mapping]]] = ..., generation: _Optional[int] = ..., rss_bytes: _Optional[int] = ..., heap_total_bytes: _Optional[int] = ..., heap_alloc_bytes: _Optional[int] = ..., rcu_pending: _Optional[int] = ..., rcu_high_water: _Optional[int] = ..., workers: _Optional[_Iterable[_Union[WorkerStatus, _Mapping]]] = ..., daemon_epoch: _Optional[int] = ..., memory: _Optional[_Union[MemoryStatus, _Mapping]] = ...) -> None: ...
 
 class ImportPluginRequest(_message.Message):
     __slots__ = ("path", "daemon_epoch")

@@ -65,10 +65,7 @@ class MacTable {
     if (capacity == 0 || capacity > (size_t{1} << 28)) {
       return nullptr;
     }
-    size_t buckets = 2;
-    while (buckets * kWays < 2 * capacity) {
-      buckets <<= 1;
-    }
+    const size_t buckets = BucketsFor(capacity);
     std::unique_ptr<MacTable> t(new (std::nothrow) MacTable(capacity, buckets));
     if (t == nullptr) {
       return nullptr;
@@ -98,6 +95,14 @@ class MacTable {
     }
     return t;
   }
+
+  // What Create allocates (D-198), all of it glibc: the buckets, the cold
+  // array and the table itself, as bytes() counts them.
+  static size_t Bytes(size_t capacity) noexcept {
+    return BucketsFor(capacity) * (sizeof(Bucket) + kWays * sizeof(Cold)) +
+           sizeof(MacTable);
+  }
+  static size_t GlibcBytes(size_t capacity) noexcept { return Bytes(capacity); }
 
   ~MacTable() {
     std::free(buckets_);
@@ -217,7 +222,7 @@ class MacTable {
 
   size_t size() const noexcept { return size_; }
   size_t capacity() const noexcept { return capacity_; }
-  size_t memory_bytes() const noexcept {
+  size_t bytes() const noexcept {
     return nbuckets_ * (sizeof(Bucket) + kWays * sizeof(Cold)) + sizeof(*this);
   }
 
@@ -231,6 +236,15 @@ class MacTable {
 
   MacTable(size_t capacity, size_t buckets)
       : capacity_(capacity), nbuckets_(buckets), mask_(buckets - 1) {}
+
+  // The smallest power of two (at least 2) giving every entry two slots.
+  static size_t BucketsFor(size_t capacity) noexcept {
+    size_t buckets = 2;
+    while (buckets * kWays < 2 * capacity) {
+      buckets <<= 1;
+    }
+    return buckets;
+  }
 
   // splitmix64's finaliser: both 32-bit halves are independent enough to pick
   // two buckets. (A CRC is linear -- crc(seed, k) = crc(0, k) ^ c -- so two

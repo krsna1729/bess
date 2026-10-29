@@ -34,6 +34,7 @@ meter_sources = files(
 stats_sources = files(
   'stats/counter_set.cc',
   'stats/event_hub.cc',
+  'stats/keyed_counters.cc',
   'stats/metric_registry.cc',
 )
 
@@ -60,10 +61,10 @@ eal_sources = files(
   'runtime/dpdk.cc',
   'runtime/opts.cc',
   'runtime/simd_width.cc',
-  'runtime/memory.cc',
   'runtime/path.cc',
   'runtime/startup.cc',
   'utils/dpdk_memory.cc',
+  'framework/memory_scope.cc',
   'utils/bpf_program.cc',
 )
 
@@ -323,7 +324,9 @@ bess_stats = static_library(
   stats_sources,
   include_directories: core_include,
   dependencies: low_level_compile_deps,
-  link_with: [bess_dataplane_core],
+  link_with: [bess_dataplane_core, bess_eal],
+  install: true,
+  install_dir: bess_archive_dir,
 )
 bess_route = static_library(
   'bess_route',
@@ -339,10 +342,10 @@ bess_route = static_library(
 pkg.generate(
   name: 'bess-dev-static',
   filebase: 'bess-dev-static',
-  description: 'BESS route, flow index, classifier, dataplane and RCU archives for programs without bessd (experimental)',
+  description: 'BESS route, flow index, classifier, keyed counters, dataplane and RCU archives for programs without bessd (experimental)',
   version: meson.project_version(),
   libraries: ['-L${libdir}/bess', '-lbess_route', '-lbess_flow', '-lbess_classifier',
-              '-lbess_dataplane_core', '-lbess_eal', '-lbess_rcu', '-lbess_utils'],
+              '-lbess_stats', '-lbess_dataplane_core', '-lbess_eal', '-lbess_rcu', '-lbess_utils'],
   requires: ['bess-dev', 'gflags'],
   requires_private: ['libpcap'],
   # A plugin must not link these: it would carry a second EAL and RCU state
@@ -576,6 +579,8 @@ core_public_subdir_headers = {
     'utils/copy.h',
     # D-123: the table headers default their socket to utils::MemoryNode().
     'utils/dpdk_memory.h',
+    'utils/dpdk_slab.h',
+    'utils/rte_ring_alloc.h',
     'utils/endian.h',
     'utils/ether.h',
     'utils/extended_priority_queue.h',
@@ -590,6 +595,7 @@ core_public_subdir_headers = {
   ),
   'framework': files(
     'framework/instance_registry.h',
+    'framework/memory_scope.h',
     'framework/module_requests.h',
     'framework/module_tick.h',
     'framework/threshold_table.h',
@@ -756,6 +762,7 @@ unit_test_sources = [
   'classifier/rte_hash_exact_test.cc',
   'classifier/concurrent_exact_test.cc',
   'classifier/concurrent_masked_test.cc',
+  'classifier/masked_rule_memory_test.cc',
   'classifier/record_arena_test.cc',
   'classifier/small_exact_test.cc',
   'classifier/direct_exact_test.cc',
@@ -774,6 +781,7 @@ unit_test_sources = [
   'dataplane/rebuild_resource_test.cc',
   'dataplane/transaction_lifecycle_test.cc',
   'dataplane/scope_snapshot_test.cc',
+  'dataplane/slot_table_test.cc',
   'meter/meter_test.cc',
   'meter/meter_set_test.cc',
   'stats/stats_test.cc',
@@ -814,7 +822,6 @@ unit_test_sources = [
   'cli_mode_test.cc',
   'bessd_test.cc',
   'gate_test.cc',
-  'runtime/memory_test.cc',
   'metadata_test.cc',
   'module_test.cc',
   'modules/acl_test.cc',
@@ -897,6 +904,9 @@ unit_test_sources = [
   'utils/bpf_program_test.cc',
   'utils/checksum_test.cc',
   'utils/copy_test.cc',
+  'utils/dpdk_memory_test.cc',
+  'utils/dpdk_slab_test.cc',
+  'framework/memory_scope_test.cc',
   'utils/http_parser_kernels_test.cc',
   'utils/codel_test.cc',
   'utils/cuckoo_map_test.cc',

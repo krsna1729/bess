@@ -900,11 +900,11 @@ int main(int argc, char **argv) {
   }
   argc = w;
 
-  // Same sandbox-safe EAL as pmd_bench/bessd -m 0: --no-huge, malloc-backed.
-  // EAL is initialized before Google Benchmark threads exist, and before any
-  // pool is created (the per-lcore caches are sized for the lcores known at
-  // pool creation).
-  bess::InitDpdk(0);
+  // Same sandbox-safe EAL as pmd_bench/`bessd --mem_backing=normal`: --no-huge,
+  // malloc-backed (the library default). EAL is initialized before Google
+  // Benchmark threads exist, and before any pool is created (the per-lcore
+  // caches are sized for the lcores known at pool creation).
+  bess::InitDpdk();
 
   ChoosePlacement();
   LOG(INFO) << "mempool_bench: lcore_mode=" << LcoreModeName(g_lcore_mode)

@@ -11,7 +11,6 @@
 #include <rte_dev.h>
 
 #include "packet_pool.h"
-#include "runtime/opts.h"
 
 namespace {
 
@@ -533,11 +532,10 @@ TEST(RxMarkNegotiationTest, ClassifiesTheAnswer) {
 
 namespace {
 
-// EAL as `bessd -m 0` brings it up (--no-huge, malloc-backed pools), once per
-// process.
+// EAL as `bessd --mem_backing=normal` brings it up (--no-huge, malloc-backed
+// pools: the library default, D-198), once per process.
 void InitEalOnce() {
   static const bool initialized = [] {
-    FLAGS_m = 0;
     bess::PacketPool::CreateDefaultPools(32767);
     return true;
   }();

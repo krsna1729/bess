@@ -25,6 +25,7 @@
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
 #include "testing/allocation_faults.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::dataplane {
 namespace {
@@ -926,7 +927,7 @@ TEST_F(TransactionEngineTest, DependencyDeclarationsAreEnforced) {
   // existing references would be missing from the ledger.
   SlotTable<ActionId, Action> populated_table(8);
   populated_table.Publish(ActionId(1),
-                          std::make_unique<const Action>(Action{1, MeterId(9)}));
+                          populated_table.Make(Action{1, MeterId(9)}));
   SlotResource<ActionId, Action> populated(
       "populated", populated_table,
       [](const Action &a) {
@@ -975,6 +976,94 @@ TEST_F(TransactionEngineTest, UnregisterWaitsForPendingRemovals) {
   EXPECT_EQ(engine_.ReclaimRetired(), 0u);
   domain_.Offline(kReader);
   domain_.Unregister(kReader);
+}
+
+// A resource whose erase finishes in a removal step that memory can refuse,
+// as MeterResource's can (its stage edits DPDK memory, D-198): while
+// `refuse` is set the step throws, having changed nothing.
+class RefusableRemoval final : public Resource {
+ public:
+  explicit RefusableRemoval(std::string name) : Resource(std::move(name)) {}
+  size_t LiveCount() const override { return keys_.size(); }
+  bool Contains(const ResourceKey &key) const override {
+    return keys_.contains(key);
+  }
+  bool DefersErase() const override { return true; }
+
+  std::expected<Reservation, std::string> Reserve(const Op &op) override {
+    struct Staged final : StagedOp {
+      RefusableRemoval *r;
+      Op op;
+      Staged(RefusableRemoval *res, Op o) : r(res), op(std::move(o)) {}
+      void Publish(Retirer &retirer) noexcept override {
+        if (op.kind == OpKind::kUpsert) {
+          r->keys_.insert(op.key);
+          return;
+        }
+        retirer.RemoveLater([r = r, key = op.key](Retirer &) {
+          r->attempts++;
+          if (r->refuse) {
+            throw utils::MemoryRefused(
+                utils::MemoryRefused::Reason::kNormalLimit, 1, "refused");
+          }
+          r->keys_.erase(key);
+        });
+      }
+    };
+    Reservation reservation{std::make_unique<Staged>(this, op), {}};
+    if (op.kind == OpKind::kErase) {
+      reservation.footprint.removals = 1;
+      reservation.existed = true;
+    }
+    return reservation;
+  }
+
+  bool refuse = false;
+  int attempts = 0;
+
+ private:
+  std::set<ResourceKey> keys_;
+};
+
+// A removal step refused for memory does not fail the transaction whose
+// reclamation met it, and runs again after another grace period; the steps
+// of its stage that ran are not run again (it used to replay them: the slot
+// emptied twice, a CHECK in SlotTable::Unpublish).
+TEST_F(TransactionEngineTest, RefusedRemovalStepIsRetriedAndItsStageNotReplayed) {
+  constexpr rcu::ReaderId kReader = 12;
+  ASSERT_TRUE(domain_.Register(kReader).has_value());
+  domain_.Online(kReader);
+  RefusableRemoval refusable("refusable");
+  ASSERT_TRUE(engine_.Register(&refusable));
+  const Op upsert_k = Op::Upsert("refusable", "k", std::any(1));
+  ASSERT_EQ(Apply({Met(1, 100), upsert_k}).outcome, Outcome::kApplied);
+  // Both rank 0, so one stage: the slot's removal step, then the refusable one.
+  ASSERT_EQ(Apply({EraseMet(1), Op::Erase("refusable", "k")}).outcome,
+            Outcome::kApplied);
+
+  refusable.refuse = true;
+  domain_.Quiescent(kReader);
+  TransactionEngine::Result r;
+  EXPECT_NO_THROW(r = Apply({Met(2, 200)}));
+  EXPECT_EQ(r.outcome, Outcome::kApplied);
+  EXPECT_EQ(refusable.attempts, 1);
+  EXPECT_TRUE(refusable.Contains("k")) << "the refused step changed nothing";
+  EXPECT_EQ(meters_.Lookup(MeterId(1)), nullptr) << "the slot's step ran";
+  EXPECT_EQ(engine_.pending_cascades(), 1u);
+
+  refusable.refuse = false;
+  domain_.Quiescent(kReader);
+  EXPECT_NO_THROW(r = Apply({Met(1, 300)}));
+  EXPECT_EQ(r.outcome, Outcome::kApplied) << "id 1 was freed once";
+  EXPECT_EQ(refusable.attempts, 2);
+  EXPECT_FALSE(refusable.Contains("k"));
+  EXPECT_EQ(engine_.pending_cascades(), 0u);
+  ASSERT_NE(meters_.Lookup(MeterId(1)), nullptr);
+  EXPECT_EQ(meters_.Lookup(MeterId(1))->rate, 300u);
+
+  domain_.Offline(kReader);
+  domain_.Unregister(kReader);
+  EXPECT_TRUE(engine_.Unregister("refusable"));
 }
 
 // Aggregate capacity cannot promise placement: keys chosen to share one
@@ -1534,15 +1623,15 @@ TEST_F(KeyHolderTest, TheKeyHolderRanksBelowEveryReferrer) {
   EXPECT_EQ(actions_res.rank(), 1);
 
   // A key the unregistered holder holds cannot be counted anywhere.
-  const std::unique_ptr<const Meter> none =
-      held.Publish(MeterId(5), std::make_unique<const Meter>(1));
+  const SlotTable<MeterId, Meter>::Owned none =
+      held.Publish(MeterId(5), held.Make(1));
   auto r = apply({Use(1, 5)});
   ASSERT_EQ(r.outcome, Outcome::kRejected);
   EXPECT_NE(r.ops[0].error.find("key holder 'held' is not registered"),
             std::string::npos)
       << r.ops[0].error;
   held.Retire(MeterId(5));
-  const std::unique_ptr<const Meter> gone = held.Unpublish(MeterId(5));
+  const SlotTable<MeterId, Meter>::Owned gone = held.Unpublish(MeterId(5));
 
   ASSERT_TRUE(engine.Register(&base_res));
   ASSERT_TRUE(engine.Register(&ranked_res));

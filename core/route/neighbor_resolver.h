@@ -224,6 +224,23 @@ class NeighborResolver {
         new NeighborResolver(config, std::move(*wheel)));
   }
 
+  // What Create allocates (D-198), all of it glibc: the timer wheel (one
+  // node per neighbor), the due list reserved for every neighbor, and the
+  // resolver itself, as bytes() counts them. The control-side maps of
+  // neighbors and interfaces grow with them and are not counted.
+  static size_t Bytes(const Config &config, uint64_t start = 0) noexcept {
+    return dataplane::ExpiryWheel<TimerPayload>::Bytes(
+               config.capacity, start, config.granularity_shift) +
+           config.capacity * sizeof(TimerPayload) + sizeof(NeighborResolver);
+  }
+  static size_t GlibcBytes(const Config &config, uint64_t start = 0) noexcept {
+    return Bytes(config, start);
+  }
+  size_t bytes() const noexcept {
+    return wheel_->bytes() + due_.capacity() * sizeof(TimerPayload) +
+           sizeof(*this);
+  }
+
   NeighborResolver(const NeighborResolver &) = delete;
   NeighborResolver &operator=(const NeighborResolver &) = delete;
 

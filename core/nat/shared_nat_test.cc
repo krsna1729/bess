@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "framework/memory_scope.h"
 #include "nat/nat.h"
 #include "rcu/rcu_domain.h"
 
@@ -56,6 +57,68 @@ TEST(SharedNatTest, NeedsAnRcuDomain) {
   auto made = SharedNat::Create(Config<SharedNat>(nullptr, 64));
   ASSERT_FALSE(made.has_value());
   EXPECT_EQ(SharedNat::CreateError::kNoRcuDomain, made.error());
+}
+
+// D-198: what Create allocates is known before it runs.
+TEST(SharedNatTest, MemoryCostIsWhatCreateAllocates) {
+  rcu::RcuDomain domain(2);
+  for (const size_t capacity : {size_t{64}, size_t{4096}, size_t{50000}}) {
+    const auto config = Config<SharedNat>(&domain, capacity);
+    auto nat = SharedNat::Create(config).value();
+    EXPECT_EQ(framework::MemoryCost<SharedNat>::Bytes(config), nat->bytes());
+    EXPECT_LT(framework::MemoryCost<SharedNat>::GlibcBytes(config), nat->bytes());
+    const auto counted = Config<CountedSharedNat>(&domain, capacity);
+    auto with_usage = CountedSharedNat::Create(counted).value();
+    EXPECT_EQ(framework::MemoryCost<CountedSharedNat>::Bytes(counted),
+              with_usage->bytes());
+  }
+}
+
+// Records what a primitive admits (D-198); refuses every growth while
+// `refuse` is set.
+struct RecordingGrowth final : utils::MemoryGrowth {
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    if (refuse) {
+      throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit,
+                                 bytes, "refused by the test");
+    }
+    grown += static_cast<ptrdiff_t>(bytes);
+    glibc += static_cast<ptrdiff_t>(glibc_bytes);
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    grown -= static_cast<ptrdiff_t>(bytes);
+    glibc -= static_cast<ptrdiff_t>(glibc_bytes);
+  }
+  bool refuse = false;
+  ptrdiff_t grown = 0;
+  ptrdiff_t glibc = 0;
+};
+
+// Grow admits the larger table before it allocates it and gives back the old
+// one's bytes once it is freed; a refusal changes nothing.
+TEST(SharedNatTest, GrowAdmitsTheLargerTable) {
+  rcu::RcuDomain domain(2);
+  auto config = Config<SharedNat>(&domain, 64);
+  config.max_capacity = 256;
+  auto nat = SharedNat::Create(config).value();
+  RecordingGrowth growth;
+  nat->set_memory_growth(&growth);
+  const size_t before = nat->bytes();
+  growth.refuse = true;
+  EXPECT_THROW(nat->Grow(128), utils::MemoryRefused);
+  EXPECT_EQ(64u, nat->capacity());
+  EXPECT_EQ(before, nat->bytes());
+  growth.refuse = false;
+  ASSERT_TRUE(nat->Grow(128));
+  EXPECT_EQ(128u, nat->capacity());
+  const auto delta = static_cast<ptrdiff_t>(SharedNat::TableBytes(128, &domain) -
+                                            SharedNat::TableBytes(64, &domain));
+  EXPECT_EQ(delta, growth.grown);
+  EXPECT_EQ(static_cast<ptrdiff_t>(SharedNat::TableGlibcBytes(128, &domain) -
+                                   SharedNat::TableGlibcBytes(64, &domain)),
+            growth.glibc);
+  EXPECT_EQ(static_cast<ptrdiff_t>(before) + delta,
+            static_cast<ptrdiff_t>(nat->bytes()));
 }
 
 // On one thread, a SharedNat answers exactly as a Nat with the same seed:

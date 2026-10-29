@@ -22,10 +22,10 @@ propose it unprompted.
   verification.
 - **No real hugepages or NIC in this sandbox.** `/proc/meminfo` shows only
   ~256MB of hugepage capacity, often already exhausted. Run `bessd` with
-  `-m 0` (no-hugepage mode — already a supported fallback path in
-  `core/dpdk.cc`). The live tests (`tests/live/live_daemon.h`) already do this
-  (`-m 0 -skip_root_check -dpdk=false`); do the same for any manual `bessd`
-  invocation.
+  `--mem_backing=normal` (normal pages only, DPDK `--no-huge`; see
+  `docs/running-in-containers.md#memory`). The live tests
+  (`tests/live/live_daemon.cc`) already do this (`--mem_backing=normal
+  -skip_root_check`); do the same for any manual `bessd` invocation.
 - **DPDK build lives in `deps/dpdk-<ver>/`**, gitignored, and is bootstrapped
   with `tools/bootstrap_dpdk.py`.  It reads the single pinned source record
   in `deps/dpdk.json`, verifies the SHA256 before extraction, and installs the
@@ -161,7 +161,7 @@ source tree.
 Module tests run without Python: in process through
 `core/testing/module_harness.h` (packets in, gates out) or, when they need a
 running daemon or workers, in `tests/live/` (suite `live`), each binary
-starting its own unprivileged `bessd -skip_root_check -m 0`.
+starting its own unprivileged `bessd -skip_root_check --mem_backing=normal`.
 
 ### Build invariants
 

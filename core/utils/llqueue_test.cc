@@ -6,6 +6,11 @@
 
 #include <gtest/gtest.h>
 
+#include <utility>
+#include <vector>
+
+#include "framework/memory_scope.h"
+
 namespace {
 
 using bess::utils::LockLessQueue;
@@ -113,6 +118,74 @@ TEST(LLQueueTest, MultiPushPop) {
     delete vals[i];
   }
   delete[] output;
+}
+
+// What the constructor allocates (the ring, glibc) is what the queue reports
+// and what RingBytes says AllocRingMem takes (D-198).
+TEST(LLQueueTest, BytesMatchesTheConstructor) {
+  using Q = LockLessQueue<int*>;
+  for (size_t capacity : {size_t{8}, size_t{256}, size_t{4096}}) {
+    Q q(capacity);
+    EXPECT_EQ(bess::framework::MemoryCost<Q>::Bytes(capacity), q.bytes());
+    EXPECT_EQ(bess::framework::MemoryCost<Q>::Bytes(capacity),
+              bess::framework::MemoryCost<Q>::GlibcBytes(capacity));
+    const ssize_t raw = rte_ring_get_memsize(static_cast<unsigned>(capacity));
+    ASSERT_GT(raw, 0);
+    EXPECT_EQ(bess::utils::RingMemBytes(static_cast<size_t>(raw)), q.bytes());
+    EXPECT_GE(q.bytes(), capacity * sizeof(void*));
+  }
+  Q fallback;
+  EXPECT_EQ(Q::Bytes(), fallback.bytes());
+  EXPECT_EQ(0u, bess::utils::RingBytes(size_t{1} << 40));
+}
+
+// Records the growth a queue asks (D-198); refuses it when `refuse` is set.
+struct RecordingGrowth final : bess::utils::MemoryGrowth {
+  std::vector<std::pair<size_t, size_t>> grown, shrunk;
+  bool refuse = false;
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    if (refuse) {
+      throw bess::utils::MemoryRefused(
+          bess::utils::MemoryRefused::Reason::kNormalLimit, bytes, "refused");
+    }
+    grown.emplace_back(bytes, glibc_bytes);
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    shrunk.emplace_back(bytes, glibc_bytes);
+  }
+};
+
+// Resize admits the new ring first and gives back the old one after.
+TEST(LLQueueTest, ResizeAdmitsTheNewRingFirst) {
+  LockLessQueue<int*> q(8);
+  RecordingGrowth growth;
+  q.set_memory_growth(&growth);
+  const size_t small = q.bytes();
+  const size_t big = bess::utils::RingBytes(64);
+  ASSERT_EQ(0, q.Resize(64));
+  EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{{big, big}}), growth.grown);
+  EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{{small, small}}),
+            growth.shrunk);
+  EXPECT_EQ(big, q.bytes());
+}
+
+// A refused Resize leaves the queue as it was, items included.
+TEST(LLQueueTest, ARefusedResizeChangesNothing) {
+  LockLessQueue<int*> q(8);
+  int value = 0;
+  ASSERT_FALSE(q.Push(&value));
+  RecordingGrowth growth;
+  growth.refuse = true;
+  q.set_memory_growth(&growth);
+  const size_t before = q.bytes();
+  EXPECT_THROW(q.Resize(64), bess::utils::MemoryRefused);
+  EXPECT_EQ(8u, q.Capacity());
+  EXPECT_EQ(before, q.bytes());
+  EXPECT_EQ(1u, q.Size());
+  EXPECT_TRUE(growth.shrunk.empty());
+  int* out = nullptr;
+  ASSERT_FALSE(q.Pop(out));
+  EXPECT_EQ(&value, out);
 }
 
 }  // namespace

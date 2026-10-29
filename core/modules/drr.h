@@ -12,6 +12,7 @@
 #include <rte_hash_crc.h>
 #include <rte_ring.h>
 
+#include "framework/memory_scope.h"
 #include "framework/singleton_resource.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
@@ -246,7 +247,8 @@ class DRR final : public Module {
 
   friend class DrrTestPeer;
 
-  // Allocates the round-robin and ingress rings (Init, after the task).
+  // Admits (D-198, "rings") and allocates the round-robin and ingress rings
+  // (Init, after the task). A refusal throws MemoryRefused, nothing allocated.
   CommandResponse AllocateRings();
 
   // Test-only fault injection for the flow-creation slow path (DrrTestPeer).
@@ -275,6 +277,10 @@ class DRR final : public Module {
   CuckooMap<FlowId, Flow *, Hash, EqualTo> flows_;
   rte_ring *ingress_;     // multi-producer, single-consumer: packets in.
   rte_ring *flow_ring_;   // ring used for round robin.
+  // The admission of flow_ring_ and ingress_ ("rings", D-198), released with
+  // the module after ~DRR frees them. The per-flow rings and Flow objects are
+  // created on the task's worker (packet path) and are not admitted.
+  bess::framework::MemoryLease rings_lease_;
   Flow *current_flow_;  // store current flow between batch rounds.
 
   // The D-019 ownership invariant, checked in debug builds: the task (its

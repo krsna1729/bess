@@ -396,10 +396,24 @@ class Conntrack {
     // at 64K and 58-64% at 1M.
     const dataplane::LookupBody forced = dataplane::LookupBodyOverride();
     ct->body_ = forced != dataplane::LookupBody::kAuto ? forced
-                : ct->table_->memory_bytes() > dataplane::CacheGeometry::Smallest().l2_bytes
+                : ct->table_->bytes() > dataplane::CacheGeometry::Smallest().l2_bytes
                     ? dataplane::LookupBody::kStaged
                     : dataplane::LookupBody::kPlain;
     return ct;
+  }
+
+  // What Create allocates (D-198), all of it glibc: the connection table,
+  // the timer wheel and the tracker itself, as bytes() counts them.
+  static size_t Bytes(size_t capacity, const TimeoutPolicy & = TimeoutPolicy{},
+                      Tick start = 0, unsigned granularity_shift = 0) noexcept {
+    return Table::Bytes(capacity) +
+           Wheel::Bytes(capacity, start, granularity_shift) + sizeof(Conntrack);
+  }
+  static size_t GlibcBytes(size_t capacity,
+                           const TimeoutPolicy &policy = TimeoutPolicy{},
+                           Tick start = 0,
+                           unsigned granularity_shift = 0) noexcept {
+    return Bytes(capacity, policy, start, granularity_shift);
   }
 
   // What `p` is to its connection, updating the connection's state and
@@ -573,6 +587,9 @@ class Conntrack {
   dataplane::LookupBody batch_body() const noexcept { return body_; }
   void SetBatchBodyForTesting(dataplane::LookupBody body) noexcept { body_ = body; }
   size_t capacity() const noexcept { return table_->capacity(); }
+  size_t bytes() const noexcept {
+    return table_->bytes() + wheel_->bytes() + sizeof(*this);
+  }
   const TimeoutPolicy &policy() const noexcept { return policy_; }
 
  private:

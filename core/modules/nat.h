@@ -9,6 +9,7 @@
 #include <string>
 #include <variant>
 
+#include "framework/memory_scope.h"
 #include "framework/module_requests.h"
 #include "module.h"
 #include "nat/nat.h"
@@ -61,21 +62,27 @@ class NAT final : public Module {
   void Translate(N &nat, Context *ctx, bess::PacketBatch *batch);
   template <typename N>
   CommandResponse Make(typename N::Config &config);
+  // Owned growth: frees a table in flight (nullptr: nothing) and gives its
+  // admitted bytes back.
+  void FreeTable(void *table) noexcept;
 
   // The engine the arguments chose: owned (fixed, or growable with
-  // max_capacity) or shared, each with or without usage counters.
-  using Engine = std::variant<std::monostate, std::unique_ptr<bess::nat::Nat>,
-                              std::unique_ptr<bess::nat::GrowableNat>,
-                              std::unique_ptr<bess::nat::SharedNat>,
-                              std::unique_ptr<bess::nat::CountedNat>,
-                              std::unique_ptr<bess::nat::CountedGrowableNat>,
-                              std::unique_ptr<bess::nat::CountedSharedNat>>;
+  // max_capacity) or shared, each with or without usage counters. Admitted as
+  // "<name>/bindings" (D-198), which also carries every growth.
+  using Engine = std::variant<std::monostate, bess::framework::Sized<bess::nat::Nat>,
+                              bess::framework::Sized<bess::nat::GrowableNat>,
+                              bess::framework::Sized<bess::nat::SharedNat>,
+                              bess::framework::Sized<bess::nat::CountedNat>,
+                              bess::framework::Sized<bess::nat::CountedGrowableNat>,
+                              bess::framework::Sized<bess::nat::CountedSharedNat>>;
   Engine engine_;
-  // Owned growth: tables in flight, of the engine's table type (deleted with
-  // delete_table_, which knows it).
+  // Owned growth: tables in flight, of the engine's table type (freed with
+  // free_table_, which knows it and gives its bytes back to table_growth_,
+  // the engine's lease).
   std::atomic<void *> handover_{nullptr};  // control -> worker
   std::atomic<void *> retired_{nullptr};   // worker -> control
-  void (*delete_table_)(void *) = nullptr;
+  void (*free_table_)(bess::utils::MemoryGrowth *, void *) = nullptr;
+  bess::utils::MemoryGrowth *table_growth_ = nullptr;
   bess::framework::RequestEndpoint<GrowRequest> grow_;
   bess::framework::RequestEndpoint<GrowRequest> free_;
   // Bindings refused (M25, D-089): the table (or its wheel) full, or no free

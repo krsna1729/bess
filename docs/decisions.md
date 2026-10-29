@@ -13831,3 +13831,120 @@ not simultaneous publication of several tenants, unrelated resources or NIC
 rules. Erasure follows the framework's grace-period removal cascade.
 This is a correctness/control consumer, not a throughput or latency claim.
 
+## D-198 Dataplane memory: hugepage-first, a declared fallback, a limit, one way to ask
+
+**Status:** proposed (2026-10-25). Completes D-029's part 2; replaces D-029's `-m` and `--no-huge` sizing;
+amends D-149's status report.
+**Code:** `core/utils/dpdk_memory.{h,cc}` (`MemoryRefused`, `MemoryPolicy`, `AdmitNormalMemory`,
+`FallbackSocket`, `RefuseDpdkMemory`, `GetMemoryStatus`), `core/utils/dpdk_slab.h` (`ObjectSlab<T>`, new),
+`core/framework/memory_scope.{h,cc}` (`MemoryScope`, `MemoryCost<T>`, `MemoryAccounts`, new),
+`core/framework/module_init_context.h`, `core/runtime/{opts,dpdk,startup}.cc`, `core/packet_pool.cc`,
+`core/dataplane/{slot_table,slot_resource,object_table}.h`, `core/stats/keyed_counters.{h,cc}`,
+`core/stats/worker_slots.h`,
+`core/meter/meter_set.{h,cc}`, `core/classifier/concurrent_exact.cc`, `core/route/route_table.cc`,
+`core/rcu/rcu_domain.{h,cc}`, the table-owning modules, `core/control/{control_error,api_v2}.cc`,
+`protobuf/control_v2.proto`, `tools/layer_dag.json`, docs.
+
+**Context.** D-029 made `utils/dpdk_memory.h` "the one allocator for dataplane memory" and listed in its part 2
+the containers to move onto it: `SlotTable`, the masked tables' records, the K6 statistics, `CuckooMap`, the RCU
+objects. Part 2 was never done, and the gap grew: `SlotTable` (slots and every object), `ObjectTable`,
+`KeyedCounters` (D-154), `WorkerSlots`, `RecordArena`'s chunks and `MeterSet`'s index are glibc memory -- 4 KiB
+pages on the memory node by `MPOL_PREFERRED` (D-123), never hugepages, although workers read them per packet.
+`DpdkArray`, `DpdkAllocator` and `MakeDpdk` had no user. A plugin found the cost first: the UPF's counter module
+kept 64 planes of `capacity x 16 B` in a zero-filled `std::vector` (D-154 was written to replace exactly that),
+and a 250K-session load committed about 1.25 GB of glibc memory at pipeline apply and was OOM-killed under a 6 GB
+limit.
+
+Four further gaps: (1) the daemon does not know its memory limit -- nothing reads `memory.max`, and `--no-huge`
+is a fixed 512 MB whatever the container allows; (2) running out of hugepages after startup has no fallback and no
+flag to allow one (`-m -1` falls back only when no hugepage is usable at startup); (3) a failed allocation on the
+control path is not an error: no handler in `control/`, `module.cc`, `framework/` or the transaction engine catches
+`std::bad_alloc`, and `ENOMEM` maps to `UNAVAILABLE`, which clients are told to retry; (4) there is no one way to
+say any of this. Memory is configured by `-m` (three meanings in one integer: -1, 0, N), `--dpdk` (a fourth
+spelling of "normal pages"), and two environment variables for tests and library users (`BESS_DPDK_NOHUGE_MB`,
+`BESS_DPDK_HUGEPAGE_MB`). Modules size their tables with arguments under 19 different names and obtain the memory
+four ways (`DpdkAllocate`, a library constructor given a socket integer -- the UPF passed `-1` and so bypassed the
+memory node --, `std::vector`, `new`); no module states what it costs, so nothing can refuse an `Init` before it
+is half built, and the status counts entries, not bytes (D-149 left `Module::ReportFootprint` out).
+
+**Decision.**
+- **One allocator, hugepage first.** Every N-scaled structure a worker reads comes from `DpdkAllocate` (directly,
+  through `DpdkArray`/`DpdkAllocator`, or through `ObjectSlab<T>` for per-entry objects). Per-entry objects never
+  get one `rte_malloc` each: DPDK adds a header and cache-line rounding per element, so a 32-byte object would
+  cost about four times its size. `ObjectSlab<T>` is a fixed-stride slab in DPDK chunks with an intrusive free
+  list; `SlotTable` owns one, creates objects with `Make`, and its owning pointer is the slab's.
+- **Keep the public counter boundary.** `KeyedCounters` keeps a public header, with construction and destruction
+  out of line in the installed `bess_stats` archive. The implementation uses the private DPDK allocator without
+  exposing its experimental header; the inline packet-path view and the counter indexing are unchanged.
+  `bess-dev-static` links the archive for standalone consumers; plugins resolve the methods from bessd.
+- **Lazy library initialization keeps CPU affinity.** A first allocation may bring up the EAL outside bessd.
+  Its `--lcores` mapping groups the whole physical CPU set in parentheses, including disjoint sets such as
+  `127@(0-1,12-15)`, so commas cannot create extra lcore mappings and narrow the caller's inherited affinity.
+- **A declared fallback.** `--mem_fallback` (default off). Off: when the hugepage heap cannot grow, the creation
+  is refused (`MemoryRefused`, reason "hugepages exhausted"), never silently downgraded. On: the memory comes from
+  a DPDK external heap ("bess-normal") of anonymous normal pages, grown in chunks on the control path -- still one
+  allocator (`rte_free` frees both), still on the memory node by the mempolicy. DPDK libraries that allocate
+  internally (`rte_hash`, `rte_lpm`, `rte_fib`) retry once on that heap's socket. What `rte_hash` still takes from
+  DPDK's native heaps (its tailq entries, its RCU defer queue) is refused when they are full
+  (`utils::RefuseDpdkMemory`), never reported as a full table. With normal backing there is no
+  backing to lose, so the fallback is always allowed.
+- **A limit the daemon knows.** `--mem_limit_mb` (default: the smallest `memory.max` on bessd's cgroup v2 path,
+  else `MemTotal`; -1: none) and `--mem_reserve_mb` (default max(128 MB, limit/16)) for memory nobody accounts
+  (glibc, gRPC, transactions). Every normal-page commitment -- the `--no-huge` heap, the fallback heap's growth,
+  DPDK library tables on normal pages -- is admitted against the working set (`memory.current` minus
+  `inactive_file`, or RSS without a cgroup): past `limit - reserve` it is refused before the pages are touched.
+  Hugepages are charged to the hugetlb controller and, only when cgroup2 has `memory_hugetlb_accounting`, to
+  `memory.max` as well (see below). The normal-page heap is sized from the limit instead of 512 MB.
+- **One flag family.** `--mem_backing=auto|hugepages|normal` (auto: hugepages when usable at startup, else normal
+  pages with a warning; hugepages: refuse to start without them), `--mem_hugepage_mb` (the hugepage cap, D-029's
+  `--socket-limit`; 0: none), `--mem_fallback`, `--mem_limit_mb`, `--mem_reserve_mb`. Library users and tests read
+  the same settings as `BESSD_MEM_*` (D-030's naming). `-m`, `--dpdk` and `BESS_DPDK_{NOHUGE,HUGEPAGE}_MB` are
+  removed, every caller migrated in the same change. The packet pool keeps `--buffers`/`--packet_data_room` and is
+  admitted and reported like a table.
+- **One way for a module to ask.** `init_context().memory()` is the module's `MemoryScope`: the memory node's
+  socket, `Admit(resource, bytes)` before anything is allocated, and `Create<T>(resource, args...)`, which admits
+  `MemoryCost<T>::Bytes(args...)` and builds `T` on the memory node. Each primitive states its cost from the
+  arguments that size it, and its tests hold the cost equal to what it allocates. An `Init` is admitted whole or
+  refused whole; control-path growth (a table that doubles) admits its delta first. Argument names stay each
+  module's own: modules size different things (entries, tuple groups, meter levels, queue depth), so the common
+  currency is bytes, not a vocabulary. A plugin that uses it declares `BESS_CAP_MEMORY` (D-089: the scope's
+  methods are daemon symbols, so an older daemon refuses the plugin by name instead of failing to load it).
+- **Refusal is an answer, not a crash.** `MemoryRefused` derives from `std::bad_alloc`; every control boundary
+  that creates (module Init, pipeline apply, transaction reserve, table commands) catches it and answers gRPC
+  `RESOURCE_EXHAUSTED` with the message (bytes asked, limit and source, what to change). `ENOMEM` maps there too:
+  a retry does not make memory appear. A transaction's removal stage can meet a refusal too (its edits are DPDK
+  memory, checked against the limit again on normal pages); nothing answers it, so the engine leaves the refused
+  step, which changed nothing, in its stage and runs it after another grace period, without running the steps
+  before it again.
+- **Reported.** `GetResourceStatus` gains `memory`: limit and its source, reserve, used, available, the hugepage
+  and fallback heaps, refusals, and bytes per module and resource (admitted and current). bessd logs the resolved
+  policy once at startup.
+
+**Amendment (2026-10-25): module memory and charged hugepages.**
+- **One entry point for modules.** A module sizes every table, pool or ring through `init_context().memory()`
+  (`framework/memory_scope.h`): each primitive states its cost (`static T::Bytes(args...)`, `GlibcBytes` for the
+  glibc part, equal to its `bytes()` after construction, checked by its unit test); `Create<T>` (or `LeaseFor<T>`
+  + factory + `Adopt`) admits it under the policy (`utils::AdmitTable`) before allocating; a primitive that grows on
+  the control path takes a `utils::MemoryGrowth` hook and admits each delta; the scope is the module's own,
+  released with it, and `GetResourceStatus.memory.modules` reports admitted and current bytes per module/resource
+  (the packet pool as `bessd/packet_pool`). Module argument names are unchanged.
+- **Hugepages can be charged to `memory.max`.** The Context's "hugepages are not charged" holds only when cgroup2 is
+  mounted without `memory_hugetlb_accounting`. With it, a hugepage is charged when faulted in and a
+  charge past `memory.max` is SIGBUS even with free pool pages (measured: a bessd holding one 1 GB page showed
+  `memory.current` 1090 MB, `memory.stat hugetlb 1073741824`). bessd reads the option from `/proc/self/mountinfo`
+  (`MemoryPolicy::hugetlb_charged`, reported as `memory.hugetlb_charged`); then table admission also admits the
+  whole pages the heap must map against the limit, and a DPDK allocation validator on the memory node refuses any
+  heap growth past the cap or, when charged, past the limit (rte_malloc fails into the existing refusal). With
+  hugepage backing the cgroup's `hugetlb.<size>.max` caps the heap like `--mem_hugepage_mb` (the smaller wins), so
+  DPDK refuses at it rather than faulting past it. bessd warns at startup when a charged limit is below the cap plus
+  the reserve. The [kernel cgroup-v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html#mount-options)
+  defines this opt-in accounting and the SIGBUS failure. Do not infer it from the kernel version alone.
+  [Kubernetes KEP-1539](https://github.com/kubernetes/enhancements/tree/f2dbd52c3c8a17842b3c25802a2f0ea8ccf16789/keps/sig-node/1539-hugepages)
+  provisions hugepages as a separate resource. Inspect the node's actual mount option: where charging is enabled,
+  `memory.max` must cover charged hugepages plus ordinary memory and the reserve; a separate hugepage request
+  is not evidence that the memory controller excludes those pages.
+
+**Evidence:** pending -- (1) the memory model against capped measurements at 10K-100K sessions with and without
+hugepages; (2) an over-limit load refused with `RESOURCE_EXHAUSTED`, the daemon alive, no OOM kill; (3) ABBA of
+the packet path, before and after, at 100K and 1M sessions (zero cost or better, the performance contract);
+(4) the unit tests named above.

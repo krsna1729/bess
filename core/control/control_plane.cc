@@ -261,7 +261,17 @@ ControlResult<PortInfo> ControlPlane::CreatePortLocked(const PortSpec& spec) {
   // DPDK functions may be called, so be prepared
   current_worker.SetNonWorker();
 
-  CommandResponse ret = p->InitWithGenericArg(spec.arg);
+  // D-198: memory refused while the driver initializes (a queue, a pool)
+  // ends like an Init that returned an error: `p` is destroyed on the way
+  // out and nothing was registered.
+  CommandResponse ret;
+  try {
+    ret = p->InitWithGenericArg(spec.arg);
+  } catch (const std::bad_alloc& e) {
+    ControlError error = OutOfMemory(e);
+    error.object = port_name;
+    return std::unexpected(std::move(error));
+  }
 
   {
     google::protobuf::Any empty;
@@ -1696,13 +1706,29 @@ ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
   const framework::ResourceBindings &bindings = framework::ResourceBindings::ProcessDefault();
   std::vector<dataplane::Op> ops;
   bool pause = false;
-  for (const ResourceSpec &resource : resources) {
-    auto converged = Converge(engine, bindings, resource, /*build_ops=*/true);
-    if (!converged) {
-      return std::unexpected(converged.error());
+  // D-198: memory refused while building the operations (a pure read of the
+  // resources) or while the engine reserves them answers RESOURCE_EXHAUSTED.
+  // The engine allocates only in its Reserve phase, whose abort guard undoes
+  // the batch's reservations on unwind (D-172); batches before it stay
+  // applied, as they do when a later batch is refused with an error, and the
+  // caller treats this like any other refusal (ApplyPipeline aborts the
+  // topology).
+  const auto refused = [](const std::bad_alloc &e) {
+    ControlError error = OutOfMemory(e);
+    error.field = "resources";
+    return std::unexpected(std::move(error));
+  };
+  try {
+    for (const ResourceSpec &resource : resources) {
+      auto converged = Converge(engine, bindings, resource, /*build_ops=*/true);
+      if (!converged) {
+        return std::unexpected(converged.error());
+      }
+      pause = pause || (converged->requires_paused_workers && !converged->ops.empty());
+      std::move(converged->ops.begin(), converged->ops.end(), std::back_inserter(ops));
     }
-    pause = pause || (converged->requires_paused_workers && !converged->ops.empty());
-    std::move(converged->ops.begin(), converged->ops.end(), std::back_inserter(ops));
+  } catch (const std::bad_alloc &e) {
+    return refused(e);
   }
   if (ops.empty()) {
     return size_t{0};
@@ -1747,7 +1773,13 @@ ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
   // also owns the busy retry, which cannot live out here: a caller looping over
   // the whole request would re-apply the batches that already applied, and an
   // erase of an already-erased key is refused ("not found"), not ignored.
-  const dataplane::TransactionEngine::Result result = engine.ApplyBatched(ops);
+  std::optional<dataplane::TransactionEngine::Result> applied;
+  try {
+    applied.emplace(engine.ApplyBatched(ops));
+  } catch (const std::bad_alloc &e) {
+    return refused(e);
+  }
+  const dataplane::TransactionEngine::Result &result = *applied;
   switch (result.outcome) {
     case dataplane::TransactionEngine::Outcome::kApplied:
       break;
@@ -1850,13 +1882,21 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
     return std::unexpected(reversible.error());
   }
 
-  // 5. Run it.
+  // 5. Run it. D-198: memory refused inside a phase (a module's or port's
+  // Init answers it as its own error; anything else unwinds out of the phase)
+  // is answered like any other refusal: the abort undoes every operation that
+  // completed. An operation that throws after its effect and before its undo
+  // is recorded is not undone; the operations that do that allocate only
+  // small control-plane objects (gates, traffic classes, an undo record), so
+  // only an exhausted process heap reaches it, never a refused table.
   Transaction transaction(this, std::move(plan), std::move(before));
-  if (auto prepared = transaction.Prepare(); !prepared) {
+  if (auto prepared = RefuseOutOfMemory([&] { return transaction.Prepare(); });
+      !prepared) {
     transaction.Abort();
     return std::unexpected(prepared.error());
   }
-  if (auto committed = transaction.Commit(); !committed) {
+  if (auto committed = RefuseOutOfMemory([&] { return transaction.Commit(); });
+      !committed) {
     transaction.Abort();
     return std::unexpected(committed.error());
   }
@@ -1876,8 +1916,10 @@ ControlResult<ApplyResult> ControlPlane::ApplyPipeline(
   // Retirement is not undoable, so its preconditions were proven before the
   // commit (CheckReversibility). If a step still fails, the new state *is*
   // active -- the generation has to say so -- but the caller is told, because
-  // returning success would claim a pipeline that does not exist.
-  if (auto retired = transaction.Retire(); !retired) {
+  // returning success would claim a pipeline that does not exist. Memory
+  // refused while retiring is such a failure too.
+  if (auto retired = RefuseOutOfMemory([&] { return transaction.Retire(); });
+      !retired) {
     runtime::runtime().BumpGeneration();
 
     const char *phase =

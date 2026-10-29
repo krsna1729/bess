@@ -30,9 +30,15 @@ static_assert(WireStatus(ct::TrackStatus::kFull) == bess::pb::CONNTRACK_STATUS_F
 
 const Commands ConnTrack::cmds = {};
 
-std::unique_ptr<ConnTrack::Ct> ConnTrack::MakeTable() const {
-  auto made = Ct::Create(capacity_, policy_, tsc_to_ns(rdtsc()), kGranularityShift);
-  return made ? std::move(*made) : nullptr;
+bess::framework::Sized<ConnTrack::Ct> ConnTrack::MakeTable() const {
+  const uint64_t start = tsc_to_ns(rdtsc());
+  bess::framework::MemoryLease lease = init_context().memory().LeaseFor<Ct>(
+      "flows", capacity_, policy_, start, kGranularityShift);
+  auto made = Ct::Create(capacity_, policy_, start, kGranularityShift);
+  if (!made) {
+    return {};
+  }
+  return bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*made));
 }
 
 ModuleCapabilities ConnTrack::Capabilities(const bess::pb::ConnTrackArg &arg) {
@@ -66,12 +72,15 @@ CommandResponse ConnTrack::Init(const bess::pb::ConnTrackArg &arg) {
     }
   }
   if (mode_ == bess::pb::ConnTrackArg::SHARED || fallback_shared_) {
-    auto made = SharedCt::Create(capacity_, init_context().rcu(), policy_, tsc_to_ns(rdtsc()),
+    const uint64_t start = tsc_to_ns(rdtsc());
+    bess::framework::MemoryLease lease = init_context().memory().LeaseFor<SharedCt>(
+        "flows", capacity_, init_context().rcu(), policy_, start, kGranularityShift);
+    auto made = SharedCt::Create(capacity_, init_context().rcu(), policy_, start,
                                  kGranularityShift);
     if (!made) {
       return CommandFailure(ENOMEM, "cannot create the connection table");
     }
-    shared_ = std::move(*made);
+    shared_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*made));
     if (mode_ == bess::pb::ConnTrackArg::SHARED) {
       max_allowed_workers_ = Worker::kMaxWorkers;
       return CommandSuccess();
@@ -84,7 +93,7 @@ CommandResponse ConnTrack::Init(const bess::pb::ConnTrackArg &arg) {
     return CommandSuccess();
   }
   tables_[0] = MakeTable();
-  if (tables_[0] == nullptr) {
+  if (!tables_[0]) {
     return CommandFailure(ENOMEM, "cannot create the connection table");
   }
   return CommandSuccess();
@@ -111,11 +120,18 @@ int ConnTrack::OnEvent(bess::Event event) {
     if (refused_) {
       break;
     }
-    if (active_workers()[wid.value()] && tables_[wid.value()] == nullptr) {
-      tables_[wid.value()] = MakeTable();
-      if (tables_[wid.value()] == nullptr) {
-        refused_ = bess::utils::Format("no memory for worker %u's table",
-                                       unsigned{wid.value()});
+    if (active_workers()[wid.value()] && !tables_[wid.value()]) {
+      // Admitted ("flows") before it is made: a refusal, like a failed
+      // allocation, leaves the worker without a table.
+      try {
+        tables_[wid.value()] = MakeTable();
+        if (!tables_[wid.value()]) {
+          refused_ = bess::utils::Format("no memory for worker %u's table",
+                                         unsigned{wid.value()});
+        }
+      } catch (const bess::utils::MemoryRefused &e) {
+        refused_ = bess::utils::Format("no memory for worker %u's table: %s",
+                                       unsigned{wid.value()}, e.what());
       }
     }
   }
@@ -191,9 +207,9 @@ void ConnTrack::Track(T &table, Context *ctx, bess::PacketBatch *batch) {
 }
 
 std::string ConnTrack::GetDesc() const {
-  size_t n = shared_ != nullptr ? shared_->size() : 0;
+  size_t n = shared_ ? shared_->size() : 0;
   for (const auto &t : tables_) {
-    n += t != nullptr ? t->size() : 0;
+    n += t ? t->size() : 0;
   }
   if (refused_ && mode_ == bess::pb::ConnTrackArg::PER_WORKER) {
     return bess::utils::Format("%s: %s (%zu connections)",

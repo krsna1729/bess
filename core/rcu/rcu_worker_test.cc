@@ -13,7 +13,6 @@
 #include <thread>
 
 #include "runtime/runtime_state.h"
-#include "runtime/opts.h"
 #include "packet_pool.h"
 #include "port.h"
 #include "rcu/rcu_domain.h"
@@ -37,7 +36,7 @@ void InitRuntimeOnce() {
   }
   initialized = true;
 
-  FLAGS_m = 0;  // malloc-backed, sandbox-safe: PlainPacketPool
+  // The library default (D-198): normal pages, PlainPacketPool, sandbox-safe.
   bess::PacketPool::CreateDefaultPools(kPoolCapacity);
   PortBuilder::InitDrivers();
 }

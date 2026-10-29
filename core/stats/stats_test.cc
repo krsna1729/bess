@@ -7,15 +7,19 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "stats/counter_set.h"
 #include "stats/keyed_counters.h"
 #include "stats/worker_histogram.h"
 #include "stats/worker_local.h"
+#include "stats/worker_slots.h"
 
 namespace bess::stats {
 namespace {
@@ -461,6 +465,40 @@ TEST(WorkerHistogramTest, SnapshotsAreInternallyConsistent) {
   }
   EXPECT_EQ(0u, inconsistent) << "over " << snapshots << " snapshots";
   EXPECT_EQ(kWriters * kPerWriter, h.Snapshot().count);
+}
+
+// -- Memory (D-198): what each constructor allocates is what it reports -------
+
+TEST(StatsMemoryTest, BytesMatchesTheConstructor) {
+  using bess::framework::MemoryCost;
+  for (size_t cells : {size_t{1}, size_t{7}, size_t{100}}) {
+    WorkerSlots slots(cells);
+    EXPECT_EQ(MemoryCost<WorkerSlots>::Bytes(cells), slots.bytes());
+    EXPECT_EQ(0u, MemoryCost<WorkerSlots>::GlibcBytes(cells));
+  }
+  for (auto [keys, cells, workers] :
+       {std::array<size_t, 3>{1, 1, 1}, std::array<size_t, 3>{1000, 2, 4},
+        std::array<size_t, 3>{33, 3, dataplane::kMaxWorkers}}) {
+    KeyedCounters counters(keys, cells, workers);
+    EXPECT_EQ(MemoryCost<KeyedCounters>::Bytes(keys, cells, workers),
+              counters.bytes());
+  }
+  for (size_t n : {size_t{1}, size_t{3}, size_t{32}}) {
+    const std::vector<std::string> names(n, "c");
+    CounterSet set(names);
+    EXPECT_EQ(MemoryCost<CounterSet>::Bytes(names), set.bytes());
+    EXPECT_EQ(dataplane::kMaxWorkers * n * sizeof(uint64_t),
+              MemoryCost<CounterSet>::GlibcBytes(names));
+  }
+  for (const HistogramLayout &layout :
+       {HistogramLayout::Log2(), HistogramLayout::Linear(10, 4),
+        HistogramLayout::Linear(1, 200)}) {
+    WorkerHistogram h(layout);
+    EXPECT_EQ(MemoryCost<WorkerHistogram>::Bytes(layout), h.bytes());
+    EXPECT_EQ(dataplane::kMaxWorkers * (layout.buckets() + 2) *
+                  sizeof(uint64_t),
+              MemoryCost<WorkerHistogram>::GlibcBytes(layout));
+  }
 }
 
 }  // namespace

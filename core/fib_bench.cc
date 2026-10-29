@@ -71,7 +71,8 @@
 // Single-threaded on purpose: this is a per-packet table cost, and one core
 // is what makes it comparable across table kinds and hosts. Numbers are
 // relative-comparable only, as everywhere in this tree: EAL runs --no-huge
-// (`bessd -m 0` shape), so this builds and runs in CI and the sandbox alike.
+// (`bessd --mem_backing=normal` shape), so this builds and runs in CI and the
+// sandbox alike.
 
 #include <benchmark/benchmark.h>
 
@@ -638,7 +639,7 @@ int main(int argc, char **argv) {
 
   // Same sandbox-safe EAL as the other benchmarks in this tree: --no-huge,
   // malloc-backed, which is also what rte_lpm/rte_fib allocate from.
-  bess::InitDpdk(0);
+  bess::InitDpdk();
 
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {

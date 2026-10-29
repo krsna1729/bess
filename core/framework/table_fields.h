@@ -34,6 +34,7 @@
 #include "classifier/record_arena.h"
 #include "classifier/table_schema.h"
 #include "dataplane/resource_registry.h"
+#include "framework/memory_scope.h"
 #include "gate.h"
 #include "message.h"
 #include "metadata.h"
@@ -211,14 +212,19 @@ class ResultFields {
  public:
   // Parses `fields` (registering each metadata destination as a write
   // attribute of `module`) and `default_result`, the record a miss places
-  // (nullopt when unset; zero-padded), and creates the record arena on `rcu`.
+  // (nullopt when unset; zero-padded), and creates the record arena on `rcu`,
+  // admitted in `memory` as `resource` (D-198: RecordArena::Bytes first, each
+  // record chunk through the lease's growth hook; refusal throws
+  // utils::MemoryRefused after every check, before the arena exists).
   CommandResponse Init(
       Module &module,
       const google::protobuf::RepeatedPtrField<bess::pb::ResultField> &fields,
-      std::optional<std::string_view> default_result, rcu::RcuDomain &rcu) {
+      std::optional<std::string_view> default_result, rcu::RcuDomain &rcu,
+      MemoryScope &memory, std::string_view resource) {
     schema_.Clear();
     attr_ids_.clear();
     records_.reset();
+    lease_.reset();
     default_record_id_ = 0;
     for (const bess::pb::ResultField &field : fields) {
       classifier::ResultFieldSpec spec;
@@ -258,24 +264,28 @@ class ResultFields {
       return CommandFailure(EINVAL, "result record is %zu bytes, the maximum is %zu",
                             record_size, classifier::RecordArena::kMaxRecordSize);
     }
+    if (default_result.has_value()) {
+      if (schema_.empty() && !default_result->empty()) {
+        return CommandFailure(EINVAL,
+                              "default_result needs at least one result field");
+      }
+      if (default_result->size() > record_size) {
+        return CommandFailure(EINVAL,
+                              "default_result is wider than the schema's record "
+                              "(%zu > %zu)",
+                              default_result->size(), record_size);
+      }
+    }
     if (!schema_.empty()) {
-      records_ = std::make_shared<classifier::RecordArena>(
-          std::max<size_t>(1, record_size), rcu);
+      const size_t arena_record = std::max<size_t>(1, record_size);
+      lease_ = memory.LeaseFor<classifier::RecordArena>(resource, arena_record,
+                                                        rcu);
+      records_ = std::make_shared<classifier::RecordArena>(arena_record, rcu);
+      lease_.Track(*records_);
+      records_->set_memory_growth(lease_.growth());
     }
-    if (!default_result.has_value()) {
+    if (!default_result.has_value() || records_ == nullptr) {
       return CommandSuccess();
-    }
-    if (records_ == nullptr) {
-      return default_result->empty()
-                 ? CommandSuccess()
-                 : CommandFailure(EINVAL,
-                                  "default_result needs at least one result field");
-    }
-    if (default_result->size() > record_size) {
-      return CommandFailure(EINVAL,
-                            "default_result is wider than the schema's record "
-                            "(%zu > %zu)",
-                            default_result->size(), record_size);
     }
     default_record_id_ = records_->Allocate();
     if (default_record_id_ == 0) {
@@ -422,6 +432,12 @@ class ResultFields {
  private:
   classifier::ResultSchema schema_;
   std::vector<int> attr_ids_;  // per field; -1 for a packet destination
+  // The arena's admission (D-198), declared before the arena. The arena is
+  // shared with generations and rule resources and may outlive this object
+  // briefly (an RCU-retired generation); it never gives bytes back through
+  // the hook (chunks are kept until it is destroyed), and only the control
+  // path grows it, through the module that owns this.
+  MemoryLease lease_;
   std::shared_ptr<classifier::RecordArena> records_;
   uint32_t default_record_id_ = 0;
   bool metadata_ready_ = false;

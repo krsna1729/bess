@@ -26,7 +26,7 @@
 // ip-port (4096 addresses x sequential ports: NAT/5-tuple-like).
 //
 // Usage: occupancy_bench [fill|churn|all] [max_log2_entries (default 20)]
-// Run pinned to one CPU. Needs DPDK hugepages (BESS_DPDK_HUGEPAGE_MB).
+// Run pinned to one CPU. Needs DPDK hugepages (BESSD_MEM_BACKING=hugepages).
 
 #define ALLOW_EXPERIMENTAL_API 1
 

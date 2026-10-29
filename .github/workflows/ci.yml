@@ -370,7 +370,7 @@ jobs:
             echo "python3 is in the runtime image"; exit 1
           fi
           set +e
-          docker run --rm --entrypoint timeout bess:"$VERSION" 5 /usr/local/bin/bessd -f -m 0 --skip_root_check
+          docker run --rm --entrypoint timeout bess:"$VERSION" 5 /usr/local/bin/bessd -f --mem_backing=normal --skip_root_check
           rc=$?
           set -e
           [ "$rc" = 124 ] || { echo "bessd exited with $rc before the 5 s smoke window"; exit 1; }

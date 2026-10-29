@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "framework/singleton_resource.h"
 #include "module.h"
 #include "rcu/rcu_ptr.h"
@@ -64,6 +65,8 @@ class ACL final : public Module {
   // not IPv4 matches no rule of `named` (each names an IPv4 field).
   struct Rules {
     static Rules Compile(const std::vector<ACLRule> &rules);
+    // Retained with the compiled rules until their RCU grace period ends.
+    bess::framework::MemoryLease lease;
 
     std::vector<MatchRule> named;
     bool otherwise_pass = false;
@@ -92,10 +95,9 @@ class ACL final : public Module {
     bess::pb::ACLArg arg;
   };
 
-  // Validates and converts every rule of `arg`; nothing is kept on error.
-  CommandResponse ParseRules(const bess::pb::ACLArg &arg,
-                             std::vector<ACLRule> *out) const;
-  void Install(const std::vector<ACLRule> &rules);
+  // Validates every rule, then admits and compiles the packet-path list.
+  CommandResponse ParseRules(const bess::pb::ACLArg &arg, Rules *out) const;
+  void Install(Rules rules);
 
   // The rule list is one immutable object published through an RcuPtr: init
   // and the "<name>/rules" resource publish a replacement

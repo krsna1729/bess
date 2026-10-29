@@ -48,6 +48,7 @@
 #define BESS_CAP_EVENTS (UINT64_C(1) << 5)        // init_context().events()
 #define BESS_CAP_EVENT_SOURCES (UINT64_C(1) << 6)  // EventHub::NamedSource/Full, stats::EventThrottle, stats::CrossingNotifier
 #define BESS_CAP_TICKS (UINT64_C(1) << 7)          // init_context().ticks()
+#define BESS_CAP_MEMORY (UINT64_C(1) << 9)         // init_context().memory() (D-198)
 
 struct BessPluginDescriptor {
   uint32_t abi_version;  // Must be BESS_PLUGIN_ABI_VERSION

@@ -4,12 +4,14 @@
 #define BESS_RCU_RCU_DOMAIN_H_
 
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -130,7 +132,26 @@ class RcuDomain {
     // The type-erased queue holds a plain void*; the deleter remembers T, so
     // both `unique_ptr<T>` and `unique_ptr<const T>` work.
     void *raw = const_cast<void *>(static_cast<const void *>(object.release()));
-    RetireErased(token, raw, [](void *p) { delete static_cast<T *>(p); },
+    RetireErased(token, raw, nullptr,
+                 [](void *p, void *) { delete static_cast<T *>(p); },
+                 outstanding);
+  }
+
+  // The same for a unique_ptr whose deleter is one word of state -- a slab
+  // object's deleter names its slab (utils::SlabDelete) -- which rides in the
+  // retire record and is rebuilt to destroy the object.
+  template <typename T, typename D>
+  void Retire(GracePeriod token, std::unique_ptr<T, D> &&object,
+              std::atomic<size_t> *outstanding = nullptr) {
+    static_assert(std::is_trivially_copyable_v<D> && sizeof(D) == sizeof(void *),
+                  "the deleter must be one trivially copyable word");
+    if (object == nullptr) {
+      return;
+    }
+    void *context = std::bit_cast<void *>(object.get_deleter());
+    void *raw = const_cast<void *>(static_cast<const void *>(object.release()));
+    RetireErased(token, raw, context,
+                 [](void *p, void *c) { std::bit_cast<D>(c)(static_cast<T *>(p)); },
                  outstanding);
   }
 
@@ -169,11 +190,13 @@ class RcuDomain {
   struct RetiredObject {
     GracePeriod token;
     void *object;
-    void (*destroy)(void *);
+    void *context;  // the deleter's state word, or null
+    void (*destroy)(void *object, void *context);
     std::atomic<size_t> *outstanding;  // decremented after destroy, or null
   };
 
-  void RetireErased(GracePeriod token, void *object, void (*destroy)(void *),
+  void RetireErased(GracePeriod token, void *object, void *context,
+                    void (*destroy)(void *object, void *context),
                     std::atomic<size_t> *outstanding = nullptr);
 
   // Lock-free, stats-free grace-period check: safe to call while holding

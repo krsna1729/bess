@@ -128,28 +128,46 @@ CommandResponse NAT::Init(const bess::pb::NATArg &arg) {
 
 template <typename N>
 CommandResponse NAT::Make(typename N::Config &config) {
+  bess::framework::MemoryLease lease = init_context().memory().LeaseFor<N>("bindings", config);
   auto made = N::Create(config);
   if (!made) {
     return CommandFailure(ENOMEM, "cannot create the NAT binding table");
   }
-  engine_ = std::move(*made);
   if constexpr (N::kGrowable && !N::kShared) {
-    delete_table_ = [](void *t) { delete static_cast<typename N::Table *>(t); };
+    // Owned growth admits each larger table through the engine's lease
+    // (OnGrowRequest) and gives a freed one back (FreeTable).
+    table_growth_ = lease.growth();
+    free_table_ = [](bess::utils::MemoryGrowth *growth, void *t) {
+      auto *table = static_cast<typename N::Table *>(t);
+      if (table == nullptr) {
+        return;
+      }
+      const size_t capacity = table->capacity();
+      delete table;
+      growth->Shrink(N::TableBytes(capacity), N::TableGlibcBytes(capacity));
+    };
   }
+  // A SharedNat takes the lease's growth hook here: its Grow admits the
+  // larger table and gives the old one back.
+  engine_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*made));
   return CommandSuccess();
 }
 
+void NAT::FreeTable(void *table) noexcept {
+  free_table_(table_growth_, table);
+}
+
 NAT::~NAT() {
-  if (delete_table_ != nullptr) {
-    delete_table_(handover_.exchange(nullptr));
-    delete_table_(retired_.exchange(nullptr));
+  if (free_table_ != nullptr) {
+    FreeTable(handover_.exchange(nullptr));
+    FreeTable(retired_.exchange(nullptr));
   }
 }
 
 // Control side, under the control-plane lock (the maintenance loop).
 void NAT::OnGrowRequest(const GrowRequest &request) {
   if (request.capacity == 0) {
-    delete_table_(retired_.exchange(nullptr, std::memory_order_acquire));
+    FreeTable(retired_.exchange(nullptr, std::memory_order_acquire));
     free_.Done();
     return;
   }
@@ -157,22 +175,41 @@ void NAT::OnGrowRequest(const GrowRequest &request) {
       [&](auto &engine) {
         using P = std::decay_t<decltype(engine)>;
         if constexpr (!std::is_same_v<P, std::monostate>) {
-          using N = typename P::element_type;
+          using N = std::remove_reference_t<decltype(*engine)>;
           if constexpr (N::kShared) {
             // Shared: the whole growth runs here; workers keep translating (D-079).
-            (void)engine->Grow(request.capacity);
+            // Its larger table is admitted first (D-198): refused, like no
+            // memory, the table stays as it is and the next request asks again.
+            try {
+              (void)engine->Grow(request.capacity);
+            } catch (const bess::utils::MemoryRefused &) {
+              grow_.Done();
+              return;
+            }
             grow_.Done();
           } else if constexpr (N::kGrowable) {
             // A table retired by an earlier growth whose free request is still queued.
-            delete_table_(retired_.exchange(nullptr, std::memory_order_acquire));
+            FreeTable(retired_.exchange(nullptr, std::memory_order_acquire));
+            // The larger table is admitted before it is built (D-198); the
+            // engine's lease then tracks it through bytes().
+            const size_t bytes = N::TableBytes(request.capacity);
+            const size_t glibc_bytes = N::TableGlibcBytes(request.capacity);
+            try {
+              table_growth_->Grow(bytes, glibc_bytes);
+            } catch (const bess::utils::MemoryRefused &) {
+              // Refused: as with no memory below.
+              grow_.Done();
+              return;
+            }
             auto bigger = N::NewTable(request.capacity);
             if (bigger == nullptr) {
               // No memory: the table stays as it is (creates refuse with kFull,
               // counted as drops); the next request asks again.
+              table_growth_->Shrink(bytes, glibc_bytes);
               grow_.Done();
               return;
             }
-            delete_table_(handover_.exchange(bigger.release(), std::memory_order_release));
+            FreeTable(handover_.exchange(bigger.release(), std::memory_order_release));
             // Re-armed once the worker has taken the table and finished
             // migrating (Run), so a full table asks once per growth.
           }
@@ -187,7 +224,7 @@ CommandResponse NAT::CommandRequestUsageReport(const bess::pb::EmptyArg &) {
       [&](auto &engine) {
         using P = std::decay_t<decltype(engine)>;
         if constexpr (!std::is_same_v<P, std::monostate>) {
-          if constexpr (P::element_type::kUsage) {
+          if constexpr (std::remove_reference_t<decltype(*engine)>::kUsage) {
             engine->RequestReport();
             counted = true;
           }
@@ -204,7 +241,7 @@ CommandResponse NAT::CommandDrainUsage(const bess::pb::EmptyArg &) {
       [&](auto &engine) {
         using P = std::decay_t<decltype(engine)>;
         if constexpr (!std::is_same_v<P, std::monostate>) {
-          if constexpr (P::element_type::kUsage) {
+          if constexpr (std::remove_reference_t<decltype(*engine)>::kUsage) {
             std::vector<nat::UsageRecord> records;
             engine->DrainUsage(&records, ~size_t{0});
             for (const nat::UsageRecord &r : records) {
