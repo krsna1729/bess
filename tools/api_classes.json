@@ -67,6 +67,8 @@
     "dataplane/interface_id.h": "experimental",
     "dataplane/member_select.h": "experimental",
     "dataplane/object_table.h": "experimental",
+    "dataplane/packet_store.h": "experimental",
+    "framework/packet_store_codec.h": "experimental",
     "dataplane/rebuild_resource.h": "experimental",
     "dataplane/resource.h": "experimental",
     "dataplane/resource_registry.h": "experimental",

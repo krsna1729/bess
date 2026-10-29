@@ -334,12 +334,10 @@ TEST_F(PacketStoreTest, InitRefusesAKeyAttributeItCannotRegister) {
   EXPECT_EQ(EINVAL, CreateStoreRefused(empty));
 }
 
-// A bound the pool cannot carry is refused at Init: the store holds mbuf
-// handles, so its bound plus what the ingress ring can hold (4096) must fit
-// the pool the hot path allocates from. Without the check the store would
-// starve every other module's batches, and the drops would look like a network
-// fault rather than a configuration. The harness creates the default pool, so
-// its number is read rather than assumed.
+// A bound the pool cannot carry is refused at Init: held and released packets
+// may coexist, so twice the bound plus ingress (4096) must fit the pool.
+// Otherwise the module can starve other modules' batches. The harness creates
+// the default pool, so its number is read rather than assumed.
 TEST(PacketStorePoolTest, InitRefusesABoundThePoolCannotCarry) {
   bess::testing::ModuleHarness h;
   const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
@@ -351,9 +349,9 @@ TEST(PacketStorePoolTest, InitRefusesABoundThePoolCannotCarry) {
   huge.set_max_packets(capacity);
   EXPECT_NE("", h.CreateError("PacketStore", huge));
 
-  // Just inside it: accepted (the bound and the ring together fit exactly).
+  // Both fixed queues and ingress fit exactly (or leave one odd buffer).
   PacketStoreArg fits;
-  fits.set_max_packets(capacity - 4096);
+  fits.set_max_packets((capacity - 4096) / 2);
   EXPECT_EQ("", h.CreateError("PacketStore", fits));
 }
 
@@ -580,8 +578,14 @@ TEST_F(PacketStoreTest, DeInitFreesEverything) {
   PacketBatch drained;
   drained.clear();
   ps->RunTask(&ctx, &drained, nullptr);  // 3 stored
+  PacketStoreCommandReleaseArg release;
+  release.set_id(0);
+  ASSERT_EQ(0, ps->CommandRelease(release).error().code());  // 3 queued
+  feed(1);
+  ps->RunTask(&ctx, &drained, nullptr);  // emits 3, stores 1
+  ASSERT_EQ(0, ps->CommandRelease(release).error().code());  // 1 queued
   feed(2);                               // 2 still on the ring
-  EXPECT_EQ("3 packets stored across 1 flows (max 100)", ps->GetDesc());
+  EXPECT_EQ("0 packets stored across 0 flows (max 100)", ps->GetDesc());
 
   ps->DeInit();
   EXPECT_EQ(16u, pool.Size());
@@ -633,6 +637,120 @@ TEST_F(PacketStoreFlowsTest, AReleaseSeesPacketsStillInFlight) {
   }
   EXPECT_EQ(kFed, released);
   EXPECT_EQ("0 packets stored across 0 flows (max 2048)", big->GetDesc());
+}
+
+// Repeated arrivals refill the held store while older releases still occupy
+// the bounded output FIFO. A blocked request must remain pending, not be
+// consumed/lost, and newer ingress must not pass that request's snapshot.
+TEST(PacketStoreReleaseQueueTest, BackpressurePreservesPacketsGatesAndSnapshotOrder) {
+  bess::testing::ModuleHarness h;
+  PacketStoreArg arg;
+  arg.set_max_packets(96);
+  arg.set_max_packets_per_flow(96);
+  auto *ps = static_cast<PacketStore *>(h.Create("PacketStore", arg));
+  ASSERT_NE(nullptr, ps);
+  const auto *pool = bess::PacketPool::GetDefaultPool();
+  ASSERT_NE(nullptr, pool);
+  const size_t available = pool->Size();
+  using Bytes = bess::testing::Bytes;
+  using Output = std::pair<gate_idx_t, Bytes>;
+  std::vector<Output> expected, actual;
+  const auto run = [&] {
+    const auto out = h.RunTask(ps, {0, 1});
+    for (const auto &[gate, packets] : out)
+      for (const auto &packet : packets) actual.emplace_back(gate, packet);
+  };
+  for (uint8_t wave = 0; wave < 4; ++wave) {
+    const gate_idx_t gate = wave % 2;
+    std::vector<Bytes> packets;
+    for (uint8_t i = 0; i < 96; ++i) {
+      Bytes packet(64, 0xab);
+      packet[0] = wave;
+      packet[1] = i;
+      expected.emplace_back(gate, packet);
+      packets.push_back(std::move(packet));
+    }
+    h.Run(ps, 0, packets, {0, 1});
+    PacketStoreCommandReleaseArg release;
+    release.set_id(0);
+    release.set_gate(gate);
+    ASSERT_EQ(0, h.Action(ps, "release", release).error().code());
+    run();
+    if (wave != 0) {
+      EXPECT_EQ("96 packets stored across 1 flows (max 96)", ps->GetDesc())
+          << "a release with insufficient queue space must stay pending";
+      run();
+      run();
+    }
+    EXPECT_EQ("0 packets stored across 0 flows (max 96)", ps->GetDesc());
+  }
+  // There are 64 older releases queued. Fill the held store, release it,
+  // then post a new arrival after the blocked request's snapshot.
+  std::vector<Bytes> held(96, Bytes(64, 0xcd));
+  for (const auto &packet : held) expected.emplace_back(0, packet);
+  h.Run(ps, 0, held, {0, 1});
+  PacketStoreCommandReleaseArg release;
+  release.set_id(0);
+  ASSERT_EQ(0, h.Action(ps, "release", release).error().code());
+  run();  // held=96, queue=32; release blocked
+  const Bytes later(64, 0xef);
+  h.Run(ps, 0, {later}, {0, 1});
+  run();  // must not store/evict the newer packet; queue drains to zero
+  EXPECT_EQ("96 packets stored across 1 flows (max 96)", ps->GetDesc());
+  run();  // old release finally applies; newer packet still on ingress
+  EXPECT_EQ("0 packets stored across 0 flows (max 96)", ps->GetDesc());
+  run();  // newer packet now enters the store
+  EXPECT_EQ("1 packets stored across 1 flows (max 96)", ps->GetDesc());
+  ASSERT_EQ(0, h.Action(ps, "release", release).error().code());
+  expected.emplace_back(0, later);
+  for (int i = 0; i < 8 && actual.size() < expected.size(); ++i) run();
+  EXPECT_EQ(expected, actual);  // exact payload order, gate, no loss/duplicates
+  EXPECT_EQ(available, pool->Size());
+  ps->DeInit();
+  EXPECT_EQ(available, pool->Size());
+}
+
+TEST(PacketStoreReleaseQueueTest, ControlClearCannotOvertakeABlockedRelease) {
+  bess::testing::ModuleHarness h;
+  PacketStoreArg arg;
+  arg.set_max_packets(96);
+  arg.set_max_packets_per_flow(96);
+  auto *ps = static_cast<PacketStore *>(h.Create("PacketStore", arg));
+  ASSERT_NE(nullptr, ps);
+  const auto *pool = bess::PacketPool::GetDefaultPool();
+  const size_t available = pool->Size();
+  using Bytes = bess::testing::Bytes;
+  const std::vector<Bytes> packets(96, Bytes(64, 0xab));
+  const std::vector<Bytes> newer(96, Bytes(64, 0xcd));
+  const std::vector<Bytes> old_burst(32, packets.front());
+  const std::vector<Bytes> new_burst(32, newer.front());
+  h.Run(ps, 0, packets, {0, 1});
+  EXPECT_TRUE(h.RunTask(ps, {0, 1})[0].empty());
+  PacketStoreCommandReleaseArg release;
+  release.set_id(0);
+  ASSERT_EQ(0, h.Action(ps, "release", release).error().code());  // output FIFO full
+  h.Run(ps, 0, newer, {0, 1});
+  EXPECT_EQ(old_burst, h.RunTask(ps, {0, 1})[0]);  // held=96, queued=64
+  ASSERT_EQ(0, h.Action(ps, "release", release).error().code());  // blocked on control
+  PacketStoreCommandDropArg drop;
+  drop.set_id(0);
+  ASSERT_EQ(0, h.Action(ps, "drop", drop).error().code());
+  PacketStoreCommandClearArg clear;
+  ASSERT_EQ(0, h.Action(ps, "clear", clear).error().code());
+  EXPECT_EQ("96 packets stored across 1 flows (max 96)", ps->GetDesc());
+  EXPECT_EQ(available - 160, pool->Size());  // neither drop nor clear overtook release
+  EXPECT_EQ(old_burst, h.RunTask(ps, {0, 1})[0]);
+  EXPECT_EQ(old_burst, h.RunTask(ps, {0, 1})[0]);
+  // Deliver(clear) snapshotted the two older pending requests before posting
+  // clear itself. The owner first applies that snapshot (release, drop), so
+  // one newer burst leaves before the next snapshot applies clear. A drop
+  // overtaking release would lose this burst; a clear overtaking it would
+  // lose the older bursts above. The remaining 64 are still owned, not leaked.
+  EXPECT_EQ(new_burst, h.RunTask(ps, {0, 1})[0]);
+  EXPECT_EQ("0 packets stored across 0 flows (max 96)", ps->GetDesc());
+  EXPECT_EQ(available - 64, pool->Size());
+  EXPECT_TRUE(h.RunTask(ps, {0, 1})[0].empty());  // next snapshot clears queued releases
+  EXPECT_EQ(available, pool->Size());
 }
 
 // A run that stored a batch is work: the scheduler's backoff counts an idle run

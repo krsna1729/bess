@@ -20,7 +20,9 @@ This document formalizes the supported C++ and build contract for out-of-tree BE
   them (`classifier/{exact,masked}_rule_resource.h`,
   `classifier/concurrent_{exact,masked}.h`, `dataplane/rebuild_resource.h`,
   D-191), the meter set as a resource (`meter/meter_resource.h` and its BESS
-  codec `meter/meter_resource_codec.h`, D-199), and the static archives of section 6
+  codec `meter/meter_resource_codec.h`, D-199), the packet store
+  (`dataplane/packet_store.h` and its BESS codec
+  `framework/packet_store_codec.h`, D-201), and the static archives of section 6
   (D-095). Their interfaces may
   change without preserving source compatibility. (`flow/` is
   the flow-state library, see `docs/flow-state.md`; a plugin that uses it
@@ -789,6 +791,37 @@ init_context().resources().Register(meters_.get());
 Declare `meters_` (a `Sized<MeterResource>`) before the `RcuPtr` and the
 binding after both. `VisitPolicies` reads the committed meters back;
 `MeterPolicyFromPb`/`MeterPolicyToPb` convert the wire policy.
+
+A packet buffer with its limits table: `dataplane::PacketStore`
+(`dataplane/packet_store.h`, D-201), the store behind the `packet_store` module.
+Per-flow FIFOs of packet handles keyed by a `uint32_t` flow id, a store-wide
+bound, a per-flow cap and an age limit; one owner thread; fixed memory, so it is
+admitted once and nothing allocates on the packet path. Its `flows` table is
+`dataplane::PacketStoreFlowsResource` over your `RcuPtr<PacketStoreLimitsMap>`
+(declare it `.Rebuilds()`, `requires_paused_workers` false):
+
+```cpp
+bess::rcu::RcuPtr<bess::dataplane::PacketStoreLimitsMap> limits_{init_context().rcu()};
+
+const bess::dataplane::PacketStoreConfig config{.max_packets = 65536};
+auto lease = init_context().memory().LeaseFor<bess::dataplane::PacketStore>("store", config);
+auto made = bess::dataplane::PacketStore::Create(config);  // refusal: made.error(); OOM: null
+store_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*made));
+limits_.Initialize(std::make_unique<const bess::dataplane::PacketStoreLimitsMap>());
+flows_ = std::make_unique<bess::dataplane::PacketStoreFlowsResource>(name() + "/flows", limits_);
+binding_ = init_context().codecs().Bind(*flows_, bess::dataplane::MakePacketStoreFlowsCodec(limits_));
+init_context().resources().Register(flows_.get());
+
+// The owner, per batch / per tick (limits: one limits_.Read() per run):
+store_->Store(handles, flow_ids, n, *limits, now_ns,
+              [&](bess::PacketHandle h) { /* evicted: yours */ });
+store_->Release(id, [&](bess::PacketHandle h) { /* released: yours */ });
+store_->Drop(id);
+store_->ExpireBounded(*limits, now_ns);
+```
+
+Packets reaching the store from other workers need a handoff first
+(`dataplane/handoff.h`); the module uses an MPSC ring.
 
 ---
 
