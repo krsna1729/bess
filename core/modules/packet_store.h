@@ -5,22 +5,20 @@
 
 #include <atomic>
 #include <cstddef>
-#include <deque>
-#include <map>
 #include <memory>
-#include <optional>
 #include <string>
 #include <type_traits>
-#include <utility>
 #include <vector>
 
-#include "dataplane/resource.h"
+#include "dataplane/packet_store.h"
+#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "module.h"
 #include "rcu/rcu_ptr.h"
 #include "stats/metric_registry.h"
 #include "pb/module_msg.pb.h"
 #include "utils/endian.h"
+#include "utils/dpdk_memory.h"
 
 // PacketStore: Bounded, ownership-safe packet buffer (K9).
 // Buffers packets indexed by flow ID: the first of `key_attrs` that the graph
@@ -28,6 +26,11 @@
 // Supports bounded capacity, per-flow limits, aging eviction, and on-demand
 // release/discard via commands. Per-flow limits are the "<module>/flows"
 // resource (D-129), key PacketStoreFlowKey, value PacketStoreFlowValue.
+//
+// An adapter (D-201): the store, its limits and expiry are
+// dataplane::PacketStore and the flows resource is
+// dataplane::PacketStoreFlowsResource; this module adds the handoff to one
+// owner, the command requests, the gates and the counters.
 //
 // Concurrency (D-129 amendment). The store has one owner: this module's own
 // task, which the scheduler runs on one worker. Any worker may feed it - a
@@ -58,16 +61,6 @@ class PacketStore final : public Module {
   static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
-  struct StoredPacket {
-    bess::PacketRef pkt;
-    uint64_t timestamp_ns = 0;
-  };
-
-  struct ReleasedPacket {
-    bess::PacketRef pkt;
-    gate_idx_t gate = 0;
-  };
-
   PacketStore() : Module(), limits_(init_context().rcu()) {
     // The module's own task is the owner, so the graph treats it as a task
     // boundary (as DRR and Queue do), and what it sends downstream runs on the
@@ -92,18 +85,12 @@ class PacketStore final : public Module {
   std::string GetDesc() const override;
 
  private:
-  // The module's `flows` resource.
-  class FlowsResource;
-  friend class FlowsResource;
+  using LimitsMap = bess::dataplane::PacketStoreLimitsMap;
 
-  // One flow's effective limits, as its `flows` entry gives them: an absent
-  // field leaves the module-wide argument in force, and timeout_ns present as
-  // 0 means this flow's packets never expire.
-  struct FlowLimits {
-    std::optional<uint64_t> timeout_ns;
-    std::optional<uint32_t> max_packets_per_flow;
+  struct ReleasedPacket {
+    bess::PacketRef pkt;
+    gate_idx_t gate = 0;
   };
-  using LimitsMap = std::map<uint32_t, FlowLimits>;
 
   // One control operation, posted to the owner. Fixed size and trivially
   // copyable: the ring copies bytes, and the element API stores the struct
@@ -128,25 +115,13 @@ class PacketStore final : public Module {
   static constexpr unsigned kIngressSlots = 4096;
   static constexpr uint32_t kIngressPerRun = 1024;
 
-  // The owner's state. Only the owner's task touches the container; the two
-  // counts are relaxed atomics because control reads them (GetDesc, metrics)
-  // while the owner writes them - one writer, so no contention.
-  std::map<uint32_t, std::deque<StoredPacket>> store_;
-  std::deque<ReleasedPacket> release_queue_;
-  std::atomic<size_t> total_packets_{0};
-  std::atomic<size_t> flows_held_{0};
-
+  // The owner's state: the store (admitted as "store", D-198) and what was
+  // released and waits to go out. Only the owner's task changes them; the
+  // store's counts are relaxed loads control may make (GetDesc).
+  bess::framework::Sized<bess::dataplane::PacketStore> store_;
+  bess::framework::Sized<bess::utils::DpdkArray<ReleasedPacket>> release_queue_;
+  uint32_t release_head_ = 0, release_count_ = 0;
   uint32_t max_packets_ = 4096;
-  uint32_t max_packets_per_flow_ = 64;
-  uint64_t timeout_ns_ = 5'000'000'000ULL;  // 5 seconds
-
-  // Flows one run's expiry sweep looks at (see EvictExpiredBounded): a run's
-  // cost is this, whatever the store holds. Expiry is honoured within one
-  // rotation, which is this many runs.
-  static constexpr size_t kExpireFlowsPerRun = 256;
-  // Where the last sweep stopped, so the next one resumes there. Only the
-  // owner touches it.
-  uint32_t expire_cursor_ = 0;
 
   // Packets the `drop` command freed (the owner's count) and packets the
   // ingress ring refused because it was full (any worker's count: a batch had
@@ -166,15 +141,10 @@ class PacketStore final : public Module {
   std::vector<std::string> key_attrs_;
   std::vector<int> key_attr_ids_;
 
-  // Per-flow limits: one immutable table, published by control and read by the
-  // owner once per task run (one acquire load, valid for that run).
+  // Per-flow limits: one immutable table, published by the flows resource
+  // and read by the owner once per task run (one acquire load, valid for
+  // that run).
   bess::rcu::RcuPtr<LimitsMap> limits_;
-  // The transaction's private copy (meter.cc's staging): every operation of a
-  // transaction edits this one table and the first publish swaps it in, so a
-  // transaction of many operations is one copy and one grace period - and no
-  // operation can publish over another's edit.
-  std::unique_ptr<LimitsMap> staged_limits_;
-  bool published_staged_ = false;
 
   // Packets in: many producers (every worker whose graph reaches the module),
   // one consumer (the owner's task). The element carries the flow id with the
@@ -193,6 +163,10 @@ class PacketStore final : public Module {
   // Control's requests: one producer (control - commands run under the
   // control-plane lock, so they are serialised), one consumer (the owner).
   struct rte_ring *requests_ = nullptr;
+  // The admission of both rings ("rings", D-198), taken before Init allocates
+  // them and released after DeInit frees them. The store is admitted
+  // separately ("store").
+  bess::framework::MemoryLease rings_lease_;
 
   // The owner's snapshot of both rings: how many requests were posted and how
   // many packets were in flight when it last looked. A request must not pass a
@@ -206,48 +180,26 @@ class PacketStore final : public Module {
 
   // The `flows` resource and its binding: the binding is declared after the
   // resource it binds and reset before the resource is (D-044).
-  std::unique_ptr<bess::dataplane::Resource> flows_resource_;
+  bess::framework::Sized<bess::dataplane::PacketStoreFlowsResource> flows_resource_;
   bess::framework::ResourceBinding flows_binding_;
 
   // --- the owner's side (the module's task) --------------------------------
-
-  // The flow's timeout and per-flow cap: the `flows` entry where it gives
-  // them, the module-wide arguments otherwise. A cap of 0 in an entry means
-  // the module-wide per-flow default; a timeout of 0 means no expiry.
-  std::pair<uint64_t, uint32_t> LimitsFor(const LimitsMap &limits,
-                                          uint32_t flow_id) const;
 
   // Takes what the ingress ring holds, up to `budget` packets, and stores it,
   // evicting to gate 1 as the limits say. Returns how many it took.
   uint32_t DrainIngress(Context *ctx, uint32_t budget);
 
-  // Stores one batch with the flow ids the feeders read: the per-flow caps, the
-  // module-wide bound and the aging eviction, as the module always did - now on
-  // the owner's thread.
-  void StoreBatch(Context *ctx, bess::PacketBatch *batch,
-                  const uint32_t *flow_ids, const LimitsMap &limits,
-                  uint64_t now_ns);
-
-  // Applies at most `max` posted requests, in order. Returns how many it
-  // applied: the ring may hold more, and a request posted after the run's
-  // snapshot waits for a later run.
+  // Applies at most `max` posted requests in order. A release remains on the
+  // ring until the fixed release queue has room for all held packets (a
+  // conservative reservation). Later requests cannot pass a blocked release.
   uint32_t DrainRequests(uint32_t max);
+  bool CanApply(const Request &request) const noexcept;
 
   // Applies one request to the store: the bodies the commands used to run
   // inline, now on the owner's thread (or on control, when no worker runs).
   void Apply(const Request &request);
 
-  // Frees the store's expired packets, by the limits in force for each flow.
-  void EvictExpired(const LimitsMap &limits, uint64_t now_ns);
-
-  // Frees expired packets without pressure, at a bounded cost per run: the
-  // sweep walks kExpireFlowsPerRun flows from `expire_cursor_` and resumes
-  // where it stopped, so a run's cost does not grow with the store's size (a
-  // full sweep per run is what this replaces: with 100K flows it would be the
-  // run's whole budget) and a flow is visited once per rotation.
-  void EvictExpiredBounded(const LimitsMap &limits, uint64_t now_ns);
-
-  // Frees everything the store holds, stored and queued.
+  // Frees everything held, stored and queued for release.
   void ClearStore();
 
   // --- control's side -------------------------------------------------------
@@ -256,15 +208,6 @@ class PacketStore final : public Module {
   // and nothing is in flight (after draining what is queued, so order is kept).
   // False only when the ring is full, which a client may retry.
   bool Deliver(const Request &request);
-
-  // Starts the transaction's private copy of the limits table, if this is its
-  // first operation.
-  void BeginTransaction();
-  // Publishes the private copy, once per transaction, retiring the table it
-  // replaced against the retirer's grace period.
-  void PublishStaged(bess::dataplane::Retirer &retirer);
-  // Drops the private copy at the end of a transaction (meter.cc:334).
-  void EndTransaction() noexcept;
 };
 
 #endif  // BESS_MODULES_PACKET_STORE_H_

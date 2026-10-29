@@ -8,7 +8,9 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <rte_ring_peek.h>
 
+#include "framework/packet_store_codec.h"
 #include "dataplane/resource_registry.h"
 #include "utils/format.h"
 #include "utils/rte_ring_alloc.h"
@@ -17,29 +19,23 @@
 namespace dataplane = bess::dataplane;
 namespace stats = bess::stats;
 
-// DPDK 25.11's rte_ring_elem.h lacks its own extern "C", so
-// rte_ring_get_memsize_elem has C++ linkage there and cannot be called from a
-// header; this reaches the C symbol directly, as handoff.cc does for the
-// handoff channel's own element size. The pointer-ring size (rte_ring_get_memsize)
-// is for 8-byte slots and would under-size an element ring.
-extern "C" ssize_t BessPacketStoreRingMemsizeElem(unsigned esize,
-                                                  unsigned count)
-    __asm__("rte_ring_get_memsize_elem");
-
 namespace {
 
 using bess::utils::be32_t;
 
 // A ring in caller-owned memory, the pattern Queue and DRR share (Queue's
 // AllocRing, drr.cc:514): rte_ring_create would allocate an EAL memzone, which
-// the malloc-pool module tests have no hugepages for.
+// the malloc-pool module tests have no hugepages for. `bytes` is
+// utils::RingElemBytes for the ring (0: DPDK refuses the size); the
+// pointer-ring size (rte_ring_get_memsize) is for 8-byte slots and would
+// under-size an element ring.
 struct rte_ring *AllocRing(uint32_t slots, const char *prefix, unsigned flags,
-                           ssize_t bytes) {
-  if (bytes < 0) {
+                           size_t bytes) {
+  if (bytes == 0) {
     return nullptr;
   }
-  struct rte_ring *ring = static_cast<rte_ring *>(
-      bess::utils::AllocRingMem(static_cast<size_t>(bytes)));
+  struct rte_ring *ring =
+      static_cast<rte_ring *>(bess::utils::AllocRingMem(bytes));
   if (ring == nullptr) {
     return nullptr;
   }
@@ -82,146 +78,15 @@ const ResourceTables PacketStore::resource_tables = {
 // The owner's side: the module's task
 // ---------------------------------------------------------------------------
 
-std::pair<uint64_t, uint32_t> PacketStore::LimitsFor(const LimitsMap &limits,
-                                                     uint32_t flow_id) const {
-  auto it = limits.find(flow_id);
-  if (it == limits.end()) {
-    return {timeout_ns_, max_packets_per_flow_};
-  }
-  const FlowLimits &entry = it->second;
-  const uint64_t timeout =
-      entry.timeout_ns.has_value() ? *entry.timeout_ns : timeout_ns_;
-  // An explicit 0 is the module-wide default for the cap, not "hold nothing".
-  uint32_t cap = max_packets_per_flow_;
-  if (entry.max_packets_per_flow.has_value() &&
-      *entry.max_packets_per_flow != 0) {
-    cap = *entry.max_packets_per_flow;
-  }
-  return {timeout, cap};
-}
-
-void PacketStore::EvictExpired(const LimitsMap &limits, uint64_t now_ns) {
-  for (auto it = store_.begin(); it != store_.end();) {
-    auto &queue = it->second;
-    // The flow's own timeout where its entry gives one: 0 means its packets
-    // never expire, so nothing here is old enough.
-    const uint64_t timeout = LimitsFor(limits, it->first).first;
-    while (timeout != 0 && !queue.empty() &&
-           (now_ns - queue.front().timestamp_ns > timeout)) {
-      bess::PacketFree(queue.front().pkt.handle());
-      queue.pop_front();
-      total_packets_.store(total_packets_.load(std::memory_order_relaxed) - 1,
-                           std::memory_order_relaxed);
-    }
-    if (queue.empty()) {
-      it = store_.erase(it);
-      flows_held_.store(flows_held_.load(std::memory_order_relaxed) - 1,
-                        std::memory_order_relaxed);
-    } else {
-      ++it;
-    }
-  }
-}
-
-void PacketStore::EvictExpiredBounded(const LimitsMap &limits,
-                                      uint64_t now_ns) {
-  if (store_.empty()) {
-    expire_cursor_ = 0;
-    return;
-  }
-  size_t visited = 0;
-  auto it = store_.lower_bound(expire_cursor_);
-  while (visited < kExpireFlowsPerRun) {
-    if (it == store_.end()) {
-      it = store_.begin();
-    }
-    auto &queue = it->second;
-    const uint64_t timeout = LimitsFor(limits, it->first).first;
-    while (timeout != 0 && !queue.empty() &&
-           (now_ns - queue.front().timestamp_ns > timeout)) {
-      bess::PacketFree(queue.front().pkt.handle());
-      queue.pop_front();
-      total_packets_.store(total_packets_.load(std::memory_order_relaxed) - 1,
-                           std::memory_order_relaxed);
-    }
-    visited++;
-    if (queue.empty()) {
-      it = store_.erase(it);
-      flows_held_.store(flows_held_.load(std::memory_order_relaxed) - 1,
-                        std::memory_order_relaxed);
-      if (store_.empty()) {
-        expire_cursor_ = 0;
-        return;
-      }
-    } else {
-      ++it;
-    }
-    // Resume at the next flow this sweep did not reach, or from the start once
-    // it ran off the end.
-    expire_cursor_ = it == store_.end() ? 0 : it->first;
-  }
-}
-
-void PacketStore::StoreBatch(Context *ctx, bess::PacketBatch *batch,
-                             const uint32_t *flow_ids, const LimitsMap &limits,
-                             uint64_t now_ns) {
-  // Evict expired packets if store is growing
-  if (total_packets_.load(std::memory_order_relaxed) >= max_packets_) {
-    EvictExpired(limits, now_ns);
-  }
-
-  // One writer at a time (the owner, or control while no worker runs), so the
-  // counts are kept in registers and stored once a batch: a locked
-  // read-modify-write per packet would protect nothing.
-  size_t total = total_packets_.load(std::memory_order_relaxed);
-  size_t held = flows_held_.load(std::memory_order_relaxed);
-
-  for (int i = 0; i < batch->cnt(); i++) {
-    const uint32_t flow_id = flow_ids[i];
-    bess::PacketRef pkt = batch->packet(i);
-
-    auto [it, inserted] = store_.try_emplace(flow_id);
-    if (inserted) {
-      held++;
-    }
-    std::deque<StoredPacket> &queue = it->second;
-    const uint32_t cap = LimitsFor(limits, flow_id).second;
-
-    // A flow's own cap where its `flows` entry gives one, the module-wide
-    // default otherwise. A loop, not one eviction: an upsert can lower the cap
-    // below what the queue already holds, and one arrival must bring it down.
-    while (queue.size() >= cap) {
-      // Evict oldest packet in this flow to gate 1
-      bess::PacketRef oldest = queue.front().pkt;
-      queue.pop_front();
-      total--;
-      EmitPacket(ctx, oldest, 1);
-    }
-
-    // Check global limit
-    if (total >= max_packets_) {
-      // Global overflow -> drop to gate 1
-      EmitPacket(ctx, pkt, 1);
-      continue;
-    }
-
-    // Buffer packet
-    queue.push_back(StoredPacket{
-        .pkt = pkt,
-        .timestamp_ns = now_ns,
-    });
-    total++;
-  }
-
-  total_packets_.store(total, std::memory_order_relaxed);
-  flows_held_.store(held, std::memory_order_relaxed);
-}
-
 uint32_t PacketStore::DrainIngress(Context *ctx, uint32_t budget) {
   const LimitsMap *limits = limits_.Read();
   const uint64_t now_ns = tsc_to_ns(current_worker.current_tsc());
   IngressPacket pkts[bess::PacketBatch::kMaxBurst];
   uint32_t taken = 0;
+  // An eviction (a flow at its cap, or the store full) leaves on gate 1.
+  auto evict = [this, ctx](bess::PacketHandle handle) {
+    EmitPacket(ctx, bess::PacketRef(handle), 1);
+  };
 
   while (budget > 0) {
     const unsigned n = rte_ring_sc_dequeue_burst_elem(
@@ -230,14 +95,13 @@ uint32_t PacketStore::DrainIngress(Context *ctx, uint32_t budget) {
     if (n == 0) {
       break;
     }
-    bess::PacketBatch batch;
+    bess::PacketHandle handles[bess::PacketBatch::kMaxBurst];
     uint32_t flow_ids[bess::PacketBatch::kMaxBurst];
-    batch.clear();
     for (unsigned i = 0; i < n; i++) {
-      batch.add(bess::PacketRef(pkts[i].handle));
+      handles[i] = pkts[i].handle;
       flow_ids[i] = pkts[i].flow_id;
     }
-    StoreBatch(ctx, &batch, flow_ids, *limits, now_ns);
+    store_->Store(handles, flow_ids, n, *limits, now_ns, evict);
     budget -= n;
     taken += n;
     if (n < bess::PacketBatch::kMaxBurst) {
@@ -249,47 +113,21 @@ uint32_t PacketStore::DrainIngress(Context *ctx, uint32_t budget) {
 
 void PacketStore::Apply(const Request &request) {
   switch (request.kind) {
-    case Request::Kind::kRelease: {
-      auto it = store_.find(request.id);
-      if (it == store_.end()) {
-        break;
-      }
-      std::deque<StoredPacket> &queue = it->second;
-      while (!queue.empty()) {
-        release_queue_.push_back(ReleasedPacket{
-            .pkt = queue.front().pkt,
-            .gate = request.gate,
-        });
-        queue.pop_front();
-        total_packets_.store(total_packets_.load(std::memory_order_relaxed) - 1,
-                             std::memory_order_relaxed);
-      }
-      store_.erase(it);
-      flows_held_.store(flows_held_.load(std::memory_order_relaxed) - 1,
-                        std::memory_order_relaxed);
+    case Request::Kind::kRelease:
+      store_->Release(request.id, [this, &request](bess::PacketHandle handle) {
+        CHECK_LT(release_count_, max_packets_);
+        uint32_t tail = release_head_ + release_count_;
+        if (tail >= max_packets_) tail -= max_packets_;
+        (*release_queue_)[tail] = ReleasedPacket{
+            .pkt = bess::PacketRef(handle), .gate = request.gate};
+        ++release_count_;
+      });
       break;
-    }
     case Request::Kind::kDrop: {
-      auto it = store_.find(request.id);
-      if (it == store_.end()) {
-        break;
-      }
-      std::deque<StoredPacket> &queue = it->second;
-      uint64_t dropped = 0;
-      while (!queue.empty()) {
-        bess::PacketFree(queue.front().pkt.handle());
-        queue.pop_front();
-        dropped++;
-      }
-      total_packets_.store(total_packets_.load(std::memory_order_relaxed) -
-                               static_cast<size_t>(dropped),
-                           std::memory_order_relaxed);
+      const size_t dropped = store_->Drop(request.id);
       dropped_packets_.store(
           dropped_packets_.load(std::memory_order_relaxed) + dropped,
           std::memory_order_relaxed);
-      store_.erase(it);
-      flows_held_.store(flows_held_.load(std::memory_order_relaxed) - 1,
-                        std::memory_order_relaxed);
       break;
     }
     case Request::Kind::kClear:
@@ -298,11 +136,21 @@ void PacketStore::Apply(const Request &request) {
   }
 }
 
+bool PacketStore::CanApply(const Request &request) const noexcept {
+  return request.kind != Request::Kind::kRelease ||
+         max_packets_ - release_count_ >= store_->packets();
+}
+
 uint32_t PacketStore::DrainRequests(uint32_t max) {
   Request request;
   uint32_t applied = 0;
   while (applied < max && requests_ != nullptr &&
-         rte_ring_sc_dequeue_elem(requests_, &request, sizeof(Request)) == 0) {
+         rte_ring_dequeue_bulk_elem_start(requests_, &request, sizeof(Request), 1, nullptr) != 0) {
+    if (!CanApply(request)) {
+      rte_ring_dequeue_elem_finish(requests_, 0);
+      break;
+    }
+    rte_ring_dequeue_elem_finish(requests_, 1);
     Apply(request);
     applied++;
   }
@@ -310,21 +158,15 @@ uint32_t PacketStore::DrainRequests(uint32_t max) {
 }
 
 void PacketStore::ClearStore() {
-  size_t freed = 0;
-  for (auto &[id, queue] : store_) {
-    while (!queue.empty()) {
-      bess::PacketFree(queue.front().pkt.handle());
-      queue.pop_front();
-      freed++;
-    }
+  if (store_) {
+    store_->Clear();
   }
-  while (!release_queue_.empty()) {
-    bess::PacketFree(release_queue_.front().pkt.handle());
-    release_queue_.pop_front();
+  while (release_count_ != 0) {
+    bess::PacketFree((*release_queue_)[release_head_].pkt.handle());
+    if (++release_head_ == max_packets_) release_head_ = 0;
+    --release_count_;
   }
-  store_.clear();
-  flows_held_.store(0, std::memory_order_relaxed);
-  total_packets_.fetch_sub(freed, std::memory_order_relaxed);
+  release_head_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,118 +185,18 @@ bool PacketStore::Deliver(const Request &request) {
   // after those packets - on its next task run.
   if (!is_any_worker_running() &&
       (ingress_ == nullptr || rte_ring_count(ingress_) == 0)) {
-    // Control owns the store here, so the snapshot means nothing: it applies
-    // what is queued and then the request, in that order.
-    requests_due_ = 0;
+    // Drain in order; a blocked release stays pending even on the direct path.
     ingress_owed_ = 0;
-    DrainRequests(kRequestSlots);
-    Apply(request);
-    return true;
+    const uint32_t pending = requests_ != nullptr ? rte_ring_count(requests_) : 0;
+    requests_due_ = pending - DrainRequests(pending);
+    if (requests_due_ == 0 && CanApply(request)) {
+      Apply(request);
+      return true;
+    }
   }
   Request copy = request;
   return rte_ring_sp_enqueue_elem(requests_, &copy, sizeof(Request)) == 0;
 }
-
-void PacketStore::BeginTransaction() {
-  if (staged_limits_ == nullptr) {
-    const LimitsMap *published = limits_.Read();
-    staged_limits_ = std::make_unique<LimitsMap>(
-        published == nullptr ? LimitsMap() : *published);
-    published_staged_ = false;
-  }
-}
-
-void PacketStore::PublishStaged(dataplane::Retirer &retirer) {
-  // Every operation of the transaction edited the same private copy, so the
-  // swap happens once: the published table becomes what that copy holds, and
-  // no operation can publish over another's edit (meter.cc:307-322).
-  if (!published_staged_) {
-    retirer.Retire(limits_.Exchange(std::move(staged_limits_)));
-    published_staged_ = true;
-  }
-}
-
-void PacketStore::EndTransaction() noexcept {
-  staged_limits_.reset();
-  published_staged_ = false;
-}
-
-// ---------------------------------------------------------------------------
-// The "<module>/flows" resource (D-129)
-// ---------------------------------------------------------------------------
-
-// Key the flow id (uint32), value its own limits, each field optional - an
-// absent field leaves the module-wide argument in force, so the entry is
-// stored as given and resolved on use. This is configuration: the table the
-// owner reads is replaced as a whole, and an erase removes an entry without
-// touching a packet (the `drop` command is what frees packets).
-class PacketStore::FlowsResource final : public dataplane::Resource {
- public:
-  explicit FlowsResource(PacketStore &owner)
-      : Resource(owner.name() + "/flows"), owner_(owner) {}
-
-  size_t LiveCount() const override {
-    const LimitsMap *limits = owner_.limits_.Read();
-    return limits == nullptr ? 0 : limits->size();
-  }
-
-  bool Contains(const dataplane::ResourceKey &key) const override {
-    uint32_t id;
-    const LimitsMap *limits = owner_.limits_.Read();
-    return limits != nullptr && dataplane::DecodeKey(key, &id) &&
-           limits->contains(id);
-  }
-
-  std::expected<Reservation, std::string> Reserve(
-      const dataplane::Op &op) override {
-    uint32_t id;
-    if (!dataplane::DecodeKey(op.key, &id)) {
-      return std::unexpected("invalid flow id key");
-    }
-    const LimitsMap *published = owner_.limits_.Read();
-    const bool existed = published != nullptr && published->contains(id);
-
-    // Everything fallible happens here, on the transaction's private copy: the
-    // first Reserve of the transaction clones the published table, and every
-    // later one edits that clone.
-    owner_.BeginTransaction();
-    if (op.kind == dataplane::OpKind::kErase) {
-      // An erased entry means the flow has no limits of its own, not that its
-      // packets are gone: the deletion path drops what a flow holds, and a
-      // transaction of many erases edits one copy and publishes once.
-      owner_.staged_limits_->erase(id);
-    } else {
-      const FlowLimits *limits = std::any_cast<FlowLimits>(&op.value);
-      if (limits == nullptr) {
-        return std::unexpected("wrong value type (want flow limits)");
-      }
-      (*owner_.staged_limits_)[id] = *limits;
-    }
-    // Publishing replaces the table that is live now.
-    Reservation reservation{std::make_unique<FlowsOp>(owner_), {},
-                            Footprint{.retires = 1}};
-    reservation.existed = existed;
-    return reservation;
-  }
-
-  void EndTransaction() noexcept override { owner_.EndTransaction(); }
-
- private:
-  class FlowsOp final : public dataplane::StagedOp {
-   public:
-    explicit FlowsOp(PacketStore &owner) : owner_(owner) {}
-
-    void Publish(dataplane::Retirer &retirer) noexcept override {
-      // The transaction's private copy becomes the published table, once.
-      owner_.PublishStaged(retirer);
-    }
-
-   private:
-    PacketStore &owner_;
-  };
-
-  PacketStore &owner_;
-};
 
 // ---------------------------------------------------------------------------
 // Module lifecycle
@@ -464,25 +206,25 @@ CommandResponse PacketStore::Init(const bess::pb::PacketStoreArg &arg) {
   using AccessMode = bess::metadata::Attribute::AccessMode;
 
   max_packets_ = arg.max_packets() ? arg.max_packets() : 4096;
-  // The store holds mbuf handles, so its bound plus what the ingress ring can
-  // hold must fit the pool the hot path allocates from. A bound near the
-  // pool's size would starve every other module's batches, and the resulting
-  // drops would look like a network fault rather than a configuration.
+  // Held, released-but-not-emitted, and ingress packets can coexist. Both
+  // fixed queues must fit the packet pool, not just the held store.
   if (const bess::PacketPool *pool = bess::PacketPool::GetDefaultPool();
       pool != nullptr &&
       pool->Capacity() <
-          static_cast<size_t>(max_packets_) + size_t{kIngressSlots}) {
+          size_t{2} * max_packets_ + size_t{kIngressSlots}) {
     return CommandFailure(
         EINVAL,
-        "max_packets %u plus the %u the ingress ring can hold exceeds the "
-        "packet pool's %zu buffers",
+        "twice max_packets %u plus the %u the ingress ring can hold exceeds "
+        "the packet pool's %zu buffers",
         max_packets_, kIngressSlots, pool->Capacity());
   }
-  max_packets_per_flow_ =
+  bess::dataplane::PacketStoreConfig config;
+  config.max_packets = max_packets_;
+  config.max_packets_per_flow =
       arg.max_packets_per_flow() ? arg.max_packets_per_flow() : 64;
-  timeout_ns_ = arg.timeout_ms()
-                    ? static_cast<uint64_t>(arg.timeout_ms()) * 1'000'000ULL
-                    : 5'000'000'000ULL;
+  config.timeout_ns =
+      arg.timeout_ms() ? static_cast<uint64_t>(arg.timeout_ms()) * 1'000'000ULL
+                       : 5'000'000'000ULL;
 
   task_id_t tid = RegisterTask(nullptr);
   if (tid == INVALID_TASK_ID) {
@@ -516,79 +258,60 @@ CommandResponse PacketStore::Init(const bess::pb::PacketStoreArg &arg) {
   // Packets in from any worker, requests in from control. The ingress ring is
   // multi-producer (every worker whose graph reaches the module) and the owner
   // is its only consumer, so the default enqueue is the multi-producer one and
-  // only the dequeue is flagged.
+  // only the dequeue is flagged. Both rings are admitted before either is
+  // allocated (D-198; a refusal throws MemoryRefused).
+  const size_t ingress_bytes =
+      bess::utils::RingElemBytes(sizeof(IngressPacket), kIngressSlots);
+  const size_t request_bytes =
+      bess::utils::RingElemBytes(sizeof(Request), kRequestSlots);
+  rings_lease_ = init_context().memory().Lease(
+      "rings", ingress_bytes + request_bytes, ingress_bytes + request_bytes);
   ingress_ = AllocRing(kIngressSlots, "packet_store_ingress", RING_F_SC_DEQ,
-                       BessPacketStoreRingMemsizeElem(sizeof(IngressPacket),
-                                                      kIngressSlots));
+                       ingress_bytes);
   if (ingress_ == nullptr) {
     return CommandFailure(ENOMEM, "the ingress ring could not be created");
   }
   requests_ = AllocRing(kRequestSlots, "packet_store_requests",
-                        RING_F_SP_ENQ | RING_F_SC_DEQ,
-                        BessPacketStoreRingMemsizeElem(sizeof(Request),
-                                                       kRequestSlots));
+                        RING_F_SP_ENQ | RING_F_SC_DEQ, request_bytes);
   if (requests_ == nullptr) {
     return CommandFailure(ENOMEM, "the request ring could not be created");
   }
 
-  // No flow has limits of its own yet: every flow takes the module-wide
-  // numbers until an entry says otherwise. Published before any worker can
-  // read it (Init runs before the module is attached).
-  limits_.Initialize(std::make_unique<const LimitsMap>());
+  // The store: every slot and flow entry it will ever use, admitted before it
+  // is allocated (D-198; a refusal throws MemoryRefused).
+  bess::framework::MemoryLease store_lease =
+      init_context().memory().LeaseFor<dataplane::PacketStore>("store", config);
+  auto created = dataplane::PacketStore::Create(config);
+  if (!created) {
+    return CommandFailure(EINVAL, "%s", created.error().c_str());
+  }
+  if (*created == nullptr) {
+    return CommandFailure(ENOMEM, "the packet store could not be allocated");
+  }
+  store_ = bess::framework::MemoryScope::Adopt(std::move(store_lease),
+                                               std::move(*created));
+  release_queue_ = init_context().memory().Create<
+      bess::utils::DpdkArray<ReleasedPacket>>("release_queue", max_packets_);
 
+  // No flow has limits of its own yet: every flow takes the module-wide
+  // numbers until an entry says otherwise. The resource publishes that first
+  // empty table before any worker can read it (Init runs before the module is
+  // attached), and admits it and every later map through the lease (D-198;
+  // a refusal throws MemoryRefused).
+  //
   // The per-flow limits (D-129). The binding is declared after the resource it
   // binds and reset before it is (D-044). No worker_running callback: the
   // resource does not require paused workers - the owner reads the published
   // table once per task run, and a transaction publishes a replacement.
-  flows_resource_ = std::make_unique<FlowsResource>(*this);
+  bess::framework::MemoryLease flows_lease =
+      init_context().memory().LeaseFor<dataplane::PacketStoreFlowsResource>(
+          "flows");
+  auto flows = std::make_unique<dataplane::PacketStoreFlowsResource>(
+      name() + "/flows", limits_, flows_lease.growth());
+  flows_resource_ = bess::framework::MemoryScope::Adopt(std::move(flows_lease),
+                                                        std::move(flows));
   flows_binding_ = init_context().codecs().Bind(
-      *flows_resource_,
-      std::make_shared<bess::framework::TypedCodec<
-          bess::pb::PacketStoreFlowKey, bess::pb::PacketStoreFlowValue>>(
-          [](const bess::pb::PacketStoreFlowKey &key)
-              -> std::expected<dataplane::ResourceKey, std::string> {
-            // The flow id is the metadata value the classifier wrote, and 0 is
-            // every packet that has none: all keyless sessions share that
-            // bucket, so a per-session entry for it would apply one session's
-            // limits to all of them.
-            if (key.id() == 0) {
-              return std::unexpected("flow id 0 is every keyless packet");
-            }
-            return dataplane::EncodeKey(key.id());
-          },
-          [](const bess::pb::PacketStoreFlowValue &value)
-              -> std::expected<std::any, std::string> {
-            // Field presence is the point: an absent field leaves the
-            // module-wide argument in force, and a present 0 is a decision.
-            FlowLimits limits;
-            if (value.has_timeout_ns()) {
-              limits.timeout_ns = value.timeout_ns();
-            }
-            if (value.has_max_packets_per_flow()) {
-              limits.max_packets_per_flow = value.max_packets_per_flow();
-            }
-            return std::any(limits);
-          },
-          // Read back as given: an entry carries exactly the fields it set,
-          // so a client can tell an absent field from a present zero.
-          [this](const auto &visit) {
-            const LimitsMap *limits = limits_.Read();
-            if (limits == nullptr) {
-              return;
-            }
-            for (const auto &[id, entry] : *limits) {
-              bess::pb::PacketStoreFlowKey key;
-              key.set_id(id);
-              bess::pb::PacketStoreFlowValue value;
-              if (entry.timeout_ns.has_value()) {
-                value.set_timeout_ns(*entry.timeout_ns);
-              }
-              if (entry.max_packets_per_flow.has_value()) {
-                value.set_max_packets_per_flow(*entry.max_packets_per_flow);
-              }
-              visit(key, value);
-            }
-          }));
+      *flows_resource_, dataplane::MakePacketStoreFlowsCodec(limits_));
 
   // The engine reaches a resource only once it is registered (D-021); the
   // binding above wires its codec. A failure destroys the module, and DeInit
@@ -637,12 +360,13 @@ void PacketStore::DeInit() {
 
   // Teardown runs with the workers paused (destroying a module is structural),
   // so the published table can go without waiting for a grace period, and every
-  // packet in flight to the owner is control's to free.
-  EndTransaction();
+  // packet in flight to the owner is control's to free. (The resource, and any
+  // transaction copy it staged, went above.)
   if (limits_.Read() != nullptr) {
     limits_.ResetQuiesced();
   }
   ClearStore();
+  release_queue_.reset();
   // What is still in flight to the owner: a partial burst is the common case,
   // so the count the ring returns is the count that is freed - a full-burst
   // free would free stale handles. The ring carries elements (handle and flow
@@ -666,7 +390,9 @@ void PacketStore::DeInit() {
       *ring = nullptr;
     }
   }
-  total_packets_.store(0, std::memory_order_relaxed);
+  rings_lease_.reset();
+  // The store is empty now; it goes, then its admission.
+  store_.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -721,19 +447,23 @@ struct task_result PacketStore::RunTask(Context *ctx, bess::PacketBatch *batch,
     ingress_owed_ = ingress_ != nullptr ? rte_ring_count(ingress_) : 0;
     requests_due_ = due;
   }
-  const uint32_t handed = DrainIngress(ctx, kIngressPerRun);
+  // Once the ingress snapshot is satisfied, leave later arrivals queued until
+  // all its requests complete, including releases blocked on output capacity.
+  const uint32_t budget = requests_due_ != 0
+      ? std::min(kIngressPerRun, ingress_owed_) : kIngressPerRun;
+  const uint32_t handed = DrainIngress(ctx, budget);
   ingress_owed_ = handed >= ingress_owed_ ? 0 : ingress_owed_ - handed;
   // What expired is freed whether or not the store is under pressure: a held
   // packet's lifetime is the flow's timeout, and the store's bound is not the
   // only thing that frees. The sweep is bounded, so this run stays a run.
   const LimitsMap *limits = limits_.Read();
   if (limits != nullptr) {
-    EvictExpiredBounded(*limits, tsc_to_ns(current_worker.current_tsc()));
+    store_->ExpireBounded(*limits, tsc_to_ns(current_worker.current_tsc()));
   }
   uint32_t applied = 0;
   if (ingress_owed_ == 0 && requests_due_ > 0) {
     applied = DrainRequests(requests_due_);
-    requests_due_ = 0;
+    requests_due_ -= applied;
   }
   // An eviction goes out through EmitPacket, which defers the packet into the
   // task's per-gate batch and records the gate in the shared Context
@@ -743,14 +473,15 @@ struct task_result PacketStore::RunTask(Context *ctx, bess::PacketBatch *batch,
   ProcessOGates(ctx);
 
   uint32_t released = 0;
-  if (!release_queue_.empty()) {
-    const gate_idx_t out_gate = release_queue_.front().gate;
+  if (release_count_ != 0) {
+    const gate_idx_t out_gate = (*release_queue_)[release_head_].gate;
     batch->clear();
-    while (!release_queue_.empty() &&
-           release_queue_.front().gate == out_gate &&
+    while (release_count_ != 0 &&
+           (*release_queue_)[release_head_].gate == out_gate &&
            released < bess::PacketBatch::kMaxBurst) {
-      batch->add(release_queue_.front().pkt);
-      release_queue_.pop_front();
+      batch->add((*release_queue_)[release_head_].pkt);
+      if (++release_head_ == max_packets_) release_head_ = 0;
+      --release_count_;
       released++;
     }
     if (released > 0) {
@@ -819,8 +550,8 @@ std::string PacketStore::GetDesc() const {
   // implicit move (clang-tidy's performance-no-automatic-move).
   std::string base = bess::utils::Format(
       "%zu packets stored across %zu flows (max %u)",
-      total_packets_.load(std::memory_order_relaxed),
-      flows_held_.load(std::memory_order_relaxed), max_packets_);
+      store_ ? store_->packets() : size_t{0},
+      store_ ? store_->flows() : size_t{0}, max_packets_);
   if (ingress_dropped == 0) {
     return base;
   }

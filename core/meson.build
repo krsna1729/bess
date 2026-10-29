@@ -7,6 +7,7 @@ rcu_sources = files(
 dataplane_core_sources = files(
   'dataplane/batch_tuning.cc',
   'dataplane/handoff.cc',
+  'dataplane/packet_store.cc',
   'dataplane/transaction_engine.cc',
 )
 
@@ -601,6 +602,7 @@ core_public_subdir_headers = {
     'framework/module_tick.h',
     'framework/threshold_table.h',
     'framework/module_init_context.h',
+    'framework/packet_store_codec.h',
     'framework/plugin.h',
     'framework/resource_bindings.h',
     'framework/resource_codec.h',
@@ -620,6 +622,7 @@ core_public_subdir_headers = {
     'dataplane/interface_id.h',
     'dataplane/member_select.h',
     'dataplane/object_table.h',
+    'dataplane/packet_store.h',
     'dataplane/rebuild_resource.h',
     'dataplane/resource.h',
     'dataplane/resource_registry.h',
@@ -783,6 +786,7 @@ unit_test_sources = [
   'dataplane/transaction_engine_test.cc',
   'dataplane/resource_registry_test.cc',
   'dataplane/rebuild_resource_test.cc',
+  'dataplane/packet_store_test.cc',
   'dataplane/transaction_lifecycle_test.cc',
   'dataplane/scope_snapshot_test.cc',
   'dataplane/slot_table_test.cc',
@@ -955,6 +959,7 @@ allocation_fault_tests = [
   'dataplane/continuation_test.cc',
   'dataplane/expiry_wheel_test.cc',
   'dataplane/handoff_test.cc',
+  'dataplane/packet_store_test.cc',
   'dataplane/transaction_engine_test.cc',
   'dataplane/rebuild_resource_test.cc',
   'dataplane/transaction_lifecycle_test.cc',
