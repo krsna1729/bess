@@ -381,6 +381,7 @@ struct BessPluginDescriptor {
   | `BESS_CAP_EVENTS` | operational events (`init_context().events()`) |
   | `BESS_CAP_EVENT_SOURCES` | named event sources and the throttled or threshold packet-path events (`EventHub::NamedSource`, `EventHub::Full`, `stats::EventThrottle`, `stats::CrossingNotifier`) |
   | `BESS_CAP_TICKS` | periodic control-side work (`init_context().ticks()`) |
+  | `BESS_CAP_OWNED_APPLY` | applying transactions to the plugin's own resources (`ResourceRegistry::ApplyOwned`, D-200) |
   | `BESS_CAP_MEMORY` | admitting, leasing and creating tables through the module's memory scope (`init_context().memory()`, D-198) |
 
   The `standalone_*` conformance plugins in `examples/standalone_plugin` use
@@ -415,7 +416,7 @@ construction or `Init()`:
 
 | Method | Capability |
 |---|---|
-| `resources()` | register and release transactional resources, read reference counts (`dataplane::ResourceRegistry`, `dataplane/resource_registry.h`, experimental); applying transactions is the control plane's |
+| `resources()` | register and release transactional resources, read reference counts, and apply transactions to the resources the caller registered (`dataplane::ResourceRegistry`, `dataplane/resource_registry.h`, experimental). `ApplyOwned(owned, ops)` is the control plane's `Apply` (all-or-nothing, same retire budget, refusals and outcome metrics; `kBusy` answered, not waited out) restricted to operations whose resource is one of the `Resource` objects in `owned`, the pointers the caller passed to `Register()`; an operation on another owner's resource rejects the whole transaction ("resource '<name>' is not owned by the caller"). Control side only, under the control-plane lock (a command, a `TickEndpoint` callback, a request handler, `Init`/`DeInit`), never from a worker or a `Resource` callback. A plugin that owns an enrolled `route::Router` publishes its `NeighborResolver`'s updates this way, as the Router module does: `SetNeighborManagedNextHopOp` operations, `owned` = `{router.neighbors_resource_object()}`, a bounded number per transaction (the module sends at most 64 per tick). Applying to any other resource stays the control plane's (D-074, D-200); requires `BESS_CAP_OWNED_APPLY` |
 | `rcu()` | the reader domain published tables retire through |
 | `ports().Find(name)` | look up an existing port by name |
 | `instances()` | borrow application-owned shared state (below) |

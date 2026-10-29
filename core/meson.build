@@ -781,6 +781,7 @@ unit_test_sources = [
   'dataplane/object_table_rcu_test.cc',
   'dataplane/object_table_publication_test.cc',
   'dataplane/transaction_engine_test.cc',
+  'dataplane/resource_registry_test.cc',
   'dataplane/rebuild_resource_test.cc',
   'dataplane/transaction_lifecycle_test.cc',
   'dataplane/scope_snapshot_test.cc',

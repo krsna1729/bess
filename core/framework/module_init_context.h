@@ -79,9 +79,11 @@ class ModuleInitContext {
   ModuleInitContext(const ModuleInitContext &) = delete;
   ModuleInitContext &operator=(const ModuleInitContext &) = delete;
 
-  // Registers and releases this instance's resources (D-021, D-022): the
-  // engine's public face. Callers hold the control-plane lock, as module
-  // commands do.
+  // Registers and releases this instance's resources (D-021, D-022), and
+  // applies transactions to them (ApplyOwned, D-200): the engine's public
+  // face. Callers hold the control-plane lock, as module commands do. A
+  // plugin that calls ApplyOwned requires BESS_CAP_OWNED_APPLY (an older bessd
+  // lacks the symbol).
   dataplane::ResourceRegistry &resources() const noexcept { return resources_; }
 
   // The reader domain every published table retires through. Needed by
