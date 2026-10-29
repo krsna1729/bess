@@ -191,6 +191,7 @@ void ConnTrack::Track(T &table, Context *ctx, bess::PacketBatch *batch) {
   uint64_t full = 0;
   const bess::metadata::mt_offset_t status = StatusOffset();
   const bool write_status = bess::metadata::IsValidOffset(status);
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
   for (int i = 0; i < cnt; i++) {
     const ct::TrackStatus s = results[i].status;
     const bool pass = s == ct::TrackStatus::kNew || s == ct::TrackStatus::kExisting ||
@@ -199,8 +200,10 @@ void ConnTrack::Track(T &table, Context *ctx, bess::PacketBatch *batch) {
     if (write_status) {
       set_attr_with_offset<uint8_t>(status, batch->packet(i), WireStatus(s));
     }
-    EmitPacket(ctx, batch->packet(i), pass ? 0 : 1);
+    gates[i] = pass ? 0 : 1;
   }
+  // The burst leaves whole when every packet takes one gate (D-099).
+  EmitBatch(ctx, batch, gates);
   if (full != 0) [[unlikely]] {
     table_full_.Note(ctx->wid, now, full);
   }

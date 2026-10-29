@@ -133,45 +133,49 @@ bool Verify(const uint8_t *bytes, const Datagram &d) {
 // UDP datagram shorter than its IP payload passes unchanged on gate 0,
 // neither summed nor verified.
 void L4Checksum::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
-  for (bess::PacketRef pkt : batch->packets()) {
+  // Survivors stay in the batch with their gate, which leaves whole when they
+  // share one (D-099); the drops go one by one.
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  int kept = 0;
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
+    const bess::PacketRef pkt(handle);
     const std::span<const uint8_t> frame(pkt.head_data<const uint8_t *>(), pkt.head_len());
     Datagram d;
     const Verdict verdict = Classify(frame, pkt.total_len(), d);
     if (verdict == Verdict::kPass) {
-      EmitPacket(ctx, pkt, kForwardGate);
-      continue;
+      gates[kept++] = kForwardGate;
+      return true;
     }
     if (unlikely(verdict == Verdict::kMalformed)) {
       DropPacket(ctx, pkt);
-      continue;
+      return false;
     }
 
     const size_t field = d.l4 + (d.udp ? kUdpChecksumOffset : kTcpChecksumOffset);
     const size_t end = d.l4 + d.covered;
     if (likely(end <= frame.size())) {
       if (verify_) {
-        EmitPacket(ctx, pkt, Verify(frame.data(), d) ? kForwardGate : kFailGate);
-        continue;
+        gates[kept++] = Verify(frame.data(), d) ? kForwardGate : kFailGate;
+        return true;
       }
-      bess::PacketHandle handle = pkt.handle();
       // The whole datagram: the sum reads it all, from the copy if there is one.
       const auto head = bess::packet::WritableHead(handle, end);
       if (unlikely(!head)) {
         DropPacket(ctx, bess::PacketRef(handle));
-        continue;
+        return false;
       }
       auto *bytes = reinterpret_cast<uint8_t *>(head->data());
       const uint16_t sum = Sum(bytes, d);
       std::memcpy(bytes + field, &sum, sizeof(sum));
-      EmitPacket(ctx, bess::PacketRef(handle), kForwardGate);
-      continue;
+      gates[kept++] = kForwardGate;
+      return true;
     }
 
     // A chain splits the datagram: packet_checksum.h sums across segments,
     // over the IP payload, which must then be the UDP datagram.
     if (d.covered != d.l4_length) {
-      EmitPacket(ctx, pkt, kForwardGate);
-      continue;
+      gates[kept++] = kForwardGate;
+      return true;
     }
     bess::packet::ChecksumPlan plan;
     plan.network_offset = d.l3;
@@ -184,23 +188,24 @@ void L4Checksum::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       const auto sums = bess::packet::ComputeChecksums(pkt, plan);
       if (unlikely(!sums)) {
         DropPacket(ctx, pkt);
-        continue;
+        return false;
       }
       // UDP 0 is "none"; 0xffff is -0 for a computed 0x0000 (the library
       // already writes a UDP 0x0000 as 0xffff).
       const bool ok = (d.udp && stored == bess::utils::be16_t(0)) || sums->transport == stored ||
                       (sums->transport == bess::utils::be16_t(0) &&
                        stored == bess::utils::be16_t(0xffff));
-      EmitPacket(ctx, pkt, ok ? kForwardGate : kFailGate);
-      continue;
+      gates[kept++] = ok ? kForwardGate : kFailGate;
+      return true;
     }
-    bess::PacketHandle handle = pkt.handle();
     if (unlikely(!bess::packet::ApplySoftwareChecksums(handle, plan))) {
       DropPacket(ctx, bess::PacketRef(handle));
-      continue;
+      return false;
     }
-    EmitPacket(ctx, bess::PacketRef(handle), kForwardGate);
-  }
+    gates[kept++] = kForwardGate;
+    return true;
+  });
+  EmitBatch(ctx, batch, gates);
 }
 
 CommandResponse L4Checksum::Init(const bess::pb::L4ChecksumArg &arg) {

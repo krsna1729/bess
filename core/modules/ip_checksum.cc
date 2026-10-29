@@ -57,37 +57,43 @@ size_t Ipv4Offset(std::span<const uint8_t> frame, size_t total_len, bool &malfor
 void IPChecksum::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   using bess::utils::Ipv4;
 
-  for (bess::PacketRef pkt : batch->packets()) {
+  // Survivors stay in the batch with their gate, which leaves whole when they
+  // share one (D-099); the drops go one by one.
+  gate_idx_t gates[bess::PacketBatch::kMaxBurst];
+  int kept = 0;
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
+    const bess::PacketRef pkt(handle);
     const std::span<const uint8_t> frame(pkt.head_data<const uint8_t *>(), pkt.head_len());
     bool malformed = false;
     const size_t l3 = Ipv4Offset(frame, pkt.total_len(), malformed);
     if (unlikely(malformed)) {
       DropPacket(ctx, pkt);
-      continue;
+      return false;
     }
     if (l3 == 0) {
-      EmitPacket(ctx, pkt, kForwardGate);
-      continue;
+      gates[kept++] = kForwardGate;
+      return true;
     }
 
     if (verify_) {
       // Summed with the stored field, as RFC 1071 verifies: a checksum stored
       // as 0xffff where 0x0000 was computed (-0, RFC 1624) is right too.
       const auto *ip = reinterpret_cast<const Ipv4 *>(frame.data() + l3);
-      EmitPacket(ctx, pkt, bess::utils::VerifyIpv4Checksum(*ip) ? kForwardGate : kFailGate);
-      continue;
+      gates[kept++] = bess::utils::VerifyIpv4Checksum(*ip) ? kForwardGate : kFailGate;
+      return true;
     }
-    bess::PacketHandle handle = pkt.handle();
     // The whole header: the sum reads it all, from the copy if there is one.
     const auto head = bess::packet::WritableHead(handle, l3 + HeaderLength(frame.data() + l3));
     if (unlikely(!head)) {
       DropPacket(ctx, bess::PacketRef(handle));
-      continue;
+      return false;
     }
     auto *ip = reinterpret_cast<Ipv4 *>(reinterpret_cast<uint8_t *>(head->data()) + l3);
     ip->checksum = bess::utils::CalculateIpv4Checksum(*ip);
-    EmitPacket(ctx, bess::PacketRef(handle), kForwardGate);
-  }
+    gates[kept++] = kForwardGate;
+    return true;
+  });
+  EmitBatch(ctx, batch, gates);
 }
 
 CommandResponse IPChecksum::Init(const bess::pb::IPChecksumArg &arg) {

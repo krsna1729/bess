@@ -241,7 +241,8 @@ TEST(IPChecksumTest, ALyingIpLengthIsDropped) {
 // Every packet leaves on a gate or is dropped as malformed, in both modes:
 // IPv4 right and wrong, a non-first fragment (its own header checksum is
 // checked), ARP and IPv6 (unchanged), and a malformed frame (dropped). The
-// old code forwarded the malformed one too.
+// old code forwarded the malformed one too. The drop is mid-batch: each
+// packet after it must still take its own gate.
 TEST(IPChecksumTest, EveryPacketIsAccountedFor) {
   ModuleHarness h;
   const Bytes arp = PacketBuilder()
@@ -264,8 +265,8 @@ TEST(IPChecksumTest, EveryPacketIsAccountedFor) {
     Module *ipc = Create(h, verify);
     ASSERT_NE(nullptr, ipc);
     Gates out = Through(h, ipc,
-                        {MakePacket(good), MakePacket(bad), MakePacket(arp), MakePacket(v6),
-                         MakePacket(frag_good), MakePacket(frag_bad), MakePacket(runt)});
+                        {MakePacket(good), MakePacket(runt), MakePacket(bad), MakePacket(arp),
+                         MakePacket(v6), MakePacket(frag_good), MakePacket(frag_bad)});
     if (verify) {
       EXPECT_EQ((std::vector<Bytes>{good, arp, v6, frag_good}), out[0]);
       EXPECT_EQ((std::vector<Bytes>{bad, frag_bad}), out[1]);
