@@ -14228,3 +14228,24 @@ are added but not yet run; the build/suite evidence above predates the bounded r
 
 **Revisit when:** a store needs more than 2^30 packets, per-packet timestamps finer than one per batch, or a second
 owner thread (the store is single-owner by design; the module's rings are the handoff).
+
+## D-202 A Router's resource names can be set by its owner
+
+**Status:** proposed (2026-10-25). Amends D-183 (the Router as an installed library).
+**Code:** `core/route/router.{h,cc}` (`RouterResourceNames`), `core/route/router_transaction_test.cc`.
+
+**Problem.** `route::Router` named its five resources `<name>/next_hops`, `/neighbors`, `/next_hop_state`, `/routes`
+and `/groups`. A module that owns two Routers (the UPF appliance: the inner and the transport table) under one
+module prefix could not give each its own resources: the names collided, and the tables would be one registry key.
+
+**Decision.** `Router::Create`, `Bytes` and `GlibcBytes` take a trailing `const RouterResourceNames &resources = {}`
+(`next_hops`, `neighbors`, `next_hop_state`, `routes`, `groups`). An empty member keeps the default
+`name + "/suffix"`, so every existing caller is unchanged. The owner picks full resource names; the Router does not
+validate or prefix them.
+
+**Behaviour.** Unchanged for callers that pass nothing. The module `Router` (D-183) does not use the new argument.
+
+**Evidence.** `TwoRoutersShareAModulePrefixWithoutSharingState` (`router_transaction_test.cc`): two Routers with
+one module prefix and distinct names register separately; a route written to one does not appear in the other.
+
+**Revisit when:** a third owner of several Routers needs a naming convention enforced rather than chosen.

@@ -216,6 +216,17 @@ struct NextHopState {
   bool down = false;
 };
 
+// Full transactional resource names (D-202). Empty members use the Router's
+// name plus the usual suffix. Independent routers in one appliance can
+// share the module prefix without sharing tables or next-hop ids.
+struct RouterResourceNames {
+  std::string next_hops;
+  std::string neighbors;
+  std::string next_hop_state;
+  std::string routes;
+  std::string groups;
+};
+
 // Route domains plus next hops (K7, K7.1, M6), dual-stack:
 //
 //   (domain, IPv4 dst) --rte_lpm/rte_fib--> NextHopId --SlotTable--> NextHop
@@ -371,7 +382,8 @@ class Router {
   // bits); with neither, kMaxNextHopsWithoutFib.
   static std::expected<std::unique_ptr<Router>, RouteError> Create(
       std::string name, const Config &config, size_t max_next_hops,
-      rcu::RcuDomain &domain, size_t max_domains = 1, size_t max_groups = 0);
+      rcu::RcuDomain &domain, size_t max_domains = 1, size_t max_groups = 0,
+      const RouterResourceNames &resources = {});
 
   // What Create allocates (D-198): the default domain's FIBs (DPDK, the
   // route tables' InstanceBytes), the three id tables' slots and states
@@ -381,10 +393,12 @@ class Router {
   // as Create.
   static size_t Bytes(const std::string &name, const Config &config,
                       size_t max_next_hops, const rcu::RcuDomain &domain,
-                      size_t max_domains = 1, size_t max_groups = 0);
+                      size_t max_domains = 1, size_t max_groups = 0,
+                      const RouterResourceNames &resources = {});
   static size_t GlibcBytes(const std::string &name, const Config &config,
                            size_t max_next_hops, const rcu::RcuDomain &domain,
-                           size_t max_domains = 1, size_t max_groups = 0);
+                           size_t max_domains = 1, size_t max_groups = 0,
+                           const RouterResourceNames &resources = {});
   // What the router holds now (any thread): every domain's FIBs (an IPv6
   // table's spare included), the id tables with their slab chunks, and the
   // control vectors. The sorted domain-id list and the transaction scratch
@@ -925,7 +939,8 @@ class Router {
 
   Router(const std::string &name, const Config &config,
          Domain default_domain, size_t max_next_hops,
-         size_t max_domains, size_t max_groups, rcu::RcuDomain &rcu);
+         size_t max_domains, size_t max_groups, rcu::RcuDomain &rcu,
+         const RouterResourceNames &resources);
 
   // A domain's FIBs for the router's families, named after `name`.
   static std::expected<Domain, RouteError> MakeDomain(
