@@ -19,7 +19,8 @@ This document formalizes the supported C++ and build contract for out-of-tree BE
   `framework/table_batch.h`, D-189), the table resources and the tables under
   them (`classifier/{exact,masked}_rule_resource.h`,
   `classifier/concurrent_{exact,masked}.h`, `dataplane/rebuild_resource.h`,
-  D-191), and the static archives of section 6
+  D-191), the meter set as a resource (`meter/meter_resource.h` and its BESS
+  codec `meter/meter_resource_codec.h`, D-199), and the static archives of section 6
   (D-095). Their interfaces may
   change without preserving source compatibility. (`flow/` is
   the flow-state library, see `docs/flow-state.md`; a plugin that uses it
@@ -763,6 +764,30 @@ exchanges the pointer, retires the old table and moves the nodes without
 allocating; a refused build leaves the published table untouched.
 `examples/standalone_plugin/standalone_rule_tables.cc` holds one table of each
 kind from the installed headers.
+
+A third ready-made resource is a meter set: `meter::MeterResource`
+(`meter/meter_resource.h`, D-199), the `Meter` module's `<name>/meters`. Key
+`EncodeKey(MeterId)` (1..capacity), value a `MeterProfileSpec`; meters are
+shared, a reconfigure keeps every other meter's token state, and an erase is
+deferred to the removal cascade (readable until then, not upsertable). It
+publishes `MeterSet` generations through your `RcuPtr<MeterSet>` and admits its
+memory through the lease you give it (D-198):
+
+```cpp
+bess::rcu::RcuPtr<bess::meter::MeterSet> meter_set_{init_context().rcu()};
+
+auto lease = init_context().memory().LeaseFor<bess::meter::MeterResource>("meters", capacity);
+auto made = std::make_unique<bess::meter::MeterResource>(
+    name() + "/meters", capacity, meter_set_, lease.growth());  // publishes the first, empty set
+meters_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(made));
+// BESS's wire types (bess.pb.MeterIdKey -> bess.pb.MeterPolicyValue), or bind your own codec:
+binding_ = init_context().codecs().Bind(*meters_, bess::meter::MakeMeterResourceCodec(*meters_));
+init_context().resources().Register(meters_.get());
+```
+
+Declare `meters_` (a `Sized<MeterResource>`) before the `RcuPtr` and the
+binding after both. `VisitPolicies` reads the committed meters back;
+`MeterPolicyFromPb`/`MeterPolicyToPb` convert the wire policy.
 
 ---
 

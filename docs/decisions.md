@@ -13948,3 +13948,117 @@ is half built, and the status counts entries, not bytes (D-149 left `Module::Rep
 hugepages; (2) an over-limit load refused with `RESOURCE_EXHAUSTED`, the daemon alive, no OOM kill; (3) ABBA of
 the packet path, before and after, at 100K and 1M sessions (zero cost or better, the performance contract);
 (4) the unit tests named above.
+
+## D-199 The meter set as an installed transactional resource; Meter is its adapter
+
+**Status:** proposed (2026-10-25; the incremental index 2026-10-30). Follows D-191's promotion pattern; keeps
+D-021, D-032 and D-129's semantics and D-198's admission; does D-021's deferred trimming of `Clone()`'s
+O(capacity) copy.
+**Code:** `core/meter/meter_resource.{h,cc}` (new), `core/meter/meter_resource_codec.h` (new),
+`core/meter/meter_resource_test.cc` (new), `core/meter/meter_set.{h,cc}`, `core/meter/meter_set_test.cc`,
+`core/modules/meter.{h,cc}`, `core/meson.build`, `tools/api_classes.json`, `tools/tidy_baseline.json`,
+`docs/plugin-api.md`, `docs/dataplane-tables.md`, `docs/performance-contract.md`, `docs/limits.md`.
+
+**Context.** `Meter`'s `<module>/meters` -- a `MeterSetBuilder` edited on a private clone per transaction,
+generations published through RCU, erases deferred to the removal cascade, the removal stage's generation
+prepaid at the erase's `Reserve` (D-198) -- was about 200 lines private to `modules/meter.cc` (`MetersResource`,
+`MetersGrowth`, six owner methods). A plugin that runs a whole pipeline in one module (the UPF appliance) needs
+the same meters without the module and could only copy them.
+
+**Decision.**
+
+- **`bess::meter::MeterResource`**, installed, experimental: `MeterResource(name, capacity, RcuPtr<MeterSet>
+  &published, utils::MemoryGrowth *lease)`. Key `EncodeKey(MeterId)` with ids 1..capacity, value a
+  `MeterProfileSpec`. Unchanged from the module: the refusal texts (`invalid meter id`, `not found`, `wrong value
+  type (want MeterProfileSpec)`, `invalid profile: ...`, `the meter is still retiring ...`), shared meters, a
+  reconfigure that keeps other meters' state, no references, `DefersErase()`, an erase absent to the control side
+  at once and readable until its removal stage, and the erase-prepay rule: `Reserve` admits
+  `MeterSet::Bytes(capacity)` for the stage, refusing the erase if it does not fit, and the stage, an abort or a
+  re-add gives back what it did not use. A stage refused anyway (its DPDK allocation is checked against the limit
+  again on normal pages) changes nothing and gives the prepay back; its retry admits it again.
+- **Codec-free.** The resource knows no protobuf and no framework; its out-of-line code is `bess_meter`'s.
+  Its `bess_rcu` dependency is declared: retiring exchanged generations calls `RcuDomain::RetireErased`.
+  The BESS wire form is `meter/meter_resource_codec.h`, header-only: `MeterPolicyFromPb`, `MeterPolicyToPb` and
+  `MakeMeterResourceCodec(resource)` (`bess.pb.MeterIdKey` -> `bess.pb.MeterPolicyValue`, read-back from
+  `VisitPolicies`). A plugin binds it, or its own codec, through `init_context().codecs()`.
+- **The owner keeps the `RcuPtr<MeterSet>`** its packet path reads, as D-191's `RebuildResource` does: the packet
+  path still makes one acquire load from the module per batch, with no extra indirection. The constructor
+  publishes the first, empty generation.
+- **A transaction costs what it changes, not what is installed.** `Reserve` edits the private builder;
+  `Prepare` builds the transaction's one generation; the first upsert publishes it and later upserts do no
+  extra swap. The clone, the build and the publish are O(1), and each changed meter adds O(depth) index
+  nodes: the index (`MeterSet`'s id -> state map and the builder's desired entries) is a persistent radix tree
+  -- 64 ids per leaf, 256 children per inner node, `MeterLevels(capacity)` inner levels (2 up to 4M ids, 3
+  up to 2^30) -- whose nodes are immutable once a generation or a second builder can reach them. `Clone()`
+  and `Build()` share the root and stamp the builder with a fresh edit token; an edit writes nodes carrying
+  its builder's token in place and copies the others on its id's path, allocating every copy before linking
+  any, so a refusal changes nothing (an erase that empties a node unlinks it). Interned profiles are shared
+  with the clone and swept when the map has doubled, and the policies as written are a per-transaction delta
+  merged on publish without allocating. Readers still load one `RcuPtr<MeterSet>` per batch and see all of the
+  old or all of the new generation; an abort drops the clone and every node it made, and the generations it
+  shared nodes with never change. Per-slot publication (SlotTable's) is O(1) too but lets one batch see one
+  meter of a transaction new and another old, so a sharing tree it is.
+  Before: every transaction cloned capacity + 1 desired entries and every policy, then built capacity + 1
+  pointers plus one owner and profile reference per meter, and every erase's removal stage built a whole
+  generation; interning swept all profiles on each new one, O(N^2) for N distinct profiles. Loading 1M UPF
+  sessions (two meters each, 4,096-operation transactions) fell from about 3,000 to 800 sessions/s as the set
+  grew. Measured with the tree (UPF graph arm, normal pages, ABBA, 2026-10-30): 100K sessions load at
+  4,860/4,892 sessions/s instead of 3,034/3,033 in 608 MiB instead of 984 MiB RSS; 500K at 4,695/4,716
+  instead of 1,146/1,156 in 1.46 GiB instead of 4.07 GiB. Building in every reservation, before that,
+  retained one capacity-sized generation per operation and refused the first 1K-session graph load under a
+  1,200 MB limit.
+- **The packet path hides the depth.** A lookup is `levels` dependent loads of small inner nodes before the
+  leaf's slot, where a flat array took one. Measured on the UPF graph arm (100K sessions, ABBA against the flat
+  index, 2026-10-30) the first tree cost +5.4% (UL) and +7.2% (DL) per packet, and +1.7-1.9% on the owned
+  appliance arm: `Meter` looked each packet up and checked it before the next, and a shared meter's check takes
+  a lock, which on x86 drains the next walk's loads, so every level's latency was exposed. Now
+  `MeterSet::Resolve` resolves a batch stage-major -- every walk with its leaf slot prefetched, then every slot
+  with its state prefetched for write -- `CheckBatch`/`CheckBatchColorAware` use it, and `Meter` resolves each
+  level's ids for the batch before checking them in packet order. A leaf keeps its 64 state pointers on their
+  own cache lines (576 B per 64 ids) and its control entries in a separate allocation, so the slots the packet
+  path reads are dense rather than spread over 3 KB per leaf. Not taken: a capacity-sized root (one inner level
+  up to 4M ids). Copying a node takes a reference on each child -- an atomic on each child's header line -- and
+  the root is copied by the first edit of every transaction and by every erase's removal stage, so that root
+  would cost O(capacity / 64) scattered cache misses per erase. Not taken either: a last-leaf cache per batch
+  (sessions' meter ids do not cluster within a batch).
+- **Memory (D-198).** `MeterResource::Bytes(capacity)` = `MeterSetBuilder::Bytes(capacity)`, the index's root
+  node, is what the owner admits (`LeaseFor<MeterResource>`); everything else goes through the lease's hook:
+  index nodes as edits make them (DPDK; at most `MeterSet::Bytes(capacity)`, one path, per edited meter), state
+  slab chunks, state control blocks and profiles. A node goes back when its last holder -- builder, generation
+  or parent node -- lets go. A capacity no longer reserves a dense index up front; installing meters grows it,
+  each step admitted first, and the erase prepay is one path. `bytes()` is what the meters hold (the admitted
+  base plus net growth through the hook, prepaid stages excluded), so `MemoryScope::Adopt` tracks it and the
+  status reports current bytes rather than only admitted bytes.
+- **Installed `meter_set.h` changes** (experimental): `MeterSet::bytes()`, `GlibcBytes()` and `profile_count()`
+  are gone (a generation's nodes are shared, so it holds no bytes of its own, and nothing is glibc);
+  `MeterSet::Bytes(capacity)` is one path; `MeterSetBuilder::Erase` may throw `utils::MemoryRefused` (it copies
+  a path). New: `MeterSet::Resolve(ids, meters)`, a batch `Lookup`. `MeterSet`'s layout changed, so a plugin
+  rebuilds; `Lookup`, `CheckBatch`, `CheckBatchColorAware`, `size()`, `capacity()` and every `MeterResource`
+  signature are unchanged.
+- **`Meter` is an adapter**: `Sized<MeterResource> meters_` declared before its `RcuPtr` and the binding;
+  `GetDesc`, `get_status` and the read-back go through `size()`, `Retiring()` and `VisitPolicies()`. Its packet
+  path keeps its semantics (level order, colour-aware charging, drops); it resolves a level's ids for the batch
+  (`Resolve`) before checking them.
+
+**Evidence:** a release build (gcc, `-O3`, `cpu=x86-64-v3`, tests on, benchmarks off) and its whole meson suite on
+CPUs 0, 1 and 12-15 (2026-10-31, with `BESS_GO` set and `GOWORK=off` for the Go conformance case): 237 of 237
+pass, the existing `Meter` tests unmodified among them (`modules_meter_test`, `modules_session_pipeline_test`);
+on CPUs 12-19 alone, the tests whose pipelines put worker 0 on CPU 0 fail, as they do on the D-203 stack's
+build. `meter_resource_test` (8): construction and
+`Bytes`/`bytes()`, multi-upsert publish and read-back with state kept across a reconfigure, every refusal leaving
+the published generation the same object, the deferred erase with a reader holding grace periods, the erase
+refused by its prepay and an aborted erase refunding it, the codec round trip, and two for the incremental index:
+`ATransactionCostsWhatItChangesNotWhatIsInstalled` (with the clone-everything code restored it fails: the same
+four reserved and prepared operations made 81 glibc allocations with 64 meters installed and 8,017 with 8,000, and
+admitted 6,293,800 and 6,547,752 bytes, above one pointer per id; now both are equal and below it) and
+`SmallTransactionsLeaveEveryOtherMeterIntact` (40 transactions over 8,000 meters, a reader holding the generation
+before each, erases' removal stages, refusals: every meter not named keeps its state and policy). `meter_set_test`
+(17) adds `EditsNeverChangeASharedIndex` and `OneEditAdmitsAtMostOnePath`. The load and memory numbers above
+are the UPF A/B run's. Per packet with `Resolve` and the dense leaves (UPF A/B, 100K sessions, normal pages,
+ABBA against the flat index, 2026-10-31): the graph arm is 5.2% (UL, 364.7 to 345.7 ns) and 5.1% (DL, 440.7 to
+418.0 ns) faster, cycles per packet -5.0% both ways; the owned appliance arm keeps a small residual, UL -0.2%
+and DL +1.8% (370.9 to 377.5 ns, cycles +1.8%). The same run loads 500K sessions at 4,624 instead of 1,144
+sessions/s, in 1.46 instead of 4.10 GiB RSS.
+
+**Revisit when:** a meter set must be sized after construction, or an owner needs worker-exclusive meters through
+the resource.

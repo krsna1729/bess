@@ -28,6 +28,7 @@ flow_sources = files(
 
 meter_sources = files(
   'meter/meter.cc',
+  'meter/meter_resource.cc',
   'meter/meter_set.cc',
 )
 
@@ -682,6 +683,8 @@ core_public_subdir_headers = {
   ),
   'meter': files(
     'meter/meter.h',
+    'meter/meter_resource.h',
+    'meter/meter_resource_codec.h',
     'meter/meter_set.h',
   ),
   'route': files(
@@ -783,6 +786,7 @@ unit_test_sources = [
   'dataplane/scope_snapshot_test.cc',
   'dataplane/slot_table_test.cc',
   'meter/meter_test.cc',
+  'meter/meter_resource_test.cc',
   'meter/meter_set_test.cc',
   'stats/stats_test.cc',
   'stats/event_hub_test.cc',
@@ -958,6 +962,7 @@ allocation_fault_tests = [
   'flow/shared_flow_table_test.cc',
   'flow/worker_flow_table_test.cc',
   'l2/fdb_test.cc',
+  'meter/meter_resource_test.cc',
   'nat/nat_test.cc',
   'offload/flow_rule_owner_test.cc',
   'route/l3_test.cc',

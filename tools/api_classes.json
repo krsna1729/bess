@@ -110,6 +110,8 @@
     "framework/table_batch.h": "experimental",
     "framework/table_fields.h": "experimental",
     "meter/meter.h": "experimental",
+    "meter/meter_resource.h": "experimental",
+    "meter/meter_resource_codec.h": "experimental",
     "meter/meter_set.h": "experimental",
     "rcu/rcu_domain.h": "experimental",
     "rcu/rcu_ptr.h": "experimental",

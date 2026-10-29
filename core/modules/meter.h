@@ -3,15 +3,13 @@
 #ifndef BESS_MODULES_METER_H_
 #define BESS_MODULES_METER_H_
 
-#include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <string>
 
-#include "dataplane/resource.h"
 #include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
+#include "meter/meter_resource.h"
 #include "meter/meter_set.h"
 #include "module.h"
 #include "pb/module_msg.pb.h"
@@ -32,9 +30,9 @@
 // names no meter is dropped rather than forwarded unmetered; id 0 means "no
 // meter at this level" and passes it.
 //
-// Control path: `<module>/meters` is a resource, so one transaction can create
-// a meter together with the rule whose result names it. A meter is an
-// immutable policy over mutable token state that
+// Control path: `<module>/meters` is a bess::meter::MeterResource (D-199), so
+// one transaction can create a meter together with the rule whose result
+// names it. A meter is an immutable policy over mutable token state that
 // survives unrelated updates (K5): reconfiguring one meter publishes a
 // generation in which every other meter keeps its buckets. An erase keeps the
 // meter readable for one removal-cascade stage -- a reader may still hold its
@@ -100,81 +98,14 @@ class Meter final : public Module {
   // module's (see the class comment).
   using Policy = bess::meter::MeterProfileSpec;
 
-  // The module's `meters` resource. Public so tests can drive it directly.
-  class MetersResource;
-
  private:
-  friend class MetersResource;
-
-  // What a transaction does to the desired state: edits a private copy of the
-  // builder, so a rejected transaction leaves the live one untouched.
-  void BeginTransaction();
-  // A transaction ended (published or aborted): the private copy goes.
-  void EndTransaction() noexcept;
-  // Swaps the edited copy in and publishes `generation`, retiring the
-  // generation it replaced through `retirer`.
-  void PublishStaged(std::unique_ptr<const bess::meter::MeterSet> generation,
-                     bess::dataplane::Retirer &retirer);
-  // Runs one removal-cascade stage after an erase: the id is unpublishable
-  // from the erase until this runs, and readable until it does.
-  void Unpublish(bess::meter::MeterId id, bess::dataplane::Retirer &later);
-  // An erase's removal-stage generation (MeterSet::Bytes(capacity)), admitted
-  // by its Reserve and given back when that stage has built it, or when the
-  // erase aborts or its stage has nothing to remove.
-  void PrepayErase();
-  void RefundErase() noexcept;
-
-  // The hook the builders get (set on the first; clones and generations
-  // share it): forwards to meters_lease_, except while a removal stage
-  // rebuilds the generation (Unpublish). That step runs in the transaction
-  // engine's removal cascade and cannot refuse, so the erase's Reserve
-  // admits the largest generation the builder can build (MeterSet::Bytes)
-  // up front, refusing the erase if it does not fit, and that Build draws on
-  // it. Prepay/Refund and the Build run on the control path under the
-  // engine's lock; Shrink may come from any thread (RCU frees).
-  class MetersGrowth final : public bess::utils::MemoryGrowth {
-   public:
-    void Grow(size_t bytes, size_t glibc_bytes = 0) override;
-    void Shrink(size_t bytes, size_t glibc_bytes = 0) noexcept override;
-    void Prepay(size_t bytes, size_t glibc_bytes);
-    void Refund(size_t bytes, size_t glibc_bytes) noexcept;
-
-    bess::utils::MemoryGrowth *lease = nullptr;  // meters_lease_.growth()
-    // Admitted by erase reservations whose removal stage has not built yet.
-    size_t prepaid_bytes = 0;
-    size_t prepaid_glibc = 0;
-    bool paying = false;  // Unpublish's Build draws on the prepay
-  };
-
-  // Memory (D-198), resource "meters": Init admits the first builder's
-  // entries (MeterSetBuilder::Bytes(capacity)); through growth_, every
-  // Clone's entries, state slab chunks, state control blocks and profiles,
-  // and every generation Build makes are admitted before they are allocated
-  // and given back when freed, so what is admitted is what the meters hold
-  // (reported as admitted: no one builder's bytes() sees the generations).
-  // Declared before every builder and generation holder: they give bytes
-  // back through the hook from their destructors and RCU frees.
-  bess::framework::MemoryLease meters_lease_;
-  MetersGrowth growth_;
-
-  std::unique_ptr<bess::meter::MeterSetBuilder> live_;
-  // The transaction's edit copy while one is in flight (see BeginTransaction).
-  std::unique_ptr<bess::meter::MeterSetBuilder> staged_;
-  // The edit copy has become the live one (its first publish ran).
-  bool published_staged_ = false;
-  // Erased meters whose removal stage has not run: absent to the control side,
-  // still readable, and not publishable again (SlotTable's kRetiring).
-  std::set<bess::meter::MeterId> retiring_;
-  // Each meter's policy as written (the builder keeps only compiled
-  // profiles), for the resource's read-back: policies_ mirrors live_ and
-  // staged_policies_ mirrors staged_, edited and swapped with them.
-  std::map<bess::meter::MeterId, Policy> policies_;
-  std::map<bess::meter::MeterId, Policy> staged_policies_;
-
+  // "<module>/meters" (D-199), with its D-198 admission: Init admits
+  // MeterResource::Bytes(capacity) and the resource admits all it grows by
+  // through the lease's hook. Declared before published_, which it
+  // initializes, so the published generation is freed first.
+  bess::framework::Sized<bess::meter::MeterResource> meters_;
   bess::rcu::RcuPtr<bess::meter::MeterSet> published_;
-
-  std::unique_ptr<bess::dataplane::Resource> resource_;
-  bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
+  bess::framework::ResourceBinding binding_;  // after meters_ (D-044)
 
   // How many meter ids one packet carries (the `meter_id` attribute is
   // 4 * levels_ bytes wide). 1 is the module's historical behaviour.
