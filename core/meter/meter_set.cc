@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <iterator>
 #include <mutex>
+#include <new>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -53,11 +55,24 @@ class MeterMemory final : public utils::MemoryGrowth {
   // Glibc bytes AdmittedAllocator holds now (state control blocks,
   // profiles).
   std::atomic<size_t> glibc_held{0};
+  // Index nodes held now by every builder and generation sharing this.
+  std::atomic<size_t> node_bytes{0};
 
  private:
   std::mutex mutex_;
   utils::MemoryGrowth *hook_ = nullptr;  // guarded by mutex_
   size_t builders_ = 0;
+};
+
+// Builders only (the caller serializes them), never generations.
+struct MeterProfiles {
+  // The map size of the first sweep.
+  static constexpr size_t kFirstSweep = 64;
+
+  std::map<std::array<uint64_t, 5>, std::weak_ptr<const MeterProfile>> interned;
+  // Expired entries are dropped when the map reaches this size, which then
+  // becomes twice what is left: amortized O(1) per new profile.
+  size_t sweep_at = kFirstSweep;
 };
 
 namespace {
@@ -103,50 +118,163 @@ struct AdmittedAllocator {
   std::shared_ptr<MeterMemory> memory;
 };
 
+// Unique per process, so no two builders ever stamp nodes alike.
+uint64_t NewToken() noexcept {
+  static std::atomic<uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+MeterInner *AsInner(MeterNode *node) noexcept {
+  return static_cast<MeterInner *>(node);
+}
+const MeterInner *AsInner(const MeterNode *node) noexcept {
+  return static_cast<const MeterInner *>(node);
+}
+MeterLeaf *AsLeaf(MeterNode *node) noexcept {
+  return static_cast<MeterLeaf *>(node);
+}
+const MeterLeaf *AsLeaf(const MeterNode *node) noexcept {
+  return static_cast<const MeterLeaf *>(node);
+}
+
+size_t NodeBytes(unsigned level) noexcept {
+  return level == 0 ? kMeterLeafBytes : kMeterInnerBytes;
+}
+
+// A node `level` levels above the leaves (0: a leaf), stamped `owner`: a copy
+// of `from`, whose children or entries it references too, or empty when
+// `from` is null. Admitted before it is allocated (D-198); a leaf is two
+// allocations, its packet-path slots and its entries.
+MeterNode *NewNode(MeterMemory &memory, unsigned level, const MeterNode *from,
+                   uint64_t owner) {
+  const size_t bytes = NodeBytes(level);
+  memory.Grow(bytes);
+  void *p = nullptr;
+  void *entries = nullptr;
+  try {
+    const size_t node_bytes =
+        level == 0 ? sizeof(MeterLeaf) : sizeof(MeterInner);
+    p = utils::DpdkAllocate(node_bytes, RTE_CACHE_LINE_SIZE);
+    if (level == 0) {
+      entries = utils::DpdkAllocate(kMeterLeafSlots * sizeof(MeterEntry),
+                                    RTE_CACHE_LINE_SIZE);
+    }
+  } catch (...) {
+    if (p != nullptr) {
+      utils::DpdkFree(p);
+    }
+    memory.Shrink(bytes);
+    throw;
+  }
+  memory.node_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  MeterNode *node;
+  if (level == 0) {
+    MeterLeaf *leaf = new (p) MeterLeaf();
+    auto *first = static_cast<MeterEntry *>(entries);
+    if (from != nullptr) {
+      const MeterLeaf *source = AsLeaf(from);
+      std::copy(std::begin(source->states), std::end(source->states),
+                leaf->states);
+      std::uninitialized_copy_n(source->entries, kMeterLeafSlots, first);
+    } else {
+      std::uninitialized_value_construct_n(first, kMeterLeafSlots);
+    }
+    leaf->entries = first;
+    node = leaf;
+  } else {
+    MeterInner *inner = new (p) MeterInner();
+    if (from != nullptr) {
+      const MeterInner *source = AsInner(from);
+      for (size_t i = 0; i < kMeterInnerSlots; i++) {
+        if (MeterNode *child = source->children[i]) {
+          child->refs.fetch_add(1, std::memory_order_relaxed);
+          inner->children[i] = child;
+        }
+      }
+    }
+    node = inner;
+  }
+  node->used = from != nullptr ? from->used : 0;
+  node->owner = owner;
+  return node;
+}
+
+// Drops one reference to `node`, if any; the last one frees it, its
+// references to its children or meters, and its admission.
+void Unref(MeterNode *node, unsigned level, MeterMemory &memory) noexcept {
+  if (node == nullptr ||
+      node->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+    return;
+  }
+  if (level == 0) {
+    MeterLeaf *leaf = AsLeaf(node);
+    std::destroy_n(leaf->entries, kMeterLeafSlots);
+    utils::DpdkFree(leaf->entries);
+    leaf->~MeterLeaf();
+  } else {
+    MeterInner *inner = AsInner(node);
+    for (MeterNode *child : inner->children) {
+      if (child != nullptr) {
+        Unref(child, level - 1, memory);
+      }
+    }
+    inner->~MeterInner();
+  }
+  utils::DpdkFree(node);
+  const size_t bytes = NodeBytes(level);
+  memory.node_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+  memory.Shrink(bytes);
+}
+
 }  // namespace
 
 }  // namespace detail
 
-MeterSet::~MeterSet() {
-  if (memory_ != nullptr) {
-    memory_->Shrink(bytes(), bytes() - states_.capacity() * sizeof(MeterState *));
-  }
+MeterSet::MeterSet(detail::MeterNode *root, size_t capacity, size_t meters,
+                   unsigned levels,
+                   std::shared_ptr<detail::MeterMemory> memory) noexcept
+    : root_(root),
+      capacity_(capacity),
+      size_(meters),
+      levels_(levels),
+      memory_(std::move(memory)) {
+  root_->refs.fetch_add(1, std::memory_order_relaxed);
 }
 
-size_t MeterSet::bytes() const noexcept {
-  return states_.capacity() * sizeof(MeterState *) +
-         owners_.capacity() * sizeof(owners_[0]) +
-         profiles_.capacity() * sizeof(profiles_[0]);
-}
+MeterSet::~MeterSet() { detail::Unref(root_, levels_, *memory_); }
 
 MeterSetBuilder::MeterSetBuilder(size_t capacity)
-    : entries_(capacity + 1),
-      memory_(std::make_shared<detail::MeterMemory>()) {
+    : capacity_(capacity),
+      levels_(detail::MeterLevels(capacity)),
+      token_(detail::NewToken()),
+      memory_(std::make_shared<detail::MeterMemory>()),
+      profiles_(std::make_shared<detail::MeterProfiles>()),
+      // No hook yet: the owner admitted Bytes(capacity) for it.
+      root_(detail::NewNode(*memory_, levels_, nullptr, token_)) {
   memory_->Join();
 }
 
 MeterSetBuilder::~MeterSetBuilder() {
-  // This builder's entries go now (a clone's were admitted by Clone, the
-  // first builder's by its owner); the hook stays with any clone left.
-  memory_->Shrink(entries_.capacity() * sizeof(std::optional<Entry>));
+  // While the hook is still attached: what only this builder held goes now.
+  detail::Unref(root_, levels_, *memory_);
   memory_->Leave();
 }
 
 MeterSetBuilder::MeterSetBuilder(CloneTag, const MeterSetBuilder &other)
-    : entries_(other.entries_),
+    : capacity_(other.capacity_),
+      levels_(other.levels_),
       size_(other.size_),
+      token_(detail::NewToken()),
+      memory_(other.memory_),
       profiles_(other.profiles_),
       slabs_(other.slabs_),
-      memory_(other.memory_) {
+      root_(other.root_) {
+  root_->refs.fetch_add(1, std::memory_order_relaxed);
   memory_->Join();
 }
 
-size_t MeterSetBuilder::Bytes(size_t capacity) {
-  return (capacity + 1) * sizeof(std::optional<Entry>);
-}
-
 size_t MeterSetBuilder::bytes() const noexcept {
-  size_t total = entries_.capacity() * sizeof(std::optional<Entry>) +
+  size_t total = memory_->node_bytes.load(std::memory_order_relaxed) +
                  memory_->glibc_held.load(std::memory_order_relaxed);
   for (const auto &[socket, slab] : slabs_) {
     total += slab->bytes();
@@ -160,16 +288,17 @@ void MeterSetBuilder::set_memory_growth(
 }
 
 std::unique_ptr<MeterSetBuilder> MeterSetBuilder::Clone() const {
-  // The copy's entries are admitted first; its destructor gives them back.
-  const size_t bytes = entries_.size() * sizeof(std::optional<Entry>);
-  memory_->Grow(bytes);
-  try {
-    return std::unique_ptr<MeterSetBuilder>(
-        new MeterSetBuilder(CloneTag{}, *this));
-  } catch (...) {
-    memory_->Shrink(bytes);
-    throw;
-  }
+  auto clone = std::unique_ptr<MeterSetBuilder>(
+      new MeterSetBuilder(CloneTag{}, *this));
+  token_ = detail::NewToken();  // the index is shared now
+  return clone;
+}
+
+std::unique_ptr<const MeterSet> MeterSetBuilder::Build() const {
+  auto set = std::unique_ptr<const MeterSet>(
+      new MeterSet(root_, capacity_, size_, levels_, memory_));
+  token_ = detail::NewToken();  // the index is published now
+  return set;
 }
 
 MeterSetBuilder::ProfileKey MeterSetBuilder::KeyOf(
@@ -194,20 +323,95 @@ MeterSetBuilder::ProfileKey MeterSetBuilder::KeyOf(
 const MeterSetBuilder::Entry *MeterSetBuilder::Find(
     MeterId id) const noexcept {
   const size_t index = static_cast<size_t>(id.value());
-  if (index == 0 || index >= entries_.size() || !entries_[index].has_value()) {
+  if (index == 0 || index > capacity_) {
     return nullptr;
   }
-  return &*entries_[index];
+  const detail::MeterNode *node = root_;
+  for (unsigned level = levels_; level != 0; level--) {
+    node = detail::AsInner(node)->children[detail::MeterDigit(index, level)];
+    if (node == nullptr) {
+      return nullptr;
+    }
+  }
+  const Entry &entry =
+      detail::AsLeaf(node)->entries[index & (detail::kMeterLeafSlots - 1)];
+  return entry.state != nullptr ? &entry : nullptr;
 }
 
-MeterSetBuilder::Entry *MeterSetBuilder::Find(MeterId id) noexcept {
-  return const_cast<Entry *>(std::as_const(*this).Find(id));
+detail::MeterLeaf *MeterSetBuilder::WritableLeaf(size_t index) {
+  // Depth d: 0 is the root, levels_ the leaf; a node's level is levels_ - d.
+  // fresh[d] replaces depth d's node, or is null when this builder writes
+  // that node in place.
+  std::array<detail::MeterNode *, detail::kMeterMaxLevels + 1> fresh{};
+  try {
+    detail::MeterNode *node = root_;
+    for (unsigned d = 0; d <= levels_; d++) {
+      const unsigned level = levels_ - d;
+      if (node == nullptr || node->owner != token_) {
+        fresh[d] = detail::NewNode(*memory_, level, node, token_);
+      }
+      if (level != 0 && node != nullptr) {
+        node = detail::AsInner(node)
+                   ->children[detail::MeterDigit(index, level)];
+      }
+    }
+  } catch (...) {
+    for (unsigned d = 0; d <= levels_; d++) {
+      if (fresh[d] != nullptr) {
+        detail::Unref(fresh[d], levels_ - d, *memory_);
+      }
+    }
+    throw;
+  }
+
+  // Link the replacements top-down; nothing below can fail. A replaced
+  // node's parent (or root_) gives up its reference, while the copy keeps
+  // the node's children alive. The root is never missing.
+  if (fresh[0] != nullptr) {
+    detail::Unref(root_, levels_, *memory_);
+    root_ = fresh[0];
+  }
+  detail::MeterNode *node = root_;
+  for (unsigned level = levels_; level != 0; level--) {
+    detail::MeterInner *parent = detail::AsInner(node);
+    detail::MeterNode *&child =
+        parent->children[detail::MeterDigit(index, level)];
+    if (detail::MeterNode *copy = fresh[levels_ - level + 1]) {
+      if (child != nullptr) {
+        detail::Unref(child, level - 1, *memory_);
+      } else {
+        parent->used++;
+      }
+      child = copy;
+    }
+    node = child;
+  }
+  return detail::AsLeaf(node);
+}
+
+void MeterSetBuilder::Prune(size_t index) noexcept {
+  std::array<detail::MeterNode *, detail::kMeterMaxLevels + 1> path{};
+  detail::MeterNode *node = root_;
+  for (unsigned d = 0; d <= levels_; d++) {
+    path[d] = node;
+    if (d < levels_) {
+      node = detail::AsInner(node)
+                 ->children[detail::MeterDigit(index, levels_ - d)];
+    }
+  }
+  for (unsigned d = levels_; d != 0 && path[d]->used == 0; d--) {
+    detail::MeterInner *parent = detail::AsInner(path[d - 1]);
+    parent->children[detail::MeterDigit(index, levels_ - d + 1)] = nullptr;
+    parent->used--;
+    detail::Unref(path[d], levels_ - d, *memory_);
+  }
 }
 
 std::expected<std::shared_ptr<const MeterProfile>, MeterError>
 MeterSetBuilder::InternProfile(const MeterProfileSpec &spec) {
   const ProfileKey key = KeyOf(spec);
-  if (auto it = profiles_.find(key); it != profiles_.end()) {
+  auto &interned = profiles_->interned;
+  if (auto it = interned.find(key); it != interned.end()) {
     if (std::shared_ptr<const MeterProfile> live = it->second.lock()) {
       return live;
     }
@@ -222,9 +426,14 @@ MeterSetBuilder::InternProfile(const MeterProfileSpec &spec) {
       std::move(compiled).value());
 
   // Drop interned entries whose profile is gone, so the map tracks live
-  // profiles rather than every specification ever seen.
-  std::erase_if(profiles_, [](const auto &p) { return p.second.expired(); });
-  profiles_[key] = profile;
+  // profiles rather than every specification ever seen -- once it has
+  // doubled, not on every new profile, which made N profiles cost O(N^2).
+  if (interned.size() >= profiles_->sweep_at) {
+    std::erase_if(interned, [](const auto &p) { return p.second.expired(); });
+    profiles_->sweep_at =
+        std::max(detail::MeterProfiles::kFirstSweep, 2 * interned.size());
+  }
+  interned[key] = profile;
   return profile;
 }
 
@@ -261,10 +470,10 @@ std::expected<void, MeterError> MeterSetBuilder::Add(
     MeterId id, const MeterProfileSpec &spec, MeterSharing sharing,
     int socket) {
   const size_t index = static_cast<size_t>(id.value());
-  if (index == 0 || index >= entries_.size()) {
+  if (index == 0 || index > capacity_) {
     return std::unexpected(MeterError::kInvalidId);
   }
-  if (entries_[index].has_value()) {
+  if (Find(id) != nullptr) {
     return std::unexpected(MeterError::kDuplicateId);
   }
 
@@ -276,15 +485,19 @@ std::expected<void, MeterError> MeterSetBuilder::Add(
   if (!state) {
     return std::unexpected(state.error());
   }
-  entries_[index].emplace(Entry{std::move(profile).value(),
-                                std::move(state).value(), sharing, socket});
+  detail::MeterLeaf *leaf = WritableLeaf(index);
+  const size_t slot = index & (detail::kMeterLeafSlots - 1);
+  leaf->states[slot] = state->get();
+  leaf->entries[slot] = Entry{std::move(profile).value(),
+                              std::move(state).value(), sharing, socket};
+  leaf->used++;
   size_++;
   return {};
 }
 
 std::expected<void, MeterError> MeterSetBuilder::Reconfigure(
     MeterId id, const MeterProfileSpec &spec) {
-  Entry *entry = Find(id);
+  const Entry *entry = Find(id);
   if (entry == nullptr) {
     return std::unexpected(MeterError::kUnknownId);
   }
@@ -300,14 +513,19 @@ std::expected<void, MeterError> MeterSetBuilder::Reconfigure(
   if (!state) {
     return std::unexpected(state.error());
   }
-  // Commit both only once both exist, so a failure leaves the meter as it was.
-  entry->profile = std::move(profile).value();
-  entry->state = std::move(state).value();
+  // Commit both only once both exist, so a failure leaves the meter as it
+  // was. `entry` may be in a node the copy below replaces: not used after.
+  const size_t index = static_cast<size_t>(id.value());
+  detail::MeterLeaf *leaf = WritableLeaf(index);
+  const size_t slot = index & (detail::kMeterLeafSlots - 1);
+  leaf->states[slot] = state->get();
+  leaf->entries[slot].profile = std::move(profile).value();
+  leaf->entries[slot].state = std::move(state).value();
   return {};
 }
 
 std::expected<void, MeterError> MeterSetBuilder::Reset(MeterId id) {
-  Entry *entry = Find(id);
+  const Entry *entry = Find(id);
   if (entry == nullptr) {
     return std::unexpected(MeterError::kUnknownId);
   }
@@ -315,60 +533,30 @@ std::expected<void, MeterError> MeterSetBuilder::Reset(MeterId id) {
   if (!state) {
     return std::unexpected(state.error());
   }
-  entry->state = std::move(state).value();
+  const size_t index = static_cast<size_t>(id.value());
+  detail::MeterLeaf *leaf = WritableLeaf(index);
+  const size_t slot = index & (detail::kMeterLeafSlots - 1);
+  leaf->states[slot] = state->get();
+  leaf->entries[slot].state = std::move(state).value();
   return {};
 }
 
 std::expected<void, MeterError> MeterSetBuilder::Erase(MeterId id) {
   const size_t index = static_cast<size_t>(id.value());
-  if (index == 0 || index >= entries_.size()) {
+  if (index == 0 || index > capacity_) {
     return std::unexpected(MeterError::kInvalidId);
   }
-  if (!entries_[index].has_value()) {
+  if (Find(id) == nullptr) {
     return std::unexpected(MeterError::kUnknownId);
   }
-  entries_[index].reset();
+  detail::MeterLeaf *leaf = WritableLeaf(index);
+  const size_t slot = index & (detail::kMeterLeafSlots - 1);
+  leaf->states[slot] = nullptr;
+  leaf->entries[slot] = Entry{};
+  leaf->used--;
   size_--;
+  Prune(index);
   return {};
-}
-
-std::unique_ptr<const MeterSet> MeterSetBuilder::Build() const {
-  // The generation is admitted before it is allocated: the state index
-  // (DPDK) and one owner and up to one profile reference per meter (glibc,
-  // reserved exactly). It gives them back when it is destroyed (D-198).
-  // MeterSet::GlibcBytes(size_) is the references of size_ meters; the
-  // index is capacity + 1 pointers whatever the occupancy.
-  const size_t glibc = MeterSet::GlibcBytes(size_);
-  const size_t bytes = entries_.size() * sizeof(MeterState *) + glibc;
-  memory_->Grow(bytes, glibc);
-  try {
-    MeterSet::States states(entries_.size(), nullptr);
-    std::vector<std::shared_ptr<MeterState>> owners;
-    std::vector<std::shared_ptr<const MeterProfile>> profiles;
-    owners.reserve(size_);
-    profiles.reserve(size_);
-
-    for (size_t index = 1; index < entries_.size(); index++) {
-      const std::optional<Entry> &entry = entries_[index];
-      if (!entry.has_value()) {
-        continue;
-      }
-      states[index] = entry->state.get();
-      owners.push_back(entry->state);
-      profiles.push_back(entry->profile);
-    }
-
-    // One owning reference per distinct profile is enough.
-    std::sort(profiles.begin(), profiles.end());
-    profiles.erase(std::unique(profiles.begin(), profiles.end()),
-                   profiles.end());
-
-    return std::unique_ptr<const MeterSet>(new MeterSet(
-        std::move(states), std::move(owners), std::move(profiles), memory_));
-  } catch (...) {
-    memory_->Shrink(bytes, glibc);
-    throw;
-  }
 }
 
 }  // namespace bess::meter

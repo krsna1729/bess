@@ -4,21 +4,19 @@
 
 #include <array>
 #include <cstdint>
-#include <expected>
 #include <limits>
 #include <memory>
 #include <span>
 #include <string>
 #include <utility>
-#include <variant>
 
+#include "dataplane/resource_registry.h"
 #include "framework/resource_bindings.h"
-#include "dataplane/transaction_engine.h"
+#include "meter/meter_resource_codec.h"
 #include "utils/endian.h"
 #include "utils/format.h"
 #include "utils/ip.h"
 
-namespace dataplane = bess::dataplane;
 namespace meter = bess::meter;
 
 const Commands Meter::cmds = {
@@ -34,55 +32,6 @@ const ResourceTables Meter::resource_tables = {
 
 namespace {
 
-// The RPC's policy message as K5's profile specification (D-025).
-std::expected<meter::MeterProfileSpec, std::string> PolicyFromPb(
-    const bess::pb::MeterPolicyValue &value) {
-  switch (value.profile_case()) {
-    case bess::pb::MeterPolicyValue::kSrTcm:
-      return meter::MeterProfileSpec{meter::SrTcmSpec{
-          value.sr_tcm().committed_rate(), value.sr_tcm().committed_burst(),
-          value.sr_tcm().excess_burst()}};
-    case bess::pb::MeterPolicyValue::kTrTcm:
-      return meter::MeterProfileSpec{meter::TrTcmSpec{
-          value.tr_tcm().committed_rate(), value.tr_tcm().committed_burst(),
-          value.tr_tcm().peak_rate(), value.tr_tcm().peak_burst()}};
-    case bess::pb::MeterPolicyValue::kTrTcmRfc4115:
-      return meter::MeterProfileSpec{meter::TrTcmRfc4115Spec{
-          value.tr_tcm_rfc4115().committed_rate(),
-          value.tr_tcm_rfc4115().committed_burst(),
-          value.tr_tcm_rfc4115().excess_rate(),
-          value.tr_tcm_rfc4115().excess_burst()}};
-    case bess::pb::MeterPolicyValue::PROFILE_NOT_SET:
-      break;
-  }
-  return std::unexpected("meter policy has no profile set");
-}
-
-// PolicyFromPb's inverse: the message a client sends for `spec` (D-129's
-// read-back; every field is a scalar, so the form is unique).
-bess::pb::MeterPolicyValue PolicyToPb(const meter::MeterProfileSpec &spec) {
-  bess::pb::MeterPolicyValue value;
-  if (const auto *sr = std::get_if<meter::SrTcmSpec>(&spec)) {
-    auto *pb = value.mutable_sr_tcm();
-    pb->set_committed_rate(sr->committed_rate);
-    pb->set_committed_burst(sr->committed_burst);
-    pb->set_excess_burst(sr->excess_burst);
-  } else if (const auto *tr = std::get_if<meter::TrTcmSpec>(&spec)) {
-    auto *pb = value.mutable_tr_tcm();
-    pb->set_committed_rate(tr->committed_rate);
-    pb->set_committed_burst(tr->committed_burst);
-    pb->set_peak_rate(tr->peak_rate);
-    pb->set_peak_burst(tr->peak_burst);
-  } else if (const auto *rfc = std::get_if<meter::TrTcmRfc4115Spec>(&spec)) {
-    auto *pb = value.mutable_tr_tcm_rfc4115();
-    pb->set_committed_rate(rfc->committed_rate);
-    pb->set_committed_burst(rfc->committed_burst);
-    pb->set_excess_rate(rfc->excess_rate);
-    pb->set_excess_burst(rfc->excess_burst);
-  }
-  return value;
-}
-
 // MeterStateSnapshot's bucket kinds as the wire enum.
 bess::pb::MeterBucketKind PbKind(meter::MeterBucketKind kind) {
   switch (kind) {
@@ -97,145 +46,6 @@ bess::pb::MeterBucketKind PbKind(meter::MeterBucketKind kind) {
 }
 
 }  // namespace
-
-// "<module>/meters" (D-021): key = EncodeKey(MeterId), value =
-// MeterProfileSpec. The desired state is a MeterSetBuilder; a transaction
-// edits a private copy of it (BeginTransaction) and every upsert publishes a
-// generation built from that copy -- so nothing is visible until the
-// transaction publishes, and a rejected transaction leaves the live builder,
-// the published generation and every meter's token state untouched.
-//
-// An erase is the two-step removal SlotTable defines: it is absent to the
-// control side at once (and the id is unpublishable), the published
-// generation keeps the meter readable until the removal cascade's stage runs,
-// and that stage publishes a generation without it and retires the one it
-// replaced.
-class Meter::MetersResource final : public dataplane::Resource {
- public:
-  explicit MetersResource(Meter &owner)
-      : Resource(owner.name() + "/meters"), owner_(owner) {}
-
-  size_t LiveCount() const override { return owner_.live_->size(); }
-
-  bool Contains(const dataplane::ResourceKey &key) const override {
-    meter::MeterId id;
-    if (!dataplane::DecodeKey(key, &id) || !owner_.live_->Contains(id)) {
-      return false;
-    }
-    return !owner_.retiring_.contains(id);
-  }
-
-
-  // A reader may still hold an erased meter's id from a rule's old result:
-  // the erase is deferred to the removal cascade.
-  bool DefersErase() const override { return true; }
-
-  std::expected<Reservation, std::string> Reserve(
-      const dataplane::Op &op) override {
-    meter::MeterId id;
-    if (!dataplane::DecodeKey(op.key, &id) || id.value() == 0 ||
-        id.value() > owner_.live_->capacity()) {
-      return std::unexpected("invalid meter id");
-    }
-    if (op.kind == dataplane::OpKind::kErase) {
-      if (!Contains(op.key)) {
-        return std::unexpected("not found");
-      }
-      // The key stops accepting writes now, but stays in every published
-      // generation until the removal cascade: a rule's old result can
-      // still hand a reader this meter id. A simultaneous upsert of another
-      // meter must not make this id disappear prematurely. The cascade's
-      // generation without it is admitted now (MetersGrowth): a removal
-      // stage cannot refuse, so a refusal refuses this erase.
-      auto erase = std::make_unique<EraseOp>(owner_, id);
-      owner_.PrepayErase();
-      try {
-        owner_.retiring_.insert(id);
-      } catch (...) {
-        owner_.RefundErase();
-        throw;
-      }
-      Reservation erase_reservation{std::move(erase), {},
-                                    Footprint{.removals = 1}};
-      erase_reservation.existed = true;
-      return erase_reservation;
-    }
-
-    const Policy *policy = std::any_cast<Policy>(&op.value);
-    if (policy == nullptr) {
-      return std::unexpected("wrong value type (want MeterProfileSpec)");
-    }
-    if (auto valid = meter::ValidateMeterProfileSpec(*policy); !valid) {
-      return std::unexpected(std::string("invalid profile: ") +
-                             meter::MeterErrorName(valid.error()));
-    }
-    if (owner_.retiring_.contains(id)) {
-      return std::unexpected(
-          "the meter is still retiring (removed less than a grace period "
-          "ago)");
-    }
-
-    // Everything fallible -- profile compilation, state allocation, building
-    // the generation -- happens here, on the transaction's private copy.
-    owner_.BeginTransaction();
-    const bool existed = owner_.staged_->Contains(id);
-    auto applied =
-        existed ? owner_.staged_->Reconfigure(id, *policy)
-                : owner_.staged_->Add(id, *policy, meter::MeterSharing::kShared);
-    if (!applied) {
-      return std::unexpected(meter::MeterErrorName(applied.error()));
-    }
-    owner_.staged_policies_.insert_or_assign(id, *policy);
-    Reservation reservation{
-        std::make_unique<UpsertOp>(owner_, owner_.staged_->Build()), {},
-        // Publishing replaces the generation that is live now.
-        Footprint{.retires = 1}};
-    reservation.existed = owner_.live_->Contains(id);
-    return reservation;
-  }
-
-  void EndTransaction() noexcept override { owner_.EndTransaction(); }
-
- private:
-  class UpsertOp final : public dataplane::StagedOp {
-   public:
-    UpsertOp(Meter &owner,
-             std::unique_ptr<const meter::MeterSet> generation)
-        : owner_(owner), generation_(std::move(generation)) {}
-    void Publish(dataplane::Retirer &retirer) noexcept override {
-      owner_.PublishStaged(std::move(generation_), retirer);
-    }
-
-   private:
-    Meter &owner_;
-    std::unique_ptr<const meter::MeterSet> generation_;
-  };
-
-  class EraseOp final : public dataplane::StagedOp {
-   public:
-    EraseOp(Meter &owner, meter::MeterId id) : owner_(owner), id_(id) {}
-    void Publish(dataplane::Retirer &retirer) noexcept override {
-      // The stage runs one grace period after this publish: by then no reader
-      // can still obtain the id from a referrer's old value.
-      retirer.RemoveLater(
-          [&owner = owner_, id = id_](dataplane::Retirer &later) {
-            owner.Unpublish(id, later);
-          });
-    }
-    // The reservation marked the meter as retiring and prepaid its removal
-    // stage; a transaction that will not publish must put both back.
-    void Abort() noexcept override {
-      owner_.retiring_.erase(id_);
-      owner_.RefundErase();
-    }
-
-   private:
-    Meter &owner_;
-    meter::MeterId id_;
-  };
-
-  Meter &owner_;
-};
 
 CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   // The level count sizes the attribute this module declares, and the
@@ -276,53 +86,24 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   }
   const size_t capacity =
       arg.capacity() == 0 ? 1024 : static_cast<size_t>(arg.capacity());
-  // Admitted before it is built (D-198); everything the builders and their
-  // generations grow by afterwards, the first generation included, is
-  // admitted through growth_ (see meter.h).
-  meters_lease_ = init_context().memory().LeaseFor<meter::MeterSetBuilder>(
-      "meters", capacity);
-  growth_.lease = meters_lease_.growth();
-  live_ = std::make_unique<meter::MeterSetBuilder>(capacity);
-  live_->set_memory_growth(&growth_);
-  published_.Initialize(live_->Build());
-
-  resource_ = std::make_unique<MetersResource>(*this);
+  // Admitted before it is built (D-198); everything the meters grow by
+  // afterwards, the first generation included, is admitted through the
+  // lease's hook (meter/meter_resource.h).
+  {
+    bess::framework::MemoryLease lease =
+        init_context().memory().LeaseFor<meter::MeterResource>("meters",
+                                                               capacity);
+    auto made = std::make_unique<meter::MeterResource>(
+        name() + "/meters", capacity, published_, lease.growth());
+    meters_ = bess::framework::MemoryScope::Adopt(std::move(lease),
+                                                  std::move(made));
+  }
   binding_ = init_context().codecs().Bind(
-      *resource_,
-      std::make_shared<bess::framework::TypedCodec<bess::pb::MeterIdKey,
-                                             bess::pb::MeterPolicyValue>>(
-          [](const bess::pb::MeterIdKey &key)
-              -> std::expected<dataplane::ResourceKey, std::string> {
-            if (key.id() == 0) {
-              return std::unexpected("meter id 0 is invalid");
-            }
-            return dataplane::EncodeKey(meter::MeterId(key.id()));
-          },
-          [](const bess::pb::MeterPolicyValue &value)
-              -> std::expected<std::any, std::string> {
-            auto policy = PolicyFromPb(value);
-            if (!policy) {
-              return std::unexpected(policy.error());
-            }
-            return std::any(*policy);
-          },
-          // Every meter the control side holds (an erased one is gone at
-          // once, though it stays readable until its removal stage).
-          [this](const auto &visit) {
-            for (const auto &[id, policy] : policies_) {
-              if (retiring_.contains(id)) {
-                continue;
-              }
-              bess::pb::MeterIdKey key;
-              key.set_id(id.value());
-              visit(key, PolicyToPb(policy));
-            }
-          }));
-  if (auto registered =
-          init_context().resources().Register(resource_.get());
+      *meters_, meter::MakeMeterResourceCodec(*meters_));
+  if (auto registered = init_context().resources().Register(meters_.get());
       !registered) {
     binding_.Reset();
-    resource_.reset();
+    meters_.reset();
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
 
@@ -339,30 +120,30 @@ CommandResponse Meter::Init(const bess::pb::MeterArg &arg) {
   // way. The library is unit-agnostic -- it is handed one integer per packet.
   packets_ = arg.cost() == bess::pb::MeterArg::METER_COST_PACKETS;
   if (meter_id_attr_ < 0) {
-    const std::string name = resource_->name();
+    const std::string name = meters_->name();
     CHECK(init_context().resources().ReleaseForTeardown(
         std::span<const std::string>(&name, 1)));
     binding_.Reset();
-    resource_.reset();
+    meters_.reset();
     return CommandFailure(-meter_id_attr_, "add_metadata_attr() failed");
   }
   return CommandSuccess();
 }
 
 void Meter::DeInit() {
-  if (resource_ == nullptr) {
+  if (!meters_) {
     return;
   }
   // Meters are referenced by classifier rules, so a meter may leave with live
   // keys and with its keys still named (D-021's teardown release): the order
   // modules are destroyed in must not decide whether a pipeline can be torn
   // down.
-  const std::string name = resource_->name();
+  const std::string name = meters_->name();
   auto released = init_context().resources().ReleaseForTeardown(
       std::span<const std::string>(&name, 1));
   CHECK(released) << released.error();
   binding_.Reset();
-  resource_.reset();
+  meters_.reset();
 }
 
 int Meter::OnEvent(bess::Event event) {
@@ -378,108 +159,6 @@ int Meter::OnEvent(bess::Event event) {
                   "dropping packets";
   }
   return 0;
-}
-
-void Meter::BeginTransaction() {
-  if (staged_ == nullptr) {
-    staged_ = live_->Clone();
-    staged_policies_ = policies_;
-    published_staged_ = false;
-  }
-}
-
-void Meter::PublishStaged(std::unique_ptr<const meter::MeterSet> generation,
-                          dataplane::Retirer &retirer) {
-  // Every operation of the transaction reserved against the same private
-  // copy, so the swap happens once: the desired state becomes what that copy
-  // holds, and the published generation is this operation's view of it.
-  if (!published_staged_) {
-    live_.swap(staged_);
-    policies_.swap(staged_policies_);
-    published_staged_ = true;
-  }
-  retirer.Retire(published_.Exchange(std::move(generation)));
-}
-
-void Meter::Unpublish(meter::MeterId id, dataplane::Retirer &later) {
-  if (retiring_.erase(id) == 0) {
-    RefundErase();
-    return;  // re-added: the published generation is already the new meter
-  }
-  auto erased = live_->Erase(id);
-  CHECK(erased) << meter::MeterErrorName(erased.error());
-  policies_.erase(id);
-
-  // A removal stage cannot refuse: Build is paid from this erase's prepay
-  // (MetersGrowth::Grow), and what it did not use -- or gave back, if it
-  // failed -- is released after.
-  const size_t had = growth_.prepaid_bytes;
-  const size_t had_glibc = growth_.prepaid_glibc;
-  const size_t capacity = live_->capacity();
-  auto settle = [&]() noexcept {
-    growth_.paying = false;
-    growth_.Refund(
-        meter::MeterSet::Bytes(capacity) - (had - growth_.prepaid_bytes),
-        meter::MeterSet::GlibcBytes(capacity) -
-            (had_glibc - growth_.prepaid_glibc));
-  };
-  growth_.paying = true;
-  std::unique_ptr<const meter::MeterSet> generation;
-  try {
-    generation = live_->Build();
-  } catch (...) {
-    settle();
-    throw;
-  }
-  settle();
-  later.Retire(published_.Exchange(std::move(generation)));
-}
-
-void Meter::PrepayErase() {
-  const size_t capacity = live_->capacity();
-  growth_.Prepay(meter::MeterSet::Bytes(capacity),
-                 meter::MeterSet::GlibcBytes(capacity));
-}
-
-void Meter::RefundErase() noexcept {
-  const size_t capacity = live_->capacity();
-  growth_.Refund(meter::MeterSet::Bytes(capacity),
-                 meter::MeterSet::GlibcBytes(capacity));
-}
-
-void Meter::MetersGrowth::Grow(size_t bytes, size_t glibc_bytes) {
-  if (!paying) {
-    lease->Grow(bytes, glibc_bytes);
-    return;
-  }
-  // Already admitted by the erase's Reserve; MeterSet::Bytes bounds every
-  // generation the builder builds.
-  CHECK(bytes <= prepaid_bytes && glibc_bytes <= prepaid_glibc)
-      << "meter generation exceeds its prepaid admission";
-  prepaid_bytes -= bytes;
-  prepaid_glibc -= glibc_bytes;
-}
-
-void Meter::MetersGrowth::Shrink(size_t bytes, size_t glibc_bytes) noexcept {
-  lease->Shrink(bytes, glibc_bytes);
-}
-
-void Meter::MetersGrowth::Prepay(size_t bytes, size_t glibc_bytes) {
-  lease->Grow(bytes, glibc_bytes);
-  prepaid_bytes += bytes;
-  prepaid_glibc += glibc_bytes;
-}
-
-void Meter::MetersGrowth::Refund(size_t bytes, size_t glibc_bytes) noexcept {
-  prepaid_bytes -= bytes;
-  prepaid_glibc -= glibc_bytes;
-  lease->Shrink(bytes, glibc_bytes);
-}
-
-void Meter::EndTransaction() noexcept {
-  staged_.reset();
-  staged_policies_.clear();
-  published_staged_ = false;
 }
 
 std::optional<uint32_t> Meter::AccountedBytes(bess::PacketRef pkt) const {
@@ -554,6 +233,13 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
     return;
   }
 
+  const auto id_at = [&](size_t l, int i) {
+    const bess::metadata::mt_offset_t slot =
+        static_cast<bess::metadata::mt_offset_t>(
+            offset + static_cast<int>(l) *
+                         static_cast<int>(sizeof(bess::utils::be32_t)));
+    return get_attr_with_offset<bess::utils::be32_t>(slot, batch->packet(i)).value();
+  };
   const meter::MeterSet *set = published_.Read();
   const uint64_t now = meter::MeterNow();
   const size_t levels = levels_;
@@ -572,19 +258,23 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
   // packet a level marks red is not charged to the levels after it, so the
   // session's bucket is not billed for what the flow's dropped. Green and
   // yellow continue and keep charging; the packet's colour is the worst seen.
+  // A level's ids are resolved for the whole batch first (MeterSet::Resolve:
+  // the walks and their misses overlap), then checked in packet order.
+  static_assert(bess::PacketBatch::kMaxBurst <= meter::MeterSet::kMaxBatch);
+  std::array<meter::MeterId, bess::PacketBatch::kMaxBurst> ids;
+  std::array<meter::MeterState *, bess::PacketBatch::kMaxBurst> states;
+  const auto n = static_cast<size_t>(cnt);
   for (size_t l = 0; l < levels; l++) {
-    const bess::metadata::mt_offset_t slot =
-        static_cast<bess::metadata::mt_offset_t>(
-            offset + static_cast<int>(l) *
-                         static_cast<int>(sizeof(bess::utils::be32_t)));
+    for (int i = 0; i < cnt; i++) {
+      ids[i] = alive[i] ? meter::MeterId(id_at(l, i)) : meter::kInvalidMeterId;
+    }
+    set->Resolve(std::span<const meter::MeterId>(ids.data(), n),
+                 std::span<meter::MeterState *>(states.data(), n));
     for (int i = 0; i < cnt; i++) {
       if (!alive[i]) {
         continue;
       }
-      bess::PacketRef pkt = batch->packet(i);
-      const meter::MeterId id(
-          get_attr_with_offset<bess::utils::be32_t>(slot, pkt).value());
-      if (id.value() == 0) {
+      if (ids[i].value() == 0) {
         continue;  // no meter at this level
       }
       if (!costs[i]) {
@@ -595,7 +285,7 @@ void Meter::MeterBatch(bess::PacketBatch *batch, gate_idx_t *gates) const {
         alive[i] = false;
         continue;
       }
-      meter::MeterState *state = set->Lookup(id);
+      meter::MeterState *state = states[i];
       if (state == nullptr) {
         // A dangling id is dropped rather than forwarded unmetered, as with
         // a single level.
@@ -622,7 +312,7 @@ void Meter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
 }
 
 std::string Meter::GetDesc() const {
-  return bess::utils::Format("%zu meters", live_->size());
+  return bess::utils::Format("%zu meters", meters_->size());
 }
 
 CommandResponse Meter::CommandGetStatus(
@@ -642,7 +332,7 @@ CommandResponse Meter::CommandGetStatus(
     const meter::MeterStateSnapshot snapshot = state->Inspect();
     bess::pb::MeterStatus *status = response.add_meters();
     status->set_meter_id(id.value());
-    *status->mutable_policy() = PolicyToPb(snapshot.spec);
+    *status->mutable_policy() = meter::MeterPolicyToPb(snapshot.spec);
     status->set_shared(snapshot.sharing == meter::MeterSharing::kShared);
     status->set_last_update_tsc(snapshot.last_update_tsc);
     for (const meter::MeterBucketState &bucket : snapshot.buckets) {
@@ -658,11 +348,8 @@ CommandResponse Meter::CommandGetStatus(
     // The control side's committed set, which is what the resource read-back
     // (GetPipeline) shows. A retiring meter is already absent there even
     // though packets may still resolve its id until the removal cascade.
-    for (const auto &entry : policies_) {
-      if (!retiring_.contains(entry.first)) {
-        append(entry.first);
-      }
-    }
+    meters_->VisitPolicies(
+        [&](meter::MeterId id, const meter::MeterProfileSpec &) { append(id); });
   } else {
     for (uint32_t raw : arg.meter_ids()) {
       if (raw == 0) {
@@ -672,7 +359,7 @@ CommandResponse Meter::CommandGetStatus(
       // An erased meter stays in the published generation until the removal
       // cascade, so packets may still resolve it, but the control side is
       // already treating it as absent (as the resource read-back does).
-      if (retiring_.contains(id) || !append(id)) {
+      if (meters_->Retiring(id) || !append(id)) {
         return CommandFailure(ENOENT, "meter %u is not configured", raw);
       }
     }
