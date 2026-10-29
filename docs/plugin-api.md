@@ -1083,6 +1083,14 @@ sizes it, `BESSD_MEM_BACKING=hugepages` uses hugepages instead: the
 (`examples/appliances/router/router_app.h`) this way and checks a forwarded
 frame; CI's install check builds it from the stage and runs it.
 
+`route::Router::Create`, `Bytes` and `GlibcBytes` also accept trailing
+`RouterResourceNames` (D-202). Its `next_hops`, `neighbors`, `next_hop_state`,
+`routes` and `groups` members are full resource names. An empty member keeps
+the default `<router-name>/<suffix>`. An appliance with separate inner and
+transport Routers can therefore expose both under one module's resource prefix
+without sharing their state. Keep the same names when computing and creating
+each Router.
+
 No ABI promise: the archives are built with bessd's compiler, options and ISA
 and are linked only by a program built against the same install. They are
 compiled as executable (PIE) code, not `-fPIC` (D-119): a shared library or

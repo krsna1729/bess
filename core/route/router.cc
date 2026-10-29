@@ -125,7 +125,8 @@ void Elect(NextHopGroup &group, const Down &down) noexcept {
 
 std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
     std::string name, const Config &config, size_t max_next_hops,
-    rcu::RcuDomain &domain, size_t max_domains, size_t max_groups) {
+    rcu::RcuDomain &domain, size_t max_domains, size_t max_groups,
+    const RouterResourceNames &resources) {
   // With a FIB a route value is 24 bits and holds max_next_hops + group id
   // (D-065); without one an id is only ever a 32-bit metadata value.
   const size_t max_value = config.ipv4 || config.ipv6 ? LpmRouteTable::kMaxValue
@@ -146,7 +147,7 @@ std::expected<std::unique_ptr<Router>, RouteError> Router::Create(
   return std::unique_ptr<Router>(new Router(name, sized,
                                             std::move(*default_domain),
                                             max_next_hops, max_domains,
-                                            max_groups, domain));
+                                            max_groups, domain, resources));
 }
 
 Router::Config Router::SizedConfig(const Config &config, size_t max_next_hops,
@@ -165,7 +166,8 @@ size_t Router::DomainBytes(const Config &config) noexcept {
 
 size_t Router::Bytes(const std::string &name, const Config &config,
                      size_t max_next_hops, const rcu::RcuDomain &domain,
-                     size_t max_domains, size_t max_groups) {
+                     size_t max_domains, size_t max_groups,
+                     const RouterResourceNames &resources) {
   // The constructor publishes the default domain's object: the domain
   // slab's first chunk.
   return DomainBytes(SizedConfig(config, max_next_hops, max_groups)) +
@@ -175,12 +177,12 @@ size_t Router::Bytes(const std::string &name, const Config &config,
          dataplane::SlotTable<NextHopGroupId, NextHopGroup>::Bytes(
              std::max<size_t>(max_groups, 1)) +
          GlibcBytes(name, config, max_next_hops, domain, max_domains,
-                    max_groups);
+                    max_groups, resources);
 }
 
 size_t Router::GlibcBytes(const std::string &, const Config &,
                           size_t max_next_hops, const rcu::RcuDomain &, size_t,
-                          size_t max_groups) {
+                          size_t max_groups, const RouterResourceNames &) {
   // references_, member_references_, hop_states_ and bindings_ per next-hop
   // id, group_references_ per group id, and the router.
   return (max_next_hops + 1) *
@@ -228,7 +230,7 @@ Router::MakeDomain(const std::string &name, const Config &config,
 Router::Router(const std::string &name, const Config &config,
                Domain default_domain,
                size_t max_next_hops, size_t max_domains, size_t max_groups,
-               rcu::RcuDomain &rcu)
+               rcu::RcuDomain &rcu, const RouterResourceNames &resources)
     : name_(name),
       rcu_(rcu),
       max_domains_(max_domains),
@@ -246,11 +248,15 @@ Router::Router(const std::string &name, const Config &config,
       group_references_(max_groups + 1, 0),
       member_references_(max_next_hops + 1, 0),
       hop_states_(max_next_hops + 1, HopState::kNone),
-      next_hops_name_(name + "/next_hops"),
-      neighbors_name_(name + "/neighbors"),
-      next_hop_state_name_(name + "/next_hop_state"),
-      routes_name_(name + "/routes"),
-      groups_name_(name + "/groups"),
+      next_hops_name_(resources.next_hops.empty() ? name + "/next_hops"
+                                                : resources.next_hops),
+      neighbors_name_(resources.neighbors.empty() ? name + "/neighbors"
+                                                : resources.neighbors),
+      next_hop_state_name_(resources.next_hop_state.empty()
+                               ? name + "/next_hop_state"
+                               : resources.next_hop_state),
+      routes_name_(resources.routes.empty() ? name + "/routes" : resources.routes),
+      groups_name_(resources.groups.empty() ? name + "/groups" : resources.groups),
       bindings_(max_next_hops + 1) {
   // Before any reader can exist: nothing to retire.
   default_domain.set_memory_growth(&fib_memory_);

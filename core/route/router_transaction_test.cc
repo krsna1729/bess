@@ -103,6 +103,47 @@ class RouterTransactionTest : public bess::testing::RouteBackendTest {
   TransactionEngine engine_{bess::runtime::runtime().rcu()};
 };
 
+TEST_P(RouterTransactionTest, TwoRoutersShareAModulePrefixWithoutSharingState) {
+  const RouterResourceNames inner_names{
+      .next_hops = "upf/next_hops",
+      .neighbors = "upf/neighbors",
+      .next_hop_state = "upf/next_hop_state",
+      .routes = "upf/routes",
+      .groups = "upf/groups"};
+  const RouterResourceNames outer_names{
+      .next_hops = "upf/transport_next_hops",
+      .neighbors = "upf/transport_neighbors",
+      .next_hop_state = "upf/transport_next_hop_state",
+      .routes = "upf/transport_routes",
+      .groups = "upf/transport_groups"};
+  Router::Config config{.ipv4 = bess::testing::TestRouteConfig()};
+  auto inner = Router::Create("inner", config, 8,
+                              bess::runtime::runtime().rcu(), 1, 0, inner_names);
+  auto outer = Router::Create("outer", config, 8,
+                              bess::runtime::runtime().rcu(), 1, 0, outer_names);
+  ASSERT_TRUE(inner);
+  ASSERT_TRUE(outer);
+  ASSERT_TRUE((*inner)->Enroll(engine_.registry()));
+  ASSERT_TRUE((*outer)->Enroll(engine_.registry()));
+  const auto net = P(Ip(10, 0, 0, 0), 8);
+  ASSERT_EQ(Apply({(*inner)->SetRouteOp(net, NextHopId(1)),
+                   (*outer)->SetRouteOp(net, NextHopId(1)),
+                   (*inner)->SetNextHopOp(NextHopId(1), Hop(11)),
+                   (*outer)->SetNextHopOp(NextHopId(1), Hop(22))}).outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(EgressOf(**inner, Ip(10, 0, 0, 1)), 11);
+  EXPECT_EQ(EgressOf(**outer, Ip(10, 0, 0, 1)), 22);
+  // Reference checks use each router's overridden names, not its build name
+  // or the other router's identical next-hop id.
+  EXPECT_EQ(Apply({(*outer)->RemoveNextHopOp(NextHopId(1))}).outcome,
+            Outcome::kRejected);
+  ASSERT_EQ(Apply({(*inner)->RemoveRouteOp(net),
+                   (*inner)->RemoveNextHopOp(NextHopId(1))}).outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(EgressOf(**inner, Ip(10, 0, 0, 1)), -1);
+  EXPECT_EQ(EgressOf(**outer, Ip(10, 0, 0, 1)), 22);
+}
+
 TEST_P(RouterTransactionTest, EnrolledRoutersAreWrittenOnlyThroughTheEngine) {
   auto router = MakeRouter();
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1)));  // before: fine
