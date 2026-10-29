@@ -997,6 +997,10 @@ std::vector<Test> Catalogue() {
       {"M.exactmatch/miss", 'M', MExactMatch(0x0b000001, 1)},
       // Bursts split across 2 gates packet by packet: the emit cost alone.
       {"M.split/2", 'M', m("RoundRobin", "rr", R"({"gates": [0, 1], "mode": "packet"})", 2)},
+      // Every packet on both gates: the original on gate 0, a copy (fresh
+      // mbuf, bytes and metadata) on gate 1, so above M.split/2 the row is
+      // the copy and its second sink.
+      {"M.replicate", 'M', m("Replicate", "repl", R"({"gates": [0, 1]})", 2)},
       {"M.wildcardmatch", 'M', MWildcardMatch},
       {"M.wildcardmatch/13b", 'M', MWildcardMatch13},
       {"M.wildcardmatch/8", 'M', MWildcardMasks(8)},
