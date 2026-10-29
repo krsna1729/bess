@@ -44,7 +44,7 @@ no wall-clock pacing, no dependency on an idle machine.
 
 | Binary | Instances | Why |
 |---|---|---|
-| `ring_bench` | `BM_RingRteMpsc/1,4,16` | DPDK ring primitives in caller-owned memory; no EAL |
+| `ring_bench` | `BM_RingRteMpsc/1,2` | DPDK ring primitives in caller-owned memory; no EAL. Producer counts above the allowed CPUs minus one skip themselves, and a hosted runner has four CPUs, so 4 and 16 are not in the subset |
 | `fib_bench` | `BM_LookupLpmVec`, `BM_LookupFib` at 1K and 64K routes | routing lookup, the most latency-sensitive dataplane path; table setup is identical per run |
 | `packet_bench` | alloc/free, bulk alloc/free, head data, append/trim, metadata | packet primitives every pipeline touches; plain pool, no hugepages |
 | `packet_checksum_bench` | one contiguous raw-checksum shape and one computed-checksum shape | checksum kernels, fixed packet bytes |
@@ -150,7 +150,7 @@ One record per run:
 {"schema":1,"date":"...","kind":"nightly","commit":"<tip sha>",
  "hardware":{"model":"...","kernel":"...","runner_image":"...","fingerprint":"..."},
  "commits":[{"sha":"...","date":"...","subject":"..."}],
- "benchmarks":{"BM_RingRteMpsc/4":[{"commit":"...","ratio":1.012,
+ "benchmarks":{"BM_RingRteMpsc/2":[{"commit":"...","ratio":1.012,
    "median_ns":48.3,"baseline_ns":47.7,"ci":[0.99,1.04],"cv":0.008,
    "eligible":true,"stable":true,"regressed":false}]},
  "flagged":["..."],"clean":["..."],"run_url":"..."}

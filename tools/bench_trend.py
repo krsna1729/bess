@@ -64,7 +64,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # two properties that make the rest of the benchmark tree unsuitable for a
 # shared hosted runner.  `threshold` is the per-benchmark default (5%).
 SUITE = (
-    {"binary": "core/ring_bench", "filter": r"^BM_RingRteMpsc/(1|4|16)$"},
+    # One and two producers: the ring benchmark skips producer counts above
+    # the allowed CPUs minus one, and a hosted runner has four.
+    {"binary": "core/ring_bench", "filter": r"^BM_RingRteMpsc/(1|2)$"},
     {"binary": "core/fib_bench",
      "filter": r"^BM_Lookup(LpmVec|Fib)/routes:(1024|65536)$"},
     {"binary": "core/packet_bench",
@@ -172,7 +174,9 @@ def parse_benchmark_json(text):
     repetition.  Both are merged per run name so the analysis sees the raw
     timings that the aggregates came from.  A library that writes a warning
     to stdout before the document is tolerated: parsing starts at the first
-    object.
+    object.  A run Google Benchmark reports as skipped or failed
+    (`error_occurred`, or `skipped` in newer versions) carries no timing --
+    its cpu_time is 0 -- so it is left out rather than recorded as a sample.
     """
     start = text.find("{")
     if start < 0:
@@ -180,6 +184,8 @@ def parse_benchmark_json(text):
     document, _ = json.JSONDecoder().raw_decode(text[start:])
     benchmarks = {}
     for entry in document.get("benchmarks", []):
+        if entry.get("error_occurred") or entry.get("skipped"):
+            continue
         name = entry.get("run_name") or entry["name"]
         record = benchmarks.setdefault(name, {"samples": [], "aggregates": {}})
         if entry.get("run_type") == "aggregate":
@@ -472,6 +478,9 @@ def compare_benchmark(name, current, baseline_entries, history_entries,
     }
     if not current_samples or not baseline_samples or result["current_median"] is None:
         result["reasons"].append("missing samples (run both passes)")
+        return result
+    if not result["baseline_median"] or result["baseline_median"] <= 0:
+        result["reasons"].append("baseline median is not positive")
         return result
     ratio = result["current_median"] / result["baseline_median"]
     result["ratio"] = ratio

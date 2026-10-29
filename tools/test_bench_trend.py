@@ -154,6 +154,20 @@ class ParsingTest(unittest.TestCase):
         parsed = bt.parse_benchmark_json("EAL: a warning\n" + json.dumps(document))
         self.assertEqual(parsed["BM_A"]["samples"], [2.0])
 
+    def test_skipped_runs_are_not_recorded_as_zero_timings(self):
+        # The shape Google Benchmark emits for SkipWithMessage: cpu_time 0.
+        document = {"benchmarks": [
+            {"name": "BM_A/1", "run_name": "BM_A/1", "run_type": "iteration",
+             "cpu_time": 50.0, "time_unit": "ns"},
+            {"name": "BM_A/4", "run_name": "BM_A/4", "run_type": "iteration",
+             "error_occurred": True, "error_message": "producer count exceeds",
+             "cpu_time": 0.0, "time_unit": "ns"},
+            {"name": "BM_A/16", "run_name": "BM_A/16", "run_type": "iteration",
+             "skipped": "skipped_with_message", "cpu_time": 0.0, "time_unit": "ns"},
+        ]}
+        parsed = bt.parse_benchmark_json(json.dumps(document))
+        self.assertEqual(sorted(parsed), ["BM_A/1"])
+
     def test_command_carries_the_required_flags(self):
         command = bt.benchmark_command("core/ring_bench", "^BM_Ring", "1s", 5, True)
         joined = " ".join(command)
@@ -174,6 +188,17 @@ class GateTest(unittest.TestCase):
     def history(self, medians):
         return [{"samples": samples(value), "aggregates": aggregate(samples(value))}
                 for value in medians]
+
+    def test_a_zero_baseline_is_not_a_comparison(self):
+        # History recorded before skipped runs were filtered holds zeros;
+        # dividing by them crashed the nightly analysis.
+        history = [{"samples": [0.0] * 5, "aggregates": {}} for _ in range(3)]
+        current = {"samples": samples(100), "aggregates": aggregate(samples(100))}
+        entry = bt.compare_benchmark("BM_Test", current, history, history,
+                                     self.config(), 1000, "nightly")
+        self.assertIsNone(entry["ratio"])
+        self.assertFalse(entry["regressed"])
+        self.assertIn("baseline median is not positive", entry["reasons"])
 
     def test_threshold_is_per_benchmark_and_defaults_to_five_percent(self):
         config = self.config()
