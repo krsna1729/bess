@@ -386,6 +386,37 @@ size_t ResourceRegistry::ReferenceCount(const std::string &resource,
 }
 uint64_t ResourceRegistry::generation() const { return engine_.generation(); }
 
+ResourceRegistry::OwnedApplyResult ResourceRegistry::ApplyOwned(
+    std::span<const Resource *const> owned, std::span<const Op> ops) {
+  TransactionEngine::Result result = engine_.ApplyOwned(owned, ops);
+  OwnedApplyResult answer;
+  answer.generation = result.generation;
+  switch (result.outcome) {
+    case TransactionEngine::Outcome::kApplied:
+      answer.outcome = OwnedApplyResult::Outcome::kApplied;
+      return answer;
+    case TransactionEngine::Outcome::kBusy:
+      answer.outcome = OwnedApplyResult::Outcome::kBusy;
+      return answer;
+    case TransactionEngine::Outcome::kRejected:
+    // Only with an expected generation or a scope-snapshot request, neither of
+    // which ApplyOwned makes; a refusal all the same.
+    case TransactionEngine::Outcome::kConflict:
+    case TransactionEngine::Outcome::kUnsupported:
+      break;
+  }
+  answer.outcome = OwnedApplyResult::Outcome::kRejected;
+  answer.over_budget = result.over_budget;
+  for (size_t i = 0; i < result.ops.size(); i++) {
+    if (result.ops[i].status == TransactionEngine::OpStatus::kFailed) {
+      answer.failed_op = i;
+      answer.error = std::move(result.ops[i].error);
+      break;
+    }
+  }
+  return answer;
+}
+
 uint64_t TransactionEngine::generation() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return generation_;
@@ -496,7 +527,16 @@ TransactionEngine::Result TransactionEngine::Reject(size_t n_ops,
 TransactionEngine::Result TransactionEngine::Apply(std::span<const Op> ops,
                                                   std::optional<uint64_t> expected_generation,
                                                   Consistency consistency, OnBusy on_busy) {
-  Result result = ApplyImpl(ops, expected_generation, consistency);
+  return Counted(ApplyImpl(ops, expected_generation, consistency, nullptr), on_busy);
+}
+
+TransactionEngine::Result TransactionEngine::ApplyOwned(
+    std::span<const Resource *const> owned, std::span<const Op> ops) {
+  return Counted(ApplyImpl(ops, std::nullopt, Consistency::kReferential, &owned),
+                 OnBusy::kAnswer);
+}
+
+TransactionEngine::Result TransactionEngine::Counted(Result result, OnBusy on_busy) {
   if (result.outcome == Outcome::kBusy && on_busy == OnBusy::kRetry) {
     busy_retried_.fetch_add(1, std::memory_order_relaxed);
     return result;
@@ -518,7 +558,7 @@ TransactionEngine::OutcomeCounts TransactionEngine::outcome_counts() const {
 
 TransactionEngine::Result TransactionEngine::ApplyImpl(
     std::span<const Op> ops, std::optional<uint64_t> expected_generation,
-    Consistency consistency) {
+    Consistency consistency, const std::span<const Resource *const> *owned) {
   std::lock_guard<std::mutex> lock(mutex_);
   ReclaimRetiredLocked();  // frees ids whose removal has completed
   // Ranks come from the bound dependency graph, which registrations may have
@@ -557,6 +597,15 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
     auto it = resources_.find(std::string_view(op.resource));
     if (it == resources_.end()) {
       return Reject(n, i, "unknown resource '" + op.resource + "'");
+    }
+    // An owner's transaction (ApplyOwned, D-200): the resource the name
+    // resolves to must be one of the caller's objects. A handful at most, so a
+    // scan; checked here, under the mutex, so it holds through the apply.
+    if (owned != nullptr &&
+        std::find(owned->begin(), owned->end(), it->second->resource) ==
+            owned->end()) {
+      return Reject(n, i,
+                    "resource '" + op.resource + "' is not owned by the caller");
     }
     w.reg[i] = it->second.get();
     if (consistency == Consistency::kScopeSnapshot &&

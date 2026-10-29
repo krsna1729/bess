@@ -17,23 +17,29 @@
 namespace dataplane = bess::dataplane;
 namespace stats = bess::stats;
 
+// DPDK 25.11's rte_ring_elem.h lacks its own extern "C", so
+// rte_ring_get_memsize_elem has C++ linkage there and cannot be called from a
+// header; this reaches the C symbol directly, as handoff.cc does for the
+// handoff channel's own element size. The pointer-ring size (rte_ring_get_memsize)
+// is for 8-byte slots and would under-size an element ring.
+extern "C" ssize_t BessPacketStoreRingMemsizeElem(unsigned esize,
+                                                  unsigned count)
+    __asm__("rte_ring_get_memsize_elem");
+
 namespace {
 
 using bess::utils::be32_t;
 
 // A ring in caller-owned memory, the pattern Queue and DRR share (Queue's
 // AllocRing, drr.cc:514): rte_ring_create would allocate an EAL memzone, which
-// the malloc-pool module tests have no hugepages for. `bytes` is
-// utils::RingElemBytes for the ring (0: DPDK refuses the size); the
-// pointer-ring size (rte_ring_get_memsize) is for 8-byte slots and would
-// under-size an element ring.
+// the malloc-pool module tests have no hugepages for.
 struct rte_ring *AllocRing(uint32_t slots, const char *prefix, unsigned flags,
-                           size_t bytes) {
-  if (bytes == 0) {
+                           ssize_t bytes) {
+  if (bytes < 0) {
     return nullptr;
   }
-  struct rte_ring *ring =
-      static_cast<rte_ring *>(bess::utils::AllocRingMem(bytes));
+  struct rte_ring *ring = static_cast<rte_ring *>(
+      bess::utils::AllocRingMem(static_cast<size_t>(bytes)));
   if (ring == nullptr) {
     return nullptr;
   }
@@ -510,21 +516,17 @@ CommandResponse PacketStore::Init(const bess::pb::PacketStoreArg &arg) {
   // Packets in from any worker, requests in from control. The ingress ring is
   // multi-producer (every worker whose graph reaches the module) and the owner
   // is its only consumer, so the default enqueue is the multi-producer one and
-  // only the dequeue is flagged. Both rings are admitted before either is
-  // allocated (D-198; a refusal throws MemoryRefused).
-  const size_t ingress_bytes =
-      bess::utils::RingElemBytes(sizeof(IngressPacket), kIngressSlots);
-  const size_t request_bytes =
-      bess::utils::RingElemBytes(sizeof(Request), kRequestSlots);
-  rings_lease_ = init_context().memory().Lease(
-      "rings", ingress_bytes + request_bytes, ingress_bytes + request_bytes);
+  // only the dequeue is flagged.
   ingress_ = AllocRing(kIngressSlots, "packet_store_ingress", RING_F_SC_DEQ,
-                       ingress_bytes);
+                       BessPacketStoreRingMemsizeElem(sizeof(IngressPacket),
+                                                      kIngressSlots));
   if (ingress_ == nullptr) {
     return CommandFailure(ENOMEM, "the ingress ring could not be created");
   }
   requests_ = AllocRing(kRequestSlots, "packet_store_requests",
-                        RING_F_SP_ENQ | RING_F_SC_DEQ, request_bytes);
+                        RING_F_SP_ENQ | RING_F_SC_DEQ,
+                        BessPacketStoreRingMemsizeElem(sizeof(Request),
+                                                       kRequestSlots));
   if (requests_ == nullptr) {
     return CommandFailure(ENOMEM, "the request ring could not be created");
   }
@@ -664,7 +666,6 @@ void PacketStore::DeInit() {
       *ring = nullptr;
     }
   }
-  rings_lease_.reset();
   total_packets_.store(0, std::memory_order_relaxed);
 }
 
