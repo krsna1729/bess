@@ -792,6 +792,12 @@ Declare `meters_` (a `Sized<MeterResource>`) before the `RcuPtr` and the
 binding after both. `VisitPolicies` reads the committed meters back;
 `MeterPolicyFromPb`/`MeterPolicyToPb` convert the wire policy.
 
+For session-major storage, `MeterState::ConstructAt(memory, profile, sharing)`
+(D-203) uses caller-owned aligned storage without allocation. Supply at least
+`sizeof(MeterState)` bytes aligned to `alignof(MeterState)`; the profile must
+outlive the state. Destroy with `state->~MeterState()`, not `MeterStateDeleter`.
+The owner admits and releases the storage. A failed construction leaves no state.
+
 A packet buffer with its limits table: `dataplane::PacketStore`
 (`dataplane/packet_store.h`, D-201), the store behind the `packet_store` module.
 Per-flow FIFOs of packet handles keyed by a `uint32_t` flow id, a store-wide

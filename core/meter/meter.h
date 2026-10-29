@@ -253,6 +253,15 @@ class alignas(RTE_CACHE_LINE_SIZE) MeterState {
       const MeterProfile &profile, MeterSharing sharing,
       int socket = bess::utils::MemoryNode());
 
+  // Caller-owned storage, for a meter embedded beside an appliance's hot
+  // session state. `memory` must hold sizeof(MeterState) bytes aligned to
+  // alignof(MeterState); profile must outlive the constructed state.
+  // On failure no state remains constructed. Destroy with ~MeterState(),
+  // never MeterStateDeleter (the caller owns the storage).
+  static std::expected<MeterState *, MeterError> ConstructAt(
+      void *memory, const MeterProfile &profile, MeterSharing sharing);
+  ~MeterState() = default;
+
   MeterState(const MeterState &) = delete;
   MeterState &operator=(const MeterState &) = delete;
 
@@ -290,20 +299,12 @@ class alignas(RTE_CACHE_LINE_SIZE) MeterState {
   }
 
  private:
-  friend struct MeterStateDeleter;
-  friend class MeterSetBuilder;
   friend class MeterStateTestAccess;
 
   MeterState(const MeterProfile &profile, MeterSharing sharing)
       : profile_(&profile), sharing_(sharing) {
     rte_spinlock_init(&lock_);
   }
-  ~MeterState() = default;
-
-  // Constructs and configures a state in `memory` (one suitably aligned cache
-  // line). On failure nothing is left constructed.
-  static std::expected<MeterState *, MeterError> ConstructAt(
-      void *memory, const MeterProfile &profile, MeterSharing sharing);
 
   template <bool kColorAware>
   MeterColor Run(uint64_t now, uint32_t bytes, MeterColor input) noexcept {
