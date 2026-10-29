@@ -355,7 +355,8 @@ TEST(L4ChecksumTest, TrailingBytesPastTheIpLengthAreNotSummed) {
 // IPv6, a non-first fragment (no L4 header: its payload is never summed or
 // written) and a first fragment (not the whole datagram). The old code never
 // emitted ICMP (nor TCP without verify), and rewrote the fragments' bytes
-// 6-7 of the IP payload as a UDP checksum.
+// 6-7 of the IP payload as a UDP checksum. The drop is mid-batch: each packet
+// after it must still take its own gate.
 TEST(L4ChecksumTest, EveryPacketIsAccountedFor) {
   ModuleHarness h;
   const Bytes arp = PacketBuilder()
@@ -385,9 +386,9 @@ TEST(L4ChecksumTest, EveryPacketIsAccountedFor) {
     Module *m = Create(h, verify);
     ASSERT_NE(nullptr, m);
     Gates out = Through(h, m,
-                        {MakePacket(udp), MakePacket(tcp), MakePacket(icmp), MakePacket(arp),
-                         MakePacket(v6), MakePacket(later), MakePacket(first),
-                         MakePacket(tcp_later), MakePacket(runt)});
+                        {MakePacket(udp), MakePacket(runt), MakePacket(tcp), MakePacket(icmp),
+                         MakePacket(arp), MakePacket(v6), MakePacket(later), MakePacket(first),
+                         MakePacket(tcp_later)});
     if (verify) {
       EXPECT_EQ((std::vector<Bytes>{udp, icmp, arp, v6, later, first, tcp_later}), out[0]);
       EXPECT_EQ(std::vector<Bytes>{tcp}, out[1]);

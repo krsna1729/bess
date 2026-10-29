@@ -247,7 +247,10 @@ void ACL::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const Rules &rules = *rules_.Read();
   const std::span<const MatchRule> named(rules.named);
 
-  for (bess::PacketRef pkt : batch->packets()) {
+  // Every passing packet leaves on the incoming gate: they stay in the batch,
+  // which leaves whole (D-099), the drops going one by one.
+  batch->KeepIf([&](bess::PacketHandle &handle, int) {
+    const bess::PacketRef pkt(handle);
     const Keyed k =
         KeyOf(std::span(pkt.head_data<const uint8_t *>(), pkt.head_len()), pkt.total_len());
     bool pass = rules.otherwise_pass;
@@ -263,12 +266,12 @@ void ACL::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       pass = false;
     }
 
-    if (pass) {
-      EmitPacket(ctx, pkt, incoming_gate);
-    } else {
+    if (!pass) {
       DropPacket(ctx, pkt);
     }
-  }
+    return pass;
+  });
+  RunChooseModule(ctx, incoming_gate, batch);
 }
 
 ADD_MODULE(ACL, "acl", "ACL module from NetBricks")

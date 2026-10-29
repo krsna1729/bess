@@ -136,19 +136,22 @@ void Firewall::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
         parseable;
   }
 
-  for (size_t i = 0; i < n; i++) {
-    bess::PacketRef pkt = batch->packet(i);
+  // Every passing packet leaves on the incoming gate: they stay in the batch,
+  // which leaves whole (D-099), the drops going one by one.
+  batch->KeepIf([&](bess::PacketHandle &handle, int i) {
+    const bess::PacketRef pkt(handle);
     const bool pass = ((matched >> i) & 1) != 0 && matches[i].action == kPass;
-    if (pass) {
-      if (publish_action) {
-        // rule_id is 1-based; action_ids holds one entry per rule, in order.
-        const uint32_t id = published->action_ids[matches[i].rule_id - 1];
-        _set_attr_with_offset<bess::utils::be32_t>(action_offset, pkt,
-                                                   bess::utils::be32_t(id));
-      }
-      EmitPacket(ctx, pkt, ctx->current_igate);
-    } else {
+    if (!pass) {
       DropPacket(ctx, pkt);
+      return false;
     }
-  }
+    if (publish_action) {
+      // rule_id is 1-based; action_ids holds one entry per rule, in order.
+      const uint32_t id = published->action_ids[matches[i].rule_id - 1];
+      _set_attr_with_offset<bess::utils::be32_t>(action_offset, pkt,
+                                                 bess::utils::be32_t(id));
+    }
+    return true;
+  });
+  RunChooseModule(ctx, ctx->current_igate, batch);
 }
