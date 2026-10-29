@@ -15,7 +15,6 @@
 #include <vector>
 
 #include "dataplane/resource.h"
-#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "module.h"
 #include "rcu/rcu_ptr.h"
@@ -194,11 +193,6 @@ class PacketStore final : public Module {
   // Control's requests: one producer (control - commands run under the
   // control-plane lock, so they are serialised), one consumer (the owner).
   struct rte_ring *requests_ = nullptr;
-  // The admission of both rings ("rings", D-198), taken before Init allocates
-  // them and released after DeInit frees them. The store itself (glibc, held
-  // packets bounded by max_packets) grows on the owner's task and is not
-  // admitted.
-  bess::framework::MemoryLease rings_lease_;
 
   // The owner's snapshot of both rings: how many requests were posted and how
   // many packets were in flight when it last looked. A request must not pass a

@@ -488,7 +488,12 @@ reference to something missing.
 - **The runtime has one engine**, `runtime().transactions()`. Call
   `Apply()` under the control-plane lock: the control plane, and a module's own
   resource writes (including an `edits_resources` action such as L2Forward's
-  `populate`), touch the same tables.
+  `populate`), touch the same tables. A module or plugin that writes its own
+  resources from its own control-side code (the Router publishing its
+  resolver's neighbor updates from its tick) uses
+  `init_context().resources().ApplyOwned(owned, ops)`: the same `Apply`,
+  refused for any operation on a resource that is not one of `owned`, the
+  caller's registered objects (D-200).
 - **Modules taking part today:** ExactMatch registers its rules as
   `<module>/rules` (key: the fields' bytes in order; value: the output gate and the rule's result record id,
   whose bytes `result_fields` places on a hit, D-172) from `Init()` to

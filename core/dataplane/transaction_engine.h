@@ -185,6 +185,14 @@ class TransactionEngine {
                Consistency consistency = Consistency::kReferential,
                OnBusy on_busy = OnBusy::kAnswer);
 
+  // Apply() with the defaults (no expected generation, referential, kBusy
+  // answered), refused unless every operation's resource is one of `owned`
+  // (ResourceRegistry::ApplyOwned, D-200). The ownership check runs under the
+  // engine's mutex with the rest of the structure checks, so a resource cannot
+  // change hands between the check and the apply.
+  Result ApplyOwned(std::span<const Resource *const> owned,
+                    std::span<const Op> ops);
+
   // Apply() with the operations split into transactions that each respect the
   // engine's retire budget. A caller whose op list is proportional to a
   // resource's contents - a clear of a map with many keys - cannot size a
@@ -236,8 +244,13 @@ class TransactionEngine {
   static constexpr size_t kMaxPendingCascades = 4096;
 
   Result Reject(size_t n_ops, size_t failed, std::string error) const;
+  // `owned`: null for Apply(); for ApplyOwned(), the resources its operations
+  // may name.
   Result ApplyImpl(std::span<const Op> ops, std::optional<uint64_t> expected_generation,
-                   Consistency consistency);
+                   Consistency consistency,
+                   const std::span<const Resource *const> *owned);
+  // Counts `result` in the outcome metrics (see outcome_counts()).
+  Result Counted(Result result, OnBusy on_busy);
   size_t ReclaimRetiredLocked();
 
   struct Registration;

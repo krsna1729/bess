@@ -15,15 +15,14 @@
 #include <string>
 #include <utility>
 
+#include "dataplane/resource_registry.h"
 #include "framework/resource_bindings.h"
-#include "dataplane/transaction_engine.h"
 #include "modules/router_gate_map.h"
 #include "packet_pool.h"
 #include "worker.h"
 #include "packet_reshape.h"
 #include "route/forward.h"
 #include "route/l3_packet.h"
-#include "runtime/runtime_state.h"
 #include "utils/endian.h"
 #include "utils/ether.h"
 #include "utils/format.h"
@@ -1281,8 +1280,9 @@ void Router::QueueNeighborUpdates(
 }
 
 // A neighbor change is a next-hop write, applied through the process's
-// transaction engine like any other (D-183) -- the module is in-tree, so it
-// uses the engine directly; plugins keep the registry's narrower face (D-074).
+// transaction engine like any other (D-183), as an owner's transaction: the
+// neighbors resource is the router's own, so ResourceRegistry::ApplyOwned
+// (D-200) applies it -- the face a plugin that owns a route::Router uses too.
 // At most kMaxNeighborUpdatesPerTick go in one transaction, so a burst of
 // changes (an interface with many bindings changing identity) is published
 // over several ticks rather than as one transaction the engine's retire budget
@@ -1301,9 +1301,11 @@ void Router::PublishNeighborUpdates(uint64_t now) {
     const auto &[id, hop] = pending_neighbor_updates_[i];
     ops.push_back(router_->SetNeighborManagedNextHopOp(id, hop));
   }
-  const dataplane::TransactionEngine::Result result =
-      bess::runtime::runtime().transactions().Apply(ops);
-  if (result.outcome == dataplane::TransactionEngine::Outcome::kApplied) {
+  const dataplane::Resource *const owned[] = {
+      router_->neighbors_resource_object()};
+  const dataplane::ResourceRegistry::OwnedApplyResult result =
+      init_context().resources().ApplyOwned(owned, ops);
+  if (result.outcome == dataplane::ResourceRegistry::OwnedApplyResult::Outcome::kApplied) {
     pending_neighbor_updates_.erase(
         pending_neighbor_updates_.begin(),
         pending_neighbor_updates_.begin() + static_cast<ptrdiff_t>(take));
@@ -1315,13 +1317,7 @@ void Router::PublishNeighborUpdates(uint64_t now) {
   }
   neighbor_warned_ = true;
   neighbor_warned_tick_ = now;
-  std::string why = "the engine is busy";
-  for (const auto &op : result.ops) {
-    if (!op.error.empty()) {
-      why = op.error;
-      break;
-    }
-  }
+  const std::string why = result.error.empty() ? "the engine is busy" : result.error;
   LOG(WARNING) << "Router '" << name() << "': "
                << pending_neighbor_updates_.size()
                << " neighbor change(s) not yet published (" << why

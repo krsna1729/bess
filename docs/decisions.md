@@ -14062,3 +14062,79 @@ sessions/s, in 1.46 instead of 4.10 GiB RSS.
 
 **Revisit when:** a meter set must be sized after construction, or an owner needs worker-exclusive meters through
 the resource.
+
+## D-200 An owner applies transactions to its own resources: `ResourceRegistry::ApplyOwned`
+
+**Status:** proposed (2026-10-25). Narrows D-074's "applying transactions stays with the control plane" to "applying
+to *another owner's* resources"; ends D-183's `check_includes.py` exemption for `core/modules/router.cc`.
+**Code:** `core/dataplane/resource_registry.h` (`OwnedApplyResult`, `ApplyOwned`),
+`core/dataplane/transaction_engine.{h,cc}` (`ApplyOwned`, the ownership check in `ApplyImpl`, `Counted`),
+`core/dataplane/resource_registry_test.cc` (new), `core/modules/router.cc` (`PublishNeighborUpdates`),
+`core/framework/{plugin.h,plugin_check.h,module_init_context.h}` (`BESS_CAP_OWNED_APPLY`), `core/meson.build`,
+`tools/check_includes.py`, `docs/plugin-api.md`, `docs/dataplane-tables.md`.
+
+**Context.** The Router module publishes its `NeighborResolver`'s updates (`SetNeighborManagedNextHopOp` on
+`<router>/neighbors`) from its tick through `runtime().transactions().Apply`, which only in-tree code can reach:
+D-183 exempted `router.cc` from D-042's include rule for it. A plugin that owns an enrolled `route::Router` (the
+UPF appliance: one module, its own router, its own resolver) has the same updates to publish and no way to: the
+registry it gets (D-074) registers and releases but does not apply. Its alternatives were a Router left
+unenrolled and written directly (no references to its next hops from other resources, so not the UPF's PDR
+results) or the in-tree exemption copied into a plugin, which the installed headers cannot offer.
+
+**Decision.**
+
+- **`ResourceRegistry::ApplyOwned(std::span<const Resource *const> owned, std::span<const Op> ops)`** applies
+  `ops` as one transaction through the engine's `Apply` path with its defaults -- no expected generation,
+  referential consistency, `kBusy` answered rather than retried -- so the retire budget, the busy refusal, every
+  structural and resource refusal and the outcome metrics are the control plane's, unchanged. Added: an
+  operation whose resource is not one of `owned` rejects the transaction before anything is reserved, that
+  operation failed with `resource '<name>' is not owned by the caller`.
+- **Ownership is the object, not the name.** `owned` holds `Resource` pointers -- what the caller passed to
+  `Register()`. An `Op` names its resource by string, and any string names anyone's resource; a pointer is held
+  by the code that built the resource (or holds the library object that did, such as a `route::Router`), and the
+  name-to-object map, `TransactionEngine::FindResource`, is internal. The engine resolves each operation's name
+  to its registration and compares the registered object with `owned`, inside `ApplyImpl` under the engine's
+  mutex, so the check and the apply see the same registrations. An object carrying another owner's name owns
+  nothing (it is not the registered object). `owned` is a handful of pointers: a linear scan per operation, on
+  the control side.
+- **A token returned by `Register()` was not chosen:** it would change `Register`'s signature for every caller and
+  need storage for a second identity of the same fact, the object the caller already holds. Registering through
+  a per-owner registry (one per `ModuleInitContext`) was not chosen either: a library such as `route::Router`
+  enrolls through whatever registry it is given, and the owner is the code holding the router, not the module
+  that happened to construct it.
+- **The answer is `ResourceRegistry::OwnedApplyResult`** (installed): `kApplied`, `kRejected` (`failed_op`,
+  `error`, `over_budget`) or `kBusy`, and the generation after. `TransactionEngine::Result` is internal and stays
+  so; `kConflict` and `kUnsupported` cannot occur without an expected generation or a scope snapshot.
+- **Threading.** Control side only, under the control-plane lock: a module command, a `TickEndpoint` callback (the
+  Router's case), a `RequestEndpoint` handler, `Init` or `DeInit`. Never on a worker: it allocates (the result,
+  the engine's scratch on growth) and starts a grace period. Never inside a `Resource` callback (`Reserve`,
+  `Prepare`, `Publish`, a retire step): the engine's mutex is held there and is not recursive. The engine's mutex
+  orders it with every other transaction; the control-plane lock keeps the caller's resources registered and the
+  control plane's read-plan-apply from interleaving with it. It never waits for readers.
+- **The Router module uses it** with `owned = {neighbors_resource_object()}`: the same `Apply` with the same
+  defaults as before, the same 64-update bound per tick, pending updates kept on any outcome but `kApplied`, the
+  same warning text (the failed operation's error, else "the engine is busy"). `router.cc` no longer includes
+  `runtime/runtime_state.h` or the engine header, and `check_includes.py`'s module rule has no exception.
+- **`BESS_CAP_OWNED_APPLY` (1<<8)**: a plugin calling `ApplyOwned` requires it, because an older `bessd` lacks the
+  symbol (as `BESS_CAP_EVENT_SOURCES` was added for the same reason, D-089).
+
+**Why this does not reopen general `Apply`.** D-074 kept `Apply` off the plugin face so that a module cannot
+write state the control plane owns, and so the stable surface does not couple to the engine's internals. Both
+hold: an owner reaches only the resources it registered -- which it already writes outside transactions
+whenever it likes (it built their tables) -- and a desired-state controller's resources stay out of its reach.
+What it gains is the engine's ledger, ordering and budget for its own writes, the thing D-022 asks of any
+resource that takes part in references. Expected generations, consistency choices, `ApplyBatched`, `OnBusy`,
+reclamation and `FindResource` stay internal. An owner's applied transaction advances the generation, as the
+Router's always has (D-183): a controller writing with `expected_generation` sees a conflict and re-reads.
+
+**Evidence:** syntax checks only (`-fsyntax-only` of `transaction_engine.cc`, `modules/router.cc` and
+`resource_registry_test.cc`). Pending: the build, `dataplane_resource_registry_test` (an owner's transaction
+applies, advances the generation and counts as `kApplied`; one foreign operation rejects the whole transaction
+-- the owner's operation in it unapplied, generation unchanged, counted `kRejected`; an unregistered object with
+another owner's name is refused while the control plane's `Apply` of the same operation applies; an unknown name
+and a resource's own refusal are answered as `Apply` answers them, with the failed operation's index; the retire
+budget refuses an over-large transaction as `over_budget` and its halves apply), and the existing Router neighbor
+tests (`router_test`), unmodified, for "no behaviour change".
+
+**Revisit when:** an owner needs an expected generation or a scope snapshot for its own writes, or ownership must
+be delegated (one module applying to resources another registered).
