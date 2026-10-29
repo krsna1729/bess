@@ -460,7 +460,7 @@ MeterSetBuilder::NewState(const std::shared_ptr<const MeterProfile> &profile,
   return std::shared_ptr<MeterState>(
       *state,
       [slab](MeterState *s) {
-        s->~MeterState();  // private: this builder is a friend, the slab is not
+        s->~MeterState();
         slab->Free(s);
       },
       detail::AdmittedAllocator<MeterState>(memory_));

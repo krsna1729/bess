@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstddef>
 #include <random>
 #include <thread>
 #include <vector>
@@ -50,6 +51,24 @@ MeterStatePtr MustState(const MeterProfile &profile, MeterSharing sharing) {
   auto state = MeterState::Create(profile, sharing);
   EXPECT_TRUE(state.has_value()) << MeterErrorName(state.error());
   return std::move(state).value();
+}
+
+TEST(MeterStateTest, EmbeddedStorageKeepsTokenStateUntilReconstructed) {
+  const auto profile = MustProfile(TrTcmSpec{1000, 100, 2000, 200});
+  alignas(MeterState) std::byte storage[sizeof(MeterState)];
+  auto made = MeterState::ConstructAt(storage, profile, MeterSharing::kShared);
+  ASSERT_TRUE(made.has_value());
+  MeterState *state = *made;
+  const uint64_t now = MeterNow();
+  EXPECT_EQ(state->Check(now, 100), MeterColor::kGreen);
+  EXPECT_EQ(state->Check(now, 100), MeterColor::kYellow);
+  EXPECT_EQ(state->Check(now, 1), MeterColor::kRed);
+  state->~MeterState();
+  made = MeterState::ConstructAt(storage, profile, MeterSharing::kShared);
+  ASSERT_TRUE(made.has_value());
+  state = *made;
+  EXPECT_EQ(state->Check(now, 100), MeterColor::kGreen);
+  state->~MeterState();
 }
 
 MeterError ErrorOf(const MeterProfileSpec &spec) {
