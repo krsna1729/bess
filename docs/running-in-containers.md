@@ -71,19 +71,22 @@ Behaviour a container runtime relies on:
   pod's memory limit must include its hugepages. A refused creation is
   non-retryable (`RESOURCE_EXHAUSTED`, errno `ENOMEM`) and leaves nothing
   behind; free memory (delete tables or sessions), raise the limit, add
-  hugepages, or allow the fallback (`--mem_fallback`).
+  hugepages, or allow normal pages past them (drop `--mem_fallback=false`).
 
 ## Memory
 
 What DPDK memory is, how much of it bessd may take, and what happens when it
-runs out (D-029, D-030, D-123, D-198) are five flags, each also a
-`BESSD_<FLAG>` variable:
+runs out (D-029, D-030, D-123, D-198, D-206) are five flags, each also a
+`BESSD_<FLAG>` variable. The defaults place memory automatically: hugepages
+while there are any, normal pages past them; the flags only override that
+(force normal pages, forbid normal pages past the hugepages, cap the
+hugepages):
 
 | flag | environment | default | what it sets |
 |---|---|---|---|
 | `--mem_backing` | `BESSD_MEM_BACKING` | `auto` | `auto`: hugepages if any are usable at startup -- host-free pages on the memory node bounded by the remaining cgroup v2 hugetlb capacity (`max - current` along this cgroup's ancestors) -- mapped as needed; none usable: normal pages, with a WARNING. `hugepages`: bessd refuses to start without usable hugepages. `normal`: normal (4 KiB) pages only (DPDK `--no-huge`), whatever the host has |
-| `--mem_hugepage_mb` | `BESSD_MEM_HUGEPAGE_MB` | `0`: no cap beyond the cgroup's `hugetlb.<size>.max` | a cap in MB on the hugepage heap on the memory node (DPDK `--socket-limit`; every other node gets none, D-123). With hugepage backing, the cgroup's hugetlb limit -- the smallest finite `hugetlb.<size>.max` along this cgroup's ancestors, summed over the usable page sizes when every one is limited -- caps the heap as well, the smaller of the two winning, so DPDK refuses at the limit instead of faulting a page past it. A table past the cap is refused, or comes from normal pages with `--mem_fallback`. Refused at startup with `--mem_backing=normal` |
-| `--mem_fallback` | `BESSD_MEM_FALLBACK` | off | when hugepages run out or reach the cap, a table comes from `bess-normal`, a heap of normal pages on the same node (slower lookups, admitted against the limit), instead of being refused with `RESOURCE_EXHAUSTED`. With normal backing there is nothing to fall back from |
+| `--mem_hugepage_mb` | `BESSD_MEM_HUGEPAGE_MB` | `0`: no cap beyond the cgroup's `hugetlb.<size>.max` | a cap in MB on the hugepage heap on the memory node (DPDK `--socket-limit`; every other node gets none, D-123). With hugepage backing, the cgroup's hugetlb limit -- the smallest finite `hugetlb.<size>.max` along this cgroup's ancestors, summed over the usable page sizes when every one is limited -- caps the heap as well, the smaller of the two winning, so DPDK refuses at the limit instead of faulting a page past it. A table past the cap comes from normal pages, or is refused with `--mem_fallback=false`. Refused at startup with `--mem_backing=normal` |
+| `--mem_fallback` | `BESSD_MEM_FALLBACK` | on | when hugepages run out or reach the cap, a table, and the part of the packet pool the hugepages cannot hold, come from normal pages on the same node (`bess-normal` for tables; slower lookups, admitted against the limit, reported per resource as `normal_bytes`). `--mem_fallback=false` refuses them instead, with `RESOURCE_EXHAUSTED` (a smaller packet pool, fatal at zero). With normal backing there is nothing to fall back from |
 | `--mem_limit_mb` | `BESSD_MEM_LIMIT_MB` | `0`: the lowest cgroup v2 `memory.max` along this cgroup's ancestors, else the host's `MemTotal` | `-1`: no limit; `N`: N MB of bessd's resident set. Normal-page memory (the normal-backing heap, `bess-normal`, DPDK library tables on normal pages, the packet pool) is admitted against it less the reserve; a creation or transaction that would cross it is refused with `RESOURCE_EXHAUSTED` rather than bessd being OOM-killed. With normal backing it also sizes DPDK's heap: the limit less the reserve (512 MB with no limit) |
 | `--mem_reserve_mb` | `BESSD_MEM_RESERVE_MB` | `-1`: max(128 MB, limit/16), at most half the limit | MB of the limit kept for memory bessd does not account (glibc, gRPC, thread stacks) |
 
@@ -91,15 +94,19 @@ bessd resolves them once, before DPDK starts, and logs one line naming every
 setting and where the limit came from, e.g. `Memory: backing hugepages
 (--mem_backing=auto; 2048 MB of hugepages usable, mapped as needed), hugepage
 cap 2048 MB (cgroup hugetlb.1GB.max (/kubepods/pod1)), hugetlb not charged to
-memory.max, fallback off, limit 6144 MB (cgroup memory.max (/kubepods/pod1)),
+memory.max, fallback on, limit 6144 MB (cgroup memory.max (/kubepods/pod1)),
 reserve 384 MB`. A combination that cannot hold (`hugepages` with none
 usable, a cap with `normal`, a reserve that leaves nothing of the limit) stops
 bessd with the reason. The packet pool (`--buffers`, `--packet_data_room`) is
 admitted like a table -- against the limit with normal pages, the cap with
-hugepages -- and a pool that does not fit stops bessd naming both flags.
+hugepages -- and takes hugepages first, the rest from normal pages (unless
+forbidden, or the IOVA mode is physical addresses: then the pool is smaller,
+and a pool of zero stops bessd naming both flags).
 `GetResourceStatus.memory` reports the resolved policy, both heaps, the
-refusals and the bytes each module and resource holds (the packet pool as
-`bessd/packet_pool`).
+refusals, the bytes admitted for hugepages that landed on normal pages
+(`spilled_bytes`), and the bytes each module and resource holds (the packet
+pool as `bessd/packet_pool`), split by where they landed: `hugepage_bytes`,
+`normal_bytes`, `glibc_bytes` (D-206).
 
 A process that brings DPDK up without bessd -- unit tests, benchmarks, a
 library user (`InitDpdk()`) -- reads the same `BESSD_MEM_*` variables, with

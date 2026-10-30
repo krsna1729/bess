@@ -5301,10 +5301,11 @@ func (x *WorkerStatus) GetCpu() uint32 {
 	return 0
 }
 
-// The daemon's memory policy and where it stands against it (D-198). Dataplane
-// memory comes from DPDK's heap on the memory node; when hugepages run out, a
-// creation is refused unless the daemon was started with --mem_fallback,
-// which lets it use a heap of normal pages ("bess-normal") instead.
+// The daemon's memory policy and where it stands against it (D-198, D-206).
+// Dataplane memory comes from DPDK's heap on the memory node, hugepages first;
+// when they run out, a creation takes normal pages from the "bess-normal"
+// heap instead, unless the daemon was started with --mem_fallback=false,
+// which refuses it.
 // Normal-page memory is admitted against a limit -- cgroup v2 memory.max, or
 // --mem_limit_mb -- and a creation that would cross it is refused with
 // RESOURCE_EXHAUSTED, never retried and never OOM-killed. Every module admits
@@ -5314,7 +5315,7 @@ func (x *WorkerStatus) GetCpu() uint32 {
 type MemoryStatus struct {
 	state                  protoimpl.MessageState `protogen:"open.v1"`
 	Hugepages              bool                   `protobuf:"varint,1,opt,name=hugepages,proto3" json:"hugepages,omitempty"`                                 // the native heap is hugepage-backed
-	Fallback               bool                   `protobuf:"varint,2,opt,name=fallback,proto3" json:"fallback,omitempty"`                                   // --mem_fallback was given
+	Fallback               bool                   `protobuf:"varint,2,opt,name=fallback,proto3" json:"fallback,omitempty"`                                   // normal pages past the hugepages (--mem_fallback, default on)
 	LimitBytes             uint64                 `protobuf:"varint,3,opt,name=limit_bytes,json=limitBytes,proto3" json:"limit_bytes,omitempty"`             // the limit normal-page memory is admitted against
 	LimitSource            string                 `protobuf:"bytes,4,opt,name=limit_source,json=limitSource,proto3" json:"limit_source,omitempty"`           // where limit_bytes came from (memory.max, a flag)
 	ReserveBytes           uint64                 `protobuf:"varint,5,opt,name=reserve_bytes,json=reserveBytes,proto3" json:"reserve_bytes,omitempty"`       // kept free for memory the daemon does not account
@@ -5333,8 +5334,11 @@ type MemoryStatus struct {
 	// limit_bytes as well, and a limit must include the hugepages.
 	HugetlbCharged    bool   `protobuf:"varint,16,opt,name=hugetlb_charged,json=hugetlbCharged,proto3" json:"hugetlb_charged,omitempty"`
 	HugepageCapSource string `protobuf:"bytes,17,opt,name=hugepage_cap_source,json=hugepageCapSource,proto3" json:"hugepage_cap_source,omitempty"` // "--mem_hugepage_mb" or the cgroup's hugetlb.<size>.max
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Bytes admitted for hugepages that landed on normal pages because the
+	// hugepage heap ran out before the cap (D-206), since startup.
+	SpilledBytes  uint64 `protobuf:"varint,18,opt,name=spilled_bytes,json=spilledBytes,proto3" json:"spilled_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MemoryStatus) Reset() {
@@ -5486,6 +5490,13 @@ func (x *MemoryStatus) GetHugepageCapSource() string {
 	return ""
 }
 
+func (x *MemoryStatus) GetSpilledBytes() uint64 {
+	if x != nil {
+		return x.SpilledBytes
+	}
+	return 0
+}
+
 // What one module admitted for one of its resources (a table, a pool, a
 // ring), by name inside the module; the daemon's own packet pool is module
 // "bessd", resource "packet_pool".
@@ -5495,6 +5506,12 @@ type ModuleMemory struct {
 	Resource      string                 `protobuf:"bytes,2,opt,name=resource,proto3" json:"resource,omitempty"`
 	AdmittedBytes uint64                 `protobuf:"varint,3,opt,name=admitted_bytes,json=admittedBytes,proto3" json:"admitted_bytes,omitempty"` // admitted before allocation, released with the object
 	CurrentBytes  uint64                 `protobuf:"varint,4,opt,name=current_bytes,json=currentBytes,proto3" json:"current_bytes,omitempty"`    // what the objects hold now (their bytes()), else admitted
+	// admitted_bytes by where they landed (D-206): DPDK memory on hugepages,
+	// DPDK memory on normal pages (the fallback heap, or normal-page backing),
+	// and glibc memory (control-plane state no worker reads).
+	HugepageBytes uint64 `protobuf:"varint,5,opt,name=hugepage_bytes,json=hugepageBytes,proto3" json:"hugepage_bytes,omitempty"`
+	NormalBytes   uint64 `protobuf:"varint,6,opt,name=normal_bytes,json=normalBytes,proto3" json:"normal_bytes,omitempty"`
+	GlibcBytes    uint64 `protobuf:"varint,7,opt,name=glibc_bytes,json=glibcBytes,proto3" json:"glibc_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5553,6 +5570,27 @@ func (x *ModuleMemory) GetAdmittedBytes() uint64 {
 func (x *ModuleMemory) GetCurrentBytes() uint64 {
 	if x != nil {
 		return x.CurrentBytes
+	}
+	return 0
+}
+
+func (x *ModuleMemory) GetHugepageBytes() uint64 {
+	if x != nil {
+		return x.HugepageBytes
+	}
+	return 0
+}
+
+func (x *ModuleMemory) GetNormalBytes() uint64 {
+	if x != nil {
+		return x.NormalBytes
+	}
+	return 0
+}
+
+func (x *ModuleMemory) GetGlibcBytes() uint64 {
+	if x != nil {
+		return x.GlibcBytes
 	}
 	return 0
 }
@@ -7232,7 +7270,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\fhas_capacity\x18\x03 \x01(\bR\vhasCapacity\x12\x1a\n" +
 	"\bcapacity\x18\x04 \x01(\x04R\bcapacity\" \n" +
 	"\fWorkerStatus\x12\x10\n" +
-	"\x03cpu\x18\x01 \x01(\rR\x03cpu\"\xc8\x05\n" +
+	"\x03cpu\x18\x01 \x01(\rR\x03cpu\"\xed\x05\n" +
 	"\fMemoryStatus\x12\x1c\n" +
 	"\thugepages\x18\x01 \x01(\bR\thugepages\x12\x1a\n" +
 	"\bfallback\x18\x02 \x01(\bR\bfallback\x12\x1f\n" +
@@ -7253,12 +7291,17 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x14hugepage_table_bytes\x18\x0e \x01(\x04R\x12hugepageTableBytes\x122\n" +
 	"\amodules\x18\x0f \x03(\v2\x18.bess.pb.v2.ModuleMemoryR\amodules\x12'\n" +
 	"\x0fhugetlb_charged\x18\x10 \x01(\bR\x0ehugetlbCharged\x12.\n" +
-	"\x13hugepage_cap_source\x18\x11 \x01(\tR\x11hugepageCapSource\"\x8e\x01\n" +
+	"\x13hugepage_cap_source\x18\x11 \x01(\tR\x11hugepageCapSource\x12#\n" +
+	"\rspilled_bytes\x18\x12 \x01(\x04R\fspilledBytes\"\xf9\x01\n" +
 	"\fModuleMemory\x12\x16\n" +
 	"\x06module\x18\x01 \x01(\tR\x06module\x12\x1a\n" +
 	"\bresource\x18\x02 \x01(\tR\bresource\x12%\n" +
 	"\x0eadmitted_bytes\x18\x03 \x01(\x04R\radmittedBytes\x12#\n" +
-	"\rcurrent_bytes\x18\x04 \x01(\x04R\fcurrentBytes\"\xb9\x03\n" +
+	"\rcurrent_bytes\x18\x04 \x01(\x04R\fcurrentBytes\x12%\n" +
+	"\x0ehugepage_bytes\x18\x05 \x01(\x04R\rhugepageBytes\x12!\n" +
+	"\fnormal_bytes\x18\x06 \x01(\x04R\vnormalBytes\x12\x1f\n" +
+	"\vglibc_bytes\x18\a \x01(\x04R\n" +
+	"glibcBytes\"\xb9\x03\n" +
 	"\x19GetResourceStatusResponse\x12;\n" +
 	"\tresources\x18\x01 \x03(\v2\x1d.bess.pb.v2.ResourceOccupancyR\tresources\x12\x1e\n" +
 	"\n" +

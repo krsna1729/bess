@@ -184,11 +184,15 @@ size_t Router::GlibcBytes(const std::string &, const Config &,
                           size_t max_next_hops, const rcu::RcuDomain &, size_t,
                           size_t max_groups, const RouterResourceNames &) {
   // references_, member_references_, hop_states_ and bindings_ per next-hop
-  // id, group_references_ per group id, and the router.
-  return (max_next_hops + 1) *
-             (2 * sizeof(uint32_t) + sizeof(HopState) +
-              sizeof(std::optional<NeighborKey>)) +
-         (max_groups + 1) * sizeof(uint32_t) + sizeof(Router);
+  // id, group_references_ per group id, and the router: one malloc each,
+  // counted as glibc's chunks (D-206).
+  using utils::MallocChunkBytes;
+  const size_t hops = max_next_hops + 1;
+  return 2 * MallocChunkBytes(hops * sizeof(uint32_t)) +
+         MallocChunkBytes(hops * sizeof(HopState)) +
+         MallocChunkBytes(hops * sizeof(std::optional<NeighborKey>)) +
+         MallocChunkBytes((max_groups + 1) * sizeof(uint32_t)) +
+         MallocChunkBytes(sizeof(Router));
 }
 
 size_t Router::bytes() const noexcept {

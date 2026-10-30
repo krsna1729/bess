@@ -343,17 +343,19 @@ class MeterSetBuilder {
   // is admitted through set_memory_growth's hook before it is allocated and
   // given back when it is freed: index nodes an edit makes (DPDK; at most
   // MeterSet::Bytes(capacity) per edit), meter-state slab chunks (DPDK;
-  // utils::ObjectSlab), each state's shared_ptr control block and each
-  // profile (glibc). Clones and generations share the hook; it stays
-  // attached while any builder sharing it lives, so the hook must outlive
-  // the builder and its clones (a Sized<MeterSetBuilder> does).
+  // utils::ObjectSlab), each profile with its shared_ptr control block
+  // (DPDK: workers read it, D-206), and each state's shared_ptr control
+  // block and interned-profile map node (glibc, as malloc's chunks:
+  // utils::MallocChunkBytes). Clones and generations share the hook; it
+  // stays attached while any builder sharing it lives, so the hook must
+  // outlive the builder and its clones (a Sized<MeterSetBuilder> does).
   static size_t Bytes(size_t capacity) {
     return detail::MeterLevels(capacity) == 0 ? detail::kMeterLeafBytes
                                                : detail::kMeterInnerBytes;
   }
   // Held now by this builder, its clones and their generations together
   // (they share index nodes): the index nodes, this builder's slabs' chunks,
-  // and the control blocks and profiles still live.
+  // the profiles, control blocks and interned map nodes still live.
   size_t bytes() const noexcept;
   void set_memory_growth(bess::utils::MemoryGrowth *growth) noexcept;
 

@@ -960,7 +960,7 @@ class WorkerStatus(_message.Message):
     def __init__(self, cpu: _Optional[int] = ...) -> None: ...
 
 class MemoryStatus(_message.Message):
-    __slots__ = ("hugepages", "fallback", "limit_bytes", "limit_source", "reserve_bytes", "used_bytes", "available_bytes", "dpdk_heap_bytes", "dpdk_heap_alloc_bytes", "fallback_heap_bytes", "fallback_heap_alloc_bytes", "refusals", "hugepage_cap_bytes", "hugepage_table_bytes", "modules", "hugetlb_charged", "hugepage_cap_source")
+    __slots__ = ("hugepages", "fallback", "limit_bytes", "limit_source", "reserve_bytes", "used_bytes", "available_bytes", "dpdk_heap_bytes", "dpdk_heap_alloc_bytes", "fallback_heap_bytes", "fallback_heap_alloc_bytes", "refusals", "hugepage_cap_bytes", "hugepage_table_bytes", "modules", "hugetlb_charged", "hugepage_cap_source", "spilled_bytes")
     HUGEPAGES_FIELD_NUMBER: _ClassVar[int]
     FALLBACK_FIELD_NUMBER: _ClassVar[int]
     LIMIT_BYTES_FIELD_NUMBER: _ClassVar[int]
@@ -978,6 +978,7 @@ class MemoryStatus(_message.Message):
     MODULES_FIELD_NUMBER: _ClassVar[int]
     HUGETLB_CHARGED_FIELD_NUMBER: _ClassVar[int]
     HUGEPAGE_CAP_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    SPILLED_BYTES_FIELD_NUMBER: _ClassVar[int]
     hugepages: bool
     fallback: bool
     limit_bytes: int
@@ -995,19 +996,26 @@ class MemoryStatus(_message.Message):
     modules: _containers.RepeatedCompositeFieldContainer[ModuleMemory]
     hugetlb_charged: bool
     hugepage_cap_source: str
-    def __init__(self, hugepages: _Optional[bool] = ..., fallback: _Optional[bool] = ..., limit_bytes: _Optional[int] = ..., limit_source: _Optional[str] = ..., reserve_bytes: _Optional[int] = ..., used_bytes: _Optional[int] = ..., available_bytes: _Optional[int] = ..., dpdk_heap_bytes: _Optional[int] = ..., dpdk_heap_alloc_bytes: _Optional[int] = ..., fallback_heap_bytes: _Optional[int] = ..., fallback_heap_alloc_bytes: _Optional[int] = ..., refusals: _Optional[int] = ..., hugepage_cap_bytes: _Optional[int] = ..., hugepage_table_bytes: _Optional[int] = ..., modules: _Optional[_Iterable[_Union[ModuleMemory, _Mapping]]] = ..., hugetlb_charged: _Optional[bool] = ..., hugepage_cap_source: _Optional[str] = ...) -> None: ...
+    spilled_bytes: int
+    def __init__(self, hugepages: _Optional[bool] = ..., fallback: _Optional[bool] = ..., limit_bytes: _Optional[int] = ..., limit_source: _Optional[str] = ..., reserve_bytes: _Optional[int] = ..., used_bytes: _Optional[int] = ..., available_bytes: _Optional[int] = ..., dpdk_heap_bytes: _Optional[int] = ..., dpdk_heap_alloc_bytes: _Optional[int] = ..., fallback_heap_bytes: _Optional[int] = ..., fallback_heap_alloc_bytes: _Optional[int] = ..., refusals: _Optional[int] = ..., hugepage_cap_bytes: _Optional[int] = ..., hugepage_table_bytes: _Optional[int] = ..., modules: _Optional[_Iterable[_Union[ModuleMemory, _Mapping]]] = ..., hugetlb_charged: _Optional[bool] = ..., hugepage_cap_source: _Optional[str] = ..., spilled_bytes: _Optional[int] = ...) -> None: ...
 
 class ModuleMemory(_message.Message):
-    __slots__ = ("module", "resource", "admitted_bytes", "current_bytes")
+    __slots__ = ("module", "resource", "admitted_bytes", "current_bytes", "hugepage_bytes", "normal_bytes", "glibc_bytes")
     MODULE_FIELD_NUMBER: _ClassVar[int]
     RESOURCE_FIELD_NUMBER: _ClassVar[int]
     ADMITTED_BYTES_FIELD_NUMBER: _ClassVar[int]
     CURRENT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    HUGEPAGE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    NORMAL_BYTES_FIELD_NUMBER: _ClassVar[int]
+    GLIBC_BYTES_FIELD_NUMBER: _ClassVar[int]
     module: str
     resource: str
     admitted_bytes: int
     current_bytes: int
-    def __init__(self, module: _Optional[str] = ..., resource: _Optional[str] = ..., admitted_bytes: _Optional[int] = ..., current_bytes: _Optional[int] = ...) -> None: ...
+    hugepage_bytes: int
+    normal_bytes: int
+    glibc_bytes: int
+    def __init__(self, module: _Optional[str] = ..., resource: _Optional[str] = ..., admitted_bytes: _Optional[int] = ..., current_bytes: _Optional[int] = ..., hugepage_bytes: _Optional[int] = ..., normal_bytes: _Optional[int] = ..., glibc_bytes: _Optional[int] = ...) -> None: ...
 
 class GetResourceStatusResponse(_message.Message):
     __slots__ = ("resources", "generation", "rss_bytes", "heap_total_bytes", "heap_alloc_bytes", "rcu_pending", "rcu_high_water", "workers", "daemon_epoch", "memory")

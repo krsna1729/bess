@@ -6,13 +6,20 @@
 
 #include "utils/dpdk_memory.h"
 
+#include "classifier/rte_hash_exact.h"
 #include "framework/memory_scope.h"
 
 #include <gtest/gtest.h>
 
 #include <rte_eal.h>
+#include <rte_hash.h>
 #include <rte_malloc.h>
 
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <new>
 #include <string>
 
@@ -108,10 +115,13 @@ TEST(DpdkMemoryTest, NoHugeAllocationPastTheLimitIsRefused) {
 TEST(DpdkMemoryTest, FallbackHeapOnlyWhereAllowed) {
   bess::utils::MemoryNode();
   if (rte_eal_has_hugepages()) {
-    // Hugepages without --mem_fallback: refused, naming the flag.
+    // Hugepages with --mem_fallback=false: refused, naming the flag.
+    MemoryPolicy forbid;
+    forbid.fallback = false;
+    PolicyScope scope(forbid);
     try {
       FallbackSocket(kMB);
-      FAIL() << "fallback without --mem_fallback";
+      FAIL() << "fallback with --mem_fallback=false";
     } catch (const MemoryRefused &e) {
       EXPECT_EQ(e.reason(), MemoryRefused::Reason::kHugepagesExhausted);
       EXPECT_NE(std::string(e.what()).find("--mem_fallback"),
@@ -144,6 +154,7 @@ TEST(DpdkMemoryTest, AdmitTableFollowsTheBacking) {
   }
   MemoryPolicy policy;
   policy.hugepage_cap_bytes = 8 * kMB;
+  policy.fallback = false;
   {
     PolicyScope scope(policy);
     const size_t before = HugepageTableBytes();
@@ -151,7 +162,7 @@ TEST(DpdkMemoryTest, AdmitTableFollowsTheBacking) {
     const size_t room = policy.hugepage_cap_bytes - before;
     EXPECT_EQ(AdmitTable(room), TableBacking::kHugepages);
     EXPECT_EQ(HugepageTableBytes(), before + room);
-    // Past the cap without --mem_fallback: refused, nothing counted.
+    // Past the cap with --mem_fallback=false: refused, nothing counted.
     try {
       AdmitTable(1);
       FAIL() << "admitted past --mem_hugepage_mb";
@@ -168,7 +179,7 @@ TEST(DpdkMemoryTest, AdmitTableFollowsTheBacking) {
   {
     PolicyScope scope(policy);
     const size_t before = HugepageTableBytes();
-    // Past the cap with --mem_fallback: normal pages, not counted.
+    // Past the cap with normal pages allowed: normal pages, not counted.
     EXPECT_EQ(AdmitTable(16 * kMB), TableBacking::kNormal);
     EXPECT_EQ(HugepageTableBytes(), before);
     ReleaseTable(TableBacking::kNormal, 16 * kMB);
@@ -241,22 +252,118 @@ TEST(DpdkMemoryTest, DpdkArrayBytesMatchesTheConstructor) {
 
 TEST(DpdkMemoryTest, StatusReflectsThePolicy) {
   MemoryPolicy policy = TightPolicy(1024 * kMB, 128 * kMB);
-  policy.fallback = true;
+  policy.fallback = false;
   const size_t limit = policy.limit_bytes;
   {
     PolicyScope scope(policy);
     const auto status = GetMemoryStatus();
     EXPECT_EQ(status.hugepages, rte_eal_has_hugepages() != 0);
-    EXPECT_TRUE(status.fallback);
+    EXPECT_FALSE(status.fallback);
     EXPECT_EQ(status.limit_bytes, limit);
     EXPECT_EQ(status.reserve_bytes, 128 * kMB);
     EXPECT_EQ(status.limit_source, "test");
     EXPECT_GT(status.used_bytes, 0u);
     EXPECT_GT(status.dpdk_heap_bytes, 0u);
   }
+  // The default (D-206): normal pages past the hugepages.
   const auto status = GetMemoryStatus();
   EXPECT_EQ(status.limit_bytes, 0u);
-  EXPECT_FALSE(status.fallback);
+  EXPECT_TRUE(status.fallback);
+}
+
+size_t Rss() {
+  size_t pages = 0, resident = 0;
+  FILE *f = std::fopen("/proc/self/statm", "r");
+  EXPECT_NE(f, nullptr);
+  EXPECT_EQ(std::fscanf(f, "%zu %zu", &pages, &resident), 2);
+  std::fclose(f);
+  return resident * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+}
+
+// oom_kill of this process's cgroup v2 memory.events; 0 if unreadable.
+uint64_t OomKills() {
+  std::ifstream cgroup("/proc/self/cgroup");
+  std::string line;
+  std::getline(cgroup, line);  // "0::/path" under cgroup v2
+  std::ifstream events("/sys/fs/cgroup" + line.substr(line.find("::") + 2) +
+                       "/memory.events");
+  std::string key;
+  uint64_t value = 0;
+  while (events >> key >> value) {
+    if (key == "oom_kill") {
+      return value;
+    }
+  }
+  return 0;
+}
+
+// A table on the --no-huge heap is resident from its allocation, right after
+// its admission, so freeing it never grows RSS (D-206): DPDK zeroes a clean
+// element on free, which used to fault an admitted but untouched table in at
+// teardown and OOM-kill bessd near its cgroup limit.
+TEST(DpdkMemoryTest, FreeNeverGrowsResidentMemory) {
+  ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
+  constexpr size_t kBytes = 64 * kMB;
+  const MemoryPolicy policy = TightPolicy(kBytes + 32 * kMB, 0);
+  PolicyScope scope(policy);
+  const size_t before = Rss();
+  void *table = DpdkAllocate(kBytes, 64);
+  const size_t allocated = Rss();
+  EXPECT_GE(allocated, before + kBytes * 9 / 10)
+      << "admitted pages are resident from the allocation";
+  DpdkFree(table);
+  EXPECT_LE(Rss(), allocated + kMB) << "the free faulted pages in";
+}
+
+// What a DPDK library allocates internally (rte_hash: rte_zmalloc, which
+// leaves clean memory untouched) cannot be prefaulted, so it is counted as
+// allocated (D-206): under a tight limit an admission that RSS alone would
+// let through is refused while the table is held, and freeing the table --
+// which faults it in -- stays within what was admitted. DPDK's heap gives
+// no page back, so RSS after the free is its peak.
+TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
+  ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
+  rte_hash_parameters params{};
+  params.name = "dpdk_memory_test";
+  params.entries = 2u << 20;
+  params.key_len = 16;
+  params.socket_id = bess::utils::MemoryNode();
+  const size_t admitted =
+      bess::classifier::detail::RteHashBytes(params.entries, params.key_len);
+  const MemoryPolicy policy = TightPolicy(admitted + 64 * kMB, 0);
+  PolicyScope scope(policy);
+  const uint64_t oom_kills = OomKills();
+  const size_t before = Rss();
+  rte_hash *table = bess::classifier::detail::CreateRteHash(params);
+  ASSERT_NE(table, nullptr);
+  const size_t created = Rss();
+  // Room by RSS alone, less a margin for the test's own glibc: refused, as
+  // the table's unfaulted bytes count.
+  const size_t by_rss = policy.limit_bytes - created - 4 * kMB;
+  EXPECT_THROW(AdmitNormalMemory(by_rss), MemoryRefused)
+      << "allocated but unfaulted DPDK memory was not counted";
+  rte_hash_free(table);
+  EXPECT_LE(Rss(), before + admitted)
+      << "freeing the table grew RSS past what was admitted";
+  EXPECT_EQ(OomKills(), oom_kills);
+}
+
+// Predicted glibc costs (D-206: Router::GlibcBytes and every MemoryCost that
+// sums MallocChunkBytes) never fall short when MallocChunkBytes bounds the
+// chunk malloc takes: checked on a block of every request size up to a
+// page, each measured on itself (MallocBytes), so no other thread's malloc
+// moves it. Which chunk a block gets depends on the heap's free chunks
+// (a free chunk 16 bytes past what is needed is handed out whole), so the
+// earlier tests' frees decide which sizes take the extra 16.
+TEST(DpdkMemoryTest, MallocChunkBytesBoundsWhatMallocTakes) {
+  for (size_t n = 1; n <= 4096; n++) {
+    void *p = std::malloc(n);
+    ASSERT_NE(p, nullptr);
+    const size_t took = bess::utils::MallocBytes(p);
+    EXPECT_LE(took, bess::utils::MallocChunkBytes(n)) << n << " bytes";
+    EXPECT_GE(took + 16, bess::utils::MallocChunkBytes(n)) << n << " bytes";
+    std::free(p);
+  }
 }
 
 }  // namespace

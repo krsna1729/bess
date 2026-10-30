@@ -896,6 +896,7 @@ unit_test_sources = [
   'modules/worker_split_test.cc',
   'packet_cursor_test.cc',
   'packet_test.cc',
+  'packet_pool_test.cc',
   'packet_checksum_test.cc',
   'packet_tx_checksum_test.cc',
   'packet_mutation_test.cc',

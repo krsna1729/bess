@@ -121,7 +121,9 @@ class PacketStoreAllocator {
 // through an RcuPtr the store's owner holds and read once per run. With an
 // admitting allocator it also admits its own header, so a clone costs its
 // header and every node before any is allocated. Not movable or assignable:
-// a table is built, published and freed.
+// a table is built, published and freed. Packet-path state (D-206, class P:
+// Store and expiry look flows up in it) left on glibc, one node per entry,
+// until a node pool on the framework allocator exists (D-206 open item).
 class PacketStoreLimitsMap
     : public std::map<uint32_t, PacketStoreLimits, std::less<uint32_t>,
                       PacketStoreAllocator<std::pair<const uint32_t, PacketStoreLimits>>> {
@@ -171,12 +173,14 @@ enum class PacketStoreDiscardReason : uint8_t { kExpired, kDropped, kCleared };
 // own threads calls it directly.
 //
 // Memory. Everything is allocated by Create and fixed for the store's life
-// (Bytes(config), all glibc): a slot per packet (`max_packets` slots, linked
-// per flow, a free list for the rest) and an open-addressing flow table of
-// FlowCapacity(max_packets) entries, at most half full because a flow is
-// held only while it holds a packet. Storing, releasing, dropping and expiry
-// allocate nothing. The eviction and release sinks are template callables,
-// inlined into the caller; only an installed discard observer is indirect.
+// (Bytes(config), all of it DPDK memory on the memory node, which the
+// framework places: workers read and write it per packet, D-206): the store,
+// a slot per packet (`max_packets` slots, linked per flow, a free list for
+// the rest) and an open-addressing flow table of FlowCapacity(max_packets)
+// entries, at most half full because a flow is held only while it holds a
+// packet. Storing, releasing, dropping and expiry allocate nothing. The
+// eviction and release sinks are template callables, inlined into the
+// caller; only an installed discard observer is indirect.
 //
 // Threads. One owner: every member that changes the store must be called by
 // one thread at a time (the module's task, or control while no worker runs).
@@ -189,18 +193,21 @@ class PacketStore {
 
   // A config with max_packets or max_packets_per_flow 0, or max_packets
   // above 2^30, is refused with the reason; null-free otherwise, or nullptr
-  // in the expected when the arrays cannot be allocated.
+  // in the expected when the arrays cannot be allocated. Throws
+  // utils::MemoryRefused when the memory policy refuses them.
   static std::expected<std::unique_ptr<PacketStore>, std::string> Create(
       const PacketStoreConfig &config);
 
-  // What Create allocates (D-198), all of it from glibc.
+  // What Create allocates (D-198), all of it DPDK memory.
   static size_t Bytes(const PacketStoreConfig &config) noexcept;
-  static size_t GlibcBytes(const PacketStoreConfig &config) noexcept {
-    return Bytes(config);
-  }
   // Flow-table entries for a bound: a power of two at least twice it.
   static size_t FlowCapacity(uint32_t max_packets) noexcept;
   size_t bytes() const noexcept { return Bytes(config_); }
+
+  // The store itself is DPDK memory too (D-206): Create makes it, the
+  // default deleter frees it.
+  static void *operator new(size_t bytes);
+  static void operator delete(void *p) noexcept;
 
   PacketStore(const PacketStore &) = delete;
   PacketStore &operator=(const PacketStore &) = delete;
@@ -299,8 +306,8 @@ class PacketStore {
     uint32_t previous_active = kNone;
   };
 
-  PacketStore(const PacketStoreConfig &config, std::unique_ptr<Slot[]> slots,
-              std::unique_ptr<Flow[]> table, size_t capacity) noexcept;
+  PacketStore(const PacketStoreConfig &config, utils::DpdkArray<Slot> slots,
+              utils::DpdkArray<Flow> table, size_t capacity) noexcept;
 
   size_t Home(uint32_t id) const noexcept {
     return static_cast<size_t>((uint64_t{id} * 0x9E3779B97F4A7C15ULL) >>
@@ -337,8 +344,8 @@ class PacketStore {
   }
 
   PacketStoreConfig config_;
-  std::unique_ptr<Slot[]> slots_;
-  std::unique_ptr<Flow[]> table_;
+  utils::DpdkArray<Slot> slots_;
+  utils::DpdkArray<Flow> table_;
   size_t mask_;
   unsigned shift_;
   uint32_t free_ = kNone;

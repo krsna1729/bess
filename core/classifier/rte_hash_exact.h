@@ -53,19 +53,23 @@ inline size_t RteHashBytes(uint32_t entries, uint32_t key_len) {
          4 * rte_align64pow2(n + 1) + 24 * rte_align64pow2(n + 2);
 }
 
-// rte_hash_create under the memory policy (D-029). Under --no-huge the
-// estimate is admitted against the process memory limit first. A creation
-// that fails for lack of memory on `params.socket_id` is retried once on the
-// normal-page fallback heap, which utils::FallbackSocket grants or refuses
+// rte_hash_create under the memory policy (D-029, D-206). Under --no-huge
+// the estimate is admitted against the process memory limit first. Created
+// where this thread's admission placed it (utils::PlacementSocket: the
+// normal-page fallback heap once the hugepage cap is spent), and a creation
+// that fails for lack of memory on the memory node is retried once on the
+// fallback heap, which utils::FallbackSocket grants or refuses
 // (MemoryRefused, propagated to the control boundary); a retry that still
 // lacks memory -- DPDK takes the tailq entries from its native heaps, never
-// the fallback heap -- is refused the same way. Any other failure -- bad
-// parameters, a name clash -- returns nullptr as rte_hash_create does.
+// the fallback heap -- is refused the same way. Where it landed is recorded
+// against the admission. Any other failure -- bad parameters, a name clash
+// -- returns nullptr as rte_hash_create does.
 inline rte_hash *CreateRteHash(rte_hash_parameters params) {
   const size_t bytes = RteHashBytes(params.entries, params.key_len);
   if (rte_eal_has_hugepages() == 0) {
     bess::utils::AdmitNormalMemory(bytes);
   }
+  params.socket_id = bess::utils::PlacementSocket(params.socket_id, bytes);
   // rte_hash_create leaves rte_errno untouched when an rte_zmalloc fails, and
   // sets ENOMEM when its ring's memzone does.
   rte_errno = 0;
@@ -77,6 +81,9 @@ inline rte_hash *CreateRteHash(rte_hash_parameters params) {
     if (table == nullptr && (rte_errno == 0 || rte_errno == ENOMEM)) {
       bess::utils::RefuseDpdkMemory(bytes);
     }
+  }
+  if (table != nullptr) {
+    bess::utils::NotePlacement(bytes, params.socket_id);
   }
   return table;
 }

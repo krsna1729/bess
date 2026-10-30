@@ -52,9 +52,11 @@ class MeterMemory final : public utils::MemoryGrowth {
     }
   }
 
-  // Glibc bytes AdmittedAllocator holds now (state control blocks,
-  // profiles).
+  // Glibc bytes GlibcAllocator holds now (state control blocks, interned
+  // map nodes), as malloc's chunks.
   std::atomic<size_t> glibc_held{0};
+  // DPDK bytes ProfileAllocator holds now (profiles with their blocks).
+  std::atomic<size_t> profile_bytes{0};
   // Index nodes held now by every builder and generation sharing this.
   std::atomic<size_t> node_bytes{0};
 
@@ -64,59 +66,110 @@ class MeterMemory final : public utils::MemoryGrowth {
   size_t builders_ = 0;
 };
 
-// Builders only (the caller serializes them), never generations.
-struct MeterProfiles {
-  // The map size of the first sweep.
-  static constexpr size_t kFirstSweep = 64;
-
-  std::map<std::array<uint64_t, 5>, std::weak_ptr<const MeterProfile>> interned;
-  // Expired entries are dropped when the map reaches this size, which then
-  // becomes twice what is left: amortized O(1) per new profile.
-  size_t sweep_at = kFirstSweep;
-};
-
-namespace {
-
-// Allocates the standard library's part of a state's or profile's shared
-// ownership (a control block per meter state; a profile with its block),
-// glibc and one per meter, admitted through `memory` first and given back
-// when it is freed (D-198).
+// Allocates control-plane state no worker reads (D-206, class C): a meter
+// state's shared_ptr control block and the interned map's nodes. Glibc, as
+// before, charged exactly (utils::MallocBytes, measured on the block) to `memory`
+// and given back when it is freed (D-198). Holds `memory`, which a block
+// may outlive the builder that made it with.
 template <typename T>
-struct AdmittedAllocator {
+struct GlibcAllocator {
   using value_type = T;
 
-  explicit AdmittedAllocator(std::shared_ptr<MeterMemory> m) noexcept
+  explicit GlibcAllocator(std::shared_ptr<MeterMemory> m) noexcept
       : memory(std::move(m)) {}
   template <typename U>
-  AdmittedAllocator(const AdmittedAllocator<U> &o) noexcept
-      : memory(o.memory) {}
+  GlibcAllocator(const GlibcAllocator<U> &o) noexcept : memory(o.memory) {}
 
   T *allocate(size_t n) {
-    const size_t bytes = n * sizeof(T);
-    memory->Grow(bytes, bytes);
-    T *p;
+    T *p = std::allocator<T>().allocate(n);
+    const size_t bytes = utils::MallocBytes(p);
     try {
-      p = std::allocator<T>().allocate(n);
+      memory->Grow(bytes, bytes);
     } catch (...) {
-      memory->Shrink(bytes, bytes);
+      std::allocator<T>().deallocate(p, n);
       throw;
     }
     memory->glibc_held.fetch_add(bytes, std::memory_order_relaxed);
     return p;
   }
   void deallocate(T *p, size_t n) noexcept {
+    const size_t bytes = utils::MallocBytes(p);
     std::allocator<T>().deallocate(p, n);
-    const size_t bytes = n * sizeof(T);
     memory->glibc_held.fetch_sub(bytes, std::memory_order_relaxed);
     memory->Shrink(bytes, bytes);
   }
   template <typename U>
-  bool operator==(const AdmittedAllocator<U> &o) const noexcept {
+  bool operator==(const GlibcAllocator<U> &o) const noexcept {
     return memory == o.memory;
   }
 
   std::shared_ptr<MeterMemory> memory;
 };
+
+// Allocates a profile together with its shared_ptr control block: packet-
+// path state (D-206, class P: MeterState::RunLocked reads the profile per
+// packet), so DPDK memory the framework places, admitted through `memory`
+// first (no glibc part) and given back when it is freed.
+template <typename T>
+struct ProfileAllocator {
+  using value_type = T;
+
+  explicit ProfileAllocator(std::shared_ptr<MeterMemory> m) noexcept
+      : memory(std::move(m)) {}
+  template <typename U>
+  ProfileAllocator(const ProfileAllocator<U> &o) noexcept
+      : memory(o.memory) {}
+
+  T *allocate(size_t n) {
+    const size_t bytes = n * sizeof(T);
+    memory->Grow(bytes);
+    void *p;
+    try {
+      p = utils::DpdkAllocate(
+          bytes, std::max<size_t>(alignof(T), RTE_CACHE_LINE_SIZE));
+    } catch (...) {
+      memory->Shrink(bytes);
+      throw;
+    }
+    memory->profile_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    return static_cast<T *>(p);
+  }
+  void deallocate(T *p, size_t n) noexcept {
+    utils::DpdkFree(p);
+    const size_t bytes = n * sizeof(T);
+    memory->profile_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    memory->Shrink(bytes);
+  }
+  template <typename U>
+  bool operator==(const ProfileAllocator<U> &o) const noexcept {
+    return memory == o.memory;
+  }
+
+  std::shared_ptr<MeterMemory> memory;
+};
+
+// Builders only (the caller serializes them), never generations.
+struct MeterProfiles {
+  // The map size of the first sweep.
+  static constexpr size_t kFirstSweep = 64;
+
+  using Key = std::array<uint64_t, 5>;
+  using Interned = std::weak_ptr<const MeterProfile>;
+
+  explicit MeterProfiles(std::shared_ptr<MeterMemory> memory)
+      : interned(GlibcAllocator<std::pair<const Key, Interned>>(
+            std::move(memory))) {}
+
+  // Its nodes admitted (class C, D-206).
+  std::map<Key, Interned, std::less<Key>,
+           GlibcAllocator<std::pair<const Key, Interned>>>
+      interned;
+  // Expired entries are dropped when the map reaches this size, which then
+  // becomes twice what is left: amortized O(1) per new profile.
+  size_t sweep_at = kFirstSweep;
+};
+
+namespace {
 
 // Unique per process, so no two builders ever stamp nodes alike.
 uint64_t NewToken() noexcept {
@@ -248,7 +301,7 @@ MeterSetBuilder::MeterSetBuilder(size_t capacity)
       levels_(detail::MeterLevels(capacity)),
       token_(detail::NewToken()),
       memory_(std::make_shared<detail::MeterMemory>()),
-      profiles_(std::make_shared<detail::MeterProfiles>()),
+      profiles_(std::make_shared<detail::MeterProfiles>(memory_)),
       // No hook yet: the owner admitted Bytes(capacity) for it.
       root_(detail::NewNode(*memory_, levels_, nullptr, token_)) {
   memory_->Join();
@@ -275,7 +328,8 @@ MeterSetBuilder::MeterSetBuilder(CloneTag, const MeterSetBuilder &other)
 
 size_t MeterSetBuilder::bytes() const noexcept {
   size_t total = memory_->node_bytes.load(std::memory_order_relaxed) +
-                 memory_->glibc_held.load(std::memory_order_relaxed);
+                 memory_->glibc_held.load(std::memory_order_relaxed) +
+                 memory_->profile_bytes.load(std::memory_order_relaxed);
   for (const auto &[socket, slab] : slabs_) {
     total += slab->bytes();
   }
@@ -422,7 +476,7 @@ MeterSetBuilder::InternProfile(const MeterProfileSpec &spec) {
     return std::unexpected(compiled.error());
   }
   auto profile = std::allocate_shared<const MeterProfile>(
-      detail::AdmittedAllocator<MeterProfile>(memory_),
+      detail::ProfileAllocator<MeterProfile>(memory_),
       std::move(compiled).value());
 
   // Drop interned entries whose profile is gone, so the map tracks live
@@ -455,7 +509,7 @@ MeterSetBuilder::NewState(const std::shared_ptr<const MeterProfile> &profile,
   }
   // Run wherever the last generation holding the state is destroyed --
   // normally the control thread that reclaims RCU retirements; the slab
-  // locks for that. The control block is admitted (AdmittedAllocator); a
+  // locks for that. The control block is admitted (GlibcAllocator); a
   // refusal runs the deleter, so the slot goes back.
   return std::shared_ptr<MeterState>(
       *state,
@@ -463,7 +517,7 @@ MeterSetBuilder::NewState(const std::shared_ptr<const MeterProfile> &profile,
         s->~MeterState();
         slab->Free(s);
       },
-      detail::AdmittedAllocator<MeterState>(memory_));
+      detail::GlibcAllocator<MeterState>(memory_));
 }
 
 std::expected<void, MeterError> MeterSetBuilder::Add(

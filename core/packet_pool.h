@@ -19,11 +19,15 @@
 // DpdkPacketPool    DPDK hugepages   O/X      O/X       O          O
 //   : hugepage backing. The memory region will be contiguous in most
 //     cases, but not so if 2MB hugepages are used and scattered. MLX4/5
-//     drivers will fail in this case.
+//     drivers will fail in this case. Hugepages first; what they cannot
+//     hold comes from the normal-page fallback heap (D-206), unless
+//     --mem_fallback=false or the IOVA mode is physical addresses, where
+//     the pool is smaller instead (fatal at zero).
 //
 // Either admits its bytes before committing them (D-198): against the
 // memory limit with normal pages, the hugepage cap with hugepages; reported
-// as bessd/packet_pool, released when the pool is destroyed.
+// as bessd/packet_pool by where they landed, released when the pool is
+// destroyed.
 
 namespace bess {
 
@@ -151,6 +155,12 @@ class DpdkPacketPool : public PacketPool {
   bool IsVirtuallyContiguous() override { return false; }
   bool IsPhysicallyContiguous() override { return false; }
   bool IsPinned() override { return true; }
+
+ private:
+  // The memory node's hugepage heap, in memzones, as far as it goes.
+  void PopulateHugepages();
+  // The rest from the normal-page fallback heap, where allowed.
+  void PopulateNormalPages();
 };
 
 }  // namespace bess
