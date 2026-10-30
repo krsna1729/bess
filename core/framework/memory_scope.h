@@ -25,12 +25,17 @@
 //    primitive's unit test checks Bytes() == bytes());
 //  - the module admits those bytes before it allocates them, under the memory
 //    policy (utils::AdmitTable: normal pages against the limit, hugepages
-//    against --mem_hugepage_mb, past it the fallback heap only with
-//    --mem_fallback), so a table that does not fit is refused whole
+//    against --mem_hugepage_mb, past it normal pages unless
+//    --mem_fallback=false), so a table that does not fit is refused whole
 //    (utils::MemoryRefused -> RESOURCE_EXHAUSTED at the control boundary),
 //    never half-built and never an OOM kill;
-//  - what each module admitted is accounted per module and resource and
-//    reported (GetResourceStatus.memory.modules).
+//  - the framework, not the module, decides where the bytes go (D-206):
+//    an admission arms the calling thread's placement (utils::ArmPlacement),
+//    so the allocations that follow land where it admitted them, and bytes
+//    that land elsewhere (hugepages ran out before the cap) move with them;
+//  - what each module admitted is accounted per module and resource, by
+//    where it landed (hugepages, normal pages, glibc), and reported
+//    (GetResourceStatus.memory.modules).
 //
 // Module argument names stay the module's own: modules size different things
 // (entries, tuples, levels, queue depth). What is uniform is the semantics.
@@ -198,10 +203,11 @@ class MemoryScope {
   // `glibc_bytes` of them from glibc and the rest from DPDK's heap, under
   // the memory policy (utils::AdmitTable): normal backing ->
   // AdmitNormalMemory; hugepage backing within the hugepage cap -> admitted;
-  // past the cap -> AdmitNormalMemory if --mem_fallback, else
-  // MemoryRefused(kHugepagesExhausted). Throws utils::MemoryRefused and
-  // records nothing on refusal. Bytes admitted here are released by Release
-  // or with the scope.
+  // past the cap -> AdmitNormalMemory, or MemoryRefused(kHugepagesExhausted)
+  // with --mem_fallback=false. Arms this thread's placement with the DPDK
+  // part (D-206): allocate it next, on this thread. Throws
+  // utils::MemoryRefused and records nothing on refusal. Bytes admitted here
+  // are released by Release or with the scope.
   void Admit(std::string_view resource, size_t bytes, size_t glibc_bytes = 0);
   // Gives back bytes Admit admitted for `resource` (at most what it holds),
   // `glibc_bytes` of them glibc's.
@@ -286,6 +292,12 @@ struct ModuleMemoryUse {
   std::string resource;
   size_t admitted_bytes = 0;
   size_t current_bytes = 0;  // tracked objects' bytes(), else admitted
+  // admitted_bytes by where they landed (D-206): DPDK memory on hugepages,
+  // DPDK memory on normal pages (the fallback heap, or a normal-page
+  // backing), and glibc.
+  size_t hugepage_bytes = 0;
+  size_t normal_bytes = 0;
+  size_t glibc_bytes = 0;
 };
 
 // The process's memory accounts: every live scope's admitted bytes by module
@@ -299,6 +311,26 @@ class MemoryAccounts {
   static MemoryScope &Process();
   // Rows with admitted bytes, ordered by module, then resource.
   static std::vector<ModuleMemoryUse> List();
+};
+
+// A growth hook that charges the daemon's own scope (MemoryAccounts::
+// Process(), module "bessd") under `resource`: for process-wide control-plane
+// state no module owns -- the transaction engine's reference ledger
+// ("transaction_refs"), the transaction outcome records
+// ("transaction_records") -- through utils::AdmittedGlibcAllocator (D-206).
+// Must outlive every container charging it.
+class ProcessGrowth final : public utils::MemoryGrowth {
+ public:
+  explicit ProcessGrowth(std::string resource) : resource_(std::move(resource)) {}
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    MemoryAccounts::Process().Admit(resource_, bytes, glibc_bytes);
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    MemoryAccounts::Process().Release(resource_, bytes, glibc_bytes);
+  }
+
+ private:
+  std::string resource_;
 };
 
 }  // namespace bess::framework

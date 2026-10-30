@@ -49,8 +49,12 @@ MeterResource::MeterResource(std::string name, size_t capacity,
     : Resource(std::move(name)),
       held_(Bytes(capacity)),
       growth_(lease, &held_),
+      control_growth_(lease, &held_),
       published_(published),
-      live_(std::make_unique<MeterSetBuilder>(capacity)) {
+      live_(std::make_unique<MeterSetBuilder>(capacity)),
+      retiring_(ControlAllocator<MeterId>(&control_growth_)),
+      policies_(Policies::allocator_type(&control_growth_)),
+      staged_policies_(Policies::allocator_type(&control_growth_)) {
   live_->set_memory_growth(&growth_);
   published_.Initialize(live_->Build());
 }
@@ -235,6 +239,17 @@ void MeterResource::Growth::Prepay(size_t bytes) {
 void MeterResource::Growth::Refund(size_t bytes) noexcept {
   prepaid_bytes -= bytes;
   lease_->Shrink(bytes, 0);
+}
+
+void MeterResource::ControlGrowth::Grow(size_t bytes, size_t glibc_bytes) {
+  lease_->Grow(bytes, glibc_bytes);
+  held_->fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void MeterResource::ControlGrowth::Shrink(size_t bytes,
+                                          size_t glibc_bytes) noexcept {
+  held_->fetch_sub(bytes, std::memory_order_relaxed);
+  lease_->Shrink(bytes, glibc_bytes);
 }
 
 }  // namespace bess::meter

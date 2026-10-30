@@ -1202,13 +1202,16 @@ TEST(ConcurrentMaskedTableMemoryTest, GrowthAdmitsTuplesChunksAndChains) {
   EXPECT_EQ(initial + growth.net, t->bytes());
   EXPECT_EQ(0u, growth.glibc_net);
 
-  // A ranged rule under another key: its chain is glibc.
+  // A ranged rule under another key: its chain is packet-path DPDK memory
+  // (D-206), admitted with no glibc part.
+  const size_t before_chain = growth.net;
   const ConcurrentMaskedTable::KeyRange range{
       .offset = 4, .width = 2, .low = 10, .high = 20};
   ASSERT_EQ(R::kInserted,
             t->Upsert(C(kLow4), C(B(2)), 1, 2, 0,
                       ConcurrentMaskedTable::Ranges(&range, 1)));
-  EXPECT_GT(growth.glibc_net, 0u);
+  EXPECT_GT(growth.net, before_chain);
+  EXPECT_EQ(0u, growth.glibc_net);
   EXPECT_EQ(initial + growth.net, t->bytes());
 
   // Erasing every rule drops the tuple: its table is given back once the

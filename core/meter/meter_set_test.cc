@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <initializer_list>
 #include <memory>
 #include <vector>
@@ -418,28 +419,30 @@ TEST(MeterSetMemoryTest, GrowthIsAdmittedAndGivenBack) {
   builder.set_memory_growth(&growth);
   const size_t initial = builder.bytes();
 
-  // A meter: its profile and state control block (glibc) and the first slab
-  // chunk of states (DPDK).
+  // A meter: its profile (DPDK: workers read it, D-206), the profile's
+  // interned entry (glibc), the first slab chunk of states (DPDK) and the
+  // state's control block (glibc).
   MustAdd(builder, 1);
-  ASSERT_EQ(3u, growth.grown.size());
+  ASSERT_EQ(4u, growth.grown.size());
+  EXPECT_EQ(0u, growth.grown_glibc[0]) << "the profile is DPDK memory";
+  EXPECT_EQ(growth.grown[1], growth.grown_glibc[1]);
   EXPECT_EQ(bess::utils::ObjectSlab<MeterState>::chunk_bytes(),
-            growth.grown[1]);
-  EXPECT_EQ(0u, growth.grown_glibc[1]);
-  EXPECT_EQ(growth.grown[0], growth.grown_glibc[0]);
-  EXPECT_EQ(growth.grown[2], growth.grown_glibc[2]);
+            growth.grown[2]);
+  EXPECT_EQ(0u, growth.grown_glibc[2]);
+  EXPECT_EQ(growth.grown[3], growth.grown_glibc[3]);
   EXPECT_EQ(initial + growth.net, builder.bytes());
 
   // A generation and a clone admit nothing: they share the index. The next
   // edit copies the node it shares (here the root leaf), once.
   auto generation = builder.Build();
   auto clone = builder.Clone();
-  ASSERT_EQ(3u, growth.grown.size());
+  ASSERT_EQ(4u, growth.grown.size());
   MustAdd(builder, 2);
-  ASSERT_EQ(5u, growth.grown.size()) << "a state control block and the leaf";
-  EXPECT_EQ(detail::kMeterLeafBytes, growth.grown[4]);
-  EXPECT_EQ(0u, growth.grown_glibc[4]);
+  ASSERT_EQ(6u, growth.grown.size()) << "a state control block and the leaf";
+  EXPECT_EQ(detail::kMeterLeafBytes, growth.grown[5]);
+  EXPECT_EQ(0u, growth.grown_glibc[5]);
   MustAdd(builder, 3);
-  EXPECT_EQ(6u, growth.grown.size()) << "the leaf is the builder's now";
+  EXPECT_EQ(7u, growth.grown.size()) << "the leaf is the builder's now";
   EXPECT_EQ(initial + growth.net, builder.bytes());
   // What only they held is given back when they go.
   generation.reset();
@@ -502,18 +505,19 @@ TEST(MeterSetMemoryTest, RefusedGrowthLeavesTheBuilderUnchanged) {
   EXPECT_THROW((void)builder.Add(MeterId(1), kSlow, MeterSharing::kShared),
                bess::utils::MemoryRefused);
   EXPECT_EQ(0u, growth.net);
-  // The profile and the slab chunk admitted, the state refused: the meter
-  // is not added and its slot goes back; the chunk stays with the slab, and
-  // the profile's block with its interned weak reference.
-  growth.allow = 2;
+  // The profile, its interned entry and the slab chunk admitted, the state
+  // refused: the meter is not added and its slot goes back; the chunk stays
+  // with the slab, and the profile's block with its interned weak
+  // reference.
+  growth.allow = 3;
   EXPECT_THROW((void)builder.Add(MeterId(1), kSlow, MeterSharing::kShared),
                bess::utils::MemoryRefused);
   EXPECT_FALSE(builder.Contains(MeterId(1)));
   EXPECT_EQ(0u, builder.size());
-  ASSERT_EQ(2u, growth.grown.size());
-  EXPECT_EQ(growth.grown[0], growth.glibc_net);
+  ASSERT_EQ(3u, growth.grown.size());
+  EXPECT_EQ(growth.grown[1], growth.glibc_net);
   EXPECT_EQ(bess::utils::ObjectSlab<MeterState>::chunk_bytes() +
-                growth.grown[0],
+                growth.grown[0] + growth.grown[1],
             growth.net);
   EXPECT_EQ(initial + growth.net, builder.bytes());
 
@@ -536,6 +540,31 @@ TEST(MeterSetMemoryTest, RefusedGrowthLeavesTheBuilderUnchanged) {
   EXPECT_FALSE(builder.Contains(MeterId(1)));
   EXPECT_NE(nullptr, generation->Lookup(MeterId(1)));
   EXPECT_EQ(initial + growth.net, builder.bytes());
+}
+
+// D-206: the glibc a meter takes -- its state's control block and, for a new
+// profile, the interned map's node -- is admitted as the chunk malloc took
+// for each block (utils::MallocBytes, measured on the block by the
+// allocator itself, so no process-wide measurement another thread could
+// move): whole 16-byte chunks, the same for every meter.
+TEST(MeterSetMemoryTest, GlibcIsAdmittedExactly) {
+  RecordingGrowth growth;
+  growth.grown.reserve(64);
+  growth.grown_glibc.reserve(64);
+  MeterSetBuilder builder(16);
+  builder.set_memory_growth(&growth);
+  MustAdd(builder, 1);  // the slab and its first chunk
+  // The profile (DPDK), its interned node, the chunk, the control block.
+  ASSERT_EQ(4u, growth.grown.size());
+  const size_t node = growth.grown_glibc[1];
+  const size_t block = growth.grown_glibc[3];
+  for (const size_t chunk : {node, block}) {
+    EXPECT_GE(chunk, bess::utils::MallocChunkBytes(1));
+    EXPECT_EQ(chunk % 16, 0u) << "not a malloc chunk";
+  }
+  const size_t glibc_before = growth.glibc_net;
+  MustAdd(builder, 2, kSlowBig);  // a new profile's node and a state's block
+  EXPECT_EQ(node + block, growth.glibc_net - glibc_before);
 }
 
 }  // namespace

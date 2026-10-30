@@ -13880,7 +13880,8 @@ is half built, and the status counts entries, not bytes (D-149 left `Module::Rep
 - **Lazy library initialization keeps CPU affinity.** A first allocation may bring up the EAL outside bessd.
   Its `--lcores` mapping groups the whole physical CPU set in parentheses, including disjoint sets such as
   `127@(0-1,12-15)`, so commas cannot create extra lcore mappings and narrow the caller's inherited affinity.
-- **A declared fallback.** `--mem_fallback` (default off). Off: when the hugepage heap cannot grow, the creation
+- **A declared fallback.** `--mem_fallback` (default on since D-206, which made normal pages past the hugepages
+  the automatic placement; it was off here). Off: when the hugepage heap cannot grow, the creation
   is refused (`MemoryRefused`, reason "hugepages exhausted"), never silently downgraded. On: the memory comes from
   a DPDK external heap ("bess-normal") of anonymous normal pages, grown in chunks on the control path -- still one
   allocator (`rte_free` frees both), still on the memory node by the mempolicy. DPDK libraries that allocate
@@ -14272,3 +14273,136 @@ observes green/yellow/red, destroys the state, then reconstructs fresh buckets i
 the same caller-owned storage.
 
 **Revisit when:** a second embedded owner needs a checked-storage factory.
+
+## D-206 The framework places memory: hugepages first, normal pages past them, glibc admitted exactly
+
+**Status:** proposed (2026-10-30). Amends D-198 (`--mem_fallback` now defaults on).
+**Code:** `core/utils/dpdk_memory.{h,cc}`, `core/framework/memory_scope.{h,cc}`, `core/packet_pool.{h,cc}`,
+`core/runtime/{opts.cc,startup.h,runtime_state.cc}`, `core/control/{api_v2.cc,dataplane_transactions.{h,cc}}`, `protobuf/control_v2.proto` (and the
+generated SDKs), `core/classifier/{concurrent_masked.{h,cc},concurrent_exact.cc,rte_hash_exact.h}`,
+`core/route/{route_table.cc,router.{h,cc}}`, `core/meter/{meter_set.{h,cc},meter_resource.{h,cc}}`,
+`core/dataplane/{packet_store.{h,cc},transaction_engine.{h,cc}}`; tests beside each.
+
+**Problem.** D-198 decided where memory comes from, but left the choice half with the module and half with the
+operator: a module picked glibc or DPDK per structure, and with hugepages a table past the cap or the exhausted heap
+was refused unless the operator had said `--mem_fallback` -- so a host with some hugepages ran out sooner than one
+with none. The packet pool, created by `rte_mempool_populate_default`, freed everything when the hugepages could
+not hold it and stopped bessd. Nothing reported where admitted bytes had landed. A code read found packet-path state
+still on glibc (meter profiles, masked range chains, the `PacketStore` arrays) and session-scaled control-plane
+state on glibc either unadmitted (meter policies, the transaction engine's reference ledger, interned profiles) or
+admitted as `n*sizeof(T)`, short of malloc's chunk (the UPF F-TEID mirror by 16 B per node).
+
+**Decision.**
+- **The framework, not the module, decides where memory lives.** Three classes:
+  - **P, packet path**: state a worker reads or writes per packet that scales with arguments, rules or sessions.
+    Always the framework's DPDK allocator on the memory node -- `DpdkArray`, `ObjectSlab`, or
+    `DpdkAllocator<T>(socket, growth)`, which now admits every allocation through `growth` -- so when the
+    framework knows hugepages exist they are used without the module asking.
+  - **C, control plane**: grows with sessions or transactions, never read on the packet path. Stays on glibc
+    (D-198's choice for control state, cold), but every byte goes through the framework's allocator
+    `utils::AdmittedGlibcAllocator<T>(growth)`, which charges the owning scope on every allocate and deallocate at
+    the size malloc actually took (`utils::MallocBytes(p)`: `malloc_usable_size` plus the chunk's size word,
+    measured on the block, not a per-node constant) -- exact by construction; a charge the scope refuses frees
+    the block and throws `MemoryRefused`. Owners: `MeterResource` policies → the Meter module's scope (its lease);
+    the transaction engine's reference ledger → `bessd/transaction_refs` (a `Resource` carries no owner scope, so
+    per-module attribution is not possible there); the transaction outcome window
+    (`DataplaneTransactions::records_`, kept serialized) → `bessd/transaction_records`, through
+    `framework::ProcessGrowth`. The note on the option to move class C onto the framework allocator
+    (node pools first, then a hot/cold placement tag; about 0.3 GiB at 1M sessions in the graph layout) is in the
+    code above that allocator, `core/utils/dpdk_memory.h`.
+  - **S, scratch**: small, fixed or bounded by gate/field counts. Plain `new`/`std::vector`, not admitted.
+- **A free never grows RSS past what was admitted.** DPDK zeroes a clean element when it is freed
+  (`malloc_elem_free`); on normal pages an admitted table nobody wrote was not resident, so admission, which measures
+  RSS, no longer saw it, admitted past it, and teardown (`ResetAll`) faulted every such table in at once -- OOM kills
+  near the cgroup limit (StrictBudget, 19 trials). Two parts:
+  - `DpdkAllocate` makes a `--no-huge` heap block resident right after admitting it (`MADV_POPULATE_WRITE`, else a
+    write per page), so its RSS matches what was admitted and its free only touches resident pages. Hugepages are
+    resident when mapped; `bess-normal` when a chunk is added (DPDK clears it).
+  - What DPDK libraries allocate internally (`rte_hash`, `rte_lpm`, `rte_fib` bodies, all `rte_zmalloc`, which
+    leaves clean memory untouched) cannot be reached from BESS, so `AdmitNormalMemory` counts it:
+    used = measured + per normal-page heap max(0, allocated − resident) (`UnfaultedHeapBytes`:
+    `rte_malloc_get_socket_stats` per heap, `mincore` over its memseg lists; resident pages are in the measurement
+    already, so nothing is counted twice). A free can still fault such a table in, but only up to bytes admission
+    already counted: a refusal, not an OOM kill. Residual: a resident free hole (a freed library table's zeroed
+    pages) hides as much unfaulted allocation elsewhere in the same heap. The hugepage growth validator, which
+    may make no DPDK memory calls, keeps the plain measurement; with hugepages the only normal-page heap,
+    `bess-normal`, is resident whole.
+  - **Airtight follow-up (deferred):** a D-131 DPDK patch populating each element in `malloc_heap_alloc` when its
+    memseg list's `page_sz` is below 2 MiB (so every `rte_malloc`/`rte_zmalloc`/memzone on normal pages is resident
+    from allocation, and a free never grows RSS at all). Deferred because it rebuilds the shared
+    `deps/dpdk-25.11.3` install every worktree and running build links against; the accounting above already
+    turns the teardown OOM into a refusal.
+- **Automatic placement, flags only override.** `--mem_backing=auto` already took hugepages when usable. Now, when
+  the hugepage heap cannot give the bytes -- the `--mem_hugepage_mb`/hugetlb cap reached, or the pages exhausted
+  before it -- the table comes from `bess-normal` (normal pages on the same node) by default: `--mem_fallback`
+  defaults on (`MemoryPolicy::fallback = true`). The overrides: `--mem_backing=normal` (normal pages only),
+  `--mem_fallback=false` / `BESSD_MEM_FALLBACK=no` (refuse past the hugepages, D-198's old default),
+  `--mem_hugepage_mb` (cap). Refusal is unchanged: `MemoryRefused`, `RESOURCE_EXHAUSTED`, never an OOM kill.
+- **Placement is armed by admission and recorded where it lands.** `MemoryScope` gives every account row a ticket;
+  an admission (`Add`, `Grow`) arms the calling thread with the ticket and the bytes it admitted per backing
+  (`utils::ArmPlacement`). `DpdkAllocate` -- and `NotePlacement` for DPDK libraries that allocate internally --
+  draws on the armed amounts: bytes admitted for hugepages that land on `bess-normal` (the heap ran out before
+  the cap) move to the row's normal-page column and are counted in `spilled_bytes`; bytes admitted past the cap
+  are allocated from `bess-normal` directly, so the cap holds. `PlacementSocket(socket, bytes)` is the socket a
+  library create should use. A free gives back hugepage bytes first (rows do not track each object's landing):
+  after a spill the split is approximate until the row empties.
+- **One measurement serves small admissions.** Class C admits per node, so `AdmitNormalMemory` reuses its last
+  cgroup measurement while the bytes admitted since stay under 1 MiB, counting them on top; a refusal is always
+  re-measured. Unadmitted growth in that window is what `--mem_reserve_mb` is for.
+- **The packet pool overflows instead of stopping.** `DpdkPacketPool` populates its own memory: hugepage memzones on
+  the pool's socket, halving the chunk on `ENOMEM` down to the minimum object chunk, then -- fallback allowed and
+  IOVA-as-VA -- one anonymous normal-page mapping for the rest, admitted against the limit and mapped into the
+  default VFIO container (best effort; `bess-normal` memsegs carry no IOVA). With `--mem_fallback=false` or IOVA-as-PA
+  the pool is smaller (a WARNING), and fatal only at zero.
+- **Reported per resource.** `GetResourceStatus.memory.modules[]` gains `hugepage_bytes`, `normal_bytes`,
+  `glibc_bytes` (they sum to `admitted_bytes`); `memory` gains `spilled_bytes`. `fallback` now reads "normal pages
+  past the hugepages are allowed".
+- **RCU defer queues stay where DPDK puts them.** `rte_rcu_qsbr_dq_create` (behind `rte_hash_rcu_qsbr_add`,
+  `rte_lpm_rcu_qsbr_add`, `rte_fib_rcu_qsbr_add`) allocates with `rte_zmalloc(NULL)` and
+  `rte_ring_create_elem(..., SOCKET_ID_ANY)`; its parameters take no socket and `SOCKET_ID_ANY` never reaches an
+  external heap, so the queue is on the calling thread's native socket and cannot use `bess-normal`. Its bytes are
+  in the table's estimate (`RteHashBytes`, `InstanceBytes`); an `ENOMEM` there is a refusal
+  (`utils::RefuseDpdkMemory`, D-198's helper), not "table full".
+
+**Classification** (file:line in `core/` unless marked; `UPF:` = `appliance-upf` `datapath/`). Changed here:
+
+| site | class | before | after |
+|---|---|---|---|
+| classifier/concurrent_masked.cc `NewChain`/`Chain::Free` (range chains) | P | glibc `::operator new`, admitted as glibc request | `DpdkAllocate`, admitted as DPDK |
+| meter/meter_set.cc `InternProfile` (profile + control block) | P | glibc `AdmittedAllocator`, n·sizeof | `ProfileAllocator`: DPDK, admitted |
+| meter/meter_set.cc `NewState` (state control block) | C | glibc, n·sizeof | glibc, malloc chunk |
+| meter/meter_set.cc `MeterProfiles::interned` | C | glibc, unadmitted | glibc, malloc chunk |
+| meter/meter_resource.h `policies_`, `staged_policies_`, `retiring_` | C | glibc, unadmitted | `AdmittedGlibcAllocator` through the owner's lease |
+| dataplane/transaction_engine.h `Registration::incoming` | C | glibc, unadmitted | `AdmittedGlibcAllocator` → `bessd/transaction_refs` (keys over 15 chars: text unadmitted) |
+| control/dataplane_transactions.h `records_`, `order_` | C | glibc, unadmitted (proto per record) | `AdmittedGlibcAllocator` (id, serialized record, node, window) → `bessd/transaction_records`, charged before the transaction is attempted (`ReserveRecord`: the largest applied record); a refused charge refuses the transaction with nothing applied, so an applied outcome is always recorded and its retry replays |
+| dataplane/packet_store.{h,cc} store, `slots_`, `table_` | P | glibc `new[]`, admitted as glibc | DPDK (`DpdkArray`, class `operator new`) |
+| route/router.cc `GlibcBytes` (`hop_states_`, `bindings_`, references) | C (workers read only `NextHopGroup::eligible[]`, written by `Elect`) | glibc, n·sizeof | glibc, a malloc chunk per vector and the object |
+| packet_pool.cc pool memory | P | `rte_mempool_populate_default`, hugepages or FATAL | hugepages first, normal pages past them |
+| classifier/rte_hash_exact.h, route/route_table.cc library tables | P | memory node, fallback retry | `PlacementSocket`, `NotePlacement` |
+| UPF: fteid_resource.h F-TEID mirror `entries_` | C | glibc, 96 B/node (`kMirrorNodeBytes`; chunk is 112) | `AdmittedGlibcAllocator` |
+| UPF: arp_responder_resource.h `slots_` | P | glibc vector | `DpdkArray` |
+| UPF: upf_appliance_buffer.cc `pending`, `sidecars`, `released`, requests ring | P | glibc (`unique_ptr<T[]>`, `AllocRingMem`) | `DpdkArray`, `DpdkAllocate` |
+| UPF: end_marker_log.h `rings_` | P | glibc aligned `new[]` | `DpdkArray` |
+
+Left as they are, and why:
+
+| site | class | where | reason |
+|---|---|---|---|
+| dataplane/packet_store.h `PacketStoreLimitsMap`; classifier/concurrent_masked.h `TupleList::tuples`, `Tuple::mask`, `Ceiling`; concurrent_exact.cc wrapper; route_table.cc table objects; modules/router.h `resolver_gates_`; modules/arp_responder.h map | P | glibc | node containers or one small object per tuple/domain: per-node `rte_malloc` costs a ~64 B header and cache-line rounding; waits for framework node pools (open) |
+| flow/worker_flow_table.h, shared_flow_table.h, decision_cache.h, l2/fdb.h, packed_mac_table.h, nat/nat.h, conntrack (`DefaultFlowAllocator`); utils/rte_ring_alloc.h (`AllocRingMem`: queue, packet_store rings); utils/histogram.h; modules acl, bpf, static_nat, firewall_table | P | glibc, admitted | per-library migration to `DpdkArray` (open) |
+| modules/drr, url_filter, flowgen | P | glibc, allocated on the worker | need preallocated pools, not an allocator swap (open) |
+| stats/event_hub.cc rings; UPF `GtpuErrorCounts`, `interfaces_`, `marker_inputs_`, `next_hop_classes_`, `Slow`, `Buffer` objects | S | glibc | fixed size or bounded by gates |
+| classifier `pending_keys_`, `Prepared`, `retired_chains_`; record_arena `retiring_`; route_table `rules_`/`fib_blocks_`/IPv6 stage; router staged maps, `memberships_`; neighbor resolver maps; rcu `retired_`; event_hub `log_`; UPF staged ops | C | glibc, unadmitted | per-transaction or bounded; next in line for `AdmittedGlibcAllocator` (open) |
+| UPF session layout (`mirrors_`, `Mirror::rules`/`fteids`, `actions_` 40 B/node vs 48 chunk, `tx_*`) and scan layout (`Policy`, `Bucket`) | C / P | glibc | not in this tree (`appliance-upf-session`, `appliance-upf-scan`); same allocators apply on adoption |
+
+**Consequences.** A host with some hugepages now degrades to normal pages where D-198 refused: an operator who
+wants the refusal says `--mem_fallback=false`. The packet path is unchanged: no lookup branches on a backing.
+Class-C admission adds one atomic account update per node (and a cgroup read per MiB admitted). Each fresh
+measurement also `mincore`s the normal-page heaps (one byte per 4 KiB page: about 0.2 ms per GiB [unmeasured]).
+A transaction with a request id charges its record before it runs, so at the limit it is refused whole.
+`Shrink` taking hugepages first can misreport a row's split after a spill until the row empties; `admitted_bytes`
+stays exact.
+
+**Revisit when:** framework node pools exist (move the remaining P node containers and, with a hot/cold tag, class
+C -- see the note in `core/utils/dpdk_memory.h`), DPDK's defer queue takes a socket, or the deps can be rebuilt
+for the `malloc_heap_alloc` populate patch (then `UnfaultedHeapBytes` goes).

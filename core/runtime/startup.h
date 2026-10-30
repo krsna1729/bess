@@ -77,7 +77,7 @@ MemoryLimit DiscoverHugetlbLimit(const std::string &hugepages_root,
 struct MemorySettings {
   utils::MemoryBacking backing = utils::MemoryBacking::kAuto;  // --mem_backing
   int64_t hugepage_mb = 0;  // --mem_hugepage_mb: 0 no cap, N MB
-  bool fallback = false;    // --mem_fallback
+  bool fallback = true;     // --mem_fallback (D-206: on unless forbidden)
   int64_t limit_mb = 0;     // --mem_limit_mb: 0 discovered, -1 none, N MB
   int64_t reserve_mb = -1;  // --mem_reserve_mb: -1 automatic, N MB
 };

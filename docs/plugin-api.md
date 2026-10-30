@@ -881,9 +881,24 @@ a tick) and never on the packet path. Argument names stay the module's own
   itself takes `memory().socket()`, the memory node (D-123) -- never a socket
   literal. Admission follows the policy (`utils::AdmitTable`): normal pages are
   admitted against the memory limit, hugepages against `--mem_hugepage_mb`, and
-  past that cap the fallback heap only with `--mem_fallback`. What does not fit
-  is refused whole -- `utils::MemoryRefused` before anything is allocated --
-  never half-built and never an OOM kill.
+  past that cap normal pages, unless bessd runs with `--mem_fallback=false`.
+  What does not fit is refused whole -- `utils::MemoryRefused` before anything
+  is allocated -- never half-built and never an OOM kill.
+- **The framework places, the module does not (D-206).** An admission arms
+  the calling thread: the DPDK allocations that follow it on that thread land
+  where it admitted them (hugepages, or normal pages past the cap), and bytes
+  that land elsewhere -- the hugepage heap ran out before the cap -- move to
+  the normal-page column of the account. So: admit, then allocate on the same
+  thread. A module never picks a heap, a page size or a socket.
+- **Three kinds of memory (D-206).** (P) state a worker reads or writes per
+  packet and that scales with arguments or sessions: the framework allocator
+  -- `DpdkArray`, `ObjectSlab`, or `DpdkAllocator<T>(socket, growth)` for a
+  vector that grows on the control path (each allocation admitted through
+  `growth`). (C) state that scales with sessions or transactions but no worker
+  reads (mirrors, desired-state maps): glibc, through
+  `utils::AdmittedGlibcAllocator<T>(growth)`, which admits each block at its
+  malloc chunk size (`utils::MallocChunkBytes`) as glibc bytes. (S) scratch and
+  small fixed objects: plain `new`, `std::vector`, nothing to admit.
 - **Growth is admitted too.** A primitive that grows on the control path after
   construction (slab chunks, a doubled table, a new tuple, a route domain)
   takes a `utils::MemoryGrowth` hook (`set_memory_growth`; `Create` wires it to
@@ -892,7 +907,8 @@ a tick) and never on the packet path. Argument names stay the module's own
   through `Create` and drops the old owner when it is freed.
 - **Accounted and reported.** The scope is the module's own, destroyed with
   it, releasing whatever is still admitted. `GetResourceStatus.memory.modules`
-  lists every module's resources: `admitted_bytes`, and `current_bytes` from
+  lists every module's resources: `admitted_bytes`, split by where they landed
+  (`hugepage_bytes`, `normal_bytes`, `glibc_bytes`), and `current_bytes` from
   the objects' `bytes()`; the daemon's packet pool is `bessd`/`packet_pool`.
 
 Validate the arguments first, admit second, allocate third:
@@ -922,13 +938,15 @@ when bessd has hugepages (`utils/dpdk_memory.h`): `DpdkArray<T>`,
 so a `SlotTable` carves its objects from 1024-object chunks that never move,
 and retiring an object after its grace period is the owner's job). A
 primitive's own code uses them; DPDK libraries that allocate internally create
-on the memory node first and, when that fails for lack of memory, on the
-socket `FallbackSocket(estimated_bytes)` returns. Module code does neither
+on `PlacementSocket(socket, estimated_bytes)` (the memory node, or the
+normal-page heap once the cap is spent) and, when that fails for lack of
+memory, on the socket `FallbackSocket(estimated_bytes)` returns, then record
+where it landed with `NotePlacement`. Module code does neither
 `AdmitNormalMemory` nor `AdmitTable` itself: `memory()` does.
 
 **Refusal.** When memory cannot be given -- the `--mem_hugepage_mb` cap
-reached or hugepages exhausted and bessd started without `--mem_fallback`, or
-the memory limit reached (the five `--mem_*` flags:
+reached or hugepages exhausted and bessd started with `--mem_fallback=false`,
+or the memory limit reached (the five `--mem_*` flags:
 [running-in-containers.md](running-in-containers.md#memory)) -- admission
 throws `utils::MemoryRefused`, a `std::bad_alloc` whose `what()` names the
 bytes, the heap state and the flag, with `reason()` (`kHugepagesExhausted`,

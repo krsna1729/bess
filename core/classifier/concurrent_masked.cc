@@ -84,18 +84,17 @@ void ConcurrentMaskedTable::set_memory_growth(
   tuple_memory_->growth = growth;
 }
 
-void ConcurrentMaskedTable::TupleMemory::Grow(size_t n, size_t glibc) {
+void ConcurrentMaskedTable::TupleMemory::Grow(size_t n) {
   const std::lock_guard<std::mutex> lock(mutex);
   if (growth != nullptr) {
-    growth->Grow(n, glibc);
+    growth->Grow(n);
   }
 }
 
-void ConcurrentMaskedTable::TupleMemory::Shrink(size_t n,
-                                                size_t glibc) noexcept {
+void ConcurrentMaskedTable::TupleMemory::Shrink(size_t n) noexcept {
   const std::lock_guard<std::mutex> lock(mutex);
   if (growth != nullptr) {
-    growth->Shrink(n, glibc);
+    growth->Shrink(n);
   }
 }
 
@@ -109,9 +108,9 @@ void ConcurrentMaskedTable::TupleTableFree::operator()(
 void ConcurrentMaskedTable::Chain::Free::operator()(
     Chain *chain) const noexcept {
   const size_t bytes = Bytes(chain->entry_capacity, chain->range_capacity);
-  ::operator delete(chain);
+  utils::DpdkFree(chain);
   owner->chain_bytes_ -= bytes;
-  owner->tuple_memory_->Shrink(bytes, bytes);
+  owner->tuple_memory_->Shrink(bytes);
 }
 
 std::shared_ptr<ConcurrentExactTable> ConcurrentMaskedTable::NewTupleTable(
@@ -205,12 +204,14 @@ std::optional<uint64_t> ConcurrentMaskedTable::FindValue(
 ConcurrentMaskedTable::ChainPtr ConcurrentMaskedTable::NewChain(
     uint32_t entries, uint32_t ranges) {
   const size_t bytes = Chain::Bytes(entries, ranges);
-  tuple_memory_->Grow(bytes, bytes);  // glibc (D-198)
+  // Packet-path state (D-206, class P: Resolve reads it per ranged hit):
+  // DPDK memory the framework places, admitted with no glibc part.
+  tuple_memory_->Grow(bytes);
   void *block;
   try {
-    block = ::operator new(bytes);
+    block = utils::DpdkAllocate(bytes, RTE_CACHE_LINE_SIZE);
   } catch (...) {
-    tuple_memory_->Shrink(bytes, bytes);
+    tuple_memory_->Shrink(bytes);
     throw;
   }
   auto *chain = new (block) Chain{0, 0, entries, ranges};

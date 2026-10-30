@@ -1713,5 +1713,73 @@ TEST(TransactionEngineBatchingTest, ASetPastTheRetireBudgetIsSplitAndApplied) {
       << again.ops[0].error;
 }
 
+// The reference ledger is control-plane state no worker reads (D-206, class
+// C): its nodes and bucket array are glibc, each block charged through the
+// engine's ledger hook at the chunk malloc took (utils::MallocBytes), the
+// nodes given back as their references go and the rest with the engine.
+TEST(TransactionEngineMemoryTest, ReferenceLedgerIsAdmittedExactly) {
+  struct Recording final : utils::MemoryGrowth {
+    size_t net = 0, glibc_net = 0;
+    void Grow(size_t bytes, size_t glibc_bytes) override {
+      net += bytes;
+      glibc_net += glibc_bytes;
+    }
+    void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+      net -= bytes;
+      glibc_net -= glibc_bytes;
+    }
+  };
+  // Declared before the engine: it must outlive it.
+  Recording growth;
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  SlotTable<MeterId, Meter> meters(kIds);
+  SlotTable<ActionId, Action> actions(kIds);
+  SlotResource<MeterId, Meter> meters_res("meters", meters);
+  SlotResource<ActionId, Action> actions_res(
+      "actions", actions,
+      [](const Action &a) {
+        return std::vector<Reference>{{"meters", EncodeKey(a.meter)}};
+      },
+      std::vector<std::string>{"meters"});
+  {
+    TransactionEngine engine(domain, &growth);
+    ASSERT_TRUE(engine.Register(&meters_res));
+    ASSERT_TRUE(engine.Register(&actions_res));
+    EXPECT_EQ(0u, growth.net) << "an empty ledger allocates nothing";
+
+    constexpr uint32_t kKeys = 20;
+    std::vector<Op> ops;
+    for (uint32_t id = 1; id <= kKeys; id++) {
+      ops.push_back(Op::Upsert("meters", EncodeKey(MeterId(id)),
+                               std::any(Meter(id))));
+      ops.push_back(Op::Upsert("actions", EncodeKey(ActionId(id)),
+                               std::any(Action{0, MeterId(id)})));
+    }
+    ASSERT_EQ(engine.Apply(ops).outcome, Outcome::kApplied);
+    ASSERT_EQ(1u, engine.ReferenceCount("meters", EncodeKey(MeterId(kKeys))));
+    const size_t held = growth.glibc_net;
+    EXPECT_GT(held, kKeys * utils::MallocChunkBytes(1));
+    EXPECT_EQ(held, growth.net) << "the ledger is glibc only";
+
+    // The references go with their actions, node by node; the bucket array
+    // stays.
+    std::vector<Op> erases;
+    for (uint32_t id = 1; id <= kKeys; id++) {
+      erases.push_back(Op::Erase("actions", EncodeKey(ActionId(id))));
+    }
+    ASSERT_EQ(engine.Apply(erases).outcome, Outcome::kApplied);
+    while (engine.ReclaimRetired() != 0) {
+    }
+    ASSERT_EQ(0u, engine.ReferenceCount("meters", EncodeKey(MeterId(kKeys))));
+    const size_t nodes = held - growth.glibc_net;
+    EXPECT_GT(growth.glibc_net, 0u) << "the bucket array stays";
+    EXPECT_EQ(nodes % kKeys, 0u) << "every node costs the same";
+    EXPECT_EQ((nodes / kKeys) % 16, 0u) << "a node is a whole malloc chunk";
+    EXPECT_GT(nodes, 0u) << "the nodes went with their references";
+    domain.Drain();
+  }
+  EXPECT_EQ(0u, growth.net) << "the engine gave its ledger back";
+}
+
 }  // namespace
 }  // namespace bess::dataplane

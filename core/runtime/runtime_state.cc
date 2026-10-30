@@ -10,6 +10,7 @@
 #include "port.h"
 #include "runtime/worker_manager.h"
 #include "dataplane/transaction_engine.h"
+#include "framework/memory_scope.h"
 #include "rcu/rcu_domain.h"
 #include "traffic_class.h"
 #include "utils/common.h"
@@ -39,6 +40,16 @@ std::string NameTemplate(const std::string &class_name,
     last_char = t;
   }
   return ss.str();
+}
+
+// The transaction engine's reference ledger is process-wide: which module
+// owns a referenced resource is not known to the engine (a Resource has no
+// owner scope), so the ledger is charged to the daemon's own scope, resource
+// "transaction_refs" (D-206, class C), as it grows -- after startup, once
+// resources register -- not when the runtime is made.
+utils::MemoryGrowth *TransactionRefs() {
+  static framework::ProcessGrowth growth("transaction_refs");  // outlives the engine
+  return &growth;
 }
 
 }  // namespace
@@ -213,7 +224,8 @@ RuntimeState::RuntimeState()
       // worker registers when its thread starts and unregisters when it is
       // done, so a recreated worker reuses its id.
       rcu_(std::make_unique<rcu::RcuDomain>(Worker::kMaxWorkers)),
-      transactions_(std::make_unique<dataplane::TransactionEngine>(*rcu_)) {
+      transactions_(std::make_unique<dataplane::TransactionEngine>(
+          *rcu_, TransactionRefs())) {
   builtin_metrics_ = metrics_.Register([this](stats::MetricWriter &w) {
     const rcu::RcuStats r = rcu_->Stats();
     w.Counter("bess_rcu_grace_periods_started_total", "Grace periods started", r.grace_periods_started);

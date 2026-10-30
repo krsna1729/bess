@@ -21,6 +21,7 @@
 #include "dataplane/resource.h"
 #include "dataplane/resource_registry.h"
 #include "rcu/rcu_domain.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess {
 namespace dataplane {
@@ -113,7 +114,13 @@ class TransactionEngine {
     bool over_budget = false;
   };
 
-  explicit TransactionEngine(rcu::RcuDomain &domain) : domain_(domain) {}
+  // `ledger_growth`: admits the reference ledger (every resource's incoming
+  // reference counts: control-plane state that grows with the keys values
+  // reference, D-206 class C) as it grows, and takes it back as it shrinks;
+  // it must outlive the engine. Null: unadmitted (tests, library users).
+  explicit TransactionEngine(rcu::RcuDomain &domain,
+                             utils::MemoryGrowth *ledger_growth = nullptr)
+      : domain_(domain), ledger_growth_(ledger_growth) {}
 
   // The public face given to modules and libraries (resource_registry.h).
   ResourceRegistry &registry() noexcept { return registry_; }
@@ -280,6 +287,18 @@ class TransactionEngine {
 
   // Everything the engine keeps about one registered resource.
   struct Registration {
+    explicit Registration(utils::MemoryGrowth *ledger_growth)
+        : incoming(Incoming::allocator_type(ledger_growth)) {}
+
+    // References to its keys held by other resources' values: key -> count.
+    // Glibc, its nodes and bucket array admitted exactly through the
+    // engine's ledger hook (D-206, class C); a key longer than the string's
+    // inline buffer (15 characters) allocates its characters apart,
+    // unadmitted.
+    using Incoming = std::unordered_map<
+        std::string, size_t, StringHash, std::equal_to<>,
+        utils::AdmittedGlibcAllocator<std::pair<const std::string, size_t>>>;
+
     Resource *resource = nullptr;
     // Its declared references that are bound (the referent is registered).
     std::vector<std::pair<std::string, Registration *>> deps;
@@ -287,8 +306,7 @@ class TransactionEngine {
     std::vector<std::string> unresolved;
     // Its declared key holder (Resource::key_holder), once registered.
     Registration *key_holder = nullptr;
-    // References to its keys held by other resources' values: key -> count.
-    StringMap<size_t> incoming;
+    Incoming incoming;
     // Retired objects of it handed to RCU and not yet destroyed.
     std::atomic<size_t> outstanding{0};
     size_t pending_removals = 0;  // cascade steps not yet run
@@ -358,6 +376,7 @@ class TransactionEngine {
   };
 
   rcu::RcuDomain &domain_;
+  utils::MemoryGrowth *ledger_growth_;  // Registration::incoming's hook
   mutable std::mutex mutex_;
   StringMap<std::unique_ptr<Registration>> resources_;
   std::vector<Cascade> cascades_;

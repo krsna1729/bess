@@ -260,27 +260,29 @@ TEST(StartupTest, MemoryPolicyLimitAndReserve) {
   bess::utils::MemoryPolicy policy;
   std::string error;
 
-  // Defaults: the discovered limit, reserve max(128 MB, limit/16).
+  // Defaults: the discovered limit, reserve max(128 MB, limit/16), normal
+  // pages past the hugepages (D-206).
   ASSERT_TRUE(Resolve(discovered, 0, [](MemorySettings &) {}, &policy, &error));
   EXPECT_EQ(policy.limit_bytes, 4096ull << 20);
   EXPECT_EQ(policy.reserve_bytes, 256ull << 20);
   EXPECT_EQ(policy.limit_source, discovered.source);
   EXPECT_EQ(policy.cgroup_dir, discovered.cgroup_dir);
-  EXPECT_FALSE(policy.fallback);
+  EXPECT_TRUE(policy.fallback);
 
   // An explicit limit is bessd's RSS; the reserve's floor is 128 MB.
+  // --mem_fallback=false forbids normal pages past the hugepages.
   ASSERT_TRUE(Resolve(
       discovered, 0,
       [](MemorySettings &s) {
         s.limit_mb = 1024;
-        s.fallback = true;
+        s.fallback = false;
       },
       &policy, &error));
   EXPECT_EQ(policy.limit_bytes, 1024ull << 20);
   EXPECT_EQ(policy.reserve_bytes, 128ull << 20);
   EXPECT_EQ(policy.limit_source, "--mem_limit_mb");
   EXPECT_EQ(policy.cgroup_dir, "");
-  EXPECT_TRUE(policy.fallback);
+  EXPECT_FALSE(policy.fallback);
 
   // A small limit keeps at least half of itself.
   ASSERT_TRUE(Resolve(
@@ -402,16 +404,17 @@ TEST(StartupTest, MemorySettingsComeFromTheEnvironment) {
   auto env = Env(none);
   ASSERT_TRUE(MemorySettingsFromEnvironment(env.data(), &settings, &error));
   EXPECT_EQ(settings.backing, MemoryBacking::kNormal);
+  EXPECT_TRUE(settings.fallback);  // D-206: normal pages past the hugepages
 
   std::vector<std::string> vars = {
       "BESSD_MEM_BACKING=hugepages", "BESSD_MEM_HUGEPAGE_MB=2048",
-      "BESSD_MEM_FALLBACK=yes", "BESSD_MEM_LIMIT_MB=3000",
+      "BESSD_MEM_FALLBACK=no", "BESSD_MEM_LIMIT_MB=3000",
       "BESSD_MEM_RESERVE_MB=0"};
   env = Env(vars);
   ASSERT_TRUE(MemorySettingsFromEnvironment(env.data(), &settings, &error));
   EXPECT_EQ(settings.backing, MemoryBacking::kHugepages);
   EXPECT_EQ(settings.hugepage_mb, 2048);
-  EXPECT_TRUE(settings.fallback);
+  EXPECT_FALSE(settings.fallback);
   EXPECT_EQ(settings.limit_mb, 3000);
   EXPECT_EQ(settings.reserve_mb, 0);
 

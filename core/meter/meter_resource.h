@@ -47,12 +47,13 @@ namespace bess::meter {
 // builder's index root) before constructing, and passes the admission's
 // growth hook. Through that hook every index node an edit copies, state slab
 // chunks, state control blocks and profiles are admitted before they are
-// allocated and given back when freed. An erase admits its removal stage's
-// edit (MeterSet::Bytes(capacity), one id's path) at Reserve; a refusal
-// there refuses the erase. The stage's DPDK allocation can still be refused
-// (normal pages are checked again, D-198): it then changes nothing, gives the
-// prepay back, and its retry prepays again. bytes() is what
-// the meters hold now. The usual owner:
+// allocated and given back when freed, and so is every node of the policy
+// and retiring containers (glibc, class C: D-206). An erase admits its
+// removal stage's edit (MeterSet::Bytes(capacity), one id's path) at
+// Reserve; a refusal there refuses the erase. The stage's DPDK allocation
+// can still be refused (normal pages are checked again, D-198): it then
+// changes nothing, gives the prepay back, and its retry prepays again.
+// bytes() is what the meters hold now. The usual owner:
 //
 //   auto lease = memory().LeaseFor<MeterResource>("meters", capacity);
 //   auto made = std::make_unique<MeterResource>(name, capacity, published_,
@@ -145,6 +146,25 @@ class MeterResource final : public dataplane::Resource {
     utils::MemoryGrowth *lease_;
     std::atomic<size_t> *held_;
   };
+  // The hook of the policy and retiring containers (class C, D-206): their
+  // glibc nodes go to the owner's lease directly, never against an erase's
+  // prepay (which is index nodes only).
+  class ControlGrowth final : public utils::MemoryGrowth {
+   public:
+    ControlGrowth(utils::MemoryGrowth *lease, std::atomic<size_t> *held)
+        : lease_(lease), held_(held) {}
+    void Grow(size_t bytes, size_t glibc_bytes = 0) override;
+    void Shrink(size_t bytes, size_t glibc_bytes = 0) noexcept override;
+
+   private:
+    utils::MemoryGrowth *lease_;
+    std::atomic<size_t> *held_;
+  };
+  template <typename T>
+  using ControlAllocator = utils::AdmittedGlibcAllocator<T>;
+  using Policies =
+      std::map<MeterId, MeterProfileSpec, std::less<MeterId>,
+               ControlAllocator<std::pair<const MeterId, MeterProfileSpec>>>;
 
   // A transaction edits a private copy of the builder, so a refused one
   // leaves the live builder untouched.
@@ -160,10 +180,11 @@ class MeterResource final : public dataplane::Resource {
   void PrepayErase();
   void RefundErase() noexcept;
 
-  // Declared before every builder and generation holder: they give bytes
-  // back through it from their destructors.
+  // Declared before every builder, generation holder and container: they
+  // give bytes back through it from their destructors.
   std::atomic<size_t> held_;
   Growth growth_;
+  ControlGrowth control_growth_;
 
   rcu::RcuPtr<MeterSet> &published_;
   std::unique_ptr<MeterSetBuilder> live_;
@@ -172,12 +193,12 @@ class MeterResource final : public dataplane::Resource {
   std::unique_ptr<const MeterSet> staged_generation_;
   // The edit copy has become the live one (its first publish ran).
   bool published_staged_ = false;
-  std::set<MeterId> retiring_;
+  std::set<MeterId, std::less<MeterId>, ControlAllocator<MeterId>> retiring_;
   // Each meter's policy as written (the builder keeps only compiled
   // profiles), for read-back: policies_ mirrors live_, staged_policies_
   // holds the transaction's upserts only and is merged into it on publish.
-  std::map<MeterId, MeterProfileSpec> policies_;
-  std::map<MeterId, MeterProfileSpec> staged_policies_;
+  Policies policies_;
+  Policies staged_policies_;
 };
 
 }  // namespace bess::meter

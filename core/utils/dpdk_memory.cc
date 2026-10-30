@@ -41,10 +41,62 @@ constexpr size_t kMaxDoubling = 1024 * kMB;
 constexpr size_t kChunkSlack = size_t{64} * 1024;
 
 std::atomic<uint64_t> refusals{0};
+std::atomic<uint64_t> spilled{0};
 
 // AdmitTable's count of hugepage tables (D-198): admitted, not yet released.
 std::mutex table_mu;
 size_t hugepage_tables = 0;
+
+// This thread's armed admission (D-206, ArmPlacement): the DPDK bytes it
+// placed and not yet drawn by an allocation, by backing.
+struct Armed {
+  uint64_t ticket = 0;  // 0: unarmed
+  size_t hugepage = 0;
+  size_t normal = 0;
+};
+thread_local Armed armed;
+std::atomic<PlacementObserver> placement_observer{nullptr};
+std::atomic<bool> native_is_hugepages_for_test{false};
+
+// DPDK's native heap is hugepages (detail::SetNativeHeapIsHugepagesForTest
+// says so for test binaries, whose EAL runs on normal pages). The EAL must
+// be up.
+bool NativeHugepages() noexcept {
+  return rte_eal_has_hugepages() ||
+         native_is_hugepages_for_test.load(std::memory_order_relaxed);
+}
+
+// Draws `bytes` that landed `on` from this thread's arming: from the bytes
+// placed there first, then from the other backing's, which move.
+void Land(size_t bytes, TableBacking on) noexcept {
+  if (armed.ticket == 0) {
+    return;
+  }
+  size_t &same = on == TableBacking::kHugepages ? armed.hugepage : armed.normal;
+  size_t &other = on == TableBacking::kHugepages ? armed.normal : armed.hugepage;
+  const size_t drawn = std::min(bytes, same);
+  same -= drawn;
+  const size_t moved = std::min(bytes - drawn, other);
+  if (moved == 0) {
+    return;
+  }
+  other -= moved;
+  {
+    std::lock_guard<std::mutex> lock(table_mu);
+    if (on == TableBacking::kHugepages) {
+      hugepage_tables += moved;
+    } else {
+      hugepage_tables -= std::min(hugepage_tables, moved);
+    }
+  }
+  if (on == TableBacking::kNormal) {
+    spilled.fetch_add(moved, std::memory_order_relaxed);
+  }
+  if (PlacementObserver observer =
+          placement_observer.load(std::memory_order_acquire)) {
+    observer(armed.ticket, moved, on);
+  }
+}
 
 MemoryPolicy &Policy() {
   static MemoryPolicy policy;
@@ -101,6 +153,78 @@ size_t UsedBytes(const MemoryPolicy &policy) {
     }
   }
   return used;
+}
+
+// The bytes resident of [base, base + len), whole 4 KiB pages; 0 if mincore
+// fails, which overstates what UnfaultedHeapBytes adds (refusing early, never
+// late).
+size_t ResidentBytes(const void *base, size_t len) {
+  constexpr size_t kWindow = 16384;  // pages per mincore call
+  unsigned char vec[kWindow];
+  size_t pages = 0;
+  for (size_t at = 0; at < len; at += kWindow * kPage) {
+    const size_t n = std::min(len - at, kWindow * kPage);
+    if (mincore(const_cast<char *>(static_cast<const char *>(base)) + at, n,
+                vec) != 0) {
+      return 0;
+    }
+    for (size_t i = 0; i < (n + kPage - 1) / kPage; i++) {
+      pages += vec[i] & 1;
+    }
+  }
+  return pages * kPage;
+}
+
+// What the normal-page DPDK heaps have allocated beyond what is resident
+// (D-206): DPDK's rte_zmalloc leaves a clean element untouched and rte_free
+// zeroes it, so a table a DPDK library allocates internally (rte_hash,
+// rte_lpm, rte_fib) faults in as it is written or freed, not when it is
+// allocated -- and a measurement alone would admit past bytes already
+// handed out, which the teardown then faults in over the limit. Per heap of
+// 4 KiB pages (DPDK's --no-huge heap; "bess-normal", which DPDK clears when
+// a chunk is added, so is resident whole), its allocated bytes
+// (rte_malloc_get_socket_stats) less its resident ones (mincore over its
+// memseg lists). Resident pages are already in the measurement: only the
+// unfaulted part is added, nothing twice. Resident free holes hide
+// unfaulted allocations, a bound on how much it can miss. Control path;
+// takes the memory hotplug lock, so never from a validator callback.
+size_t UnfaultedHeapBytes() {
+  if (!IsDpdkInitialized()) {
+    return 0;
+  }
+  struct Heap {
+    int socket;
+    size_t resident;
+  };
+  std::vector<Heap> heaps;
+  rte_memseg_list_walk(
+      [](const rte_memseg_list *msl, void *arg) {
+        if (msl->heap == 0 || msl->page_sz >= RTE_PGSIZE_2M ||
+            msl->base_va == nullptr) {
+          return 0;
+        }
+        auto &found = *static_cast<std::vector<Heap> *>(arg);
+        const size_t resident = ResidentBytes(msl->base_va, msl->len);
+        auto it = std::find_if(found.begin(), found.end(), [&](const Heap &h) {
+          return h.socket == msl->socket_id;
+        });
+        if (it == found.end()) {
+          found.push_back(Heap{msl->socket_id, resident});
+        } else {
+          it->resident += resident;
+        }
+        return 0;
+      },
+      &heaps);
+  size_t unfaulted = 0;
+  for (const Heap &heap : heaps) {
+    rte_malloc_socket_stats stats{};
+    if (rte_malloc_get_socket_stats(heap.socket, &stats) == 0 &&
+        stats.heap_allocsz_bytes > heap.resident) {
+      unfaulted += stats.heap_allocsz_bytes - heap.resident;
+    }
+  }
+  return unfaulted;
 }
 
 [[noreturn]] void Refuse(MemoryRefused::Reason reason, size_t bytes,
@@ -233,7 +357,26 @@ MemoryRefused::MemoryRefused(Reason reason, size_t bytes, std::string message)
 
 const char *MemoryRefused::what() const noexcept { return message_->c_str(); }
 
-void SetMemoryPolicy(MemoryPolicy policy) { Policy() = std::move(policy); }
+namespace {
+
+// AdmitNormalMemory's last measurement and what it has admitted since
+// (D-206): class-C containers admit every node, so a measurement (two
+// cgroupfs reads) per admission would cost more than the node. One is reused
+// while the bytes admitted since stay under kRemeasureBytes, counted as if
+// all were still held; a refusal is only ever made on a fresh measurement.
+constexpr size_t kRemeasureBytes = kMB;
+std::mutex measure_mu;
+bool measured = false;
+size_t measured_used = 0;
+size_t admitted_since = 0;
+
+}  // namespace
+
+void SetMemoryPolicy(MemoryPolicy policy) {
+  Policy() = std::move(policy);
+  const std::lock_guard<std::mutex> lock(measure_mu);
+  measured = false;
+}
 
 const MemoryPolicy &memory_policy() noexcept { return Policy(); }
 
@@ -245,7 +388,24 @@ void AdmitNormalMemory(size_t bytes) {
   const size_t allowed = policy.limit_bytes > policy.reserve_bytes
                              ? policy.limit_bytes - policy.reserve_bytes
                              : 0;
-  const size_t used = UsedBytes(policy);
+  {
+    const std::lock_guard<std::mutex> lock(measure_mu);
+    if (measured && bytes <= allowed &&
+        admitted_since + bytes <= kRemeasureBytes &&
+        measured_used + admitted_since <= allowed - bytes) {
+      admitted_since += bytes;
+      return;
+    }
+  }
+  // Allocated DPDK heap memory counts whether or not it is resident yet: a
+  // free faults it in (D-206).
+  const size_t used = UsedBytes(policy) + UnfaultedHeapBytes();
+  {
+    const std::lock_guard<std::mutex> lock(measure_mu);
+    measured = true;
+    measured_used = used;
+    admitted_since = bytes;
+  }
   if (bytes > allowed || used > allowed - bytes) {
     std::ostringstream message;
     message << "memory limit: refusing " << bytes << " bytes ("
@@ -263,7 +423,7 @@ bool HugepageBacked() {
   if (!IsDpdkInitialized()) {
     InitDpdk();
   }
-  return rte_eal_has_hugepages();
+  return NativeHugepages();
 }
 
 // The page size of the memory node's hugepage heap: the first memory
@@ -347,6 +507,10 @@ size_t HugepageCharge(size_t bytes, size_t largest_free, size_t page_size) {
   return page_size == 0 ? bytes : RoundUp(bytes, page_size);
 }
 
+void SetNativeHeapIsHugepagesForTest(bool on) noexcept {
+  native_is_hugepages_for_test.store(on, std::memory_order_relaxed);
+}
+
 }  // namespace detail
 
 void InstallHeapValidator() {
@@ -422,8 +586,8 @@ TableBacking AdmitTable(size_t bytes, size_t glibc_bytes) {
             << Mb(HugepageTableBytes()) << " of the "
             << Mb(policy.hugepage_cap_bytes) << " hugepage cap ("
             << policy.hugepage_cap_source
-            << ") already admitted; raise the cap or start bessd with "
-               "--mem_fallback to use normal pages instead";
+            << ") already admitted, and normal pages past it are forbidden "
+               "(--mem_fallback=false); raise the cap or allow them";
     Refuse(MemoryRefused::Reason::kHugepagesExhausted, dpdk_bytes,
            message.str());
   }
@@ -448,17 +612,48 @@ int FallbackSocket(size_t bytes) {
   if (!IsDpdkInitialized()) {
     InitDpdk();
   }
-  if (rte_eal_has_hugepages() && !memory_policy().fallback) {
+  if (NativeHugepages() && !memory_policy().fallback) {
     std::ostringstream message;
     message << "hugepages exhausted: refusing about " << bytes << " bytes ("
             << Mb(bytes) << ") of DPDK memory (" << HeapState(MemoryNode())
-            << "); give bessd more hugepages or start it with "
-               "--mem_fallback to use normal pages instead";
+            << "), and normal pages past them are forbidden "
+               "(--mem_fallback=false); give bessd more hugepages or allow "
+               "normal pages";
     Refuse(MemoryRefused::Reason::kHugepagesExhausted, bytes, message.str());
   }
   return FallbackHeap::Get().Reserve(bytes);
 }
 
+void SetPlacementObserver(PlacementObserver observer) noexcept {
+  placement_observer.store(observer, std::memory_order_release);
+}
+
+void ArmPlacement(uint64_t ticket, TableBacking backing, size_t bytes) noexcept {
+  armed = Armed{ticket, backing == TableBacking::kHugepages ? bytes : 0,
+                backing == TableBacking::kNormal ? bytes : 0};
+}
+
+bool ArmedForNormalPages() noexcept {
+  return armed.ticket != 0 && armed.hugepage == 0 && armed.normal != 0 &&
+         NativeHugepages();
+}
+
+int PlacementSocket(int socket, size_t bytes) {
+  if (!IsDpdkInitialized()) {
+    InitDpdk();
+  }
+  return ArmedForNormalPages() ? FallbackSocket(bytes) : socket;
+}
+
+void NotePlacement(size_t bytes, int socket) noexcept {
+  const bool normal =
+      !NativeHugepages() || socket == FallbackHeap::Get().socket();
+  Land(bytes, normal ? TableBacking::kNormal : TableBacking::kHugepages);
+}
+
+void NotePlacement(size_t bytes, TableBacking landed) noexcept {
+  Land(bytes, landed);
+}
 void RefuseDpdkMemory(size_t bytes) {
   std::ostringstream message;
   if (HugepageBacked()) {
@@ -487,10 +682,11 @@ MemoryStatus GetMemoryStatus() {
   status.limit_source = policy.limit_source;
   status.used_bytes = UsedBytes(policy);
   status.refusals = refusals.load(std::memory_order_relaxed);
+  status.spilled_bytes = spilled.load(std::memory_order_relaxed);
   if (!IsDpdkInitialized()) {
     return status;
   }
-  status.hugepages = rte_eal_has_hugepages();
+  status.hugepages = NativeHugepages();
   rte_malloc_socket_stats stats{};
   // External heaps are not among rte_socket_count()'s sockets.
   for (unsigned i = 0; i < rte_socket_count(); i++) {
@@ -516,6 +712,37 @@ int MemoryNode() {
   return rte_eal_has_hugepages() ? bess::runtime::MemoryNode() : 0;
 }
 
+namespace {
+
+// Makes a --no-huge heap block resident now (D-206): DPDK zeroes a clean
+// element when it is freed (malloc_elem_free), so a block admitted but never
+// written would fault its whole size in at free. Faulted in at allocation,
+// right after its admission, RSS matches what was admitted and a free never
+// grows it. Hugepages are resident when mapped, and "bess-normal" when a
+// chunk is added (DPDK clears it). What DPDK libraries allocate internally
+// cannot be reached here; UnfaultedHeapBytes counts it instead.
+void Prefault(void *p, size_t bytes) noexcept {
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23  // Linux 5.14
+#endif
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(p) & ~(kPage - 1);
+  const uintptr_t end = reinterpret_cast<uintptr_t>(p) + bytes;
+  if (madvise(reinterpret_cast<void *>(begin), end - begin,
+              MADV_POPULATE_WRITE) == 0) {
+    return;
+  }
+  // Older kernels: write each page's first byte of the block back to itself.
+  auto *bytes_at = static_cast<volatile unsigned char *>(p);
+  for (uintptr_t page = begin; page < end; page += kPage) {
+    const size_t at = page < reinterpret_cast<uintptr_t>(p)
+                          ? 0
+                          : page - reinterpret_cast<uintptr_t>(p);
+    bytes_at[at] = bytes_at[at];
+  }
+}
+
+}  // namespace
+
 void *DpdkAllocate(size_t bytes, size_t align, int socket) {
   if (!IsDpdkInitialized()) {
     InitDpdk();
@@ -523,12 +750,18 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
   if (bytes == 0) {
     bytes = 1;
   }
-  const bool hugepages = rte_eal_has_hugepages();
+  const bool hugepages = NativeHugepages();
   if (!hugepages) {
     // DPDK's fixed --no-huge heap is reserved, not resident: its pages are
     // committed as they are first written, so this allocation is what may
     // cross the limit (D-198).
     AdmitNormalMemory(bytes);
+  } else if (ArmedForNormalPages()) {
+    // Admitted past the hugepage cap (D-206): normal pages, as admitted,
+    // without taking hugepages the cap no longer has room for.
+    void *p = FallbackHeap::Get().Allocate(bytes, align);
+    Land(bytes, TableBacking::kNormal);
+    return p;
   }
   limit_refused = false;
   void *p = rte_malloc_socket("bess", bytes, static_cast<unsigned>(align),
@@ -546,6 +779,10 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
                           SOCKET_ID_ANY);
   }
   if (p != nullptr) {
+    if (rte_eal_has_hugepages() == 0) {
+      Prefault(p, bytes);
+    }
+    Land(bytes, hugepages ? TableBacking::kHugepages : TableBacking::kNormal);
     return p;
   }
   if (limit_refused) {
@@ -563,15 +800,16 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
             << " reserve; raise the memory limit to include the hugepages";
     Refuse(MemoryRefused::Reason::kNormalLimit, bytes, message.str());
   }
-  // DPDK's heap is out (D-198). With hugepages, normal pages only when the
-  // operator declared them acceptable; under --no-huge the fixed heap is
-  // normal pages already, and the fallback heap merely extends it.
+  // DPDK's heap is out (D-198). With hugepages, normal pages unless the
+  // operator forbade them (D-206); under --no-huge the fixed heap is normal
+  // pages already, and the fallback heap merely extends it.
   if (hugepages && !memory_policy().fallback) {
     std::ostringstream message;
     message << "hugepages exhausted: refusing " << bytes << " bytes ("
             << Mb(bytes) << ") of DPDK memory (" << HeapState(socket)
-            << "); give bessd more hugepages or start it with "
-               "--mem_fallback to use normal pages instead";
+            << "), and normal pages past them are forbidden "
+               "(--mem_fallback=false); give bessd more hugepages or allow "
+               "normal pages";
     Refuse(MemoryRefused::Reason::kHugepagesExhausted, bytes, message.str());
   }
   {
@@ -581,10 +819,12 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
                                  : "DPDK's --no-huge heap is full")
                    << ": dataplane tables now also use the normal-page "
                       "fallback heap "
-                   << kFallbackHeap << " (D-198)";
+                   << kFallbackHeap << " (D-206)";
     });
   }
-  return FallbackHeap::Get().Allocate(bytes, align);
+  p = FallbackHeap::Get().Allocate(bytes, align);
+  Land(bytes, TableBacking::kNormal);
+  return p;
 }
 
 void DpdkFree(void *p) noexcept { rte_free(p); }

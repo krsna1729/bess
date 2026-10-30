@@ -26,7 +26,7 @@ enum class ControlErrorCode {
   kResourceFailure,
   // A bounded resource is used up -- no free CPU for an automatic worker, a
   // message above the size limit, or memory (ENOMEM, a utils::MemoryRefused:
-  // hugepages exhausted without --mem_fallback, or the memory limit,
+  // hugepages exhausted with --mem_fallback=false, or the memory limit,
   // D-198): RESOURCE_EXHAUSTED on the wire. Clients do not retry it: the same
   // request fails the same way until the operator frees or adds the resource.
   kResourceExhausted,

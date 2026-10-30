@@ -389,8 +389,8 @@ class Router {
   // route tables' InstanceBytes), the three id tables' slots and states
   // (DPDK, SlotTable::Bytes) with the domain slab's first chunk (the default
   // domain's object), and the per-id control vectors and the router itself
-  // (glibc, GlibcBytes) -- what bytes() counts after Create. Same arguments
-  // as Create.
+  // (glibc, GlibcBytes: malloc's chunks, utils::MallocChunkBytes, D-206) --
+  // what bytes() counts after Create. Same arguments as Create.
   static size_t Bytes(const std::string &name, const Config &config,
                       size_t max_next_hops, const rcu::RcuDomain &domain,
                       size_t max_domains = 1, size_t max_groups = 0,

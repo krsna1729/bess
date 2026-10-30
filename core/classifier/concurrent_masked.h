@@ -131,8 +131,8 @@ class ConcurrentMaskedTable {
     uint32_t entry_capacity;
     uint32_t range_capacity;
 
-    // Frees what NewChain allocated: one raw ::operator new block holding
-    // the header and its trailing arrays (the header is trivially
+    // Frees what NewChain allocated: one DPDK block (D-206) holding the
+    // header and its trailing arrays (the header is trivially
     // destructible), and gives its bytes back to `owner`'s growth hook
     // (D-198). Chains are freed only by their table's writer, while the
     // table lives.
@@ -222,11 +222,11 @@ class ConcurrentMaskedTable {
   // set_memory_growth's hook before it is allocated: record chunks (the
   // arena), tuple tables -- a new mask's, and each larger replacement Grown
   // builds (rte_hash, ConcurrentExactTable::Bytes) -- and range chains
-  // (glibc). A tuple table is given back when it is freed, after the grace
-  // period of the last tuple list holding it (on whichever control thread
-  // reclaims), a chain when it is freed; so the hook must stay valid while
-  // the table lives (destroy the table before its lease). The destructor
-  // detaches it first and gives nothing back.
+  // (DPDK memory, D-206). A tuple table is given back when it is freed,
+  // after the grace period of the last tuple list holding it (on whichever
+  // control thread reclaims), a chain when it is freed; so the hook must
+  // stay valid while the table lives (destroy the table before its lease).
+  // The destructor detaches it first and gives nothing back.
   static size_t Bytes(uint32_t key_len, size_t max_tuples,
                       const rcu::RcuDomain &domain);
   // Held now: the record arena, every tuple table not yet freed (live and
@@ -448,8 +448,8 @@ class ConcurrentMaskedTable {
     std::atomic<size_t> table_bytes{0};     // tuple tables not yet freed
     // The hook's Grow / Shrink (no hook: nothing). Grow throws
     // MemoryRefused when the growth is refused.
-    void Grow(size_t n, size_t glibc = 0);
-    void Shrink(size_t n, size_t glibc = 0) noexcept;
+    void Grow(size_t n);
+    void Shrink(size_t n) noexcept;
   };
   struct TupleTableFree {
     std::shared_ptr<TupleMemory> memory;
@@ -560,7 +560,8 @@ class ConcurrentMaskedTable {
   // Throws MemoryRefused when the growth hook refuses the table or DPDK has
   // no memory for it (never nullptr for memory: kFull is capacity).
   std::shared_ptr<ConcurrentExactTable> NewTupleTable(size_t rules) const;
-  // A chain for `entries` entries and `ranges` ranges, admitted first (glibc).
+  // A chain for `entries` entries and `ranges` ranges, admitted first (DPDK
+  // memory, D-206).
   ChainPtr NewChain(uint32_t entries, uint32_t ranges);
   // A copy of `from` at least twice its capacity; nullptr on failure.
   std::shared_ptr<ConcurrentExactTable> Grown(
