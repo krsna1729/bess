@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "framework/memory_scope.h"
 #include "framework/packet_store_codec.h"
 #include "dataplane/transaction_engine.h"
 #include "packet.h"
@@ -118,7 +119,8 @@ class PacketStoreTest : public ::testing::Test {
 };
 
 // A bad config is refused before anything is allocated; what Create
-// allocates is Bytes(config), and bytes() reports the same.
+// allocates is Bytes(config), all of it DPDK memory (D-206: workers read
+// and write it per packet), and bytes() reports the same.
 TEST_F(PacketStoreTest, CreateRefusesBadConfigsAndCostsWhatBytesSays) {
   EXPECT_FALSE(PacketStore::Create({.max_packets = 0}).has_value());
   EXPECT_FALSE(PacketStore::Create({.max_packets_per_flow = 0}).has_value());
@@ -130,10 +132,14 @@ TEST_F(PacketStoreTest, CreateRefusesBadConfigsAndCostsWhatBytesSays) {
   EXPECT_EQ(256u, PacketStore::FlowCapacity(128));
 
   const PacketStoreConfig config{.max_packets = 100};
+  const size_t dpdk_before = utils::GetMemoryStatus().dpdk_heap_alloc_bytes;
   auto store = PacketStore::Create(config);
   ASSERT_TRUE(store.has_value() && *store != nullptr);
+  EXPECT_GE(utils::GetMemoryStatus().dpdk_heap_alloc_bytes - dpdk_before,
+            PacketStore::Bytes(config))
+      << "the store did not come from DPDK's heap";
   EXPECT_EQ(PacketStore::Bytes(config), (*store)->bytes());
-  EXPECT_EQ(PacketStore::Bytes(config), PacketStore::GlibcBytes(config));
+  EXPECT_EQ(0u, framework::MemoryCost<PacketStore>::GlibcBytes(config));
   EXPECT_GT(PacketStore::Bytes({.max_packets = 200}), PacketStore::Bytes(config));
   EXPECT_EQ(0u, (*store)->packets());
   EXPECT_EQ(0u, (*store)->flows());

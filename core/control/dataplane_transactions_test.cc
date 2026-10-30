@@ -394,6 +394,72 @@ TEST(DataplaneTransactionsWindowTest, OldestRecordsAgeOut) {
   EXPECT_EQ(transactions.Get("r1").daemon_epoch(), 7u);
 }
 
+// The window is control-plane glibc charged to the daemon's scope (D-206,
+// class C): every record's id, serialized record and window slot moves
+// bessd/transaction_records, all of it glibc, and it is all given back with
+// the window. The record is charged before the transaction runs: at the
+// memory limit the transaction is refused with nothing applied, and its
+// retry applies once. A record reads back byte for byte.
+TEST(DataplaneTransactionsWindowTest, RecordsAreChargedToTheDaemonScope) {
+  InitRuntimeOnce();
+  const auto row = [] {
+    for (const auto &use : bess::framework::MemoryAccounts::List()) {
+      if (use.module == "bessd" && use.resource == "transaction_records") {
+        return use;
+      }
+    }
+    return bess::framework::ModuleMemoryUse{};
+  };
+  bess::dataplane::TransactionEngine engine(bess::runtime::runtime().rcu());
+  bess::framework::ResourceBindings bindings;
+  {
+    DataplaneTransactions transactions(engine, bindings, /*epoch=*/7);
+    v2::ApplyTransactionRequest req;
+    req.set_request_id("a-request-id-longer-than-sso-0");
+    const auto first = transactions.Apply(req);
+    ASSERT_TRUE(first.has_value());
+    const size_t one = row().admitted_bytes;
+    // The id's heap text, the record's bytes, the node, buckets, the deque.
+    EXPECT_GE(one, 4 * bess::utils::kMallocSmallestChunk);
+    EXPECT_EQ(row().glibc_bytes, one);
+    const auto got = transactions.Get("a-request-id-longer-than-sso-0");
+    ASSERT_TRUE(got.known());
+    EXPECT_EQ(got.record().SerializeAsString(),
+              first->record().SerializeAsString());
+    const auto replayed = transactions.Apply(req);
+    ASSERT_TRUE(replayed.has_value());
+    EXPECT_TRUE(replayed->replayed());
+    EXPECT_EQ(replayed->record().SerializeAsString(),
+              first->record().SerializeAsString());
+    req.set_request_id("a-request-id-longer-than-sso-1");
+    ASSERT_TRUE(transactions.Apply(req).has_value());
+    EXPECT_GT(row().admitted_bytes, one);
+
+    const bess::utils::MemoryPolicy saved = bess::utils::memory_policy();
+    bess::utils::MemoryPolicy tight = saved;
+    tight.limit_bytes = size_t{1} << 20;  // far below what the test holds
+    tight.limit_source = "test";
+    tight.reserve_bytes = 0;
+    bess::utils::SetMemoryPolicy(tight);
+    const uint64_t generation = engine.generation();
+    const size_t held = row().admitted_bytes;
+    req.set_request_id("a-request-id-longer-than-sso-2");
+    const auto refused = transactions.Apply(req);
+    bess::utils::SetMemoryPolicy(saved);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().code,
+              bess::control::ControlErrorCode::kResourceExhausted);
+    EXPECT_EQ(engine.generation(), generation) << "applied though refused";
+    EXPECT_EQ(row().admitted_bytes, held);
+    EXPECT_FALSE(transactions.Get("a-request-id-longer-than-sso-2").known());
+    const auto retried = transactions.Apply(req);
+    ASSERT_TRUE(retried.has_value());
+    EXPECT_FALSE(retried->replayed());
+    EXPECT_TRUE(transactions.Get("a-request-id-longer-than-sso-2").known());
+  }
+  EXPECT_EQ(row().admitted_bytes, 0u);
+}
+
 // -- M8 (D-050): the consistency level over the wire ----------------------------------
 
 struct SessionVersion {

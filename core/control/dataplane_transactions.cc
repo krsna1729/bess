@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <random>
 #include <string>
@@ -97,6 +98,12 @@ v2::TransactionRecord Undecodable(int ops, int failed, std::string error,
   return record;
 }
 
+// A window entry's record, which CommitRecord serialized: it parses.
+void ReadRecord(std::string_view bytes, v2::TransactionRecord *record) {
+  static_cast<void>(
+      record->ParseFromArray(bytes.data(), static_cast<int>(bytes.size())));
+}
+
 }  // namespace
 
 DataplaneTransactions::DataplaneTransactions(
@@ -138,7 +145,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
                        "' was used for a different transaction",
             .object = id});
       }
-      *response.mutable_record() = it->second.record;
+      ReadRecord(it->second.record, response.mutable_record());
       response.set_replayed(true);
       return response;
     }
@@ -161,6 +168,27 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
           .field = "ops"});
     }
   }
+
+  // The outcome's record is charged before anything is attempted (D-206):
+  // a refused charge refuses the transaction with nothing applied -- never an
+  // applied transaction that a retry under its id would find unknown and
+  // apply again. Given back below unless the outcome is recorded.
+  Records::node_type pending;
+  if (!id.empty()) {
+    try {
+      pending = ReserveRecord(id, digest, request.ops_size());
+    } catch (const std::bad_alloc &e) {
+      return std::unexpected(OutOfMemory(e));
+    }
+  }
+  struct WindowSlot {
+    Order *order;
+    ~WindowSlot() {
+      if (order != nullptr) {
+        order->pop_back();
+      }
+    }
+  } window_slot{pending.empty() ? nullptr : &order_};
 
   // Decode every operation through its resource's codec; the first that
   // cannot be decoded rejects the transaction.
@@ -269,22 +297,56 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   // BUSY and CONFLICT attempted nothing: the client retries under the id.
   const bool attempted = record.outcome() == v2::TransactionRecord::OUTCOME_APPLIED ||
                          record.outcome() == v2::TransactionRecord::OUTCOME_REJECTED;
-  if (!id.empty() && attempted) {
-    Record(id, digest, record);
+  if (!pending.empty() && attempted) {
+    try {
+      CommitRecord(std::move(pending), record);
+    } catch (const std::bad_alloc &e) {
+      // Only a rejection's errors can outgrow the reserved bytes (an applied
+      // record never does): nothing was applied.
+      return std::unexpected(OutOfMemory(e));
+    }
+    window_slot.order = nullptr;
   }
   *response.mutable_record() = std::move(record);
   return response;
 }
 
-void DataplaneTransactions::Record(const std::string &request_id,
-                                   uint64_t digest,
-                                   const v2::TransactionRecord &record) {
-  if (order_.size() == kMaxRecords) {
-    records_.erase(order_.front());
+DataplaneTransactions::Records::node_type DataplaneTransactions::ReserveRecord(
+    const std::string &request_id, uint64_t digest, int ops) {
+  // The largest applied record of `ops` operations: applied operations carry
+  // no error, and every varint at its widest.
+  v2::TransactionRecord largest;
+  largest.set_request_id(request_id);
+  largest.set_outcome(v2::TransactionRecord::OUTCOME_APPLIED);
+  largest.set_generation(std::numeric_limits<uint64_t>::max());
+  largest.set_visibility(v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
+  for (int i = 0; i < ops; i++) {
+    largest.add_ops()->set_status(v2::TransactionOpResult::STATUS_NOT_APPLIED);
+  }
+  const utils::AdmittedGlibcAllocator<char> alloc(&growth_);
+  Text bytes(alloc);
+  bytes.reserve(largest.ByteSizeLong());
+  records_.reserve(records_.size() + 1);  // CommitRecord inserts unallocated
+  Records::node_type node =
+      records_.extract(records_.emplace(Text(request_id, alloc),
+                                        Recorded{digest, std::move(bytes)})
+                           .first);
+  order_.push_back(nullptr);  // the window slot, filled by CommitRecord
+  return node;
+}
+
+void DataplaneTransactions::CommitRecord(Records::node_type node,
+                                         const v2::TransactionRecord &record) {
+  Text &bytes = node.mapped().record;
+  bytes.resize(record.ByteSizeLong());
+  // Sized by ByteSizeLong just above: it fits.
+  static_cast<void>(
+      record.SerializeToArray(bytes.data(), static_cast<int>(bytes.size())));
+  order_.back() = &records_.insert(std::move(node)).position->first;
+  if (order_.size() > kMaxRecords) {
+    records_.erase(records_.find(std::string_view(*order_.front())));
     order_.pop_front();
   }
-  records_.emplace(request_id, Recorded{digest, record});
-  order_.push_back(request_id);
 }
 
 v2::GetTransactionResponse DataplaneTransactions::Get(
@@ -293,7 +355,7 @@ v2::GetTransactionResponse DataplaneTransactions::Get(
   response.set_daemon_epoch(epoch_);
   if (auto it = records_.find(request_id); it != records_.end()) {
     response.set_known(true);
-    *response.mutable_record() = it->second.record;
+    ReadRecord(it->second.record, response.mutable_record());
   }
   return response;
 }

@@ -38,18 +38,28 @@ std::expected<std::unique_ptr<PacketStore>, std::string> PacketStore::Create(
     return std::unexpected("max_packets_per_flow must be positive");
   }
   const size_t capacity = FlowCapacity(config.max_packets);
-  std::unique_ptr<Slot[]> slots(new (std::nothrow) Slot[config.max_packets]);
-  std::unique_ptr<Flow[]> table(new (std::nothrow) Flow[capacity]);
-  if (slots == nullptr || table == nullptr) {
+  try {
+    utils::DpdkArray<Slot> slots(config.max_packets);
+    utils::DpdkArray<Flow> table(capacity);
+    return std::unique_ptr<PacketStore>(new PacketStore(
+        config, std::move(slots), std::move(table), capacity));
+  } catch (const utils::MemoryRefused &) {
+    throw;  // the policy's refusal names its reason (D-198)
+  } catch (const std::bad_alloc &) {
     return std::unique_ptr<PacketStore>();
   }
-  return std::unique_ptr<PacketStore>(new (std::nothrow) PacketStore(
-      config, std::move(slots), std::move(table), capacity));
 }
 
+void *PacketStore::operator new(size_t bytes) {
+  return utils::DpdkAllocate(
+      bytes, std::max<size_t>(alignof(PacketStore), RTE_CACHE_LINE_SIZE));
+}
+
+void PacketStore::operator delete(void *p) noexcept { utils::DpdkFree(p); }
+
 PacketStore::PacketStore(const PacketStoreConfig &config,
-                         std::unique_ptr<Slot[]> slots,
-                         std::unique_ptr<Flow[]> table,
+                         utils::DpdkArray<Slot> slots,
+                         utils::DpdkArray<Flow> table,
                          size_t capacity) noexcept
     : config_(config),
       slots_(std::move(slots)),

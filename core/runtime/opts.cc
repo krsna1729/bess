@@ -193,17 +193,18 @@ static bool ValidateHugepageMegabytes(const char *flag, int64_t value) {
 }
 DEFINE_int64(mem_hugepage_mb, 0,
              "Cap in MB on the hugepage heap on the memory node (other nodes "
-             "get none, D-123); tables past it are refused, or come from "
-             "normal pages with --mem_fallback. 0 (default): no cap beyond "
-             "the host's or container's hugepages. Not with "
+             "get none, D-123); tables past it come from normal pages, or "
+             "are refused with --mem_fallback=false. 0 (default): no cap "
+             "beyond the host's or container's hugepages. Not with "
              "--mem_backing=normal");
 static const bool _mem_hugepage_mb_dummy[[maybe_unused]] =
     google::RegisterFlagValidator(&FLAGS_mem_hugepage_mb,
                                   &ValidateHugepageMegabytes);
-DEFINE_bool(mem_fallback, false,
+DEFINE_bool(mem_fallback, true,
             "When hugepages run out (or reach --mem_hugepage_mb), allocate "
-            "tables from normal pages instead of refusing (slower lookups; "
-            "admitted against the memory limit)");
+            "tables and packet buffers from normal pages (slower lookups; "
+            "admitted against the memory limit; reported per resource, "
+            "D-206). Default on; --mem_fallback=false refuses instead");
 static bool ValidateMemoryMegabytes(const char *flag, int64_t value) {
   if (!bess::startup::ValidMemoryMegabytes(value)) {
     LOG(ERROR) << "Invalid --" << flag << ": " << value;

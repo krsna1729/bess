@@ -3,6 +3,8 @@
 #ifndef BESS_UTILS_DPDK_MEMORY_H_
 #define BESS_UTILS_DPDK_MEMORY_H_
 
+#include <malloc.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -27,15 +29,18 @@ namespace bess::utils {
 int MemoryNode();
 
 // Dataplane memory policy (Decision D-198, "Dataplane memory: hugepage-first
-// with a declared fallback and a limit"): every N-scaled table a worker reads
-// comes from DPDK's heap (D-029) on the memory node (D-123). When hugepages
-// run out a creation is refused unless bessd was started with --mem_fallback,
-// which lets it take normal (4 KiB) pages instead -- slower lookups, declared
-// rather than silent. Normal-page memory is admitted against the process's
-// memory limit (cgroup v2 memory.max, --mem_limit_mb) first, so a creation or
-// transaction that would cross it is refused with a clear, non-retryable error
-// instead of the kernel OOM-killing bessd. Everything here runs on the control
-// path; nothing on the packet path changes.
+// with a declared fallback and a limit"; D-206, "the framework places
+// dataplane memory"): every N-scaled table a worker reads comes from DPDK's
+// heap (D-029) on the memory node (D-123). Hugepages are used while there
+// are any (the cap, the host's pool, the cgroup's hugetlb limit); past them
+// a creation takes normal (4 KiB) pages from the "bess-normal" heap instead
+// -- slower lookups, reported per resource -- unless bessd was started with
+// --mem_fallback=false, which refuses it. Normal-page memory is admitted
+// against the process's memory limit (cgroup v2 memory.max, --mem_limit_mb)
+// first, so a creation or transaction that would cross it is refused with a
+// clear, non-retryable error instead of the kernel OOM-killing bessd.
+// Everything here runs on the control path; nothing on the packet path
+// changes.
 
 // Thrown on the control path when memory cannot be given. Derives from
 // std::bad_alloc so existing bad_alloc handling still applies.
@@ -70,7 +75,7 @@ struct MemoryPolicy {
   // Hugepages are charged to memory.max (cgroup2 memory_hugetlb_accounting):
   // hugepage growth is admitted against the memory limit too.
   bool hugetlb_charged = false;
-  bool fallback = false;     // --mem_fallback
+  bool fallback = true;      // --mem_fallback (D-206: on unless forbidden)
   size_t limit_bytes = 0;    // --mem_limit_mb (resolved); 0: no limit known
   size_t reserve_bytes = 0;  // --mem_reserve_mb (resolved): kept free for
                              // unaccounted (glibc, control) memory
@@ -83,7 +88,7 @@ struct MemoryPolicy {
 };
 // bessd sets it at startup, before the first pool or table; it is not
 // synchronized with readers. Until then it is default-constructed (tests,
-// library users): no limit, no fallback under hugepages.
+// library users): no limit, normal pages past the hugepages.
 void SetMemoryPolicy(MemoryPolicy policy);
 const MemoryPolicy &memory_policy() noexcept;
 
@@ -91,7 +96,9 @@ const MemoryPolicy &memory_policy() noexcept;
 // (memory.current less memory.stat inactive_file: reclaimable page cache is
 // not what the OOM killer counts against bessd) when cgroup_dir is set, else
 // process RSS plus hugetlb when charged. Throws MemoryRefused(kNormalLimit) if usage + bytes would
-// exceed limit - reserve. No-op without a limit.
+// exceed limit - reserve. No-op without a limit. One measurement serves the
+// admissions after it, each counted on top, until they add up to 1 MiB
+// (per-node class-C admission, D-206); a refusal is always measured afresh.
 void AdmitNormalMemory(size_t bytes);
 
 // Where an admitted table's DPDK-heap bytes are expected to land
@@ -109,10 +116,11 @@ enum class TableBacking : uint8_t { kHugepages, kNormal };
 // hugepage_cap_bytes (0: no cap) -- and, when hugetlb is charged to
 // memory.max, the whole pages the heap must add for it (HugepageCharge) are
 // admitted against the limit as well; past the cap, AdmitNormalMemory(bytes)
-// when --mem_fallback was given (the table will come from the fallback
-// heap), else MemoryRefused(kHugepagesExhausted). Returns where the DPDK
-// part goes. Throws MemoryRefused and counts nothing on refusal. Control
-// path; thread-safe.
+// (the table will come from the fallback heap), or
+// MemoryRefused(kHugepagesExhausted) with --mem_fallback=false. Returns
+// where the DPDK part goes and arms nothing (MemoryScope arms placement).
+// Throws MemoryRefused and counts nothing on refusal. Control path;
+// thread-safe.
 TableBacking AdmitTable(size_t bytes, size_t glibc_bytes = 0);
 // Gives back the DPDK part (bytes - glibc_bytes) AdmitTable admitted, with
 // the backing it returned; normal pages are measured, not counted.
@@ -120,11 +128,49 @@ void ReleaseTable(TableBacking backing, size_t bytes) noexcept;
 // The hugepage bytes AdmitTable has counted and not yet released.
 size_t HugepageTableBytes() noexcept;
 
+// Where admitted bytes land (D-206). An admission (framework::MemoryScope)
+// arms the calling thread with the DPDK bytes AdmitTable placed and on which
+// backing, under a ticket naming the admission's account. The thread's
+// next DPDK allocations draw from it: an armed normal-page placement under
+// hugepage backing allocates from the fallback heap directly (the cap is
+// spent); an armed hugepage placement allocates from the memory node's heap
+// and, when that heap cannot give the bytes (hugepages ran out before the
+// cap did), from the fallback heap. Bytes that land on the other backing
+// than admitted move: the hugepage count follows, and the observer is told
+// so the account reports where they are. Unarmed allocations (tests,
+// library users, unadmitted DPDK bookkeeping) are placed as before and
+// reported nowhere. A later admission on the thread replaces the arming;
+// leftover bytes an allocation did not draw are dropped then.
+using PlacementObserver = void (*)(uint64_t ticket, size_t bytes,
+                                   TableBacking now_on) noexcept;
+// The framework's account keeper; set once, before the first admission.
+void SetPlacementObserver(PlacementObserver observer) noexcept;
+void ArmPlacement(uint64_t ticket, TableBacking backing, size_t bytes) noexcept;
+// Whether this thread's admission placed its next bytes on normal pages under
+// hugepage backing (the hugepage cap is spent). The EAL must be up.
+bool ArmedForNormalPages() noexcept;
+// For DPDK libraries that allocate internally (rte_hash, rte_lpm, rte_fib,
+// rte_mempool): the socket to create an object of about `bytes` on -- the
+// fallback heap's (FallbackSocket) when this thread's admission placed it
+// on normal pages under hugepage backing, else `socket`.
+int PlacementSocket(int socket, size_t bytes);
+// After such an object was created on `socket`: records where its `bytes`
+// landed against this thread's arming, as DpdkAllocate does.
+void NotePlacement(size_t bytes, int socket) noexcept;
+// The same for memory placed outside DPDK's heaps (the packet pool's own
+// mapping): `landed` says which backing it is.
+void NotePlacement(size_t bytes, TableBacking landed) noexcept;
+
 namespace detail {
 // What a hugepage table of `bytes` adds to memory.max when hugetlb is
 // charged (D-198): nothing if the heap's largest free block holds it, else
 // the whole pages the heap must map for it (DPDK grows the heap by pages).
 size_t HugepageCharge(size_t bytes, size_t largest_free, size_t page_size);
+// Tests only (D-206): account DPDK's native heap as hugepages (the cap,
+// placement, the spill to the fallback heap when the native heap runs out)
+// so test binaries, whose EAL runs on normal pages, exercise hugepage
+// backing. Off by default; never set in bessd.
+void SetNativeHeapIsHugepagesForTest(bool on) noexcept;
 }  // namespace detail
 
 // The hugepage heap's growth gate (D-198): a DPDK allocation validator on
@@ -144,6 +190,9 @@ void InstallHeapValidator();
 // them, and Shrink with what it gave back after. Grow throws MemoryRefused
 // to refuse the growth, which then must not happen. Without a hook a
 // primitive grows unadmitted (tests, library users). Control path only.
+//
+// Shrink takes the DPDK part from the hugepage-placed bytes first (D-206):
+// accounts know where an admission landed, not where each freed object was.
 class MemoryGrowth {
  public:
   virtual void Grow(size_t bytes, size_t glibc_bytes = 0) = 0;
@@ -151,6 +200,91 @@ class MemoryGrowth {
 
  protected:
   ~MemoryGrowth() = default;
+};
+
+// glibc's smallest malloc chunk (MINSIZE on 64-bit): a fact of glibc, not a
+// BESS limit.
+constexpr size_t kMallocSmallestChunk = 32;
+
+// The most glibc's malloc takes for an allocation of `n` bytes below its mmap
+// threshold (D-206): the chunk, an 8-byte header and the payload rounded up
+// to 16 bytes, at least kMallocSmallestChunk, plus 16, because malloc hands
+// a free chunk out whole when splitting it would leave less than
+// kMallocSmallestChunk (_int_malloc). An upper bound, for a Bytes() that
+// must be known before allocating; which chunk a block gets depends on the
+// heap's free chunks.
+constexpr size_t MallocChunkBytes(size_t n) noexcept {
+  const size_t chunk = (n + 8 + 15) & ~size_t{15};
+  return (chunk < kMallocSmallestChunk ? kMallocSmallestChunk : chunk) + 16;
+}
+
+// What glibc's malloc took for the live block `p` (D-206): its usable size
+// as malloc reports it plus the chunk's size word -- measured, not
+// predicted. At most MallocChunkBytes(n), and at least 16 bytes less, for
+// blocks below the mmap threshold.
+inline size_t MallocBytes(void *p) noexcept {
+  return malloc_usable_size(p) + sizeof(size_t);
+}
+
+// The framework's allocator for cold control-plane state that scales with
+// sessions or transactions and that no worker reads (D-206, class C): glibc
+// memory, every block charged to `growth` (as glibc bytes) at the size
+// malloc actually took (MallocBytes, measured on the block) when it is
+// allocated, and given back at that size when it is freed: exact by
+// construction. A refused charge frees the block and throws MemoryRefused,
+// so the container is unchanged and the scope refuses growth at its limit.
+// Null `growth`: unadmitted (tests, library users). The hook must outlive
+// every container using the allocator. Packet-path state never uses this:
+// it takes DpdkAllocator or an ObjectSlab (DPDK heap, hugepages first).
+//
+// Future work (D-206, "Class C on the framework allocator"): route these
+// containers (UPF F-TEID mirror and session mirrors, MeterResource
+// policies_/retiring_, the transaction engine's incoming references)
+// through the framework's DPDK allocator too, so placement is uniform.
+// Preconditions: (1) fixed-size node
+// pools carved from framework chunks (as ObjectSlab), since one rte_malloc
+// per node adds about a cache line of header and 64-byte alignment,
+// roughly doubling 48-80 B map nodes and fragmenting the heap [unmeasured];
+// (2) a hot/cold placement tag the framework decides: cold memory on normal
+// pages by default, hugepages only above a reserve kept for hot data, so
+// cold growth cannot push later hot-table growth onto normal pages.
+// Motivation: about 0.3 GiB at 1M sessions in the graph layout.
+template <typename T>
+struct AdmittedGlibcAllocator {
+  using value_type = T;
+  MemoryGrowth *growth = nullptr;
+
+  AdmittedGlibcAllocator() = default;
+  explicit AdmittedGlibcAllocator(MemoryGrowth *g) noexcept : growth(g) {}
+  template <typename U>
+  AdmittedGlibcAllocator(const AdmittedGlibcAllocator<U> &o) noexcept
+      : growth(o.growth) {}
+
+  T *allocate(size_t n) {
+    T *p = std::allocator<T>().allocate(n);
+    if (growth != nullptr) {
+      const size_t bytes = MallocBytes(static_cast<void *>(p));
+      try {
+        growth->Grow(bytes, bytes);
+      } catch (...) {
+        std::allocator<T>().deallocate(p, n);
+        throw;
+      }
+    }
+    return p;
+  }
+  void deallocate(T *p, size_t n) noexcept {
+    const size_t bytes =
+        growth != nullptr ? MallocBytes(static_cast<void *>(p)) : 0;
+    std::allocator<T>().deallocate(p, n);
+    if (growth != nullptr) {
+      growth->Shrink(bytes, bytes);
+    }
+  }
+  template <typename U>
+  bool operator==(const AdmittedGlibcAllocator<U> &o) const noexcept {
+    return growth == o.growth;
+  }
 };
 
 // For DPDK libraries that allocate internally (rte_hash, rte_lpm, rte_fib,
@@ -162,8 +296,9 @@ class MemoryGrowth {
 int FallbackSocket(size_t bytes);
 
 // For a DPDK library allocation that failed for lack of memory where no
-// fallback applies (rte_hash's RCU defer queue and tailq entries, which DPDK
-// takes from its native heaps, never the fallback heap): throws
+// fallback applies (the RCU defer queues of rte_hash, rte_lpm and rte_fib,
+// and rte_hash's tailq entries, which DPDK takes from its native heaps,
+// never the fallback heap): throws
 // MemoryRefused for about `bytes` -- kHugepagesExhausted with hugepages,
 // kNormalLimit when DPDK's fixed --no-huge heap is full.
 [[noreturn]] void RefuseDpdkMemory(size_t bytes);
@@ -180,6 +315,9 @@ struct MemoryStatus {
   size_t dpdk_heap_bytes = 0, dpdk_heap_alloc_bytes = 0;  // native heap(s)
   size_t fallback_heap_bytes = 0, fallback_heap_alloc_bytes = 0;  // "bess-normal"
   uint64_t refusals = 0;  // MemoryRefused thrown so far
+  // Admitted hugepage bytes that landed on normal pages because the heap ran
+  // out before the cap (D-206), since startup.
+  uint64_t spilled_bytes = 0;
 };
 MemoryStatus GetMemoryStatus();
 
@@ -192,8 +330,9 @@ MemoryStatus GetMemoryStatus();
 // Allocation happens at creation, on the control path; running out is an
 // error there, never a packet-path event (D-198): under --no-huge the bytes
 // are admitted against the memory limit first; hugepages exhausted means the
-// normal-page fallback heap with --mem_fallback (always under --no-huge,
-// whose fixed heap may fill), else MemoryRefused.
+// normal-page fallback heap unless --mem_fallback=false (always under
+// --no-huge, whose fixed heap may fill), else MemoryRefused. Placement
+// follows this thread's armed admission (ArmPlacement, D-206).
 //
 // Initializes DPDK first if nothing has yet (tests, benchmarks).
 void *DpdkAllocate(size_t bytes, size_t align, int socket = MemoryNode());
@@ -285,29 +424,56 @@ class DpdkArray {
   size_t size_ = 0;
 };
 
-// A standard allocator over DPDK memory, for containers that grow on the
-// control path (std::vector<T, DpdkAllocator<T>>).
+// The framework allocator for packet-path containers (D-206, class P): a
+// standard allocator over DpdkAllocate on `socket` (the memory node), so the
+// memory policy places it (hugepages first, normal pages past them), with
+// every allocation admitted through `growth` first (DPDK bytes, n *
+// sizeof(T)) and given back when it is freed. Null `growth`: unadmitted
+// (tests, library users); the hook must outlive the container. For
+// containers that grow on the control path (std::vector<T,
+// DpdkAllocator<T>>); one rte_malloc per allocation, so a container of
+// small nodes takes an ObjectSlab instead.
 template <typename T>
 struct DpdkAllocator {
   using value_type = T;
   int socket = MemoryNode();
+  MemoryGrowth *growth = nullptr;
 
   DpdkAllocator() = default;
-  explicit DpdkAllocator(int s) : socket(s) {}
+  explicit DpdkAllocator(int s, MemoryGrowth *g = nullptr) noexcept
+      : socket(s), growth(g) {}
   template <typename U>
-  DpdkAllocator(const DpdkAllocator<U> &o) noexcept : socket(o.socket) {}
+  DpdkAllocator(const DpdkAllocator<U> &o) noexcept
+      : socket(o.socket), growth(o.growth) {}
 
   T *allocate(size_t n) {
     // T is the element type; a container of pointers (MeterSet's index)
     // allocates pointer-sized elements by design.
     // NOLINTNEXTLINE(bugprone-sizeof-expression)
-    return static_cast<T *>(DpdkAllocate(n * sizeof(T), alignof(T), socket));
+    const size_t bytes = n * sizeof(T);
+    if (growth != nullptr) {
+      growth->Grow(bytes);
+    }
+    try {
+      return static_cast<T *>(DpdkAllocate(bytes, alignof(T), socket));
+    } catch (...) {
+      if (growth != nullptr) {
+        growth->Shrink(bytes);
+      }
+      throw;
+    }
   }
-  void deallocate(T *p, size_t) noexcept { DpdkFree(static_cast<void *>(p)); }
+  void deallocate(T *p, size_t n) noexcept {
+    DpdkFree(static_cast<void *>(p));
+    if (growth != nullptr) {
+      // NOLINTNEXTLINE(bugprone-sizeof-expression)
+      growth->Shrink(n * sizeof(T));
+    }
+  }
 
   template <typename U>
   bool operator==(const DpdkAllocator<U> &o) const noexcept {
-    return socket == o.socket;
+    return socket == o.socket && growth == o.growth;
   }
 };
 

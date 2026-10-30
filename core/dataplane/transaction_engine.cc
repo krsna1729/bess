@@ -68,7 +68,7 @@ std::expected<void, std::string> TransactionEngine::Register(
     return std::unexpected("resource '" + resource->name() +
                            "' is already registered");
   }
-  auto reg = std::make_unique<Registration>();
+  auto reg = std::make_unique<Registration>(ledger_growth_);
   reg->resource = resource;
   for (const std::string &dep : resource->declared_references()) {
     if (dep == resource->name()) {

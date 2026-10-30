@@ -357,9 +357,10 @@ resources the reply carries the daemon's `rss_bytes`, the EAL heap's
 `heap_total_bytes` and `heap_alloc_bytes` on the daemon's memory node, the
 reclamation budget (`rcu_pending`, `rcu_high_water`: the same counters
 `bess.rcu_backlog` alerts on, and past half of the high-water mark the engine's
-retiring waits), and `workers` by core. `memory` (D-198) is the memory policy
-and where the daemon stands against it: whether the heap is on hugepages,
-whether `--mem_fallback` was given, the limit (`limit_bytes`, 0 when
+retiring waits), and `workers` by core. `memory` (D-198, D-206) is the memory
+policy and where the daemon stands against it: whether the heap is on
+hugepages, whether normal pages may be used past them (`fallback`: on unless
+`--mem_fallback=false`), the limit (`limit_bytes`, 0 when
 none is known, and `limit_source`: cgroup `memory.max`, `--mem_limit_mb` or
 `MemTotal`), the `reserve_bytes` kept for unaccounted memory, `used_bytes`,
 `available_bytes` (limit less reserve less used, floored at 0), the hugepage
@@ -368,12 +369,16 @@ cap (`hugepage_cap_bytes`, 0 for none, and `hugepage_cap_source`:
 admitted against it (`hugepage_table_bytes`), whether hugepages are charged
 to `memory.max` (`hugetlb_charged`: cgroup2 `memory_hugetlb_accounting`; then
 hugepage growth is admitted against the limit too), both heaps (`dpdk_heap_*`,
-`fallback_heap_*`), `refusals` so far, and `modules`: what each module admitted
-before it allocated, by resource (`module`, `resource`, `admitted_bytes`, and
-`current_bytes`, what the objects hold now; the daemon's packet pool is module
-`bessd`, resource `packet_pool`). A creation or transaction that needs more
-than `available_bytes` of normal pages, or more hugepages than the cap leaves
-without the fallback, is refused with `RESOURCE_EXHAUSTED` (errno `ENOMEM`),
+`fallback_heap_*`), `refusals` so far, `spilled_bytes` (admitted for
+hugepages, landed on normal pages because the heap ran out before the cap),
+and `modules`: what each module admitted before it allocated, by resource
+(`module`, `resource`, `admitted_bytes`, split by where it landed into
+`hugepage_bytes`, `normal_bytes` and `glibc_bytes`, and `current_bytes`, what
+the objects hold now; the daemon's packet pool is module `bessd`, resource
+`packet_pool`). A creation or transaction that needs more than
+`available_bytes` of normal pages, or more hugepages than the cap leaves when
+normal pages are forbidden, is refused with `RESOURCE_EXHAUSTED` (errno
+`ENOMEM`),
 which no SDK retries. Every field is a fact the daemon holds now, never a
 prediction: what a change will cost depends on the resource's own shape (a
 rule's groups, a cascade's removals), so the controller does that arithmetic.

@@ -1055,9 +1055,11 @@ grpc::Status ControlV2Service::GetResourceStatus(
   out->set_fallback_heap_bytes(memory.fallback_heap_bytes);
   out->set_fallback_heap_alloc_bytes(memory.fallback_heap_alloc_bytes);
   out->set_refusals(memory.refusals);
-  // What each module admitted, by resource (D-198), with what the objects
-  // hold now: their bytes() are read here, under the control-plane lock that
-  // orders every module's creation, growth and destruction.
+  out->set_spilled_bytes(memory.spilled_bytes);
+  // What each module admitted, by resource (D-198) and by where it landed
+  // (D-206), with what the objects hold now: their bytes() are read here,
+  // under the control-plane lock that orders every module's creation,
+  // growth and destruction.
   for (const bess::framework::ModuleMemoryUse &use :
        bess::framework::MemoryAccounts::List()) {
     v2::ModuleMemory *row = out->add_modules();
@@ -1065,6 +1067,9 @@ grpc::Status ControlV2Service::GetResourceStatus(
     row->set_resource(use.resource);
     row->set_admitted_bytes(use.admitted_bytes);
     row->set_current_bytes(use.current_bytes);
+    row->set_hugepage_bytes(use.hugepage_bytes);
+    row->set_normal_bytes(use.normal_bytes);
+    row->set_glibc_bytes(use.glibc_bytes);
   }
 
   for (int core : runtime::runtime().workers().Cores()) {

@@ -107,22 +107,29 @@ std::string InstanceName(const std::string &base) {
   return base.substr(0, room) + suffix;
 }
 
-// A DPDK routing structure under the memory policy (D-029): `create(socket)`
-// makes one of about `bytes`. Under --no-huge the bytes are admitted against
-// the process memory limit first. A creation that fails for lack of memory
-// (rte_errno ENOMEM) on `socket` is retried once on the normal-page fallback
-// heap, which utils::FallbackSocket grants or refuses (MemoryRefused,
-// propagated to the control boundary); other failures return nullptr with
-// rte_errno as the creator left it.
+// A DPDK routing structure under the memory policy (D-029, D-206):
+// `create(socket)` makes one of about `bytes`. Under --no-huge the bytes are
+// admitted against the process memory limit first. Created where this
+// thread's admission placed it (utils::PlacementSocket), and a creation that
+// fails for lack of memory (rte_errno ENOMEM) on `socket` is retried once on
+// the normal-page fallback heap, which utils::FallbackSocket grants or
+// refuses (MemoryRefused, propagated to the control boundary); where it
+// landed is recorded against the admission. Other failures return nullptr
+// with rte_errno as the creator left it.
 template <typename Create>
 auto CreateOnPolicy(int socket, size_t bytes, Create create) {
   if (rte_eal_has_hugepages() == 0) {
     utils::AdmitNormalMemory(bytes);
   }
+  socket = utils::PlacementSocket(socket, bytes);
   rte_errno = 0;
   auto *made = create(socket);
   if (made == nullptr && rte_errno == ENOMEM) {
-    made = create(utils::FallbackSocket(bytes));
+    socket = utils::FallbackSocket(bytes);
+    made = create(socket);
+  }
+  if (made != nullptr) {
+    utils::NotePlacement(bytes, socket);
   }
   return made;
 }
@@ -130,7 +137,11 @@ auto CreateOnPolicy(int socket, size_t bytes, Create create) {
 // The estimates below are the allocations DPDK 25.11 makes on the socket
 // asked for: a 2^24-entry tbl24 of the entry size, tbl8 groups of 256
 // entries, and the bookkeeping of each library. The RCU defer queues, small
-// and allocated on any native socket by DPDK, are not counted.
+// and allocated on the calling thread's native socket by DPDK whatever the
+// table's socket (an ENOMEM there is utils::RefuseDpdkMemory), are not
+// counted; a queue entry is about kDeferEntryBytes (an 8-byte token and the
+// 4- or 8-byte element, ring-aligned).
+constexpr size_t kDeferEntryBytes = 16;
 constexpr size_t kTbl24Entries = size_t{1} << 24;
 
 // rte_lpm: tbl24 and tbl8s of 4-byte entries, 8 bytes per rule.
@@ -245,7 +256,11 @@ LpmRouteTable::NewInstance(uint32_t default_value) {
     // reclamation, rte_fib logs and leaks the group it could not queue.
     rcu.dq_size = RTE_ALIGN_CEIL(conf.dir24_8.num_tbl8, 64);
     if (rte_fib_rcu_qsbr_add(fib, &rcu) != 0) {
+      const int error = rte_errno;
       rte_fib_free(fib);
+      if (error == ENOMEM) {
+        utils::RefuseDpdkMemory(kDeferEntryBytes * rcu.dq_size);
+      }
       return std::unexpected(RouteError::kBackendFailure);
     }
     instance->fib = fib;
@@ -267,7 +282,11 @@ LpmRouteTable::NewInstance(uint32_t default_value) {
   rcu.v = domain_.dpdk_qsbr();
   rcu.mode = RTE_LPM_QSBR_MODE_DQ;
   if (rte_lpm_rcu_qsbr_add(lpm, &rcu) != 0) {
+    const int error = rte_errno;
     rte_lpm_free(lpm);
+    if (error == ENOMEM) {
+      utils::RefuseDpdkMemory(kDeferEntryBytes * conf.number_tbl8s);
+    }
     return std::unexpected(RouteError::kBackendFailure);
   }
   instance->lpm = lpm;

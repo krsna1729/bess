@@ -40,16 +40,23 @@ constexpr uint32_t kReader = 1;
 struct CountingGrowth final : utils::MemoryGrowth {
   size_t grown = 0;
   size_t shrunk = 0;
+  size_t glibc_grown = 0;
+  size_t glibc_shrunk = 0;
   bool refuse = false;
   size_t limit = std::numeric_limits<size_t>::max();
-  void Grow(size_t bytes, size_t) override {
+  void Grow(size_t bytes, size_t glibc_bytes) override {
     if (refuse || bytes > limit || grown - shrunk > limit - bytes) {
       throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit,
                                  bytes, "refused");
     }
     grown += bytes;
+    glibc_grown += glibc_bytes;
   }
-  void Shrink(size_t bytes, size_t) noexcept override { shrunk += bytes; }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    shrunk += bytes;
+    glibc_shrunk += glibc_bytes;
+  }
+  size_t glibc_net() const { return glibc_grown - glibc_shrunk; }
 };
 
 MeterProfileSpec TrTcm(uint64_t cir) {
@@ -205,7 +212,9 @@ TEST_F(MeterResourceTest, ATransactionCostsWhatItChangesNotWhatIsInstalled) {
     MeterState *one = before->Lookup(MeterId(1));
     const auto policies = Policies();
     const size_t net = growth_.grown - growth_.shrunk;
-    const size_t grown = growth_.grown;
+    // DPDK bytes: the index edit. The glibc policy containers (class C,
+    // D-206) grow their bucket arrays as they fill, amortized, not per edit.
+    const size_t grown = growth_.grown - growth_.glibc_grown;
     const std::vector<Op> ops = {Upsert(kLarge - 1, TrTcm(500)),
                                  Upsert(kLarge, TrTcm(500)),
                                  Upsert(1, TrTcm(900)), Erase(2)};
@@ -222,7 +231,7 @@ TEST_F(MeterResourceTest, ATransactionCostsWhatItChangesNotWhatIsInstalled) {
       EXPECT_TRUE(resource_->Prepare());
       cost.allocations = window.allocations();
     }
-    cost.admitted = growth_.grown - grown;
+    cost.admitted = growth_.grown - growth_.glibc_grown - grown;
     for (auto &reservation : reserved) {
       reservation.staged->Abort();
     }
@@ -371,12 +380,14 @@ TEST_F(MeterResourceTest, EraseRefusedWhenItsRemovalStageDoesNotFit) {
   EXPECT_TRUE(Has(1));
   EXPECT_FALSE(resource_->Retiring(MeterId(1)));
   EXPECT_EQ(published_.Read(), before);
-  // An admitted erase that aborts gives its prepay back.
-  const size_t shrunk = growth_.shrunk;
+  // An admitted erase that aborts gives its prepay back (and the glibc node
+  // that marked it retiring).
+  const size_t shrunk = growth_.shrunk - growth_.glibc_shrunk;
   auto reserved = resource_->Reserve(Erase(1));
   ASSERT_TRUE(reserved);
   reserved->staged->Abort();
-  EXPECT_EQ(growth_.shrunk - shrunk, MeterSet::Bytes(kCapacity));
+  EXPECT_EQ(growth_.shrunk - growth_.glibc_shrunk - shrunk,
+            MeterSet::Bytes(kCapacity));
   EXPECT_TRUE(Has(1));
 }
 
@@ -448,6 +459,62 @@ TEST_F(MeterResourceTest, RefusedRemovalStageIsRetriedNotReplayed) {
   }
   domain_.Drain();
   EXPECT_TRUE(engine_.Unregister("cnt/counters"));
+}
+
+// The policies as written and the retiring ids are control-plane state no
+// worker reads (D-206, class C): glibc, every node admitted exactly as
+// malloc's chunk (utils::MallocChunkBytes) through the owner's lease, and
+// given back when the meter goes.
+TEST_F(MeterResourceTest, PolicyNodesAreAdmittedExactly) {
+  // What one policy node and one meter state's control block take, under
+  // the same allocators.
+  size_t policy_node = 0;
+  {
+    CountingGrowth probe;
+    std::map<MeterId, MeterProfileSpec, std::less<MeterId>,
+             utils::AdmittedGlibcAllocator<
+                 std::pair<const MeterId, MeterProfileSpec>>>
+        one{utils::AdmittedGlibcAllocator<
+            std::pair<const MeterId, MeterProfileSpec>>(&probe)};
+    one.emplace(MeterId(1), TrTcm(500));
+    policy_node = probe.glibc_grown;
+  }
+  size_t state_block = 0;
+  {
+    CountingGrowth probe;
+    MeterSetBuilder builder(kCapacity);
+    builder.set_memory_growth(&probe);
+    ASSERT_TRUE(builder.Add(MeterId(1), TrTcm(500), MeterSharing::kShared));
+    const size_t first = probe.glibc_grown;  // the profile is interned now
+    ASSERT_TRUE(builder.Add(MeterId(2), TrTcm(500), MeterSharing::kShared));
+    state_block = probe.glibc_grown - first;
+  }
+  ASSERT_GE(policy_node, utils::kMallocSmallestChunk);
+  ASSERT_GE(state_block, utils::kMallocSmallestChunk);
+
+  ASSERT_EQ(Apply({Upsert(1, TrTcm(500))}).outcome, Outcome::kApplied);
+  while (engine_.ReclaimRetired() != 0) {
+  }
+  const size_t before = growth_.glibc_net();
+  constexpr uint32_t kMeters = kCapacity - 1;
+  Install(2, 1 + kMeters, TrTcm(500));
+  while (engine_.ReclaimRetired() != 0) {
+  }
+  EXPECT_EQ(growth_.glibc_net() - before,
+            kMeters * (policy_node + state_block));
+  EXPECT_EQ(resource_->bytes(), growth_.grown - growth_.shrunk);
+
+  std::vector<Op> erases;
+  for (uint32_t id = 2; id <= 1 + kMeters; ++id) {
+    erases.push_back(Erase(id));
+  }
+  ASSERT_EQ(engine_.ApplyBatched(erases).outcome, Outcome::kApplied);
+  while (engine_.ReclaimRetired() != 0) {
+  }
+  domain_.Drain();  // the generations that held the erased states
+  EXPECT_EQ(resource_->LiveCount(), 1u);
+  EXPECT_EQ(growth_.glibc_net(), before);
+  EXPECT_EQ(resource_->bytes(), growth_.grown - growth_.shrunk);
 }
 
 // BESS's codec: bess.pb.MeterIdKey -> bess.pb.MeterPolicyValue, the module's

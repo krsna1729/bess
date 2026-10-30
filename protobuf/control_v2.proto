@@ -797,10 +797,11 @@ message WorkerStatus {
   uint32 cpu = 1;   // the core this worker runs on
 }
 
-// The daemon's memory policy and where it stands against it (D-198). Dataplane
-// memory comes from DPDK's heap on the memory node; when hugepages run out, a
-// creation is refused unless the daemon was started with --mem_fallback,
-// which lets it use a heap of normal pages ("bess-normal") instead.
+// The daemon's memory policy and where it stands against it (D-198, D-206).
+// Dataplane memory comes from DPDK's heap on the memory node, hugepages first;
+// when they run out, a creation takes normal pages from the "bess-normal"
+// heap instead, unless the daemon was started with --mem_fallback=false,
+// which refuses it.
 // Normal-page memory is admitted against a limit -- cgroup v2 memory.max, or
 // --mem_limit_mb -- and a creation that would cross it is refused with
 // RESOURCE_EXHAUSTED, never retried and never OOM-killed. Every module admits
@@ -809,7 +810,7 @@ message WorkerStatus {
 // means no limit is known.
 message MemoryStatus {
   bool hugepages = 1;              // the native heap is hugepage-backed
-  bool fallback = 2;               // --mem_fallback was given
+  bool fallback = 2;               // normal pages past the hugepages (--mem_fallback, default on)
   uint64 limit_bytes = 3;          // the limit normal-page memory is admitted against
   string limit_source = 4;         // where limit_bytes came from (memory.max, a flag)
   uint64 reserve_bytes = 5;        // kept free for memory the daemon does not account
@@ -828,6 +829,9 @@ message MemoryStatus {
   // limit_bytes as well, and a limit must include the hugepages.
   bool hugetlb_charged = 16;
   string hugepage_cap_source = 17; // "--mem_hugepage_mb" or the cgroup's hugetlb.<size>.max
+  // Bytes admitted for hugepages that landed on normal pages because the
+  // hugepage heap ran out before the cap (D-206), since startup.
+  uint64 spilled_bytes = 18;
 }
 
 // What one module admitted for one of its resources (a table, a pool, a
@@ -838,6 +842,12 @@ message ModuleMemory {
   string resource = 2;
   uint64 admitted_bytes = 3;  // admitted before allocation, released with the object
   uint64 current_bytes = 4;   // what the objects hold now (their bytes()), else admitted
+  // admitted_bytes by where they landed (D-206): DPDK memory on hugepages,
+  // DPDK memory on normal pages (the fallback heap, or normal-page backing),
+  // and glibc memory (control-plane state no worker reads).
+  uint64 hugepage_bytes = 5;
+  uint64 normal_bytes = 6;
+  uint64 glibc_bytes = 7;
 }
 
 message GetResourceStatusResponse {
