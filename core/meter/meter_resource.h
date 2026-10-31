@@ -6,8 +6,10 @@
 #include <atomic>
 #include <cstddef>
 #include <expected>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -105,6 +107,20 @@ class MeterResource final : public dataplane::Resource {
         visit(id, policy);
       }
     }
+  }
+
+  // VisitPolicies from id `from` until visit returns false; returns the id
+  // to resume from, or nullopt when none remains. Costs the meters visited.
+  template <typename Visit>
+  std::optional<MeterId> VisitPoliciesFrom(MeterId from, Visit &&visit) const {
+    for (auto it = policies_.lower_bound(from); it != policies_.end(); ++it) {
+      if (retiring_.contains(it->first) || visit(it->first, it->second)) {
+        continue;
+      }
+      const auto next = std::next(it);
+      return next == policies_.end() ? std::nullopt : std::optional<MeterId>(next->first);
+    }
+    return std::nullopt;
   }
 
   // dataplane::Resource.

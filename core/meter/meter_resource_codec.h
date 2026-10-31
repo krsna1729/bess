@@ -4,9 +4,13 @@
 #define BESS_METER_METER_RESOURCE_CODEC_H_
 
 #include <any>
+#include <array>
+#include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 
 #include "dataplane/resource.h"
@@ -95,13 +99,17 @@ inline std::shared_ptr<const framework::ResourceCodec> MakeMeterResourceCodec(
         }
         return std::any(*policy);
       },
-      [&resource](const auto &visit) {
-        resource.VisitPolicies(
-            [&visit](MeterId id, const MeterProfileSpec &policy) {
+      // Resumable by meter id (the cursor is the next id).
+      [&resource](std::string_view cursor, const auto &visit) -> std::string {
+        std::array<uint32_t, 1> from{};
+        (void)framework::CursorFields(cursor, &from);
+        const std::optional<MeterId> next = resource.VisitPoliciesFrom(
+            MeterId(from[0]), [&visit](MeterId id, const MeterProfileSpec &policy) {
               bess::pb::MeterIdKey key;
               key.set_id(id.value());
-              visit(key, MeterPolicyToPb(policy));
+              return visit(key, MeterPolicyToPb(policy));
             });
+        return next ? framework::CursorOf<1>({next->value()}) : std::string();
       });
 }
 

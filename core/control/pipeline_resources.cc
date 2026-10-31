@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -20,23 +21,60 @@ namespace {
 
 using framework::ResourceCodec;
 
+// Sized exactly: a grown string keeps up to twice its bytes, per entry read.
+// Into `bytes`, so a caller that keeps few of them reuses one buffer.
+void CanonicalBytes(const google::protobuf::Message &message, std::string *bytes) {
+  bytes->resize(message.ByteSizeLong());
+  google::protobuf::io::ArrayOutputStream stream(bytes->data(), static_cast<int>(bytes->size()));
+  google::protobuf::io::CodedOutputStream out(&stream);
+  out.SetSerializationDeterministic(true);
+  message.SerializeWithCachedSizes(&out);
+}
+
 std::string CanonicalBytes(const google::protobuf::Message &message) {
   std::string bytes;
-  {
-    google::protobuf::io::StringOutputStream stream(&bytes);
-    google::protobuf::io::CodedOutputStream out(&stream);
-    out.SetSerializationDeterministic(true);
-    // Fails only beyond protobuf's 2 GiB message limit.
-    (void)message.SerializeToCodedStream(&out);
-  }
+  CanonicalBytes(message, &bytes);
   return bytes;
 }
 
-google::protobuf::Any Pack(const google::protobuf::Message &message) {
+std::string TypeUrl(std::string_view full_name) {
+  return "type.googleapis.com/" + std::string(full_name);
+}
+
+google::protobuf::Any Pack(const google::protobuf::Message &message, std::string bytes) {
   google::protobuf::Any any;
-  any.set_type_url("type.googleapis.com/" + std::string(message.GetDescriptor()->full_name()));
-  any.set_value(CanonicalBytes(message));
+  any.set_type_url(TypeUrl(message.GetDescriptor()->full_name()));
+  any.set_value(std::move(bytes));
   return any;
+}
+
+google::protobuf::Any Pack(const google::protobuf::Message &message) {
+  return Pack(message, CanonicalBytes(message));
+}
+
+// A length-delimited field of `bytes` behind a one-byte tag.
+size_t FieldBytes(size_t bytes) {
+  return 1 + google::protobuf::io::CodedOutputStream::VarintSize64(bytes) + bytes;
+}
+
+// The entry as one element of a repeated ResourceEntry field (a
+// ResourceContents' or a ResourcePage's): its key when set, its value always.
+size_t FramedEntryBytes(const ResourceEntrySpec &entry) {
+  size_t bytes = FieldBytes(entry.value.ByteSizeLong());
+  if (!entry.key.type_url().empty()) {
+    bytes += FieldBytes(entry.key.ByteSizeLong());
+  }
+  return FieldBytes(bytes);
+}
+
+// The smallest entry the codec's types allow: empty key and value messages.
+size_t MinEntryBytes(const ResourceCodec &codec) {
+  ResourceEntrySpec entry;
+  if (codec.kind() != ResourceCodec::Kind::kSingleton) {
+    entry.key.set_type_url(TypeUrl(codec.key_type()));
+  }
+  entry.value.set_type_url(TypeUrl(codec.value_type()));
+  return FramedEntryBytes(entry);
 }
 
 ControlError ResourceError(int err, const std::string &resource, const std::string &message) {
@@ -58,11 +96,21 @@ ControlResult<const ResourceCodec *> CodecOf(const dataplane::TransactionEngine 
   return codec;
 }
 
+ControlError TooLarge(size_t bytes, size_t max_bytes) {
+  ControlError error = Err(EMSGSIZE,
+                           "the resources are at least %zu bytes, above the %zu-byte message "
+                           "limit: name fewer resources, or read one with ReadResource",
+                           bytes, max_bytes);
+  error.code = ControlErrorCode::kResourceExhausted;
+  error.field = "resources";
+  return error;
+}
+
 }  // namespace
 
 ControlResult<std::vector<ResourceSpec>> ReadResources(
     const dataplane::TransactionEngine &engine, const framework::ResourceBindings &bindings,
-    std::span<const std::string> names) {
+    std::span<const std::string> names, size_t max_bytes) {
   std::vector<std::string> wanted(names.begin(), names.end());
   if (wanted.empty()) {
     for (const std::string &name : engine.ResourceNames()) {
@@ -72,30 +120,140 @@ ControlResult<std::vector<ResourceSpec>> ReadResources(
       }
     }
   }
-  std::vector<ResourceSpec> out;
-  out.reserve(wanted.size());
+  // Refused before reading an entry when even the smallest entries the types
+  // allow do not fit: the walk would build that much and more.
+  std::vector<const ResourceCodec *> codecs;
+  codecs.reserve(wanted.size());
+  size_t smallest = 0;
   for (const std::string &name : wanted) {
     auto codec = CodecOf(engine, bindings, name);
     if (!codec) {
       return std::unexpected(codec.error());
     }
+    smallest += engine.FindResource(name)->LiveCount() * MinEntryBytes(**codec);
+    codecs.push_back(*codec);
+  }
+  if (smallest > max_bytes) {
+    return std::unexpected(TooLarge(smallest, max_bytes));
+  }
+  std::vector<ResourceSpec> out;
+  out.reserve(wanted.size());
+  size_t bytes = 0;
+  for (size_t i = 0; i < wanted.size(); i++) {
     ResourceSpec spec;
-    spec.name = name;
-    const bool singleton = (*codec)->kind() == ResourceCodec::Kind::kSingleton;
-    (*codec)->Entries([&](const google::protobuf::Message &key,
-                          const google::protobuf::Message &value) {
+    spec.name = wanted[i];
+    spec.entries.reserve(engine.FindResource(wanted[i])->LiveCount());
+    const bool singleton = codecs[i]->kind() == ResourceCodec::Kind::kSingleton;
+    codecs[i]->Entries([&](const google::protobuf::Message &key,
+                           const google::protobuf::Message &value) {
+      if (bytes > max_bytes) {
+        return;  // refused: build no more
+      }
       ResourceEntrySpec entry;
       if (!singleton) {
         entry.key = Pack(key);
       }
       entry.value = Pack(value);
+      bytes += FramedEntryBytes(entry);
       spec.entries.push_back(std::move(entry));
     });
+    if (bytes > max_bytes) {
+      return std::unexpected(TooLarge(bytes, max_bytes));
+    }
     out.push_back(std::move(spec));
   }
   std::sort(out.begin(), out.end(),
             [](const ResourceSpec &a, const ResourceSpec &b) { return a.name < b.name; });
   return out;
+}
+
+ControlResult<ResourceEntryPage> ReadResourcePage(
+    const dataplane::TransactionEngine &engine, const framework::ResourceBindings &bindings,
+    const std::string &name, const std::string &cursor, size_t max_entries, size_t max_bytes) {
+  auto codec = CodecOf(engine, bindings, name);
+  if (!codec) {
+    return std::unexpected(codec.error());
+  }
+  const bool singleton = (*codec)->kind() == ResourceCodec::Kind::kSingleton;
+  ResourceEntryPage page;
+  size_t bytes = 0;
+  // The codec's own position: the page costs its entries.
+  std::optional<std::string> next = (*codec)->VisitFrom(
+      cursor, [&](const google::protobuf::Message &key, const google::protobuf::Message &value) {
+        ResourceEntrySpec entry;
+        if (!singleton) {
+          entry.key = Pack(key);
+        }
+        entry.value = Pack(value);
+        bytes += FramedEntryBytes(entry);
+        page.entries.push_back(std::move(entry));
+        return page.entries.size() < max_entries && bytes < max_bytes;
+      });
+  if (next.has_value()) {
+    if (!next->empty()) {
+      page.next = std::move(*next);
+    }
+    return page;
+  }
+
+  // scale: no position, so every page walks the whole resource -- a full
+  // read is ceil(N / max_entries) walks, O(N^2 / page) visits. Bounded only
+  // for resources a module keeps small (configuration, not sessions); a
+  // codec that can hold session-scale N gives TypedCodec a PageFn instead.
+  // The cursor is "k" and the last key's canonical bytes (never empty, so
+  // an empty key still continues); the page is the smallest keys after it
+  // that fit, as a max-heap by key: an entry that sorts after a full page's
+  // last is never packed, and one that pushes the page over evicts the
+  // largest.
+  std::optional<std::string_view> after;
+  if (!cursor.empty()) {
+    after = std::string_view(cursor).substr(1);
+  }
+  struct Candidate {
+    std::string key;  // canonical bytes
+    ResourceEntrySpec entry;
+    size_t bytes;
+  };
+  const auto by_key = [](const Candidate &a, const Candidate &b) { return a.key < b.key; };
+  std::vector<Candidate> heap;
+  bool more = false;
+  std::string canonical;  // reused: most keys a walk sees are not kept
+  (*codec)->Entries([&](const google::protobuf::Message &key,
+                        const google::protobuf::Message &value) {
+    CanonicalBytes(key, &canonical);
+    if (after.has_value() && canonical <= *after) {
+      return;
+    }
+    if (!heap.empty() && canonical > heap.front().key &&
+        (heap.size() >= max_entries || bytes >= max_bytes)) {
+      more = true;
+      return;
+    }
+    Candidate candidate{canonical, {}, 0};
+    if (!singleton) {
+      candidate.entry.key = Pack(key, candidate.key);
+    }
+    candidate.entry.value = Pack(value);
+    candidate.bytes = FramedEntryBytes(candidate.entry);
+    bytes += candidate.bytes;
+    heap.push_back(std::move(candidate));
+    std::push_heap(heap.begin(), heap.end(), by_key);
+    while (heap.size() > max_entries || (bytes > max_bytes && heap.size() > 1)) {
+      std::pop_heap(heap.begin(), heap.end(), by_key);
+      bytes -= heap.back().bytes;
+      heap.pop_back();
+      more = true;
+    }
+  });
+  std::sort_heap(heap.begin(), heap.end(), by_key);
+  page.entries.reserve(heap.size());
+  for (Candidate &candidate : heap) {
+    page.entries.push_back(std::move(candidate.entry));
+  }
+  if (more) {
+    page.next = "k" + heap.back().key;
+  }
+  return page;
 }
 
 ControlResult<ResourceConvergence> Converge(const dataplane::TransactionEngine &engine,

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "dataplane/transaction_engine.h"
@@ -229,13 +230,22 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
       },
       // Every rule as a client sends it: per-field value and mask bytes,
       // full field width (the table holds them canonical), and its ranges
-      // in field order, as the resource enumerates them.
-      [this](const bess::framework::TypedCodec<
-             bess::pb::WildcardMatchRuleKey,
-             bess::pb::WildcardMatchRuleValue>::TypedVisitor &visit) {
+      // in field order, as the resource enumerates them. Resumable: the
+      // cursor is the table's WalkCursor (capacity, slot, then the mask).
+      [this](std::string_view cursor,
+             const bess::framework::TypedCodec<
+                 bess::pb::WildcardMatchRuleKey,
+                 bess::pb::WildcardMatchRuleValue>::TypedPageVisitor &visit) -> std::string {
+        bess::classifier::ConcurrentMaskedTable::WalkCursor at;
+        std::array<uint32_t, 2> fields{};  // capacity, slot
+        if (std::string_view mask; bess::framework::CursorFields(cursor, &fields, &mask)) {
+          const auto *begin = reinterpret_cast<const std::byte *>(mask.data());
+          at = {std::vector<std::byte>(begin, begin + mask.size()), fields[0], fields[1]};
+        }
         bess::pb::WildcardMatchRuleKey key;
         bess::pb::WildcardMatchRuleValue value;
-        table_->ForEach(
+        const bool more = table_->VisitFrom(
+            &at,
             [&](bess::classifier::ConstBytes mask,
                 bess::classifier::ConstBytes bytes,
                 const bess::classifier::ConcurrentMaskedTable::Rule &r,
@@ -267,8 +277,14 @@ CommandResponse WildcardMatch::Init(const bess::pb::WildcardMatchArg &arg) {
                 value.set_result(reinterpret_cast<const char *>(record.data()),
                                  record.size());
               }
-              visit(key, value);
+              return visit(key, value);
             });
+        if (!more) {
+          return {};
+        }
+        return bess::framework::CursorOf<2>(
+            {at.capacity, at.slot},
+            std::string_view(reinterpret_cast<const char *>(at.mask.data()), at.mask.size()));
       }));
   if (auto registered =
           init_context().resources().Register(resource_.get());

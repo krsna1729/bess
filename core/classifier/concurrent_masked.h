@@ -323,6 +323,66 @@ class ConcurrentMaskedTable {
     }
   }
 
+  // Where a resumable walk continues: a tuple by its mask, the capacity its
+  // table had, and the key slot in it. The default value is the first rule.
+  struct WalkCursor {
+    std::vector<std::byte> mask;  // empty: the first tuple
+    uint32_t capacity = 0;
+    uint32_t slot = 0;
+  };
+  // ForEach from `*cursor` until fn returns false (the rules sharing a key
+  // finish first): tuples by mask bytes, not list order (the list reorders
+  // by priority), each by key slot (ConcurrentExactTable::VisitFrom). Sets
+  // `*cursor` to where to resume and returns true, or returns false when no
+  // rule remains. A tuple whose table was replaced (it grew) is walked again
+  // from its first slot: rules may repeat, none present throughout is missed.
+  template <typename Fn>
+  bool VisitFrom(WalkCursor *cursor, Fn &&fn) const {
+    const std::vector<Tuple> &tuples = tuples_.Read()->tuples;
+    std::vector<const Tuple *> order;
+    order.reserve(tuples.size());
+    for (const Tuple &tuple : tuples) {
+      order.push_back(&tuple);
+    }
+    const auto by_mask = [](const Tuple *a, const Tuple *b) { return a->mask < b->mask; };
+    std::sort(order.begin(), order.end(), by_mask);
+    auto it = std::lower_bound(order.begin(), order.end(), cursor->mask,
+                               [](const Tuple *a, const std::vector<std::byte> &mask) {
+                                 return a->mask < mask;
+                               });
+    uint32_t slot = it != order.end() && (*it)->mask == cursor->mask &&
+                            (*it)->table->capacity() == cursor->capacity
+                        ? cursor->slot
+                        : 0;
+    for (; it != order.end(); ++it, slot = 0) {
+      const Tuple &tuple = **it;
+      const ConstBytes mask(tuple.mask.data(), tuple.mask.size());
+      bool stop = false;
+      const uint32_t next = tuple.table->VisitFrom(slot, [&](ConstBytes value, uint64_t packed) {
+        if (!IsChain(packed)) {
+          stop = !fn(mask, value, Record(IdOf(packed)), Ranges{});
+          return !stop;
+        }
+        const Chain &chain = ChainOf(packed);
+        for (uint32_t e = 0; e < chain.count; e++) {
+          const ChainEntry &entry = chain.entries()[e];
+          stop = !fn(mask, value, Record(IdOf(entry.packed)), chain.RangesOf(entry)) || stop;
+        }
+        return !stop;
+      });
+      if (!stop) {
+        continue;
+      }
+      if (next == 0 && it + 1 == order.end()) {
+        return false;
+      }
+      const Tuple &at = next != 0 ? tuple : **(it + 1);
+      *cursor = WalkCursor{at.mask, at.table->capacity(), next};
+      return true;
+    }
+    return false;
+  }
+
   size_t size() const noexcept { return size_; }
   size_t tuple_count() const noexcept { return tuples_.Read()->tuples.size(); }
   size_t max_tuples() const noexcept { return max_tuples_; }

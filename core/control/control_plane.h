@@ -3,7 +3,9 @@
 #ifndef BESS_CONTROL_CONTROL_PLANE_H_
 #define BESS_CONTROL_CONTROL_PLANE_H_
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -15,6 +17,7 @@
 #include "control/pipeline_spec.h"
 #include "control/pipeline_diff.h"
 #include "control/pipeline_plan.h"
+#include "control/pipeline_resources.h"
 #include "control/pipeline_snapshot.h"
 #include "control/pipeline_validator.h"
 #include "control/transaction.h"
@@ -171,6 +174,9 @@ class ControlPlane {
     bool include = false;
     std::vector<std::string> names;  // with include: only these (empty: all)
     bool include_metadata = false;   // also snapshot the metadata report
+    // With include: contents above this many serialized bytes are refused
+    // (RESOURCE_EXHAUSTED) without building them (ReadResources).
+    size_t max_bytes = std::numeric_limits<size_t>::max();
   };
   struct PipelineRead {
     PipelineSnapshot snapshot;
@@ -180,10 +186,14 @@ class ControlPlane {
     std::optional<metadata::MetadataReport> metadata;
   };
   ControlResult<Versioned<PipelineRead>> ReadPipeline(const ResourceQuery& query) const;
-  // One resource's contents as one snapshot, for the streamed read: the
-  // entries and the dataplane generation they were read at. Unknown names are
-  // NOT_FOUND, as ReadPipeline's are.
-  ControlResult<Versioned<ResourceSpec>> ReadResource(const std::string& name) const;
+  // One page of one resource's contents, for the streamed read: the entries
+  // from `cursor` (empty: the first page), bounded as ReadResourcePage bounds
+  // them, the next page's cursor, and the generations they were read at.
+  // Each page is its own lock hold. Unknown names are NOT_FOUND, as
+  // ReadPipeline's are.
+  ControlResult<Versioned<ResourceEntryPage>> ReadResource(
+      const std::string& name, const std::string& cursor, size_t max_entries,
+      size_t max_bytes) const;
   // Empty the named map resources without sending their keys to the client:
   // each is converged to no entries and the erases are applied in batches,
   // with the same pause rule as a desired-state apply. Duplicate names are

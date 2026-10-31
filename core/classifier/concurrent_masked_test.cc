@@ -70,6 +70,45 @@ uint64_t LookupGates(const ConcurrentMaskedTable &t, ConstBytes keys,
   return hits;
 }
 
+// A walk resumed one rule at a time returns every rule present throughout,
+// though a higher-priority rule reorders the tuple list and a new mask adds
+// a tuple between the steps: the walk goes by mask, not list position.
+TEST(ConcurrentMaskedTableTest, ResumedWalkReturnsEveryStableRule) {
+  auto t = MakeTable();
+  const std::array<const Bytes *, 3> masks{&kFull, &kLow4, &kLow2};
+  std::map<std::pair<uint64_t, uint64_t>, int> seen;  // (mask, value) -> visits
+  for (const Bytes *mask : masks) {
+    uint64_t m;
+    std::memcpy(&m, mask->data(), kKeyLen);
+    for (uint64_t v = 1; v <= 100; v++) {
+      ASSERT_EQ(R::kInserted, t->Upsert(C(*mask), C(B(v & m)), 1, 1));
+      seen[{m, v & m}] = 0;
+    }
+  }
+  ConcurrentMaskedTable::WalkCursor cursor;
+  int step = 0;
+  bool more = true;
+  while (more) {
+    more = t->VisitFrom(&cursor, [&](ConstBytes mask, ConstBytes value,
+                                     const ConcurrentMaskedTable::Rule &,
+                                     ConcurrentMaskedTable::Ranges) {
+      uint64_t m;
+      uint64_t v;
+      std::memcpy(&m, mask.data(), kKeyLen);
+      std::memcpy(&v, value.data(), kKeyLen);
+      seen[{m, v}]++;
+      return false;
+    });
+    if (++step == 150) {
+      ASSERT_EQ(R::kInserted, t->Upsert(C(kLow2), C(B(0xbeef)), 99, 2));  // reorders
+      ASSERT_EQ(R::kInserted, t->Upsert(C(kLow1), C(B(0x7)), 1, 3));      // a new tuple
+    }
+  }
+  for (const auto &[rule, visits] : seen) {
+    EXPECT_GE(visits, 1) << std::hex << rule.first << "/" << rule.second;
+  }
+}
+
 TEST(ConcurrentMaskedTableTest, HigherPriorityThenLaterCommandWins) {
   auto t = MakeTable();
   const uint64_t key = 0x1122334455667788ull;

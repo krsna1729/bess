@@ -78,6 +78,35 @@ TEST(ConcurrentExactTableTest, InsertUpdateEraseAndIterate) {
   EXPECT_EQ(1u, t->size());
 }
 
+// A walk resumed one entry at a time (a page of one) visits every key present
+// throughout exactly once while keys come and go between the steps: a key
+// keeps its slot, and the walk goes by slot, not by cuckoo bucket.
+TEST(ConcurrentExactTableTest, ResumedWalkVisitsEveryStableKeyOnce) {
+  constexpr uint32_t kStable = 2000;
+  auto t = MakeTable(8192);
+  for (uint32_t id = 0; id < kStable; id++) {
+    ASSERT_EQ(ConcurrentExactTable::UpsertResult::kInserted, t->Upsert(B(K(id)), V(id)));
+  }
+  std::map<uint32_t, int> seen;
+  uint32_t churn = kStable;
+  uint32_t slot = 0;
+  do {
+    slot = t->VisitFrom(slot, [&](ConstBytes key, uint64_t value) {
+      uint32_t id;
+      std::memcpy(&id, key.data(), sizeof(id));
+      EXPECT_EQ(V(id), value);
+      seen[id]++;
+      return false;
+    });
+    t->Erase(B(K(churn)));
+    churn++;
+    ASSERT_NE(ConcurrentExactTable::UpsertResult::kFull, t->Upsert(B(K(churn)), V(churn)));
+  } while (slot != 0);
+  for (uint32_t id = 0; id < kStable; id++) {
+    EXPECT_EQ(1, seen[id]) << "key " << id;
+  }
+}
+
 // Decision D-015: lookups hash inline with a fixed-width kernel and call
 // DPDK's prehashed bulk lookup. That is only correct if the kernel is
 // bit-identical to the table's own hash (rte_hash_hash, used by every add and

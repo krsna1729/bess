@@ -194,15 +194,25 @@ yet, so its keys are checked only when the apply commits them).
 resource) lists those resources' contents too, so the snapshot applies back as
 a no-op. A response above the 64 MiB message limit is `RESOURCE_EXHAUSTED`:
 name fewer resources, or read one large table with `ReadResource` (D-170).
+The daemon refuses before reading an entry when the live entry counts alone
+cannot fit, and otherwise stops reading at the limit.
 
 `ReadResource` is one resource per server-streamed call, in bounded pages. The
 request names the resource (`<module>/<table>`) and `max_entries` (default
 4096, capped at 65536); a page is also bounded at 3 MiB of serialized message,
 framing included, so an entry larger than that travels alone. Each `ResourcePage`
-carries the resource name, the snapshot's `resource_generation` and
+carries the resource name, the `resource_generation` it was read at and
 `daemon_epoch`, and up to that many entries, so no message carries the whole
-table. The snapshot is taken when the call starts, and its generation is the
-one to send as a later write's expected generation. An unknown resource is
+table. The daemon reads one batch of up to `max_entries` per control-plane
+lock hold, from the resource's own cursor, and never holds more than that of
+the table. Pages follow Redis SCAN semantics: an entry present for the whole
+read is returned at least once; one written or erased meanwhile may be
+missed or returned twice, and a table that grows mid-read may return
+entries twice (a consumer that needs each once dedupes by key). When the
+first and last pages report the same generation, no write happened in
+between: the stream is one snapshot, each entry once, and that generation is
+the one to send as a later write's expected generation; otherwise re-read
+for one. An unknown resource is
 `NOT_FOUND`. In Go the generated stub is
 `controlv2.NewControlClient(conn).ReadResource(ctx, &controlv2.ReadResourceRequest{...})`,
 then `Recv` until `io.EOF`; Python uses the generated `stub.ReadResource`
