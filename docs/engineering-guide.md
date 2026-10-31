@@ -28,6 +28,8 @@ capabilities (D-180).
 | An installed header or plugin surface | [plugin-api.md](plugin-api.md); architecture.md §5 |
 | A `.proto` file | [compatibility.md](compatibility.md); [control-sdk.md](control-sdk.md) (regenerate the SDKs) |
 | A fixed limit (`kMax*`, `kMin*`, `kDefault*`, `*Limit*`, `MAX_*`, `MIN_*`, `DEFAULT_*`) | [limits.md](limits.md) |
+| A structure that grows with entries (table, arena, queue, index, record window), or a loop over entries | §8 and §9 of this page; [decisions.md](decisions.md) D-198 and D-206 |
+| A lock, an RCU retire path, or worker-owned state | §11 of this page; [dataplane-tables.md](dataplane-tables.md) §8 |
 
 ## 2. Packet-path correctness
 
@@ -200,6 +202,13 @@ The layers and the enforced edges are in architecture.md §1-2;
 9. **Do not write a kernel for hardware you cannot test** (no AVX-512
    without AVX-512 hardware, D-126). Every kernel has a portable fallback
    with an identity test.
+10. **Know where every thread runs.** The EAL pins the main thread and its
+    children inherit that CPU, so a bench and its readers shared one CPU
+    (D-021 cost section). Keep control threads off worker CPUs (D-118).
+11. **Count, do not time, a scale question** (§8). Under IRQ contamination,
+    claim only instruction counts (f86edc9f, 2a33b051).
+12. **Control-plane rates move with load.** Record the load average and
+    pair the runs: one sample was 3.4× off at load 1.3 (UPF 1cfcb8c).
 
 ## 6. Change hygiene
 
@@ -227,6 +236,13 @@ The layers and the enforced edges are in architecture.md §1-2;
     `tools/api_classes.json`.
 - **A `.proto` change** regenerates the Go and Python SDKs
   (`tools/gen_go_sdk.sh`, `tools/gen_python_sdk.sh`) in the same change.
+- **Review a fix as new code:** list the state it adds and that state's
+  rollback and release paths. A crash fix added a terminate on every
+  shutdown (49f1ec86 → cfa82e3b); a perf change's review found leak windows
+  (9cb5314a → e3238456).
+- **A claim names its check** (test, lane or measurement) or says
+  `[INFERENCE]`; the commit that falsifies a doc claim corrects it
+  (a0e0dfdb, 830f7cdf).
 - **A flaky test** gets its timing fixed, not its assertion loosened.
   Use an injected monotonic clock for deadline/state-transition checks, not
   sleeps. `utils::Codel<T, Clock>` accepts a clock as its last constructor
@@ -261,3 +277,116 @@ meson test -C build/fast --print-errorlogs \
   modules_transaction_conformance_test modules_bridge_test \
   modules_replicate_test packet_test metadata_test
 ```
+
+## 8. Control-plane scale
+
+Each miss below passed every functional test and showed only at 100K-1M
+entries. IDs such as CL-7 or CTL-5 name findings of the 2026-10-31
+data-structure audit at 2561ff36.
+
+1. **Cost follows what changed, not what is installed.** No whole clone,
+   copy or rebuild per transaction or reservation; a load of N of them is
+   O(N²). MeterResource copied capacity+1 entries per transaction and a
+   load fell from 3,000 to 800 sessions/s (59918343 → 4474ccfb). The packet
+   store's flows resource still copies its `std::map` (DP-2).
+2. **Grow geometrically.** `reserve(size() + n)` allocates exactly that, so
+   each call copies the whole vector (f59f3c8b; CL-7, RO-2, RO-3).
+   Copy `RcuDomain::ReserveRetirements`.
+3. **Reclaim on the path that makes the garbage,** in O(reclaimed). Reclaim
+   only in `Allocate()` never runs in a teardown: 1M took 60+ min against
+   44 s at 100K (f59f3c8b). Never erase from the front of a vector
+   (fd836db2, D-021; CL-8).
+4. **Many entries are many bounded batches.** The retire budget (2048 per
+   transaction) and the 64 MiB message limit refuse one huge transaction or
+   message (D-148, db34e956). Page reads; empty on the daemon side (D-170,
+   D-171). A batch starts where the last stopped: `ApplyBatched` restarts at
+   the whole tail, about N²/B `Reserve` calls (CTL-1).
+5. **Budget maintenance per run and resume** (791df7df, 2e8fc0f7). The
+   budget covers the whole lock hold, not each endpoint (CTL-5).
+6. **Prove it with a count.** Assert allocations, bytes or copies per
+   operation at two installed sizes
+   (`MeterResourceTest.ATransactionCostsWhatItChangesNotWhatIsInstalled`:
+   64 against 8,000), plus an erase-only run
+   (`RecordArenaTest.EraseOnlyWorkloadKeepsRetiringBounded`).
+7. **Justify each remaining O(N) step with `// scale: <bound>`** on the
+   line or the line above: what bounds N (config, a constant, the module
+   count) and the test, as the audit's JUSTIFIED rows do (CTL-7: 39 modules
+   in the deployed graph). A planned gate, `tools/check_scaling.py`, will
+   enforce it; it does not exist yet.
+
+**Scale review checklist.** Run it on every change that touches a table,
+queue, loop over entries, tick or packet path:
+
+- [ ] Per-operation cost is O(changed): no whole copy, rebuild or walk.
+- [ ] Containers grow geometrically; no `reserve(size() + n)`.
+- [ ] Garbage is reclaimed where it is made; an erase-only run stays bounded.
+- [ ] Queues reclaim in O(reclaimed), never by erasing from the front.
+- [ ] No message, transaction or lock hold scales with N; work is batched, paged, resumable.
+- [ ] No grace-period wait per item, and no destructor or `Synchronize()` under a lock.
+- [ ] Memory is admitted, `Bytes()` equals `bytes()`, nothing admitted stays unwritten (§9).
+- [ ] No allocation and no locked instruction per packet.
+- [ ] Each remaining O(N) step has a `// scale:` bound and a count-based test.
+
+## 9. Memory accounting
+
+- **State the bytes, then admit them.** `Bytes(args)` before construction
+  equals `bytes()` after. Admit before you allocate, and refuse with
+  RESOURCE_EXHAUSTED; never crash or answer UNAVAILABLE (D-198).
+- **A library's own allocation bypasses you.** Map its failure to a memory
+  refusal: an rte_hash defer ring failed at 373K UPF sessions and answered
+  "table full" with gRPC OK (ef6c8b48).
+- **Admitted is not resident; freed is not returned.** `rte_free` zero-fills
+  clean elements, so a `--no-huge` teardown made pages resident and was
+  OOM-killed (D-206; U-1).
+- **Do not admit what nothing writes.** 64 counter planes for one worker
+  cost 3 KiB per ActionId (U-6); a defer queue sized to every entry is
+  40% of an exact table (CL-4).
+- **Retained state is memory.** The transaction record window held about
+  351 MiB at 1M sessions (CTL-2; D-206). Admit per chunk, not per node:
+  each `Grow` reads cgroup files (CTL-4).
+- **No allocation per packet** (D-201: a map node per flow became a slot).
+
+## 10. Refusal and retry
+
+§7 covers publication. Every commit step has an undo (2aff76d2). Abort what
+staging took (88e517e6: an arena id leaked per failed staging). A deferred
+step that can be refused throws only having changed nothing and records its
+progress, so a retry does not replay it: a replayed stage emptied a slot
+twice (07bb1a87), a meter stage refunded twice (f50b68aa). A refused
+registration leaves nothing behind (c3ab8af0). Fail at every allocation
+point with `AllocationFaults`/`ForEachFailurePoint` (8c4a4433).
+
+## 11. Locks, RCU and worker-owned state
+
+- No destructor and no `Synchronize()` under a lock that they or a reader
+  take (2a5ff89c; D-021 amendment 2 answers kBusy); no grace-period wait
+  per item under a command lock (a85e9b38). One lock order: take the
+  second lock after releasing the first (7225386e).
+- A freed id stays retiring for a grace period; a test that reuses it
+  holds a reader (9a7b9cb5). Rewrite worker-owned state only while the
+  worker is parked, or keep it per worker (b729aa6b, fc1db537).
+- Readers' and writer's fields go on separate cache lines, with fences for
+  Dekker flags (ef099df3, 876837c7).
+
+## 12. Tests that check something
+
+- **A fake enforces the engine's rules.** A recorder that accepted anything
+  passed three UPF commits the daemon refuses (UPF 0ac7d0c). Use the real
+  engine (§7) or a fake that refuses what it refuses.
+- **A run that did not run fails.** Skipped benches recorded 0 ns
+  (1ebaad69); a bench with no default gate counted misses as hits (dbc359ff).
+- **Concurrency tests pass under `taskset -c 0`** (4db3819d). Loop until
+  progress, not a fixed count (bf25c58c); never ASSERT with joinable threads
+  (58aa8765, 641ed215); size contention to your CPUs (f9f665f4).
+- **Take CPUs from the affinity mask** (9ce02101, b9a7fe91), and write
+  scratch under the run's directory, not a shared `/tmp` (637d67f4).
+
+## 13. Toolchain traps
+
+- Range-for over a member of a temporary dangles: three incidents
+  (98ca6788, 0b54b3db, 43075325). Check a wire integer's range before
+  narrowing (52f261d4); widen before a multiply (820c9146).
+- An absolute `-I` made depfiles stale under ccache (f79063f5). A static
+  `bessd` loaded a second protobuf runtime (3f021949) and needs DPDK drivers
+  whole-archive (e7fcedb7). Put the ISA baseline in cache keys (68d2b677).
+  Inline asm needs earlyclobber and memory clobbers (f79c20c8, ddae0181).
