@@ -193,12 +193,6 @@
     "core/utils/common.h": {
       "performance-noexcept-move-constructor": 1
     },
-    "core/utils/cuckoo_map.h": {
-      "bugprone-assignment-in-if-condition": 2,
-      "bugprone-multi-level-implicit-pointer-conversion": 2,
-      "bugprone-use-after-move": 3,
-      "cppcoreguidelines-narrowing-conversions": 2
-    },
     "core/utils/endian.h": {
       "misc-redundant-expression": 3
     },

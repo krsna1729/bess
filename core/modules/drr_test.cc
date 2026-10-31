@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// DRR's flow admission (D-019): a new flow ends up both in the flow map and
+// DRR's flow admission (D-019): a new flow ends up both in the flow table and
 // on the round-robin ring, or in neither, and every packet is either queued or
-// freed -- under a failure at each step (deterministic fault injection), not
-// only on the stress path.
+// freed; admitting a flow allocates nothing, and a round visits only the flows
+// with packets queued.
 
 #include "modules/drr.h"
 
@@ -25,42 +25,39 @@
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
+#include "testing/allocation_faults.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
 class DrrTestPeer {
  public:
-  using Faults = DRR::Faults;
-
-  static void Setup(DRR &drr) {
-    drr.max_number_flows_ = 64;
-    ASSERT_EQ(drr.AllocateRings().error().code(), 0);
+  // `flows`: a power of two, the round-robin ring's size (num_flows + 1).
+  static void Setup(DRR &drr, uint32_t flows = 64) {
+    drr.max_number_flows_ = flows;
+    ASSERT_EQ(drr.AllocateState().error().code(), 0);
   }
-  static Faults &faults(DRR &drr) { return drr.faults_; }
   using FlowId = DRR::FlowId;
   static FlowId IdOf(DRR &drr, bess::PacketRef pkt) { return drr.GetId(pkt); }
-  static void Drain(DRR &drr) { drr.DrainIngress(DRR::kIngressPerRun); }
+  static void Drain(DRR &drr) { drr.DrainIngress(DRR::kIngressPerRun, 0); }
   static void SetQuantum(DRR &drr, uint32_t q) {
     ASSERT_EQ(drr.SetQuantumSize(q).error().code(), 0);
   }
   static uint32_t NextBatch(DRR &drr, bess::PacketBatch *batch) {
-    int err = 0;
     batch->clear();
-    const uint32_t bytes = drr.GetNextBatch(batch, &err);
-    EXPECT_GE(err, 0);
-    return bytes;
+    return drr.GetNextBatch(batch);
   }
-  static size_t Mapped(const DRR &drr) { return drr.flows_.Count(); }
+  static size_t Mapped(const DRR &drr) { return drr.flows_->size(); }
+  // The flows a round of the task visits.
   static size_t Scheduled(const DRR &drr) {
     return rte_ring_count(drr.flow_ring_) + (drr.current_flow_ ? 1 : 0);
   }
   // Every mapped flow is on the round-robin ring exactly once, and nothing
-  // else is.
+  // else is (every flow here has a packet queued).
   static bool MapMatchesRing(DRR &drr) {
     std::set<const void *> mapped;
-    for (const auto &entry : drr.flows_) {
-      mapped.insert(entry.second);
-    }
+    drr.flows_->ForEach([&](bess::flow::FlowHandle, const FlowId &, const DRR::Flow &f) {
+      mapped.insert(&f);
+    });
     std::vector<void *> ring(rte_ring_count(drr.flow_ring_));
     const unsigned n = rte_ring_sc_dequeue_bulk(drr.flow_ring_, ring.data(),
                                                 ring.size(), nullptr);
@@ -73,7 +70,7 @@ class DrrTestPeer {
 namespace {
 
 // Ethernet + IPv4 + UDP, one flow per `flow`.
-bess::PacketHandle FlowPacket(bess::PlainPacketPool &pool, uint8_t flow) {
+bess::PacketHandle FlowPacket(bess::PlainPacketPool &pool, uint16_t flow) {
   bess::PacketHandle pkt = pool.Alloc(60);
   if (pkt == nullptr) {
     return nullptr;
@@ -84,7 +81,9 @@ bess::PacketHandle FlowPacket(bess::PlainPacketPool &pool, uint8_t flow) {
   p[14] = 0x45;           // version 4, 20-byte header
   p[16] = 0; p[17] = 46;  // total length
   p[23] = 17;             // UDP
-  p[26] = 10; p[29] = flow;          // source 10.0.0.<flow>
+  p[26] = 10;             // source 10.0.<flow>
+  p[28] = static_cast<uint8_t>(flow >> 8);
+  p[29] = static_cast<uint8_t>(flow);
   p[30] = 10; p[31] = 1; p[33] = 1;  // destination 10.1.0.1
   p[35] = 53; p[37] = 53;            // ports
   return pkt;
@@ -100,60 +99,90 @@ bess::PacketHandle SizedFlowPacket(bess::PlainPacketPool &pool, uint8_t flow,
   return pkt;
 }
 
-void Send(DRR &drr, bess::PlainPacketPool &pool, uint8_t first, int n) {
+// One packet each of flows first .. first + n - 1 (n <= 32), into the ingress.
+void Hand(DRR &drr, bess::PlainPacketPool &pool, uint16_t first, int n) {
   bess::PacketBatch batch;
   batch.clear();
   for (int i = 0; i < n; i++) {
-    bess::PacketHandle pkt = FlowPacket(pool, static_cast<uint8_t>(first + i));
+    bess::PacketHandle pkt = FlowPacket(pool, static_cast<uint16_t>(first + i));
     ASSERT_NE(pkt, nullptr);
     batch.add(bess::PacketRef(pkt));
   }
   drr.ProcessBatch(nullptr, &batch);
+}
+
+void Send(DRR &drr, bess::PlainPacketPool &pool, uint16_t first, int n) {
+  Hand(drr, pool, first, n);
   DrrTestPeer::Drain(drr);
 }
 
-struct Case {
-  const char *name;
-  bool DrrTestPeer::Faults::*fault;
-  bool flow_survives;  // only the first packet is lost
-};
-
-class DrrAdmissionTest : public ::testing::TestWithParam<Case> {};
-
-TEST_P(DrrAdmissionTest, FailedStepLeavesNoHalfCreatedFlowAndNoLeak) {
+// A full flow table drops a new flow's packet: no half-made flow, no leak.
+TEST(DrrAdmissionTest, AFullFlowTableDropsTheNewFlowsPacket) {
   bess::PlainPacketPool pool(256);
   const size_t capacity = pool.Size();
   {
     DRR drr;
-    DrrTestPeer::Setup(drr);
-    DrrTestPeer::faults(drr).*GetParam().fault = true;
-    Send(drr, pool, 1, 4);
-    const size_t expected = GetParam().flow_survives ? 4 : 0;
-    EXPECT_EQ(DrrTestPeer::Mapped(drr), expected);
-    EXPECT_EQ(DrrTestPeer::Scheduled(drr), expected);
+    DrrTestPeer::Setup(drr);  // 63 flows
+    Send(drr, pool, 1, 32);
+    Send(drr, pool, 33, 32);
+    Send(drr, pool, 65, 6);
+    EXPECT_EQ(DrrTestPeer::Mapped(drr), 63u);
+    EXPECT_EQ(DrrTestPeer::Scheduled(drr), 63u);
     EXPECT_TRUE(DrrTestPeer::MapMatchesRing(drr));
-    EXPECT_EQ(pool.Size(), capacity) << "a packet of a failed admission leaked";
-
-    // With the fault cleared the same flows are admitted normally.
-    DrrTestPeer::faults(drr).*GetParam().fault = false;
-    Send(drr, pool, 1, 4);
-    EXPECT_EQ(DrrTestPeer::Mapped(drr), 4u);
-    EXPECT_EQ(DrrTestPeer::Scheduled(drr), 4u);
-    EXPECT_TRUE(DrrTestPeer::MapMatchesRing(drr));
-    EXPECT_EQ(pool.Size(), capacity - 4) << "four packets queued";
+    EXPECT_EQ(pool.Size(), capacity - 63) << "the 7 packets past the table were freed";
   }
   EXPECT_EQ(pool.Size(), capacity) << "destroying DRR freed every packet";
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    EachStep, DrrAdmissionTest,
-    ::testing::Values(Case{"QueueAlloc", &DrrTestPeer::Faults::queue_alloc, false},
-                      Case{"MapInsert", &DrrTestPeer::Faults::map_insert, false},
-                      Case{"RingEnqueue", &DrrTestPeer::Faults::ring_enqueue, false},
-                      Case{"FirstPacket", &DrrTestPeer::Faults::first_enqueue, true}),
-    [](const ::testing::TestParamInfo<Case> &info) {
-      return std::string(info.param.name);
-    });
+// MA-B1: admitting 1000 new flows allocates nothing on the task's worker (the
+// flow table and queue slab are made at Init).
+TEST(DrrAdmissionTest, NewFlowsAllocateNothing) {
+  constexpr int kFlows = 1000;
+  bess::PlainPacketPool pool(kFlows + 64);
+  DRR drr;
+  DrrTestPeer::Setup(drr, 2048);
+  size_t allocations = 0;
+  for (int first = 1; first <= kFlows; first += 25) {
+    Hand(drr, pool, static_cast<uint16_t>(first), 25);
+    const bess::fault_injection::AllocationFaults window;
+    DrrTestPeer::Drain(drr);
+    allocations += window.allocations();
+  }
+  EXPECT_EQ(DrrTestPeer::Mapped(drr), static_cast<size_t>(kFlows));
+  EXPECT_EQ(0u, allocations);
+}
+
+// MA-B2: a flow drained of its packets leaves the round robin, so with 10,000
+// idle flows and one packet queued a round visits one flow, not 10,000.
+TEST(DrrSchedulingTest, ARoundVisitsOnlyTheFlowsWithPackets) {
+  constexpr int kFlows = 10'000;
+  bess::PlainPacketPool pool(kFlows + 64);
+  const size_t capacity = pool.Size();
+  {
+    DRR drr;
+    DrrTestPeer::Setup(drr, 16384);
+    for (int first = 1; first <= kFlows; first += 25) {
+      Send(drr, pool, static_cast<uint16_t>(first), 25);
+    }
+    ASSERT_EQ(DrrTestPeer::Mapped(drr), static_cast<size_t>(kFlows));
+    size_t sent = 0;
+    for (bess::PacketBatch out; DrrTestPeer::NextBatch(drr, &out) > 0;) {
+      sent += out.cnt();
+      bess::PacketFreeBatch(&out);
+    }
+    ASSERT_EQ(static_cast<size_t>(kFlows), sent);
+    EXPECT_EQ(0u, DrrTestPeer::Scheduled(drr));
+
+    Send(drr, pool, 7, 1);
+    EXPECT_EQ(1u, DrrTestPeer::Scheduled(drr));
+    bess::PacketBatch out;
+    EXPECT_GT(DrrTestPeer::NextBatch(drr, &out), 0u);
+    EXPECT_EQ(1, out.cnt());
+    bess::PacketFreeBatch(&out);
+    EXPECT_EQ(DrrTestPeer::Mapped(drr), static_cast<size_t>(kFlows)) << "idle, not expired";
+  }
+  EXPECT_EQ(pool.Size(), capacity);
+}
 
 bess::PacketHandle Bytes(bess::PlainPacketPool &pool,
                         const std::vector<uint8_t> &bytes) {
@@ -281,44 +310,6 @@ TEST(DrrFlowIdTest, ChainedPacketsGiveTheSameFlowAtEverySplit) {
         << "split at " << at;
     bess::PacketFree(pkt);
   }
-}
-
-// A flow whose queue fills is grown; if that allocation fails, the flow keeps
-// its queue and packets and only the new packet is dropped (the queue used to
-// become null and leak).
-TEST(DrrQueueTest, FailedGrowthKeepsTheFlowsQueue) {
-  constexpr int kPackets = DRR::kFlowQueueSize + 64;
-  bess::PlainPacketPool pool(kPackets + 64);
-  const size_t capacity = pool.Size();
-  {
-    DRR drr;
-    DrrTestPeer::Setup(drr);
-    DrrTestPeer::faults(drr).resize_alloc = true;
-    for (int sent = 0; sent < kPackets; sent += 32) {
-      bess::PacketBatch batch;
-      batch.clear();
-      for (int i = 0; i < 32; i++) {
-        batch.add(bess::PacketRef(FlowPacket(pool, 1)));
-      }
-      drr.ProcessBatch(nullptr, &batch);
-      DrrTestPeer::Drain(drr);
-    }
-    EXPECT_EQ(DrrTestPeer::Mapped(drr), 1u);
-    // The initial ring holds size - 1 packets; the rest were dropped.
-    EXPECT_EQ(pool.Size(), capacity - (DRR::kFlowQueueSize - 1));
-
-    // With growth working again the queue grows past its first size.
-    DrrTestPeer::faults(drr).resize_alloc = false;
-    bess::PacketBatch batch;
-    batch.clear();
-    for (int i = 0; i < 32; i++) {
-      batch.add(bess::PacketRef(FlowPacket(pool, 1)));
-    }
-    drr.ProcessBatch(nullptr, &batch);
-    DrrTestPeer::Drain(drr);
-    EXPECT_EQ(pool.Size(), capacity - (DRR::kFlowQueueSize - 1) - 32);
-  }
-  EXPECT_EQ(pool.Size(), capacity) << "destroying DRR freed every packet";
 }
 
 // Deficit round robin: backlogged flows get equal bytes whatever their packet

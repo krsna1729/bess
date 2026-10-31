@@ -8,10 +8,12 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <memory>
 
 #include <rte_hash_crc.h>
 #include <rte_ring.h>
 
+#include "flow/worker_flow_table.h"
 #include "framework/memory_scope.h"
 #include "framework/singleton_resource.h"
 #include "module.h"
@@ -19,11 +21,9 @@
 #include "pktbatch.h"
 #include "stats/counter_set.h"
 #include "stats/metric_registry.h"
-#include "utils/cuckoo_map.h"
 #include "utils/ip.h"
 
 using bess::utils::Ipv4Prefix;
-using bess::utils::CuckooMap;
 
 //
 // This module implements Deficit Round Robin, a fair queueing algorithm, for
@@ -68,9 +68,9 @@ class DRR final : public Module {
   static const int kDefaultNumFlows = 4096;
   // Upper bound for the num_flows argument (the round-robin ring's size).
   static constexpr uint32_t kMaxNumFlows = uint32_t{1} << 24;
-  static const int kFlowQueueSize = 2048;  // initial queue size for a flow
-  static const int kQueueGrowthFactor =
-      2;  // the scale at which a flow's queue grows
+  // Packets queued in all flows at once, at most: the queue slab's size (the
+  // smaller of this and num_flows x kFlowQueueMax). A full slab drops.
+  static constexpr uint32_t kMaxQueuedPackets = uint32_t{1} << 18;
   static const int kFlowQueueMax =
       8192;                     // the max flow queue size if non-specified
   static const int kTtl = 300;  // time to live for flow entries
@@ -94,56 +94,33 @@ class DRR final : public Module {
     uint8_t protocol;
   };
 
-  // stores the metrics of the flow, a timer and the queue to store the packets
-  // in.
+  // A flow: its deficit, when it last queued a packet, and its queue, a FIFO
+  // of slots in the module's queue slab (head first). Lives in the flow
+  // table's slot; the slab owns the packets.
   struct Flow {
-    uint32_t deficit;                // the allocated bytes to the flow
-    double timer;                  // to determine if TTL should be used
-    FlowId id;                     // allows the flow to remove itself from the map
-    struct rte_ring *queue;        // queue to store current packets for flow
-    bess::PacketHandle next_packet;  // buffer to store next packet from the queue.
-    Flow() : deficit(0), timer(0), id(), queue(nullptr), next_packet(nullptr){};
-    Flow(FlowId new_id)
-        : deficit(0), timer(0), id(new_id), queue(nullptr),
-          next_packet(nullptr){};
-    ~Flow() {
-      if (queue) {
-        bess::PacketHandle pkt;
-        while (rte_ring_sc_dequeue(queue, reinterpret_cast<void **>(&pkt)) ==
-               0) {
-          bess::PacketFree(pkt);
-        }
-
-        std::free(queue);
-      }
-
-      if (next_packet) {
-        bess::PacketFree(next_packet);
-      }
-    }
+    uint32_t deficit = 0;      // the allocated bytes to the flow
+    uint32_t count = 0;        // packets queued
+    uint32_t head = 0;         // first queued slot (when count > 0)
+    uint32_t tail = 0;         // last queued slot (when count > 0)
+    bool active = false;       // on the round-robin ring, or current_flow_
+    uint64_t last_ns = 0;      // when it last queued a packet
+    FlowId id{};               // allows the flow to remove itself from the map
   };
 
-  // hashes a FlowId
+  // hashes a FlowId: its fields' bytes, as the flow table's default hash
+  // does for a key without padding (FlowId has some).
   struct Hash {
-    // a similar method to boost's hash_combine in order to combine hashes
-    inline void combine(std::size_t &hash, const unsigned int &val) const {
-      std::hash<unsigned int> hasher;
-      hash ^= hasher(val) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    }
-    bess::utils::HashResult operator()(const FlowId &id) const {
-      std::size_t hash = 0;
-      combine(hash, id.src_ip);
-      combine(hash, id.dst_ip);
-      combine(hash, id.src_port);
-      combine(hash, id.dst_port);
-      combine(hash, (uint32_t)id.protocol);
-      return hash;
+    uint64_t operator()(const FlowId &id) const noexcept {
+      const uint64_t words[3] = {uint64_t{id.src_ip} << 32 | id.dst_ip,
+                                 uint64_t{id.src_port} << 32 | id.dst_port,
+                                 id.protocol};
+      return bess::flow::detail::HashFixedBytes<sizeof(words)>(words);
     }
   };
 
   // to compare two FlowId for equality in a hash table
   struct EqualTo {
-    bool operator()(const FlowId &id1, const FlowId &id2) const {
+    bool operator()(const FlowId &id1, const FlowId &id2) const noexcept {
       bool ips = (id1.src_ip == id2.src_ip) && (id1.dst_ip == id2.dst_ip);
       bool ports =
           (id1.src_port == id2.src_port) && (id1.dst_port == id2.dst_port);
@@ -184,83 +161,69 @@ class DRR final : public Module {
   //  Returns 0 on success and error value otherwise.
   CommandResponse SetMaxFlowQueueSize(uint32_t queue_size);
 
-  //  Creates a new larger ring queue of the specifed size and moves over all
-  //  of the entries from the old queue and frees the old_queue. Takes a pointer
-  //  to the
-  //  location of the  current queue, the new size of the queue and integer
-  //  pointer
-  //  to set on error. If the integer pointer is set than the return value will
-  //  be
-  //  a
-  //  nullptr. Returns a pointer to the new ring otherwise.
-  rte_ring *ResizeQueue(rte_ring *old_queue, uint32_t new_size, int *err);
-
-  //  Puts the packet into the ring queue within the flow. Takes the flow to
-  //  enqueue into, the packet handle to enqueue into the flow's queue
-  //  and integer pointer to be set on error.
-  void Enqueue(Flow *f, bess::PacketHandle pkt, int *err);
+  //  Appends the packet to the flow's queue, and puts the flow on the
+  //  round-robin ring if it was idle. Drops the packet when the flow's queue is
+  //  at the max flow queue size or the queue slab is full.
+  void Enqueue(Flow *f, bess::PacketHandle pkt, uint64_t now);
 
   //  Moves up to `limit` packets from the ingress ring into their flows' queues
   //  (the task's worker only).
-  void DrainIngress(uint32_t limit);
+  void DrainIngress(uint32_t limit, uint64_t now);
 
-  //  Puts one packet into its flow, creating the flow if needed.
-  void Classify(bess::PacketHandle pkt);
+  //  Puts one packet into its flow, creating the flow if needed (a full flow
+  //  table drops the packet).
+  void Classify(bess::PacketHandle pkt, uint64_t now);
 
   //  Takes a PacketRef to get a flow id for. Returns the 5 element identifier
   //  for the packet's flow.
   FlowId GetId(bess::PacketRef pkt);
 
-  //  Creates a new flow and adds it to the round robin queue. Takes the packet
-  //  handle to enqueue, the id of the new flow and integer pointer to set on
-  //  error.
-  void AddNewFlow(bess::PacketHandle pkt, FlowId id, int *err);
-
-  //  Removes the flow from the hash table and frees all the packets within its
-  //  queue. Takes the pointer to the flow to remove
-  void RemoveFlow(Flow *f);
+  //  Removes the idle flows (not on the ring, nothing queued) older than kTtl
+  //  among the next kSweepSlots slots of the flow table.
+  void ExpireIdle(uint64_t now);
 
   //  Obtain the next batch of packets from the next flows in round robin.
-  //  Takes a PacketBatch to insert the packets into and integer pointer
-  //  to set on error. Returns total bytes added to batch.
-  uint32_t GetNextBatch(bess::PacketBatch *batch, int *err);
+  //  Takes a PacketBatch to insert the packets into. Returns total bytes
+  //  added to batch.
+  uint32_t GetNextBatch(bess::PacketBatch *batch);
 
   //  gets the next set of packets from flow given allocated bytes
   //  Takes the PacketBatch to put the packets into and the flow to get the
-  //  packets
-  //  from and integer pointer to set on error. Returns the total bytes put in
-  //  batch
-  uint32_t GetNextPackets(bess::PacketBatch *batch, Flow *f, int *err);
+  //  packets from. Returns the total bytes put in batch
+  uint32_t GetNextPackets(bess::PacketBatch *batch, Flow *f);
 
-  //  gets the next flow from the queue of flows. Returns nullptr if the next
-  //  flow is empty or if the flow is deleted. If there is a an error returns
-  //  an error and sets the integer pointer to error value.
-  Flow *GetNextFlow(int *err);
+  //  gets the next flow from the round-robin ring of flows with packets, and
+  //  adds a quantum to its deficit. Returns nullptr when the ring is empty.
+  Flow *GetNextFlow();
 
-  //  allocates ring queue space and adds the queue to the specified flow with
-  //  size indicated by slots. Takes the Flow to add the queue, the number
-  //  of slots for the queue to have and the integer pointer to set on error.
-  //  Returns a ring queue.
-  // `flags` defaults to single-producer/single-consumer.
+  //  allocates ring space for `slots` entries. Sets the integer pointer on
+  //  error. `flags` defaults to single-producer/single-consumer.
   rte_ring *AddQueue(uint32_t slots, int *err,
                      unsigned flags = RING_F_SP_ENQ | RING_F_SC_DEQ);
 
   friend class DrrTestPeer;
 
-  // Admits (D-198, "rings") and allocates the round-robin and ingress rings
-  // (Init, after the task). A refusal throws MemoryRefused, nothing allocated.
-  CommandResponse AllocateRings();
+  // Admits (D-198) and allocates what the task uses: the round-robin and
+  // ingress rings ("rings"), the flow table ("flows") and the queue slab
+  // ("queue") (Init, after the task). A refusal throws MemoryRefused.
+  CommandResponse AllocateState();
 
-  // Test-only fault injection for the flow-creation slow path (DrrTestPeer).
-  // Never set in production; checked only when a new flow is created.
-  struct Faults {
-    bool queue_alloc = false;
-    bool map_insert = false;
-    bool ring_enqueue = false;
-    bool first_enqueue = false;
-    bool resize_alloc = false;  // growing a full flow queue
+  // A queued packet: a slot of the queue slab, linked to the next one of its
+  // flow (or of the free list).
+  struct Queued {
+    bess::PacketHandle pkt = nullptr;
+    uint32_t next = 0;
   };
-  Faults faults_;
+  // Flow table slots ExpireIdle visits per task run.
+  static constexpr size_t kSweepSlots = 64;
+  // The flow table: fixed at Init, nothing allocated or rehashed on the
+  // worker (MA-B1). Unchecked ownership: the task may move between workers
+  // while they are paused, and D-019 (draining_ below) already guarantees one
+  // user at a time.
+  struct FlowTableTraits : bess::flow::DefaultFlowTableTraits {
+    using Owner = bess::flow::UncheckedOwner;
+  };
+  using FlowTable = bess::flow::WorkerFlowTable<FlowId, Flow, Hash, EqualTo, FlowTableTraits>;
 
   // the number of bytes to allocate to each flow in each round. Set by
   // commands, read by the task.
@@ -273,14 +236,22 @@ class DRR final : public Module {
   // max number of flow's that the module will handle.
   uint32_t max_number_flows_;
 
-  // state map used to reunite packets with their flow
-  CuckooMap<FlowId, Flow *, Hash, EqualTo> flows_;
+  // The flows (max_number_flows_ - 1: what the round-robin ring holds),
+  // admitted as "flows".
+  bess::framework::Sized<FlowTable> flows_;
   rte_ring *ingress_;     // multi-producer, single-consumer: packets in.
-  rte_ring *flow_ring_;   // ring used for round robin.
+  // The round robin: only the flows with packets queued (MA-B2), each once.
+  rte_ring *flow_ring_;
   // The admission of flow_ring_ and ingress_ ("rings", D-198), released with
-  // the module after ~DRR frees them. The per-flow rings and Flow objects are
-  // created on the task's worker (packet path) and are not admitted.
+  // the module after ~DRR frees them.
   bess::framework::MemoryLease rings_lease_;
+  // The queue slab ("queue"): every queued packet, linked per flow; free_
+  // heads the free list (queue_slots_ when the slab is full).
+  bess::framework::MemoryLease queue_lease_;
+  std::unique_ptr<Queued[]> queued_;
+  uint32_t queue_slots_ = 0;
+  uint32_t free_ = 0;
+  size_t sweep_cursor_ = 0;  // ExpireIdle's next flow table slot
   Flow *current_flow_;  // store current flow between batch rounds.
 
   // The D-019 ownership invariant, checked in debug builds: the task (its

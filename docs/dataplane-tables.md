@@ -737,7 +737,7 @@ reference to something missing.
 | URLFilter | `Trie` per host | Pause | legacy: cleartext HTTP only; a modern SNI classifier is recorded in MODERNIZATION §31.6 |
 | BPF | compiled filters | Pause | deferred: G together with the `rte_bpf` decision (MODERNIZATION §31.6) |
 | NAT | `nat::Nat`: bindings on `WorkerFlowTable` (internal endpoint key, external alias), `PortPool` bitmaps, expiry wheel | worker-owned (the packet path creates mappings) | one worker; D-068 |
-| DRR | `CuckooMap` of flows | worker-owned: upstream workers hand packets over an MP/SC ingress ring; the task's worker owns the flow map and queues; commands are atomics | D-019 |
+| DRR | `WorkerFlowTable` of flows, fixed at Init; per-flow FIFOs in one queue slab | worker-owned: upstream workers hand packets over an MP/SC ingress ring; the task's worker owns the flow table, the queues and the round robin (flows with packets only); commands are atomics | D-019 |
 | Bridge | `l2::Fdb` (`MacTable` + `ExpiryWheel`) | worker-owned (the packet path learns); commands are THREAD_UNSAFE | one worker; D-064 |
 
 ## 6. Why it is like this
