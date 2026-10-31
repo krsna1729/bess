@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "control/control_error.h"
 #include "dataplane/transaction_engine.h"
@@ -28,12 +29,16 @@ namespace bess::control {
 //     the record; the same id with other contents is refused (kConflict).
 //     BUSY and CONFLICT outcomes attempted nothing and are not recorded:
 //     the client retries under the same id.
-//   - Records live in a bounded window, oldest out first (kMaxRecords),
-//     on glibc, every byte charged through utils::AdmittedGlibcAllocator to
+//   - Records live in a bounded window, oldest out first: at most
+//     kMaxRecords records, and at most kMaxRecordBytes charged (D-207), on
+//     glibc, every byte charged through utils::AdmittedGlibcAllocator to
 //     the daemon's scope, resource "transaction_records" (D-206, class C):
-//     the id, the record (kept serialized, so its own allocations are the
-//     string's) and the window's bookkeeping. Charged before the
-//     transaction is attempted: a refused charge refuses it with nothing
+//     the id, the record and the window's bookkeeping. A record is kept
+//     serialized and compacted (D-207): only the operation results that
+//     differ from the transaction's common one (an applied transaction keeps
+//     none), so a 1600-operation load costs its id, not 1600 results; Get
+//     and a replay rebuild the full record, byte-identical. Charged before
+//     the transaction is attempted: a refused charge refuses it with nothing
 //     applied (RESOURCE_EXHAUSTED), so an applied outcome is always recorded.
 //   - The daemon epoch is drawn at construction: a record of another epoch
 //     cannot exist, so a client that sees the epoch change knows an unknown
@@ -44,6 +49,7 @@ namespace bess::control {
 class DataplaneTransactions {
  public:
   static constexpr size_t kMaxRecords = 4096;
+  static constexpr size_t kMaxRecordBytes = size_t{4} << 20u;
 
   DataplaneTransactions(dataplane::TransactionEngine &engine,
                         const framework::ResourceBindings &bindings);
@@ -53,9 +59,9 @@ class DataplaneTransactions {
       : engine_(engine),
         bindings_(bindings),
         epoch_(epoch),
-        records_(Records::allocator_type(&growth_)),
-        order_(Order::allocator_type(&growth_)) {}
-  // The containers' allocators point at growth_.
+        records_(Records::allocator_type(lease_.growth())),
+        order_(Order::allocator_type(lease_.growth())) {}
+  // The containers' allocators point at lease_'s growth hook.
   DataplaneTransactions(const DataplaneTransactions &) = delete;
   DataplaneTransactions &operator=(const DataplaneTransactions &) = delete;
 
@@ -85,13 +91,24 @@ class DataplaneTransactions {
 
   uint64_t epoch() const { return epoch_; }
   size_t records() const { return records_.size(); }
+  // What the window is charged now (the lease kMaxRecordBytes bounds).
+  size_t bytes() const { return lease_.bytes(); }
 
  private:
   using Text = std::basic_string<char, std::char_traits<char>,
                                  utils::AdmittedGlibcAllocator<char>>;
+  using Positions =
+      std::vector<uint32_t, utils::AdmittedGlibcAllocator<uint32_t>>;
+  // A record as kept: `record` serializes it without its id (the map key)
+  // and without the results equal to `common` (status, no error); it holds
+  // the others, at positions `at`, of `ops` in all.
   struct Recorded {
     uint64_t digest;
-    Text record;  // a serialized pb::v2::TransactionRecord
+    Text record;
+    uint32_t ops = 0;
+    pb::v2::TransactionOpResult::Status common =
+        pb::v2::TransactionOpResult::STATUS_APPLIED;
+    Positions at;
   };
   // Looked up by std::string without a copy: compared as string_views
   // (strings of different allocators have no operator==).
@@ -115,22 +132,29 @@ class DataplaneTransactions {
       std::deque<const Text *, utils::AdmittedGlibcAllocator<const Text *>>;
 
   // The record of a transaction about to be attempted, charged now (D-206):
-  // its id, the bytes its largest applied outcome of `ops` operations
-  // serializes to, its map node and bucket room, and a window slot at the
-  // back of order_ (nullptr until CommitRecord). Throws MemoryRefused,
+  // its id, the bytes its applied outcome serializes to (compacted, it keeps
+  // no operation result), its map node and bucket room, and a window slot at
+  // the back of order_ (nullptr until CommitRecord). Throws MemoryRefused,
   // leaving order_ unchanged; the caller pops the slot if it does not commit.
   Records::node_type ReserveRecord(const std::string &request_id,
-                                   uint64_t digest, int ops);
-  // Records `record` in a node and slot ReserveRecord gave, ageing the oldest
-  // out. Allocates nothing for an applied record; a rejection whose errors
-  // outgrow the reserved bytes may throw MemoryRefused, recording nothing.
+                                   uint64_t digest);
+  // Records `record`, compacted, in a node and slot ReserveRecord gave,
+  // ageing the oldest out past kMaxRecords or kMaxRecordBytes. Allocates
+  // nothing for an applied record; a rejection's kept results may throw
+  // MemoryRefused, recording nothing.
   void CommitRecord(Records::node_type node,
                     const pb::v2::TransactionRecord &record);
+  // The full record `kept` was compacted from, its id `request_id`.
+  static pb::v2::TransactionRecord Expand(std::string_view request_id,
+                                          const Recorded &kept);
 
   dataplane::TransactionEngine &engine_;
   const framework::ResourceBindings &bindings_;
   const uint64_t epoch_;
-  framework::ProcessGrowth growth_{"transaction_records"};  // before records_
+  // Charges the daemon's scope (bessd/transaction_records) for what the
+  // containers hold; declared before them.
+  framework::MemoryLease lease_ =
+      framework::MemoryAccounts::Process().Lease("transaction_records", 0);
   Records records_;
   Order order_;
 };

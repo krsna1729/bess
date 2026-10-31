@@ -2,9 +2,10 @@
 
 #include "control/dataplane_transactions.h"
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <expected>
-#include <functional>
 #include <limits>
 #include <optional>
 #include <random>
@@ -13,7 +14,7 @@
 #include <vector>
 
 #include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <google/protobuf/io/zero_copy_stream.h>
 
 #include "framework/resource_bindings.h"
 
@@ -34,21 +35,55 @@ uint64_t DrawEpoch() {
   return epoch;
 }
 
-// A digest of what the request asks for (everything but its id).
+// Hashes (FNV-1a) what is serialized into it, a buffer at a time, so the
+// digest of a request costs no copy of it (D-207).
+class HashStream final : public google::protobuf::io::ZeroCopyOutputStream {
+ public:
+  bool Next(void **data, int *size) override {
+    Flush();
+    *data = buffer_;
+    *size = sizeof(buffer_);
+    pending_ = sizeof(buffer_);
+    count_ += pending_;
+    return true;
+  }
+  void BackUp(int count) override {
+    pending_ -= count;
+    count_ -= count;
+  }
+  int64_t ByteCount() const override { return count_; }
+  uint64_t Finish() {
+    Flush();
+    return hash_;
+  }
+
+ private:
+  void Flush() {
+    for (int i = 0; i < pending_; i++) {
+      hash_ = (hash_ ^ buffer_[i]) * 0x100000001b3ULL;
+    }
+    pending_ = 0;
+  }
+
+  unsigned char buffer_[4096];
+  int pending_ = 0;
+  int64_t count_ = 0;
+  uint64_t hash_ = 0xcbf29ce484222325ULL;
+};
+
+// A digest of the request, its deterministic serialization hashed as it is
+// written. The id is part of it: digests are only compared under one id.
 uint64_t Digest(const v2::ApplyTransactionRequest &request) {
-  v2::ApplyTransactionRequest contents = request;
-  contents.clear_request_id();
-  std::string bytes;
+  HashStream stream;
   bool serialized = false;
-  google::protobuf::io::StringOutputStream stream(&bytes);
   {
     google::protobuf::io::CodedOutputStream out(&stream);
     out.SetSerializationDeterministic(true);
-    serialized = contents.SerializeToCodedStream(&out);
+    serialized = request.SerializeToCodedStream(&out);
   }
   // Only a message beyond protobuf's 2 GiB limit fails; gRPC would not have
   // delivered it. Hash what there is regardless.
-  return std::hash<std::string>{}(bytes) ^ (serialized ? 0 : 1);
+  return stream.Finish() ^ (serialized ? 0u : 1u);
 }
 
 v2::TransactionRecord::Outcome ToProto(TransactionEngine::Outcome outcome) {
@@ -145,7 +180,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
                        "' was used for a different transaction",
             .object = id});
       }
-      ReadRecord(it->second.record, response.mutable_record());
+      *response.mutable_record() = Expand(id, it->second);
       response.set_replayed(true);
       return response;
     }
@@ -174,9 +209,17 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   // applied transaction that a retry under its id would find unknown and
   // apply again. Given back below unless the outcome is recorded.
   Records::node_type pending;
+  // D-207: an erase-only transaction's record draws on the erase headroom,
+  // as the erases do in the engine.
+  const utils::Headroom headroom(
+      request.ops_size() != 0 &&
+              std::all_of(request.ops().begin(), request.ops().end(),
+                          [](const v2::TransactionOp &op) { return op.erase(); })
+          ? utils::Headroom::kErase
+          : utils::Headroom::kNone);
   if (!id.empty()) {
     try {
-      pending = ReserveRecord(id, digest, request.ops_size());
+      pending = ReserveRecord(id, digest);
     } catch (const std::bad_alloc &e) {
       return std::unexpected(OutOfMemory(e));
     }
@@ -312,41 +355,85 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
 }
 
 DataplaneTransactions::Records::node_type DataplaneTransactions::ReserveRecord(
-    const std::string &request_id, uint64_t digest, int ops) {
-  // The largest applied record of `ops` operations: applied operations carry
-  // no error, and every varint at its widest.
+    const std::string &request_id, uint64_t digest) {
+  // The record of an applied transaction as kept: no operation result (they
+  // are all the common one), no id (the key), every varint at its widest.
   v2::TransactionRecord largest;
-  largest.set_request_id(request_id);
   largest.set_outcome(v2::TransactionRecord::OUTCOME_APPLIED);
   largest.set_generation(std::numeric_limits<uint64_t>::max());
   largest.set_visibility(v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
-  for (int i = 0; i < ops; i++) {
-    largest.add_ops()->set_status(v2::TransactionOpResult::STATUS_NOT_APPLIED);
-  }
-  const utils::AdmittedGlibcAllocator<char> alloc(&growth_);
+  const utils::AdmittedGlibcAllocator<char> alloc(lease_.growth());
   Text bytes(alloc);
   bytes.reserve(largest.ByteSizeLong());
   records_.reserve(records_.size() + 1);  // CommitRecord inserts unallocated
-  Records::node_type node =
-      records_.extract(records_.emplace(Text(request_id, alloc),
-                                        Recorded{digest, std::move(bytes)})
-                           .first);
+  Records::node_type node = records_.extract(
+      records_
+          .emplace(Text(request_id, alloc),
+                   Recorded{.digest = digest,
+                            .record = std::move(bytes),
+                            .at = Positions(Positions::allocator_type(alloc))})
+          .first);
   order_.push_back(nullptr);  // the window slot, filled by CommitRecord
   return node;
 }
 
 void DataplaneTransactions::CommitRecord(Records::node_type node,
                                          const v2::TransactionRecord &record) {
-  Text &bytes = node.mapped().record;
-  bytes.resize(record.ByteSizeLong());
+  Recorded &kept = node.mapped();
+  kept.ops = static_cast<uint32_t>(record.ops_size());
+  // The common result: the most frequent status among results with no error
+  // (the engine's shapes: all APPLIED; one FAILED among NOT_APPLIED).
+  std::array<int, 4> bare{};
+  for (const auto &op : record.ops()) {
+    if (op.error().empty() && op.status() >= 0 &&
+        static_cast<size_t>(op.status()) < bare.size()) {
+      bare[static_cast<size_t>(op.status())]++;
+    }
+  }
+  kept.common = static_cast<v2::TransactionOpResult::Status>(
+      std::max_element(bare.begin(), bare.end()) - bare.begin());
+  v2::TransactionRecord compact;
+  compact.set_outcome(record.outcome());
+  compact.set_generation(record.generation());
+  compact.set_visibility(record.visibility());
+  for (int i = 0; i < record.ops_size(); i++) {
+    const auto &op = record.ops(i);
+    if (op.status() != kept.common || !op.error().empty()) {
+      *compact.add_ops() = op;
+      kept.at.push_back(static_cast<uint32_t>(i));
+    }
+  }
+  kept.record.resize(compact.ByteSizeLong());
   // Sized by ByteSizeLong just above: it fits.
-  static_cast<void>(
-      record.SerializeToArray(bytes.data(), static_cast<int>(bytes.size())));
+  static_cast<void>(compact.SerializeToArray(
+      kept.record.data(), static_cast<int>(kept.record.size())));
   order_.back() = &records_.insert(std::move(node)).position->first;
-  if (order_.size() > kMaxRecords) {
+  while (order_.size() > kMaxRecords ||
+         (order_.size() > 1 && lease_.bytes() > kMaxRecordBytes)) {
     records_.erase(records_.find(std::string_view(*order_.front())));
     order_.pop_front();
   }
+}
+
+v2::TransactionRecord DataplaneTransactions::Expand(std::string_view request_id,
+                                                    const Recorded &kept) {
+  v2::TransactionRecord compact;
+  ReadRecord(kept.record, &compact);
+  v2::TransactionRecord record;
+  record.set_request_id(request_id.data(), request_id.size());
+  record.set_outcome(compact.outcome());
+  record.set_generation(compact.generation());
+  record.mutable_ops()->Reserve(static_cast<int>(kept.ops));
+  size_t next = 0;
+  for (uint32_t i = 0; i < kept.ops; i++) {
+    if (next < kept.at.size() && kept.at[next] == i) {
+      record.add_ops()->Swap(compact.mutable_ops(static_cast<int>(next++)));
+    } else {
+      record.add_ops()->set_status(kept.common);
+    }
+  }
+  record.set_visibility(compact.visibility());
+  return record;
 }
 
 v2::GetTransactionResponse DataplaneTransactions::Get(
@@ -355,7 +442,7 @@ v2::GetTransactionResponse DataplaneTransactions::Get(
   response.set_daemon_epoch(epoch_);
   if (auto it = records_.find(request_id); it != records_.end()) {
     response.set_known(true);
-    ReadRecord(it->second.record, response.mutable_record());
+    *response.mutable_record() = Expand(request_id, it->second);
   }
   return response;
 }
