@@ -5,6 +5,7 @@
 // glibc once they pass the bound.
 
 #include "runtime/malloc_policy.h"
+#include "utils/sanitizers.h"
 
 #include <malloc.h>
 
@@ -88,6 +89,9 @@ TEST(MallocPolicyTest, ArenasStayAtTheCapUnderConcurrentAllocation) {
 }
 
 TEST(MallocPolicyTest, FreeBytesPastTheBoundTrimOncePerPeriod) {
+#if BESS_ADDRESS_SANITIZER
+  GTEST_SKIP() << "ASan replaces glibc malloc; mallinfo2 does not see it";
+#endif
   constexpr size_t kMiB = size_t{1024} * 1024;
   constexpr size_t kBound = 16 * kMiB;
   MallocFreeCheck check(std::chrono::seconds(1));

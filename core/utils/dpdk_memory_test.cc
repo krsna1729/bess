@@ -9,6 +9,7 @@
 #include "classifier/rte_hash_exact.h"
 #include "framework/memory_scope.h"
 #include "runtime/malloc_policy.h"
+#include "utils/sanitizers.h"
 
 #include <gtest/gtest.h>
 
@@ -396,6 +397,9 @@ TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
 // (a free chunk 16 bytes past what is needed is handed out whole), so the
 // earlier tests' frees decide which sizes take the extra 16.
 TEST(DpdkMemoryTest, MallocChunkBytesBoundsWhatMallocTakes) {
+#if BESS_ADDRESS_SANITIZER
+  GTEST_SKIP() << "ASan replaces glibc malloc; its chunks are not glibc's";
+#endif
   for (size_t n = 1; n <= 4096; n++) {
     void *p = std::malloc(n);
     ASSERT_NE(p, nullptr);
