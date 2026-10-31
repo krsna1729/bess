@@ -1,9 +1,21 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <gtest/gtest.h>
+#include <malloc.h>
 
+#include <algorithm>
+#include <any>
+#include <array>
 #include <cerrno>
+#include <cstdio>
+#include <expected>
+#include <iterator>
+#include <memory>
+#include <set>
 #include <string>
+#include <string_view>
+
+#include <google/protobuf/wrappers.pb.h>
 
 #include "control/control_plane.h"
 #include "control/pipeline_diff.h"
@@ -11,6 +23,11 @@
 #include "control/transaction.h"
 #include "control/pipeline_spec.h"
 #include "control/pipeline_validator.h"
+#include "dataplane/resource.h"
+#include "dataplane/transaction_engine.h"
+#include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
+#include "rcu/rcu_domain.h"
 #include "runtime/runtime_state.h"
 #include "module.h"
 #include "port.h"
@@ -836,6 +853,106 @@ TEST_F(ControlPlaneTest, LegacyMutationsInvalidateStaleTransactions) {
                   .has_value());
 
   ASSERT_TRUE(control_plane.Reset().has_value());
+}
+
+// A table of uint32 keys for ResetResources to clear (CTL-1): counts its
+// Reserve and Abort calls and samples the heap at each Reserve, while the
+// reset's operations are alive. Each erase declares one retirement.
+class CountedKeys final : public bess::dataplane::Resource {
+ public:
+  explicit CountedKeys(std::string name) : Resource(std::move(name)) {}
+  size_t LiveCount() const override { return keys.size(); }
+  bool Contains(const bess::dataplane::ResourceKey &key) const override {
+    uint32_t id = 0;
+    return bess::dataplane::DecodeKey(key, &id) && keys.contains(id);
+  }
+  std::expected<Reservation, std::string> Reserve(const bess::dataplane::Op &op) override {
+    reserves++;
+    high_water = std::max(high_water, mallinfo2().uordblks);
+    uint32_t id = 0;
+    if (op.kind != bess::dataplane::OpKind::kErase ||
+        !bess::dataplane::DecodeKey(op.key, &id) || !keys.contains(id)) {
+      return std::unexpected("erase of a present key only");
+    }
+    Reservation erase{std::make_unique<Erase>(*this, id), {}, Footprint{.retires = 1}};
+    erase.existed = true;
+    return erase;
+  }
+
+  std::set<uint32_t> keys;
+  size_t reserves = 0;
+  size_t aborts = 0;
+  size_t high_water = 0;
+
+ private:
+  class Erase final : public bess::dataplane::StagedOp {
+   public:
+    Erase(CountedKeys &table, uint32_t id) : table_(table), id_(id) {}
+    void Publish(bess::dataplane::Retirer &) noexcept override { table_.keys.erase(id_); }
+    void Abort() noexcept override { table_.aborts++; }
+
+   private:
+    CountedKeys &table_;
+    uint32_t id_;
+  };
+};
+
+// CTL-1: a reset of N keys at the runtime's retire budget B reserves each key
+// about once and holds about a batch of operations, not N: it reads and
+// erases B keys per batch from the resource's cursor. Converging to empty
+// held every key and operation at once and refitted each batch from the whole
+// remainder, reserving O(N^2/B).
+TEST_F(ControlPlaneTest, ResetResourcesReservesEachKeyAboutOnce) {
+  using google::protobuf::UInt32Value;
+  bess::dataplane::TransactionEngine &engine = runtime_->transactions();
+  CountedKeys table("ctl1/keys");
+  ASSERT_TRUE(engine.Register(&table).has_value());
+  const bess::framework::ResourceBinding binding =
+      bess::framework::ResourceBindings::ProcessDefault().Bind(
+          table,
+          std::make_shared<bess::framework::TypedCodec<UInt32Value, UInt32Value>>(
+              [](const UInt32Value &key)
+                  -> std::expected<bess::dataplane::ResourceKey, std::string> {
+                return bess::dataplane::EncodeKey(key.value());
+              },
+              [](const UInt32Value &) -> std::expected<std::any, std::string> {
+                return std::unexpected("erase only");
+              },
+              [&table](std::string_view cursor, const auto &visit) -> std::string {
+                std::array<uint32_t, 1> from{};
+                (void)bess::framework::CursorFields(cursor, &from);
+                UInt32Value key;
+                for (auto it = table.keys.lower_bound(from[0]); it != table.keys.end(); ++it) {
+                  key.set_value(*it);
+                  if (!visit(key, key)) {
+                    return std::next(it) == table.keys.end()
+                               ? std::string()
+                               : bess::framework::CursorOf<1>({*std::next(it)});
+                  }
+                }
+                return {};
+              }));
+  constexpr uint32_t kCount = 100000;
+  for (uint32_t i = 0; i < kCount; i++) {
+    table.keys.insert(table.keys.end(), i);
+  }
+  const size_t budget = runtime_->rcu().retire_high_water() / 2;
+  ASSERT_EQ(2048u, budget);
+
+  const size_t base = mallinfo2().uordblks;
+  ControlPlane control_plane;
+  auto reset = control_plane.ResetResources({"ctl1/keys"}, std::nullopt);
+  ASSERT_TRUE(reset.has_value()) << reset.error().message;
+  EXPECT_EQ(kCount, reset->value.removed);
+  EXPECT_TRUE(table.keys.empty());
+  const size_t held = table.high_water > base ? table.high_water - base : 0;
+  const size_t held_ops = held / sizeof(bess::dataplane::Op);
+  std::printf("reset %u at budget %zu: %zu reserves, %zu aborts, %zu bytes held (%zu ops)\n",
+              kCount, budget, table.reserves, table.aborts, held, held_ops);
+  EXPECT_LE(table.reserves, 3 * size_t{kCount});
+  EXPECT_LE(table.aborts, 2 * size_t{kCount});
+  EXPECT_LE(held_ops, 4 * budget);
+  ASSERT_TRUE(engine.Unregister("ctl1/keys").has_value());
 }
 
 }  // namespace

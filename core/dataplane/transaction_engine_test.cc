@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <map>
 #include <optional>
 #include <random>
@@ -1711,6 +1712,82 @@ TEST(TransactionEngineBatchingTest, ASetPastTheRetireBudgetIsSplitAndApplied) {
   EXPECT_NE(std::string::npos, again.ops[0].error.find("not found"))
       << "a converged clear must report the keys as absent, got: "
       << again.ops[0].error;
+}
+
+// A SlotResource that counts its Reserve and Abort calls (CTL-1).
+class CountingSlotResource final : public SlotResource<MeterId, Meter> {
+ public:
+  using SlotResource::SlotResource;
+  std::expected<Reservation, std::string> Reserve(const Op &op) override {
+    reserves++;
+    auto reserved = SlotResource::Reserve(op);
+    if (reserved) {
+      reserved->staged = std::make_unique<Counted>(std::move(reserved->staged), aborts);
+    }
+    return reserved;
+  }
+  size_t reserves = 0;
+  size_t aborts = 0;
+
+ private:
+  class Counted final : public StagedOp {
+   public:
+    Counted(std::unique_ptr<StagedOp> inner, size_t &aborts)
+        : inner_(std::move(inner)), aborts_(aborts) {}
+    void Publish(Retirer &retirer) noexcept override { inner_->Publish(retirer); }
+    void Abort() noexcept override {
+      aborts_++;
+      inner_->Abort();
+    }
+
+   private:
+    std::unique_ptr<StagedOp> inner_;
+    size_t &aborts_;
+  };
+};
+
+// CTL-1: ApplyBatched keeps the batch size it fitted, and a batch over the
+// budget is refused once its reservations pass the budget, not after all of
+// them. A clear of N keys at budget B costs about N reservations and
+// log2(N/B) refusals; refitting from the whole remainder after every batch
+// reserved O(N^2/B).
+TEST(TransactionEngineBatchingTest, AClearReservesEachKeyAboutOnce) {
+  rcu::RcuDomain domain(1, /*retire_high_water=*/64);
+  TransactionEngine engine(domain);
+  constexpr size_t kCount = 4096;
+  SlotTable<MeterId, Meter> meters(kCount);
+  CountingSlotResource resource("meters", meters);
+  ASSERT_TRUE(engine.Register(&resource).has_value());
+  const size_t budget = domain.retire_high_water() / 2;
+  ASSERT_EQ(32u, budget);
+
+  std::vector<Op> ops;
+  ops.reserve(kCount);
+  for (size_t i = 0; i < kCount; i++) {
+    ops.push_back(Op::Upsert("meters", EncodeKey(MeterId(i + 1)),
+                             std::any(Meter(static_cast<uint32_t>(i)))));
+  }
+  ASSERT_EQ(engine.Apply(ops).outcome, Outcome::kApplied);
+  ops.clear();
+  for (size_t i = 0; i < kCount; i++) {
+    ops.push_back(Op::Erase("meters", EncodeKey(MeterId(i + 1))));
+  }
+  resource.reserves = 0;
+  resource.aborts = 0;
+  const auto rejected = [&] {
+    return engine.outcome_counts()[static_cast<size_t>(Outcome::kRejected)];
+  };
+  const uint64_t rejected_before = rejected();
+  const auto cleared = engine.ApplyBatched(ops);
+  ASSERT_EQ(cleared.outcome, Outcome::kApplied) << cleared.ops[0].error;
+  EXPECT_EQ(0u, meters.size());
+  const uint64_t refusals = rejected() - rejected_before;
+  std::printf("clear %zu at budget %zu: %zu reserves, %zu aborts, %llu refusals\n", kCount,
+              budget, resource.reserves, resource.aborts,
+              static_cast<unsigned long long>(refusals));
+  EXPECT_LE(resource.reserves, 2 * kCount);
+  EXPECT_LE(resource.aborts, kCount);
+  EXPECT_LE(refusals, 8u);  // log2(4096 / 32) + 1
 }
 
 // The reference ledger is control-plane state no worker reads (D-206, class

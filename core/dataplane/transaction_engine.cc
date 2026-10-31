@@ -751,6 +751,12 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   });
 
   Resource::Footprint footprint;  // summed over the transaction
+  // Retirement runs behind readers. Never let the RCU retire queue approach
+  // the point where RetireErased() waits for readers (while this lock is
+  // held): what the transaction declares must fit half the high water.
+  // Checked as the declarations add up, so a batch over it is refused after
+  // reserving about a budget's worth, not all of it.
+  const size_t retire_budget = domain_.retire_high_water() / 2;
   for (const uint32_t index : w.reserve_order) {
     const size_t i = index;
     const Op &op = ops[i];
@@ -833,28 +839,27 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
     footprint.removals += r.footprint.removals;
     footprint.callbacks += r.footprint.callbacks;
     w.removals_by_op[i] = r.footprint.removals;
+    const size_t may_retire = size_t{footprint.retires} + size_t{footprint.removals};
+    if (may_retire > retire_budget) {
+      Result result =
+          Reject(n, 0,
+                 "transaction retires up to " + std::to_string(may_retire) +
+                     " objects, more than one batch allows (" +
+                     std::to_string(retire_budget) + "); split it");
+      // ApplyBatched() splits on this; a caller of Apply() has the same fact
+      // in the error text above.
+      result.over_budget = true;
+      result.may_retire = may_retire;
+      return result;
+    }
   }
 
   // -- bounded backpressure -------------------------------------------------
-  // Retirement runs behind readers. Never let the RCU retire queue approach
-  // the point where RetireErased() waits for readers (while this lock is
-  // held): count what is queued, what pending removal cascades will still
-  // retire, and what this transaction declares. Refuse retriably -- the
-  // reservations are aborted, so nothing becomes visible.
+  // Count what is queued and what pending removal cascades will still retire
+  // with this transaction's share; refuse retriably -- the reservations are
+  // aborted, so nothing becomes visible.
   const size_t may_retire =
       size_t{footprint.retires} + size_t{footprint.removals};
-  const size_t retire_budget = domain_.retire_high_water() / 2;
-  if (may_retire > retire_budget) {
-    Result result =
-        Reject(n, 0,
-               "transaction retires up to " + std::to_string(may_retire) +
-                   " objects, more than one batch allows (" +
-                   std::to_string(retire_budget) + "); split it");
-    // ApplyBatched() splits on this; a caller of Apply() has the same fact in
-    // the error text above.
-    result.over_budget = true;
-    return result;
-  }
   if (domain_.pending_retired() + deferred_objects_ + may_retire >
           retire_budget ||
       cascades_.size() >= kMaxPendingCascades) {
@@ -993,6 +998,7 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   Result applied;
   applied.outcome = Outcome::kApplied;
   applied.ops.assign(n, OpResult{OpStatus::kApplied, {}});
+  applied.may_retire = may_retire;
 
   // -- publish: from here on nothing may fail, and nothing allocates --------
   if (internal::g_publish_window_hook != nullptr) {
@@ -1071,8 +1077,11 @@ TransactionEngine::Result TransactionEngine::ApplyBatched(
   }
   Result last;
   size_t offset = 0;
+  // The fitted batch size carries over: a clear of N keys that fits B per
+  // batch is found once (log2(N/B) refusals), not again after every batch.
+  size_t take = ops.size();
   while (offset < ops.size()) {
-    size_t take = ops.size() - offset;
+    take = std::min(take, ops.size() - offset);
     auto backoff = std::chrono::microseconds(200);
     for (int retry = 0;; retry++) {
       Result result =
@@ -1098,7 +1107,7 @@ TransactionEngine::Result TransactionEngine::ApplyBatched(
       // request - it is found by asking.
       if (result.outcome == Outcome::kRejected && result.over_budget &&
           take > 1) {
-        take = take / 2;
+        take = FitBatch(result, take);
         continue;
       }
       // A real failure, or a single operation that cannot fit a batch alone:
@@ -1113,8 +1122,19 @@ TransactionEngine::Result TransactionEngine::ApplyBatched(
       return result;
     }
     offset += take;
+    take = FitBatch(last, take);
   }
   return last;
+}
+
+size_t TransactionEngine::FitBatch(const Result &result, size_t take) const {
+  if (result.over_budget) {
+    return std::max<size_t>(1, take / 2);
+  }
+  if (result.outcome == Outcome::kApplied && result.may_retire * 2 <= retire_budget()) {
+    return std::max(take, std::min(take * 2, std::max<size_t>(1, retire_budget())));
+  }
+  return take;
 }
 
 }  // namespace dataplane
