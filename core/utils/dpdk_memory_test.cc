@@ -8,6 +8,7 @@
 
 #include "classifier/rte_hash_exact.h"
 #include "framework/memory_scope.h"
+#include "runtime/malloc_policy.h"
 
 #include <gtest/gtest.h>
 
@@ -92,6 +93,45 @@ TEST(DpdkMemoryTest, AdmitNormalMemoryRefusesPastLimitLessReserve) {
   }
   EXPECT_THROW(AdmitNormalMemory(SIZE_MAX), MemoryRefused);
   EXPECT_EQ(GetMemoryStatus().refusals, refusals + 2);
+}
+
+// D-207: an erase-only transaction's admissions may use half the reserve,
+// so erases succeed at the limit where every other admission is refused; a
+// removal stage's prepaid allocations are not checked at all. A scope only
+// raises the level and restores the one it found.
+TEST(DpdkMemoryTest, HeadroomLevels) {
+  using bess::utils::Headroom;
+  PolicyScope scope(TightPolicy(508 * kMB, 512 * kMB));  // 4 MiB past it
+  EXPECT_THROW(AdmitNormalMemory(1 * kMB), MemoryRefused);
+  {
+    const Headroom none(Headroom::kNone);
+    EXPECT_THROW(AdmitNormalMemory(1 * kMB), MemoryRefused);
+  }
+  {
+    const Headroom erase(Headroom::kErase);
+    EXPECT_NO_THROW(AdmitNormalMemory(1 * kMB));
+    EXPECT_THROW(AdmitNormalMemory(300 * kMB), MemoryRefused);  // past half
+    {
+      const Headroom prepaid(Headroom::kPrepaid);
+      EXPECT_NO_THROW(AdmitNormalMemory(300 * kMB));
+      const Headroom none(Headroom::kNone);  // does not lower it
+      EXPECT_NO_THROW(AdmitNormalMemory(300 * kMB));
+    }
+    EXPECT_THROW(AdmitNormalMemory(300 * kMB), MemoryRefused);  // restored
+  }
+  EXPECT_THROW(AdmitNormalMemory(1 * kMB), MemoryRefused);
+}
+
+// D-207: free memory glibc retains in its arenas is given back (RT-1's trim)
+// before an admission is refused on it; one past the limit itself is
+// refused without a trim.
+TEST(DpdkMemoryTest, AWouldBeRefusalTrimsGlibcFirst) {
+  PolicyScope scope(TightPolicy(64 * kMB, 32 * kMB));
+  const uint64_t trims = bess::runtime::malloc_trims();
+  EXPECT_THROW(AdmitNormalMemory(48 * kMB), MemoryRefused);
+  EXPECT_EQ(bess::runtime::malloc_trims(), trims + 1);
+  EXPECT_THROW(AdmitNormalMemory(SIZE_MAX), MemoryRefused);
+  EXPECT_EQ(bess::runtime::malloc_trims(), trims + 1);
 }
 
 TEST(DpdkMemoryTest, NoHugeAllocationPastTheLimitIsRefused) {

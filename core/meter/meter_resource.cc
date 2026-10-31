@@ -177,9 +177,10 @@ void MeterResource::Unpublish(MeterId id, bool &prepaid,
 
   // The edit is paid from this erase's prepay (Growth::Grow), and what it did
   // not use -- or gave back, if it failed -- is released after. Its DPDK
-  // memory can still be refused (on normal pages each allocation is checked
-  // against the limit, D-198): then nothing changed but the prepay, given
-  // back, and the engine runs this stage again.
+  // memory is not checked against the limit again (a removal stage runs
+  // under utils::Headroom::kPrepaid, D-207), but the heap can still be out of
+  // pages: then nothing changed but the prepay, given back, and the engine
+  // runs this stage again.
   const size_t had = growth_.prepaid_bytes;
   auto settle = [&]() noexcept {
     growth_.paying = false;
