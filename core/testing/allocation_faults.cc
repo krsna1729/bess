@@ -25,6 +25,9 @@ std::atomic<size_t> g_injected{0};
     g_injected.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
   }
+  if (Window *w = t_window; w != nullptr) {
+    w->bytes += n;
+  }
   if (n == 0) {
     n = 1;
   }

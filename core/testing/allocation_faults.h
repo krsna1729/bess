@@ -50,6 +50,7 @@ namespace internal {
 // Touched only by the thread that opened it.
 struct Window {
   size_t allocations = 0;
+  size_t bytes = 0;  // requested by the allocations that succeeded
   size_t frees = 0;
   size_t fail_at = kNoFailure;
   bool injected = false;
@@ -76,6 +77,9 @@ class AllocationFaults {
 
   // Allocation attempts seen, the refused one included.
   size_t allocations() const noexcept { return own_.allocations; }
+  // Bytes requested by the allocations that were not refused: what a copy
+  // or a reallocation costs, where a count of calls cannot tell.
+  size_t bytes() const noexcept { return own_.bytes; }
   // Non-null pointers freed while the window was open (allocated in it or not).
   size_t frees() const noexcept { return own_.frees; }
   // The `fail_at`-th allocation happened and was refused.
