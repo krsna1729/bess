@@ -22,6 +22,7 @@
 #include "packet_pool.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
+#include "testing/allocation_faults.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 #include "utils/format.h"
@@ -555,6 +556,79 @@ TEST(BridgeResourceTest, ARefusedTransactionGivesItsReservedSlotBack) {
   EXPECT_EQ(FdbEntries(kFullFdb), br->GetDesc());
   const std::string full = h.UpsertResource(statics, StaticKey(kHostC), StaticValue(2));
   EXPECT_NE(std::string::npos, full.find("FDB full")) << full;
+}
+
+// A task that sends the frames the test queued, all in one batch.
+class BridgeFeeder final : public Module {
+ public:
+  static const gate_idx_t kNumIGates = 0;
+  static const gate_idx_t kNumOGates = 1;
+
+  struct task_result RunTask(Context *ctx, bess::PacketBatch *batch, void *) override {
+    batch->clear();
+    for (bess::PacketHandle frame : frames_) {
+      batch->add(PacketRef(frame));
+    }
+    frames_.clear();
+    RunNextModule(ctx, batch);
+    return {};
+  }
+
+  std::vector<bess::PacketHandle> frames_;
+};
+
+ADD_MODULE(BridgeFeeder, "bridge_test_feeder", "test: sends the frames it was given")
+
+// Flooding allocates nothing per batch (MA-B3): the flood list is built when
+// the graph changes (PreResume), not per batch.
+TEST(BridgeResourceTest, FloodingAllocatesNothingPerBatch) {
+  ModuleHarness h;
+  Module *br = h.Create("Bridge", BridgeArg());
+  ASSERT_NE(nullptr, br);
+  auto *feeder = dynamic_cast<BridgeFeeder *>(
+      h.Create("BridgeFeeder", bess::pb::EmptyArg(), "feeder"));
+  ASSERT_NE(nullptr, feeder);
+  const auto &builders = ModuleBuilder::all_module_builders();
+  // Without the default hooks, as the harness connects: they count per
+  // worker thread, and this one is not.
+  ASSERT_EQ(0, ModuleGraph::ConnectModules(feeder, 0, br, 0, true));
+  for (gate_idx_t g = 0; g < 4; g++) {
+    Module *sink = ModuleGraph::CreateModule(builders.find("Sink")->second,
+                                             "sink" + std::to_string(g), {}, nullptr);
+    ASSERT_NE(nullptr, sink);
+    ASSERT_EQ(0, ModuleGraph::ConnectModules(br, g, sink, 0, true));
+  }
+  ModuleGraph::UpdateTaskGraph();
+  Task task(feeder, nullptr);
+  uint32_t gates = 0;
+  for (const auto &[_, module] : ModuleGraph::GetAllModules()) {
+    gates += module->igates().size() + module->ogates().size();
+  }
+  task.UpdatePerGateBatch(gates + 1);
+  (void)br->OnEvent(bess::Event::PreResume);  // as a resume does
+
+  Context ctx{};
+  ctx.wid = bess::dataplane::WorkerId(0);
+  ctx.task = &task;
+  // One batch of broadcasts from host A, each flooded to gates 1-3.
+  auto run = [&](size_t *allocations) {
+    for (size_t i = 0; i < bess::PacketBatch::kMaxBurst; i++) {
+      feeder->frames_.push_back(bess::testing::MakePacket(Frame("ff:ff:ff:ff:ff:ff", kHostA)));
+    }
+    ctx.current_tsc = rdtsc();
+    ctx.current_ns = tsc_to_ns(ctx.current_tsc);
+    const bess::fault_injection::AllocationFaults window;
+    task(&ctx);
+    *allocations += window.allocations();
+  };
+  size_t warmup = 0;
+  run(&warmup);  // learns A; the task's run queue reaches its size
+  size_t allocations = 0;
+  for (int i = 0; i < 100; i++) {
+    run(&allocations);
+  }
+  EXPECT_EQ(0u, allocations);
+  EXPECT_EQ(0u, br->deadends()) << "every broadcast was flooded, none dropped";
 }
 
 }  // namespace
