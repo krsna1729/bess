@@ -1098,6 +1098,19 @@ test(
   args: [files('../tools/check_limits.py'), '--self-test'],
   suite: 'architecture',
 )
+# Growth that scales with entries names its bound (`// scale:`; DSA audit).
+test(
+  'check_scaling',
+  python,
+  args: [files('../tools/check_scaling.py'), '--root', meson.project_source_root()],
+  suite: 'architecture',
+)
+test(
+  'check_scaling_self_test',
+  python,
+  args: [files('../tools/check_scaling.py'), '--self-test'],
+  suite: 'architecture',
+)
 # Architecture code stays in core/arch/ or in an owner's *_kernels.{h,cc} file
 # (BESS_ARCH_* conditions only, with a portable branch); the allowlist
 # grandfathers the rest and only shrinks (M21, D-071, D-190).

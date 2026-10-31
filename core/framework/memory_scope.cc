@@ -265,6 +265,8 @@ MemoryLease MemoryScope::Lease(std::string_view resource, size_t bytes,
     auto node = std::make_unique<detail::LeaseNode>();
     std::lock_guard<std::mutex> lock(Mu());
     Entry &entry = EntryLocked(resource);
+    // scale: leases per resource (one per table or command), not per entry
+    // (CTL-9).
     entry.leases.reserve(entry.leases.size() + 1);
     node->ticket = NewTicketLocked(&node->placed);
     Add(&node->placed, node->ticket, backing, bytes, glibc_bytes);

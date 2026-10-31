@@ -365,7 +365,9 @@ DataplaneTransactions::Records::node_type DataplaneTransactions::ReserveRecord(
   const utils::AdmittedGlibcAllocator<char> alloc(lease_.growth());
   Text bytes(alloc);
   bytes.reserve(largest.ByteSizeLong());
-  records_.reserve(records_.size() + 1);  // CommitRecord inserts unallocated
+  // scale: at most kMaxRecords (4096) records; CommitRecord inserts
+  // unallocated.
+  records_.reserve(records_.size() + 1);
   Records::node_type node = records_.extract(
       records_
           .emplace(Text(request_id, alloc),

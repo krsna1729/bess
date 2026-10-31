@@ -406,6 +406,7 @@ ControlResult<ValidatedPipeline> ValidatePipeline(
     int64_t share;
   };
   std::vector<Child> children;
+  // scale: one reserve per validation, sized to every child at once.
   children.reserve(spec.traffic_classes.size() + spec.tasks.size());
   for (const TrafficClassSpec &tc : spec.traffic_classes) {
     children.push_back({"tc", "traffic class '" + tc.name + "'", tc.parent,

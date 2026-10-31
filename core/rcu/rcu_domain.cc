@@ -308,6 +308,8 @@ size_t RcuDomain::ReclaimReady() {
       retired_.clear();  // keeps the capacity
       head_ = 0;
     } else if (head_ >= 1024 && head_ * 2 >= retired_.size()) {
+      // scale: at least half the queue is dead, so a compaction moves no
+      // more entries than it drops (DP-11).
       retired_.erase(retired_.begin(),
                      retired_.begin() + static_cast<ptrdiff_t>(head_));
       head_ = 0;
