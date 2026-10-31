@@ -930,19 +930,36 @@ class BasicNat {
     prev_.store(nullptr, std::memory_order_release);
     lock_.Release();
     rcu_->Synchronize();  // no worker still holds an old binding
-    lock_.Acquire();
-    old_->ForEach([this](flow::FlowHandle, const Endpoint &internal, const BindingT &b) {
-      if (BindingT *n = table_->Find(internal)) {
-        const Tick old_refresh = Store::RefreshOf(b);
-        if (static_cast<int64_t>(old_refresh - Store::RefreshOf(*n)) > 0) {
-          Store::Refresh(*n, old_refresh);
-        }
-        // A copy starts at zero; the original's counts (before and after the
-        // copy) join it here, so nothing is counted twice or lost.
-        const auto [packets, bytes] = Store::UsageOf(b);
-        Store::AddUsage(*n, packets, bytes);
+    // The fold, in chunks too: workers no longer read the old table, but expiry
+    // still does (under the lock, both copies), so a folded original leaves it
+    // in the same hold, and expiry never counts its usage twice.
+    for (size_t cursor = 0; cursor < old_->capacity();) {
+      Endpoint folded[kGrowChunk];
+      size_t n = 0;
+      lock_.Acquire();
+      cursor = old_->VisitRange(cursor, kGrowChunk,
+                                [this, &folded, &n](flow::FlowHandle, const Endpoint &internal,
+                                                    const BindingT &b) {
+                                  if (BindingT *copy = table_->Find(internal)) {
+                                    const Tick old_refresh = Store::RefreshOf(b);
+                                    if (static_cast<int64_t>(old_refresh -
+                                                             Store::RefreshOf(*copy)) > 0) {
+                                      Store::Refresh(*copy, old_refresh);
+                                    }
+                                    // A copy starts at zero; the original's counts
+                                    // (before and after the copy) join it here, so
+                                    // nothing is counted twice or lost.
+                                    const auto [packets, bytes] = Store::UsageOf(b);
+                                    Store::AddUsage(*copy, packets, bytes);
+                                    folded[n++] = internal;
+                                  }
+                                });
+      for (size_t i = 0; i < n; i++) {
+        (void)old_->Erase(folded[i]);
       }
-    });
+      lock_.Release();
+    }
+    lock_.Acquire();
     std::unique_ptr<Table> retired = std::move(old_);
     migrated_tables_++;
     lock_.Release();
