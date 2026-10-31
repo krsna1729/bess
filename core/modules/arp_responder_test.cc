@@ -10,11 +10,15 @@
 #include <vector>
 
 #include "dataplane/transaction_engine.h"
+#include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "modules/arp_responder.h"
 #include "packet.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
+#include "task.h"
+#include "testing/allocation_faults.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
@@ -127,7 +131,7 @@ TEST(ArpResponderResourceTest, EntriesAnswerAndReadBack) {
   Module *arp = h.Create("ArpResponder", bess::pb::ArpResponderArg());
   ASSERT_NE(nullptr, arp);
   const std::string entries = arp->name() + "/entries";
-  EXPECT_TRUE(RequiresPausedWorkers(entries));
+  EXPECT_FALSE(RequiresPausedWorkers(entries)) << "live: a running worker does not refuse it";
   EXPECT_TRUE(h.Run(arp, 0, {RequestFor("1.2.3.4")}, {0})[0].empty());
 
   const ArpResponderEntryKey key = EntryKey("1.2.3.4");
@@ -300,6 +304,61 @@ TEST(ArpResponderTest, TheReplyGoesToTheSenderHardwareAddress) {
                                  "1.2.3.4")
                             .Build();
   EXPECT_EQ(Reply(), Through(h, arp, MakePacket(request)));
+}
+
+// MA-B4: the table is admitted ("entries", D-198): 10,000 entries upserted
+// leave at least their bytes admitted, and answering requests (hits and
+// misses) allocates nothing.
+TEST(ArpResponderResourceTest, EntriesAreAdmittedAndLookupsAllocateNothing) {
+  constexpr uint32_t kEntries = 10'000;
+  ModuleHarness h;
+  bess::pb::ArpResponderArg arg;
+  arg.set_max_entries(kEntries);
+  Module *arp = h.Create("ArpResponder", arg, "arp_admit");
+  ASSERT_NE(nullptr, arp);
+  const std::string entries = "arp_admit/entries";
+  const bess::framework::ResourceCodec *codec = h.Codec(entries);
+  ASSERT_NE(nullptr, codec);
+  google::protobuf::Any packed_value;
+  ASSERT_TRUE(packed_value.PackFrom(EntryValue("a0:22:33:44:55:66")));
+  const auto value = codec->Value(packed_value.type_url(), packed_value.value());
+  ASSERT_TRUE(value.has_value()) << value.error();
+  std::vector<bess::dataplane::Op> ops;
+  for (uint32_t i = 1; i <= kEntries; i++) {
+    ops.push_back(bess::dataplane::Op::Upsert(
+        entries, bess::dataplane::EncodeKey(uint32_t{0x0a000000} + i), *value));
+    if (ops.size() == 1000) {
+      ASSERT_EQ("", h.Apply(ops));
+      ops.clear();
+    }
+  }
+  size_t admitted = 0;
+  for (const bess::framework::ModuleMemoryUse &row :
+       bess::framework::MemoryAccounts::List()) {
+    if (row.module == "arp_admit" && row.resource == "entries") {
+      admitted = row.admitted_bytes;
+    }
+  }
+  EXPECT_GE(admitted, kEntries * sizeof(ArpResponder::Entry));
+
+  // A hit (rewritten in place, then dropped at the unconnected gate) and a
+  // miss, per packet.
+  Task task(arp, nullptr);
+  Context ctx{};
+  ctx.wid = bess::dataplane::WorkerId(0);
+  ctx.task = &task;
+  size_t allocations = 0;
+  for (int round = 0; round < 100; round++) {
+    bess::PacketBatch batch;
+    batch.clear();
+    for (int i = 0; i < 32; i++) {
+      batch.add(bess::PacketRef(MakePacket(RequestFor(i % 2 ? "10.0.0.7" : "10.1.0.7"))));
+    }
+    const bess::fault_injection::AllocationFaults window;
+    arp->ProcessBatch(&ctx, &batch);
+    allocations += window.allocations();
+  }
+  EXPECT_EQ(0u, allocations);
 }
 
 }  // namespace

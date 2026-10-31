@@ -27,112 +27,234 @@ const Commands ArpResponder::cmds = {};
 const ResourceTables ArpResponder::resource_tables = {
     ResourceTable::Map<bess::pb::ArpResponderEntryKey,
                        bess::pb::ArpResponderEntryValue>(
-        "entries", /*requires_paused_workers=*/true)};
+        "entries", /*requires_paused_workers=*/false)};
 
-// "<module>/entries": key EncodeKey(the IPv4 address, host order), value the
-// MAC (Ethernet::Address). Workers read the map without synchronization, so
-// this runs with them paused (the codec says so; Reserve refuses otherwise
-// too). Publish allocates nothing: an upsert's map node is built in Reserve,
-// and an erased node leaves with its operation.
-class ArpResponder::EntriesResource final : public dataplane::Resource {
+class ArpResponder::EntriesResource::UpsertOp final : public dataplane::StagedOp {
  public:
-  explicit EntriesResource(ArpResponder &owner)
-      : Resource(owner.name() + "/entries"), owner_(owner) {}
+  UpsertOp(EntriesResource &owner, uint32_t ip, Owned entry)
+      : owner_(owner), ip_(ip), entry_(std::move(entry)) {}
 
-  size_t LiveCount() const override { return owner_.entries_.size(); }
-
-  bool Contains(const dataplane::ResourceKey &key) const override {
-    uint32_t ip;
-    return dataplane::DecodeKey(key, &ip) && owner_.entries_.contains(be32_t(ip));
-  }
-
-  std::expected<Reservation, std::string> Reserve(
-      const dataplane::Op &op) override {
-    if (owner_.HasRunningWorker()) {
-      return std::unexpected(
-          "a worker runs the module (entries require paused workers)");
+  void Publish(dataplane::Retirer &retirer) noexcept override {
+    // Claimed again now, by key: a sibling op of the same transaction may have
+    // taken over the value-less claim Reserve made. Both phases run under the
+    // engine's lock.
+    const size_t slot = owner_.Claim(ip_);
+    if (slot == kNoSlot) {
+      // Reserve established room: unreachable. Nothing has seen the entry.
+      retirer.Retire(std::move(entry_));
+      return;
     }
-    uint32_t host_ip;
-    if (!dataplane::DecodeKey(op.key, &host_ip)) {
-      return std::unexpected("invalid IPv4 address key");
+    // The slot owns the entry from here.
+    if (const Entry *old = owner_.Publish(slot, entry_.release()); old != nullptr) {
+      retirer.Retire(owner_.Own(old));
     }
-    const be32_t ip(host_ip);
-    const bool existed = owner_.entries_.contains(ip);
-    if (op.kind == dataplane::OpKind::kErase) {
-      if (!existed) {
-        return std::unexpected("not found");
-      }
-      Reservation reservation{std::make_unique<EraseOp>(owner_, ip), {}, {}};
-      reservation.existed = true;
-      return reservation;
-    }
-    const Ethernet::Address *mac = std::any_cast<Ethernet::Address>(&op.value);
-    if (mac == nullptr) {
-      return std::unexpected("wrong value type (want a MAC address)");
-    }
-    arp_entry entry;
-    entry.mac_addr = *mac;
-    entry.ip_addr = ip;
-    entry.time = 0;
-    Map node_source;
-    node_source.emplace(ip, entry);
-    Reservation reservation{
-        std::make_unique<UpsertOp>(owner_,
-                                   node_source.extract(node_source.begin())),
-        {}, {}};
-    reservation.existed = existed;
-    return reservation;
   }
 
  private:
-  using Map = std::map<be32_t, arp_entry>;
-  using Node = Map::node_type;
-
-  class UpsertOp final : public dataplane::StagedOp {
-   public:
-    UpsertOp(ArpResponder &owner, Node node)
-        : owner_(owner), node_(std::move(node)) {}
-    void Publish(dataplane::Retirer &) noexcept override {
-      auto it = owner_.entries_.find(node_.key());
-      if (it != owner_.entries_.end()) {
-        it->second = node_.mapped();
-      } else {
-        owner_.entries_.insert(std::move(node_));
-      }
-    }
-
-   private:
-    ArpResponder &owner_;
-    Node node_;
-  };
-
-  class EraseOp final : public dataplane::StagedOp {
-   public:
-    EraseOp(ArpResponder &owner, be32_t ip) : owner_(owner), ip_(ip) {}
-    void Publish(dataplane::Retirer &) noexcept override {
-      erased_ = owner_.entries_.extract(ip_);  // freed with this operation
-    }
-
-   private:
-    ArpResponder &owner_;
-    be32_t ip_;
-    Node erased_;
-  };
-
-  ArpResponder &owner_;
+  EntriesResource &owner_;
+  uint32_t ip_;
+  Owned entry_;
 };
 
+class ArpResponder::EntriesResource::EraseOp final : public dataplane::StagedOp {
+ public:
+  EraseOp(EntriesResource &owner, uint32_t ip) : owner_(owner), ip_(ip) {}
+
+  void Publish(dataplane::Retirer &retirer) noexcept override {
+    if (const Entry *old = owner_.Clear(ip_); old != nullptr) {
+      retirer.Retire(owner_.Own(old));
+    }
+  }
+
+ private:
+  EntriesResource &owner_;
+  uint32_t ip_;
+};
+
+ArpResponder::EntriesResource::EntriesResource(std::string name, size_t max_entries)
+    : Resource(std::move(name)),
+      slab_(bess::utils::ObjectSlab<Entry>::Create()),
+      slots_(SlotCount(max_entries)),
+      mask_(slots_.size() - 1) {}
+
+ArpResponder::EntriesResource::~EntriesResource() {
+  // Module teardown, after the workers stopped reading: the live entries go
+  // with the table (ReleaseForTeardown tolerates them).
+  for (const Slot &slot : slots_) {
+    if (const Entry *entry = slot.value.load(std::memory_order_relaxed)) {
+      slab_->Destroy(entry);
+    }
+  }
+}
+
+const ArpResponder::Entry *ArpResponder::EntriesResource::Lookup(
+    uint32_t ip) const noexcept {
+  if (ip == 0) {
+    return nullptr;
+  }
+  size_t i = Hash(ip);
+  for (size_t n = 0; n <= mask_; n++) {
+    if (slots_[i].key.load(std::memory_order_acquire) == ip) {
+      // A later transaction may reuse this slot for another address between
+      // the two loads: an entry for a different address is not this key's.
+      const Entry *entry = slots_[i].value.load(std::memory_order_acquire);
+      if (entry != nullptr && entry->ip == ip) {
+        return entry;
+      }
+    }
+    if (slots_[i].passed.load(std::memory_order_acquire) == 0) {
+      return nullptr;
+    }
+    i = (i + 1) & mask_;
+  }
+  return nullptr;
+}
+
+size_t ArpResponder::EntriesResource::Find(uint32_t ip) const noexcept {
+  size_t i = Hash(ip);
+  for (size_t n = 0; n <= mask_; n++) {
+    if (slots_[i].key.load(std::memory_order_acquire) == ip) {
+      return i;
+    }
+    if (slots_[i].passed.load(std::memory_order_acquire) == 0) {
+      break;
+    }
+    i = (i + 1) & mask_;
+  }
+  return kNoSlot;
+}
+
+size_t ArpResponder::EntriesResource::Claim(uint32_t ip) noexcept {
+  if (const size_t held = Find(ip); held != kNoSlot) {
+    return held;
+  }
+  const size_t home = Hash(ip);
+  size_t i = home;
+  for (size_t n = 0; n <= mask_; n++) {
+    const uint32_t key = slots_[i].key.load(std::memory_order_relaxed);
+    if (key == 0 || slots_[i].value.load(std::memory_order_relaxed) == nullptr) {
+      // Empty, or a claim no transaction published. Every slot before it
+      // counts the pass; the counts precede the key's release store.
+      if (key != 0) {
+        Release(key, i);
+      }
+      for (size_t j = home; j != i; j = (j + 1) & mask_) {
+        slots_[j].passed.fetch_add(1, std::memory_order_relaxed);
+      }
+      slots_[i].key.store(ip, std::memory_order_release);
+      return i;
+    }
+    i = (i + 1) & mask_;
+  }
+  return kNoSlot;
+}
+
+const ArpResponder::Entry *ArpResponder::EntriesResource::Clear(uint32_t ip) noexcept {
+  const size_t slot = Find(ip);
+  if (slot == kNoSlot) {
+    return nullptr;
+  }
+  const Entry *old = slots_[slot].value.exchange(nullptr, std::memory_order_acq_rel);
+  if (old != nullptr) {
+    live_--;
+  }
+  Release(ip, slot);
+  return old;
+}
+
+void ArpResponder::EntriesResource::Release(uint32_t ip, size_t slot) noexcept {
+  // Only `ip`'s own passes go: a live key's probe still counts in every slot
+  // before its own.
+  for (size_t j = Hash(ip); j != slot; j = (j + 1) & mask_) {
+    slots_[j].passed.fetch_sub(1, std::memory_order_relaxed);
+  }
+  slots_[slot].key.store(0, std::memory_order_release);
+}
+
+const ArpResponder::Entry *ArpResponder::EntriesResource::Publish(
+    size_t slot, const Entry *entry) noexcept {
+  const Entry *old = slots_[slot].value.exchange(entry, std::memory_order_acq_rel);
+  if (old == nullptr) {
+    live_++;
+  }
+  return old;
+}
+
+bool ArpResponder::EntriesResource::Install(uint32_t ip, const Ethernet::Address &mac) {
+  const size_t slot = Claim(ip);
+  if (slot == kNoSlot) {
+    return false;
+  }
+  if (const Entry *old = Publish(slot, slab_->Make(Entry{ip, mac}).release())) {
+    slab_->Destroy(old);  // not published yet: no reader holds it
+  }
+  return true;
+}
+
+bool ArpResponder::EntriesResource::Contains(const dataplane::ResourceKey &key) const {
+  uint32_t ip = 0;
+  return dataplane::DecodeKey(key, &ip) && Lookup(ip) != nullptr;
+}
+
+std::expected<dataplane::Resource::Reservation, std::string>
+ArpResponder::EntriesResource::Reserve(const dataplane::Op &op) {
+  uint32_t ip = 0;
+  if (!dataplane::DecodeKey(op.key, &ip)) {
+    return std::unexpected("invalid IPv4 address key");
+  }
+  if (ip == 0) {
+    return std::unexpected("0.0.0.0 cannot be answered for");
+  }
+  if (op.kind == dataplane::OpKind::kErase) {
+    if (Lookup(ip) == nullptr) {
+      return std::unexpected("not found");
+    }
+    Reservation erase{std::make_unique<EraseOp>(*this, ip), {}, {.retires = 1}};
+    erase.existed = true;
+    return erase;
+  }
+  const Ethernet::Address *mac = std::any_cast<Ethernet::Address>(&op.value);
+  if (mac == nullptr) {
+    return std::unexpected("wrong value type (want a MAC address)");
+  }
+  // The slot the entry will be published in, claimed now: the only step that
+  // can find no room.
+  const size_t slot = Claim(ip);
+  if (slot == kNoSlot) {
+    return std::unexpected("the entries table is full (" + std::to_string(mask_ + 1) +
+                           " slots)");
+  }
+  const bool existed = slots_[slot].value.load(std::memory_order_acquire) != nullptr;
+  // May add a slab chunk, admitted first (a refusal throws MemoryRefused).
+  Owned entry = slab_->Make(Entry{ip, *mac});
+  // Room for one replacement always: a sibling op may publish under this key
+  // first.
+  Reservation reservation{std::make_unique<UpsertOp>(*this, ip, std::move(entry)), {},
+                          {.retires = 1}};
+  reservation.existed = existed;
+  return reservation;
+}
+
 CommandResponse ArpResponder::Init(const bess::pb::ArpResponderArg &arg) {
+  const uint64_t max_entries = arg.max_entries() ? arg.max_entries() : kDefaultMaxEntries;
+  // Validated before admitting (D-198).
+  if (max_entries > kMaxEntriesLimit) {
+    return CommandFailure(EINVAL, "max_entries %llu is above %zu",
+                          static_cast<unsigned long long>(max_entries), kMaxEntriesLimit);
+  }
+  entries_ = init_context().memory().Create<EntriesResource>(
+      "entries", name() + "/entries", static_cast<size_t>(max_entries));
+
   if (!arg.ip().empty() || !arg.mac_addr().empty()) {
     CommandResponse added = Add(arg);
     if (added.error().code() != 0) {
+      entries_ = {};  // never registered: DeInit has nothing to release
       return added;
     }
   }
 
-  resource_ = std::make_unique<EntriesResource>(*this);
   binding_ = init_context().codecs().Bind(
-      *resource_,
+      *entries_,
       std::make_shared<bess::framework::TypedCodec<
           bess::pb::ArpResponderEntryKey, bess::pb::ArpResponderEntryValue>>(
           [](const bess::pb::ArpResponderEntryKey &key)
@@ -157,41 +279,40 @@ CommandResponse ArpResponder::Init(const bess::pb::ArpResponderArg &arg) {
           // Read back as a client sends an entry: the address in dotted
           // decimal, the MAC in lower case.
           [this](const auto &visit) {
-            for (const auto &[ip, entry] : entries_) {
+            entries_->ForEach([&](const Entry &entry) {
               bess::pb::ArpResponderEntryKey key;
-              key.set_ip(bess::utils::ToIpv4Address(ip));
+              key.set_ip(bess::utils::ToIpv4Address(be32_t(entry.ip)));
               bess::pb::ArpResponderEntryValue value;
-              value.set_mac_addr(entry.mac_addr.ToString());
+              value.set_mac_addr(entry.mac.ToString());
               visit(key, value);
-            }
-          },
-          [this] { return HasRunningWorker(); }));
-  if (auto registered = init_context().resources().Register(resource_.get());
+            });
+          }));
+  if (auto registered = init_context().resources().Register(entries_.get());
       !registered) {
     binding_.Reset();
-    resource_.reset();
+    entries_ = {};
     return CommandFailure(EEXIST, "%s", registered.error().c_str());
   }
   return CommandSuccess();
 }
 
 void ArpResponder::DeInit() {
-  if (resource_ == nullptr) {
+  if (entries_.get() == nullptr) {
     return;
   }
   // The entries may still be live: the module leaves with them.
-  const std::string name = resource_->name();
+  const std::string name = entries_->name();
   auto released = init_context().resources().ReleaseForTeardown(
       std::span<const std::string>(&name, 1));
   CHECK(released) << released.error();
   binding_.Reset();
-  resource_.reset();
+  entries_ = {};
 }
 
 // The init argument's entry, validated before anything is installed.
 CommandResponse ArpResponder::Add(const bess::pb::ArpResponderArg &arg) {
   be32_t ip_addr;
-  arp_entry entry;
+  Ethernet::Address mac;
 
   if (!arg.ip().length()) {
     return CommandFailure(EINVAL, "IP address is missing");
@@ -199,14 +320,14 @@ CommandResponse ArpResponder::Add(const bess::pb::ArpResponderArg &arg) {
   if (!bess::utils::ParseIpv4Address(arg.ip(), &ip_addr)) {
     return CommandFailure(EINVAL, "Invalid IP Address: %s", arg.ip().c_str());
   }
-
-  if (!entry.mac_addr.FromString(arg.mac_addr())) {
+  if (ip_addr.value() == 0) {
+    return CommandFailure(EINVAL, "0.0.0.0 cannot be answered for");
+  }
+  if (!mac.FromString(arg.mac_addr())) {
     return CommandFailure(EINVAL, "Invalid MAC Address: %s",
                           arg.mac_addr().c_str());
   }
-
-  entry.ip_addr = ip_addr;
-  entries_[ip_addr] = entry;
+  entries_->Install(ip_addr.value(), mac);
   return CommandSuccess();
 }
 
@@ -233,21 +354,20 @@ void ArpResponder::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     }
 
     // Try to find target IP in cache, if exists convert request to reply
-    auto it = entries_.find(arp->target_ip);
-    if (it == entries_.end()) {
+    const Entry *entry = entries_->Lookup(arp->target_ip.value());
+    if (entry == nullptr) {
       // Did not find an ARP entry in cache, drop packet
       // TODO(galsagie) Optinally emit packet to next module here
       DropPacket(ctx, pkt);
       continue;
     }
 
-    const struct arp_entry &entry = it->second;
     bess::PacketHandle handle = pkt.handle();
     const auto head = bess::packet::WritableHead(handle, bess::route::kArpFrameSize);
     if (unlikely(!head) ||
         !bess::route::AnswerArpRequest(
             std::span<uint8_t>(reinterpret_cast<uint8_t *>(head->data()), head->size()),
-            entry.mac_addr, entry.ip_addr)) {
+            entry->mac, be32_t(entry->ip))) {
       DropPacket(ctx, bess::PacketRef(handle));
       continue;
     }
