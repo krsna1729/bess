@@ -186,6 +186,24 @@ bool HasArg(const google::protobuf::Any &arg) {
   return !arg.type_url().empty() || !arg.value().empty();
 }
 
+// Copies the entries from an lvalue, moves them from an rvalue (GetPipeline:
+// the read is built once and handed to the response, not copied).
+template <typename Resources>
+void AddResources(Resources &&resources, v2::Pipeline *out) {
+  for (auto &&r : resources) {
+    auto *resource = out->add_resources();
+    resource->set_name(r.name);
+    resource->mutable_entries()->Reserve(static_cast<int>(r.entries.size()));
+    for (auto &&e : r.entries) {
+      auto *entry = resource->add_entries();
+      if (HasArg(e.key)) {
+        *entry->mutable_key() = std::forward_like<Resources>(e.key);
+      }
+      *entry->mutable_value() = std::forward_like<Resources>(e.value);
+    }
+  }
+}
+
 }  // namespace
 
 namespace {
@@ -363,17 +381,7 @@ v2::Pipeline ToProto(const PipelineSpec &spec) {
     if (t.has_priority) task->set_priority(t.priority);
     if (t.has_share) task->set_share(t.share);
   }
-  for (const auto &r : spec.resources) {
-    auto *resource = out.add_resources();
-    resource->set_name(r.name);
-    for (const ResourceEntrySpec &e : r.entries) {
-      auto *entry = resource->add_entries();
-      if (HasArg(e.key)) {
-        *entry->mutable_key() = e.key;
-      }
-      *entry->mutable_value() = e.value;
-    }
-  }
+  AddResources(spec.resources, &out);
   return out;
 }
 
@@ -650,13 +658,13 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *context,
   query.include = request->include_resources();
   query.include_metadata = request->include_metadata();
   query.names.assign(request->resources().begin(), request->resources().end());
+  query.max_bytes = kMaxMessageBytes;
   auto read = control_plane_.ReadPipeline(query);
   if (!read) {
     return ToStatus(read.error(), context);
   }
-  PipelineSpec spec = SpecFromSnapshot(read->value.snapshot);
-  spec.resources = std::move(read->value.resources);
-  *response->mutable_pipeline() = ToProto(spec);
+  *response->mutable_pipeline() = ToProto(SpecFromSnapshot(read->value.snapshot));
+  AddResources(std::move(read->value.resources), response->mutable_pipeline());
   response->set_generation(read->generation);
   response->set_resource_generation(read->resource_generation);
   response->set_daemon_epoch(transactions_.epoch());
@@ -692,14 +700,11 @@ grpc::Status ControlV2Service::GetPipeline(grpc::ServerContext *context,
 grpc::Status ControlV2Service::ReadResource(
     grpc::ServerContext *context, const v2::ReadResourceRequest *request,
     grpc::ServerWriter<v2::ResourcePage> *writer) {
-  // One snapshot under the control-plane lock, then pages outside it: the
-  // stream may block on a slow client, and holding the lock across the writes
-  // would hold every writer behind it. The generation is the snapshot's, so a
-  // reader can tell whether a later page is from the same dataplane state.
-  auto read = control_plane_.ReadResource(request->resource());
-  if (!read) {
-    return ToStatus(read.error(), context);
-  }
+  // One read per control-plane lock hold, from the codec's cursor, written
+  // outside the lock: the stream may block on a slow client, and holding the
+  // lock across the writes would hold every writer behind it. No more than a
+  // read's entries are ever built. Each page carries the generation its
+  // entries were read at (SCAN semantics across pages, ReadResourcePage).
   // The budget is the whole serialized page -- its own fields, and for each
   // entry the repeated field's tag and length prefix -- not the entries alone:
   // framing is bytes on the wire, and the client decodes all of them.
@@ -711,61 +716,73 @@ grpc::Status ControlV2Service::ReadResource(
   max_entries = std::min<size_t>(max_entries, kMaxPageEntries);
 
   v2::ResourcePage page;
-  page.set_resource(read->value.name);
-  page.set_resource_generation(read->resource_generation);
+  page.set_resource(request->resource());
+  page.set_resource_generation(std::numeric_limits<uint64_t>::max());  // the widest
   page.set_daemon_epoch(transactions_.epoch());
-  size_t count = 0;
-  size_t bytes = page.ByteSizeLong();
+  const size_t header_bytes = page.ByteSizeLong();
+  size_t bytes = header_bytes;
+  bool sent = false;
   auto flush = [&]() -> std::optional<grpc::Status> {
-    if (count != 0 || (page.entries_size() == 0 && read->value.entries.empty())) {
-      if (!writer->Write(page)) {
-        return grpc::Status(grpc::StatusCode::CANCELLED, "the reader went away");
-      }
-      page.mutable_entries()->Clear();
-      count = 0;
-      bytes = page.ByteSizeLong();
+    if (!writer->Write(page)) {
+      return grpc::Status(grpc::StatusCode::CANCELLED, "the reader went away");
     }
+    sent = true;
+    page.mutable_entries()->Clear();
+    bytes = header_bytes;
     if (context->IsCancelled()) {
       return grpc::Status(grpc::StatusCode::CANCELLED, "the reader cancelled");
     }
     return std::nullopt;
   };
-  for (const ResourceEntrySpec &entry : read->value.entries) {
-    v2::ResourceEntry candidate;
-    if (!entry.key.type_url().empty()) {
-      *candidate.mutable_key() = entry.key;
+  std::string cursor;
+  for (;;) {
+    auto read = control_plane_.ReadResource(request->resource(), cursor, max_entries,
+                                            kPageBytes - std::min(kPageBytes, header_bytes));
+    if (!read) {
+      return ToStatus(read.error(), context);
     }
-    *candidate.mutable_value() = entry.value;
-    const size_t entry_bytes = candidate.ByteSizeLong();
-    if (entry_bytes >
-        static_cast<size_t>(kMaxMessageBytes) - (64 << 10)) {
-      // One entry this large cannot leave in any page: refuse it by name
-      // rather than let the transport fail the stream mid-table.
-      ControlError error = Err(E2BIG, "resource '%s': one entry is %zu bytes",
-                               read->value.name.c_str(), entry_bytes);
-      error.code = ControlErrorCode::kResourceExhausted;
-      error.field = "resource";
-      return ToStatus(error, context);
+    page.set_resource_generation(read->resource_generation);
+    for (ResourceEntrySpec &entry : read->value.entries) {
+      v2::ResourceEntry candidate;
+      if (!entry.key.type_url().empty()) {
+        *candidate.mutable_key() = std::move(entry.key);
+      }
+      *candidate.mutable_value() = std::move(entry.value);
+      const size_t entry_bytes = candidate.ByteSizeLong();
+      if (entry_bytes > static_cast<size_t>(kMaxMessageBytes) - (64 << 10)) {
+        // One entry this large cannot leave in any page: refuse it by name
+        // rather than let the transport fail the stream mid-table.
+        ControlError error = Err(E2BIG, "resource '%s': one entry is %zu bytes",
+                                 request->resource().c_str(), entry_bytes);
+        error.code = ControlErrorCode::kResourceExhausted;
+        error.field = "resource";
+        return ToStatus(error, context);
+      }
+      const size_t framed_bytes =
+          kEntryTagBytes + google::protobuf::io::CodedOutputStream::VarintSize64(entry_bytes) +
+          entry_bytes;
+      if (page.entries_size() != 0 &&
+          (static_cast<size_t>(page.entries_size()) >= max_entries ||
+           bytes + framed_bytes > kPageBytes)) {
+        if (auto stopped = flush(); stopped) {
+          return *stopped;
+        }
+      }
+      *page.add_entries() = std::move(candidate);
+      bytes += framed_bytes;
     }
-    const size_t framed_bytes =
-        kEntryTagBytes +
-        google::protobuf::io::CodedOutputStream::VarintSize32(
-            static_cast<uint32_t>(entry_bytes)) +
-        entry_bytes;
-    if (count != 0 &&
-        (count >= max_entries || bytes + framed_bytes > kPageBytes)) {
+    // A read's entries leave in its own pages, under its generation; an
+    // empty resource still answers one page, so the caller learns it exists.
+    if (page.entries_size() != 0 || (!sent && !read->value.next.has_value())) {
       if (auto stopped = flush(); stopped) {
         return *stopped;
       }
     }
-    *page.add_entries() = std::move(candidate);
-    count++;
-    bytes += framed_bytes;
+    if (!read->value.next.has_value()) {
+      return grpc::Status::OK;
+    }
+    cursor = std::move(*read->value.next);
   }
-  if (auto stopped = flush(); stopped) {
-    return *stopped;
-  }
-  return grpc::Status::OK;
 }
 
 grpc::Status ControlV2Service::ResetResources(

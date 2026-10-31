@@ -827,6 +827,7 @@ unit_test_sources = [
   'control/control_plane_test.cc',
   'control/maintenance_loop_test.cc',
   'control/metrics_exposition_test.cc',
+  'control/pipeline_resources_test.cc',
   'control/pressure_monitor_test.cc',
   'control/resource_fill_test.cc',
   'control/scheduling_constraints_test.cc',

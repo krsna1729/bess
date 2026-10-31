@@ -558,6 +558,19 @@ omitted, one spelling per value: lower-case MAC addresses, the network
 address of a prefix). Otherwise desired state that came from a read applies
 back as an update, every time.
 
+The third function is either a whole walk (`[](const auto &visit) {...}`) or,
+for a resource that can hold session-scale entries, a resumable one:
+`[](std::string_view cursor, const auto &visit) -> std::string` visits from
+`cursor` (empty: the first entry) until `visit` returns false and returns
+where to continue (empty: done), its position written with
+`framework::CursorOf` and read back with `framework::CursorFields`.
+`ReadResource` then reads one page per call, so a page costs its own entries;
+a whole walk is read by key, one full walk per page (O(N²/page) for the
+table). An entry present for the whole read must be visited at least once;
+an entry changed meanwhile may be missed or repeat (Redis SCAN semantics),
+and a cursor that names a layout that has gone (a table that grew) restarts
+that part of the walk.
+
 An optional fourth argument, a predicate that is true while a worker runs
 the module (`[this] { return HasRunningWorker(); }`), marks a resource whose
 values workers read unsynchronized: `ApplyTransaction` refuses it

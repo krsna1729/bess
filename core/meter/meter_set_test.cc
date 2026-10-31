@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "framework/memory_scope.h"
@@ -59,6 +60,36 @@ TEST(MeterSetBuilderTest, IdRules) {
   EXPECT_EQ(MeterError::kUnknownId, builder.Reset(MeterId(1)).error());
   EXPECT_EQ(1u, builder.size());
   EXPECT_EQ(4u, builder.capacity());
+}
+
+// A paged read resumes where the last page stopped and visits each meter
+// once, in id order, across leaves and inner nodes of a sparse index.
+TEST(MeterSetBuilderTest, VisitSpecsFromResumesAndVisitsEachMeterOnce) {
+  constexpr uint32_t kCapacity = 100000;
+  MeterSetBuilder builder(kCapacity);
+  std::vector<uint32_t> added;
+  for (uint32_t id = 1; id <= kCapacity; id += 37) {
+    MustAdd(builder, id);
+    added.push_back(id);
+  }
+  MustAdd(builder, kCapacity);
+  added.push_back(kCapacity);
+  std::vector<uint32_t> seen;
+  size_t visits = 0;
+  size_t pages = 0;
+  std::optional<MeterId> from = MeterId(0);
+  while (from.has_value()) {
+    size_t page = 0;
+    from = builder.VisitSpecsFrom(*from, [&](MeterId id, const MeterProfileSpec &) {
+      visits++;
+      seen.push_back(id.value());
+      return ++page < 64;
+    });
+    pages++;
+  }
+  EXPECT_EQ(added, seen);
+  EXPECT_EQ(added.size(), visits);
+  EXPECT_EQ((added.size() + 63) / 64, pages);
 }
 
 TEST(MeterSetBuilderTest, InvalidSpecLeavesBuilderUnchanged) {

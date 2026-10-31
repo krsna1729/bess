@@ -6,7 +6,9 @@
 #include <atomic>
 #include <cstddef>
 #include <expected>
+
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -105,6 +107,15 @@ class MeterResource final : public dataplane::Resource {
       if (!retiring_.contains(id)) {
         visit(id, policy);
       }
+    });
+  }
+
+  // VisitPolicies from id `from` until visit returns false; returns the id
+  // to resume from, or nullopt when none remains. Costs the meters visited.
+  template <typename Visit>
+  std::optional<MeterId> VisitPoliciesFrom(MeterId from, Visit &&visit) const {
+    return live_->VisitSpecsFrom(from, [&](MeterId id, const MeterProfileSpec &policy) {
+      return retiring_.contains(id) || visit(id, policy);
     });
   }
 

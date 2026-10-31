@@ -4,9 +4,13 @@
 #define BESS_FRAMEWORK_PACKET_STORE_CODEC_H_
 
 #include <any>
+#include <array>
+#include <cstdint>
 #include <expected>
+#include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "dataplane/packet_store.h"
 #include "framework/resource_codec.h"
@@ -50,23 +54,30 @@ inline std::shared_ptr<framework::ResourceCodec> MakePacketStoreFlowsCodec(
         return std::any(limits);
       },
       // Read back as given: an entry carries exactly the fields it set.
-      [&published](const auto &visit) {
+      // Resumable by flow id (the cursor is the next id).
+      [&published](std::string_view cursor, const auto &visit) -> std::string {
         const dataplane::PacketStoreLimitsMap *limits = published.Read();
         if (limits == nullptr) {
-          return;
+          return {};
         }
-        for (const auto &[id, entry] : *limits) {
+        std::array<uint32_t, 1> from{};
+        (void)framework::CursorFields(cursor, &from);
+        for (auto it = limits->lower_bound(from[0]); it != limits->end(); ++it) {
           bess::pb::PacketStoreFlowKey key;
-          key.set_id(id);
+          key.set_id(it->first);
           bess::pb::PacketStoreFlowValue value;
-          if (entry.timeout_ns.has_value()) {
-            value.set_timeout_ns(*entry.timeout_ns);
+          if (it->second.timeout_ns.has_value()) {
+            value.set_timeout_ns(*it->second.timeout_ns);
           }
-          if (entry.max_packets_per_flow.has_value()) {
-            value.set_max_packets_per_flow(*entry.max_packets_per_flow);
+          if (it->second.max_packets_per_flow.has_value()) {
+            value.set_max_packets_per_flow(*it->second.max_packets_per_flow);
           }
-          visit(key, value);
+          if (!visit(key, value)) {
+            const auto next = std::next(it);
+            return next == limits->end() ? std::string() : framework::CursorOf<1>({next->first});
+          }
         }
+        return {};
       });
 }
 
