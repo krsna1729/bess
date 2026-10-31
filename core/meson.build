@@ -966,6 +966,7 @@ allocation_fault_tests = [
   'dataplane/transaction_lifecycle_test.cc',
   'modules/firewall_test.cc',
   'modules/transaction_conformance_test.cc',
+  'modules/url_filter_test.cc',
   'flow/shared_flow_table_test.cc',
   'flow/worker_flow_table_test.cc',
   'l2/fdb_test.cc',

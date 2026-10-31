@@ -100,6 +100,7 @@ Columns:
 | NAT | idle timeout | 300 s | `kDefaultNatTimeout` (`nat/nat.h`), `BasicNat::kDefaultTimeout` | No | — |
 | Conntrack | flows | default 65,536 | `ConntrackArg.capacity` | yes | a new connection's packet leaves on gate 1 (not tracked) and `bess.table_full` is raised |
 | URLFilter | reconstructed bytes per flow | 64 KiB from the SYN's sequence number | `TcpFlowReconstruct::kMaxBufLen` (`utils/tcp_flow_reconstruct.h`) | No | data past it is ignored (a segment straddling it keeps the part inside); a request whose headers do not end inside it is never matched and the flow passes |
+| URLFilter | flows tracked | default 4,096; at most 2^24; a flow idle 10 s leaves | `UrlFilter::kDefaultMaxFlows`, `kMaxFlowsLimit` | `max_flows` | EINVAL above 2^24; a SYN that finds the table full is dropped and counted |
 | Conntrack, NAT, tunnel decaps, Router, Firewall, HashLB (L3/L4), URLFilter | IPv6 extension headers parsed (hop-by-hop, routing, destination options, fragment, AH) | 8 | `kMaxExtensionHeaders` (`packet_parse.h`) | No | packet treated as malformed: Firewall, HashLB and URLFilter drop it (D-188) |
 | DRR | flows | default 4,096; max 16M | `DRR::kDefaultNumFlows`, `kMaxNumFlows` | `num_flows` | EINVAL |
 | Queue | size | default 1,024; 4–16,384, a power of 2 | `DEFAULT_QUEUE_SIZE` (`queue.cc`); the bounds are literals in `Queue::SetSize` | `size` | EINVAL "must be in [4, 16384]" / "must be a power of 2" |

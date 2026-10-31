@@ -7,7 +7,6 @@
 #include <expected>
 #include <span>
 #include <string>
-#include <tuple>
 
 #include "packet_parse.h"
 #include "utils/checksum.h"
@@ -163,6 +162,21 @@ void UrlFilter::Insert(
 }
 
 CommandResponse UrlFilter::Init(const bess::pb::UrlFilterArg &arg) {
+  const uint64_t max_flows = arg.max_flows() ? arg.max_flows() : kDefaultMaxFlows;
+  // Validated before admitting (D-198), as the table refuses it.
+  if (max_flows > kMaxFlowsLimit) {
+    return CommandFailure(EINVAL, "max_flows %llu is above %zu",
+                          static_cast<unsigned long long>(max_flows), kMaxFlowsLimit);
+  }
+  bess::framework::MemoryLease lease =
+      init_context().memory().LeaseFor<FlowTable>("flows", static_cast<size_t>(max_flows));
+  auto table = FlowTable::Create(static_cast<size_t>(max_flows));
+  if (!table) {
+    return CommandFailure(ENOMEM, "cannot create the flow table for %llu flows",
+                          static_cast<unsigned long long>(max_flows));
+  }
+  flows_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*table));
+
   Insert(arg.blacklist(), &blacklist_);
   *config_.mutable_blacklist() = arg.blacklist();
 
@@ -194,8 +208,28 @@ void UrlFilter::DeInit() {
   blacklist_resource_.Release();
 }
 
+void UrlFilter::SweepExpired(uint64_t now) {
+  bess::flow::FlowHandle expired[kSweepSlots];
+  size_t n = 0;
+  sweep_cursor_ = flows_->VisitRange(
+      sweep_cursor_, kSweepSlots,
+      [now, &expired, &n](bess::flow::FlowHandle handle, const Flow &, FlowRecord &record) {
+        if (now >= record.ExpiryTime()) {
+          expired[n++] = handle;
+        }
+      });
+  for (size_t i = 0; i < n; i++) {
+    (void)flows_->Erase(expired[i]);
+  }
+  if (sweep_cursor_ == flows_->capacity()) {
+    sweep_cursor_ = 0;
+  }
+}
+
 void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   gate_idx_t igate = ctx->current_igate;
+  // A flow nobody sends on again leaves within one walk of the table.
+  SweepExpired(ctx->current_ns);
 
   // Pass reverse traffic
   if (igate == 1) {
@@ -236,39 +270,42 @@ void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     uint64_t now = ctx->current_ns;
 
     // Find existing flow, if we have one.
-    std::unordered_map<Flow, FlowRecord, FlowHash>::iterator it =
-        flow_cache_.find(flow);
+    FlowRecord *record = flows_->Find(flow);
 
-    if (it != flow_cache_.end()) {
-      if (now >= it->second.ExpiryTime()) {
+    if (record != nullptr) {
+      if (now >= record->ExpiryTime()) {
         // Discard old flow and start over.
-        flow_cache_.erase(it);
-        it = flow_cache_.end();
-      } else if (it->second.IsAnalyzed()) {
+        (void)flows_->Erase(flow);
+        record = nullptr;
+      } else if (record->IsAnalyzed()) {
         // Once we're finished analyzing, we only record *blocked* flows.
         // Continue blocking this flow for TIME_OUT_NS more ns.
-        it->second.SetExpiryTime(now + TIME_OUT_NS);
+        record->SetExpiryTime(now + TIME_OUT_NS);
         DropPacket(ctx, pkt);
         continue;
       }
     }
 
-    if (it == flow_cache_.end()) {
+    if (record == nullptr) {
       // Don't have a flow, or threw an aged one out.  If there's no
       // SYN in this packet the reconstruct code will fail.  This is
       // a common case (for any flow that got analyzed and allowed);
       // skip a pointless emplace/erase pair for such packets.
-      if (tcp->flags & Tcp::Flag::kSyn) {
-        std::tie(it, std::ignore) = flow_cache_.emplace(
-            std::piecewise_construct, std::make_tuple(flow), std::make_tuple());
-      } else {
+      if (!(tcp->flags & Tcp::Flag::kSyn)) {
         EmitPacket(ctx, pkt, 0);
+        continue;
+      }
+      // A full table drops the SYN rather than pass a flow unanalyzed; the
+      // client retries once the sweep has freed a slot.
+      record = flows_->Emplace(flow).state;
+      if (record == nullptr) {
+        refused_flows_++;
+        DropPacket(ctx, pkt);
         continue;
       }
     }
 
-    FlowRecord &record = it->second;
-    TcpFlowReconstruct &buffer = record.GetBuffer();
+    TcpFlowReconstruct &buffer = record->GetBuffer();
 
     // If the reconstruct code indicates failure, treat this
     // as a flow to pass.  Note: we only get failure if there is
@@ -277,13 +314,13 @@ void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     bool success = buffer.InsertParsed(pkt, parsed);
     if (!success) {
       VLOG(1) << "Reconstruction failure";
-      flow_cache_.erase(it);
+      (void)flows_->Erase(flow);
       EmitPacket(ctx, pkt, 0);
       continue;
     }
 
     // Have something on this flow; keep it alive for a while longer.
-    record.SetExpiryTime(now + TIME_OUT_NS);
+    record->SetExpiryTime(now + TIME_OUT_NS);
 
     // We are by definition still analyzing.  See if we can determine
     // the final disposition of this flow.
@@ -320,12 +357,12 @@ void UrlFilter::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
       // NOTE: if FIN is lost on its way to destination, this will simply pass
       // the retransmitted packet.
       if (parse_result != -2 || (tcp->flags & Tcp::Flag::kFin)) {
-        flow_cache_.erase(it);
+        (void)flows_->Erase(flow);
       }
     } else {
       // No need to keep reconstructing, just mark it as analyzed
       // (and hence blocked).
-      it->second.SetAnalyzed();
+      record->SetAnalyzed();
 
       // Inject RST to destination
       bess::PacketRef rst_to_destination = GenerateResetPacket(
