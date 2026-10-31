@@ -983,6 +983,7 @@ allocation_fault_tests = [
   'route/l3_test.cc',
   'route/neighbor_resolver_test.cc',
   'route/router_transaction_test.cc',
+  'route/route_test.cc',
 ]
 
 taskset_prog = find_program('taskset', required: false)
