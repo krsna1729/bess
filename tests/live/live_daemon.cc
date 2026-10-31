@@ -119,7 +119,7 @@ Output RunProgramIn(const std::string &dir, const std::vector<std::string> &argv
   }
   pid_t pid = -1;
   auto args = Argv(argv);
-  const int rc = posix_spawn(&pid, args[0], &actions, nullptr, args.data(), environ);
+  const int rc = posix_spawnp(&pid, args[0], &actions, nullptr, args.data(), environ);
   posix_spawn_file_actions_destroy(&actions);
   close(in[0]);
   close(out[1]);
@@ -191,7 +191,7 @@ Child::Child(const std::vector<std::string> &argv) {
   posix_spawn_file_actions_adddup2(&actions, err[1], 2);
   auto args = Argv(argv);
   pid_t pid = -1;
-  const int rc = posix_spawn(&pid, args[0], &actions, nullptr, args.data(), environ);
+  const int rc = posix_spawnp(&pid, args[0], &actions, nullptr, args.data(), environ);
   posix_spawn_file_actions_destroy(&actions);
   close(out[1]);
   close(err[1]);
@@ -350,8 +350,9 @@ void Daemon::Start(int port) {
   const int log_fd = mkstemp(log_template);
   log_path_ = log_template;
   keep_log_ = false;  // a fresh daemon: this run's log is this run's to remove
-  std::vector<std::string> argv = {Env("BESSD"),       "-f", "--mem_backing=normal", "-p",
-                                   std::to_string(port), "-skip_root_check"};
+  std::vector<std::string> argv = launcher_;
+  argv.insert(argv.end(), {Env("BESSD"), "-f", "--mem_backing=normal", "-p",
+                           std::to_string(port), "-skip_root_check"});
   argv.insert(argv.end(), flags_.begin(), flags_.end());
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);
@@ -359,7 +360,7 @@ void Daemon::Start(int port) {
   posix_spawn_file_actions_adddup2(&actions, log_fd, 2);
   auto args = Argv(argv);
   pid_t pid = -1;
-  const int rc = posix_spawn(&pid, args[0], &actions, nullptr, args.data(), environ);
+  const int rc = posix_spawnp(&pid, args[0], &actions, nullptr, args.data(), environ);
   posix_spawn_file_actions_destroy(&actions);
   close(log_fd);
   if (rc != 0) {
@@ -463,6 +464,14 @@ void Daemon::Stop() {
 
 std::unique_ptr<Daemon> Daemon::Launch(std::vector<std::string> flags) {
   std::unique_ptr<Daemon> d(new Daemon(std::move(flags)));
+  d->Start();
+  return d;
+}
+
+std::unique_ptr<Daemon> Daemon::LaunchUnder(std::vector<std::string> launcher,
+                                            std::vector<std::string> flags) {
+  std::unique_ptr<Daemon> d(new Daemon(std::move(flags)));
+  d->launcher_ = std::move(launcher);
   d->Start();
   return d;
 }

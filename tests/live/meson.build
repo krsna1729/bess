@@ -13,6 +13,7 @@ live_test_sources = [
   'module_traffic_test.cc',
   'simd_width_test.cc',
   'stateful_modules_test.cc',
+  'strict_budget_test.cc',
   'usage_report_test.cc',
 ]
 live_lib = static_library(
