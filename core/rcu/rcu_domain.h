@@ -18,6 +18,9 @@
 #include <rte_rcu_qsbr.h>
 
 namespace bess {
+namespace utils {
+class MemoryGrowth;
+}  // namespace utils
 namespace rcu {
 
 // The reader identity is the BESS WorkerId, not a CPU, a DPDK lcore or a thread
@@ -156,8 +159,15 @@ class RcuDomain {
   }
 
   // Makes room for `n` more retirements, so that the next `n` Retire() calls
-  // do not allocate (for callers that must not fail after committing).
+  // do not allocate (for callers that must not fail after committing). The
+  // queue's growth is admitted first through set_memory_growth's hook, which
+  // may throw utils::MemoryRefused (a std::bad_alloc), as the growth may.
   void ReserveRetirements(size_t n);
+
+  // The hook ReserveRetirements admits the retirement queue's growth through
+  // (glibc bytes; the queue keeps its capacity, so its high water stays
+  // admitted). Null: not admitted. Set once, before the domain is shared.
+  void set_memory_growth(utils::MemoryGrowth *growth) { growth_ = growth; }
 
   // Destroys every retired object whose grace period has completed, and returns
   // how many were destroyed. Call from a control thread.
@@ -224,6 +234,7 @@ class RcuDomain {
   size_t head_ = 0;
   std::atomic<size_t> pending_count_{0};  // retired_.size(), readable unlocked
   const size_t retire_high_water_;
+  utils::MemoryGrowth *growth_ = nullptr;
   mutable RcuStats stats_;  // counters are updated by const readers too
 };
 

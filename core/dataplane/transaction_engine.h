@@ -285,19 +285,46 @@ class TransactionEngine {
   using StringMap =
       std::unordered_map<std::string, V, StringHash, std::equal_to<>>;
 
+  // A referenced key (EncodeKey bytes): inline up to 15 bytes -- the ids
+  // references name -- else in a block of its own, admitted through the
+  // ledger hook like the nodes. A ledger node is then 40 bytes, a 48-byte
+  // malloc chunk, against 64 with a std::string key, whose longer keys went
+  // unadmitted (D-207). Looked up as a string_view.
+  class LedgerKey {
+   public:
+    LedgerKey(std::string_view key, utils::MemoryGrowth *growth);
+    LedgerKey(LedgerKey &&other) noexcept;
+    LedgerKey(const LedgerKey &) = delete;
+    LedgerKey &operator=(const LedgerKey &) = delete;
+    LedgerKey &operator=(LedgerKey &&) = delete;
+    ~LedgerKey();
+    operator std::string_view() const noexcept;  // NOLINT(google-explicit-constructor)
+    friend bool operator==(const LedgerKey &a, std::string_view b) noexcept {
+      return std::string_view(a) == b;
+    }
+    friend bool operator==(const LedgerKey &a, const LedgerKey &b) noexcept {
+      return std::string_view(a) == std::string_view(b);
+    }
+
+   private:
+    static constexpr unsigned char kApart = 0xff;  // in bytes_[15]
+    // Inline: the bytes, their count in bytes_[15]. Apart: the block's
+    // address and a uint32_t size, kApart in bytes_[15].
+    char bytes_[16];
+    utils::MemoryGrowth *growth_;
+  };
+
   // Everything the engine keeps about one registered resource.
   struct Registration {
     explicit Registration(utils::MemoryGrowth *ledger_growth)
         : incoming(Incoming::allocator_type(ledger_growth)) {}
 
     // References to its keys held by other resources' values: key -> count.
-    // Glibc, its nodes and bucket array admitted exactly through the
-    // engine's ledger hook (D-206, class C); a key longer than the string's
-    // inline buffer (15 characters) allocates its characters apart,
-    // unadmitted.
+    // Glibc, its nodes, bucket array and longer keys (LedgerKey) admitted
+    // exactly through the engine's ledger hook (D-206, class C).
     using Incoming = std::unordered_map<
-        std::string, size_t, StringHash, std::equal_to<>,
-        utils::AdmittedGlibcAllocator<std::pair<const std::string, size_t>>>;
+        LedgerKey, size_t, StringHash, std::equal_to<>,
+        utils::AdmittedGlibcAllocator<std::pair<const LedgerKey, size_t>>>;
 
     Resource *resource = nullptr;
     // Its declared references that are bound (the referent is registered).
