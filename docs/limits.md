@@ -54,6 +54,7 @@ Columns:
 | Limit | Value | Where | Configurable | When exceeded |
 |---|---|---|---|---|
 | Transaction history kept | 4,096 records | `DataplaneTransactions::kMaxRecords` | No | oldest record dropped |
+| Transaction history bytes | 4 MiB (`bessd/transaction_records`) | `DataplaneTransactions::kMaxRecordBytes` | No | oldest record dropped (the newest is always kept) |
 | Pending reference cascades | 4,096 | `TransactionEngine::kMaxPendingCascades` | No | transaction answered BUSY (retry) |
 
 ## Modules
