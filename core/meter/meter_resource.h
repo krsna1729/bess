@@ -109,14 +109,13 @@ class MeterResource final : public dataplane::Resource {
   }
 
   // The same, from the first id at or above `first`, while `visit` returns
-  // true: a page costs its length, not the meters before it.
+  // true: the walk enters the live builder's index at `first`, so a page
+  // costs its length, not the meters before it.
   template <typename Visit>
   void VisitPoliciesFrom(MeterId first, Visit &&visit) const {
-    for (auto it = policies_.lower_bound(first); it != policies_.end(); ++it) {
-      if (!retiring_.contains(it->first) && !visit(it->first, it->second)) {
-        return;
-      }
-    }
+    live_->VisitSpecsFrom(first, [&](MeterId id, const MeterProfileSpec &policy) {
+      return retiring_.contains(id) || visit(id, policy);
+    });
   }
 
   // dataplane::Resource.

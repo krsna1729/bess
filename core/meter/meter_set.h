@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 
 #include "dataplane/batch_stages.h"
@@ -331,6 +332,12 @@ class MeterSetBuilder {
   // read-back needs no copy of its own, D-207). Control path.
   void VisitSpecs(
       const std::function<void(MeterId, const MeterProfileSpec &)> &visit) const;
+  // VisitSpecs from id `from` until visit returns false; returns the id to
+  // resume from, or nullopt when the walk is done. Skips the subtrees below
+  // `from`, so a resumed walk costs the meters it visits.
+  std::optional<MeterId> VisitSpecsFrom(
+      MeterId from,
+      const std::function<bool(MeterId, const MeterProfileSpec &)> &visit) const;
   size_t size() const noexcept { return size_; }
   size_t capacity() const noexcept { return capacity_; }
 
