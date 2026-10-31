@@ -1978,7 +1978,7 @@ ControlResult<ControlPlane::Versioned<ControlPlane::PipelineRead>> ControlPlane:
   }
   if (query.include) {
     auto resources = ReadResources(engine, framework::ResourceBindings::ProcessDefault(),
-                                   query.names);
+                                   query.names, query.max_bytes);
     if (!resources) {
       return std::unexpected(resources.error());
     }
@@ -1987,8 +1987,9 @@ ControlResult<ControlPlane::Versioned<ControlPlane::PipelineRead>> ControlPlane:
   return read;
 }
 
-ControlResult<ControlPlane::Versioned<ResourceSpec>>
-ControlPlane::ReadResource(const std::string &name) const {
+ControlResult<ControlPlane::Versioned<ResourceEntryPage>> ControlPlane::ReadResource(
+    const std::string &name, const std::string &cursor, size_t max_entries,
+    size_t max_bytes) const {
   if (name.empty()) {
     ControlError error = Err(EINVAL, "resource: a name is required");
     error.field = "resource";
@@ -1996,20 +1997,13 @@ ControlPlane::ReadResource(const std::string &name) const {
   }
   std::lock_guard<std::mutex> lock(mutex_);
   const dataplane::TransactionEngine &engine = runtime::runtime().transactions();
-  const std::vector<std::string> names{name};
-  auto resources = ReadResources(engine, framework::ResourceBindings::ProcessDefault(),
-                                 names);
-  if (!resources) {
-    return std::unexpected(resources.error());
+  auto page = ReadResourcePage(engine, framework::ResourceBindings::ProcessDefault(), name,
+                               cursor, max_entries, max_bytes);
+  if (!page) {
+    return std::unexpected(page.error());
   }
-  if (resources->size() != 1) {
-    ControlError error = Err(EIO, "resource '%s': the read returned %zu specs",
-                             name.c_str(), resources->size());
-    error.field = "resource";
-    return std::unexpected(error);
-  }
-  Versioned<ResourceSpec> read;
-  read.value = std::move((*resources)[0]);
+  Versioned<ResourceEntryPage> read;
+  read.value = std::move(*page);
   read.generation = runtime::runtime().generation();
   read.resource_generation = engine.generation();
   return read;

@@ -4,9 +4,12 @@
 #define BESS_FRAMEWORK_PACKET_STORE_CODEC_H_
 
 #include <any>
+#include <array>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "dataplane/packet_store.h"
 #include "framework/resource_codec.h"
@@ -50,14 +53,21 @@ inline std::shared_ptr<framework::ResourceCodec> MakePacketStoreFlowsCodec(
         return std::any(limits);
       },
       // Read back as given: an entry carries exactly the fields it set.
-      [&table](const auto &visit) {
-        for (size_t i = 1; i <= table.capacity(); i++) {
-          const auto id = static_cast<uint32_t>(i);
-          const PacketStoreLimits *found = table.Current(PacketStoreFlowId(id));
-          if (found == nullptr) {
-            continue;
+      // Resumable by flow id (the cursor is the next id).
+      [&table](std::string_view cursor, const auto &visit) -> std::string {
+        std::array<uint32_t, 1> from{};
+        (void)framework::CursorFields(cursor, &from);
+        const auto next_from = [&table](size_t i) -> size_t {
+          for (; i <= table.capacity(); i++) {
+            if (table.Current(PacketStoreFlowId(static_cast<uint32_t>(i))) != nullptr) {
+              return i;
+            }
           }
-          const PacketStoreLimits &entry = *found;
+          return 0;
+        };
+        for (size_t i = next_from(from[0] == 0 ? 1 : from[0]); i != 0; i = next_from(i + 1)) {
+          const auto id = static_cast<uint32_t>(i);
+          const PacketStoreLimits &entry = *table.Current(PacketStoreFlowId(id));
           bess::pb::PacketStoreFlowKey key;
           key.set_id(id);
           bess::pb::PacketStoreFlowValue value;
@@ -67,8 +77,12 @@ inline std::shared_ptr<framework::ResourceCodec> MakePacketStoreFlowsCodec(
           if (entry.max_packets_per_flow.has_value()) {
             value.set_max_packets_per_flow(*entry.max_packets_per_flow);
           }
-          visit(key, value);
+          if (!visit(key, value)) {
+            const size_t next = next_from(i + 1);
+            return next == 0 ? std::string() : framework::CursorOf<1>({static_cast<uint32_t>(next)});
+          }
         }
+        return {};
       });
 }
 

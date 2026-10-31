@@ -257,6 +257,31 @@ class ConcurrentExactTable {
     }
   }
 
+  // Visits entries by key slot from `slot` (0: the first) until fn(ConstBytes
+  // key, uint64_t value) returns false or the slots end; returns the slot to
+  // resume from, 0 at the end. A key keeps its slot while it is in the table
+  // (cuckoo moves bucket entries, not key slots), so a walk resumed on the
+  // same table visits an entry present throughout exactly once; one added
+  // meanwhile may land behind it. Costs the slots it passes, not the table.
+  template <typename Fn>
+  uint32_t VisitFrom(uint32_t slot, Fn &&fn) const {
+    WriterGuard guard(*this);
+    const auto end = static_cast<uint32_t>(rte_hash_max_key_id(table_));
+    for (uint32_t s = slot; s < end; s++) {
+      void *key;
+      void *data;
+      if (rte_hash_get_key_with_position(table_, static_cast<int32_t>(s), &key) != 0 ||
+          rte_hash_lookup_data(table_, key, &data) != static_cast<int32_t>(s)) {
+        continue;  // a free slot, or one whose key waits out a grace period
+      }
+      if (!fn(ConstBytes(static_cast<const std::byte *>(key), key_len_),
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)))) {
+        return s + 1 < end ? s + 1 : 0;
+      }
+    }
+    return 0;
+  }
+
   size_t size() const noexcept {
     return size_.load(std::memory_order_relaxed);
   }

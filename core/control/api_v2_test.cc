@@ -10,6 +10,7 @@
 #include <google/protobuf/util/message_differencer.h>
 #include <grpcpp/generic/generic_stub.h>
 #include <grpcpp/grpcpp.h>
+#include <google/protobuf/wrappers.pb.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -1087,6 +1088,61 @@ TEST_F(ApiV2ServiceTest, ReadResourceReadsATableAboveTheMessageLimit) {
   }
 }
 
+// A resource of `count` entries its codec generates; it stores none.
+class GeneratedResource final : public bess::dataplane::Resource {
+ public:
+  GeneratedResource(std::string name, size_t count) : Resource(std::move(name)), count_(count) {}
+  bool Contains(const bess::dataplane::ResourceKey &) const override { return false; }
+  std::expected<Reservation, std::string> Reserve(const bess::dataplane::Op &) override {
+    return std::unexpected("read only");
+  }
+  size_t LiveCount() const override { return count_; }
+
+ private:
+  size_t count_;
+};
+
+// GetPipeline refuses resources that cannot fit one message before building
+// them: 1,000,000 live entries at no less than ~100 bytes each are above the
+// 64 MiB limit however small their values, so the codec is never walked.
+TEST_F(ApiV2ServiceTest, GetPipelineRefusesAnOversizedTableBeforeReadingIt) {
+  constexpr uint32_t kEntries = 1000000;
+  GeneratedResource resource("generated/r", kEntries);
+  bess::dataplane::TransactionEngine &engine = bess::runtime::runtime().transactions();
+  ASSERT_TRUE(engine.registry().Register(&resource));
+  size_t visits = 0;
+  bess::framework::ResourceBinding binding = bess::framework::ResourceBindings::ProcessDefault().Bind(
+      resource,
+      std::make_shared<bess::framework::TypedCodec<google::protobuf::UInt32Value,
+                                                   google::protobuf::BytesValue>>(
+          [](const google::protobuf::UInt32Value &)
+              -> std::expected<bess::dataplane::ResourceKey, std::string> {
+            return std::unexpected("unused");
+          },
+          [](const google::protobuf::BytesValue &) -> std::expected<std::any, std::string> {
+            return std::unexpected("unused");
+          },
+          [&visits](const auto &visit) {
+            google::protobuf::UInt32Value key;
+            const google::protobuf::BytesValue value;
+            for (uint32_t i = 0; i < kEntries; i++) {
+              key.set_value(i);
+              visit(key, value);
+              visits++;
+            }
+          }));
+  grpc::ClientContext ctx;
+  v2::GetPipelineRequest req;
+  req.set_include_resources(true);
+  req.add_resources("generated/r");
+  v2::GetPipelineResponse resp;
+  const grpc::Status status = stub_->GetPipeline(&ctx, req, &resp);
+  binding.Reset();
+  ASSERT_TRUE(engine.registry().Unregister("generated/r"));
+  EXPECT_EQ(grpc::StatusCode::RESOURCE_EXHAUSTED, status.error_code());
+  EXPECT_EQ(0u, visits) << "entries were built for a read the live count already refused";
+}
+
 // ResetResources empties only the tables it names, in the daemon: no key is
 // read over the wire, and the unlisted table keeps its entries. The expected
 // resource generation is checked before anything changes.
@@ -1145,7 +1201,7 @@ TEST_F(ApiV2ServiceTest, ResetResourcesErasesOnlyTheNamedTables) {
     v2::ResetResourcesRequest req;
     req.set_daemon_epoch(Epoch());
     req.add_resources("take/rules");
-    auto before = control_plane_->ReadResource("take/rules");
+    auto before = control_plane_->ReadResource("take/rules", "", 1, 1 << 20);
     ASSERT_TRUE(before.has_value());
     req.set_expected_resource_generation(before->resource_generation);
     v2::ResetResourcesResponse resp;
