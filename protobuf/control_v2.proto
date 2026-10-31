@@ -832,6 +832,16 @@ message MemoryStatus {
   // Bytes admitted for hugepages that landed on normal pages because the
   // hugepage heap ran out before the cap (D-206), since startup.
   uint64 spilled_bytes = 18;
+  // D-207: every module's admitted_bytes summed; the working set the daemon
+  // held when its control server started that nothing admitted (binary,
+  // libraries, EAL, gRPC, thread stacks); and used_bytes less that
+  // baseline and the admitted bytes it holds (glibc and normal pages, and
+  // hugepages when hugetlb_charged): what no account explains, which a
+  // strict budget keeps near zero. Negative when admitted bytes are not
+  // resident yet.
+  uint64 admitted_bytes = 19;
+  uint64 baseline_bytes = 20;
+  int64 unattributed_bytes = 21;
 }
 
 // What one module admitted for one of its resources (a table, a pool, a

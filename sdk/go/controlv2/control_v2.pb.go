@@ -5336,9 +5336,19 @@ type MemoryStatus struct {
 	HugepageCapSource string `protobuf:"bytes,17,opt,name=hugepage_cap_source,json=hugepageCapSource,proto3" json:"hugepage_cap_source,omitempty"` // "--mem_hugepage_mb" or the cgroup's hugetlb.<size>.max
 	// Bytes admitted for hugepages that landed on normal pages because the
 	// hugepage heap ran out before the cap (D-206), since startup.
-	SpilledBytes  uint64 `protobuf:"varint,18,opt,name=spilled_bytes,json=spilledBytes,proto3" json:"spilled_bytes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SpilledBytes uint64 `protobuf:"varint,18,opt,name=spilled_bytes,json=spilledBytes,proto3" json:"spilled_bytes,omitempty"`
+	// D-207: every module's admitted_bytes summed; the working set the daemon
+	// held when its control server started that nothing admitted (binary,
+	// libraries, EAL, gRPC, thread stacks); and used_bytes less that
+	// baseline and the admitted bytes it holds (glibc and normal pages, and
+	// hugepages when hugetlb_charged): what no account explains, which a
+	// strict budget keeps near zero. Negative when admitted bytes are not
+	// resident yet.
+	AdmittedBytes     uint64 `protobuf:"varint,19,opt,name=admitted_bytes,json=admittedBytes,proto3" json:"admitted_bytes,omitempty"`
+	BaselineBytes     uint64 `protobuf:"varint,20,opt,name=baseline_bytes,json=baselineBytes,proto3" json:"baseline_bytes,omitempty"`
+	UnattributedBytes int64  `protobuf:"varint,21,opt,name=unattributed_bytes,json=unattributedBytes,proto3" json:"unattributed_bytes,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *MemoryStatus) Reset() {
@@ -5493,6 +5503,27 @@ func (x *MemoryStatus) GetHugepageCapSource() string {
 func (x *MemoryStatus) GetSpilledBytes() uint64 {
 	if x != nil {
 		return x.SpilledBytes
+	}
+	return 0
+}
+
+func (x *MemoryStatus) GetAdmittedBytes() uint64 {
+	if x != nil {
+		return x.AdmittedBytes
+	}
+	return 0
+}
+
+func (x *MemoryStatus) GetBaselineBytes() uint64 {
+	if x != nil {
+		return x.BaselineBytes
+	}
+	return 0
+}
+
+func (x *MemoryStatus) GetUnattributedBytes() int64 {
+	if x != nil {
+		return x.UnattributedBytes
 	}
 	return 0
 }
@@ -7270,7 +7301,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\fhas_capacity\x18\x03 \x01(\bR\vhasCapacity\x12\x1a\n" +
 	"\bcapacity\x18\x04 \x01(\x04R\bcapacity\" \n" +
 	"\fWorkerStatus\x12\x10\n" +
-	"\x03cpu\x18\x01 \x01(\rR\x03cpu\"\xed\x05\n" +
+	"\x03cpu\x18\x01 \x01(\rR\x03cpu\"\xea\x06\n" +
 	"\fMemoryStatus\x12\x1c\n" +
 	"\thugepages\x18\x01 \x01(\bR\thugepages\x12\x1a\n" +
 	"\bfallback\x18\x02 \x01(\bR\bfallback\x12\x1f\n" +
@@ -7292,7 +7323,10 @@ const file_control_v2_proto_rawDesc = "" +
 	"\amodules\x18\x0f \x03(\v2\x18.bess.pb.v2.ModuleMemoryR\amodules\x12'\n" +
 	"\x0fhugetlb_charged\x18\x10 \x01(\bR\x0ehugetlbCharged\x12.\n" +
 	"\x13hugepage_cap_source\x18\x11 \x01(\tR\x11hugepageCapSource\x12#\n" +
-	"\rspilled_bytes\x18\x12 \x01(\x04R\fspilledBytes\"\xf9\x01\n" +
+	"\rspilled_bytes\x18\x12 \x01(\x04R\fspilledBytes\x12%\n" +
+	"\x0eadmitted_bytes\x18\x13 \x01(\x04R\radmittedBytes\x12%\n" +
+	"\x0ebaseline_bytes\x18\x14 \x01(\x04R\rbaselineBytes\x12-\n" +
+	"\x12unattributed_bytes\x18\x15 \x01(\x03R\x11unattributedBytes\"\xf9\x01\n" +
 	"\fModuleMemory\x12\x16\n" +
 	"\x06module\x18\x01 \x01(\tR\x06module\x12\x1a\n" +
 	"\bresource\x18\x02 \x01(\tR\bresource\x12%\n" +

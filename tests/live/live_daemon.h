@@ -132,6 +132,11 @@ class Daemon {
   // A daemon of its own, started with `flags` after the usual ones (Shared()
   // takes none). Stopped when destroyed, unless Shutdown() ran.
   static std::unique_ptr<Daemon> Launch(std::vector<std::string> flags);
+  // As Launch, the daemon started by `launcher` (an argv that execs the
+  // rest of its arguments in place, as `systemd-run --scope` does, so the
+  // daemon keeps the pid it is waited on by).
+  static std::unique_ptr<Daemon> LaunchUnder(std::vector<std::string> launcher,
+                                             std::vector<std::string> flags);
   // What it has logged so far (standard output and error).
   std::string Log() const;
   // Asks it to shut down and waits (SIGKILL after 10 s): waitpid's raw
@@ -145,6 +150,7 @@ class Daemon {
   void Start(int port = 0);  // 0: a free port
   void Stop();
 
+  std::vector<std::string> launcher_;
   std::vector<std::string> flags_;
   int pid_ = -1;
   std::string address_;

@@ -8,11 +8,13 @@
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/message.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <grpcpp/resource_quota.h>
 #ifdef BESS_GRPC_REFLECTION
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <format>
@@ -894,9 +896,52 @@ void PrepareControlServer() {
   (void)prepared;
 }
 
+int MaxReceiveBytes() {
+  const bess::utils::MemoryPolicy &policy = bess::utils::memory_policy();
+  if (policy.limit_bytes == 0 || policy.reserve_bytes == 0) {
+    return kMaxMessageBytes;
+  }
+  return static_cast<int>(
+      std::min<size_t>(kMaxMessageBytes, policy.reserve_bytes / 8));
+}
+
 void ConfigureControlServer(grpc::ServerBuilder *builder) {
-  builder->SetMaxReceiveMessageSize(kMaxMessageBytes);
+  builder->SetMaxReceiveMessageSize(MaxReceiveBytes());
   builder->SetMaxSendMessageSize(kMaxMessageBytes);
+  const bess::utils::MemoryPolicy &policy = bess::utils::memory_policy();
+  if (policy.limit_bytes != 0 && policy.reserve_bytes != 0) {
+    grpc::ResourceQuota quota("bessd-control");
+    quota.Resize(policy.reserve_bytes / 4);
+    builder->SetResourceQuota(quota);
+  }
+}
+
+namespace {
+
+// The working set's baseline (RecordMemoryBaseline), and what the accounts
+// charge against it: the rows' glibc and normal-page bytes, and their
+// hugepage bytes when hugepages are charged to the cgroup.
+std::atomic<int64_t> memory_baseline{0};
+
+uint64_t ChargedBytes(const std::vector<bess::framework::ModuleMemoryUse> &rows,
+                      bool hugetlb_charged) {
+  uint64_t bytes = 0;
+  for (const bess::framework::ModuleMemoryUse &use : rows) {
+    bytes += use.glibc_bytes + use.normal_bytes +
+             (hugetlb_charged ? use.hugepage_bytes : 0);
+  }
+  return bytes;
+}
+
+}  // namespace
+
+void RecordMemoryBaseline() {
+  const bess::utils::MemoryStatus memory = bess::utils::GetMemoryStatus();
+  memory_baseline.store(
+      static_cast<int64_t>(memory.used_bytes) -
+          static_cast<int64_t>(ChargedBytes(bess::framework::MemoryAccounts::List(),
+                                            memory.hugetlb_charged)),
+      std::memory_order_relaxed);
 }
 
 ControlV2Service::ControlV2Service(ControlPlane &control_plane)
@@ -1060,8 +1105,10 @@ grpc::Status ControlV2Service::GetResourceStatus(
   // (D-206), with what the objects hold now: their bytes() are read here,
   // under the control-plane lock that orders every module's creation,
   // growth and destruction.
-  for (const bess::framework::ModuleMemoryUse &use :
-       bess::framework::MemoryAccounts::List()) {
+  const std::vector<bess::framework::ModuleMemoryUse> rows =
+      bess::framework::MemoryAccounts::List();
+  uint64_t admitted = 0;
+  for (const bess::framework::ModuleMemoryUse &use : rows) {
     v2::ModuleMemory *row = out->add_modules();
     row->set_module(use.module);
     row->set_resource(use.resource);
@@ -1070,7 +1117,15 @@ grpc::Status ControlV2Service::GetResourceStatus(
     row->set_hugepage_bytes(use.hugepage_bytes);
     row->set_normal_bytes(use.normal_bytes);
     row->set_glibc_bytes(use.glibc_bytes);
+    admitted += use.admitted_bytes;
   }
+  // D-207: the working set less the baseline and what is admitted on it.
+  const int64_t baseline = memory_baseline.load(std::memory_order_relaxed);
+  out->set_admitted_bytes(admitted);
+  out->set_baseline_bytes(static_cast<uint64_t>(std::max<int64_t>(baseline, 0)));
+  out->set_unattributed_bytes(
+      static_cast<int64_t>(memory.used_bytes) -
+      static_cast<int64_t>(ChargedBytes(rows, memory.hugetlb_charged)) - baseline);
 
   for (int core : runtime::runtime().workers().Cores()) {
     response->add_workers()->set_cpu(static_cast<uint32_t>(core));
