@@ -8,6 +8,8 @@
 // are appended to the log after the lock is released. With an event log, it
 // also moves workers' events into it every tick and, about once a second,
 // samples the control-visible pressure conditions (control/pressure_monitor.h).
+// After a large teardown it hands glibc's free pages back
+// (runtime/malloc_policy.h).
 
 #ifndef BESS_CONTROL_MAINTENANCE_LOOP_H_
 #define BESS_CONTROL_MAINTENANCE_LOOP_H_

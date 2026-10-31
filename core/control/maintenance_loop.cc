@@ -11,6 +11,7 @@
 #include "control/resource_fill.h"
 #include "framework/module_requests.h"
 #include "framework/module_tick.h"
+#include "runtime/malloc_policy.h"
 #include "stats/event_hub.h"
 
 namespace bess::control {
@@ -97,6 +98,9 @@ void MaintenanceLoop::Run() {
       // The hub has its own lock: workers' events reach the log every tick.
       (void)events_->DrainWorkers();
     }
+    // After a large teardown, glibc's free pages go back (RT-1); RPCs are not
+    // held up while it walks the arenas.
+    (void)runtime::TrimAfterRelease();
     ticks_.fetch_add(1, std::memory_order_relaxed);
     wait.lock();
   }
