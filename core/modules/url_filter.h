@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "arch/crc32c.h"
+#include "flow/worker_flow_table.h"
+#include "framework/memory_scope.h"
 #include "framework/singleton_resource.h"
 #include "module.h"
 #include "packet.h"
@@ -59,7 +61,8 @@ struct FlowHash {
 
 class FlowRecord {
  public:
-  FlowRecord() : done_analyzing_(false), buffer_(128), expiry_time_(0) {}
+  // The buffer starts empty: a SYN allocates nothing, the first data grows it.
+  FlowRecord() : done_analyzing_(false), buffer_(0), expiry_time_(0) {}
 
   bool IsAnalyzed() { return done_analyzing_; }
   void SetAnalyzed() { done_analyzing_ = true; }
@@ -86,7 +89,7 @@ class UrlFilter final : public Module {
   static const gate_idx_t kNumIGates = 2;
   static const gate_idx_t kNumOGates = 2;
   // One worker (the default limit); ProcessBatch inserts, refreshes and
-  // erases flow_cache_ entries (TCP reassembly per flow).
+  // erases flows_ entries (TCP reassembly per flow).
   static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kSingleWorker,
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
@@ -97,8 +100,22 @@ class UrlFilter final : public Module {
 
   std::string GetDesc() const override;
 
+  // Most flows analyzed (or held blocked) at once, by default.
+  static constexpr size_t kDefaultMaxFlows = 4096;
+  // The largest `max_flows`.
+  static constexpr size_t kMaxFlowsLimit = size_t{1} << 24;
+  // Table slots the expiry sweep visits per batch.
+  static constexpr size_t kSweepSlots = 64;
+  // Flows tracked now.
+  size_t flows() const { return flows_->size(); }
+  // SYNs dropped because the flow table was full.
+  uint64_t refused_flows() const { return refused_flows_; }
+
  private:
   using Blacklist = std::unordered_map<std::string, Trie<std::tuple<>>>;
+  // Flows by 4-tuple: fixed capacity, admitted at Init ("<name>/flows"), so
+  // a SYN flood neither allocates on the worker nor grows without bound.
+  using FlowTable = bess::flow::WorkerFlowTable<Flow, FlowRecord>;
 
   // A "<name>/blacklist" value, built: the blacklist and the
   // UrlFilterConfig it came from (read back as given).
@@ -111,8 +128,13 @@ class UrlFilter final : public Module {
       const google::protobuf::RepeatedPtrField<bess::pb::UrlFilterArg_Url> &urls,
       Blacklist *blacklist);
 
+  // Erases the expired flows in the next kSweepSlots slots of the table.
+  void SweepExpired(uint64_t now);
+
   Blacklist blacklist_;
-  std::unordered_map<Flow, FlowRecord, FlowHash> flow_cache_;
+  bess::framework::Sized<FlowTable> flows_;
+  size_t sweep_cursor_ = 0;
+  uint64_t refused_flows_ = 0;
 
   // The blacklist as given, in order (control side): "<name>/blacklist"
   // reads it back.

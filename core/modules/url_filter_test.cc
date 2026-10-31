@@ -17,8 +17,12 @@
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
+#include "modules/url_filter.h"
+#include "packet_pool.h"
 #include "pb/module_msg.pb.h"
 #include "runtime/runtime_state.h"
+#include "task.h"
+#include "testing/allocation_faults.h"
 #include "testing/module_harness.h"
 #include "testing/packet_builder.h"
 
@@ -272,6 +276,61 @@ TEST(UrlFilterTest, DataPastTheWindowIsIgnored) {
                              Tcp(10001, 80, 0, 12346 + 0x7ffffff0u, 23456),
                              std::string(32, 'x').c_str());
   EXPECT_EQ((std::vector<Bytes>{syn, far}), h.Run(uf, 0, {syn, far}, {0})[0]);
+}
+
+// MZ-11: a flood of 1M SYNs, each a new flow. The table holds at most
+// max_flows flows, a SYN past them is dropped and counted, and tracking a flow
+// allocates nothing on the worker; once the flows are idle past the timeout,
+// one walk of the table (a sweep per batch) empties it.
+TEST(UrlFilterTest, ASynFloodStaysWithinTheFlowTable) {
+  constexpr size_t kMaxFlows = 1024;
+  constexpr size_t kSyns = 1'000'000;
+  constexpr size_t kBurst = bess::PacketBatch::kMaxBurst;
+  ModuleHarness h;
+  bess::pb::UrlFilterArg arg;
+  arg.set_max_flows(kMaxFlows);
+  auto *uf = dynamic_cast<UrlFilter *>(h.Create("UrlFilter", arg, "uf_flood"));
+  ASSERT_NE(nullptr, uf);
+
+  const Bytes syn = ToServer("192.168.0.4", "10.0.0.4", Tcp(10001, 80, 0x02, 12345, 0));
+  constexpr size_t kSrcIp = 14 + 12;  // Ethernet, then the IPv4 source
+  bess::PlainPacketPool pool(2 * kBurst);
+  Task task(uf, nullptr);
+  Context ctx{};
+  ctx.wid = bess::dataplane::WorkerId(0);
+  ctx.task = &task;
+  ctx.current_igate = 0;
+  ctx.current_ns = 1;
+  size_t allocations = 0;
+  for (size_t i = 0; i < kSyns; i += kBurst) {
+    bess::PacketBatch batch;
+    batch.clear();
+    for (size_t j = i; j < i + kBurst; j++) {
+      bess::PacketHandle pkt = pool.Alloc(syn.size());
+      ASSERT_NE(nullptr, pkt);
+      auto *frame = bess::PacketRef(pkt).head_data<uint8_t *>();
+      std::memcpy(frame, syn.data(), syn.size());
+      const bess::utils::be32_t src(static_cast<uint32_t>(0x0a000000u + j));
+      std::memcpy(frame + kSrcIp, &src, sizeof(src));
+      batch.add(bess::PacketRef(pkt));
+    }
+    // Every packet ends dropped (a refused SYN, or one emitted to the
+    // unconnected gate 0): the dead batch frees them.
+    const bess::fault_injection::AllocationFaults window;
+    uf->ProcessBatch(&ctx, &batch);
+    allocations += window.allocations();
+  }
+  EXPECT_EQ(kMaxFlows, uf->flows());
+  EXPECT_EQ(kSyns - kMaxFlows, uf->refused_flows());
+  EXPECT_EQ(0u, allocations);
+
+  ctx.current_ns = 1 + 10'000'000'000ull;  // the 10 s timeout
+  for (size_t sweep = 0; sweep < kMaxFlows / UrlFilter::kSweepSlots; sweep++) {
+    bess::PacketBatch empty;
+    empty.clear();
+    uf->ProcessBatch(&ctx, &empty);
+  }
+  EXPECT_EQ(0u, uf->flows());
 }
 
 }  // namespace

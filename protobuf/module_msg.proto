@@ -1469,7 +1469,9 @@ message UpdateArg {
  * (gate 0). A frame the checked parse refuses (headers that do not fit the
  * first segment, lengths that lie) is dropped. A flow's request is
  * reconstructed from the first 64 KiB after the SYN; data past that is
- * ignored.
+ * ignored. At most `max_flows` flows are tracked at once; a SYN that finds
+ * the table full is dropped (the client retries), and a flow idle for 10 s
+ * leaves the table.
  *
  * __Input Gates__: 2
  * __Output Gates__: 2
@@ -1486,6 +1488,7 @@ message UrlFilterArg {
     string path = 2;  /// Path prefix, e.g. "/"
   }
   repeated Url blacklist = 1; /// A list of Urls to block.
+  uint64 max_flows = 2; /// Most flows tracked at once (default 4096, at most 2^24).
 }
 
 /**
