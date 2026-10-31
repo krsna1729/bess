@@ -908,6 +908,7 @@ unit_test_sources = [
   'traffic_class_test.cc',
   'drivers/pcap_test.cc',
   'drivers/pmd_test.cc',
+  'drivers/unix_socket_test.cc',
   'utils/bits_test.cc',
   'utils/inline_function_test.cc',
   'utils/bpf_program_test.cc',
