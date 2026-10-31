@@ -14,10 +14,12 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <initializer_list>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <google/protobuf/wrappers.pb.h>
 
@@ -344,6 +346,73 @@ TEST_F(DataplaneTransactionsTest, RequestIdsMakeRetriesSafe) {
   EXPECT_TRUE(Get("stale").known());
 }
 
+// D-207: a record keeps its id, not one result per operation; a replay and
+// GetTransaction still answer every operation exactly as the first answer.
+TEST_F(DataplaneTransactionsTest, RecordsKeepOnlyTheResultsThatDiffer) {
+  v2::ApplyTransactionRequest bulk;
+  bulk.set_request_id("bulk");
+  for (uint32_t i = 0; i < 1000; i++) {
+    *bulk.add_ops() = ExactRule("em0", i, 1, 2);
+  }
+  const auto first = Apply(bulk);
+  ASSERT_EQ(first.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  ASSERT_EQ(first.record().ops_size(), 1000);
+  EXPECT_EQ(Get("bulk").record().SerializeAsString(), first.record().SerializeAsString());
+  const auto again = Apply(bulk);
+  EXPECT_TRUE(again.replayed());
+  EXPECT_EQ(again.record().SerializeAsString(), first.record().SerializeAsString());
+
+  // A rejection keeps its failed operation, where it was, with its error.
+  v2::ApplyTransactionRequest bad;
+  bad.set_request_id("bad");
+  for (uint32_t i = 0; i < 10; i++) {
+    *bad.add_ops() = ExactRule("em0", 5000 + i, 1, 2);
+  }
+  bad.mutable_ops(7)->set_resource("nope/rules");
+  const auto rejected = Apply(bad);
+  ASSERT_EQ(rejected.record().outcome(), v2::TransactionRecord::OUTCOME_REJECTED);
+  ASSERT_EQ(rejected.record().ops(7).status(), v2::TransactionOpResult::STATUS_FAILED);
+  EXPECT_EQ(Get("bad").record().SerializeAsString(), rejected.record().SerializeAsString());
+}
+
+// D-207: at the memory limit an upsert is refused with nothing applied, and
+// an erase-only transaction still applies (the erase headroom, half the
+// reserve), record and all: a full daemon can always be emptied.
+TEST_F(DataplaneTransactionsTest, ErasesApplyAtTheLimit) {
+  v2::ApplyTransactionRequest load;
+  load.set_request_id("load");
+  for (uint32_t i = 0; i < 100; i++) {
+    *load.add_ops() = ExactRule("em0", i, 1, 2);
+  }
+  ASSERT_EQ(Apply(load).record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+
+  bess::utils::MemoryPolicy saved = bess::utils::memory_policy();
+  bess::utils::MemoryPolicy full = saved;
+  // 4 MiB past limit - reserve; the erase headroom is half the reserve.
+  full.reserve_bytes = size_t{512} << 20u;
+  full.limit_bytes = bess::utils::GetMemoryStatus().used_bytes +
+                     full.reserve_bytes - (size_t{4} << 20u);
+  full.limit_source = "test";
+  bess::utils::SetMemoryPolicy(full);
+  v2::ApplyTransactionRequest more;
+  more.set_request_id("more");
+  *more.add_ops() = ExactRule("em0", 1000, 1, 2);
+  grpc::Status refused;
+  Apply(more, &refused);
+  v2::ApplyTransactionRequest drain;
+  drain.set_request_id("drain");
+  for (uint32_t i = 0; i < 100; i++) {
+    *drain.add_ops() = EraseExact("em0", i, 1);
+  }
+  const auto drained = Apply(drain);
+  bess::utils::SetMemoryPolicy(std::move(saved));
+  EXPECT_EQ(refused.error_code(), grpc::StatusCode::RESOURCE_EXHAUSTED);
+  EXPECT_EQ(drained.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  EXPECT_EQ(Rules("em0"), 0u);
+  EXPECT_TRUE(Get("drain").known());
+  EXPECT_FALSE(Get("more").known());
+}
+
 // A large transaction: 50,000 typed rules (about 5 MB on the wire). gRPC's
 // default 4 MiB limit refuses it; the control server's settings take it.
 TEST_F(DataplaneTransactionsTest, LargeTransactionsFitTheServerLimits) {
@@ -392,6 +461,51 @@ TEST(DataplaneTransactionsWindowTest, OldestRecordsAgeOut) {
   EXPECT_FALSE(transactions.Get("r0").known());
   EXPECT_TRUE(transactions.Get("r1").known());
   EXPECT_EQ(transactions.Get("r1").daemon_epoch(), 7u);
+}
+
+// D-207: with request ids as clients send them (a 36-character UUID), the
+// count binds, never the bytes: a record ages out exactly when it did before
+// the byte bound existed, oldest first.
+TEST(DataplaneTransactionsWindowTest, RealisticRecordsAgeOutByCountNotBytes) {
+  InitRuntimeOnce();
+  bess::dataplane::TransactionEngine engine(bess::runtime::runtime().rcu());
+  bess::framework::ResourceBindings bindings;
+  DataplaneTransactions transactions(engine, bindings, /*epoch=*/7);
+  auto id = [](size_t i) { return std::format("{:08x}-0000-4000-8000-{:012x}", i, i); };
+  v2::ApplyTransactionRequest req;
+  for (size_t i = 0; i < DataplaneTransactions::kMaxRecords + 2; i++) {
+    req.set_request_id(id(i));
+    ASSERT_TRUE(transactions.Apply(req).has_value());
+  }
+  EXPECT_EQ(transactions.records(), DataplaneTransactions::kMaxRecords);
+  EXPECT_LT(transactions.bytes(), DataplaneTransactions::kMaxRecordBytes / 2);
+  EXPECT_FALSE(transactions.Get(id(0)).known());
+  EXPECT_FALSE(transactions.Get(id(1)).known());
+  EXPECT_TRUE(transactions.Get(id(2)).known());
+  EXPECT_TRUE(transactions.Get(id(DataplaneTransactions::kMaxRecords + 1)).known());
+}
+
+// D-207: the window is bounded in charged bytes too, oldest out first.
+TEST(DataplaneTransactionsWindowTest, TheWindowIsBoundedInBytes) {
+  InitRuntimeOnce();
+  bess::dataplane::TransactionEngine engine(bess::runtime::runtime().rcu());
+  bess::framework::ResourceBindings bindings;
+  DataplaneTransactions transactions(engine, bindings, /*epoch=*/7);
+  // About 4 KiB a record (its 4000-byte id): the bytes bind first.
+  const std::string pad(4000, 'x');
+  v2::ApplyTransactionRequest req;
+  for (size_t i = 0; i < 2000; i++) {
+    req.set_request_id(pad + std::to_string(i));
+    ASSERT_TRUE(transactions.Apply(req).has_value());
+    ASSERT_LE(transactions.bytes(), DataplaneTransactions::kMaxRecordBytes);
+  }
+  EXPECT_LT(transactions.records(), 2000u);
+  EXPECT_GT(transactions.records(), 500u);
+  // Oldest out first: what is kept is the newest records() transactions.
+  const size_t oldest = 2000 - transactions.records();
+  EXPECT_FALSE(transactions.Get(pad + std::to_string(oldest - 1)).known());
+  EXPECT_TRUE(transactions.Get(pad + std::to_string(oldest)).known());
+  EXPECT_TRUE(transactions.Get(pad + "1999").known());
 }
 
 // The window is control-plane glibc charged to the daemon's scope (D-206,
