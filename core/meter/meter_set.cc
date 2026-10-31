@@ -392,6 +392,32 @@ const MeterSetBuilder::Entry *MeterSetBuilder::Find(
   return entry.state != nullptr ? &entry : nullptr;
 }
 
+void MeterSetBuilder::VisitSpecs(
+    const std::function<void(MeterId, const MeterProfileSpec &)> &visit) const {
+  // Depth-first in slot order, so ids ascend; `base` is the node's first id.
+  auto walk = [&](auto &self, const detail::MeterNode *node, unsigned level,
+                  size_t base) -> void {
+    if (level == 0) {
+      const detail::MeterLeaf *leaf = detail::AsLeaf(node);
+      for (size_t i = 0; i < detail::kMeterLeafSlots; i++) {
+        if (leaf->entries[i].state != nullptr) {
+          visit(MeterId(static_cast<uint32_t>(base + i)),
+                leaf->entries[i].profile->spec());
+        }
+      }
+      return;
+    }
+    const unsigned shift =
+        detail::kMeterLeafBits + detail::kMeterInnerBits * (level - 1);
+    for (size_t i = 0; i < detail::kMeterInnerSlots; i++) {
+      if (const detail::MeterNode *child = detail::AsInner(node)->children[i]) {
+        self(self, child, level - 1, base + (i << shift));
+      }
+    }
+  };
+  walk(walk, root_, levels_, 0);
+}
+
 detail::MeterLeaf *MeterSetBuilder::WritableLeaf(size_t index) {
   // Depth d: 0 is the root, levels_ the leaf; a node's level is levels_ - d.
   // fresh[d] replaces depth d's node, or is null when this builder writes

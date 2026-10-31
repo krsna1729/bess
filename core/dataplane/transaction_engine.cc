@@ -3,7 +3,9 @@
 #include "dataplane/transaction_engine.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <new>
 #include <thread>
 #include <utility>
@@ -123,6 +125,47 @@ void TransactionEngine::RebindDependenciesLocked(Registration &reg) {
   }
 }
 
+TransactionEngine::LedgerKey::LedgerKey(std::string_view key,
+                                        utils::MemoryGrowth *growth)
+    : growth_(growth) {
+  if (key.size() < sizeof(bytes_)) {
+    std::memcpy(bytes_, key.data(), key.size());
+    bytes_[15] = static_cast<char>(key.size());
+    return;
+  }
+  char *apart = utils::AdmittedGlibcAllocator<char>(growth_).allocate(key.size());
+  std::memcpy(apart, key.data(), key.size());
+  const auto size = static_cast<uint32_t>(key.size());
+  std::memcpy(bytes_, static_cast<const void *>(&apart), sizeof(apart));
+  std::memcpy(bytes_ + sizeof(apart), &size, sizeof(size));
+  bytes_[15] = static_cast<char>(kApart);
+}
+
+TransactionEngine::LedgerKey::LedgerKey(LedgerKey &&other) noexcept
+    : growth_(other.growth_) {
+  std::memcpy(bytes_, other.bytes_, sizeof(bytes_));
+  other.bytes_[15] = 0;  // empty, owns nothing
+}
+
+TransactionEngine::LedgerKey::~LedgerKey() {
+  if (static_cast<unsigned char>(bytes_[15]) == kApart) {
+    const std::string_view key = *this;
+    utils::AdmittedGlibcAllocator<char>(growth_).deallocate(
+        const_cast<char *>(key.data()), key.size());
+  }
+}
+
+TransactionEngine::LedgerKey::operator std::string_view() const noexcept {
+  if (static_cast<unsigned char>(bytes_[15]) != kApart) {
+    return {bytes_, static_cast<size_t>(bytes_[15])};
+  }
+  const char *apart = nullptr;
+  uint32_t size = 0;
+  std::memcpy(static_cast<void *>(&apart), bytes_, sizeof(apart));
+  std::memcpy(&size, bytes_ + sizeof(apart), sizeof(size));
+  return {apart, size};
+}
+
 void TransactionEngine::RebuildIncomingLocked() {
   for (auto &[name, reg] : resources_) {
     reg->incoming.clear();
@@ -134,7 +177,8 @@ void TransactionEngine::RebuildIncomingLocked() {
           target == nullptr ? nullptr
                             : Holder(target, ref.key, /*in_transaction=*/false);
       if (holder != nullptr) {
-        ++holder->incoming[ref.key];
+        ++holder->incoming.try_emplace(LedgerKey(ref.key, ledger_growth_), 0)
+              .first->second;
       }
     });
   }
@@ -938,8 +982,8 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
 
   // Ledger entries for new references, so publishing only updates counts.
   for (const Delta &d : w.deltas) {
-    if (d.change > 0) {
-      d.target->incoming.try_emplace(std::string(d.key), 0);
+    if (d.change > 0 && !d.target->incoming.contains(d.key)) {
+      d.target->incoming.try_emplace(LedgerKey(d.key, ledger_growth_), 0);
     }
   }
 
