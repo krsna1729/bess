@@ -103,13 +103,11 @@ DRR::~DRR() {
     }
     std::free(ingress_);
   }
-  // Collect first: removing entries while iterating the map is not safe.
-  std::vector<Flow *> flows;
-  for (auto &entry : flows_) {
-    flows.push_back(entry.second);
-  }
-  for (Flow *f : flows) {
-    RemoveFlow(f);
+  // The slab holds every queued packet (a free slot holds none).
+  for (uint32_t slot = 0; slot < queue_slots_; slot++) {
+    if (queued_[slot].pkt != nullptr) {
+      bess::PacketFree(queued_[slot].pkt);
+    }
   }
   std::free(flow_ring_);
 }
@@ -153,7 +151,7 @@ CommandResponse DRR::Init(const bess::pb::DRRArg &arg) {
     return CommandFailure(ENOMEM, "task creation failed");
   }
 
-  err = AllocateRings();
+  err = AllocateState();
   if (err.error().code() != 0) {
     return err;
   }
@@ -209,7 +207,7 @@ void DRR::DeInit() {
   settings_.Release();
 }
 
-CommandResponse DRR::AllocateRings() {
+CommandResponse DRR::AllocateState() {
   // Both rings admitted before either is allocated (D-198).
   const size_t bytes = bess::utils::RingBytes(max_number_flows_) +
                        bess::utils::RingBytes(kIngressSize);
@@ -223,6 +221,27 @@ CommandResponse DRR::AllocateRings() {
   if (err_num != 0) {
     return CommandFailure(-err_num);
   }
+
+  // The round-robin ring holds max_number_flows_ - 1 flows, each at most once:
+  // the table holds as many, so a flow joining the ring always finds room.
+  const size_t capacity = max_number_flows_ - 1;
+  bess::framework::MemoryLease lease =
+      init_context().memory().LeaseFor<FlowTable>("flows", capacity);
+  auto table = FlowTable::Create(capacity);
+  if (!table) {
+    return CommandFailure(ENOMEM, "cannot create the flow table for %zu flows", capacity);
+  }
+  flows_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*table));
+
+  queue_slots_ = static_cast<uint32_t>(std::min<uint64_t>(
+      uint64_t{max_number_flows_} * kFlowQueueMax, kMaxQueuedPackets));
+  const size_t queue_bytes = size_t{queue_slots_} * sizeof(Queued);
+  queue_lease_ = init_context().memory().Lease("queue", queue_bytes, queue_bytes);
+  queued_ = std::make_unique<Queued[]>(queue_slots_);
+  for (uint32_t slot = 0; slot < queue_slots_; slot++) {
+    queued_[slot].next = slot + 1;
+  }
+  free_ = 0;
   return CommandSuccess();
 }
 
@@ -247,7 +266,7 @@ void DRR::ProcessBatch(Context *, bess::PacketBatch *batch) {
   }
 }
 
-void DRR::DrainIngress(uint32_t limit) {
+void DRR::DrainIngress(uint32_t limit, uint64_t now) {
   bess::PacketHandle pkts[bess::PacketBatch::kMaxBurst];
   // D-019: one consumer at a time. Both the flag and the check are debug-only
   // (no cost in a release build): the task may move between workers while they
@@ -269,7 +288,7 @@ void DRR::DrainIngress(uint32_t limit) {
           << "DRR: the ingress ring handed out packet " << i << " of " << n
              << " (value " << static_cast<const void *>(pkts[i])
              << ", ring count " << rte_ring_count(ingress_) << ")";
-      Classify(pkts[i]);
+      Classify(pkts[i], now);
     }
     if (n < bess::PacketBatch::kMaxBurst) {
       break;
@@ -281,23 +300,21 @@ void DRR::DrainIngress(uint32_t limit) {
 #endif
 }
 
-void DRR::Classify(bess::PacketHandle handle) {
-  int err = 0;
+void DRR::Classify(bess::PacketHandle handle, uint64_t now) {
   // TODO(joshua): Add support for fragmented packets.
-  FlowId id = GetId(bess::PacketRef(handle));
-  auto it = flows_.Find(id);
-
-  // if the Flow doesn't exist create one
-  // and add the packet to the new Flow
-  if (it == nullptr) {
-    if (rte_ring_full(flow_ring_)) {
+  const FlowId id = GetId(bess::PacketRef(handle));
+  Flow *f = flows_->Find(id);
+  if (f == nullptr) {
+    // A full table drops the packet. Nothing is allocated: the flow takes a
+    // slot of the table made at Init (MA-B1).
+    f = flows_->Emplace(id).state;
+    if (f == nullptr) {
       bess::PacketFree(handle);
-    } else {
-      AddNewFlow(handle, id, &err);
+      return;
     }
-  } else {
-    Enqueue(it->second, handle, &err);
+    f->id = id;
   }
+  Enqueue(f, handle, now);
 }
 
 struct task_result DRR::RunTask(Context *ctx, bess::PacketBatch *batch,
@@ -309,16 +326,12 @@ struct task_result DRR::RunTask(Context *ctx, bess::PacketBatch *batch,
     };
   }
 
-  DrainIngress(kIngressPerRun);
+  const uint64_t now = ctx->current_ns;
+  DrainIngress(kIngressPerRun, now);
+  ExpireIdle(now);
 
-  int err = 0;
   batch->clear();
-  uint32_t total_bytes = 0;
-  if (flow_ring_ != NULL) {
-    total_bytes = GetNextBatch(batch, &err);
-  }
-  assert(err >= 0);  // TODO(joshua) do proper error checking
-
+  const uint32_t total_bytes = GetNextBatch(batch);
   if (total_bytes > 0) {
     RunNextModule(ctx, batch);
   }
@@ -329,8 +342,7 @@ struct task_result DRR::RunTask(Context *ctx, bess::PacketBatch *batch,
   return {.block = (cnt == 0), .packets = cnt, .bits = bits_retrieved};
 }
 
-uint32_t DRR::GetNextBatch(bess::PacketBatch *batch, int *err) {
-  Flow *f;
+uint32_t DRR::GetNextBatch(bess::PacketBatch *batch) {
   uint32_t total_bytes = 0;
   uint32_t count = rte_ring_count(flow_ring_);
   if (current_flow_) {
@@ -353,34 +365,22 @@ uint32_t DRR::GetNextBatch(bess::PacketBatch *batch, int *err) {
     }
     count--;
 
-    f = GetNextFlow(err);
-    if (*err != 0) {
-      return total_bytes;
-    } else if (f == nullptr) {
-      continue;
+    Flow *f = GetNextFlow();
+    if (f == nullptr) {
+      break;  // no flow has a packet queued
     }
+    total_bytes += GetNextPackets(batch, f);
 
-    uint32_t bytes = GetNextPackets(batch, f, err);
-    total_bytes += bytes;
-    if (*err != 0) {
-      return total_bytes;
-    }
-
-    if (rte_ring_empty(f->queue) && !f->next_packet) {
+    if (f->count == 0) {
+      // Drained: the flow leaves the round robin until its next packet, so a
+      // round visits the flows with packets only (MA-B2).
       f->deficit = 0;
-    }
-
-    // if the flow doesn't have any more packets to give, reenqueue it
-    bool next_packet_over_deficit = false;
-    if (f->next_packet) {
-      bess::PacketRef next_packet(f->next_packet);
-      next_packet_over_deficit = next_packet.total_len() > f->deficit;
-    }
-    if (!f->next_packet || next_packet_over_deficit) {
-      *err = rte_ring_sp_enqueue(flow_ring_, f);
-      if (*err != 0) {
-        return total_bytes;
-      }
+      f->active = false;
+    } else if (bess::PacketRef(queued_[f->head].pkt).total_len() > f->deficit) {
+      // Its turn is over: to the back of the round robin. The ring holds every
+      // flow at once, so this cannot fail.
+      const int requeued = rte_ring_sp_enqueue(flow_ring_, f);
+      DCHECK_EQ(0, requeued);
     } else {
       // knowing that the while statement will exit, keep the flow that still
       // has packets at the front
@@ -390,66 +390,59 @@ uint32_t DRR::GetNextBatch(bess::PacketBatch *batch, int *err) {
   return total_bytes;
 }
 
-DRR::Flow *DRR::GetNextFlow(int *err) {
-  Flow *f;
-  double now = get_epoch_time();
-
-  if (!current_flow_) {
-    *err = rte_ring_sc_dequeue(flow_ring_, reinterpret_cast<void **>(&f));
-    if (*err < 0) {
-      return nullptr;
-    }
-
-    if (rte_ring_empty(f->queue) && !f->next_packet) {
-      // if the flow expired, remove it
-      if (now - f->timer > kTtl) {
-        RemoveFlow(f);
-      } else {
-        *err = rte_ring_sp_enqueue(flow_ring_, f);
-        if (*err < 0) {
-          return nullptr;
-        }
-      }
-      return nullptr;
-    }
-
-    f->deficit += quantum_.load(std::memory_order_relaxed);
-  } else {
-    f = current_flow_;
+DRR::Flow *DRR::GetNextFlow() {
+  Flow *f = current_flow_;
+  if (f != nullptr) {
     current_flow_ = nullptr;
+    return f;
   }
+  if (rte_ring_sc_dequeue(flow_ring_, reinterpret_cast<void **>(&f)) != 0) {
+    return nullptr;
+  }
+  f->deficit += quantum_.load(std::memory_order_relaxed);
   return f;
 }
 
-uint32_t DRR::GetNextPackets(bess::PacketBatch *batch, Flow *f, int *err) {
+uint32_t DRR::GetNextPackets(bess::PacketBatch *batch, Flow *f) {
   uint32_t total_bytes = 0;
-  bess::PacketHandle pkt_handle;
-
-  while (!batch->full() && (!rte_ring_empty(f->queue) || f->next_packet)) {
-    // makes sure there isn't already a packet at the front
-    if (!f->next_packet) {
-      *err = rte_ring_sc_dequeue(
-          f->queue, reinterpret_cast<void **>(&pkt_handle));
-      if (*err < 0) {
-        return total_bytes;
-      }
-    } else {
-      pkt_handle = f->next_packet;
-      f->next_packet = nullptr;
-    }
-
-    bess::PacketRef pkt(pkt_handle);
+  while (!batch->full() && f->count > 0) {
+    const uint32_t slot = f->head;
+    Queued &q = queued_[slot];
+    bess::PacketRef pkt(q.pkt);
     if (pkt.total_len() > f->deficit) {
-      f->next_packet = pkt.handle();
       break;
     }
-
     f->deficit -= pkt.total_len();
     total_bytes += pkt.total_len();
     batch->add(pkt);
+    // The slot goes back to the free list.
+    f->head = q.next;
+    f->count--;
+    q.pkt = nullptr;
+    q.next = free_;
+    free_ = slot;
   }
-
   return total_bytes;
+}
+
+void DRR::ExpireIdle(uint64_t now) {
+  constexpr uint64_t kTtlNs = uint64_t{kTtl} * 1'000'000'000;
+  FlowId expired[kSweepSlots];
+  size_t n = 0;
+  sweep_cursor_ = flows_->VisitRange(
+      sweep_cursor_, kSweepSlots,
+      [now, &expired, &n](bess::flow::FlowHandle, const FlowId &id, const Flow &f) {
+        // An idle flow is off the round robin and holds no packet.
+        if (!f.active && now > f.last_ns + kTtlNs) {
+          expired[n++] = id;
+        }
+      });
+  for (size_t i = 0; i < n; i++) {
+    (void)flows_->Erase(expired[i]);
+  }
+  if (sweep_cursor_ == flows_->capacity()) {
+    sweep_cursor_ = 0;
+  }
 }
 
 // The 5-tuple of an untagged IPv4 packet, read through a PacketCursor (bounds
@@ -488,55 +481,6 @@ DRR::FlowId DRR::GetId(bess::PacketRef pkt) {
   return id;
 }
 
-void DRR::AddNewFlow(bess::PacketHandle pkt, FlowId id, int *err) {
-  // Every step completes or is undone: a new flow ends up both in the map and
-  // on the round-robin ring, or in neither, and the packet is always either
-  // queued or freed.
-  auto f = std::make_unique<Flow>(id);
-  if (faults_.queue_alloc) {
-    *err = -ENOMEM;
-  } else {
-    f->queue = AddQueue(static_cast<int>(kFlowQueueSize), err);
-  }
-  if (*err != 0) {
-    bess::PacketFree(pkt);
-    return;
-  }
-
-  if (faults_.map_insert || flows_.Insert(id, f.get()) == nullptr) {
-    *err = -ENOMEM;
-    bess::PacketFree(pkt);
-    return;  // `f` frees its queue
-  }
-
-  // Puts the flow in the round robin.
-  *err = faults_.ring_enqueue ? -ENOBUFS
-                              : rte_ring_sp_enqueue(flow_ring_, f.get());
-  if (*err != 0) {
-    flows_.Remove(id);
-    bess::PacketFree(pkt);
-    return;
-  }
-
-  // The flow is complete and schedulable; a failure to queue its first packet
-  // drops that packet only (Enqueue frees it).
-  Flow *flow = f.release();
-  if (faults_.first_enqueue) {
-    *err = -ENOBUFS;
-    bess::PacketFree(pkt);
-    return;
-  }
-  Enqueue(flow, pkt, err);
-}
-
-void DRR::RemoveFlow(Flow *f) {
-  if (f == current_flow_) {
-    current_flow_ = nullptr;
-  }
-  flows_.Remove(f->id);
-  delete f;
-}
-
 rte_ring *DRR::AddQueue(uint32_t slots, int *err, unsigned flags) {
   ssize_t bytes = rte_ring_get_memsize(slots);
   if (bytes < 0) {
@@ -562,68 +506,31 @@ rte_ring *DRR::AddQueue(uint32_t slots, int *err, unsigned flags) {
   return queue;
 }
 
-void DRR::Enqueue(Flow *f, bess::PacketHandle newpkt, int *err) {
-  // if the queue is full. drop the packet.
-  if (rte_ring_count(f->queue) >=
-      max_queue_size_.load(std::memory_order_relaxed)) {
-    bess::PacketFree(newpkt);
+void DRR::Enqueue(Flow *f, bess::PacketHandle pkt, uint64_t now) {
+  // A full flow queue, or a full slab, drops the packet.
+  if (f->count >= max_queue_size_.load(std::memory_order_relaxed) ||
+      free_ == queue_slots_) {
+    bess::PacketFree(pkt);
     return;
   }
-
-  // creates a new queue if there is not enough space for the new packet
-  // in the old queue
-  if (rte_ring_full(f->queue)) {
-    uint32_t slots =
-        RoundToPowerTwo(rte_ring_count(f->queue) * kQueueGrowthFactor);
-    // On failure the flow keeps its current queue (and its packets); only
-    // the new packet is dropped. Assigning the failed result nulled the queue
-    // and leaked it (external audit, 2026-09-27).
-    rte_ring *grown = nullptr;
-    if (faults_.resize_alloc) {
-      *err = -ENOMEM;
-    } else {
-      grown = ResizeQueue(f->queue, slots, err);
-    }
-    if (*err != 0) {
-      bess::PacketFree(newpkt);
-      return;
-    }
-    f->queue = grown;
-  }
-
-  *err = rte_ring_sp_enqueue(f->queue, reinterpret_cast<void *>(newpkt));
-  if (*err == 0) {
-    f->timer = get_epoch_time();
+  const uint32_t slot = free_;
+  free_ = queued_[slot].next;
+  queued_[slot].pkt = pkt;
+  if (f->count == 0) {
+    f->head = slot;
   } else {
-    bess::PacketFree(newpkt);
+    queued_[f->tail].next = slot;
   }
-}
-
-rte_ring *DRR::ResizeQueue(rte_ring *old_queue, uint32_t new_size, int *err) {
-  rte_ring *new_queue = AddQueue(new_size, err);
-  if (*err != 0) {
-    return nullptr;
+  f->tail = slot;
+  f->count++;
+  f->last_ns = now;
+  if (!f->active) {
+    // Joins the round robin. The ring holds every flow at once, so this
+    // cannot fail.
+    f->active = true;
+    const int joined = rte_ring_sp_enqueue(flow_ring_, f);
+    DCHECK_EQ(0, joined);
   }
-
-  // migrates packets from the old queue
-  if (old_queue) {
-    bess::PacketHandle pkt;
-
-    while (rte_ring_sc_dequeue(old_queue,
-                               reinterpret_cast<void **>(&pkt)) == 0) {
-      *err = rte_ring_sp_enqueue(new_queue, reinterpret_cast<void *>(pkt));
-      if (*err == -ENOBUFS) {
-        bess::PacketFree(pkt);
-        *err = 0;
-      } else if (*err != 0) {
-        std::free(new_queue);
-        return nullptr;
-      }
-    }
-
-    std::free(old_queue);
-  }
-  return new_queue;
 }
 
 CommandResponse DRR::SetQuantumSize(uint32_t size) {

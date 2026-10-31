@@ -110,7 +110,8 @@ Columns:
 | WildcardMatch | default `max_tuples` | 8 | `kDefaultMaxTuples` | `max_tuples` | — |
 | GenericEncap | header bytes | 64 (fields × bytes) | `MAX_HEADER_SIZE` (`generic_encap.cc`) | No | follows from the field limits |
 | HashLB | default hash mode | L4 | `HashLB::kDefaultMode` | `mode` | — |
-| DRR | default quantum; per-flow queue | 1,500 B; 2,048 growing ×2 to 8,192 | `kDefaultQuantum`, `kFlowQueueSize`, `kFlowQueueMax` | `quantum`, `max_flow_queue_size` | — |
+| DRR | default quantum; per-flow queue | 1,500 B; 8,192 packets | `kDefaultQuantum`, `kFlowQueueMax` | `quantum`, `max_flow_queue_size` | the packet is dropped |
+| DRR | packets queued in all flows | min(`num_flows` × 8,192, 262,144), a slab admitted at Init (`<name>/queue`) | `DRR::kMaxQueuedPackets` | No | the packet is dropped |
 | Measure | jitter sample probability | 0.05 | `kDefaultIpDvSampleProb` | `jitter_sample_prob` | — |
 | Timestamp | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Timestamp::Init` (`timestamp.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet the stamp cannot be placed in, in its first segment, is dropped (D-172) |
 | Measure | in-packet stamp offset | `offset` + 12 B (`Timestamp::kStampSize`) at most the packet data room | `Measure::Init` (`measure.cc`), the default pool's data room (`--packet_data_room`) | No | EINVAL; a packet whose first segment ends before the stamp's end is forwarded, not measured |
