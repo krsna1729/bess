@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "utils/dpdk_memory.h"
 #include "utils/logging.h"
 #include "utils/sanitizers.h"
 
@@ -237,7 +238,12 @@ void RcuDomain::ReserveRetirements(size_t n) {
   // RcuPtr::Publish) must not copy the queue on every call.
   const size_t needed = retired_.size() + n;
   if (needed > retired_.capacity()) {
-    retired_.reserve(std::max(needed, 2 * retired_.capacity()));
+    const size_t capacity = std::max(needed, 2 * retired_.capacity());
+    if (growth_ != nullptr) {
+      const size_t bytes = (capacity - retired_.capacity()) * sizeof(RetiredObject);
+      growth_->Grow(bytes, bytes);
+    }
+    retired_.reserve(capacity);
   }
 }
 

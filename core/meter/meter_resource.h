@@ -6,7 +6,6 @@
 #include <atomic>
 #include <cstddef>
 #include <expected>
-#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -98,14 +97,15 @@ class MeterResource final : public dataplane::Resource {
   bool Retiring(MeterId id) const noexcept { return retiring_.contains(id); }
 
   // Every committed, non-retiring meter with its policy as written, in id
-  // order. Control path.
+  // order: the live builder's specifications (D-207: no copy of its own).
+  // Control path.
   template <typename Visit>
   void VisitPolicies(Visit &&visit) const {
-    for (const auto &[id, policy] : policies_) {
+    live_->VisitSpecs([&](MeterId id, const MeterProfileSpec &policy) {
       if (!retiring_.contains(id)) {
         visit(id, policy);
       }
-    }
+    });
   }
 
   // dataplane::Resource.
@@ -162,9 +162,6 @@ class MeterResource final : public dataplane::Resource {
   };
   template <typename T>
   using ControlAllocator = utils::AdmittedGlibcAllocator<T>;
-  using Policies =
-      std::map<MeterId, MeterProfileSpec, std::less<MeterId>,
-               ControlAllocator<std::pair<const MeterId, MeterProfileSpec>>>;
 
   // A transaction edits a private copy of the builder, so a refused one
   // leaves the live builder untouched.
@@ -194,11 +191,6 @@ class MeterResource final : public dataplane::Resource {
   // The edit copy has become the live one (its first publish ran).
   bool published_staged_ = false;
   std::set<MeterId, std::less<MeterId>, ControlAllocator<MeterId>> retiring_;
-  // Each meter's policy as written (the builder keeps only compiled
-  // profiles), for read-back: policies_ mirrors live_, staged_policies_
-  // holds the transaction's upserts only and is merged into it on publish.
-  Policies policies_;
-  Policies staged_policies_;
 };
 
 }  // namespace bess::meter
