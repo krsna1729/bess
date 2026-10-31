@@ -356,7 +356,8 @@ TEST_F(BessctlTest, SchemaStatusAndUsage) {
                            "bess.pb.L2ForwardCommandLookupResponse  (no pause)"))
       << l2;
   EXPECT_FALSE(Contains(l2, "set_default_gate")) << l2;
-  EXPECT_TRUE(Contains(Ok({"schema", "ArpResponder"}).out, "  (paused)"));
+  EXPECT_TRUE(Contains(Ok({"schema", "Bridge"}).out, "  (paused)"));
+  EXPECT_FALSE(Contains(Ok({"schema", "ArpResponder"}).out, "  (paused)"));
   Ok({"status"});
   Ok({"metrics"});
   EXPECT_EQ(2, daemon().Bessctl({"nonsense"}).status);
