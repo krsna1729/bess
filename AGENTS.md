@@ -26,3 +26,6 @@ The most frequent review findings, in order:
    a `docs/limits.md` row for each new fixed limit.
 5. **Scope.** One concern per commit. Reference docs show the final state;
    a change's before and after numbers go in its commit message.
+6. **Scale.** A change to a table, queue, loop over entries, tick or packet
+   path runs the scale review checklist (engineering guide §8): cost follows
+   what changed, proven by a count, not a time.
