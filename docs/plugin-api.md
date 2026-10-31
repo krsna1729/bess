@@ -803,27 +803,28 @@ A packet buffer with its limits table: `dataplane::PacketStore`
 Per-flow FIFOs of packet handles keyed by a `uint32_t` flow id, a store-wide
 bound, a per-flow cap and an age limit; one owner thread; fixed memory, so it is
 admitted once and nothing allocates on the packet path. Its `flows` table is
-`dataplane::PacketStoreFlowsResource` over your `RcuPtr<PacketStoreLimitsMap>`
-(declare it `.Rebuilds()`, `requires_paused_workers` false):
+`dataplane::PacketStoreFlowsResource` over your `PacketStoreLimitsTable` (a
+`SlotTable` of flow ids 1..capacity, each entry published on its own; declare
+the resource live, no `.Rebuilds()`, `requires_paused_workers` false):
 
 ```cpp
-bess::rcu::RcuPtr<bess::dataplane::PacketStoreLimitsMap> limits_{init_context().rcu()};
+bess::framework::Sized<bess::dataplane::PacketStoreLimitsTable> limits_;
 
 const bess::dataplane::PacketStoreConfig config{.max_packets = 65536};
 auto lease = init_context().memory().LeaseFor<bess::dataplane::PacketStore>("store", config);
 auto made = bess::dataplane::PacketStore::Create(config);  // refusal: made.error(); OOM: null
 store_ = bess::framework::MemoryScope::Adopt(std::move(lease), std::move(*made));
-limits_.Initialize(std::make_unique<const bess::dataplane::PacketStoreLimitsMap>());
-flows_ = std::make_unique<bess::dataplane::PacketStoreFlowsResource>(name() + "/flows", limits_);
-binding_ = init_context().codecs().Bind(*flows_, bess::dataplane::MakePacketStoreFlowsCodec(limits_));
+limits_ = init_context().memory().Create<bess::dataplane::PacketStoreLimitsTable>("flows", flow_capacity);
+flows_ = std::make_unique<bess::dataplane::PacketStoreFlowsResource>(name() + "/flows", *limits_);
+binding_ = init_context().codecs().Bind(*flows_, bess::dataplane::MakePacketStoreFlowsCodec(*limits_));
 init_context().resources().Register(flows_.get());
 
-// The owner, per batch / per tick (limits: one limits_.Read() per run):
-store_->Store(handles, flow_ids, n, *limits, now_ns,
+// The owner, per batch / per tick (one acquire load per flow looked up):
+store_->Store(handles, flow_ids, n, *limits_, now_ns,
               [&](bess::PacketHandle h) { /* evicted: yours */ });
 store_->Release(id, [&](bess::PacketHandle h) { /* released: yours */ });
 store_->Drop(id);
-store_->ExpireBounded(*limits, now_ns);
+store_->ExpireBounded(*limits_, now_ns);
 ```
 
 Packets reaching the store from other workers need a handoff first

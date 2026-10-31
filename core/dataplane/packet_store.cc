@@ -131,7 +131,7 @@ bool PacketStore::ExpireFlow(Flow &flow, uint64_t timeout, uint64_t now_ns,
   return flow.count == 0;
 }
 
-void PacketStore::ExpireAll(const PacketStoreLimitsMap &limits,
+void PacketStore::ExpireAll(const PacketStoreLimitsTable &limits,
                             uint64_t now_ns) {
   size_t total = total_.load(std::memory_order_relaxed);
   size_t held = held_.load(std::memory_order_relaxed);
@@ -149,7 +149,7 @@ void PacketStore::ExpireAll(const PacketStoreLimitsMap &limits,
   held_.store(held, std::memory_order_relaxed);
 }
 
-void PacketStore::ExpireBounded(const PacketStoreLimitsMap &limits,
+void PacketStore::ExpireBounded(const PacketStoreLimitsTable &limits,
                                 uint64_t now_ns) {
   size_t total = total_.load(std::memory_order_relaxed);
   size_t held = held_.load(std::memory_order_relaxed);
@@ -215,83 +215,76 @@ size_t PacketStore::Clear() {
 // The flows resource
 // ---------------------------------------------------------------------------
 
-// Every operation of a transaction stages one of these; the first to publish
-// swaps the private copy in, once, and retires the table it replaced.
-PacketStoreFlowsResource::PacketStoreFlowsResource(
-    std::string name, rcu::RcuPtr<PacketStoreLimitsMap> &published,
-    utils::MemoryGrowth *growth)
-    : Resource(std::move(name)),
-      memory_(std::make_shared<PacketStoreMemory>()),
-      published_(published) {
-  memory_->Attach(growth);
-  published_.Initialize(std::make_unique<const PacketStoreLimitsMap>(
-      PacketStoreAllocator<std::pair<const uint32_t, PacketStoreLimits>>(memory_)));
-}
-
-PacketStoreFlowsResource::~PacketStoreFlowsResource() {
-  memory_->Attach(nullptr);
-}
-
-class PacketStoreFlowsResource::SwapOp final : public StagedOp {
+// An upsert's object, made by Reserve, published in place by Publish.
+class PacketStoreFlowsResource::PublishOp final : public StagedOp {
  public:
-  explicit SwapOp(PacketStoreFlowsResource &owner) : owner_(owner) {}
-
+  PublishOp(PacketStoreLimitsTable &table, PacketStoreFlowId id,
+            PacketStoreLimitsTable::Owned limits)
+      : table_(table), id_(id), limits_(std::move(limits)) {}
   void Publish(Retirer &retirer) noexcept override {
-    if (!owner_.swapped_) {
-      retirer.Retire(owner_.published_.Exchange(std::move(owner_.staged_)));
-      owner_.swapped_ = true;
+    retirer.Retire(table_.Publish(id_, std::move(limits_)));
+  }
+
+ private:
+  PacketStoreLimitsTable &table_;
+  PacketStoreFlowId id_;
+  PacketStoreLimitsTable::Owned limits_;
+};
+
+// Empties the entry, if there is one, when the transaction publishes. No
+// other resource refers to a flow id, so the id is free at once; the object
+// goes after a grace period.
+class PacketStoreFlowsResource::EraseOp final : public StagedOp {
+ public:
+  EraseOp(PacketStoreLimitsTable &table, PacketStoreFlowId id)
+      : table_(table), id_(id) {}
+  void Publish(Retirer &retirer) noexcept override {
+    if (table_.Contains(id_)) {
+      table_.Retire(id_);
+      retirer.Retire(table_.Unpublish(id_));
     }
   }
 
  private:
-  PacketStoreFlowsResource &owner_;
+  PacketStoreLimitsTable &table_;
+  PacketStoreFlowId id_;
 };
-
-size_t PacketStoreFlowsResource::LiveCount() const {
-  const PacketStoreLimitsMap *limits = published_.Read();
-  return limits == nullptr ? 0 : limits->size();
-}
 
 bool PacketStoreFlowsResource::Contains(const ResourceKey &key) const {
   uint32_t id;
-  const PacketStoreLimitsMap *limits = published_.Read();
-  return limits != nullptr && DecodeKey(key, &id) && limits->contains(id);
+  return DecodeKey(key, &id) && table_.Contains(PacketStoreFlowId(id));
 }
 
 std::expected<Resource::Reservation, std::string>
 PacketStoreFlowsResource::Reserve(const Op &op) {
-  uint32_t id;
-  if (!DecodeKey(op.key, &id)) {
+  uint32_t raw;
+  if (!DecodeKey(op.key, &raw)) {
     return std::unexpected("invalid flow id key");
   }
-  const PacketStoreLimitsMap *published = published_.Read();
-  const bool existed = published != nullptr && published->contains(id);
-
-  // Everything fallible happens here, on the transaction's private copy: the
-  // first Reserve clones the published table, every later one edits it.
-  if (staged_ == nullptr) {
-    staged_ = std::make_unique<PacketStoreLimitsMap>(*published);
-    swapped_ = false;
-  }
+  const PacketStoreFlowId id(raw);
+  Reservation reservation;
+  reservation.existed = table_.Contains(id);
+  // Each operation retires at most the one object it replaces or removes.
+  reservation.footprint = Footprint{.retires = 1};
   if (op.kind == OpKind::kErase) {
-    staged_->erase(id);
-  } else {
-    const PacketStoreLimits *limits = std::any_cast<PacketStoreLimits>(&op.value);
-    if (limits == nullptr) {
-      return std::unexpected("wrong value type (want flow limits)");
-    }
-    (*staged_)[id] = *limits;
+    // An id outside the table has no entry either: a no-op.
+    reservation.staged = std::make_unique<EraseOp>(table_, id);
+    return reservation;
   }
-  // Publishing replaces the table that is live now.
-  Reservation reservation{std::make_unique<SwapOp>(*this), {},
-                          Footprint{.retires = 1}};
-  reservation.existed = existed;
+  if (!table_.ValidId(id)) {
+    return std::unexpected("flow id " + std::to_string(raw) +
+                           " is outside the flows table (1.." +
+                           std::to_string(table_.capacity()) + ")");
+  }
+  const PacketStoreLimits *limits = std::any_cast<PacketStoreLimits>(&op.value);
+  if (limits == nullptr) {
+    return std::unexpected("wrong value type (want flow limits)");
+  }
+  // Make may add a slab chunk, admitted first through the table's growth
+  // hook (D-198): its MemoryRefused refuses the transaction.
+  reservation.staged =
+      std::make_unique<PublishOp>(table_, id, table_.Make(*limits));
   return reservation;
-}
-
-void PacketStoreFlowsResource::EndTransaction() noexcept {
-  staged_.reset();
-  swapped_ = false;
 }
 
 }  // namespace dataplane

@@ -14,7 +14,6 @@
 #include "framework/memory_scope.h"
 #include "framework/resource_bindings.h"
 #include "module.h"
-#include "rcu/rcu_ptr.h"
 #include "stats/metric_registry.h"
 #include "pb/module_msg.pb.h"
 #include "utils/endian.h"
@@ -39,8 +38,8 @@
 // is the only thread that touches the store, the release queue or the counts.
 // Control reaches the owner with a request on an SPSC ring, or applies it
 // itself when no worker runs the module (then control owns the state, as a
-// THREAD_UNSAFE command already assumes). The per-flow limits are one
-// immutable table published through an RcuPtr and read once per task run.
+// THREAD_UNSAFE command already assumes). The per-flow limits are a dense
+// table of flow ids, each entry published on its own and read per packet.
 // Nothing here pauses the dataplane, no command is refused with EBUSY, and no
 // counter is shared between packet paths: the only shared state on a packet
 // path is the ingress ring, which is what it is for (D-054's handoff shape).
@@ -61,7 +60,7 @@ class PacketStore final : public Module {
   static constexpr ModuleCapabilities kCapabilities{ModuleCapabilities::State::kShared,
                                                     ModuleCapabilities::FlowAffinity::kNone};
 
-  PacketStore() : Module(), limits_(init_context().rcu()) {
+  PacketStore() : Module() {
     // The module's own task is the owner, so the graph treats it as a task
     // boundary (as DRR and Queue do), and what it sends downstream runs on the
     // owner's worker - not on every worker that feeds it.
@@ -85,7 +84,7 @@ class PacketStore final : public Module {
   std::string GetDesc() const override;
 
  private:
-  using LimitsMap = bess::dataplane::PacketStoreLimitsMap;
+  using LimitsTable = bess::dataplane::PacketStoreLimitsTable;
 
   struct ReleasedPacket {
     bess::PacketRef pkt;
@@ -114,6 +113,9 @@ class PacketStore final : public Module {
   // (DRR's ingress sizes: kIngressSize / kIngressPerRun).
   static constexpr unsigned kIngressSlots = 4096;
   static constexpr uint32_t kIngressPerRun = 1024;
+  // Flow ids the flows table gives limits to when PacketStoreArg.flow_capacity
+  // is 0: 1..65,536 (about 576 KiB of slots).
+  static constexpr uint32_t kDefaultFlowCapacity = 65536;
 
   // The owner's state: the store (admitted as "store", D-198) and what was
   // released and waits to go out. Only the owner's task changes them; the
@@ -141,10 +143,10 @@ class PacketStore final : public Module {
   std::vector<std::string> key_attrs_;
   std::vector<int> key_attr_ids_;
 
-  // Per-flow limits: one immutable table, published by the flows resource
-  // and read by the owner once per task run (one acquire load, valid for
-  // that run).
-  bess::rcu::RcuPtr<LimitsMap> limits_;
+  // Per-flow limits: flow ids 1..flow_capacity, each entry published by the
+  // flows resource on its own (BP-6); the owner looks a flow up with one
+  // acquire load. Declared before the resource, which refers to it.
+  bess::framework::Sized<LimitsTable> limits_;
 
   // Packets in: many producers (every worker whose graph reaches the module),
   // one consumer (the owner's task). The element carries the flow id with the
