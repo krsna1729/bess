@@ -132,12 +132,16 @@ TEST_F(PacketStoreTest, CreateRefusesBadConfigsAndCostsWhatBytesSays) {
   EXPECT_EQ(256u, PacketStore::FlowCapacity(128));
 
   const PacketStoreConfig config{.max_packets = 100};
-  const size_t dpdk_before = utils::GetMemoryStatus().dpdk_heap_alloc_bytes;
+  // DPDK's heaps: its native one, or "bess-normal" under --no-huge (BP-3).
+  auto dpdk_alloc_bytes = [] {
+    const utils::MemoryStatus status = utils::GetMemoryStatus();
+    return status.dpdk_heap_alloc_bytes + status.fallback_heap_alloc_bytes;
+  };
+  const size_t dpdk_before = dpdk_alloc_bytes();
   auto store = PacketStore::Create(config);
   ASSERT_TRUE(store.has_value() && *store != nullptr);
-  EXPECT_GE(utils::GetMemoryStatus().dpdk_heap_alloc_bytes - dpdk_before,
-            PacketStore::Bytes(config))
-      << "the store did not come from DPDK's heap";
+  EXPECT_GE(dpdk_alloc_bytes() - dpdk_before, PacketStore::Bytes(config))
+      << "the store did not come from DPDK's heaps";
   EXPECT_EQ(PacketStore::Bytes(config), (*store)->bytes());
   EXPECT_EQ(0u, framework::MemoryCost<PacketStore>::GlibcBytes(config));
   EXPECT_GT(PacketStore::Bytes({.max_packets = 200}), PacketStore::Bytes(config));

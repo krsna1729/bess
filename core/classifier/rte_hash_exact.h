@@ -71,12 +71,18 @@ inline rte_hash *CreateRteHash(rte_hash_parameters params) {
   }
   params.socket_id = bess::utils::PlacementSocket(params.socket_id, bytes);
   // rte_hash_create leaves rte_errno untouched when an rte_zmalloc fails, and
-  // sets ENOMEM when its ring's memzone does.
+  // sets ENOMEM when its ring's memzone does. Under the heap lock: the table
+  // may land on "bess-normal" (utils::HeapGuard).
   rte_errno = 0;
-  rte_hash *table = rte_hash_create(&params);
+  rte_hash *table = nullptr;
+  {
+    const bess::utils::HeapGuard guard;
+    table = rte_hash_create(&params);
+  }
   if (table == nullptr && (rte_errno == 0 || rte_errno == ENOMEM)) {
     params.socket_id = bess::utils::FallbackSocket(bytes);
     rte_errno = 0;
+    const bess::utils::HeapGuard guard;
     table = rte_hash_create(&params);
     if (table == nullptr && (rte_errno == 0 || rte_errno == ENOMEM)) {
       bess::utils::RefuseDpdkMemory(bytes);

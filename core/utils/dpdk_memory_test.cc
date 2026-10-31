@@ -17,13 +17,19 @@
 #include <rte_hash.h>
 #include <rte_malloc.h>
 
+#include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <new>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -135,6 +141,47 @@ TEST(DpdkMemoryTest, AWouldBeRefusalTrimsGlibcFirst) {
   EXPECT_EQ(bess::runtime::malloc_trims(), trims + 1);
 }
 
+// The 4 KiB pages of [p, p + bytes) mincore reports resident.
+size_t ResidentPages(const void *p, size_t bytes) {
+  const size_t head = reinterpret_cast<uintptr_t>(p) & uintptr_t{4095};
+  const size_t pages = (head + bytes + 4095) / 4096;
+  std::vector<unsigned char> vec(pages);
+  EXPECT_EQ(mincore(const_cast<char *>(static_cast<const char *>(p)) - head,
+                    pages * 4096, vec.data()),
+            0);
+  size_t resident = 0;
+  for (const unsigned char v : vec) {
+    resident += v & 1U;
+  }
+  return resident;
+}
+
+// BP-3 (U-1): DPDK zeroes a freed --no-huge element, which kept it resident,
+// and admission measures residency, so freed memory counted as used until it
+// was reused -- a teardown and reload was refused. DpdkFree gives the whole
+// pages inside a freed block back. Limit = usage + 0.7 L: allocate 0.4 L,
+// write it, free it (at most its 2 edge pages stay resident), admit 0.4 L
+// again -- ten rounds, no refusal.
+TEST(DpdkMemoryTest, FreedHeapMemoryIsReadmitted) {
+  bess::utils::MemoryNode();
+  if (rte_eal_has_hugepages()) {
+    GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
+  }
+  constexpr size_t kL = 160 * kMB;
+  constexpr size_t kReserve = 16 * kMB;
+  PolicyScope scope(TightPolicy(kL / 10 * 7 + kReserve, kReserve));
+  const uint64_t refusals = GetMemoryStatus().refusals;
+  for (int round = 0; round < 10; round++) {
+    void *p = nullptr;
+    ASSERT_NO_THROW(p = DpdkAllocate(kL / 10 * 4, 64)) << "round " << round;
+    std::memset(p, round + 1, kL / 10 * 4);
+    DpdkFree(p);
+    EXPECT_LE(ResidentPages(p, kL / 10 * 4), 2u) << "round " << round;
+    EXPECT_NO_THROW(AdmitNormalMemory(kL / 10 * 4)) << "round " << round;
+  }
+  EXPECT_EQ(GetMemoryStatus().refusals, refusals);
+}
+
 TEST(DpdkMemoryTest, NoHugeAllocationPastTheLimitIsRefused) {
   bess::utils::MemoryNode();
   if (rte_eal_has_hugepages()) {
@@ -170,7 +217,7 @@ TEST(DpdkMemoryTest, FallbackHeapOnlyWhereAllowed) {
     }
     return;
   }
-  // Under --no-huge the fallback heap extends DPDK's fixed one.
+  // Under --no-huge the fallback heap holds the tables (BP-3).
   const int socket = FallbackSocket(kMB);
   EXPECT_NE(socket, bess::utils::MemoryNode());
   void *p = DpdkAllocate(kMB, 64, socket);
@@ -179,6 +226,58 @@ TEST(DpdkMemoryTest, FallbackHeapOnlyWhereAllowed) {
   EXPECT_GE(status.fallback_heap_bytes, 64 * kMB);
   EXPECT_GE(status.fallback_heap_alloc_bytes, kMB);
   DpdkFree(p);
+}
+
+// BP-3: DpdkFree gives "bess-normal" pages back under BESS's heap lock, which
+// every allocation able to reach that heap holds. A create placed there
+// takes it; then, while one thread allocates, writes and frees tables there,
+// this one creates rte_hash tables on that heap and checks every key: no
+// guarded allocation starts during a give-back, and no table loses what was
+// written to it.
+TEST(DpdkMemoryTest, AGiveBackNeverOverlapsAnAllocation) {
+  const int socket = FallbackSocket(kMB);
+  auto create = [socket](const std::string &name) {
+    rte_hash_parameters params{};
+    params.name = name.c_str();
+    params.entries = 4096;
+    params.key_len = sizeof(uint64_t);
+    params.socket_id = socket;
+    return bess::classifier::detail::CreateRteHash(params);
+  };
+  const uint64_t guards = bess::utils::detail::HeapGuards();
+  rte_hash *probe = create("give_back_probe");
+  ASSERT_NE(probe, nullptr);
+  EXPECT_GE(bess::utils::detail::HeapGuards() - guards, 1u)
+      << "a create on the fallback heap takes the heap lock";
+  rte_hash_free(probe);
+
+  std::atomic<bool> stop{false};
+  std::thread freer([&stop] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      void *p = DpdkAllocate(4 * kMB, 64);
+      std::memset(p, 0xa5, 4 * kMB);
+      DpdkFree(p);
+    }
+  });
+  int lost = 0;
+  for (int t = 0; t < 200; t++) {
+    rte_hash *table = create("give_back_" + std::to_string(t));
+    if (table == nullptr) {
+      ADD_FAILURE() << "rte_hash " << t << " not created";
+      break;
+    }
+    for (uint64_t key = 1; key <= 1000; key++) {
+      rte_hash_add_key(table, &key);
+    }
+    for (uint64_t key = 1; key <= 1000; key++) {
+      lost += rte_hash_lookup(table, &key) < 0 ? 1 : 0;
+    }
+    rte_hash_free(table);
+  }
+  stop.store(true, std::memory_order_relaxed);
+  freer.join();
+  EXPECT_EQ(bess::utils::detail::HeapGuardOverlaps(), 0u);
+  EXPECT_EQ(lost, 0) << "keys a table lost";
 }
 
 // AdmitTable (D-198): the policy-aware admission MemoryScope calls before a
@@ -343,17 +442,21 @@ uint64_t OomKills() {
 // element on free, which used to fault an admitted but untouched table in at
 // teardown and OOM-kill bessd near its cgroup limit.
 TEST(DpdkMemoryTest, FreeNeverGrowsResidentMemory) {
+  bess::utils::MemoryNode();  // DPDK up: before it, has_hugepages is 1
   ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
   constexpr size_t kBytes = 64 * kMB;
   const MemoryPolicy policy = TightPolicy(kBytes + 32 * kMB, 0);
   PolicyScope scope(policy);
-  const size_t before = Rss();
   void *table = DpdkAllocate(kBytes, 64);
-  const size_t allocated = Rss();
-  EXPECT_GE(allocated, before + kBytes * 9 / 10)
+  // The block's own pages, not RSS growth: a library table freed earlier
+  // (rte_hash_free) leaves resident free pages the block may reuse.
+  EXPECT_GE(ResidentPages(table, kBytes), kBytes / 4096)
       << "admitted pages are resident from the allocation";
+  const size_t allocated = Rss();
   DpdkFree(table);
   EXPECT_LE(Rss(), allocated + kMB) << "the free faulted pages in";
+  EXPECT_LE(ResidentPages(table, kBytes), 2u)
+      << "the freed pages stayed resident (BP-3)";
 }
 
 // What a DPDK library allocates internally (rte_hash: rte_zmalloc, which
@@ -363,6 +466,7 @@ TEST(DpdkMemoryTest, FreeNeverGrowsResidentMemory) {
 // which faults it in -- stays within what was admitted. DPDK's heap gives
 // no page back, so RSS after the free is its peak.
 TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
+  bess::utils::MemoryNode();  // DPDK up: before it, has_hugepages is 1
   ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
   rte_hash_parameters params{};
   params.name = "dpdk_memory_test";

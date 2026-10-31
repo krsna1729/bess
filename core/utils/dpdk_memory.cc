@@ -186,10 +186,11 @@ size_t ResidentBytes(const void *base, size_t len) {
 // allocated -- and a measurement alone would admit past bytes already
 // handed out, which the teardown then faults in over the limit. Per heap of
 // 4 KiB pages (DPDK's --no-huge heap; "bess-normal", which DPDK clears when
-// a chunk is added, so is resident whole), its allocated bytes
-// (rte_malloc_get_socket_stats) less its resident ones (mincore over its
-// memseg lists). Resident pages are already in the measurement: only the
-// unfaulted part is added, nothing twice. Resident free holes hide
+// a chunk is added), its allocated bytes (rte_malloc_get_socket_stats) less
+// its resident ones (mincore over its memseg lists). Resident pages are
+// already in the measurement: only the unfaulted part is added, nothing
+// twice. DpdkFree gives a freed block's pages back; what a library frees
+// (rte_free inside rte_hash_free) stays resident, and such free holes hide
 // unfaulted allocations, a bound on how much it can miss. Control path;
 // takes the memory hotplug lock, so never from a validator callback.
 size_t UnfaultedHeapBytes() {
@@ -238,13 +239,67 @@ size_t UnfaultedHeapBytes() {
   throw MemoryRefused(reason, bytes, std::move(message));
 }
 
+// Makes a normal-page heap block resident now (D-206): DPDK zeroes a clean
+// element when it is freed (malloc_elem_free), so a block admitted but never
+// written would fault its whole size in at free. Faulted in at allocation,
+// right after its admission, RSS matches what was admitted and a free never
+// grows it. Hugepages are resident when mapped. "bess-normal" gives its free
+// pages back (a new chunk's, and a freed block's: DpdkFree), so a block
+// there is faulted in here too. What DPDK libraries allocate internally
+// cannot be reached here; UnfaultedHeapBytes counts it instead.
+void Prefault(void *p, size_t bytes) noexcept {
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23  // Linux 5.14
+#endif
+  const size_t head = reinterpret_cast<uintptr_t>(p) & (kPage - 1);
+  if (madvise(static_cast<char *>(p) - head, head + bytes,
+              MADV_POPULATE_WRITE) == 0) {
+    return;
+  }
+  // Older kernels: write each page's first byte of the block back to itself.
+  auto *bytes_at = static_cast<volatile unsigned char *>(p);
+  for (size_t at = 0; at < bytes; at = at == 0 ? kPage - head : at + kPage) {
+    bytes_at[at] = bytes_at[at];
+  }
+}
+
+// BESS's heap lock (BP-3): DpdkFree gives a freed "bess-normal" block's pages
+// back after rte_free returns, and an allocation in between could be handed
+// those pages and lose what it wrote to them. Every allocation that can reach
+// "bess-normal" holds it: BESS's own (HeapAllocate), and the DPDK library
+// creates placed there (HeapGuard at CreateRteHash and the route tables'
+// CreateOnPolicy). Nothing else allocates there: DPDK's own threads and
+// SOCKET_ID_ANY never reach an external heap (D-206). Recursive, so a guarded
+// call may allocate through HeapAllocate. Never take FallbackHeap's mutex
+// while holding it (that one is taken first).
+std::recursive_mutex heap_mu;
+std::atomic<bool> giving_back{false};
+std::atomic<uint64_t> heap_guards{0};
+std::atomic<uint64_t> heap_guard_overlaps{0};
+
+void *HeapAllocate(size_t bytes, size_t align, int socket) {
+  const HeapGuard guard;
+  return rte_malloc_socket("bess", bytes, static_cast<unsigned>(align), socket);
+}
+
+// Gives the 4 KiB pages of [p, p + bytes), free and zero to DPDK, back to the
+// kernel (BP-3, U-1): a freed block stayed resident, and admission, which
+// measures residency, counted it as used until a later block reused it -- a
+// teardown and reload were refused. "bess-normal" is private anonymous
+// memory: MADV_DONTNEED frees the pages, and they read back as zeroes, as
+// DPDK expects of a clean free element. The caller holds heap_mu.
+void ReturnPages(void *p, size_t bytes) noexcept {
+  madvise(p, bytes, MADV_DONTNEED);
+}
+
 // The normal-page fallback heap (D-198): a DPDK external heap of anonymous
 // 4 KiB pages, created on first use and grown by whole chunks, which DPDK
 // commits as it adds them (malloc_heap_add_external_memory clears the
 // region) -- so each chunk is admitted against the limit before it is
 // mapped. The pages are first touched by the control thread adding them and
 // so follow bessd's MPOL_PREFERRED memory node (D-123). Chunks are never
-// unmapped: freed memory goes back to the heap. Control path only; the mutex
+// unmapped, but their free pages go back to the kernel: a new chunk's once
+// added, a freed block's in DpdkFree (BP-3). Control path only; the mutex
 // orders creation and growth.
 class FallbackHeap {
  public:
@@ -257,14 +312,14 @@ class FallbackHeap {
   void *Allocate(size_t bytes, size_t align) {
     std::lock_guard<std::mutex> lock(mu_);
     EnsureLocked(bytes, align);
-    void *p = rte_malloc_socket("bess", bytes, static_cast<unsigned>(align),
-                                socket_);
+    void *p = HeapAllocate(bytes, align, socket_);
     if (p == nullptr) {
       // A new chunk is larger than bytes + alignment + slack: not reached.
       LOG(ERROR) << "fallback heap " << kFallbackHeap << " could not give "
                  << bytes << " bytes after growing";
       throw std::bad_alloc();
     }
+    Prefault(p, bytes);
     return p;
   }
 
@@ -324,6 +379,11 @@ class FallbackHeap {
       PLOG(ERROR) << "mmap of " << Mb(chunk) << " for " << kFallbackHeap;
       throw std::bad_alloc();
     }
+    // DPDK clears the chunk as it adds it, so all of it is resident; what
+    // no block uses goes back at once, but for the first and last pages
+    // (the free element's header). Under heap_mu: the chunk is allocatable
+    // as soon as it is added.
+    const HeapGuard guard;
     if (rte_malloc_heap_memory_add(kFallbackHeap, va, chunk, nullptr,
                                    chunk / kPage, kPage) != 0) {
       LOG(ERROR) << "rte_malloc_heap_memory_add(" << kFallbackHeap << ", "
@@ -331,6 +391,7 @@ class FallbackHeap {
       munmap(va, chunk);
       throw std::bad_alloc();
     }
+    ReturnPages(static_cast<char *>(va) + kPage, chunk - 2 * kPage);
     last_chunk_ = chunk;
     LOG(INFO) << "Normal-page fallback heap " << kFallbackHeap << " grew by "
               << Mb(chunk) << " (" << bytes << " bytes asked for)";
@@ -738,32 +799,6 @@ int MemoryNode() {
   return rte_eal_has_hugepages() ? bess::runtime::MemoryNode() : 0;
 }
 
-namespace {
-
-// Makes a --no-huge heap block resident now (D-206): DPDK zeroes a clean
-// element when it is freed (malloc_elem_free), so a block admitted but never
-// written would fault its whole size in at free. Faulted in at allocation,
-// right after its admission, RSS matches what was admitted and a free never
-// grows it. Hugepages are resident when mapped, and "bess-normal" when a
-// chunk is added (DPDK clears it). What DPDK libraries allocate internally
-// cannot be reached here; UnfaultedHeapBytes counts it instead.
-void Prefault(void *p, size_t bytes) noexcept {
-#ifndef MADV_POPULATE_WRITE
-#define MADV_POPULATE_WRITE 23  // Linux 5.14
-#endif
-  const size_t head = reinterpret_cast<uintptr_t>(p) & (kPage - 1);
-  if (madvise(static_cast<char *>(p) - head, head + bytes,
-              MADV_POPULATE_WRITE) == 0) {
-    return;
-  }
-  // Older kernels: write each page's first byte of the block back to itself.
-  auto *bytes_at = static_cast<volatile unsigned char *>(p);
-  for (size_t at = 0; at < bytes; at = at == 0 ? kPage - head : at + kPage) {
-    bytes_at[at] = bytes_at[at];
-  }
-}
-
-}  // namespace
 
 void *DpdkAllocate(size_t bytes, size_t align, int socket) {
   if (!IsDpdkInitialized()) {
@@ -774,11 +809,18 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
   }
   const bool hugepages = NativeHugepages();
   if (!hugepages) {
-    // DPDK's fixed --no-huge heap is reserved, not resident: its pages are
-    // committed as they are first written, so this allocation is what may
-    // cross the limit (D-198).
+    // --no-huge (BP-3): tables come from "bess-normal", not DPDK's fixed
+    // heap, so a freed one's pages can go back to the kernel (DpdkFree):
+    // DPDK's own threads allocate from the fixed heap without BESS's heap
+    // lock, never from an external heap. Tables are CPU memory: no IOVA
+    // needed. Admitted first: this allocation is what may cross the limit
+    // (D-198).
     AdmitNormalMemory(bytes);
-  } else if (ArmedForNormalPages()) {
+    void *p = FallbackHeap::Get().Allocate(bytes, align);
+    Land(bytes, TableBacking::kNormal);
+    return p;
+  }
+  if (ArmedForNormalPages()) {
     // Admitted past the hugepage cap (D-206): normal pages, as admitted,
     // without taking hugepages the cap no longer has room for.
     void *p = FallbackHeap::Get().Allocate(bytes, align);
@@ -786,8 +828,7 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
     return p;
   }
   limit_refused = false;
-  void *p = rte_malloc_socket("bess", bytes, static_cast<unsigned>(align),
-                              socket);
+  void *p = HeapAllocate(bytes, align, socket);
   if (p == nullptr && socket != SOCKET_ID_ANY) {
     // The socket asked for is out of memory; any socket beats failing, but
     // the memory then crosses the interconnect on every access.
@@ -797,14 +838,13 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
                    << " is out of memory; allocating on any socket "
                       "(cross-NUMA memory; give that node more hugepages)";
     });
-    p = rte_malloc_socket("bess", bytes, static_cast<unsigned>(align),
-                          SOCKET_ID_ANY);
+    p = HeapAllocate(bytes, align, SOCKET_ID_ANY);
   }
   if (p != nullptr) {
     if (rte_eal_has_hugepages() == 0) {
       Prefault(p, bytes);
     }
-    Land(bytes, hugepages ? TableBacking::kHugepages : TableBacking::kNormal);
+    Land(bytes, TableBacking::kHugepages);
     return p;
   }
   if (limit_refused) {
@@ -822,10 +862,9 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
             << " reserve; raise the memory limit to include the hugepages";
     Refuse(MemoryRefused::Reason::kNormalLimit, bytes, message.str());
   }
-  // DPDK's heap is out (D-198). With hugepages, normal pages unless the
-  // operator forbade them (D-206); under --no-huge the fixed heap is normal
-  // pages already, and the fallback heap merely extends it.
-  if (hugepages && !memory_policy().fallback) {
+  // DPDK's heap is out (D-198): normal pages unless the operator forbade
+  // them (D-206).
+  if (!memory_policy().fallback) {
     std::ostringstream message;
     message << "hugepages exhausted: refusing " << bytes << " bytes ("
             << Mb(bytes) << ") of DPDK memory (" << HeapState(socket)
@@ -836,11 +875,9 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
   }
   {
     static std::once_flag warned;
-    std::call_once(warned, [hugepages] {
-      LOG(WARNING) << (hugepages ? "Hugepages exhausted"
-                                 : "DPDK's --no-huge heap is full")
-                   << ": dataplane tables now also use the normal-page "
-                      "fallback heap "
+    std::call_once(warned, [] {
+      LOG(WARNING) << "Hugepages exhausted: dataplane tables now also use the "
+                      "normal-page fallback heap "
                    << kFallbackHeap << " (D-206)";
     });
   }
@@ -849,6 +886,58 @@ void *DpdkAllocate(size_t bytes, size_t align, int socket) {
   return p;
 }
 
-void DpdkFree(void *p) noexcept { rte_free(p); }
+void DpdkFree(void *p) noexcept {
+  // The whole pages inside a block on "bess-normal" (its first and last may
+  // hold neighbors' headers or data). Only there: every allocation from it
+  // holds heap_mu, so none can be handed the pages between rte_free and
+  // their return. DPDK's native heaps, which its own threads allocate from,
+  // keep their pages (BP-3).
+  size_t bytes = 0;
+  const rte_memseg_list *msl = rte_mem_virt2memseg_list(p);
+  const uintptr_t at = reinterpret_cast<uintptr_t>(p);
+  const size_t head = RoundUp(at, kPage) - at;
+  size_t pages = 0;
+  if (msl != nullptr && msl->external != 0 && msl->heap != 0 &&
+      msl->page_sz == kPage && rte_malloc_validate(p, &bytes) == 0 &&
+      bytes > head) {
+    pages = (bytes - head) / kPage;
+  }
+  if (pages == 0) {
+    rte_free(p);
+    return;
+  }
+  // From the memseg list, not from p, which rte_free ends.
+  void *const first = static_cast<char *>(msl->base_va) +
+                      (at + head - reinterpret_cast<uintptr_t>(msl->base_va));
+  const HeapGuard guard;
+  giving_back.store(true, std::memory_order_relaxed);
+  rte_free(p);
+  ReturnPages(first, pages * kPage);
+  giving_back.store(false, std::memory_order_relaxed);
+}
+
+HeapGuard::HeapGuard() {
+  heap_mu.lock();
+  heap_guards.fetch_add(1, std::memory_order_relaxed);
+  if (giving_back.load(std::memory_order_relaxed)) {
+    heap_guard_overlaps.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+HeapGuard::~HeapGuard() {
+  heap_mu.unlock();
+}
+
+namespace detail {
+
+uint64_t HeapGuards() noexcept {
+  return heap_guards.load(std::memory_order_relaxed);
+}
+
+uint64_t HeapGuardOverlaps() noexcept {
+  return heap_guard_overlaps.load(std::memory_order_relaxed);
+}
+
+}  // namespace detail
 
 }  // namespace bess::utils
