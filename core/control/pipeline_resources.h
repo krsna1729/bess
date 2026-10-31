@@ -60,6 +60,24 @@ ControlResult<ResourceEntryPage> ReadResourcePage(
     const dataplane::TransactionEngine &engine, const framework::ResourceBindings &bindings,
     const std::string &name, const std::string &cursor, size_t max_entries, size_t max_bytes);
 
+// Up to `max_ops` erases of the resource's entries from `cursor` (empty: the
+// first), and the cursor to continue from once they applied (unset: none
+// remain after these). ResetResources clears a table in these batches, so it
+// never holds the table's keys or one operation per entry. A codec with a
+// position (VisitFrom) reads only the batch's entries; any other walks the
+// whole resource per batch for its first keys (the ones a batch erased are
+// gone). `max_ops` 0 only checks the name (NOT_FOUND); a singleton has no
+// entries to clear.
+struct ResourceClearBatch {
+  std::vector<dataplane::Op> ops;
+  std::optional<std::string> next;
+  bool requires_paused_workers = false;
+};
+ControlResult<ResourceClearBatch> ClearBatch(const dataplane::TransactionEngine &engine,
+                                             const framework::ResourceBindings &bindings,
+                                             const std::string &name, const std::string &cursor,
+                                             size_t max_ops);
+
 // Compares `desired` with the resource's contents: every desired key decodes
 // (INVALID_ARGUMENT naming the entry if not, or if a key repeats), a key
 // absent now is created, a value whose canonical bytes differ is updated,

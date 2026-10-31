@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <iterator>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <string>
 #include <thread>
@@ -1718,21 +1719,6 @@ ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
     error.field = "resources";
     return std::unexpected(std::move(error));
   };
-  try {
-    for (const ResourceSpec &resource : resources) {
-      auto converged = Converge(engine, bindings, resource, /*build_ops=*/true);
-      if (!converged) {
-        return std::unexpected(converged.error());
-      }
-      pause = pause || (converged->requires_paused_workers && !converged->ops.empty());
-      std::move(converged->ops.begin(), converged->ops.end(), std::back_inserter(ops));
-    }
-  } catch (const std::bad_alloc &e) {
-    return refused(e);
-  }
-  if (ops.empty()) {
-    return size_t{0};
-  }
   // The spec lists resources by name, not by what refers to what. Reserve
   // follows the operation order, and a resource may decide what an entry
   // refers to from entries written earlier in the same transaction (a
@@ -1740,21 +1726,44 @@ ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
   // ApplyBatched may split the list: so the referenced come first. Upserts
   // in ascending rank (a referent before its referrers), then erases in
   // descending rank (a referrer before its referent), the order the engine
-  // publishes in.
-  {
-    auto rank_of = [&engine](const dataplane::Op &op) {
-      const dataplane::Resource *resource = engine.FindResource(op.resource);
-      return resource != nullptr ? resource->rank() : 0;
+  // publishes in; a resource's own operations keep their order. Each
+  // resource's rank is looked up once, not per comparison.
+  try {
+    std::vector<std::pair<int, std::vector<dataplane::Op>>> by_resource;
+    by_resource.reserve(resources.size());
+    for (const ResourceSpec &resource : resources) {
+      auto converged = Converge(engine, bindings, resource, /*build_ops=*/true);
+      if (!converged) {
+        return std::unexpected(converged.error());
+      }
+      pause = pause || (converged->requires_paused_workers && !converged->ops.empty());
+      const dataplane::Resource *found = engine.FindResource(resource.name);
+      by_resource.emplace_back(found != nullptr ? found->rank() : 0, std::move(converged->ops));
+    }
+    std::vector<size_t> order(by_resource.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    const auto append = [&](dataplane::OpKind kind) {
+      for (const size_t r : order) {
+        for (dataplane::Op &op : by_resource[r].second) {
+          if (op.kind == kind) {
+            ops.push_back(std::move(op));
+          }
+        }
+      }
     };
-    std::stable_sort(ops.begin(), ops.end(),
-                     [&rank_of](const dataplane::Op &a, const dataplane::Op &b) {
-                       const bool au = a.kind == dataplane::OpKind::kUpsert;
-                       const bool bu = b.kind == dataplane::OpKind::kUpsert;
-                       if (au != bu) {
-                         return au;
-                       }
-                       return au ? rank_of(a) < rank_of(b) : rank_of(a) > rank_of(b);
-                     });
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+      return by_resource[a].first < by_resource[b].first;
+    });
+    append(dataplane::OpKind::kUpsert);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+      return by_resource[a].first > by_resource[b].first;
+    });
+    append(dataplane::OpKind::kErase);
+  } catch (const std::bad_alloc &e) {
+    return refused(e);
+  }
+  if (ops.empty()) {
+    return size_t{0};
   }
   // A resource whose values workers read unsynchronized changes only with
   // the workers paused (they may be paused for the commit already).
@@ -2013,8 +2022,9 @@ ControlResult<ControlPlane::Versioned<ControlPlane::ResourceReset>>
 ControlPlane::ResetResources(
     std::vector<std::string> names,
     std::optional<uint64_t> expected_resource_generation) {
-  std::lock_guard<std::mutex> lock(mutex_);
   dataplane::TransactionEngine &engine = runtime::runtime().transactions();
+  const framework::ResourceBindings &bindings = framework::ResourceBindings::ProcessDefault();
+  std::unique_lock<std::mutex> lock(mutex_);
   if (expected_resource_generation.has_value() &&
       *expected_resource_generation != engine.generation()) {
     ControlError error =
@@ -2042,20 +2052,112 @@ ControlPlane::ResetResources(
       unique.push_back(std::move(name));
     }
   }
-  std::vector<ResourceSpec> specs;
-  specs.reserve(unique.size());
+  const auto refused = [](const std::bad_alloc &e) {
+    ControlError error = OutOfMemory(e);
+    error.field = "resources";
+    return std::unexpected(std::move(error));
+  };
+  // Every name before anything is erased: an unknown one is NOT_FOUND.
   for (const std::string &name : unique) {
-    ResourceSpec spec;
-    spec.name = name;  // no entries: converge to empty
-    specs.push_back(std::move(spec));
+    if (auto known = ClearBatch(engine, bindings, name, {}, 0); !known) {
+      return std::unexpected(known.error());
+    }
   }
-  auto removed = ApplyResourcesLocked(specs);
-  if (!removed) {
-    return std::unexpected(removed.error());
+  // In batches from each resource's cursor, one lock hold per batch, so the
+  // table is never held as its keys or one operation per entry, and the
+  // lock is free between batches and while reclamation catches up. A batch
+  // over the retire budget is halved and read again from the same cursor;
+  // the fitted size carries over, and grows when a batch used little of it
+  // (TransactionEngine::FitBatch).
+  size_t removed = 0;
+  size_t take = std::max<size_t>(1, engine.retire_budget());
+  for (const std::string &name : unique) {
+    std::string cursor;
+    auto backoff = std::chrono::microseconds(200);
+    int busy = 0;
+    for (;;) {
+      if (!lock.owns_lock()) {
+        lock.lock();
+      }
+      std::optional<ResourceClearBatch> batch;
+      dataplane::TransactionEngine::Result result;
+      try {
+        auto read = ClearBatch(engine, bindings, name, cursor, take);
+        if (!read) {
+          return std::unexpected(read.error());
+        }
+        if (read->ops.empty()) {
+          break;
+        }
+        batch.emplace(std::move(*read));
+        // A resource whose values workers read unsynchronized changes only
+        // with the workers paused.
+        std::optional<WorkerPauser> pauser;
+        if (batch->requires_paused_workers) {
+          pauser.emplace();
+        }
+        result = engine.Apply(batch->ops);
+      } catch (const std::bad_alloc &e) {
+        return refused(e);
+      }
+      if (result.outcome == dataplane::TransactionEngine::Outcome::kApplied) {
+        removed += batch->ops.size();
+        take = engine.FitBatch(result, take);
+        busy = 0;
+        backoff = std::chrono::microseconds(200);
+        if (!batch->next.has_value()) {
+          break;
+        }
+        cursor = std::move(*batch->next);
+        lock.unlock();
+        continue;
+      }
+      if (result.over_budget && take > 1) {
+        take = engine.FitBatch(result, take);
+        continue;
+      }
+      // BUSY: reclamation is behind the readers and nothing was attempted.
+      // Wait a few grace periods without the lock, then read the batch again.
+      if (result.outcome == dataplane::TransactionEngine::Outcome::kBusy) {
+        if (busy++ < 5) {
+          lock.unlock();
+          std::this_thread::sleep_for(backoff);
+          backoff *= 2;
+          continue;
+        }
+        ControlError error = Err(EBUSY, "resources: reclamation is behind the readers; retry");
+        error.code = ControlErrorCode::kResourceBusy;
+        error.field = "resources";
+        return std::unexpected(error);
+      }
+      for (size_t i = 0; i < result.ops.size(); i++) {
+        if (result.ops[i].status == dataplane::TransactionEngine::OpStatus::kFailed) {
+          ControlError error = Err(EINVAL, "resource '%s': %s", name.c_str(),
+                                   result.ops[i].error.c_str());
+          error.object = name;
+          error.field = "resources";
+          return std::unexpected(error);
+        }
+      }
+      ControlError error = Err(EINVAL, "resources: the transaction was refused");
+      error.field = "resources";
+      return std::unexpected(error);
+    }
+  }
+  if (!lock.owns_lock()) {
+    lock.lock();
+  }
+  if (removed != 0) {
+    runtime::runtime().events().Emit("bess.transaction", "control",
+                                     {{"request_id", ""},
+                                      {"origin", "pipeline"},
+                                      {"outcome", "applied"},
+                                      {"operations", std::to_string(removed)}},
+                                     engine.generation());
   }
   Versioned<ResourceReset> reset;
   reset.value.resources = std::move(unique);
-  reset.value.removed = *removed;
+  reset.value.removed = removed;
   reset.generation = runtime::runtime().generation();
   reset.resource_generation = engine.generation();
   return reset;

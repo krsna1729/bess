@@ -112,6 +112,9 @@ class TransactionEngine {
     // split rather than fixed. ApplyBatched() reads it; a caller of Apply()
     // finds the same fact in the failed operation's error text.
     bool over_budget = false;
+    // What the transaction may retire: all of it when applied, what was
+    // reserved before the refusal when over budget. FitBatch() reads it.
+    size_t may_retire = 0;
   };
 
   // `ledger_growth`: admits the reference ledger (every resource's incoming
@@ -206,7 +209,8 @@ class TransactionEngine {
   // transaction itself: what one retires depends on the operations' cascades,
   // not on their count, and the budget is not the caller's to know. So this
   // splits adaptively (apply what fits; on the budget refusal halve and try
-  // again) and applies the batches in request order.
+  // again, FitBatch) and applies the batches in request order, keeping the
+  // fitted size from one batch to the next.
   //
   // Convergence, not atomicity: the batches that applied stay applied, and the
   // caller's next Apply finishes the rest, the desired state being unchanged.
@@ -215,6 +219,14 @@ class TransactionEngine {
   // map a batch-relative index back to its own request.
   Result ApplyBatched(std::span<const Op> ops,
                       Consistency consistency = Consistency::kReferential);
+  // The next batch size after `result` of a batch of `take` operations, for
+  // ApplyBatched and a caller that batches itself (one that must not wait
+  // inside the engine): halved on the retire-budget refusal, doubled (to at
+  // most retire_budget() operations) after a batch that retired at most half
+  // the budget, else kept.
+  size_t FitBatch(const Result &result, size_t take) const;
+  // What one transaction may retire (half the RCU retire high water).
+  size_t retire_budget() const { return domain_.retire_high_water() / 2; }
 
   // How many Apply() calls ended in each Outcome, indexed by the enum's value
   // (operational metrics, M25). kBusy counts answers only: a kBusy under

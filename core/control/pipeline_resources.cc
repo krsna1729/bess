@@ -256,6 +256,66 @@ ControlResult<ResourceEntryPage> ReadResourcePage(
   return page;
 }
 
+ControlResult<ResourceClearBatch> ClearBatch(const dataplane::TransactionEngine &engine,
+                                             const framework::ResourceBindings &bindings,
+                                             const std::string &name, const std::string &cursor,
+                                             size_t max_ops) {
+  auto found = CodecOf(engine, bindings, name);
+  if (!found) {
+    return std::unexpected(found.error());
+  }
+  const ResourceCodec &codec = **found;
+  ResourceClearBatch batch;
+  if (max_ops == 0 || codec.kind() == ResourceCodec::Kind::kSingleton) {
+    return batch;
+  }
+  batch.requires_paused_workers = codec.requires_paused_workers();
+  batch.ops.reserve(max_ops);
+  // A read-back key that does not decode is the codec's bug (as Converge).
+  std::string unreadable;
+  const auto erase = [&](const google::protobuf::Message &key) {
+    const google::protobuf::Any packed = Pack(key);
+    auto internal = codec.Key(packed.type_url(), packed.value());
+    if (!internal) {
+      unreadable = internal.error();
+      return false;
+    }
+    batch.ops.push_back(dataplane::Op::Erase(name, std::move(*internal)));
+    return batch.ops.size() < max_ops;
+  };
+  std::optional<std::string> next = codec.VisitFrom(
+      cursor, [&](const google::protobuf::Message &key, const google::protobuf::Message &) {
+        return erase(key);
+      });
+  if (!next.has_value()) {
+    // scale: no position, so each batch walks the whole resource for its
+    // first max_ops keys: a clear is ceil(N / max_ops) walks, O(N^2 / batch)
+    // visits. Bounded only for resources a module keeps small; one that can
+    // hold session-scale N has a position (TypedCodec's PageFn). The cursor
+    // only says that keys remain: the erased ones are gone.
+    bool more = false;
+    codec.Entries([&](const google::protobuf::Message &key, const google::protobuf::Message &) {
+      if (more || !unreadable.empty()) {
+        return;
+      }
+      if (batch.ops.size() >= max_ops) {
+        more = true;
+        return;
+      }
+      (void)erase(key);
+    });
+    next = more ? "k" : "";
+  }
+  if (!unreadable.empty()) {
+    return std::unexpected(ResourceError(
+        EIO, name, "resource '" + name + "' reads back a key it refuses: " + unreadable));
+  }
+  if (!next->empty()) {
+    batch.next = std::move(*next);
+  }
+  return batch;
+}
+
 ControlResult<ResourceConvergence> Converge(const dataplane::TransactionEngine &engine,
                                             const framework::ResourceBindings &bindings,
                                             const ResourceSpec &desired, bool build_ops) {
