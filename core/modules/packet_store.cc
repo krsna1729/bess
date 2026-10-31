@@ -65,21 +65,20 @@ const Commands PacketStore::cmds = {
 };
 
 // Per-flow limits are the "<module>/flows" resource (D-129): configuration,
-// not state the dataplane acts on directly. The owner reads the published table
-// once per task run, so the table needs no paused workers, and an operation
-// publishes a replacement instead of touching anything live.
+// not state the dataplane acts on directly. An operation publishes its own
+// entry of a dense table (BP-6) the owner reads per packet, so the table
+// needs no paused workers and updates live.
 const ResourceTables PacketStore::resource_tables = {
     ResourceTable::Map<bess::pb::PacketStoreFlowKey,
                        bess::pb::PacketStoreFlowValue>(
-        "flows", /*requires_paused_workers=*/false)
-        .Rebuilds()};
+        "flows", /*requires_paused_workers=*/false)};
 
 // ---------------------------------------------------------------------------
 // The owner's side: the module's task
 // ---------------------------------------------------------------------------
 
 uint32_t PacketStore::DrainIngress(Context *ctx, uint32_t budget) {
-  const LimitsMap *limits = limits_.Read();
+  const LimitsTable &limits = *limits_;
   const uint64_t now_ns = tsc_to_ns(current_worker.current_tsc());
   IngressPacket pkts[bess::PacketBatch::kMaxBurst];
   uint32_t taken = 0;
@@ -101,7 +100,7 @@ uint32_t PacketStore::DrainIngress(Context *ctx, uint32_t budget) {
       handles[i] = pkts[i].handle;
       flow_ids[i] = pkts[i].flow_id;
     }
-    store_->Store(handles, flow_ids, n, *limits, now_ns, evict);
+    store_->Store(handles, flow_ids, n, limits, now_ns, evict);
     budget -= n;
     taken += n;
     if (n < bess::PacketBatch::kMaxBurst) {
@@ -294,24 +293,28 @@ CommandResponse PacketStore::Init(const bess::pb::PacketStoreArg &arg) {
       bess::utils::DpdkArray<ReleasedPacket>>("release_queue", max_packets_);
 
   // No flow has limits of its own yet: every flow takes the module-wide
-  // numbers until an entry says otherwise. The resource publishes that first
-  // empty table before any worker can read it (Init runs before the module is
-  // attached), and admits it and every later map through the lease (D-198;
-  // a refusal throws MemoryRefused).
+  // numbers until an entry says otherwise. The table of flow ids
+  // 1..flow_capacity is admitted whole before it is allocated, and each
+  // entry's object through the lease as the table's slab grows (D-198; a
+  // refusal throws MemoryRefused). Init runs before the module is attached,
+  // so no worker reads the table before it exists.
   //
   // The per-flow limits (D-129). The binding is declared after the resource it
   // binds and reset before it is (D-044). No worker_running callback: the
-  // resource does not require paused workers - the owner reads the published
-  // table once per task run, and a transaction publishes a replacement.
+  // resource does not require paused workers - an operation publishes its
+  // own entry, and the owner reads entries per packet.
+  limits_ = init_context().memory().Create<LimitsTable>(
+      "flows",
+      arg.flow_capacity() ? arg.flow_capacity() : kDefaultFlowCapacity);
   bess::framework::MemoryLease flows_lease =
       init_context().memory().LeaseFor<dataplane::PacketStoreFlowsResource>(
-          "flows");
+          "flows_resource");
   auto flows = std::make_unique<dataplane::PacketStoreFlowsResource>(
-      name() + "/flows", limits_, flows_lease.growth());
+      name() + "/flows", *limits_);
   flows_resource_ = bess::framework::MemoryScope::Adopt(std::move(flows_lease),
                                                         std::move(flows));
   flows_binding_ = init_context().codecs().Bind(
-      *flows_resource_, dataplane::MakePacketStoreFlowsCodec(limits_));
+      *flows_resource_, dataplane::MakePacketStoreFlowsCodec(*limits_));
 
   // The engine reaches a resource only once it is registered (D-021); the
   // binding above wires its codec. A failure destroys the module, and DeInit
@@ -359,12 +362,10 @@ void PacketStore::DeInit() {
   flows_resource_.reset();
 
   // Teardown runs with the workers paused (destroying a module is structural),
-  // so the published table can go without waiting for a grace period, and every
-  // packet in flight to the owner is control's to free. (The resource, and any
-  // transaction copy it staged, went above.)
-  if (limits_.Read() != nullptr) {
-    limits_.ResetQuiesced();
-  }
+  // so the table can go without waiting for a grace period, and every packet
+  // in flight to the owner is control's to free. (The resource went above;
+  // objects it retired wait in the RCU queue, holding the table's slab.)
+  limits_.reset();
   ClearStore();
   release_queue_.reset();
   // What is still in flight to the owner: a partial burst is the common case,
@@ -456,9 +457,8 @@ struct task_result PacketStore::RunTask(Context *ctx, bess::PacketBatch *batch,
   // What expired is freed whether or not the store is under pressure: a held
   // packet's lifetime is the flow's timeout, and the store's bound is not the
   // only thing that frees. The sweep is bounded, so this run stays a run.
-  const LimitsMap *limits = limits_.Read();
-  if (limits != nullptr) {
-    store_->ExpireBounded(*limits, tsc_to_ns(current_worker.current_tsc()));
+  if (limits_) {
+    store_->ExpireBounded(*limits_, tsc_to_ns(current_worker.current_tsc()));
   }
   uint32_t applied = 0;
   if (ingress_owed_ == 0 && requests_due_ > 0) {
