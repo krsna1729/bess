@@ -915,8 +915,11 @@ std::expected<void, RouteError> Ipv6RouteTable::Stage::UpsertLocked(
   if (!current && counted && routes_ >= table_.config_.max_routes) {
     return std::unexpected(RouteError::kTableFull);
   }
-  // Everything that allocates, before the spare changes.
-  touched_.reserve(touched_.size() + 1);
+  // Everything that allocates, before the spare changes. Geometric: one
+  // edit at a time must not copy the list on every call (RO-3).
+  if (touched_.size() == touched_.capacity()) {
+    touched_.reserve(std::max<size_t>(4, 2 * touched_.capacity()));
+  }
   const auto [it, inserted] = changes_.try_emplace(prefix);
   Change &change = it->second;
   if (change.node.empty() && !table_.rules_.contains(prefix)) {
@@ -960,7 +963,9 @@ std::expected<void, RouteError> Ipv6RouteTable::Stage::EraseLocked(
   if (!FindLocked(prefix)) {
     return std::unexpected(RouteError::kNotFound);
   }
-  touched_.reserve(touched_.size() + 1);
+  if (touched_.size() == touched_.capacity()) {
+    touched_.reserve(std::max<size_t>(4, 2 * touched_.capacity()));
+  }
   const auto [it, inserted] = changes_.try_emplace(prefix);
   if (table_.rules_.contains(prefix)) {
     // Commit() unlinks at most one committed node per change.

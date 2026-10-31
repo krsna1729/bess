@@ -158,7 +158,10 @@ class ObjectSlab {
           std::max<size_t>(alignof(T), RTE_CACHE_LINE_SIZE);
       bool admitted = false;
       try {
-        chunks_.reserve(chunks_.size() + 1);  // push_back below cannot throw
+        // Geometric, and push_back below cannot throw (U-3).
+        if (chunks_.size() == chunks_.capacity()) {
+          chunks_.reserve(std::max<size_t>(4, 2 * chunks_.capacity()));
+        }
         if (growth_ != nullptr) {
           growth_->Grow(chunk_bytes());
           admitted = true;

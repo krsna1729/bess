@@ -343,14 +343,18 @@ class FlowRuleOwner {
   // port before the previous drain become reusable.
   void NoteDrained(uint16_t port) {
     drain_epoch_[port]++;
-    for (auto it = quarantine_.begin(); it != quarantine_.end();) {
-      if (it->port == port && drain_epoch_[port] > it->epoch) {
-        free_marks_.PushBack(it->mark);
-        it = quarantine_.erase(it);
-      } else {
-        ++it;
+    // One pass that keeps the rest in order: erasing each released entry
+    // moved the whole tail, O(Q^2) at Q quarantined marks (FM-7).
+    size_t kept = 0;
+    for (size_t i = 0; i < quarantine_.size(); i++) {
+      const Draining &d = quarantine_[i];
+      if (d.port == port && drain_epoch_[port] > d.epoch) {
+        free_marks_.PushBack(d.mark);
+        continue;
       }
+      quarantine_[kept++] = d;
     }
+    quarantine_.resize(kept);
   }
 
   // -- device reset and reconciliation ------------------------------------------------

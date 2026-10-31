@@ -871,8 +871,14 @@ class Router::NeighborResource final : public dataplane::Resource {
   // the change log, before anything can publish.
   void StageChange(NextHopId id, std::optional<NeighborKey> neighbor) {
     router_.staged_bindings_[id] = neighbor;
-    router_.binding_changes_.reserve(router_.binding_changes_.size() +
-                                     router_.staged_bindings_.size());
+    // Geometric: staging one binding at a time must not copy the log on
+    // every call (RO-2).
+    const size_t needed =
+        router_.binding_changes_.size() + router_.staged_bindings_.size();
+    if (needed > router_.binding_changes_.capacity()) {
+      router_.binding_changes_.reserve(
+          std::max(needed, 2 * router_.binding_changes_.capacity()));
+    }
   }
 
   class NoOp final : public dataplane::StagedOp {
@@ -1849,7 +1855,10 @@ void Router::ReserveMemberships(std::vector<NextHopId> hops) {
   for (auto run = hops.begin(); run != hops.end();) {
     const auto end = std::upper_bound(run, hops.end(), *run);
     std::vector<NextHopGroupId> &groups = memberships_[*run];
-    groups.reserve(groups.size() + static_cast<size_t>(end - run));
+    const size_t needed = groups.size() + static_cast<size_t>(end - run);
+    if (needed > groups.capacity()) {
+      groups.reserve(std::max(needed, 2 * groups.capacity()));
+    }
     run = end;
   }
 }

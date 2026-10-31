@@ -61,6 +61,7 @@ ConcurrentMaskedTable::~ConcurrentMaskedTable() {
   }
   // Every chain goes before chain_bytes_, which their Free updates.
   retired_chains_.clear();
+  retired_head_ = 0;
   pending_keys_.clear();
   tuples_.ResetQuiesced();
 }
@@ -279,8 +280,13 @@ ConcurrentMaskedTable::KeyStates::iterator ConcurrentMaskedTable::PrepareKey(
   const auto key = pending_keys_.try_emplace(std::move(bytes)).first;
   try {
     KeyState &state = key->second;
-    // Every outstanding change may retire one chain when it commits.
-    retired_chains_.reserve(retired_chains_.size() + prepared_changes_ + 1);
+    // Every outstanding change may retire one chain when it commits; grown
+    // geometrically, so preparing one change at a time copies the queue
+    // O(log n) times, not on every call (CL-7).
+    const size_t needed = retired_chains_.size() + prepared_changes_ + 1;
+    if (needed > retired_chains_.capacity()) {
+      retired_chains_.reserve(std::max(needed, 2 * retired_chains_.capacity()));
+    }
     if (IsChain(live) || state.ranged_upserts > 0 ||
         (upsert && new_ranges > 0)) {
       // The key can hold a chain, and any of its changes may be the one
@@ -388,13 +394,24 @@ void ConcurrentMaskedTable::RetireChain(const Chain *chain) noexcept {
 }
 
 void ConcurrentMaskedTable::ReclaimChains() noexcept {
-  size_t done = 0;
-  while (done < retired_chains_.size() &&
-         domain_.IsComplete(retired_chains_[done].token)) {
-    done++;
+  while (retired_head_ < retired_chains_.size() &&
+         domain_.IsComplete(retired_chains_[retired_head_].token)) {
+    retired_chains_[retired_head_].chain.reset();
+    retired_head_++;
   }
-  retired_chains_.erase(retired_chains_.begin(),
-                        retired_chains_.begin() + static_cast<ptrdiff_t>(done));
+  if (retired_head_ == retired_chains_.size()) {
+    retired_chains_.clear();
+    retired_head_ = 0;
+  } else if (retired_head_ >= 1024 &&
+             2 * retired_head_ >= retired_chains_.size()) {
+    chain_compaction_moves_ += retired_chains_.size() - retired_head_;
+    // scale: at least half the queue is dead, so a compaction moves no more
+    // entries than it drops: O(1) moves per chain however far a reader lags.
+    retired_chains_.erase(
+        retired_chains_.begin(),
+        retired_chains_.begin() + static_cast<ptrdiff_t>(retired_head_));
+    retired_head_ = 0;
+  }
 }
 
 ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::UpsertViaCommit(
@@ -507,6 +524,8 @@ ConcurrentMaskedTable::UpsertResult ConcurrentMaskedTable::Upsert(
   }
 
   if (new_tuple || replaced) {
+    // scale: copies only when a mask appears or a tuple's table is replaced;
+    // the list holds at most max_tuples tuples (pointers, not rules).
     auto next = std::make_unique<TupleList>(*list);
     if (new_tuple) {
       next->tuples.push_back(
@@ -677,6 +696,8 @@ ConcurrentMaskedTable::PrepareUpsert(ConstBytes mask, ConstBytes value,
       }
     }
     if (new_tuple || replaced) {
+      // scale: copies only when a mask appears or a tuple's table is
+      // replaced; the list holds at most max_tuples tuples.
       auto next = std::make_unique<TupleList>(*list);
       if (new_tuple) {
         // A pending entry never wins: the ceiling rises at Commit(). The
@@ -849,7 +870,10 @@ bool ConcurrentMaskedTable::Erase(ConstBytes mask, ConstBytes value,
     if (tuple.table->size() == 0) {
       // The mask's last rule: the tuple goes, and with it a slot of the
       // tuple ceiling. Its table is freed with the old list.
+      // scale: once per emptied mask; the list holds at most max_tuples
+      // tuples (pointers, not rules).
       auto next = std::make_unique<TupleList>(*list);
+      // scale: moves at most max_tuples tuple pointers.
       next->tuples.erase(next->tuples.begin() + static_cast<ptrdiff_t>(t));
       PublishTuples(std::move(next));
     }
@@ -875,6 +899,7 @@ void ConcurrentMaskedTable::Clear() {
       }
     });
   }
+  // scale: once per Clear, sized to every chain it retires at once.
   retired_chains_.reserve(retired_chains_.size() + chains.size() +
                           prepared_changes_);
   // Publish first, then start the grace periods that retire the ids: a

@@ -138,7 +138,10 @@ void RecordArena::Reclaim() {
   if (retiring_head_ == retiring_.size()) {
     retiring_.clear();
     retiring_head_ = 0;
-  } else if (retiring_head_ >= 1024) {
+  } else if (retiring_head_ >= 1024 && 2 * retiring_head_ >= retiring_.size()) {
+    compaction_moves_ += retiring_.size() - retiring_head_;
+    // scale: at least half the queue is dead, so a compaction moves no more
+    // entries than it drops: O(1) moves per id however far a reader lags.
     retiring_.erase(retiring_.begin(),
                     retiring_.begin() + static_cast<ptrdiff_t>(retiring_head_));
     retiring_head_ = 0;
