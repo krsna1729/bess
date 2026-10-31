@@ -8,6 +8,9 @@
 // are appended to the log after the lock is released. With an event log, it
 // also moves workers' events into it every tick and, about once a second,
 // samples the control-visible pressure conditions (control/pressure_monitor.h).
+// After a large teardown, or once glibc holds a bound's worth of new free
+// bytes (checked once a second), it hands glibc's free pages back
+// (runtime/malloc_policy.h).
 
 #ifndef BESS_CONTROL_MAINTENANCE_LOOP_H_
 #define BESS_CONTROL_MAINTENANCE_LOOP_H_
@@ -19,6 +22,8 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+
+#include "runtime/malloc_policy.h"
 
 namespace bess::framework {
 class RequestHub;
@@ -68,6 +73,7 @@ class MaintenanceLoop {
   stats::EventHub *const events_;
   const std::chrono::microseconds interval_;
   std::unique_ptr<PressureMonitor> pressure_;
+  runtime::MallocFreeCheck free_check_{runtime::kMallocFreeCheckPeriod};
   uint64_t pressure_every_ = 1;  // ticks
   std::mutex stop_mutex_;
   std::condition_variable stop_cv_;

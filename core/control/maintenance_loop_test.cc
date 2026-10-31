@@ -16,11 +16,13 @@
 #include "control/control_plane.h"
 #include "control/resource_fill.h"
 #include "dataplane/transaction_engine.h"
+#include "framework/memory_scope.h"
 #include "framework/module_requests.h"
 #include "framework/module_tick.h"
 #include "framework/resource_bindings.h"
 #include "framework/resource_codec.h"
 #include "rcu/rcu_domain.h"
+#include "runtime/malloc_policy.h"
 #include "stats/event_hub.h"
 
 namespace bess::control {
@@ -33,6 +35,19 @@ struct Ping {
 bool WaitFor(const std::atomic<int> &value, int want) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (value.load() < want) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+// Waits until the loop has run `n` more whole ticks than when called.
+bool WaitForTicks(const MaintenanceLoop &loop, uint64_t n) {
+  const uint64_t want = loop.ticks() + n + 1;  // the one under way may be past its trim
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (loop.ticks() < want) {
     if (std::chrono::steady_clock::now() > deadline) {
       return false;
     }
@@ -245,6 +260,33 @@ TEST(MaintenanceLoopTest, AFillCrossingOfAnUnboundedResourceOmitsCapacity) {
   EXPECT_EQ("5", got.events[0].fields.at("count"));
   EXPECT_EQ("5", got.events[0].fields.at("limit"));
   EXPECT_FALSE(got.events[0].fields.contains("capacity"));
+}
+
+// A module's teardown that gives back a trim's worth of admitted bytes makes
+// the loop hand glibc's free pages back, once (RT-1); a smaller teardown after
+// it does not, and admitting does not.
+TEST(MaintenanceLoopTest, ALargeTeardownTrimsGlibcOnce) {
+  ControlPlane control;
+  framework::RequestHub hub;
+  framework::TickHub ticks;
+  MaintenanceLoop loop(control, hub, ticks, std::chrono::microseconds(500));
+  const std::string big_owner = "big";
+  const std::string small_owner = "small";
+  auto big = std::make_unique<framework::MemoryScope>(&big_owner);
+  auto small = std::make_unique<framework::MemoryScope>(&small_owner);
+  constexpr size_t kTrim = runtime::kMallocTrimAfterBytes;
+  big->Admit("table", kTrim, kTrim);
+  small->Admit("table", kTrim / 2, kTrim / 2);
+  ASSERT_TRUE(WaitForTicks(loop, 2));
+  const uint64_t trims = runtime::malloc_trims();
+
+  big.reset();
+  ASSERT_TRUE(WaitForTicks(loop, 2));
+  EXPECT_EQ(trims + 1, runtime::malloc_trims());
+
+  small.reset();
+  ASSERT_TRUE(WaitForTicks(loop, 2));
+  EXPECT_EQ(trims + 1, runtime::malloc_trims()) << "half a trim's worth released";
 }
 
 }  // namespace

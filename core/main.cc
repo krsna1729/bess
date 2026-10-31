@@ -22,6 +22,7 @@
 #include "debug.h"
 #include "runtime/opts.h"
 #include "runtime/numa_placement.h"
+#include "runtime/malloc_policy.h"
 #include "runtime/simd_width.h"
 #include "packet_pool.h"
 #include "runtime/startup.h"
@@ -43,6 +44,7 @@ int main(int argc, char *argv[]) {
   }
 
   bess::startup::BlockTerminationSignals();  // before any thread exists
+  bess::runtime::CapMallocArenas();  // RT-1: also before any thread exists
   FLAGS_logbuflevel = -1;
   FLAGS_colorlogtostderr = true;
   google::InitGoogleLogging(argv[0]);

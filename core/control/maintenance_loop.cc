@@ -12,6 +12,7 @@
 #include "framework/module_requests.h"
 #include "framework/module_tick.h"
 #include "stats/event_hub.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::control {
 
@@ -96,6 +97,13 @@ void MaintenanceLoop::Run() {
     if (events_ != nullptr) {
       // The hub has its own lock: workers' events reach the log every tick.
       (void)events_->DrainWorkers();
+    }
+    // After a large teardown, or garbage that never went through admission,
+    // glibc's free pages go back (RT-1); RPCs are not held up while it walks
+    // the arenas. The second check reads mallinfo2 at most once a second.
+    if (!runtime::TrimAfterRelease()) {
+      (void)free_check_.Check(std::chrono::steady_clock::now(),
+                              runtime::MallocFreeBound(utils::memory_policy().limit_bytes));
     }
     ticks_.fetch_add(1, std::memory_order_relaxed);
     wait.lock();
