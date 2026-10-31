@@ -96,10 +96,35 @@ const MemoryPolicy &memory_policy() noexcept;
 // (memory.current less memory.stat inactive_file: reclaimable page cache is
 // not what the OOM killer counts against bessd) when cgroup_dir is set, else
 // process RSS plus hugetlb when charged. Throws MemoryRefused(kNormalLimit) if usage + bytes would
-// exceed limit - reserve. No-op without a limit. One measurement serves the
-// admissions after it, each counted on top, until they add up to 1 MiB
-// (per-node class-C admission, D-206); a refusal is always measured afresh.
+// exceed limit - reserve, or what this thread's Headroom allows. No-op
+// without a limit. One measurement serves the admissions after it, each
+// counted on top, until they add up to 1 MiB (per-node class-C admission,
+// D-206); a refusal is always measured afresh.
 void AdmitNormalMemory(size_t bytes);
+
+// How much of the reserve this thread's admissions may draw while one lives
+// (D-207), for AdmitNormalMemory and the hugepage heap's growth validator.
+// The one exception to "limit less the reserve"; a scope only raises the
+// level, and restores the one it found.
+//  kErase: limit less half the reserve. A transaction that only erases
+//    allocates a little before it frees -- its record, the prepay of its
+//    removal stage, retirement room -- and must succeed at the limit, where
+//    everything else is refused, so a full daemon can always be emptied.
+//  kPrepaid: not checked. A removal stage (Retirer::RemoveLater) spends what
+//    its erase admitted in Reserve; checking each allocation again would
+//    refuse prepaid memory, and a refused stage would wait for memory use to
+//    drop, retrying every grace period.
+class Headroom {
+ public:
+  enum Level : uint8_t { kNone, kErase, kPrepaid };
+  explicit Headroom(Level level) noexcept;
+  ~Headroom();
+  Headroom(const Headroom &) = delete;
+  Headroom &operator=(const Headroom &) = delete;
+
+ private:
+  Level saved_;
+};
 
 // Where an admitted table's DPDK-heap bytes are expected to land
 // (AdmitTable).

@@ -20,6 +20,7 @@
 #include <rte_malloc.h>
 
 #include "dpdk.h"
+#include "runtime/malloc_policy.h"
 #include "runtime/numa_placement.h"
 #include "utils/logging.h"
 
@@ -39,6 +40,9 @@ constexpr size_t kMaxDoubling = 1024 * kMB;
 // header and trailer, alignment padding, and the heap's own bookkeeping at
 // the start of the segment. Generous on purpose; it is 64 KiB.
 constexpr size_t kChunkSlack = size_t{64} * 1024;
+
+// This thread's Headroom level (D-207).
+thread_local Headroom::Level headroom = Headroom::kNone;
 
 std::atomic<uint64_t> refusals{0};
 std::atomic<uint64_t> spilled{0};
@@ -299,9 +303,12 @@ class FallbackHeap {
       return;
     }
     // Prefer a large chunk; if the limit leaves room only for what this
-    // allocation needs, take just that.
-    size_t chunk = std::max({needed, kMinChunk,
-                             std::min(last_chunk_ * 2, kMaxDoubling)});
+    // allocation needs, take just that. Unchecked prepaid memory (a removal
+    // stage, Headroom::kPrepaid) takes only what it needs.
+    size_t chunk = headroom == Headroom::kPrepaid
+                       ? needed
+                       : std::max({needed, kMinChunk,
+                                   std::min(last_chunk_ * 2, kMaxDoubling)});
     try {
       AdmitNormalMemory(chunk);
     } catch (const MemoryRefused &) {
@@ -370,7 +377,21 @@ bool measured = false;
 size_t measured_used = 0;
 size_t admitted_since = 0;
 
+// What usage may reach on this thread: the limit less the reserve, or less
+// half of it under Headroom::kErase. Not called under kPrepaid.
+size_t AllowedBytes(const MemoryPolicy &policy) noexcept {
+  const size_t reserve = headroom == Headroom::kErase ? policy.reserve_bytes / 2
+                                                      : policy.reserve_bytes;
+  return policy.limit_bytes > reserve ? policy.limit_bytes - reserve : 0;
+}
+
 }  // namespace
+
+Headroom::Headroom(Level level) noexcept : saved_(headroom) {
+  headroom = std::max(saved_, level);
+}
+
+Headroom::~Headroom() { headroom = saved_; }
 
 void SetMemoryPolicy(MemoryPolicy policy) {
   Policy() = std::move(policy);
@@ -382,12 +403,10 @@ const MemoryPolicy &memory_policy() noexcept { return Policy(); }
 
 void AdmitNormalMemory(size_t bytes) {
   const MemoryPolicy &policy = memory_policy();
-  if (policy.limit_bytes == 0) {
+  if (policy.limit_bytes == 0 || headroom == Headroom::kPrepaid) {
     return;
   }
-  const size_t allowed = policy.limit_bytes > policy.reserve_bytes
-                             ? policy.limit_bytes - policy.reserve_bytes
-                             : 0;
+  const size_t allowed = AllowedBytes(policy);
   {
     const std::lock_guard<std::mutex> lock(measure_mu);
     if (measured && bytes <= allowed &&
@@ -399,7 +418,15 @@ void AdmitNormalMemory(size_t bytes) {
   }
   // Allocated DPDK heap memory counts whether or not it is resident yet: a
   // free faults it in (D-206).
-  const size_t used = UsedBytes(policy) + UnfaultedHeapBytes();
+  size_t used = UsedBytes(policy) + UnfaultedHeapBytes();
+  if (bytes <= allowed && used > allowed - bytes) {
+    // glibc keeps what was freed in its arenas (a transaction's decoded
+    // copy, a request's buffers): given back (RT-1's trim) and measured
+    // again, so free memory glibc retains never refuses an admission
+    // (D-207). Only a would-be refusal pays for the trim.
+    runtime::TrimAfterRelease(0);
+    used = UsedBytes(policy) + UnfaultedHeapBytes();
+  }
   {
     const std::lock_guard<std::mutex> lock(measure_mu);
     measured = true;
@@ -411,8 +438,8 @@ void AdmitNormalMemory(size_t bytes) {
     message << "memory limit: refusing " << bytes << " bytes ("
             << Mb(bytes) << ") of normal-page memory: " << Mb(used)
             << " in use, the limit is " << Mb(policy.limit_bytes) << " ("
-            << policy.limit_source << ") less a " << Mb(policy.reserve_bytes)
-            << " reserve";
+            << policy.limit_source << ") less a "
+            << Mb(policy.limit_bytes - allowed) << " reserve";
     Refuse(MemoryRefused::Reason::kNormalLimit, bytes, message.str());
   }
 }
@@ -479,14 +506,13 @@ int ValidateHeapGrowth(int, size_t, size_t new_len) {
     refusals.fetch_add(1, std::memory_order_relaxed);
     return -1;
   }
-  if (!policy.hugetlb_charged || policy.limit_bytes == 0) {
+  if (!policy.hugetlb_charged || policy.limit_bytes == 0 ||
+      headroom == Headroom::kPrepaid) {
     return 0;
   }
   const size_t current = heap_bytes.load(std::memory_order_relaxed);
   const size_t growth = new_len > current ? new_len - current : 0;
-  const size_t allowed = policy.limit_bytes > policy.reserve_bytes
-                             ? policy.limit_bytes - policy.reserve_bytes
-                             : 0;
+  const size_t allowed = AllowedBytes(policy);
   const size_t used = UsedBytes(policy);
   if (growth > allowed || used > allowed - growth) {
     refusals.fetch_add(1, std::memory_order_relaxed);

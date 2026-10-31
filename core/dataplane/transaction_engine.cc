@@ -464,6 +464,11 @@ size_t TransactionEngine::ReclaimRetiredLocked() {
       if (domain_.pending_retired() + left > retire_budget) {
         break;
       }
+      // The stage spends what its erases admitted in Reserve (D-207): its
+      // allocations are not checked against the memory limit again, so a
+      // stage at the limit completes rather than waiting for memory use to
+      // drop. The retirement room it reserves is bounded by the budget above.
+      const utils::Headroom prepaid(utils::Headroom::kPrepaid);
       domain_.ReserveRetirements(left);
       Retirer retirer;
       retirer.retire_.reserve(left);
@@ -476,9 +481,11 @@ size_t TransactionEngine::ReclaimRetiredLocked() {
         try {
           step.fn(retirer);
         } catch (const std::bad_alloc &e) {
-          // Memory refused (a stage's edit is DPDK memory, D-198): the step
-          // changed nothing and runs again after another grace period. The
-          // steps before it ran and must not run again (a slot emptied twice).
+          // Memory refused (a stage's edit is DPDK memory, D-198; prepaid,
+          // it is not checked against the limit, but the heap can still be
+          // out of pages): the step changed nothing and runs again after
+          // another grace period. The steps before it ran and must not run
+          // again (a slot emptied twice).
           LOG(WARNING) << "removal step of '" << step.owner->name()
                        << "' refused, retried later: " << e.what();
           refused = true;
@@ -560,11 +567,18 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
     std::span<const Op> ops, std::optional<uint64_t> expected_generation,
     Consistency consistency, const std::span<const Resource *const> *owned) {
   std::lock_guard<std::mutex> lock(mutex_);
+  const size_t n = ops.size();
+  // D-207: a transaction that only erases may use half the reserve, so a
+  // daemon at its memory limit can always be emptied (utils::Headroom).
+  const utils::Headroom headroom(
+      n != 0 && std::ranges::all_of(
+                    ops, [](const Op &op) { return op.kind == OpKind::kErase; })
+          ? utils::Headroom::kErase
+          : utils::Headroom::kNone);
   ReclaimRetiredLocked();  // frees ids whose removal has completed
   // Ranks come from the bound dependency graph, which registrations may have
   // changed since the last Apply (a referent registering after its referrer).
   RecomputeRanksLocked();
-  const size_t n = ops.size();
 
   if (reference_cycle_) {
     return Reject(n, 0,

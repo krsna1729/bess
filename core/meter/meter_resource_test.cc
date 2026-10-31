@@ -391,18 +391,15 @@ TEST_F(MeterResourceTest, EraseRefusedWhenItsRemovalStageDoesNotFit) {
   EXPECT_TRUE(Has(1));
 }
 
-// The prepay admits the stage's edit, but on normal pages every DPDK
-// allocation is checked against the memory limit again (D-198), so the
-// stage itself can be refused. That refusal must not fail the next
-// transaction, replay the stage's other steps (a counter slot beside the
-// meter, as in the UPF appliance; replayed, it emptied the slot twice) or
-// bring the meter back: the stage runs again once memory allows.
-TEST_F(MeterResourceTest, RefusedRemovalStageIsRetriedNotReplayed) {
+// The erase's Reserve prepays its removal stage's edit; the stage spends that
+// prepay, and its DPDK allocations are not checked against the memory limit
+// again (D-207, utils::Headroom::kPrepaid). At the limit -- where on normal
+// pages each allocation would be refused, and the stage retried every grace
+// period until memory use dropped -- the stage completes: the stage's other
+// step (a counter slot beside the meter, as in the UPF appliance) runs once,
+// the meter is gone, and its prepay is settled exactly once.
+TEST_F(MeterResourceTest, RemovalStageCompletesAtTheLimit) {
   utils::MemoryNode();  // DPDK up: its backing is known
-  if (utils::GetMemoryStatus().hugepages) {
-    GTEST_SKIP() << "only normal pages check each DPDK allocation against "
-                    "the limit (BESSD_MEM_BACKING)";
-  }
   struct CounterTag;
   using CounterId = dataplane::StrongId<CounterTag, uint32_t>;
   struct Counter {};
@@ -427,26 +424,22 @@ TEST_F(MeterResourceTest, RefusedRemovalStageIsRetriedNotReplayed) {
 
   utils::MemoryPolicy saved = utils::memory_policy();
   utils::MemoryPolicy tight;
-  tight.limit_bytes = 1;  // refuses every normal-page allocation
+  tight.limit_bytes = 1;  // refuses every checked normal-page allocation
   tight.limit_source = "test";
   utils::SetMemoryPolicy(tight);
   domain_.Quiescent(kReader);
   dataplane::TransactionEngine::Result r;
-  EXPECT_NO_THROW(r = Apply({erase_counter(2)}));  // allocates nothing
+  // Allocates nothing itself; runs the pending stage first.
+  EXPECT_NO_THROW(r = Apply({erase_counter(2)}));
   utils::SetMemoryPolicy(std::move(saved));
   EXPECT_EQ(r.outcome, Outcome::kApplied);
   EXPECT_EQ(counters.size(), 0u);
-  EXPECT_TRUE(resource_->Retiring(MeterId(1)));
-  EXPECT_FALSE(Has(1));
-  EXPECT_NE(published_.Read()->Lookup(MeterId(1)), nullptr);
-
-  PassGracePeriod();
   EXPECT_FALSE(resource_->Retiring(MeterId(1)));
   EXPECT_FALSE(Has(1));
   EXPECT_EQ(published_.Read()->Lookup(MeterId(1)), nullptr);
   EXPECT_EQ(Visited(), (std::vector<uint32_t>{2}));
   EXPECT_EQ(resource_->bytes(), growth_.grown - growth_.shrunk)
-      << "the refused stage's prepay was not settled exactly once";
+      << "the stage's prepay was not settled exactly once";
   EXPECT_EQ(Apply({counter(1), Upsert(1, TrTcm(900))}).outcome,
             Outcome::kApplied)
       << "both ids are free again";

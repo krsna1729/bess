@@ -125,10 +125,13 @@ class Retirer {
   // -- a grace period after the publish for the highest-rank resource, and a
   // grace period after the rank above for each lower rank (a reader that saw
   // a referrer just before it went away must be done before its referent
-  // goes). The step receives a Retirer for whatever it replaces. It may
-  // throw std::bad_alloc (refused memory) only having changed nothing: the
-  // engine runs it again after another grace period, and does not run the
-  // steps before it again. SlotResource's erase uses this to empty its slot.
+  // goes). The step receives a Retirer for whatever it replaces. Its memory
+  // is prepaid: the erase's Reserve admits it, and the step's allocations
+  // are not checked against the limit again (utils::Headroom::kPrepaid,
+  // D-207). It may throw std::bad_alloc (memory refused all the same, as by
+  // an exhausted heap) only having changed nothing: the engine runs it again
+  // after another grace period, and does not run the steps before it again.
+  // SlotResource's erase uses this to empty its slot.
   void RemoveLater(Step step) {
     CheckRoom(removals_.size(), removals_.capacity(), "RemoveLater");
     removals_.push_back({rank_, owner_, std::move(step)});
