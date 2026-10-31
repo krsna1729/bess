@@ -6,6 +6,8 @@
 #include <mutex>
 #include <tuple>
 
+#include "runtime/malloc_policy.h"
+
 namespace bess::framework {
 
 namespace {
@@ -29,8 +31,10 @@ std::vector<MemoryScope *> &Scopes() {
 // hugepage-counted first: when an owner releases less than it holds and
 // admitted under both backings, freeing cap room it did not use is the error
 // that heals (DPDK's --socket-limit still bounds the heap), keeping cap room
-// it no longer uses is the one that refuses tables forever.
+// it no longer uses is the one that refuses tables forever. What it takes is
+// noted for the maintenance loop's trim (runtime/malloc_policy.h).
 void Take(size_t *huge, size_t *normal, size_t bytes, size_t glibc_bytes) {
+  const size_t held = *huge + *normal;
   glibc_bytes = std::min({glibc_bytes, bytes, *normal});
   *normal -= glibc_bytes;
   bytes -= glibc_bytes;
@@ -38,6 +42,7 @@ void Take(size_t *huge, size_t *normal, size_t bytes, size_t glibc_bytes) {
   *huge -= from_huge;
   utils::ReleaseTable(utils::TableBacking::kHugepages, from_huge);
   *normal -= std::min(*normal, bytes - from_huge);
+  runtime::NoteReleasedBytes(held - (*huge + *normal));
 }
 
 // Records what AdmitTable(bytes, glibc_bytes) admitted with `backing`.
@@ -115,6 +120,7 @@ void MemoryLease::reset() noexcept {
       auto &siblings = *node_->siblings;
       siblings.erase(std::find(siblings.begin(), siblings.end(), node_));
       utils::ReleaseTable(utils::TableBacking::kHugepages, node_->huge);
+      runtime::NoteReleasedBytes(node_->huge + node_->normal);
     }
   }
   delete node_;
@@ -132,11 +138,13 @@ MemoryScope::~MemoryScope() {
   scopes.erase(std::find(scopes.begin(), scopes.end(), this));
   for (auto &[name, entry] : entries_) {
     utils::ReleaseTable(utils::TableBacking::kHugepages, entry->huge);
+    runtime::NoteReleasedBytes(entry->huge + entry->normal);
     // A lease that outlives its scope (not reachable from a module: the
     // scope is a Module member, its leases the subclass's) releases nothing
     // later.
     for (detail::LeaseNode *node : entry->leases) {
       utils::ReleaseTable(utils::TableBacking::kHugepages, node->huge);
+      runtime::NoteReleasedBytes(node->huge + node->normal);
       node->scope = nullptr;
       node->siblings = nullptr;
       node->huge = node->normal = 0;
