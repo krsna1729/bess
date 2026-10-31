@@ -292,21 +292,42 @@ CommandResponse Bridge::CommandFlush(const bess::pb::EmptyArg &) {
   return CommandSuccess();
 }
 
-void Bridge::Flood(Context *ctx, bess::PacketRef pkt, gate_idx_t,
-                   const std::vector<gate_idx_t> &flood_gates) {
-  if (flood_gates.empty()) {
+int Bridge::OnEvent(bess::Event event) {
+  if (event != bess::Event::PreResume) {
+    return -ENOTSUP;
+  }
+  connected_ogates_.clear();
+  const auto &out_gates = ogates();
+  for (size_t g = 0; g < out_gates.size(); g++) {
+    if (out_gates[g] != nullptr) {
+      connected_ogates_.push_back(static_cast<gate_idx_t>(g));
+    }
+  }
+  return 0;
+}
+
+void Bridge::Flood(Context *ctx, bess::PacketRef pkt, gate_idx_t igate) {
+  // A copy to every flood gate but the last, which takes the packet itself.
+  gate_idx_t last = INVALID_GATE;
+  for (const gate_idx_t g : connected_ogates_) {
+    if (g == igate) {
+      continue;
+    }
+    if (last != INVALID_GATE) {
+      // A flooded copy is the same frame on another port: the metadata an
+      // upstream module wrote (tenant, meter id) is part of the packet.
+      bess::PacketRef copy(bess::PacketCopyWithMetadata(pkt.handle()));
+      if (copy.handle() != nullptr) {
+        EmitPacket(ctx, copy, last);
+      }
+    }
+    last = g;
+  }
+  if (last == INVALID_GATE) {
     DropPacket(ctx, pkt);
     return;
   }
-  for (size_t g = 1; g < flood_gates.size(); g++) {
-    // A flooded copy is the same frame on another port: the metadata an
-    // upstream module wrote (tenant, meter id) is part of the packet.
-    bess::PacketRef copy(bess::PacketCopyWithMetadata(pkt.handle()));
-    if (copy.handle() != nullptr) {
-      EmitPacket(ctx, copy, flood_gates[g]);
-    }
-  }
-  EmitPacket(ctx, pkt, flood_gates[0]);
+  EmitPacket(ctx, pkt, last);
 }
 
 void Bridge::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
@@ -316,13 +337,6 @@ void Bridge::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
   const uint64_t now = tsc_to_ns(ctx->current_tsc);
   fdb_->Age(now, kAgeBudget);
 
-  std::vector<gate_idx_t> flood_gates;
-  const auto &out_gates = ogates();
-  for (size_t g = 0; g < out_gates.size(); g++) {
-    if (out_gates[g] != nullptr && static_cast<gate_idx_t>(g) != igate) {
-      flood_gates.push_back(static_cast<gate_idx_t>(g));
-    }
-  }
   const dataplane::InterfaceId ingress = InterfaceOfGate(igate);
   for (bess::PacketRef pkt : batch->packets()) {
     if (unlikely(pkt.head_len() < sizeof(Ethernet))) {
@@ -334,12 +348,12 @@ void Bridge::ProcessBatch(Context *ctx, bess::PacketBatch *batch) {
     (void)fdb_->Learn(kDomain, ToMac(eth->src_addr), ingress, now);
 
     if (unlikely((eth->dst_addr.bytes[0] & 1) != 0)) {
-      Flood(ctx, pkt, igate, flood_gates);
+      Flood(ctx, pkt, igate);
       continue;
     }
     const dataplane::InterfaceId out = fdb_->Lookup(kDomain, ToMac(eth->dst_addr));
     if (out == dataplane::kInvalidInterfaceId) {
-      Flood(ctx, pkt, igate, flood_gates);
+      Flood(ctx, pkt, igate);
     } else if (out == ingress) {
       DropPacket(ctx, pkt);  // hairpin
     } else {

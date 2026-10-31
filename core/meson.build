@@ -968,6 +968,7 @@ allocation_fault_tests = [
   'dataplane/rebuild_resource_test.cc',
   'dataplane/transaction_lifecycle_test.cc',
   'modules/drr_test.cc',
+  'modules/bridge_test.cc',
   'modules/firewall_test.cc',
   'modules/transaction_conformance_test.cc',
   'modules/url_filter_test.cc',

@@ -54,6 +54,9 @@ class Bridge final : public Module {
   CommandResponse CommandFlush(const bess::pb::EmptyArg &arg);
 
   void ProcessBatch(Context *ctx, bess::PacketBatch *batch) override;
+  // Rebuilds the flood list: a graph change pauses the workers and sends this
+  // before they resume.
+  int OnEvent(bess::Event event) override;
   std::string GetDesc() const override;
 
   // A MAC's six bytes, as the statics are keyed.
@@ -64,8 +67,7 @@ class Bridge final : public Module {
  private:
   friend class StaticsResource;
 
-  void Flood(Context *ctx, bess::PacketRef pkt, gate_idx_t igate,
-             const std::vector<gate_idx_t> &flood_gates);
+  void Flood(Context *ctx, bess::PacketRef pkt, gate_idx_t igate);
 
   uint32_t max_entries_ = 1024;
   // "<name>/fdb" (D-198); its growth hook admits flood-group growth.
@@ -75,6 +77,10 @@ class Bridge final : public Module {
   // the worker-owned FDB. Learning never creates or moves a static entry and
   // aging never removes one, so only the control side changes this.
   std::map<Mac, gate_idx_t> statics_;
+  // Every connected output gate, ascending: the flood targets but the
+  // ingress. Built on the control side (OnEvent) so a batch neither allocates
+  // nor scans the ogates (performance-contract.md).
+  std::vector<gate_idx_t> connected_ogates_;
 
   std::unique_ptr<bess::dataplane::Resource> resource_;
   bess::framework::ResourceBinding binding_;  // after resource_ (D-044)
