@@ -87,6 +87,7 @@ class UnixSocketPort final : public Port {
   // Value for a disconnected socket.
   static const int kNotConnectedFd = -1;
   friend class UnixSocketAcceptThread;
+  friend class UnixSocketPortTestAccess;
 
   static const uint64_t kDefaultMinRxInterval = 50000;  // 50 microsec
 

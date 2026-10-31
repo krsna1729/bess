@@ -72,18 +72,27 @@ void UnixSocketAcceptThread::Run() {
   }
 }
 
+// Refills the slots in [0, cnt) that RecvPackets consumed (left nullptr); a
+// slot whose record was empty still holds its unused mbuf and is kept.
 void UnixSocketPort::ReplenishRecvVector(int cnt) {
   DCHECK_LE(cnt, bess::PacketBatch::kMaxBurst);
-  bool allocated =
-      current_worker.packet_pool()->AllocBulk(pkt_recv_vector_.data(), cnt);
-
+  bess::PacketHandle fresh[bess::PacketBatch::kMaxBurst];
+  int needed = 0;
   for (int i = 0; i < cnt; i++) {
-    if (allocated) {
-      recv_iovecs_[i] = {.iov_base = bess::PacketRef(pkt_recv_vector_[i]).head_data(),
-                         .iov_len = bess::PacketRef(pkt_recv_vector_[i]).tailroom()};
-    } else {
-      // vectors can have holes, it will just drop the packet
-      recv_iovecs_[i] = {.iov_base = nullptr, .iov_len = 0};
+    needed += (pkt_recv_vector_[i] == nullptr);
+  }
+  // On failure the slots stay holes (nullptr iov): their records are dropped.
+  if (needed == 0 || !current_worker.packet_pool()->AllocBulk(fresh, needed)) {
+    return;
+  }
+
+  int j = 0;
+  for (int i = 0; i < cnt; i++) {
+    if (pkt_recv_vector_[i] == nullptr) {
+      pkt_recv_vector_[i] = fresh[j++];
+      bess::PacketRef pkt(pkt_recv_vector_[i]);
+      recv_iovecs_[i] = {.iov_base = pkt.head_data(),
+                         .iov_len = pkt.tailroom()};
     }
   }
 }
@@ -195,7 +204,7 @@ int UnixSocketPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) 
     return 0;
   }
 
-  uint64_t now_ns = current_worker.current_tsc();
+  uint64_t now_ns = current_worker.current_ns();
   if (now_ns - last_idle_ns_ < min_rx_interval_ns_) {
     return 0;
   }
@@ -213,6 +222,8 @@ int UnixSocketPort::RecvPackets(queue_t qid, bess::PacketHandle *pkts, int cnt) 
           bess::PacketRef pkt(pkt_recv_vector_[i]);
           pkt.append(recv_vector_[i].msg_len);
           pkts[received++] = pkt.handle();
+          pkt_recv_vector_[i] = nullptr;
+          recv_iovecs_[i] = {.iov_base = nullptr, .iov_len = 0};
         }
       }
       ReplenishRecvVector(ret);
