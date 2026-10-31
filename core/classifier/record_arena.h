@@ -82,6 +82,11 @@ class RecordArena {
   [[nodiscard]] size_t retiring() const noexcept {
     return retiring_.size() - retiring_head_;
   }
+  // Retiring entries moved by compaction since construction: at most one
+  // move per retired id, however far a reader lags (CL-8).
+  [[nodiscard]] size_t compaction_moves() const noexcept {
+    return compaction_moves_;
+  }
 
   // Memory (D-198). The constructor allocates the published-chunk array,
   // kMaxChunks pointers on the DPDK heap, whatever the record size; records
@@ -145,6 +150,7 @@ class RecordArena {
   };
   std::vector<Retiring> retiring_;
   size_t retiring_head_ = 0;
+  size_t compaction_moves_ = 0;
   // Reservations not yet consumed by Retire(): capacity already promised, so
   // a second reservation cannot count the same spare slot twice.
   size_t retirement_reserved_ = 0;

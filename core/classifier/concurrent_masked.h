@@ -393,7 +393,14 @@ class ConcurrentMaskedTable {
   // Rule ids retired but not yet past their grace period.
   size_t retiring_ids() const noexcept { return records_.retiring(); }
   // Chains replaced but not yet past their grace period.
-  size_t retiring_chains() const noexcept { return retired_chains_.size(); }
+  size_t retiring_chains() const noexcept {
+    return retired_chains_.size() - retired_head_;
+  }
+  // Retired chains moved by compaction since construction: at most one move
+  // per chain, however far a reader lags (CL-8).
+  size_t chain_compaction_moves() const noexcept {
+    return chain_compaction_moves_;
+  }
   // Rule ids not free: live rules, retiring ids, prepared records and the
   // pending record.
   size_t ids_in_use() const noexcept { return records_.in_use(); }
@@ -706,6 +713,10 @@ class ConcurrentMaskedTable {
     rcu::GracePeriod token;
   };
   std::vector<RetiredChain> retired_chains_;
+  // Chains before retired_head_ are freed; ReclaimChains compacts them away
+  // once they are half the queue.
+  size_t retired_head_ = 0;
+  size_t chain_compaction_moves_ = 0;
   // Bytes of every chain allocated and not yet freed (writer only).
   size_t chain_bytes_ = 0;
 };

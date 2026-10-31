@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <vector>
@@ -115,6 +116,47 @@ TEST(RecordArenaTest, EraseOnlyWorkloadKeepsRetiringBounded) {
     ASSERT_LE(arena.retiring(), 1u) << "completed retirements must be freed";
   }
   EXPECT_LE(arena.in_use(), 1u);
+}
+
+// Sixteen readers each pass a quiescent state every 16K retirements,
+// staggered 1K apart: about 16K retirements stay pending, and completions
+// arrive 1K at a time. A compaction per 1K completions moved the whole
+// backlog (~15K entries) each time; compacting only when half the queue is
+// dead moves each id at most once (CL-8).
+TEST(RecordArenaTest, LaggingReadersMoveEachRetiredIdAtMostOnce) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  constexpr uint32_t kFirstReader = 40;
+  constexpr uint32_t kReaders = 16;
+  constexpr size_t kStep = 1024;
+  constexpr size_t kRetires = 200 * kStep;
+  for (uint32_t r = 0; r < kReaders; r++) {
+    ASSERT_TRUE(domain.Register(kFirstReader + r).has_value());
+    domain.Online(kFirstReader + r);
+  }
+  RecordArena arena(sizeof(Bytes), domain);
+  size_t max_retiring = 0;
+  for (size_t i = 0; i < kRetires; i++) {
+    if (i % kStep == 0) {
+      domain.Quiescent(kFirstReader +
+                       static_cast<uint32_t>((i / kStep) % kReaders));
+    }
+    const RecordArena::Id id = arena.Allocate();
+    ASSERT_NE(0u, id);
+    arena.ReserveRetirement(1);
+    arena.Retire(id);
+    max_retiring = std::max(max_retiring, arena.retiring());
+  }
+  for (uint32_t r = 0; r < kReaders; r++) {
+    domain.Offline(kFirstReader + r);
+    domain.Unregister(kFirstReader + r);
+  }
+  // The backlog is the lag the readers impose, not the ids ever retired.
+  EXPECT_GE(max_retiring, (kReaders - 1) * kStep);
+  EXPECT_LE(max_retiring, (kReaders + 1) * kStep);
+  RecordProperty("max_retiring", static_cast<int>(max_retiring));
+  RecordProperty("compaction_moves",
+                 static_cast<int>(arena.compaction_moves()));
+  EXPECT_LE(arena.compaction_moves(), kRetires);
 }
 
 TEST(RecordArenaTest, CrossesChunks) {

@@ -32,13 +32,14 @@
 #include <vector>
 
 #include "dpdk.h"
-#include "runtime/runtime_state.h"
-#include "packet_pool.h"
 #include "framework/memory_scope.h"
+#include "packet_pool.h"
 #include "route/connected_route.h"
 #include "route/route_table.h"
 #include "route/router.h"
+#include "runtime/runtime_state.h"
 #include "testing/route_backends.h"
+#include "testing/scale_probe.h"
 #include "utils/dpdk_memory.h"
 #include "utils/endian.h"
 
@@ -1963,6 +1964,28 @@ TEST(Ipv6RouteTableTest, Tbl8ExhaustionLeavesTheLiveTableUnchanged) {
   ASSERT_TRUE(table->Erase(P6("2001:db8:1::", 48)));
   ASSERT_TRUE(table->Upsert(P6("2001:db9:1::", 48), 2)) << "the groups came back";
   EXPECT_EQ(2u, table->Read().Lookup(V6("2001:db9:1::5")));
+  bess::runtime::runtime().rcu().Drain();
+}
+
+// A staged edit costs the edit, not the edits staged before it: reserving the
+// stage's touched list one entry at a time copied the whole list on every
+// edit, O(k^2) bytes per stage (RO-3). /24 prefixes sit in tbl24 alone.
+TEST(Ipv6RouteTableTest, AStagedEditCopiesNothingStagedBeforeIt) {
+  auto table = MakeTable6(Cfg6(2048, 64));
+  auto stage = table->BeginStage();
+  ASSERT_TRUE(stage);
+  const auto costs =
+      bess::scale_probe::CostsOfSteps(1000, {99, 999}, [&](size_t i) {
+        bess::utils::Ipv6Address addr{};
+        addr.bytes[0] = 0x20;
+        addr.bytes[1] = static_cast<uint8_t>(i >> 8);
+        addr.bytes[2] = static_cast<uint8_t>(i);
+        ASSERT_TRUE((*stage)->Upsert(Ipv6Prefix::Make(addr, 24).value(), 1));
+      });
+  table->Abort(**stage);
+  RecordProperty("edit_100_bytes", static_cast<int>(costs[0].bytes));
+  RecordProperty("edit_1000_bytes", static_cast<int>(costs[1].bytes));
+  EXPECT_LE(costs[1].bytes, costs[0].bytes) << "edit 1000 vs edit 100";
   bess::runtime::runtime().rcu().Drain();
 }
 
