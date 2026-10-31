@@ -83,6 +83,8 @@ void ApiServer::Run() {
     LOG(ERROR) << "ServerBuilder::BuildAndStart() failed";
     return;
   }
+  // The working set nothing admitted, once the server runs (D-207).
+  bess::control::RecordMemoryBaseline();
 
   // HTTP (D-125) calls this server over an in-process channel: the same
   // services, limits and errors as a gRPC client sees.

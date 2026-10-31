@@ -59,8 +59,21 @@ inline constexpr int kMaxMessageBytes = 64 << 20;
 // it, server reflection -- so orchestrators and generic tools (grpcurl) work
 // without BESS's protos.
 void PrepareControlServer();
-// Per builder: message size limits.
+// Per builder: message size limits, and under a memory limit (D-207) the
+// receive bound MaxReceiveBytes() and a gRPC resource quota of a quarter of
+// the reserve on what gRPC itself buffers.
 void ConfigureControlServer(grpc::ServerBuilder *builder);
+// The largest request accepted (D-207): kMaxMessageBytes, or under a memory
+// limit an eighth of the reserve when that is smaller -- a request is
+// parsed and decoded unadmitted (several times its wire size), so one must
+// fit the reserve whatever else is in flight.
+int MaxReceiveBytes();
+// Notes the daemon's baseline (D-207): the working set nothing admitted
+// accounts for -- binary, libraries, EAL, gRPC, thread stacks -- measured
+// once, when the control server has started. GetResourceStatus reports it
+// and what the working set holds beyond it and the admitted bytes
+// (MemoryStatus.unattributed_bytes).
+void RecordMemoryBaseline();
 
 // ApplyTransaction waits out a BUSY answer (reclamation behind the readers)
 // itself before passing it on: up to kBusyRetries more attempts, sleeping
