@@ -8,6 +8,7 @@
 #include <array>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -541,11 +542,18 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
       // unmasked as given, so cutting it at the field sizes gives back every
       // field's bytes. Canonical form: every field as value_bin (one a client
       // sent as value_int decodes to the same packed key), and the value as
-      // its gate and result record (D-172).
-      [this](const auto &visit) {
+      // its gate and result record (D-172). Resumable by key slot; the
+      // cursor names the table's capacity, so a walk that outlives a growth
+      // starts the new table over (entries may repeat, none is missed).
+      [this](std::string_view cursor, const auto &visit) -> std::string {
+        std::array<uint32_t, 2> at{};  // capacity, slot
+        const uint32_t capacity = table_->capacity();
+        const uint32_t slot =
+            bess::framework::CursorFields(cursor, &at) && at[0] == capacity ? at[1] : 0;
         bess::pb::ExactMatchRuleKey key;
         bess::pb::ExactMatchRuleValue value;
-        table_->ForEach([&](classifier::ConstBytes packed, uint64_t v) {
+        const uint32_t next = table_->VisitFrom(slot, [&](classifier::ConstBytes packed,
+                                                          uint64_t v) {
           key.Clear();
           size_t pos = 0;
           for (const bess::framework::KeyField &spec : keys_.fields()) {
@@ -561,8 +569,9 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
                 records->Lookup(bess::ResultIdOfResult(v));
             value.set_result(record.data(), record.size());
           }
-          visit(key, value);
+          return visit(key, value);
         });
+        return next == 0 ? std::string() : bess::framework::CursorOf<2>({capacity, next});
       }));
   if (auto registered =
           init_context().resources().Register(resource_.get());
