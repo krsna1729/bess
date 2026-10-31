@@ -8,9 +8,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <type_traits>
 #include <new>
 #include <optional>
@@ -18,8 +16,9 @@
 #include <utility>
 
 #include "dataplane/resource.h"
+#include "dataplane/slot_table.h"
+#include "dataplane/strong_id.h"
 #include "packet_handle.h"
-#include "rcu/rcu_ptr.h"
 #include "utils/dpdk_memory.h"
 
 namespace bess {
@@ -36,123 +35,20 @@ struct PacketStoreLimits {
   bool operator==(const PacketStoreLimits &) const = default;
 };
 
-// The admission shared by a flows resource and every limits map it makes
-// (D-198). A retired map is freed after a grace period, possibly after the
-// resource, so maps hold this and give bytes back through it; the resource
-// detaches the owner's hook when it dies, and later frees give nothing back.
-class PacketStoreMemory {
- public:
-  void Grow(size_t bytes) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (hook_ != nullptr) {
-      hook_->Grow(bytes, bytes);
-    }
-    held_.fetch_add(bytes, std::memory_order_relaxed);
-  }
-  void Shrink(size_t bytes) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (hook_ != nullptr) {
-      hook_->Shrink(bytes, bytes);
-    }
-    held_.fetch_sub(bytes, std::memory_order_relaxed);
-  }
-  void Attach(utils::MemoryGrowth *hook) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    hook_ = hook;
-  }
-  size_t held() const noexcept { return held_.load(std::memory_order_relaxed); }
+// A flow id with limits of its own: 1..capacity of the limits table. 0 is
+// every packet without a key, so it never has an entry.
+struct PacketStoreFlowIdTag;
+using PacketStoreFlowId = StrongId<PacketStoreFlowIdTag, uint32_t>;
 
- private:
-  std::mutex mutex_;
-  utils::MemoryGrowth *hook_ = nullptr;  // guarded by mutex_
-  std::atomic<size_t> held_{0};
-};
-
-// Admits each node before allocating it and gives it back when freed. A
-// default allocator has no admission (tests, library users).
-template <typename T>
-class PacketStoreAllocator {
- public:
-  using value_type = T;
-  using propagate_on_container_copy_assignment = std::true_type;
-  using propagate_on_container_move_assignment = std::true_type;
-  using propagate_on_container_swap = std::true_type;
-
-  PacketStoreAllocator() = default;
-  explicit PacketStoreAllocator(std::shared_ptr<PacketStoreMemory> memory) noexcept
-      : memory_(std::move(memory)) {}
-  template <typename U>
-  PacketStoreAllocator(const PacketStoreAllocator<U> &o) noexcept
-      : memory_(o.memory()) {}
-
-  T *allocate(size_t n) {
-    const size_t bytes = n * sizeof(T);
-    if (memory_ != nullptr) {
-      memory_->Grow(bytes);  // refusal throws before anything is allocated
-    }
-    try {
-      return std::allocator<T>().allocate(n);
-    } catch (...) {
-      if (memory_ != nullptr) {
-        memory_->Shrink(bytes);
-      }
-      throw;
-    }
-  }
-  void deallocate(T *p, size_t n) noexcept {
-    std::allocator<T>().deallocate(p, n);
-    if (memory_ != nullptr) {
-      memory_->Shrink(n * sizeof(T));
-    }
-  }
-  const std::shared_ptr<PacketStoreMemory> &memory() const noexcept {
-    return memory_;
-  }
-  template <typename U>
-  bool operator==(const PacketStoreAllocator<U> &o) const noexcept {
-    return memory_ == o.memory();
-  }
-
- private:
-  std::shared_ptr<PacketStoreMemory> memory_;
-};
-
-// The per-flow limits by flow id: one immutable table, published whole
-// through an RcuPtr the store's owner holds and read once per run. With an
-// admitting allocator it also admits its own header, so a clone costs its
-// header and every node before any is allocated. Not movable or assignable:
-// a table is built, published and freed. Packet-path state (D-206, class P:
-// Store and expiry look flows up in it) left on glibc, one node per entry,
-// until a node pool on the framework allocator exists (D-206 open item).
-class PacketStoreLimitsMap
-    : public std::map<uint32_t, PacketStoreLimits, std::less<uint32_t>,
-                      PacketStoreAllocator<std::pair<const uint32_t, PacketStoreLimits>>> {
-  using Base = std::map<uint32_t, PacketStoreLimits, std::less<uint32_t>,
-                        PacketStoreAllocator<std::pair<const uint32_t, PacketStoreLimits>>>;
-
- public:
-  using Base::Base;
-  PacketStoreLimitsMap() = default;
-  explicit PacketStoreLimitsMap(const allocator_type &alloc) : Base(alloc) {
-    Admit();
-  }
-  PacketStoreLimitsMap(const PacketStoreLimitsMap &o) : Base(o) { Admit(); }
-  PacketStoreLimitsMap &operator=(const PacketStoreLimitsMap &) = delete;
-  ~PacketStoreLimitsMap() {
-    if (counted_) {
-      get_allocator().memory()->Shrink(sizeof(*this));
-    }
-  }
-
- private:
-  void Admit() {
-    if (get_allocator().memory() != nullptr) {
-      get_allocator().memory()->Grow(sizeof(*this));
-      counted_ = true;
-    }
-  }
-  bool counted_ = false;
-};
+// The per-flow limits by flow id (BP-6): a dense table of `capacity` slots
+// fixed at creation, each entry an immutable object published on its own
+// (one release store; the replaced object is retired after a grace period),
+// so the owner looks a flow up with one acquire load and a transaction
+// costs what it changes, never a copy of the table. The slot array is
+// admitted with the table (Bytes(capacity)); objects come from its slab,
+// whose chunks are admitted through set_memory_growth. Packet-path state
+// (D-206, class P), all DPDK memory.
+using PacketStoreLimitsTable = SlotTable<PacketStoreFlowId, PacketStoreLimits>;
 
 struct PacketStoreConfig {
   uint32_t max_packets = 4096;           // packets held, all flows (> 0)
@@ -238,14 +134,14 @@ class PacketStore {
 
   // The flow's timeout and cap: its entry in `limits` where the entry gives
   // them, the config otherwise. A cap of 0 in an entry is the config's cap,
-  // not "hold nothing"; a timeout of 0 is no expiry.
-  std::pair<uint64_t, uint32_t> LimitsFor(const PacketStoreLimitsMap &limits,
+  // not "hold nothing"; a timeout of 0 is no expiry. One acquire load.
+  std::pair<uint64_t, uint32_t> LimitsFor(const PacketStoreLimitsTable &limits,
                                           uint32_t flow_id) const {
-    auto it = limits.find(flow_id);
-    if (it == limits.end()) {
+    const PacketStoreLimits *found = limits.Lookup(PacketStoreFlowId(flow_id));
+    if (found == nullptr) {
       return {config_.timeout_ns, config_.max_packets_per_flow};
     }
-    const PacketStoreLimits &entry = it->second;
+    const PacketStoreLimits &entry = *found;
     const uint64_t timeout = entry.timeout_ns.value_or(config_.timeout_ns);
     uint32_t cap = config_.max_packets_per_flow;
     if (entry.max_packets_per_flow.value_or(0) != 0) {
@@ -263,7 +159,7 @@ class PacketStore {
   // receives.
   template <typename Evict>
   void Store(const PacketHandle *handles, const uint32_t *flow_ids, size_t n,
-             const PacketStoreLimitsMap &limits, uint64_t now_ns,
+             const PacketStoreLimitsTable &limits, uint64_t now_ns,
              Evict &&evict);
 
   // Hands every packet flow `flow_id` holds to `sink(PacketHandle)`, oldest
@@ -280,11 +176,11 @@ class PacketStore {
   size_t Clear();
 
   // Frees, in every flow, the packets older than the flow's timeout.
-  void ExpireAll(const PacketStoreLimitsMap &limits, uint64_t now_ns);
+  void ExpireAll(const PacketStoreLimitsTable &limits, uint64_t now_ns);
 
   // As ExpireAll, at a bounded cost: examines at most kExpireFlowsPerRun held
   // flows from where the last call stopped (a tick's sweep).
-  void ExpireBounded(const PacketStoreLimitsMap &limits, uint64_t now_ns);
+  void ExpireBounded(const PacketStoreLimitsTable &limits, uint64_t now_ns);
 
  private:
   static constexpr uint32_t kNone = UINT32_MAX;
@@ -360,7 +256,7 @@ class PacketStore {
 
 template <typename Evict>
 void PacketStore::Store(const PacketHandle *handles, const uint32_t *flow_ids,
-                        size_t n, const PacketStoreLimitsMap &limits,
+                        size_t n, const PacketStoreLimitsTable &limits,
                         uint64_t now_ns, Evict &&evict) {
   if (total_.load(std::memory_order_relaxed) >= config_.max_packets) {
     ExpireAll(limits, now_ns);
@@ -444,48 +340,41 @@ size_t PacketStore::Release(uint32_t flow_id, Sink &&sink) {
 
 // The flows table as a transactional resource (D-129, D-201): key
 // EncodeKey(uint32_t flow id), value PacketStoreLimits. Configuration, not
-// state the packet path changes: a transaction edits one private copy of the
-// owner's published table (cloned by its first Reserve) and its first Publish
-// swaps the copy in and retires the old table, so a transaction is one copy
-// and one grace period, and workers never pause. Erasing an id that has no
-// entry is a no-op, and an erase removes limits, never packets. The owner
-// keeps the RcuPtr (Initialize it before registering), declares the table
-// `.Rebuilds()` with requires_paused_workers false, and binds
-// MakePacketStoreFlowsCodec (framework/packet_store_codec.h) for the wire.
-// Memory (D-198): Bytes() is the resource object, admitted before it is
-// constructed (MemoryCost<PacketStoreFlowsResource>); the maps it builds
-// (the first empty one, each transaction's clone and every insert into it)
-// are admitted through `growth` before they are allocated and given back
-// when freed, a retired map when its grace period ends. A refusal throws
-// utils::MemoryRefused from Reserve, which refuses the transaction; the
-// published table is untouched. Detached at destruction: the owner resets
-// `published` after the resource, then releases its admission.
+// state the packet path changes: each operation publishes or empties its own
+// entry of the owner's PacketStoreLimitsTable (BP-6), the replaced object
+// retired after the transaction's grace period, so a transaction costs what
+// it changes and workers never pause. An upsert past the table's capacity
+// is refused; erasing an id that has no entry is a no-op, and an erase
+// removes limits, never packets. The owner keeps the table (it must outlive
+// the resource), declares the resource live (no `.Rebuilds()`) with
+// requires_paused_workers false, and binds MakePacketStoreFlowsCodec
+// (framework/packet_store_codec.h) for the wire. Memory (D-198): Bytes() is
+// the resource object, admitted before it is constructed
+// (MemoryCost<PacketStoreFlowsResource>); the table's slot array is the
+// owner's admission, and an upsert's object comes from the table's slab,
+// whose new chunk is admitted through the table's growth hook: a refusal
+// throws utils::MemoryRefused from Reserve, which refuses the transaction
+// with the table untouched.
 class PacketStoreFlowsResource final : public Resource {
  public:
-  // Publishes the first, empty table; `published` must be uninitialized.
-  // Throws what `growth` throws if that is refused.
-  PacketStoreFlowsResource(std::string name,
-                           rcu::RcuPtr<PacketStoreLimitsMap> &published,
-                           utils::MemoryGrowth *growth = nullptr);
-  ~PacketStoreFlowsResource() override;
+  PacketStoreFlowsResource(std::string name, PacketStoreLimitsTable &table)
+      : Resource(std::move(name)), table_(table) {}
 
   static size_t Bytes() noexcept { return sizeof(PacketStoreFlowsResource); }
   static size_t GlibcBytes() noexcept { return Bytes(); }
-  // Held now: Bytes() plus every map admitted and not yet freed.
-  size_t bytes() const noexcept { return Bytes() + memory_->held(); }
 
-  size_t LiveCount() const override;
+  size_t LiveCount() const override { return table_.size(); }
+  std::optional<uint64_t> Capacity() const override {
+    return table_.capacity();
+  }
   bool Contains(const ResourceKey &key) const override;
   std::expected<Reservation, std::string> Reserve(const Op &op) override;
-  void EndTransaction() noexcept override;
 
  private:
-  class SwapOp;
+  class PublishOp;
+  class EraseOp;
 
-  std::shared_ptr<PacketStoreMemory> memory_;
-  rcu::RcuPtr<PacketStoreLimitsMap> &published_;
-  std::unique_ptr<PacketStoreLimitsMap> staged_;
-  bool swapped_ = false;
+  PacketStoreLimitsTable &table_;
 };
 
 }  // namespace dataplane
