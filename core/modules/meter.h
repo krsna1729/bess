@@ -83,9 +83,14 @@ class Meter final : public Module {
 
   // The `get_status` action: read-only inspection of the meters' profiles and
   // token state. It takes no locks beyond each shared meter's own check lock,
-  // so it runs while workers keep metering (THREAD_SAFE).
+  // so it runs while workers keep metering (THREAD_SAFE). Without ids it
+  // returns one page, ascending from `start_id`, of at most `limit` (at most
+  // kStatusPage) meters, and the next page's `start_id` (0 after the last).
   CommandResponse CommandGetStatus(
       const bess::pb::MeterCommandGetStatusArg &arg);
+  // The largest get_status page: about 80 bytes a meter, far below the reply
+  // limit however many meters are configured.
+  static constexpr size_t kStatusPage = 1024;
 
   std::string GetDesc() const override;
 

@@ -1735,7 +1735,9 @@ message MeterArg {
  * while that worker is not running it).
  */
 message MeterCommandGetStatusArg {
-  repeated uint32 meter_ids = 1; /// Empty: every configured meter.
+  repeated uint32 meter_ids = 1; /// Empty: one page of the configured meters, by id.
+  uint32 start_id = 2; /// Without `meter_ids`: the lowest id the page may hold (0: from the first).
+  uint32 limit = 3;    /// Without `meter_ids`: the most meters in the page (0, or above 1024: 1024).
 }
 
 enum MeterBucketKind {
@@ -1764,6 +1766,7 @@ message MeterStatus {
 
 message MeterCommandGetStatusResponse {
   repeated MeterStatus meters = 1;
+  uint32 next_id = 2; /// The `start_id` of the next page; 0 when no meter follows this page.
 }
 
 /**

@@ -107,6 +107,17 @@ class MeterResource final : public dataplane::Resource {
     }
   }
 
+  // The same, from the first id at or above `first`, while `visit` returns
+  // true: a page costs its length, not the meters before it.
+  template <typename Visit>
+  void VisitPoliciesFrom(MeterId first, Visit &&visit) const {
+    for (auto it = policies_.lower_bound(first); it != policies_.end(); ++it) {
+      if (!retiring_.contains(it->first) && !visit(it->first, it->second)) {
+        return;
+      }
+    }
+  }
+
   // dataplane::Resource.
   size_t LiveCount() const override { return live_->size(); }
   bool Contains(const dataplane::ResourceKey &key) const override;

@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "framework/resource_codec.h"
 #include "metadata.h"
 #include "module.h"
 #include "modules/meter.h"
@@ -250,6 +251,69 @@ TEST(MeterStatusTest, RefusesAnErasedMeterBeforeTheCascade) {
   arg.add_meter_ids(1);
   CommandResponse response = h.Action(m, "get_status", arg);
   EXPECT_NE(0, response.error().code()) << "a retiring meter has no live status";
+}
+
+// MZ-5: with 100K meters, get_status without ids returns one page (at most
+// kStatusPage meters, a bounded reply) and where the next one starts; walking
+// the pages lists every meter once, in id order.
+TEST(MeterStatusTest, PagesTheConfiguredMeters) {
+  constexpr uint32_t kMeters = 100'000;
+  ModuleHarness h;
+  bess::pb::MeterArg meter_arg;
+  meter_arg.set_capacity(kMeters);
+  Meter *m = static_cast<Meter *>(h.Create("Meter", meter_arg, "mt"));
+  ASSERT_NE(nullptr, m);
+  const bess::framework::ResourceCodec *codec = h.Codec("mt/meters");
+  ASSERT_NE(nullptr, codec);
+  google::protobuf::Any packed_value;
+  ASSERT_TRUE(packed_value.PackFrom(SrTcmPolicy(1, 3000, 4000)));
+  const auto value = codec->Value(packed_value.type_url(), packed_value.value());
+  ASSERT_TRUE(value.has_value()) << value.error();
+  std::vector<bess::dataplane::Op> ops;
+  for (uint32_t id = 1; id <= kMeters; id++) {
+    google::protobuf::Any packed_key;
+    ASSERT_TRUE(packed_key.PackFrom(Key(id)));
+    auto key = codec->Key(packed_key.type_url(), packed_key.value());
+    ASSERT_TRUE(key.has_value()) << key.error();
+    ops.push_back(bess::dataplane::Op::Upsert("mt/meters", std::move(*key), *value));
+    if (ops.size() == 1000) {
+      ASSERT_EQ("", h.Apply(ops));
+      ops.clear();
+    }
+  }
+
+  auto page = [&](uint32_t start_id, uint32_t limit) {
+    bess::pb::MeterCommandGetStatusArg arg;
+    arg.set_start_id(start_id);
+    arg.set_limit(limit);
+    CommandResponse response = h.Action(m, "get_status", arg);
+    EXPECT_EQ(0, response.error().code()) << response.error().errmsg();
+    bess::pb::MeterCommandGetStatusResponse status;
+    EXPECT_TRUE(response.data().UnpackTo(&status));
+    return status;
+  };
+  const bess::pb::MeterCommandGetStatusResponse first = page(0, 0);
+  EXPECT_EQ(Meter::kStatusPage, static_cast<size_t>(first.meters_size()));
+  EXPECT_EQ(Meter::kStatusPage + 1, first.next_id());
+  EXPECT_LE(first.ByteSizeLong(), size_t{3} << 20);
+  const bess::pb::MeterCommandGetStatusResponse mid = page(5, 10);
+  ASSERT_EQ(10, mid.meters_size());
+  EXPECT_EQ(5u, mid.meters(0).meter_id());
+  EXPECT_EQ(15u, mid.next_id());
+
+  uint32_t next = 0, expected = 1;
+  size_t pages = 0;
+  do {
+    const bess::pb::MeterCommandGetStatusResponse status = page(next, 4096);  // clamped
+    ASSERT_LE(static_cast<size_t>(status.meters_size()), Meter::kStatusPage);
+    for (const bess::pb::MeterStatus &meter : status.meters()) {
+      ASSERT_EQ(expected++, meter.meter_id());
+    }
+    next = status.next_id();
+    pages++;
+  } while (next != 0 && pages <= kMeters);
+  EXPECT_EQ(kMeters + 1, expected);
+  EXPECT_EQ((kMeters + Meter::kStatusPage - 1) / Meter::kStatusPage, pages);
 }
 
 // The command's read path while the packet path updates the same shared
