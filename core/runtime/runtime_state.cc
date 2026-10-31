@@ -52,6 +52,14 @@ utils::MemoryGrowth *TransactionRefs() {
   return &growth;
 }
 
+// The RCU retirement queue grows with the largest transaction's retirements
+// and keeps its capacity: admitted as it grows, to the daemon's scope,
+// resource "rcu_retired" (D-207).
+utils::MemoryGrowth *RcuRetirements() {
+  static framework::ProcessGrowth growth("rcu_retired");  // outlives the domain
+  return &growth;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -226,6 +234,7 @@ RuntimeState::RuntimeState()
       rcu_(std::make_unique<rcu::RcuDomain>(Worker::kMaxWorkers)),
       transactions_(std::make_unique<dataplane::TransactionEngine>(
           *rcu_, TransactionRefs())) {
+  rcu_->set_memory_growth(RcuRetirements());
   builtin_metrics_ = metrics_.Register([this](stats::MetricWriter &w) {
     const rcu::RcuStats r = rcu_->Stats();
     w.Counter("bess_rcu_grace_periods_started_total", "Grace periods started", r.grace_periods_started);

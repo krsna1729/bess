@@ -1771,11 +1771,14 @@ TEST(TransactionEngineMemoryTest, ReferenceLedgerIsAdmittedExactly) {
     while (engine.ReclaimRetired() != 0) {
     }
     ASSERT_EQ(0u, engine.ReferenceCount("meters", EncodeKey(MeterId(kKeys))));
+    // Each node is charged the chunk malloc gave it, which is not the same
+    // for every node: a free chunk at most 16 bytes larger than the request
+    // is handed out whole (D-207: a 40-byte node's 48-byte chunk can be 64).
     const size_t nodes = held - growth.glibc_net;
     EXPECT_GT(growth.glibc_net, 0u) << "the bucket array stays";
-    EXPECT_EQ(nodes % kKeys, 0u) << "every node costs the same";
-    EXPECT_EQ((nodes / kKeys) % 16, 0u) << "a node is a whole malloc chunk";
-    EXPECT_GT(nodes, 0u) << "the nodes went with their references";
+    EXPECT_EQ(nodes % 16, 0u) << "nodes are whole malloc chunks";
+    EXPECT_GE(nodes, kKeys * utils::kMallocSmallestChunk)
+        << "the nodes went with their references";
     domain.Drain();
   }
   EXPECT_EQ(0u, growth.net) << "the engine gave its ledger back";

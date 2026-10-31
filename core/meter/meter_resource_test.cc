@@ -454,24 +454,13 @@ TEST_F(MeterResourceTest, RemovalStageCompletesAtTheLimit) {
   EXPECT_TRUE(engine_.Unregister("cnt/counters"));
 }
 
-// The policies as written and the retiring ids are control-plane state no
-// worker reads (D-206, class C): glibc, every node admitted exactly as
+// The retiring ids and each meter's control block are control-plane state
+// no worker reads (D-206, class C): glibc, every node admitted exactly as
 // malloc's chunk (utils::MallocChunkBytes) through the owner's lease, and
-// given back when the meter goes.
-TEST_F(MeterResourceTest, PolicyNodesAreAdmittedExactly) {
-  // What one policy node and one meter state's control block take, under
-  // the same allocators.
-  size_t policy_node = 0;
-  {
-    CountingGrowth probe;
-    std::map<MeterId, MeterProfileSpec, std::less<MeterId>,
-             utils::AdmittedGlibcAllocator<
-                 std::pair<const MeterId, MeterProfileSpec>>>
-        one{utils::AdmittedGlibcAllocator<
-            std::pair<const MeterId, MeterProfileSpec>>(&probe)};
-    one.emplace(MeterId(1), TrTcm(500));
-    policy_node = probe.glibc_grown;
-  }
+// given back when the meter goes. The policies as written cost nothing of
+// their own (D-207): read-back takes them from the interned profiles.
+TEST_F(MeterResourceTest, ControlNodesAreAdmittedExactly) {
+  // What one meter state's control block takes, under the same allocators.
   size_t state_block = 0;
   {
     CountingGrowth probe;
@@ -482,7 +471,6 @@ TEST_F(MeterResourceTest, PolicyNodesAreAdmittedExactly) {
     ASSERT_TRUE(builder.Add(MeterId(2), TrTcm(500), MeterSharing::kShared));
     state_block = probe.glibc_grown - first;
   }
-  ASSERT_GE(policy_node, utils::kMallocSmallestChunk);
   ASSERT_GE(state_block, utils::kMallocSmallestChunk);
 
   ASSERT_EQ(Apply({Upsert(1, TrTcm(500))}).outcome, Outcome::kApplied);
@@ -493,8 +481,7 @@ TEST_F(MeterResourceTest, PolicyNodesAreAdmittedExactly) {
   Install(2, 1 + kMeters, TrTcm(500));
   while (engine_.ReclaimRetired() != 0) {
   }
-  EXPECT_EQ(growth_.glibc_net() - before,
-            kMeters * (policy_node + state_block));
+  EXPECT_EQ(growth_.glibc_net() - before, kMeters * state_block);
   EXPECT_EQ(resource_->bytes(), growth_.grown - growth_.shrunk);
 
   std::vector<Op> erases;

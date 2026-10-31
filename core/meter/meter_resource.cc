@@ -52,9 +52,7 @@ MeterResource::MeterResource(std::string name, size_t capacity,
       control_growth_(lease, &held_),
       published_(published),
       live_(std::make_unique<MeterSetBuilder>(capacity)),
-      retiring_(ControlAllocator<MeterId>(&control_growth_)),
-      policies_(Policies::allocator_type(&control_growth_)),
-      staged_policies_(Policies::allocator_type(&control_growth_)) {
+      retiring_(ControlAllocator<MeterId>(&control_growth_)) {
   live_->set_memory_growth(&growth_);
   published_.Initialize(live_->Build());
 }
@@ -114,7 +112,6 @@ MeterResource::Reserve(const dataplane::Op &op) {
 
   // Everything fallible happens on the private builder. Prepare builds one
   // generation for all operations after their validation has succeeded.
-  // staged_policies_ holds this transaction's upserts only.
   BeginTransaction();
   const bool existed = staged_->Contains(id);
   auto applied = existed ? staged_->Reconfigure(id, *policy)
@@ -122,7 +119,6 @@ MeterResource::Reserve(const dataplane::Op &op) {
   if (!applied) {
     return std::unexpected(MeterErrorName(applied.error()));
   }
-  staged_policies_.insert_or_assign(id, *policy);
   // Publishing replaces the generation that is live now.
   Reservation reservation{std::make_unique<UpsertOp>(*this),
                           {}, Footprint{.retires = 1}, live_->Contains(id), {}};
@@ -146,19 +142,12 @@ std::expected<void, std::string> MeterResource::Prepare() {
 void MeterResource::EndTransaction() noexcept {
   staged_generation_.reset();
   staged_.reset();
-  staged_policies_.clear();
   published_staged_ = false;
 }
 
 void MeterResource::PublishStaged(dataplane::Retirer &retirer) {
   if (!published_staged_) {
     live_.swap(staged_);
-    // The upserts' nodes move over; the policies they replace are
-    // overwritten in place. Neither allocates.
-    policies_.merge(staged_policies_);
-    for (auto &[id, policy] : staged_policies_) {
-      policies_.find(id)->second = policy;
-    }
     retirer.Retire(published_.Exchange(std::move(staged_generation_)));
     published_staged_ = true;
   }
@@ -202,7 +191,6 @@ void MeterResource::Unpublish(MeterId id, bool &prepaid,
   }
   settle();
   retiring_.erase(id);
-  policies_.erase(id);
   later.Retire(published_.Exchange(std::move(generation)));
 }
 

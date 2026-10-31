@@ -5,10 +5,12 @@
 #include <atomic>
 #include <cerrno>
 #include <memory>
+#include <new>
 #include <thread>
 #include <vector>
 
 #include "rcu/rcu_domain.h"
+#include "utils/dpdk_memory.h"
 
 namespace {
 
@@ -348,6 +350,39 @@ TEST_F(RcuDomainTest, RetirementQueueIsBounded) {
   EXPECT_EQ(0, Tracked::alive);
 
   bounded.Unregister(id);
+}
+
+// D-207: the queue's growth is admitted before ReserveRetirements makes it,
+// and a refused growth leaves the queue as it was.
+TEST_F(RcuDomainTest, RetirementQueueGrowthIsAdmitted) {
+  struct Ledger final : bess::utils::MemoryGrowth {
+    size_t bytes = 0, glibc = 0;
+    bool refuse = false;
+    void Grow(size_t b, size_t g) override {
+      if (refuse) {
+        throw std::bad_alloc();
+      }
+      bytes += b;
+      glibc += g;
+    }
+    void Shrink(size_t b, size_t g) noexcept override {
+      bytes -= b;
+      glibc -= g;
+    }
+  } ledger;
+  domain_->set_memory_growth(&ledger);
+  domain_->ReserveRetirements(100);
+  EXPECT_GE(ledger.bytes, size_t{100} * 4 * sizeof(void *));
+  EXPECT_EQ(ledger.glibc, ledger.bytes);
+  const size_t admitted = ledger.bytes;
+  domain_->ReserveRetirements(50);  // within the capacity: nothing more
+  EXPECT_EQ(ledger.bytes, admitted);
+  ledger.refuse = true;
+  EXPECT_THROW(domain_->ReserveRetirements(1000), std::bad_alloc);
+  ledger.refuse = false;
+  domain_->ReserveRetirements(1000);
+  EXPECT_GT(ledger.bytes, admitted);
+  domain_->set_memory_growth(nullptr);
 }
 
 // Teardown invariant: a domain must not disappear while readers are registered.

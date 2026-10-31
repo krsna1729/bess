@@ -264,7 +264,7 @@ inline size_t MallocBytes(void *p) noexcept {
 //
 // Future work (D-206, "Class C on the framework allocator"): route these
 // containers (UPF F-TEID mirror and session mirrors, MeterResource
-// policies_/retiring_, the transaction engine's incoming references)
+// retiring_, the transaction engine's incoming references)
 // through the framework's DPDK allocator too, so placement is uniform.
 // Preconditions: (1) fixed-size node
 // pools carved from framework chunks (as ObjectSlab), since one rte_malloc

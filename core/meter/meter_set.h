@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <map>
 #include <memory>
 #include <span>
@@ -325,6 +326,11 @@ class MeterSetBuilder {
   std::expected<void, MeterError> Erase(MeterId id);
 
   bool Contains(MeterId id) const noexcept { return Find(id) != nullptr; }
+  // Calls visit(id, spec) for every meter, in id order, with the
+  // specification as written (the meter's interned profile keeps it, so a
+  // read-back needs no copy of its own, D-207). Control path.
+  void VisitSpecs(
+      const std::function<void(MeterId, const MeterProfileSpec &)> &visit) const;
   size_t size() const noexcept { return size_; }
   size_t capacity() const noexcept { return capacity_; }
 
