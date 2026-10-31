@@ -122,11 +122,17 @@ auto CreateOnPolicy(int socket, size_t bytes, Create create) {
     utils::AdmitNormalMemory(bytes);
   }
   socket = utils::PlacementSocket(socket, bytes);
+  // Under the heap lock: the structure may land on "bess-normal"
+  // (utils::HeapGuard).
+  auto guarded = [&create](int on) {
+    const utils::HeapGuard guard;
+    return create(on);
+  };
   rte_errno = 0;
-  auto *made = create(socket);
+  auto *made = guarded(socket);
   if (made == nullptr && rte_errno == ENOMEM) {
     socket = utils::FallbackSocket(bytes);
-    made = create(socket);
+    made = guarded(socket);
   }
   if (made != nullptr) {
     utils::NotePlacement(bytes, socket);
