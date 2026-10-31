@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // SharedNat (TP6, D-079): the NAT every worker translates through.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -374,6 +375,65 @@ void RunGrowth(bool expire) {
 
 TEST(SharedNatTest, GrowsUnderTrafficWithoutLosingAMapping) { RunGrowth(false); }
 TEST(SharedNatTest, GrowsWhileExpiringAndStaysConsistent) { RunGrowth(true); }
+
+// SharedBindings whose lock records the most bindings one hold of the NAT's
+// lock folded (UsageOf is read by the growth fold only, here).
+struct HoldCountingStore : SharedStore<> {
+  static inline size_t folded = 0, max_folded = 0;
+  static std::pair<uint64_t, uint64_t> UsageOf(const BindingType &b) noexcept {
+    folded++;
+    return SharedStore<>::UsageOf(b);
+  }
+  struct Lock : SharedStore<>::Lock {
+    void Acquire() noexcept {
+      SharedStore<>::Lock::Acquire();
+      folded = 0;
+    }
+    bool TryAcquire() noexcept {
+      if (!SharedStore<>::Lock::TryAcquire()) {
+        return false;
+      }
+      folded = 0;
+      return true;
+    }
+    void Release() noexcept {
+      max_folded = std::max(max_folded, folded);
+      SharedStore<>::Lock::Release();
+    }
+  };
+};
+using HoldCountingNat = BasicNat<HoldCountingStore>;
+
+// FM-1: growing 2^16 -> 2^17 with 48K live bindings folds them in windows of
+// kGrowChunk slots, so no hold of the lock (which workers creating a binding
+// spin on) folds more than kGrowChunk bindings.
+TEST(SharedNatTest, GrowFoldsAtMostOneChunkPerLockHold) {
+  rcu::RcuDomain domain(2);
+  ASSERT_TRUE(domain.Register(1).has_value());
+  domain.Online(1);
+  auto config = Config<HoldCountingNat>(&domain, size_t{1} << 16);
+  config.max_capacity = size_t{1} << 17;
+  config.timeout = ~uint64_t{0} / 4;
+  auto nat = HoldCountingNat::Create(config).value();
+  constexpr size_t kLive = 48 * 1024;
+  for (size_t i = 0; i < kLive && !HasFailure(); i++) {
+    auto f = Udp(0x0a000000u + static_cast<uint32_t>(i / 50),
+                 static_cast<uint16_t>(3000 + i % 50), kRemote, 53);
+    ParsedFrame p;
+    EXPECT_EQ(ParseStatus::kOk, ParseFrame(f, p));
+    EXPECT_EQ(Verdict::kTranslated, nat->Translate(f, p, Direction::kForward, 1));
+    domain.Quiescent(1);
+  }
+  domain.Offline(1);  // Grow waits for a grace period
+  EXPECT_EQ(kLive, nat->size());
+  HoldCountingStore::max_folded = 0;
+  ASSERT_TRUE(nat->Grow(size_t{1} << 17));
+  EXPECT_EQ(kLive, nat->size());
+  EXPECT_LE(HoldCountingStore::max_folded, HoldCountingNat::kGrowChunk);
+  EXPECT_GT(HoldCountingStore::max_folded, 0u);
+  nat.reset();
+  domain.Unregister(1);
+}
 
 }  // namespace
 }  // namespace bess::nat
