@@ -375,7 +375,10 @@ and `modules`: what each module admitted before it allocated, by resource
 (`module`, `resource`, `admitted_bytes`, split by where it landed into
 `hugepage_bytes`, `normal_bytes` and `glibc_bytes`, and `current_bytes`, what
 the objects hold now; the daemon's packet pool is module `bessd`, resource
-`packet_pool`). A creation or transaction that needs more than
+`packet_pool`), their sum (`admitted_bytes`), the working set nothing admits
+(`baseline_bytes`: binary, libraries, EAL, gRPC, measured when the control
+server starts) and what `used_bytes` holds beyond both (`unattributed_bytes`,
+D-207). A creation or transaction that needs more than
 `available_bytes` of normal pages, or more hugepages than the cap leaves when
 normal pages are forbidden, is refused with `RESOURCE_EXHAUSTED` (errno
 `ENOMEM`),
