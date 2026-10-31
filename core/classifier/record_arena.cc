@@ -2,6 +2,7 @@
 
 #include "classifier/record_arena.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "utils/logging.h"
@@ -100,8 +101,12 @@ void RecordArena::Abort(Id id) noexcept {
 void RecordArena::ReserveRetirement(size_t count) {
   // Count outstanding reservations too: two transactions may each reserve one
   // slot before either Retire() enqueues, and the queue must grow once.
-  const size_t pending = retiring_.size() + retirement_reserved_;
-  retiring_.reserve(pending + count);
+  const size_t needed = retiring_.size() + retirement_reserved_ + count;
+  // Geometric, like RcuDomain::ReserveRetirements: reserving one at a time
+  // must not copy the queue on every call.
+  if (needed > retiring_.capacity()) {
+    retiring_.reserve(std::max(needed, 2 * retiring_.capacity()));
+  }
   retirement_reserved_ += count;
 }
 
@@ -112,6 +117,11 @@ void RecordArena::CancelRetirement(size_t count) noexcept {
 
 void RecordArena::Retire(Id id) {
   if (id != 0) {
+    // An erase-only workload never calls Allocate(); reclaim here too so the
+    // queue stays bounded. It frees only ids whose grace period completed,
+    // exactly as Allocate() does, and never allocates (erase/clear keep the
+    // capacity a reservation promised).
+    Reclaim();
     if (retirement_reserved_ > 0) {
       retirement_reserved_--;
     }

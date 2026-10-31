@@ -96,6 +96,27 @@ TEST(RecordArenaTest, RetiredIdWaitsForOnlineReaders) {
   EXPECT_NE(0u, c);
 }
 
+// A teardown only retires: Allocate() never runs, so Retire() itself must
+// reclaim, or the queue grows to every id ever erased (and, reserved one
+// slot at a time, was copied on every reservation).
+TEST(RecordArenaTest, EraseOnlyWorkloadKeepsRetiringBounded) {
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  RecordArena arena(sizeof(Bytes), domain);
+  constexpr size_t kRecords = 4096;
+  std::vector<RecordArena::Id> ids;
+  for (size_t i = 0; i < kRecords; i++) {
+    ids.push_back(arena.Allocate());
+    ASSERT_NE(0u, ids.back());
+  }
+  // No reader is online, so every grace period is complete at once.
+  for (const RecordArena::Id id : ids) {
+    arena.ReserveRetirement(1);
+    arena.Retire(id);
+    ASSERT_LE(arena.retiring(), 1u) << "completed retirements must be freed";
+  }
+  EXPECT_LE(arena.in_use(), 1u);
+}
+
 TEST(RecordArenaTest, CrossesChunks) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   RecordArena arena(sizeof(Bytes), domain);
