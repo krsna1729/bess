@@ -559,9 +559,12 @@ reference to something missing.
   published generation without pausing workers (it is `THREAD_SAFE`). For each
   configured meter it returns the profile, the sharing mode, the TSC of the
   last update, and the committed and excess/peak buckets with their current
-  tokens and limits. It takes no new lock and adds no write, atomic or
-  reference count to the packet path: a shared meter is read under the same
-  spinlock its check takes, so the pair of buckets is a coherent snapshot.
+  tokens and limits. Without `meter_ids` it returns one page in id order: at
+  most `limit` meters (at most 1024) from `start_id`, and `next_id`, the next
+  page's `start_id` (0 after the last page). It takes no new lock and adds no
+  write, atomic or reference count to the packet path: a shared meter is read
+  under the same spinlock its check takes, so the pair of buckets is a
+  coherent snapshot.
   The reading is per meter state, never a module-wide total; a
   worker-exclusive meter's tokens belong to its owner and are only coherent
   when that worker is not running the meter (the core

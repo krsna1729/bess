@@ -2,6 +2,7 @@
 
 #include "meter.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -348,8 +349,19 @@ CommandResponse Meter::CommandGetStatus(
     // The control side's committed set, which is what the resource read-back
     // (GetPipeline) shows. A retiring meter is already absent there even
     // though packets may still resolve its id until the removal cascade.
-    meters_->VisitPolicies(
-        [&](meter::MeterId id, const meter::MeterProfileSpec &) { append(id); });
+    // One page: a reply for every meter would outgrow the reply limit.
+    const size_t limit =
+        arg.limit() == 0 ? kStatusPage : std::min<size_t>(arg.limit(), kStatusPage);
+    meters_->VisitPoliciesFrom(
+        meter::MeterId(arg.start_id()),
+        [&](meter::MeterId id, const meter::MeterProfileSpec &) {
+          if (static_cast<size_t>(response.meters_size()) == limit) {
+            response.set_next_id(id.value());
+            return false;
+          }
+          append(id);
+          return true;
+        });
   } else {
     for (uint32_t raw : arg.meter_ids()) {
       if (raw == 0) {
