@@ -7,6 +7,8 @@
 #include <tuple>
 #include <unordered_map>
 
+#include "runtime/malloc_policy.h"
+
 namespace bess::framework {
 
 namespace detail {
@@ -80,8 +82,10 @@ void OnPlacementMoved(uint64_t ticket, size_t bytes,
 // hugepage-counted first: when an owner releases less than it holds and
 // admitted under both backings, freeing cap room it did not use is the error
 // that heals (DPDK's --socket-limit still bounds the heap), keeping cap room
-// it no longer uses is the one that refuses tables forever.
+// it no longer uses is the one that refuses tables forever. What it takes is
+// noted for the maintenance loop's trim (runtime/malloc_policy.h).
 void Take(Placed *placed, size_t bytes, size_t glibc_bytes) {
+  const size_t held = placed->total();
   glibc_bytes = std::min({glibc_bytes, bytes, placed->glibc});
   placed->glibc -= glibc_bytes;
   bytes -= glibc_bytes;
@@ -92,6 +96,7 @@ void Take(Placed *placed, size_t bytes, size_t glibc_bytes) {
   const size_t from_normal = std::min(placed->normal, bytes);
   placed->normal -= from_normal;
   placed->glibc -= std::min(placed->glibc, bytes - from_normal);
+  runtime::NoteReleasedBytes(held - placed->total());
 }
 
 // Records what AdmitTable(bytes, glibc_bytes) admitted with `backing`, and
@@ -174,6 +179,7 @@ void MemoryLease::reset() noexcept {
       utils::ReleaseTable(utils::TableBacking::kHugepages,
                           node_->placed.hugepage);
       Tickets().erase(node_->ticket);
+      runtime::NoteReleasedBytes(node_->placed.total());
     }
   }
   delete node_;
@@ -193,6 +199,7 @@ MemoryScope::~MemoryScope() {
     utils::ReleaseTable(utils::TableBacking::kHugepages,
                         entry->placed.hugepage);
     Tickets().erase(entry->ticket);
+    runtime::NoteReleasedBytes(entry->placed.total());
     // A lease that outlives its scope (not reachable from a module: the
     // scope is a Module member, its leases the subclass's) releases nothing
     // later.
@@ -200,6 +207,7 @@ MemoryScope::~MemoryScope() {
       utils::ReleaseTable(utils::TableBacking::kHugepages,
                           node->placed.hugepage);
       Tickets().erase(node->ticket);
+      runtime::NoteReleasedBytes(node->placed.total());
       node->scope = nullptr;
       node->siblings = nullptr;
       node->placed = {};
