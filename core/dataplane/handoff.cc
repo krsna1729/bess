@@ -37,7 +37,15 @@ void *DpdkAllocateBlock(size_t bytes, size_t align, int socket,
   } catch (const std::bad_alloc &) {
     return nullptr;
   }
-  const rte_memseg *segment = rte_mem_virt2memseg(block, nullptr);
+  // "bess-normal" (D-206; every block under --no-huge, BP-3) is labelled
+  // with a heap id, not a node: its pages follow bessd's memory node, as
+  // they are first touched under its MPOL_PREFERRED policy (D-123).
+  const rte_memseg_list *msl = rte_mem_virt2memseg_list(block);
+  if (msl != nullptr && msl->external) {
+    *placed = bess::utils::MemoryNode();
+    return block;
+  }
+  const rte_memseg *segment = rte_mem_virt2memseg(block, msl);
   *placed = segment != nullptr ? segment->socket_id : -1;
   return block;
 }

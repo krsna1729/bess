@@ -9,6 +9,7 @@
 #include <rte_malloc.h>
 
 #include "dpdk.h"
+#include "utils/dpdk_memory.h"
 #include "utils/logging.h"
 
 namespace bess::meter {
@@ -248,6 +249,8 @@ MeterStateSnapshot MeterState::Inspect() const noexcept {
 
 std::expected<MeterStatePtr, MeterError> MeterState::Create(
     const MeterProfile &profile, MeterSharing sharing, int socket) {
+  // Under the heap lock: `socket` may be "bess-normal" (utils::HeapGuard).
+  const utils::HeapGuard guard;
   void *memory = rte_malloc_socket("bess_meter_state", sizeof(MeterState),
                                    alignof(MeterState), socket);
   if (memory == nullptr && socket != SOCKET_ID_ANY) {

@@ -361,8 +361,30 @@ MemoryStatus GetMemoryStatus();
 //
 // Initializes DPDK first if nothing has yet (tests, benchmarks).
 void *DpdkAllocate(size_t bytes, size_t align, int socket = MemoryNode());
-// rte_free, for the native and the fallback heap alike.
+// rte_free, for the native and the fallback heap alike; on "bess-normal"
+// the whole pages inside the block go back to the kernel (BP-3).
 void DpdkFree(void *p) noexcept;
+
+// BESS's DPDK heap lock (BP-3). DpdkFree gives a freed "bess-normal" block's
+// pages back after rte_free, so every allocation that can reach that heap
+// holds this around the call: DpdkAllocate's own, and a DPDK library create
+// placed there (PlacementSocket, FallbackSocket). Recursive. Never call
+// PlacementSocket, FallbackSocket or DpdkAllocate's growth path (which takes
+// the fallback heap's mutex first) while holding one.
+class HeapGuard {
+ public:
+  HeapGuard();
+  ~HeapGuard();
+  HeapGuard(const HeapGuard &) = delete;
+  HeapGuard &operator=(const HeapGuard &) = delete;
+};
+
+namespace detail {
+// HeapGuards taken, and those taken while a DpdkFree gave pages back (0
+// unless the lock is broken), since start.
+uint64_t HeapGuards() noexcept;
+uint64_t HeapGuardOverlaps() noexcept;
+}  // namespace detail
 
 template <typename T>
 struct DpdkDelete {
