@@ -14406,3 +14406,88 @@ stays exact.
 **Revisit when:** framework node pools exist (move the remaining P node containers and, with a hot/cold tag, class
 C -- see the note in `core/utils/dpdk_memory.h`), DPDK's defer queue takes a socket, or the deps can be rebuilt
 for the `malloc_heap_alloc` populate patch (then `UnfaultedHeapBytes` goes).
+
+## D-207 A strict memory budget: every byte admitted, refused, or reported
+
+**Status:** proposed (2026-10-31). Builds on D-198 and D-206; carries RT-1 (`fix/bp1-glibc-arenas`, glibc arena
+cap) as its first commit.
+**Code:** `core/utils/dpdk_memory.{h,cc}`, `core/dataplane/{resource.h,transaction_engine.{h,cc}}`,
+`core/control/{dataplane_transactions.{h,cc},api_v2.{h,cc}}`, `core/api_server.cc`,
+`core/meter/{meter_resource.{h,cc},meter_set.{h,cc}}`, `core/rcu/rcu_domain.{h,cc}`, `core/runtime/runtime_state.cc`,
+`protobuf/control_v2.proto` (and the generated SDKs), `tests/live/strict_budget_test.cc`; tests beside each.
+
+**Problem.** D-206 placed and admitted dataplane memory, but a daemon whose only limit is its cgroup (a Kubernetes
+pod: `memory.max`, no swap, no `--mem_limit_mb`) could still get stuck at its budget or quietly go past it:
+- **Erasing at the limit.** An erase allocates before it frees: its record, its removal stage's prepay, room in the
+  retirement queue. A full daemon refused the very erases that would have emptied it.
+- **Removal stages.** The erase's `Reserve` prepays the stage's edit. On normal pages, though, `DpdkAllocate` checked
+  each allocation against the limit again, so a meter stage at the limit was refused and retried every grace period
+  until usage dropped (the open item from the RefusedEraseRollback fix to D-198/D-199).
+- **Memory nobody accounted for.**
+  - The transaction window kept every operation's result and the request id twice.
+  - The RCU retirement queue and the reference ledger's keys longer than 15 bytes went unadmitted.
+  - The meter resource kept a second copy of every policy.
+  - glibc gave each control thread its own arena, and each arena kept what had been freed in it. The live test
+    below hit its first refusal at 740K rules with 265 MiB of its 512 MiB cgroup unattributed: `mallinfo2` showed
+    264.5 MiB free across about 21 arenas and only 6 MiB in use.
+- **Nothing reported the gap.** Status gave `used_bytes` and each module's admitted bytes, but not the difference.
+
+**Decision.**
+- **One headroom scope.** `utils::Headroom` is a thread-local level read by `AdmitNormalMemory` and the hugepage
+  heap's growth validator. A scope only ever raises the level, and restores the one it found.
+  - `kErase`: admit against the limit less *half* the reserve. Set by `TransactionEngine::ApplyImpl` and around the
+    record charge in `DataplaneTransactions::Apply` when every operation is an erase, so a daemon at its limit can
+    always be emptied.
+  - `kPrepaid`: not checked at all. Set by `ReclaimRetiredLocked` around each removal stage (and the retirement room
+    that stage reserves). The stage spends what its erase admitted in `Reserve`, so the meter stage completes at the
+    limit. The fallback heap grows by only what a prepaid allocation needs. A stage can still fail on an exhausted
+    heap; the retry-without-replay path of D-198 stays. The contract is written on `Retirer::RemoveLater`.
+  - This replaces the draft's separate erase-headroom flag: the erase case and the removal stage are now two levels
+    of the same scope.
+- **glibc retention.**
+  - RT-1 caps glibc at 2 arenas (`mallopt(M_ARENA_MAX, 2)` before any thread exists).
+  - RT-1's maintenance loop trims (`malloc_trim(0)`) once 64 MiB of admitted bytes have been released.
+  - Here, `AdmitNormalMemory` also trims and measures again before it refuses (`runtime::TrimAfterRelease(0)`). Free
+    memory glibc still holds therefore never refuses an admission, and only a would-be refusal pays for the trim.
+- **Compact records, a bounded window.**
+  - A record keeps only the results that differ from its common one, with their positions, and holds the id only as
+    the map key. Get and replay rebuild the full record byte for byte.
+  - The window holds at most `kMaxRecords` (4096) records and `kMaxRecordBytes` (4 MiB, `bessd/transaction_records`).
+  - The request digest is FNV-1a computed while the request is serialized, so the request is no longer copied.
+- **The rest is admitted, or no longer kept.**
+  - The RCU retirement queue's growth is admitted to `bessd/rcu_retired`.
+  - A ledger key is a `LedgerKey`: up to 15 bytes inline, longer keys in a separately admitted block. A node is now
+    a 48-byte chunk where it was 64.
+  - Meter read-back walks the live builder (`MeterSetBuilder::VisitSpecs`), so `policies_`/`staged_policies_` are
+    gone.
+- **Reported.** `MemoryStatus` gains three fields:
+  - `admitted_bytes`: the sum of every module's admitted bytes.
+  - `baseline_bytes`: the working set nothing admitted, recorded once when the control server starts.
+  - `unattributed_bytes` (signed): `used_bytes` less the baseline and the admitted bytes it holds.
+- **Requests bounded.** Under a limit, the largest request accepted is `min(64 MiB, reserve / 8)`, because a request
+  is parsed and decoded unadmitted, at several times its wire size. The server also gets a gRPC resource quota of a
+  quarter of the reserve.
+
+**Measured** (`live_strict_budget`: a 512 MiB cgroup with a 128 MiB reserve, normal pages, ExactMatch loaded in
+20K-rule transactions until refused, then a 20K erase and a small load):
+
+| | rules at refusal | used | admitted | baseline | unattributed | glibc free (`mallinfo2`) |
+|---|---|---|---|---|---|---|
+| without RT-1 and the trim | 740K | 357 MiB | 64 MiB | 28 MiB | 265 MiB | 264.5 MiB in ~21 arenas |
+| D-207 | 2.98M | 287 MiB | 208 MiB | 27 MiB | 52 MiB | 35 MiB in 2 arenas |
+
+What D-207 leaves free in glibc is the high water of the transactions after the refusal's trim. The test bounds the
+unattributed bytes at half the reserve (64 MiB); `oom` and `oom_kill` stay 0.
+
+**Consequences.**
+- A daemon at its limit can always be emptied.
+- A removal stage at the limit completes instead of being retried every grace period.
+- Free memory glibc holds no longer causes refusals.
+- `unattributed_bytes` makes the remaining gap visible to operators.
+- Removal stages run unchecked: one that allocates more than its erase prepaid goes past the limit by that much. The
+  meter stage `CHECK`s its prepay (`Growth::Grow`).
+- With 2 arenas, concurrent control threads contend for malloc's locks (RT-1).
+
+**Revisit when:** the gRPC quota's coverage of receive buffers is measured (no test yet); unadmitted transaction
+transients (the decoded request, about 18 MiB per 20K-op transaction) are worth admitting; or DPDK's
+`malloc_heap_alloc` populate patch (D-206) lands.
