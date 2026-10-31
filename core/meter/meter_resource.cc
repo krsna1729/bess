@@ -2,6 +2,7 @@
 
 #include "meter/meter_resource.h"
 
+#include <algorithm>
 #include <any>
 #include <utility>
 
@@ -24,12 +25,7 @@ class MeterResource::EraseOp final : public dataplane::StagedOp {
  public:
   EraseOp(MeterResource &owner, MeterId id) : owner_(owner), id_(id) {}
   void Publish(dataplane::Retirer &retirer) noexcept override {
-    // The stage runs one grace period after this publish: by then no reader
-    // can still obtain the id from a referrer's old value.
-    retirer.RemoveLater([&owner = owner_, id = id_, prepaid = true](
-                            dataplane::Retirer &later) mutable {
-      owner.Unpublish(id, prepaid, later);
-    });
+    owner_.PublishErases(retirer);
   }
   // The reservation marked the meter as retiring and prepaid its removal
   // stage; a transaction that will not publish puts both back.
@@ -52,9 +48,11 @@ MeterResource::MeterResource(std::string name, size_t capacity,
       control_growth_(lease, &held_),
       published_(published),
       live_(std::make_unique<MeterSetBuilder>(capacity)),
-      retiring_(ControlAllocator<MeterId>(&control_growth_)) {
+      retiring_(ControlAllocator<MeterId>(&control_growth_)),
+      erasing_(ControlAllocator<MeterId>(&control_growth_)) {
   live_->set_memory_growth(&growth_);
   published_.Initialize(live_->Build());
+  generations_ = 1;
 }
 
 MeterResource::~MeterResource() = default;
@@ -83,17 +81,26 @@ MeterResource::Reserve(const dataplane::Op &op) {
     // hand a reader this id, and a simultaneous upsert of another meter must
     // not make it disappear early. The cascade's edit without it (one id's
     // path, MeterSet::Bytes) is admitted now: a removal stage cannot refuse,
-    // so a refusal refuses this erase.
+    // so a refusal refuses this erase. The transaction's erases share one
+    // removal step, declared by the first.
     auto erase = std::make_unique<EraseOp>(*this, id);
     PrepayErase();
     try {
-      retiring_.insert(id);
+      erasing_.push_back(id);
     } catch (...) {
       RefundErase();
       throw;
     }
-    Reservation reservation{std::move(erase), {}, Footprint{.removals = 1},
-                            true, {}};
+    try {
+      retiring_.insert(id);
+    } catch (...) {
+      erasing_.pop_back();
+      RefundErase();
+      throw;
+    }
+    const uint32_t steps = erasing_.size() == 1 ? 1 : 0;
+    Reservation reservation{
+        std::move(erase), {}, Footprint{.removals = steps}, true, {}};
     return reservation;
   }
 
@@ -143,29 +150,46 @@ void MeterResource::EndTransaction() noexcept {
   staged_generation_.reset();
   staged_.reset();
   published_staged_ = false;
+  ErasedIds(erasing_.get_allocator()).swap(erasing_);  // nothing kept admitted
 }
 
 void MeterResource::PublishStaged(dataplane::Retirer &retirer) {
   if (!published_staged_) {
     live_.swap(staged_);
     retirer.Retire(published_.Exchange(std::move(staged_generation_)));
+    generations_++;
     published_staged_ = true;
   }
 }
 
-void MeterResource::Unpublish(MeterId id, bool &prepaid,
+void MeterResource::PublishErases(dataplane::Retirer &retirer) noexcept {
+  if (erasing_.empty()) {
+    return;
+  }
+  // The step runs one grace period after this publish: by then no reader can
+  // still obtain an id from a referrer's old value.
+  retirer.RemoveLater([&owner = *this, ids = std::move(erasing_),
+                       prepaid = true](dataplane::Retirer &later) mutable {
+    owner.Unpublish(ids, prepaid, later);
+  });
+  erasing_.clear();
+}
+
+void MeterResource::Unpublish(const ErasedIds &ids, bool &prepaid,
                               dataplane::Retirer &later) {
+  const size_t prepay = MeterSet::Bytes(live_->capacity()) * ids.size();
   if (!prepaid) {
-    PrepayErase();  // a retry: the refused attempt gave its prepay back
+    growth_.Prepay(prepay);  // a retry: the refused attempt gave it back
     prepaid = true;
   }
-  if (!retiring_.contains(id)) {
-    RefundErase();
-    return;  // re-added: the published generation is already the new meter
+  if (std::none_of(ids.begin(), ids.end(),
+                   [&](MeterId id) { return retiring_.contains(id); })) {
+    growth_.Refund(prepay);
+    return;  // all re-added: the published generation has the new meters
   }
 
-  // The edit is paid from this erase's prepay (Growth::Grow), and what it did
-  // not use -- or gave back, if it failed -- is released after. Its DPDK
+  // The edit is paid from these erases' prepay (Growth::Grow), and what it
+  // did not use -- or gave back, if it failed -- is released after. Its DPDK
   // memory is not checked against the limit again (a removal stage runs
   // under utils::Headroom::kPrepaid, D-207), but the heap can still be out of
   // pages: then nothing changed but the prepay, given back, and the engine
@@ -173,15 +197,17 @@ void MeterResource::Unpublish(MeterId id, bool &prepaid,
   const size_t had = growth_.prepaid_bytes;
   auto settle = [&]() noexcept {
     growth_.paying = false;
-    growth_.Refund(MeterSet::Bytes(live_->capacity()) -
-                   (had - growth_.prepaid_bytes));
+    growth_.Refund(prepay - (had - growth_.prepaid_bytes));
   };
   growth_.paying = true;
   std::unique_ptr<const MeterSet> generation;
   try {
-    if (live_->Contains(id)) {  // a retry after Build was refused: erased
-      auto erased = live_->Erase(id);
-      CHECK(erased) << MeterErrorName(erased.error());
+    for (const MeterId id : ids) {
+      // Not erased yet (a retry after Build was refused finds some erased).
+      if (retiring_.contains(id) && live_->Contains(id)) {
+        auto erased = live_->Erase(id);
+        CHECK(erased) << MeterErrorName(erased.error());
+      }
     }
     generation = live_->Build();
   } catch (...) {
@@ -190,8 +216,11 @@ void MeterResource::Unpublish(MeterId id, bool &prepaid,
     throw;
   }
   settle();
-  retiring_.erase(id);
+  for (const MeterId id : ids) {
+    retiring_.erase(id);
+  }
   later.Retire(published_.Exchange(std::move(generation)));
+  generations_++;
 }
 
 void MeterResource::PrepayErase() {

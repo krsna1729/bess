@@ -454,6 +454,30 @@ TEST_F(MeterResourceTest, RemovalStageCompletesAtTheLimit) {
   EXPECT_TRUE(engine_.Unregister("cnt/counters"));
 }
 
+// BP-7 (FM-3): a transaction's erases share one removal step, which erases
+// every id from the builder and builds and publishes one generation -- not
+// one generation per erased meter.
+TEST_F(MeterResourceTest, AnEraseTransactionPublishesOneGeneration) {
+  constexpr uint32_t kMeters = 1000;
+  Recreate(1024);
+  Install(1, kMeters, TrTcm(500));
+  HoldGracePeriods();
+  std::vector<Op> erases;
+  for (uint32_t id = 1; id <= kMeters; id++) {
+    erases.push_back(Erase(id));
+  }
+  ASSERT_EQ(Apply(std::move(erases)).outcome, Outcome::kApplied);
+  const uint64_t before = resource_->generations();
+  PassGracePeriod();
+  RecordProperty("removal_generations",
+                 static_cast<int>(resource_->generations() - before));
+  EXPECT_EQ(resource_->generations() - before, 1u)
+      << "generations published by the removal of " << kMeters << " meters";
+  EXPECT_EQ(resource_->LiveCount(), 0u);
+  EXPECT_EQ(published_.Read()->Lookup(MeterId(kMeters)), nullptr);
+  EXPECT_FALSE(resource_->Retiring(MeterId(1)));
+}
+
 // The retiring ids and each meter's control block are control-plane state
 // no worker reads (D-206, class C): glibc, every node admitted exactly as
 // malloc's chunk (utils::MallocChunkBytes) through the owner's lease, and
