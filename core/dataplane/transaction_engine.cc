@@ -114,6 +114,7 @@ void TransactionEngine::RebindDependenciesLocked(Registration &reg) {
       continue;
     }
     reg.deps.emplace_back(reg.unresolved[i], it->second.get());
+    // scale: a resource's declared dependencies (a handful), at registration.
     reg.unresolved.erase(reg.unresolved.begin() +
                          static_cast<std::ptrdiff_t>(i));
   }
@@ -982,6 +983,8 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
       }
       cascade.stages[s_i].reserve(steps);
     }
+    // scale: at most kMaxPendingCascades (4096) cascades; reserving one more
+    // per Apply reallocates at most once per pending cascade (DP-9).
     cascades_.reserve(cascades_.size() + 1);
   }
 

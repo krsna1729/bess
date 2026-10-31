@@ -95,6 +95,7 @@ bool PriorityTrafficClass::RemoveChild(TrafficClass *child) {
 
   for (size_t i = 0; i < children_.size(); i++) {
     if (children_[i].c_ == child) {
+      // scale: children of one traffic class (RT-J4).
       children_.erase(children_.begin() + i);
       child->parent_ = nullptr;
       if (first_runnable_ > i) {
@@ -334,6 +335,7 @@ bool RoundRobinTrafficClass::RemoveChild(TrafficClass *child) {
 
   for (size_t i = 0; i < runnable_children_.size(); i++) {
     if (runnable_children_[i] == child) {
+      // scale: children of one traffic class (RT-J4); order is the schedule.
       runnable_children_.erase(runnable_children_.begin() + i);
       child->parent_ = nullptr;
       if (next_child_ > i) {
@@ -374,6 +376,7 @@ void RoundRobinTrafficClass::BlockTowardsRoot() {
   for (size_t i = 0; i < runnable_children_.size();) {
     if (runnable_children_[i]->blocked_) {
       blocked_children_.push_back(runnable_children_[i]);
+      // scale: children of one traffic class (RT-J4); order is the schedule.
       runnable_children_.erase(runnable_children_.begin() + i);
       if (next_child_ > i) {
         next_child_--;
@@ -394,6 +397,7 @@ void RoundRobinTrafficClass::FinishAndAccountTowardsRoot(
     const ResourceUsage &usage, uint64_t tsc) {
   stats_.usage += usage;
   if (child->blocked_) {
+    // scale: children of one traffic class (RT-J4); order is the schedule.
     runnable_children_.erase(runnable_children_.begin() + next_child_);
     blocked_children_.push_back(child);
     blocked_ = runnable_children_.empty();
