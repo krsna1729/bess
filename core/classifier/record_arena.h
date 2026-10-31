@@ -64,7 +64,7 @@ class RecordArena {
   void Abort(Id id) noexcept;
 
   // The record is no longer reachable from any table: free it after the
-  // current grace period.
+  // current grace period. Reclaims ids whose grace period completed.
   void Retire(Id id);
 
   // Grow the retirement queue now, on the control path, so a later Retire()
