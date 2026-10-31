@@ -19,12 +19,12 @@ namespace dataplane {
 // own messages: bess.pb.PacketStoreFlowKey{id} ->
 // bess.pb.PacketStoreFlowValue{timeout_ns?, max_packets_per_flow?}. Flow id
 // 0 is refused (it is every packet without a key); readback reports each
-// entry with exactly the fields it set. `published` is the owner's RcuPtr,
-// which must outlive the binding.
+// entry with exactly the fields it set, in flow id order (a walk of the
+// table's capacity). `table` is the owner's, which must outlive the binding.
 inline std::shared_ptr<framework::ResourceCodec> MakePacketStoreFlowsCodec(
-    const rcu::RcuPtr<PacketStoreLimitsMap> &published) {
-  return std::make_shared<framework::TypedCodec<bess::pb::PacketStoreFlowKey,
-                                                bess::pb::PacketStoreFlowValue>>(
+    const PacketStoreLimitsTable &table) {
+  return std::make_shared<framework::TypedCodec<
+      bess::pb::PacketStoreFlowKey, bess::pb::PacketStoreFlowValue>>(
       [](const bess::pb::PacketStoreFlowKey &key)
           -> std::expected<dataplane::ResourceKey, std::string> {
         // The flow id is the metadata value the classifier wrote, and 0 is
@@ -50,12 +50,14 @@ inline std::shared_ptr<framework::ResourceCodec> MakePacketStoreFlowsCodec(
         return std::any(limits);
       },
       // Read back as given: an entry carries exactly the fields it set.
-      [&published](const auto &visit) {
-        const dataplane::PacketStoreLimitsMap *limits = published.Read();
-        if (limits == nullptr) {
-          return;
-        }
-        for (const auto &[id, entry] : *limits) {
+      [&table](const auto &visit) {
+        for (size_t i = 1; i <= table.capacity(); i++) {
+          const auto id = static_cast<uint32_t>(i);
+          const PacketStoreLimits *found = table.Current(PacketStoreFlowId(id));
+          if (found == nullptr) {
+            continue;
+          }
+          const PacketStoreLimits &entry = *found;
           bess::pb::PacketStoreFlowKey key;
           key.set_id(id);
           bess::pb::PacketStoreFlowValue value;

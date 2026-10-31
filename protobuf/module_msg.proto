@@ -1958,6 +1958,9 @@ message PacketStoreArg {
   repeated string key_attrs = 4;    /// The metadata attributes that may carry the flow ID,
                                     /// in priority order: the first one this graph provides
                                     /// is the key. Default: store_id, then vif_id.
+  uint32 flow_capacity = 5;         /// Flow IDs the "<module>/flows" resource can give limits
+                                    /// to: 1..flow_capacity (default: 65536); an entry past it
+                                    /// is refused. Admitted at init, 9 bytes per ID.
 }
 
 /// The per-flow limits of the "<module>/flows" resource (D-129): a flow's own

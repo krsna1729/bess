@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <random>
@@ -30,6 +31,25 @@
 
 namespace bess::dataplane {
 namespace {
+
+// A limits table for flow ids 1..16 holding `entries`, as a flows resource
+// publishes them.
+std::unique_ptr<PacketStoreLimitsTable> Limits(
+    std::initializer_list<std::pair<uint32_t, PacketStoreLimits>> entries =
+        {}) {
+  auto table = std::make_unique<PacketStoreLimitsTable>(16);
+  for (const auto &[id, limits] : entries) {
+    (void)table->Publish(PacketStoreFlowId(id), table->Make(limits));
+  }
+  return table;
+}
+
+// A table with no entries: every flow takes the store's numbers. Never
+// freed, so the DPDK heap outlives it.
+const PacketStoreLimitsTable &NoLimits() {
+  static const PacketStoreLimitsTable *const table = Limits().release();
+  return *table;
+}
 
 constexpr uint64_t kSecond = 1'000'000'000ULL;
 
@@ -89,9 +109,9 @@ class PacketStoreTest : public ::testing::Test {
 
   // Stores one packet per flow id, tagged with `first_tag + i`; returns the
   // tags `evict` received (and frees those packets).
-  std::vector<uint64_t> Store(PacketStore &store, std::vector<uint32_t> ids,
-                              uint64_t now_ns, uint64_t first_tag,
-                              const PacketStoreLimitsMap &limits = {}) {
+  std::vector<uint64_t> Store(
+      PacketStore &store, std::vector<uint32_t> ids, uint64_t now_ns,
+      uint64_t first_tag, const PacketStoreLimitsTable &limits = NoLimits()) {
     std::vector<PacketHandle> handles;
     for (size_t i = 0; i < ids.size(); i++) {
       handles.push_back(Alloc(first_tag + i));
@@ -169,14 +189,18 @@ TEST_F(PacketStoreTest, ReleaseIsFifoPerFlow) {
 TEST_F(PacketStoreTest, APerFlowCapEvictsTheOldest) {
   auto store = Make(100, 2);
   EXPECT_EQ((std::vector<uint64_t>{0}), Store(*store, {1, 1, 1}, 0, 0));
-  EXPECT_EQ((std::vector<uint64_t>{1, 2}),
-            Store(*store, {1}, 0, 3, {{1, {.max_packets_per_flow = 1}}}));
+  EXPECT_EQ(
+      (std::vector<uint64_t>{1, 2}),
+      Store(*store, {1}, 0, 3, *Limits({{1, {.max_packets_per_flow = 1}}})));
   EXPECT_EQ(1u, store->packets());
   // A present 0 is the default cap (2), not "hold nothing".
-  EXPECT_TRUE(Store(*store, {1}, 0, 4, {{1, {.max_packets_per_flow = 0}}}).empty());
+  EXPECT_TRUE(
+      Store(*store, {1}, 0, 4, *Limits({{1, {.max_packets_per_flow = 0}}}))
+          .empty());
   EXPECT_EQ((std::vector<uint64_t>{3, 4}), Release(*store, 1));
 
-  const PacketStoreLimitsMap limits{{5, {.max_packets_per_flow = 4}}};
+  const auto table = Limits({{5, {.max_packets_per_flow = 4}}});
+  const PacketStoreLimitsTable &limits = *table;
   EXPECT_TRUE(Store(*store, {5, 5, 5, 5}, 0, 10, limits).empty());
   EXPECT_EQ((std::vector<uint64_t>{10}), Store(*store, {5}, 0, 14, limits));
   EXPECT_EQ(4u, store->packets());
@@ -194,8 +218,9 @@ TEST_F(PacketStoreTest, AFullStoreEvictsTheArrival) {
 
   // Flow 1 at a cap of 1 while full: its packet goes to make room, then the
   // arrival fits.
-  EXPECT_EQ((std::vector<uint64_t>{0}),
-            Store(*store, {1}, 0, 5, {{1, {.max_packets_per_flow = 1}}}));
+  EXPECT_EQ(
+      (std::vector<uint64_t>{0}),
+      Store(*store, {1}, 0, 5, *Limits({{1, {.max_packets_per_flow = 1}}})));
   EXPECT_EQ((std::vector<uint64_t>{5}), Release(*store, 1));
   EXPECT_EQ(2u, store->flows());
   store->Clear();
@@ -237,13 +262,13 @@ TEST_F(PacketStoreTest, InternalDiscardsNotifyExactlyOnceBeforeFree) {
   EXPECT_EQ(40u, log.size);
 
   EXPECT_TRUE(Store(*store, {2, 2, 2}, 0, 40).empty());
-  store->ExpireAll({}, 101);
-  store->ExpireAll({}, 101);
+  store->ExpireAll(NoLimits(), 101);
+  store->ExpireAll(NoLimits(), 101);
   EXPECT_EQ(43u, log.size);
 
   EXPECT_TRUE(Store(*store, {3, 3, 3}, 0, 43).empty());
-  store->ExpireBounded({}, 101);
-  store->ExpireBounded({}, 101);
+  store->ExpireBounded(NoLimits(), 101);
+  store->ExpireBounded(NoLimits(), 101);
   EXPECT_EQ(46u, log.size);
 
   EXPECT_TRUE(Store(*store, {4, 4, 4}, 0, 46).empty());
@@ -310,7 +335,8 @@ TEST_F(PacketStoreTest, ObservedPacketOperationsDoNotAllocate) {
     handles[i] = Alloc(i);
   }
   const uint32_t ids[]{1, 1, 1, 2, 2, 3, 4, 5};
-  const PacketStoreLimitsMap limits;
+  const auto table = Limits();
+  const PacketStoreLimitsTable &limits = *table;
   size_t evicted = 0;
   size_t released = 0;
   size_t dropped = 0;
@@ -356,8 +382,9 @@ TEST_F(PacketStoreTest, ObservedPacketOperationsDoNotAllocate) {
 // evicts an arrival.
 TEST_F(PacketStoreTest, ExpiryFollowsEachFlowsTimeout) {
   auto store = Make(4, 10, 2 * kSecond);
-  const PacketStoreLimitsMap limits{{2, {.timeout_ns = 0}},
-                                    {3, {.timeout_ns = 10 * kSecond}}};
+  const auto table =
+      Limits({{2, {.timeout_ns = 0}}, {3, {.timeout_ns = 10 * kSecond}}});
+  const PacketStoreLimitsTable &limits = *table;
   EXPECT_TRUE(Store(*store, {1, 2, 3}, 0, 0, limits).empty());
   EXPECT_TRUE(Store(*store, {1}, 3 * kSecond, 3, limits).empty());
 
@@ -382,14 +409,14 @@ TEST_F(PacketStoreTest, BoundedExpiryCoversHeldFlowsInOneRotation) {
   }
   EXPECT_TRUE(Store(*store, ids, 0, 0).empty());
 
-  store->ExpireBounded({}, 2 * kSecond);
+  store->ExpireBounded(NoLimits(), 2 * kSecond);
   EXPECT_GT(store->packets(), 0u) << "one call is bounded";
   EXPECT_LT(store->packets(), size_t{kFlows});
   const size_t rotation =
       (kFlows + PacketStore::kExpireFlowsPerRun - 1) /
       PacketStore::kExpireFlowsPerRun;
   for (size_t i = 1; i < rotation; i++) {
-    store->ExpireBounded({}, 2 * kSecond);
+    store->ExpireBounded(NoLimits(), 2 * kSecond);
   }
   EXPECT_EQ(0u, store->packets());
   EXPECT_EQ(0u, store->flows());
@@ -430,10 +457,10 @@ TEST_F(PacketStoreTest, RandomOperationsMatchAModel) {
         break;
       case 2:
         if (step % 2 == 0) {
-          store->ExpireAll({}, now);
+          store->ExpireAll(NoLimits(), now);
         } else {
           // At most 64 held flows, so one bounded sweep visits them all.
-          store->ExpireBounded({}, now);
+          store->ExpireBounded(NoLimits(), now);
         }
         for (auto it = model.begin(); it != model.end();) {
           while (!it->second.empty() && now - it->second.front().second > 100) {
@@ -485,18 +512,20 @@ TEST_F(PacketStoreTest, RandomOperationsMatchAModel) {
   store->Clear();
 }
 
-// The flows resource through the transaction engine: a transaction edits one
-// private copy and publishes it once, an entry keeps exactly the fields it
-// set, erasing an absent id is a no-op, and a wrong value type is refused
-// without touching the published table.
-// Records the admission the resource asks (D-198); refuses growth while
+// The flows resource through the transaction engine: each operation
+// publishes or empties its own entry, an entry keeps exactly the fields it
+// set, erasing an absent id is a no-op, and a wrong value type or an id past
+// the table is refused without touching the table.
+// Records the admission the table's slab asks (D-198); refuses growth while
 // `refuse` is set.
 struct CountingGrowth final : utils::MemoryGrowth {
   size_t grown = 0;
   size_t shrunk = 0;
+  size_t calls = 0;  // Grow calls, refused ones too
   bool refuse = false;
   void Grow(size_t bytes, size_t glibc_bytes = 0) override {
-    EXPECT_EQ(bytes, glibc_bytes) << "map memory is all glibc";
+    calls++;
+    EXPECT_EQ(0u, glibc_bytes) << "the table is all DPDK memory";
     if (refuse) {
       throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit,
                                  bytes, "refused");
@@ -504,7 +533,7 @@ struct CountingGrowth final : utils::MemoryGrowth {
     grown += bytes;
   }
   void Shrink(size_t bytes, size_t glibc_bytes = 0) noexcept override {
-    EXPECT_EQ(bytes, glibc_bytes);
+    EXPECT_EQ(0u, glibc_bytes);
     shrunk += bytes;
   }
   size_t net() const { return grown - shrunk; }
@@ -512,19 +541,19 @@ struct CountingGrowth final : utils::MemoryGrowth {
 
 class PacketStoreFlowsResourceTest : public ::testing::Test {
  protected:
+  static constexpr size_t kCapacity = size_t{1} << 17;
+
   void SetUp() override {
-    resource_ = std::make_unique<PacketStoreFlowsResource>("ps/flows", published_,
-                                                           &growth_);
-    ASSERT_TRUE(engine_.Register(resource_.get()));
+    table_.set_memory_growth(&growth_);
+    ASSERT_TRUE(engine_.Register(&resource_));
   }
   void TearDown() override {
     const std::string name = "ps/flows";
     ASSERT_TRUE(engine_.ReleaseForTeardown(std::span<const std::string>(&name, 1)));
     domain_.Drain();
-    EXPECT_EQ(resource_->bytes(), PacketStoreFlowsResource::Bytes() + growth_.net());
-    published_.ResetQuiesced();
-    resource_.reset();
-    EXPECT_EQ(0u, growth_.net()) << "every admitted byte was given back";
+    EXPECT_EQ(table_.bytes(),
+              PacketStoreLimitsTable::Bytes(kCapacity) + growth_.net())
+        << "every slab chunk was admitted";
   }
 
   static Op Upsert(uint32_t id, PacketStoreLimits limits) {
@@ -532,94 +561,119 @@ class PacketStoreFlowsResourceTest : public ::testing::Test {
   }
   static Op Erase(uint32_t id) { return Op::Erase("ps/flows", EncodeKey(id)); }
 
-  // Declared before the resource and the maps it publishes.
+  // The live entries, by id.
+  std::map<uint32_t, PacketStoreLimits> Entries() const {
+    std::map<uint32_t, PacketStoreLimits> entries;
+    for (size_t id = 1; id <= kCapacity; id++) {
+      const PacketStoreFlowId flow(static_cast<uint32_t>(id));
+      if (const PacketStoreLimits *limits = table_.Current(flow)) {
+        entries.emplace(static_cast<uint32_t>(id), *limits);
+      }
+    }
+    return entries;
+  }
+
+  // Declared before the table, which admits through it.
   CountingGrowth growth_;
   rcu::RcuDomain &domain_ = bess::runtime::runtime().rcu();
-  rcu::RcuPtr<PacketStoreLimitsMap> published_{domain_};
-  std::unique_ptr<PacketStoreFlowsResource> resource_;
+  PacketStoreLimitsTable table_{kCapacity};
+  PacketStoreFlowsResource resource_{"ps/flows", table_};
   TransactionEngine engine_{domain_};
 };
 
-TEST_F(PacketStoreFlowsResourceTest, ATransactionPublishesOneTable) {
-  const PacketStoreLimitsMap *before = published_.Read();
+TEST_F(PacketStoreFlowsResourceTest, ATransactionPublishesItsEntries) {
   auto r = engine_.Apply(std::vector<Op>{
       Upsert(1, {.timeout_ns = 7, .max_packets_per_flow = 4}),
       Upsert(2, {.timeout_ns = 0}), Erase(9)});
   ASSERT_EQ(TransactionEngine::Outcome::kApplied, r.outcome);
-  const PacketStoreLimitsMap *after = published_.Read();
-  EXPECT_NE(before, after);
-  EXPECT_EQ((PacketStoreLimitsMap{
+  EXPECT_EQ((std::map<uint32_t, PacketStoreLimits>{
                 {1, {.timeout_ns = 7, .max_packets_per_flow = 4}},
                 {2, {.timeout_ns = 0}}}),
-            *after);
-  EXPECT_EQ(2u, resource_->LiveCount());
-  EXPECT_TRUE(resource_->Contains(EncodeKey(uint32_t{2})));
-  EXPECT_FALSE(after->at(2).max_packets_per_flow.has_value())
+            Entries());
+  EXPECT_EQ(2u, resource_.LiveCount());
+  EXPECT_TRUE(resource_.Contains(EncodeKey(uint32_t{2})));
+  EXPECT_FALSE(table_.Lookup(PacketStoreFlowId(2))->max_packets_per_flow)
       << "an absent field stays absent";
 
   r = engine_.Apply(std::vector<Op>{Erase(1)});
   ASSERT_EQ(TransactionEngine::Outcome::kApplied, r.outcome);
-  EXPECT_EQ((PacketStoreLimitsMap{{2, {.timeout_ns = 0}}}), *published_.Read());
+  EXPECT_EQ((std::map<uint32_t, PacketStoreLimits>{{2, {.timeout_ns = 0}}}),
+            Entries());
 
-  const PacketStoreLimitsMap *kept = published_.Read();
+  const PacketStoreLimits *kept = table_.Lookup(PacketStoreFlowId(2));
   r = engine_.Apply(std::vector<Op>{
       Upsert(3, {}), Op::Upsert("ps/flows", EncodeKey(uint32_t{4}), std::any(5))});
   EXPECT_NE(TransactionEngine::Outcome::kApplied, r.outcome);
-  EXPECT_EQ(kept, published_.Read()) << "a refused transaction publishes nothing";
-  EXPECT_FALSE(resource_->Contains(EncodeKey(uint32_t{3})));
+  EXPECT_FALSE(resource_.Contains(EncodeKey(uint32_t{3})))
+      << "a refused transaction publishes nothing";
+  EXPECT_EQ(kept, table_.Lookup(PacketStoreFlowId(2)));
+
+  // Past the table: an upsert is refused, an erase is a no-op.
+  const auto past = static_cast<uint32_t>(kCapacity + 1);
+  EXPECT_NE(TransactionEngine::Outcome::kApplied,
+            engine_.Apply(std::vector<Op>{Upsert(past, {})}).outcome);
+  EXPECT_EQ(TransactionEngine::Outcome::kApplied,
+            engine_.Apply(std::vector<Op>{Erase(past)}).outcome);
+  EXPECT_EQ(1u, resource_.LiveCount());
 }
 
-// A refused clone or insert refuses the transaction before it allocates,
-// leaves the published table and the byte count as they were, and an aborted
-// copy gives back everything it admitted.
+// A refused slab chunk refuses the transaction with the table untouched;
+// one admitted chunk then holds the next entries.
 TEST_F(PacketStoreFlowsResourceTest, RefusedGrowthRefusesTheTransactionCleanly) {
-  ASSERT_EQ(TransactionEngine::Outcome::kApplied,
-            engine_.Apply(std::vector<Op>{Upsert(1, {.timeout_ns = 7})}).outcome);
-  domain_.Drain();
-  const size_t held = growth_.net();
-  EXPECT_GT(held, 0u) << "the published map is admitted";
-  EXPECT_EQ(resource_->bytes(), PacketStoreFlowsResource::Bytes() + held);
-  const PacketStoreLimitsMap *kept = published_.Read();
-
-  // Reserve drives the resource directly: a refusal throws out of it, and the
-  // engine's EndTransaction hook (called here) frees what the copy admitted.
   growth_.refuse = true;
-  EXPECT_THROW((void)resource_->Reserve(Upsert(2, {})), utils::MemoryRefused);
+  EXPECT_THROW((void)resource_.Reserve(Upsert(1, {})), utils::MemoryRefused);
+  EXPECT_THROW((void)engine_.Apply(std::vector<Op>{Upsert(1, {})}),
+               utils::MemoryRefused);
   growth_.refuse = false;
-  resource_->EndTransaction();
-  EXPECT_EQ(kept, published_.Read());
-  EXPECT_EQ(held, growth_.net()) << "the refused copy kept nothing";
+  EXPECT_EQ(0u, growth_.net());
+  EXPECT_EQ(0u, resource_.LiveCount());
 
-  // A copy whose second insert is refused (a clone and a node were admitted)
-  // gives both back.
-  ASSERT_TRUE(resource_->Reserve(Upsert(5, {})));
-  EXPECT_GT(growth_.net(), held);
-  growth_.refuse = true;
-  EXPECT_THROW((void)resource_->Reserve(Upsert(6, {})), utils::MemoryRefused);
-  growth_.refuse = false;
-  resource_->EndTransaction();
-  EXPECT_EQ(held, growth_.net());
-  EXPECT_FALSE(resource_->Contains(EncodeKey(uint32_t{5})));
-
-  // A published copy costs a clone and a node; the replaced table is given back
-  // when its grace period ends, not before.
-  ASSERT_EQ(TransactionEngine::Outcome::kApplied,
-            engine_.Apply(std::vector<Op>{Upsert(2, {})}).outcome);
-  EXPECT_GT(growth_.net(), held);
-  domain_.Drain();
-  EXPECT_EQ(2u, resource_->LiveCount());
-  EXPECT_EQ(resource_->bytes(), PacketStoreFlowsResource::Bytes() + growth_.net());
+  ASSERT_EQ(
+      TransactionEngine::Outcome::kApplied,
+      engine_.Apply(std::vector<Op>{Upsert(1, {}), Upsert(2, {})}).outcome);
+  EXPECT_EQ(utils::ObjectSlab<PacketStoreLimits>::chunk_bytes(), growth_.net());
+  EXPECT_EQ(2u, resource_.LiveCount());
 }
 
+// BP-6 (DP-2): a transaction costs what it changes, not a copy of the
+// table. 100K entries, then 100 one-op transactions (erase one id, add it
+// back): at most one admission each, where a clone of the whole table per
+// transaction made ~10^7 Grow calls; and what is held returns to where it
+// was once the replaced objects are reclaimed.
+TEST_F(PacketStoreFlowsResourceTest, AOneOpTransactionAdmitsOneEntryAtMost) {
+  constexpr uint32_t kEntries = 100'000;
+  for (uint32_t first = 1; first <= kEntries; first += 1000) {
+    std::vector<Op> ops;
+    for (uint32_t id = first; id < first + 1000; id++) {
+      ops.push_back(Upsert(id, {.timeout_ns = id}));
+    }
+    ASSERT_EQ(TransactionEngine::Outcome::kApplied,
+              engine_.Apply(std::move(ops)).outcome);
+    domain_.Drain();
+  }
+  const size_t calls = growth_.calls;
+  const size_t held = growth_.net();
+  for (uint32_t i = 0; i < 100; i++) {
+    const uint32_t id = 1 + i / 2 * 997;
+    ASSERT_EQ(
+        TransactionEngine::Outcome::kApplied,
+        engine_.Apply(std::vector<Op>{i % 2 == 0 ? Erase(id) : Upsert(id, {})})
+            .outcome);
+  }
+  domain_.Drain();
+  RecordProperty("grow_calls", static_cast<int>(growth_.calls - calls));
+  EXPECT_LE(growth_.calls - calls, 100u)
+      << "Grow calls over 100 one-op transactions on " << kEntries;
+  EXPECT_EQ(held, growth_.net()) << "held bytes after reclaim";
+  EXPECT_EQ(kEntries, resource_.LiveCount());
+}
 
 // The BESS codec: flow id 0 is refused, a value keeps field presence both
 // ways, and readback reports each entry with exactly the fields it set.
 TEST(PacketStoreFlowsCodecTest, KeepsFieldPresenceAndRefusesTheKeylessId) {
-  rcu::RcuPtr<PacketStoreLimitsMap> published(bess::runtime::runtime().rcu());
-  published.Initialize(std::make_unique<const PacketStoreLimitsMap>(
-      PacketStoreLimitsMap{{3, {.timeout_ns = 0}},
-                           {4, {.max_packets_per_flow = 2}}}));
-  auto codec = MakePacketStoreFlowsCodec(published);
+  const auto table =
+      Limits({{3, {.timeout_ns = 0}}, {4, {.max_packets_per_flow = 2}}});
+  auto codec = MakePacketStoreFlowsCodec(*table);
   const std::string key_url = "type.googleapis.com/bess.pb.PacketStoreFlowKey";
   const std::string value_url =
       "type.googleapis.com/bess.pb.PacketStoreFlowValue";
@@ -650,7 +704,6 @@ TEST(PacketStoreFlowsCodecTest, KeepsFieldPresenceAndRefusesTheKeylessId) {
                    (fv.has_max_packets_per_flow() ? "c" : ""));
   });
   EXPECT_EQ((std::vector<std::string>{"3:t", "4:c"}), seen);
-  published.ResetQuiesced();
 }
 
 }  // namespace
