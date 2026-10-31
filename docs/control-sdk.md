@@ -227,9 +227,12 @@ conflict (`kPipelineConflict`, `*PipelineConflictError`), nothing changed. A
 version without one checks only the pipeline generation.
 
 `ResetResources` empties map resources without reading their keys to the
-client: the request names one or more `<module>/<table>` resources, the
-control plane converges each to no entries and applies the erases in batches,
-under the same lock and worker-pause rules as an apply. Names are deduped; a
+client: the request names one or more `<module>/<table>` resources, and the
+control plane erases each one's entries in batches read from the resource's
+cursor (about one retire budget per batch, never every key or operation at
+once), taking the control-plane lock per batch and not while it waits out a
+busy engine, under the same worker-pause rules as an apply. Batches that
+applied stay applied if a later one fails. Names are deduped; a
 resource the request does not name is untouched, and a singleton has no
 entries to clear and is a no-op. An empty list is `INVALID_ARGUMENT`, an
 unknown name is `NOT_FOUND` (nothing is erased), and a stale
