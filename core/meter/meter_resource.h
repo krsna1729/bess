@@ -5,10 +5,12 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "dataplane/resource.h"
 #include "meter/meter.h"
@@ -40,7 +42,9 @@ namespace bess::meter {
 // side at once (Contains, VisitPolicies) and its id cannot be upserted, the
 // published generation keeps it readable until the removal cascade's stage
 // runs (a referrer's old value may still hand a reader the id), and that stage
-// publishes a generation without it.
+// publishes a generation without it. A transaction's erases share one removal
+// step (BP-7): it erases every id from the builder, then builds and publishes
+// one generation.
 //
 // Memory (D-198), one resource: the owner admits Bytes(capacity) (the first
 // builder's index root) before constructing, and passes the admission's
@@ -95,6 +99,9 @@ class MeterResource final : public dataplane::Resource {
   // Erased, and its removal stage has not run: absent to the control side,
   // still readable by packets, not upsertable.
   bool Retiring(MeterId id) const noexcept { return retiring_.contains(id); }
+  // Generations published since construction, the first one included: one
+  // per transaction that upserts, one per removal step.
+  uint64_t generations() const noexcept { return generations_; }
 
   // Every committed, non-retiring meter with its policy as written, in id
   // order: the live builder's specifications (D-207: no copy of its own).
@@ -178,10 +185,16 @@ class MeterResource final : public dataplane::Resource {
   void BeginTransaction();
   // Swaps the edited copy in and publishes its prepared generation once.
   void PublishStaged(dataplane::Retirer &retirer);
-  // One removal-cascade stage after an erase: publishes a generation without
-  // `id` (unless it was re-added meanwhile). `prepaid`: the step's prepay is
-  // held; a refused attempt clears it and the retry admits it again.
-  void Unpublish(MeterId id, bool &prepaid, dataplane::Retirer &later);
+  // A transaction's removal step, one cascade stage after its erases:
+  // publishes one generation without `ids` (any re-added meanwhile is
+  // skipped). `prepaid`: the step's prepay (one erase's per id) is held; a
+  // refused attempt clears it and the retry admits it again.
+  using ErasedIds = std::vector<MeterId, ControlAllocator<MeterId>>;
+  void Unpublish(const ErasedIds &ids, bool &prepaid,
+                 dataplane::Retirer &later);
+  // Hands the transaction's erased ids to one removal step; the erases after
+  // the first find none.
+  void PublishErases(dataplane::Retirer &retirer) noexcept;
   // An erase's removal-stage edit, admitted by Reserve; given back when the
   // stage has made it, the erase aborts, or the stage has nothing to do.
   void PrepayErase();
@@ -201,6 +214,9 @@ class MeterResource final : public dataplane::Resource {
   // The edit copy has become the live one (its first publish ran).
   bool published_staged_ = false;
   std::set<MeterId, std::less<MeterId>, ControlAllocator<MeterId>> retiring_;
+  // The ids this transaction erases, for its one removal step.
+  ErasedIds erasing_;
+  uint64_t generations_ = 0;
 };
 
 }  // namespace bess::meter
