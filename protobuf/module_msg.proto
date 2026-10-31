@@ -1616,6 +1616,7 @@ message WildcardMatchArg {
 message ArpResponderArg {
   string ip = 1; /// The IP
   string mac_addr = 2; /// The MAC address
+  uint64 max_entries = 3; /// Most entries the table holds (default 1024, at most 2^20). A new entry past it refuses its transaction.
 }
 
 /// The key of an ArpResponder's "<module>/entries" resource (D-129): the IPv4
