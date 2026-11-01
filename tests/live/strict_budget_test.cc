@@ -14,6 +14,7 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <string_view>
 
 #include "control_v2.grpc.pb.h"
 #include "live_daemon.h"
@@ -68,6 +69,32 @@ std::string ThpMode() {
   return "unknown";
 }
 
+// Where the cgroup's memory is, in MiB, for the log and a failure: the
+// kernel's per-cgroup counts (memory.stat) and the daemon's own mappings
+// (smaps_rollup), so an unattributed figure that differs between hosts
+// names its component.
+std::string Breakdown(const std::string &cgroup, int pid) {
+  const auto stat = ReadKeyed(cgroup + "/memory.stat");
+  std::string out = "memory.stat";
+  for (const char *field : {"anon", "file", "active_file", "shmem", "kernel", "kernel_stack",
+                            "pagetables", "sock", "slab", "percpu"}) {
+    const auto it = stat.find(field);
+    out += std::format(" {} {:.1f}", field, it == stat.end() ? -1.0 : it->second / 1048576.0);
+  }
+  out += "; smaps_rollup";
+  std::ifstream rollup("/proc/" + std::to_string(pid) + "/smaps_rollup");
+  std::string line;
+  while (std::getline(rollup, line)) {
+    for (const std::string_view field : {"Rss:", "Pss_Anon:", "Pss_File:", "Pss_Shmem:"}) {
+      if (line.starts_with(field)) {
+        out += std::format(" {} {:.1f}", field.substr(0, field.size() - 1),
+                           std::stoull(line.substr(field.size())) / 1024.0);
+      }
+    }
+  }
+  return out;
+}
+
 v2::GetResourceStatusResponse Status(const std::string &address) {
   auto stub = v2::Control::NewStub(
       grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
@@ -91,6 +118,7 @@ TEST(StrictBudgetTest, RefusesInsteadOfBeingKilledAndAccountsEveryByte) {
   const std::string cgroup = CgroupOf(daemon->pid());
   ASSERT_NE(cgroup.find(unit), std::string::npos) << cgroup;
 
+  const std::string at_start = Breakdown(cgroup, daemon->pid());
   const v2::MemoryStatus start = Status(daemon->address()).memory();
   ASSERT_EQ(start.limit_bytes(), kCapMiB << 20u) << start.limit_source();
   EXPECT_NE(start.limit_source().find("memory.max"), std::string::npos);
@@ -148,9 +176,10 @@ TEST(StrictBudgetTest, RefusesInsteadOfBeingKilledAndAccountsEveryByte) {
   const v2::MemoryStatus at = Status(daemon->address()).memory();
   EXPECT_LE(at.used_bytes(), at.limit_bytes());
   EXPECT_GT(at.refusals(), 0u);
+  const std::string at_end = Breakdown(cgroup, daemon->pid());
   EXPECT_LT(at.unattributed_bytes(), kUnattributedBound)
       << "used " << at.used_bytes() << " admitted " << at.admitted_bytes() << " baseline "
-      << at.baseline_bytes();
+      << at.baseline_bytes() << "\nat start: " << at_start << "\nat end: " << at_end;
   const auto events = ReadKeyed(cgroup + "/memory.events");
   EXPECT_EQ(events.at("oom"), 0u);
   EXPECT_EQ(events.at("oom_kill"), 0u);
@@ -162,6 +191,8 @@ TEST(StrictBudgetTest, RefusesInsteadOfBeingKilledAndAccountsEveryByte) {
               at.unattributed_bytes() / 1048576.0,
               static_cast<unsigned long long>(events.count("max") ? events.at("max") : 0),
               ThpMode().c_str());
+  std::printf("[strict budget] at start: %s\n[strict budget] at end: %s\n", at_start.c_str(),
+              at_end.c_str());
   daemon->Shutdown();
 }
 
