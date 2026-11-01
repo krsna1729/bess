@@ -41,10 +41,13 @@ bool TrimAfterRelease(size_t threshold = kMallocTrimAfterBytes) noexcept;
 // How many times glibc was trimmed, by either trigger (tests and diagnostics).
 uint64_t malloc_trims() noexcept;
 
-// The free bytes MallocFreeCheck lets glibc gain before it trims:
-// max(kMallocTrimAfterBytes, limit_bytes / 32), `limit_bytes` the memory
-// policy's limit (0: none known).
-size_t MallocFreeBound(size_t limit_bytes) noexcept;
+// The free bytes MallocFreeCheck lets glibc gain before it trims: a quarter of
+// `reserve_bytes`, the memory policy's reserve for what is not admitted
+// (kMallocTrimAfterBytes when there is none: no limit known). The invariant:
+// free bytes glibc retains <= reserve / 4 < reserve / 2, the unattributed
+// bound (tests/live/strict_budget_test.cc); the other half of the reserve is
+// the margin for a request in flight.
+size_t MallocFreeBound(size_t reserve_bytes) noexcept;
 
 // The second trigger: glibc's free bytes (mallinfo2().fordblks), which also
 // count what never went through admission (a teardown's transient copies).

@@ -103,7 +103,7 @@ void MaintenanceLoop::Run() {
     // the arenas. The second check reads mallinfo2 at most once a second.
     if (!runtime::TrimAfterRelease()) {
       (void)free_check_.Check(std::chrono::steady_clock::now(),
-                              runtime::MallocFreeBound(utils::memory_policy().limit_bytes));
+                              runtime::MallocFreeBound(utils::memory_policy().reserve_bytes));
     }
     ticks_.fetch_add(1, std::memory_order_relaxed);
     wait.lock();
