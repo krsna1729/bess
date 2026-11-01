@@ -19,8 +19,15 @@
 
 #include <gtest/gtest.h>
 
+#include "runtime/startup.h"
+#include "utils/dpdk_memory.h"
+
 namespace bess::runtime {
 namespace {
+
+using startup::MemoryLimit;
+using startup::MemorySettings;
+using startup::ResolveMemoryPolicy;
 
 // The arenas glibc has made: one <heap> element each in malloc_info.
 size_t MallocHeaps() {
@@ -117,11 +124,41 @@ TEST(MallocPolicyTest, FreeBytesPastTheBoundTrimOncePerPeriod) {
   free(keep);
 }
 
-TEST(MallocPolicyTest, FreeBoundIsAThirtySecondOfTheLimitAtLeast64MiB) {
-  constexpr size_t kGiB = size_t{1024} * 1024 * 1024;
+// Under a 512 MiB limit the reserve is 128 MiB, and the unattributed bound
+// half of it: 40 MiB of garbage no admission saw must trim, or retained free
+// bytes alone could reach that bound (64 MiB at a bound of max(64 MiB,
+// limit / 32)).
+TEST(MallocPolicyTest, FreeBytesTrimWithinAQuarterOfTheReserve) {
+#if BESS_ADDRESS_SANITIZER
+  GTEST_SKIP() << "ASan replaces glibc malloc; mallinfo2 does not see it";
+#endif
+  constexpr size_t kMiB = size_t{1024} * 1024;
+  MemorySettings settings;
+  settings.backing = utils::MemoryBacking::kNormal;
+  settings.limit_mb = 512;
+  utils::MemoryPolicy policy;
+  std::string error;
+  ASSERT_TRUE(ResolveMemoryPolicy(settings, MemoryLimit{}, 0, &policy, &error)) << error;
+  ASSERT_EQ(128 * kMiB, policy.reserve_bytes);
+  const size_t bound = MallocFreeBound(policy.reserve_bytes);
+  EXPECT_LT(bound, policy.reserve_bytes / 2);
+
+  MallocFreeCheck check(std::chrono::seconds(1));
+  auto now = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+  (void)check.Check(now, bound);  // the base
+  const uint64_t trims = malloc_trims();
+  void *keep = Garbage(40 * kMiB);
+  now += std::chrono::seconds(1);
+  EXPECT_TRUE(check.Check(now, bound));
+  EXPECT_EQ(trims + 1, malloc_trims());
+  free(keep);
+}
+
+TEST(MallocPolicyTest, FreeBoundIsAQuarterOfTheReserve) {
+  constexpr size_t kMiB = size_t{1024} * 1024;
   EXPECT_EQ(kMallocTrimAfterBytes, MallocFreeBound(0));
-  EXPECT_EQ(kMallocTrimAfterBytes, MallocFreeBound(kGiB));
-  EXPECT_EQ(4 * kGiB / 32, MallocFreeBound(4 * kGiB));
+  EXPECT_EQ(32 * kMiB, MallocFreeBound(128 * kMiB));
+  EXPECT_EQ(48 * kMiB, MallocFreeBound(192 * kMiB));
 }
 
 }  // namespace

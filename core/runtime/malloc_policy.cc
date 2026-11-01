@@ -40,8 +40,8 @@ bool TrimAfterRelease(size_t threshold) noexcept {
 
 uint64_t malloc_trims() noexcept { return trims.load(std::memory_order_relaxed); }
 
-size_t MallocFreeBound(size_t limit_bytes) noexcept {
-  return std::max(kMallocTrimAfterBytes, limit_bytes / 32);
+size_t MallocFreeBound(size_t reserve_bytes) noexcept {
+  return reserve_bytes == 0 ? kMallocTrimAfterBytes : reserve_bytes / 4;
 }
 
 bool MallocFreeCheck::Check(std::chrono::steady_clock::time_point now, size_t bound) noexcept {
