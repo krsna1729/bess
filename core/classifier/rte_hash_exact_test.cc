@@ -292,4 +292,27 @@ TEST(RteHashBackendMemoryTest, BytesMatchesConstruction) {
   EXPECT_EQ(MemoryCost<RteHashPositionBackend>::Bytes(8u), defaulted.bytes());
 }
 
+// RT-1: what rte_hash_create takes from the DPDK heaps fits the estimate's
+// parts it allocates (all but the defer queue, which this table does not
+// attach), on every cache-line size: generic arm64 builds DPDK with 128-byte
+// lines, which doubles the cache-aligned buckets (65,536 keys: 1 MiB, not the
+// 512 KiB a 64-byte bucket gives).
+TEST(RteHashBackendMemoryTest, AllocationFitsTheEstimateOnThisCacheLine) {
+  constexpr uint32_t kKeys = 65536;
+  // The heap's element headers and alignment, the rte_hash struct and the
+  // ring's memzone: 10,096 bytes on x86-64.
+  constexpr size_t kHeaders = 16384;
+  const auto allocated = [] {
+    const bess::utils::MemoryStatus status = bess::utils::GetMemoryStatus();
+    return status.dpdk_heap_alloc_bytes + status.fallback_heap_alloc_bytes;
+  };
+  const size_t before = allocated();
+  RteHashPositionBackend table(8, kKeys);
+  ASSERT_TRUE(table.valid());
+  const size_t taken = allocated() - before;
+  const size_t defer_queue = 24 * rte_align64pow2(kKeys + 2);
+  EXPECT_LE(taken, bess::classifier::detail::RteHashBytes(kKeys, 8) - defer_queue + kHeaders)
+      << "cache line " << RTE_CACHE_LINE_SIZE;
+}
+
 }  // namespace

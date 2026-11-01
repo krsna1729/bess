@@ -41,16 +41,19 @@ inline std::string UniqueRteHashName() {
 
 // The bytes rte_hash_create allocates for `entries` keys of `key_len` bytes
 // (DPDK 25.11 lib/hash/rte_cuckoo_hash.c), for the memory policy: the
-// buckets (64 B per 8 entries, entries rounded up to a power of two), the key
-// store (one slot more than entries, each the key and an 8-byte data
-// pointer, 16-byte aligned), the free-slot ring (4 B per slot, a power of
-// two) and the RCU defer queue (24 B per entry, a power of two; counted
-// whether or not the table attaches one). An estimate: the per-lcore caches
-// and extendable buckets, off by default, are not counted.
+// buckets (one per 8 entries, entries rounded up to a power of two; 64 B of
+// fields in a cache-aligned struct, so 128 B where DPDK's cache line is 128,
+// as on generic arm64), the key store (one slot more than entries, each the
+// key and an 8-byte data pointer, 16-byte aligned), the free-slot ring (4 B
+// per slot, a power of two) and the RCU defer queue (24 B per entry, a power
+// of two; counted whether or not the table attaches one). An estimate: the
+// per-lcore caches and extendable buckets, off by default, are not counted.
+inline constexpr size_t kRteHashBucketBytes = RTE_ALIGN_CEIL(64, RTE_CACHE_LINE_SIZE);
 inline size_t RteHashBytes(uint32_t entries, uint32_t key_len) {
   const size_t n = entries;
-  return 64 * rte_align64pow2(n) / 8 + RTE_ALIGN_CEIL(8 + key_len, 16) * (n + 1) +
-         4 * rte_align64pow2(n + 1) + 24 * rte_align64pow2(n + 2);
+  return kRteHashBucketBytes * rte_align64pow2(n) / 8 +
+         RTE_ALIGN_CEIL(8 + key_len, 16) * (n + 1) + 4 * rte_align64pow2(n + 1) +
+         24 * rte_align64pow2(n + 2);
 }
 
 // rte_hash_create under the memory policy (D-029, D-206). Under --no-huge
