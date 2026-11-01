@@ -56,6 +56,18 @@ std::string CgroupOf(int pid) {
   return "";
 }
 
+// The host's THP mode, for the log: the bracketed word of the sysfs file.
+std::string ThpMode() {
+  std::ifstream in("/sys/kernel/mm/transparent_hugepage/enabled");
+  std::string word;
+  while (in >> word) {
+    if (word.size() > 2 && word.front() == '[' && word.back() == ']') {
+      return word.substr(1, word.size() - 2);
+    }
+  }
+  return "unknown";
+}
+
 v2::GetResourceStatusResponse Status(const std::string &address) {
   auto stub = v2::Control::NewStub(
       grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
@@ -144,11 +156,12 @@ TEST(StrictBudgetTest, RefusesInsteadOfBeingKilledAndAccountsEveryByte) {
   EXPECT_EQ(events.at("oom_kill"), 0u);
   ASSERT_TRUE(daemon->Alive());
   std::printf("[strict budget] %u rules, refused: %s; used %.1f MiB, admitted %.1f, baseline %.1f, "
-              "unattributed %.1f, events max %llu\n",
+              "unattributed %.1f, events max %llu, THP %s\n",
               loaded, refused.message.c_str(), at.used_bytes() / 1048576.0,
               at.admitted_bytes() / 1048576.0, at.baseline_bytes() / 1048576.0,
               at.unattributed_bytes() / 1048576.0,
-              static_cast<unsigned long long>(events.count("max") ? events.at("max") : 0));
+              static_cast<unsigned long long>(events.count("max") ? events.at("max") : 0),
+              ThpMode().c_str());
   daemon->Shutdown();
 }
 

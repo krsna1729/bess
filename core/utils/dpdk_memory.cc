@@ -379,6 +379,10 @@ class FallbackHeap {
       PLOG(ERROR) << "mmap of " << Mb(chunk) << " for " << kFallbackHeap;
       throw std::bad_alloc();
     }
+    // The tables keep transparent hugepages where bessd confines THP to
+    // advised memory (runtime::ConfineThpToAdvised, RT-1). Advice only: a
+    // host whose THP is "never" ignores it, and a failure costs only that.
+    (void)madvise(va, chunk, MADV_HUGEPAGE);
     // DPDK clears the chunk as it adds it, so all of it is resident; what
     // no block uses goes back at once, but for the first and last pages
     // (the free element's header). Under heap_mu: the chunk is allocatable

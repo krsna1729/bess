@@ -228,6 +228,39 @@ TEST(DpdkMemoryTest, FallbackHeapOnlyWhereAllowed) {
   DpdkFree(p);
 }
 
+// The VmFlags of the mapping in /proc/self/smaps that holds `p`.
+std::string VmFlagsOf(const void *p) {
+  std::ifstream smaps("/proc/self/smaps");
+  const auto at = reinterpret_cast<uintptr_t>(p);
+  bool inside = false;
+  std::string line;
+  while (std::getline(smaps, line)) {
+    uintptr_t start = 0, end = 0;
+    if (std::sscanf(line.c_str(), "%lx-%lx ", &start, &end) == 2) {
+      inside = start <= at && at < end;
+    } else if (inside && line.rfind("VmFlags:", 0) == 0) {
+      return line;
+    }
+  }
+  return "";
+}
+
+// RT-1: bessd confines THP to advised memory under THP "always", so the
+// fallback heap, which holds the tables under --no-huge, advises its chunks.
+TEST(DpdkMemoryTest, FallbackHeapChunksAskForTransparentHugepages) {
+  bess::utils::MemoryNode();
+  if (rte_eal_has_hugepages()) {
+    GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
+  }
+  if (!std::ifstream("/sys/kernel/mm/transparent_hugepage/enabled")) {
+    GTEST_SKIP() << "no THP in this kernel";
+  }
+  void *p = DpdkAllocate(kMB, 64, FallbackSocket(kMB));
+  ASSERT_NE(p, nullptr);
+  EXPECT_NE(VmFlagsOf(p).find(" hg"), std::string::npos) << VmFlagsOf(p);
+  DpdkFree(p);
+}
+
 // BP-3: DpdkFree gives "bess-normal" pages back under BESS's heap lock, which
 // every allocation able to reach that heap holds. A create placed there
 // takes it; then, while one thread allocates, writes and frees tables there,

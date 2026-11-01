@@ -2,10 +2,19 @@
 
 #include "runtime/malloc_policy.h"
 
+#include <fcntl.h>
 #include <malloc.h>
+#include <sys/prctl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+
+// Linux 6.18, "prctl: extend PR_SET_THP_DISABLE to optionally exclude
+// VM_HUGEPAGE" (David Hildenbrand): older headers lack it.
+#ifndef PR_THP_DISABLE_EXCEPT_ADVISED
+#define PR_THP_DISABLE_EXCEPT_ADVISED (1 << 1)
+#endif
 
 namespace bess::runtime {
 
@@ -22,6 +31,31 @@ void Trim() noexcept {
 }  // namespace
 
 void CapMallocArenas() noexcept { mallopt(M_ARENA_MAX, kMallocArenas); }
+
+std::string_view ThpModeOf(std::string_view enabled) noexcept {
+  const size_t open = enabled.find('[');
+  const size_t close = enabled.find(']', open);
+  if (open == std::string_view::npos || close == std::string_view::npos) {
+    return {};
+  }
+  return enabled.substr(open + 1, close - open - 1);
+}
+
+ThpConfinement ConfineThpToAdvised() noexcept {
+  char text[128];
+  ssize_t got = -1;
+  const int fd = open("/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    got = read(fd, text, sizeof(text));
+    close(fd);
+  }
+  if (got <= 0 || ThpModeOf({text, static_cast<size_t>(got)}) != "always") {
+    return ThpConfinement::kNotNeeded;
+  }
+  return prctl(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0) == 0
+             ? ThpConfinement::kConfined
+             : ThpConfinement::kRefused;
+}
 
 void NoteReleasedBytes(size_t bytes) noexcept {
   released_bytes.fetch_add(bytes, std::memory_order_relaxed);
