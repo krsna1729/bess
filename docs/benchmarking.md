@@ -319,6 +319,7 @@ tests.
 is how a 2x "regression" was once written up that was nothing but the build (F.floor read 3.7-4.0 on
 `build/fast` against 1.91 on `build/perf-release`). A build may also name a tree, its build directory and
 bessd flags, comma-separated: `current:<tree>:<builddir>:<flags>`, or a binary and flags: `name=<bessd>[,flag...]`.
+The binary may be a copy under any name (`bessd.parent`): a round stops its daemon by the pid it wrote (`-i`).
 The same binary under different flags is then two builds, paired like any others (D-126 compared
 `current:<tree>:build/fast` with `current:<tree>:build/fast:--simd_width=256`). master is an archival snapshot of
 upstream and is not a build `live_perf` drives; the master comparisons in D-092 to D-127 were made with the Python

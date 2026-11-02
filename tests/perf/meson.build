@@ -1,5 +1,5 @@
 # The live performance clients, on the C++ SDK alone (no meson tests: they
-# need a bessd on isolated CPUs).
+# need a bessd on isolated CPUs; daemon_stop_test below needs none).
 # live_perf (D-138): classified live performance tests; starts its own bessd
 # per round (sudo -n).
 live_perf = executable(
@@ -18,3 +18,13 @@ live_transaction_bench = executable(
   include_directories: include_directories('.'),
   dependencies: [bess_sdk_dep],
 )
+# How live_perf stops a round's bessd (daemon_stop.h), against a stand-in
+# daemon.
+perf_daemon_stop_test = executable(
+  'perf_daemon_stop_test',
+  'daemon_stop_test.cc',
+  implicit_include_directories: false,
+  include_directories: include_directories('.'),
+  dependencies: [gtest_dep, dependency('gtest_main', method: 'pkg-config')],
+)
+test('perf_daemon_stop_test', perf_daemon_stop_test)
