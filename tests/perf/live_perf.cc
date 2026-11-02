@@ -64,6 +64,7 @@
 #include <vector>
 
 #include "bess/sdk/client.h"
+#include "daemon_stop.h"
 #include "placement_check.h"
 #include "schema_types.h"
 
@@ -1418,9 +1419,8 @@ std::map<std::string, Sample> RunRound(const BuildSpec &spec, const std::vector<
     if (o.control_cpu) {
       // Every daemon thread not pinned to one CPU (main, gRPC, DPDK service
       // threads) onto the control CPU; workers pin themselves.
-      std::ifstream pf(pidfile);
-      long pid = 0;
-      if (!(pf >> pid) || pid <= 0) {
+      const pid_t pid = bess::perf::PidfilePid(pidfile);
+      if (pid == 0) {
         throw std::runtime_error("no daemon pid in " + pidfile);
       }
       for (const auto &task : fs::directory_iterator("/proc/" + std::to_string(pid) + "/task")) {
@@ -1449,18 +1449,10 @@ std::map<std::string, Sample> RunRound(const BuildSpec &spec, const std::vector<
       out[t.name].error = std::string("error: ") + e.what();
     }
   }
-  const std::string pattern = "bessd .* -p " + std::to_string(port) + " ";
-  Run({"sudo", "-n", "pkill", "-f", pattern});
-  // Up to 10 s for a clean exit, then SIGKILL: a bessd stuck in shutdown
-  // must not hang the run.
-  int status = 0;
-  for (int i = 0; i < 100 && waitpid(daemon, &status, WNOHANG) == 0; i++) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (i == 99) {
-      Run({"sudo", "-n", "pkill", "-KILL", "-f", pattern});
-      waitpid(daemon, &status, 0);
-    }
-  }
+  // By the pid bessd wrote, not by its name (daemon_stop.h).
+  bess::perf::StopDaemon(daemon, pidfile, [](pid_t pid, int sig) {
+    Run({"sudo", "-n", "kill", "-" + std::to_string(sig), std::to_string(pid)});
+  });
   Run({"sudo", "-n", "rm", "-f", pidfile});
   return out;
 }
