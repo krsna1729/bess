@@ -32,10 +32,16 @@ constexpr size_t kMB = size_t{1} << 20;
 constexpr size_t kPage = 4096;  // the fallback heap's page size
 constexpr const char *kFallbackHeap = "bess-normal";
 // Fallback heap growth (D-198): chunks of at least 64 MiB, each twice the
-// previous one up to 1 GiB, so a large table costs a few memseg lists (DPDK
-// has 128 in all) and a small one does not commit a gigabyte.
+// previous one up to FallbackChunkCap. DPDK writes every page of a chunk as
+// it adds it (malloc_heap_add_external_memory zeroes the whole segment, under
+// the EAL's memory lock), so a chunk's size is the work one growth does under
+// one control call: about 0.6 s per GiB on 4 KiB pages, more under memory
+// pressure. The cap keeps it small (256 MiB) where the fallback heap stays
+// within kChunkLists chunks of it, and grows with the limit past that, so
+// the heap stays within DPDK's 128 memseg lists.
 constexpr size_t kMinChunk = 64 * kMB;
-constexpr size_t kMaxDoubling = 1024 * kMB;
+constexpr size_t kMaxChunk = 256 * kMB;
+constexpr size_t kChunkLists = 64;
 // Headroom over the bytes asked for in a new chunk: the malloc element
 // header and trailer, alignment padding, and the heap's own bookkeeping at
 // the start of the segment. Generous on purpose; it is 64 KiB.
@@ -363,7 +369,8 @@ class FallbackHeap {
     size_t chunk = headroom == Headroom::kPrepaid
                        ? needed
                        : std::max({needed, kMinChunk,
-                                   std::min(last_chunk_ * 2, kMaxDoubling)});
+                                   std::min(last_chunk_ * 2,
+                                            detail::FallbackChunkCap(memory_policy().limit_bytes))});
     try {
       AdmitNormalMemory(chunk);
     } catch (const MemoryRefused &) {
@@ -379,10 +386,6 @@ class FallbackHeap {
       PLOG(ERROR) << "mmap of " << Mb(chunk) << " for " << kFallbackHeap;
       throw std::bad_alloc();
     }
-    // The tables keep transparent hugepages where bessd confines THP to
-    // advised memory (runtime::ConfineThpToAdvised, RT-1). Advice only: a
-    // host whose THP is "never" ignores it, and a failure costs only that.
-    (void)madvise(va, chunk, MADV_HUGEPAGE);
     // DPDK clears the chunk as it adds it, so all of it is resident; what
     // no block uses goes back at once, but for the first and last pages
     // (the free element's header). Under heap_mu: the chunk is allocatable
@@ -396,6 +399,14 @@ class FallbackHeap {
       throw std::bad_alloc();
     }
     ReturnPages(static_cast<char *>(va) + kPage, chunk - 2 * kPage);
+    // The tables keep transparent hugepages where bessd confines THP to
+    // advised memory (runtime::ConfineThpToAdvised, RT-1): the blocks made
+    // resident later (Prefault) get them. Advised only now, after the clear
+    // and the give-back: advised before, DPDK's clear faulted the chunk in
+    // as huge pages with direct compaction (3x slower; 1.9 s for 1 GiB) only
+    // for ReturnPages to drop them. Advice only: a host whose THP is "never"
+    // ignores it, and a failure costs only that.
+    (void)madvise(va, chunk, MADV_HUGEPAGE);
     last_chunk_ = chunk;
     LOG(INFO) << "Normal-page fallback heap " << kFallbackHeap << " grew by "
               << Mb(chunk) << " (" << bytes << " bytes asked for)";
@@ -596,6 +607,10 @@ size_t HugepageCharge(size_t bytes, size_t largest_free, size_t page_size) {
     return 0;  // the heap holds it in pages it has already mapped
   }
   return page_size == 0 ? bytes : RoundUp(bytes, page_size);
+}
+
+size_t FallbackChunkCap(size_t limit_bytes) noexcept {
+  return RoundUp(std::max(kMaxChunk, limit_bytes / kChunkLists), kPage);
 }
 
 void SetNativeHeapIsHugepagesForTest(bool on) noexcept {

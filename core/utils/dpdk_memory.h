@@ -191,6 +191,12 @@ namespace detail {
 // charged (D-198): nothing if the heap's largest free block holds it, else
 // the whole pages the heap must map for it (DPDK grows the heap by pages).
 size_t HugepageCharge(size_t bytes, size_t largest_free, size_t page_size);
+// The largest chunk the "bess-normal" fallback heap grows by, but for a
+// single allocation larger than it: max(256 MiB, limit / 64). DPDK writes
+// every page of a chunk as it adds it, under one control call; the cap
+// bounds that work, and the limit term keeps the heap within DPDK's memseg
+// lists (one per chunk, 128 in all) at large limits.
+size_t FallbackChunkCap(size_t limit_bytes) noexcept;
 // Tests only (D-206): account DPDK's native heap as hugepages (the cap,
 // placement, the spill to the fallback heap when the native heap runs out)
 // so test binaries, whose EAL runs on normal pages, exercise hugepage
