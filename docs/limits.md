@@ -142,7 +142,7 @@ Not reachable as a configuration error, but each one changes behavior.
 | `kDefaultIntervalNs` | 1 s | `stats/event_throttle.h` | at most one event per throttle per interval (e.g. `bess.table_full`) |
 | `kDefaultPacketDataSize` | 2,048 B | `packet.h` | packet data room when `--packet_data_room` is not given |
 | `kMinHeadroom` | 256 slots | `classifier/concurrent_exact.h` | free slots an exact table keeps for deletes in a grace period (D-010); it grows before this runs out |
-| `kMinChunk`, `kMaxDoubling` | 64 MiB, 1 GiB | `utils/dpdk_memory.cc` | normal-page fallback heap growth (D-198): each chunk at least 64 MiB and twice the previous up to 1 GiB, admitted against the memory limit before it is mapped; DPDK allows 128 memseg lists in all |
+| `kMinChunk`, `kMaxChunk`, `kChunkLists` | 64 MiB, 256 MiB, 64 | `utils/dpdk_memory.cc` | normal-page fallback heap growth (D-198): each chunk at least 64 MiB and twice the previous up to max(`kMaxChunk`, limit / `kChunkLists`), or one allocation's size if larger, admitted against the memory limit before it is mapped. DPDK zeroes a whole chunk as it adds it, under one control call (about 0.6 s per GiB), so the cap bounds that work; the limit term keeps the heap within DPDK's 128 memseg lists |
 | `kMaxRules` | 64 | `classifier/small_exact.h` | entries of the small linear exact table (internal callers only) |
 | `kMaxNodes` | 256 buckets | `l2/mac_table.h`, `l2/packed_mac_table.h` | cuckoo displacement search width; past it an insert reports full |
 | `kMaxRetries` | 64 | `l2/packed_mac_table.h` | reader retries while a writer moves an entry; past it the lookup is a miss (L2Forward: default gate, once) |

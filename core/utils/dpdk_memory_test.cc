@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -259,6 +260,45 @@ TEST(DpdkMemoryTest, FallbackHeapChunksAskForTransparentHugepages) {
   ASSERT_NE(p, nullptr);
   EXPECT_NE(VmFlagsOf(p).find(" hg"), std::string::npos) << VmFlagsOf(p);
   DpdkFree(p);
+}
+
+// DPDK writes every page of a chunk as the fallback heap adds it, under one
+// control call and the heap lock, so no growth adds more than
+// FallbackChunkCap (256 MiB without a limit) for small tables: a load of
+// 8 MiB tables over four growths. Doubling to 1 GiB, the fourth was 512 MiB
+// (1 GiB further on: 2.2-5.9 s under one RPC at 1.2M sessions).
+TEST(DpdkMemoryTest, FallbackHeapGrowsByAtMostTheChunkCap) {
+  bess::utils::MemoryNode();
+  if (rte_eal_has_hugepages()) {
+    GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
+  }
+  const int socket = FallbackSocket(kMB);
+  std::vector<void *> tables;
+  size_t heap = GetMemoryStatus().fallback_heap_bytes;
+  size_t growths = 0, largest = 0;
+  while (growths < 4 && tables.size() < 256) {  // 2 GiB at most
+    tables.push_back(DpdkAllocate(8 * kMB, 64, socket));
+    ASSERT_NE(tables.back(), nullptr);
+    const size_t now = GetMemoryStatus().fallback_heap_bytes;
+    if (now != heap) {
+      growths++;
+      largest = std::max(largest, now - heap);
+      heap = now;
+    }
+  }
+  for (void *p : tables) {
+    DpdkFree(p);
+  }
+  EXPECT_EQ(growths, 4u);
+  EXPECT_LE(largest, bess::utils::detail::FallbackChunkCap(0));
+}
+
+TEST(DpdkMemoryTest, FallbackChunkCapKeepsTheHeapWithinItsMemsegLists) {
+  constexpr size_t kGiB = 1024 * kMB;
+  EXPECT_EQ(256 * kMB, bess::utils::detail::FallbackChunkCap(0));
+  EXPECT_EQ(256 * kMB, bess::utils::detail::FallbackChunkCap(3 * kGiB));
+  EXPECT_EQ(256 * kMB, bess::utils::detail::FallbackChunkCap(16 * kGiB));
+  EXPECT_EQ(kGiB, bess::utils::detail::FallbackChunkCap(64 * kGiB));
 }
 
 // BP-3: DpdkFree gives "bess-normal" pages back under BESS's heap lock, which
