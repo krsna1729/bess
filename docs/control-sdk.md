@@ -401,7 +401,9 @@ normal pages are forbidden, is refused with `RESOURCE_EXHAUSTED` (errno
 `ENOMEM`),
 which no SDK retries. Every field is a fact the daemon holds now, never a
 prediction: what a change will cost depends on the resource's own shape (a
-rule's groups, a cascade's removals), so the controller does that arithmetic.
+rule's groups, a cascade's removals), so the controller does that arithmetic;
+the per-table formulas it needs are in
+[limits.md](limits.md#sizing-a-deployment).
 
 A left-out `core` no longer means CPU 0. The field gained presence, so the
 bytes are unchanged but their meaning is not: a client built from the proto
