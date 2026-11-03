@@ -89,7 +89,7 @@ Columns:
 | Router | address families | destination mode: IPv4, IPv6 or both, at least one; next-hop-id mode: no FIB, both families forwarded | `RouterArg.max_ipv4_routes`, `max_ipv6_routes` (D-183) | destination mode: a family is enabled by setting its route capacity; next-hop-id mode takes no capacity | EINVAL "no address family is enabled" (destination); an explicit 0 is refused; in next-hop-id mode a capacity, a non-default `backend` or `flow_hash`, a nonzero `max_groups`, `max_domains` above 1, `domain_attr`, `punt_miss_gate` or `punt_unresolved_gate` is EINVAL "has no FIB", and route and group writes are refused |
 | Router | IPv4 routes; tbl8 groups per domain | 4G − 1; default 256 | `RouterArg.max_ipv4_routes`, `max_ipv4_tbl8s`, `Router::kDefaultIpv4Tbl8s` (`modules/router.h`) | yes | EINVAL "ipv4 capacity exceeds backend limits"; a full table refuses the route write (`kTableFull`) |
 | Router | IPv6 routes; tbl8 groups per domain | 1G − 1 (rte_fib6's rule pool is 2 × routes); default 8,192 | `RouterArg.max_ipv6_routes`, `max_ipv6_tbl8s`, `Router::kDefaultIpv6Tbl8s` (`modules/router.h`) | yes | a full table refuses the route write (`kTableFull`); the transaction changes nothing |
-| Router | IPv6 FIB entry width; memory per domain | 2 B while the largest value (`max_next_hops + max_groups`) and `max_ipv6_tbl8s` are at most 32,767, else 4 B; at 2 B one instance is 32 MiB + 512 B × `max_ipv6_tbl8s` plus the rib | `kMaxTwoByteValue` (`route/route_table.cc`) | follows from the capacities | — (a domain holds no instance while its IPv6 routes are at most ::/0, one from its first other IPv6 route, and two from the next change, live and spare; double the bytes at 4 B. IPv4 likewise holds no rte_lpm/rte_fib until its first route other than /0) |
+| Router | IPv6 FIB entry width; memory per domain | 2 B while the largest value (`max_next_hops + max_groups`) and `max_ipv6_tbl8s` are at most 32,767, else 4 B; at 2 B one instance is 32 MiB + 516 B × `max_ipv6_tbl8s` + 512 B plus the rib (128 B per route; `Fib6Bytes`, `route/route_table.cc:172-177`) | `kMaxTwoByteValue` (`route/route_table.cc`) | follows from the capacities | — (a domain holds no instance while its IPv6 routes are at most ::/0, one from its first other IPv6 route, and two from the next change, live and spare; double the bytes at 4 B. IPv4 likewise holds no rte_lpm/rte_fib until its first route other than /0) |
 | Router | next hops | destination mode: 16M − 1; next-hop-id mode: 4G − 2 | `LpmRouteTable::kMaxValue` (the FIB's 24-bit route value); `Router::kMaxNextHopsWithoutFib` (the 32-bit id) | `max_next_hops` up to the bound | EINVAL "router capacity exceeds backend limits" |
 | Router | next-hop groups | destination mode: 16M − 1 − `max_next_hops`; next-hop-id mode: none | `LpmRouteTable::kMaxValue` (shares the bound with `max_next_hops`) | `max_groups` up to the bound in destination mode; 0 (the default) registers the empty resource | EINVAL "router capacity exceeds backend limits"; a nonzero value in next-hop-id mode is EINVAL |
 | Router | route domains | destination mode: 16M; next-hop-id mode: 1 | `route::kMaxRouteDomains` | `max_domains` up to the bound in destination mode | EINVAL |
@@ -168,3 +168,99 @@ configuration cannot reach them.
 | Handoff ring item; capacity | 64 B; 2^30 − 1 | `kMaxItemBytes`, `kMaxCapacity` (`dataplane/handoff.h`) |
 | Cuckoo displacement path | 3 | `CuckooMap::kMaxCuckooPath` |
 | NAT migration step | 256 slots | `kMaxMigrateSlots` (`nat/nat.h`) |
+
+## Sizing a deployment
+
+What a bessd needs from its memory limit, and how to check a sizing while it
+runs. Byte counts are x86-64's (DPDK's 64-byte cache line): each formula is the
+code cited next to it, and the test named beside it is what holds the code to
+it. Everything a module sizes from its arguments is admitted before it is
+allocated and reported per module (D-198, `framework/memory_scope.h:19-38`).
+
+### The budget
+
+A creation is admitted while `used + bytes` (allocated DPDK heap memory not yet
+touched counted as used) is at most `limit − reserve`; an erase-only
+transaction may use half the reserve (`AllowedBytes`, `AdmitNormalMemory`,
+`utils/dpdk_memory.cc:474-537`). Past it the creation or transaction is refused
+(RESOURCE_EXHAUSTED) and nothing of it is built. Tests:
+`DpdkMemoryTest.AdmitNormalMemoryRefusesPastLimitLessReserve` and `.HeadroomLevels`
+(`core/utils/dpdk_memory_test.cc:88`, `:111`); end to end in a 512 MiB cgroup,
+`StrictBudgetTest.RefusesInsteadOfBeingKilledAndAccountsEveryByte`
+(`tests/live/strict_budget_test.cc:120`). A deployment therefore fits when
+
+    limit ≥ baseline + packet pool + Σ tables + growth + reserve
+
+| Term | What it is | How to get it | Code; test |
+|---|---|---|---|
+| baseline | the working set when the control server starts that nothing admitted: binary, libraries, EAL, gRPC, thread stacks | `baseline_bytes` of a bessd started with the deployment's flags (recorded once, at that start) | `RecordMemoryBaseline` (`control/api_v2.cc:967-974`, called at `api_server.cc:87`); `StrictBudgetTest` checks it is reported (`strict_budget_test.cc:137`) |
+| packet pool | the `--buffers` packets | row `bessd` / `packet_pool` | what `rte_mempool_op_calc_mem_size_default` gives for the pool, admitted then mapped (`packet_pool.cc:340-345`, `:371-374`) |
+| Σ tables | every module's tables at their entry counts | the formulas below, one per module row | each formula's row below |
+| transaction records | the request-id window | at most 4 MiB, row `bessd` / `transaction_records` | `DataplaneTransactions::kMaxRecordBytes` (`control/dataplane_transactions.h:52`); `DataplaneTransactionsWindowTest.TheWindowIsBoundedInBytes` (`core/control/dataplane_transactions_test.cc:489`) |
+| growth | a growing table builds its replacement while the old one is still published, and the old one's bytes come back after its grace period: both are held | the formula of the largest table that can grow next, at its next size | ExactMatch (`modules/exact_match.cc:249-253`, `:301`), WildcardMatch mask tables (`classifier/concurrent_masked.cc:145-166`) |
+| fallback heap chunk | tables on the normal-page fallback heap (`fallback_heap_bytes` > 0): the heap grows by chunks admitted whole before they are mapped, 64 MiB doubling up to `max(256 MiB, limit / 64)`, or one allocation's size if larger; DPDK writes every page of a chunk as it adds it (DPDK 25.11 `lib/eal/common/malloc_heap.c:1299`, measured in a51e1364) | add `max(256 MiB, limit / 64)` to growth | `utils/dpdk_memory.cc:385-389`, `FallbackChunkCap` `:628-630`; `DpdkMemoryTest.FallbackHeapGrowsByAtMostTheChunkCap`, `.FallbackChunkCapKeepsTheHeapWithinItsMemsegLists` (`dpdk_memory_test.cc:271`, `:297`) |
+| reserve | room for what is not admitted (glibc, gRPC, protobuf) | `--mem_reserve_mb`, else `min(max(128 MiB, limit / 16), limit / 2)` | `runtime/startup.cc:525-532`; `StartupTest.MemoryPolicyLimitAndReserve` (`core/runtime/startup_test.cc:255`) |
+
+With hugepage backing, a table is admitted against the hugepage cap
+(`--mem_hugepage_mb` or the cgroup's `hugetlb.<size>.max`) instead of the
+limit, past the cap on normal pages against the limit, and against the limit as
+well when hugepages are charged to `memory.max` (`hugetlb_charged`)
+(`framework/memory_scope.h:26-31`; `DpdkMemoryTest.AdmitTableFollowsTheBacking`,
+`.ChargedHugepagesAreAdmittedAgainstTheLimit`, `dpdk_memory_test.cc:359`, `:419`).
+The rows' `hugepage_bytes` then size the cap and the rest sizes the limit.
+
+### Table formulas
+
+P(n) is n rounded up to a power of two; ⌈x⌉₁₆ is x rounded up to a multiple of
+16.
+
+| Structure (who uses it) | Bytes | Code | Test |
+|---|---|---|---|
+| rte_hash of n keys of K bytes | H(n, K) = 8·P(n) (buckets of 8 entries, 64 B each) + ⌈8 + K⌉₁₆·(n + 1) (key store) + 4·P(n + 1) (free-slot ring) | `detail::RteHashBytes` (`classifier/rte_hash_exact.h:51-56`); the bucket term doubles where DPDK's cache line is 128 B | measured against the DPDK heaps: `RteHashBackendMemoryTest.AllocationFitsTheEstimateOnThisCacheLine` (`core/classifier/rte_hash_exact_test.cc:299`, at most H + 16 KiB) |
+| exact table of capacity C (ExactMatch `rules`; each WildcardMatch mask; `SharedExactIndex`; the `SharedFlowTable` directory) | E(K, C) = H(max(C, 8), K) + 4·C (a held position per key slot, D-208) + 4,096 (256 grace periods of 16 B) | `ConcurrentExactTable::Bytes` (`classifier/concurrent_exact.cc:86-91`), `HeldBytes` (`classifier/concurrent_exact.h:415-418`) | measured against the DPDK heaps: `ConcurrentExactTableTest.CreateTakesWhatBytesCountsAndNoDeferQueue` (`core/classifier/concurrent_exact_test.cc:839`: between E and E + 16 KiB, C = 196,608, K = 12) |
+| capacity for n keys | C = CapacityFor(n): the smallest ¾·2^k, k ≥ 10, with ¾·2^k − max(¾·2^k / 20, 256) ≥ n + 1; a table that fills grows to CapacityFor(C), the next ¾·2^k | `classifier/concurrent_exact.cc:163-170`, `Headroom` (`classifier/concurrent_exact.h:240-244`) | `ConcurrentExactTableTest.BytesMatchesCreate` (`concurrent_exact_test.cc:819`) creates at CapacityFor sizes |
+| `SharedExactIndex` of `keys` keys (flow directories; a plugin's index) | E(K, CapacityFor(keys)), fixed at creation | `flow/shared_exact_index.cc:26-29` | as the exact table |
+| WildcardMatch `rules` | 128 KiB (16,384 chunk pointers) + 32 KiB per 1,024 records (one per rule and one for a pending rule; 32 B each: the 24-byte `Rule` rounded to 16; chunks kept while the table lives) + Σ over the masks in use of E(K, CapacityFor(rules with that mask)) + a range chain per ranged key | `RecordArena::Bytes`, `ChunkBytes` (`classifier/record_arena.cc:34-41`, `:56-58`), `Rule` (`classifier/concurrent_masked.h:89-98`), `NewTupleTable` (`classifier/concurrent_masked.cc:117-143`), `Chain::Bytes` (`classifier/concurrent_masked.h:144-147`) | `ConcurrentMaskedTableMemoryTest.GrowthAdmitsTuplesChunksAndChains` (`core/classifier/concurrent_masked_test.cc:1226`): a new mask admits E(K, CapacityFor(1)) and one record chunk |
+| WildcardMatch `results` (with `result_fields`) | 128 KiB + ⌈record size⌉₁₆ × 1,024 per 1,024 records: one per rule and the default result's | `ResultFields::Init` (`framework/table_fields.h:281`), a record per staged rule (`classifier/masked_rule_resource.h:206-216`) | `RecordArenaTest.BytesMatchesConstruction` (`core/classifier/record_arena_test.cc:192`), against the arena's own count |
+| Router IPv4, `rte_lpm`, per route domain from its first route other than /0 | 64 MiB + 1 KiB × `max_ipv4_tbl8s` + 8 B × `max_ipv4_routes` | `LpmBytes` (`route/route_table.cc:153-157`) | `RouteTableTest.MemoryCostIsWhatCreateAllocates` (`core/route/route_test.cc:313`), against what the table reports holding |
+| Router IPv4, `rte_fib` | 64 MiB + 2 MiB + 1 KiB × (T + 1) + T / 8 + 64 B × `max_ipv4_routes`, T = `max_ipv4_tbl8s` + 1 rounded up to 64 | `FibBytes` (`route/route_table.cc:163-167`, configured at `:211-217`) | as `rte_lpm` (the test runs both backends) |
+| Router IPv6, `rte_fib6`, per instance (a domain holds one from its first route other than ::/0, two from the next change: live and spare) | 2^24·w + 256·w·(`max_ipv6_tbl8s` + 1) + 4 B × `max_ipv6_tbl8s` + 128 B × `max_ipv6_routes`; w = 2 B or 4 B (row "IPv6 FIB entry width" above) | `Fib6Bytes`, `EntryBytes` (`route/route_table.cc:172-177`, `:568-575`) | `Ipv6RouteTableTest.MemoryCostAndTheTrieAdmissions` (`core/route/route_test.cc:1831`): one instance, then two, against the table's own count |
+| `SlotTable` of `capacity` ids (a plugin's per-id records) | (capacity + 1) × 9 B + 1,024 × stride per 1,024 live objects (stride: max(object size, 8 B) rounded up to max(its alignment, 8 B)) | `dataplane/slot_table.h:74-78`, `ObjectSlab::Stride`, `chunk_bytes` (`utils/dpdk_slab.h:80-104`) | `SlotTableTest.BytesMatchesTheConstructor` (`core/dataplane/slot_table_test.cc:42`), `ObjectSlabTest.CreateCostsNothingAndBytesMatches` (`core/utils/dpdk_slab_test.cc:164`), against their own counts |
+
+A structure with no closed form per entry -- a Meter's index and meter states,
+which grow per edit (`MeterSet::Bytes` bounds one edit, `meter/meter_set.h:229-239`)
+-- is sized from its row: its `admitted_bytes` at two entry counts, and the
+difference per entry.
+
+### Checking a sizing at runtime
+
+`GetResourceStatus.memory` (`protobuf/control_v2.proto:811-853`, filled at
+`control/api_v2.cc:1114-1159`):
+
+- `modules`: one row per module and resource. `admitted_bytes` is what the
+  formula above gives for that table at its size; `hugepage_bytes`,
+  `normal_bytes` and `glibc_bytes` say where it landed (D-206), `current_bytes`
+  what the objects hold now. A row above its formula is a cost this page does
+  not list.
+- `admitted_bytes`: the rows' `admitted_bytes` summed (`api_v2.cc:1141-1155`).
+- `baseline_bytes`: the baseline term.
+- `limit_bytes`, `limit_source`, `reserve_bytes`: the policy the budget uses.
+- `used_bytes`: `memory.current` less `inactive_file`, else RSS.
+- `available_bytes`: `limit − reserve − used`, floored at 0
+  (`api_v2.cc:1124-1126`): room for the next creation, so it must stay above the
+  growth term.
+- `unattributed_bytes`: `used` less the rows' glibc and normal-page bytes (and
+  hugepage bytes when charged) less the baseline (`api_v2.cc:955-963`,
+  `:1157-1159`): what no row explains, such as a module that allocates without
+  admitting, or the free bytes glibc keeps (trimmed past a quarter of the
+  reserve, `runtime/malloc_policy.h:68-74`). `StrictBudgetTest` holds it, less
+  the heaps' resident-minus-allocated bytes, below 64 MiB in its 512 MiB cgroup
+  (`strict_budget_test.cc:29-47`, `:199`).
+- `dpdk_heap_resident_bytes` − `dpdk_heap_alloc_bytes`, and the fallback heap's
+  pair: that heap's share of `unattributed_bytes`, positive for freed blocks
+  still resident, negative for allocated bytes not touched yet.
+- `refusals`: creations refused for memory since startup; each was a
+  RESOURCE_EXHAUSTED to its caller.
+- `hugepage_cap_bytes`, `hugepage_table_bytes`, `spilled_bytes`: the hugepage
+  cap, what is admitted against it, and what landed on normal pages because the
+  hugepages ran out before the cap.
