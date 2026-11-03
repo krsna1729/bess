@@ -327,9 +327,9 @@ struct AdmittedGlibcAllocator {
 int FallbackSocket(size_t bytes);
 
 // For a DPDK library allocation that failed for lack of memory where no
-// fallback applies (the RCU defer queues of rte_hash, rte_lpm and rte_fib,
-// and rte_hash's tailq entries, which DPDK takes from its native heaps,
-// never the fallback heap): throws
+// fallback applies (the RCU defer queues of rte_lpm and rte_fib, and
+// rte_hash's tailq entries, which DPDK takes from its native heaps, never
+// the fallback heap): throws
 // MemoryRefused for about `bytes` -- kHugepagesExhausted with hugepages,
 // kNormalLimit when DPDK's fixed --no-huge heap is full.
 [[noreturn]] void RefuseDpdkMemory(size_t bytes);

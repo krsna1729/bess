@@ -44,16 +44,15 @@ inline std::string UniqueRteHashName() {
 // buckets (one per 8 entries, entries rounded up to a power of two; 64 B of
 // fields in a cache-aligned struct, so 128 B where DPDK's cache line is 128,
 // as on generic arm64), the key store (one slot more than entries, each the
-// key and an 8-byte data pointer, 16-byte aligned), the free-slot ring (4 B
-// per slot, a power of two) and the RCU defer queue (24 B per entry, a power
-// of two; counted whether or not the table attaches one). An estimate: the
-// per-lcore caches and extendable buckets, off by default, are not counted.
+// key and an 8-byte data pointer, 16-byte aligned) and the free-slot ring
+// (4 B per slot, a power of two). An estimate: the per-lcore caches and
+// extendable buckets, off by default, are not counted; nor is an RCU defer
+// queue (24 B per entry), which no BESS table attaches (D-208).
 inline constexpr size_t kRteHashBucketBytes = RTE_ALIGN_CEIL(64, RTE_CACHE_LINE_SIZE);
 inline size_t RteHashBytes(uint32_t entries, uint32_t key_len) {
   const size_t n = entries;
   return kRteHashBucketBytes * rte_align64pow2(n) / 8 +
-         RTE_ALIGN_CEIL(8 + key_len, 16) * (n + 1) + 4 * rte_align64pow2(n + 1) +
-         24 * rte_align64pow2(n + 2);
+         RTE_ALIGN_CEIL(8 + key_len, 16) * (n + 1) + 4 * rte_align64pow2(n + 1);
 }
 
 // rte_hash_create under the memory policy (D-029, D-206). Under --no-huge
@@ -160,8 +159,7 @@ class RteHashPositionBackend {
   [[nodiscard]] bool valid() const noexcept { return table_ != nullptr; }
 
   // Memory (D-198): what the constructor allocates, the rte_hash for
-  // max(reserve, 8) keys (detail::RteHashBytes, an estimate that also counts
-  // the defer queue this table does not attach). Fixed: add_key never grows
+  // max(reserve, 8) keys (detail::RteHashBytes). Fixed: add_key never grows
   // it (-ENOSPC).
   [[nodiscard]] static size_t Bytes(uint32_t key_len, uint32_t reserve = 64) {
     return detail::RteHashBytes(std::max(reserve, 8u), key_len);

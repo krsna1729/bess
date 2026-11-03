@@ -60,13 +60,11 @@ TEST(MaskedRuleMemoryTest, ATupleTableDpdkCannotAllocateIsRefusedNotFull) {
   ASSERT_EQ(engine.Apply(std::vector<Op>{Upsert(0xff, 1)}).outcome,
             Outcome::kApplied);
 
-  // DPDK's heap full but for `room`: enough for its small bookkeeping
-  // (tailq entries, an RCU config), not for a ring. A new mask's rte_hash
-  // then goes to the fallback heap, and its RCU defer queue, which DPDK
-  // allocates on SOCKET_ID_ANY (never the fallback heap), fails.
-  void *room = rte_malloc(nullptr, 2048, 0);
+  // DPDK's heap full. A new mask's rte_hash then goes to the fallback heap,
+  // and its tailq entry, which DPDK allocates from its native heaps (never
+  // the fallback heap), fails. (Its held-slot rings take the fallback heap,
+  // as DpdkAllocate's tables do under --no-huge; D-208.)
   void *spare = rte_malloc(nullptr, size_t{4} << 20, 0);
-  ASSERT_NE(room, nullptr);
   ASSERT_NE(spare, nullptr);
   std::vector<void *> filler;  // never freed (see the top of the file)
   for (size_t size = size_t{1} << 30; size >= 64;) {
@@ -76,7 +74,6 @@ TEST(MaskedRuleMemoryTest, ATupleTableDpdkCannotAllocateIsRefusedNotFull) {
       size /= 2;
     }
   }
-  rte_free(room);
 
   const Op rule = Upsert(0xf0, 0x10);
   try {

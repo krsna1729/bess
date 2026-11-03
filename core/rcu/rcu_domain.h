@@ -112,6 +112,19 @@ class RcuDomain {
   // `token` was started?
   bool IsComplete(GracePeriod token) const;
 
+  // StartGracePeriod and IsComplete for a writer that may run on a packet
+  // worker (ConcurrentExactTable's held key slots, D-208): no lock, no
+  // allocation, never a wait -- starting one is an atomic add on the QSBR
+  // token; checking one loads the readers' counters and may store the
+  // acknowledged token (rte_rcu_qsbr_check without waiting). Not counted in
+  // Stats(), as the grace periods DPDK's own defer queues start on this
+  // variable are not. IsCompleteLockFree is also the check ReclaimReady
+  // makes under its lock.
+  GracePeriod StartGracePeriodLockFree() noexcept {
+    return rte_rcu_qsbr_start(qsbr_);
+  }
+  bool IsCompleteLockFree(GracePeriod token) const noexcept;
+
   // Blocks until the current grace period completes. Control side only.
   void Synchronize();
 
@@ -208,10 +221,6 @@ class RcuDomain {
   void RetireErased(GracePeriod token, void *object, void *context,
                     void (*destroy)(void *object, void *context),
                     std::atomic<size_t> *outstanding = nullptr);
-
-  // Lock-free, stats-free grace-period check: safe to call while holding
-  // retire_mutex_ (which ReclaimReady does).
-  bool IsGracePeriodComplete(GracePeriod token) const;
 
   void *qsbr_mem_ = nullptr;
   struct rte_rcu_qsbr *qsbr_ = nullptr;

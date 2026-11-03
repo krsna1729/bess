@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -13,8 +14,12 @@
 #include <thread>
 #include <vector>
 
+#include <rte_eal.h>
+
+#include "classifier/rte_hash_exact.h"
 #include "framework/memory_scope.h"
 #include "runtime/runtime_state.h"
+#include "utils/dpdk_memory.h"
 namespace bess::classifier {
 namespace {
 
@@ -176,13 +181,6 @@ TEST(ConcurrentExactTableTest, ReportsFullAndReusesErasedSlots) {
   }
 }
 
-// DPDK contract (rte_hash LF with QSBR in defer-queue mode), deterministically:
-// a deleted key's slot is not handed
-// back while a registered reader that was online before the delete has not
-// reported quiescence -- that reader may have matched the key and be about
-// to load its value (DPDK's LF lookup compares the key, then loads the
-// value; a reused slot would give it another key's value). Once the reader
-// is quiescent, the slot comes back.
 // DPDK behaviour G1.2b relies on (D-007): rte_hash_add_key_data on a key
 // that is already present updates its value in place and never fails, even
 // when the table has no free slot. ExactRuleResource::Publish depends on it.
@@ -203,11 +201,11 @@ TEST(ConcurrentExactTableTest, UpsertOfAPresentKeySucceedsWhenFull) {
   }
 }
 
-// DPDK behaviour relied on (D-007): with the default defer-queue size
-// (dq_size = the table's key slots) rte_hash_del_key never falls back to
-// rte_rcu_qsbr_synchronize(), which it does when the defer queue is full --
-// every outstanding entry is one deleted slot, so the queue cannot fill.
-// Deleting every key with a stalled reader must therefore return promptly.
+// Relied on since D-007, kept by D-208: a delete never waits for readers.
+// No RCU is attached to the rte_hash, so rte_hash_del_key has no path to
+// rte_rcu_qsbr_synchronize() (DPDK's fallback when its defer queue fills);
+// the table holds the slot instead. Deleting every key with a stalled
+// reader must therefore return promptly.
 TEST(ConcurrentExactTableTest, DeletesNeverWaitForStalledReaders) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   constexpr rcu::ReaderId kReader = 29;
@@ -239,6 +237,260 @@ TEST(ConcurrentExactTableTest, DeletesNeverWaitForStalledReaders) {
   t->ReclaimAll();
 }
 
+// D-208: a delete storm with a reader stalled -- online, never quiescent --
+// holds every deleted slot and waits for nothing: every slot of a full table,
+// three times kMaxDeleteBatches, so most deletes join the newest batch. A
+// delete that waited would never return (the reader never quiesces), so the
+// count of deletes that returned is the check. The held slots then exhaust
+// the key store: an add is refused full, counted, and not waited on either.
+// Once the reader quiesces, every held slot is freed.
+TEST(ConcurrentExactTableTest, DeleteStormWithAStalledReaderHoldsEverySlotAndNeverWaits) {
+  using T = ConcurrentExactTable;
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  auto t = MakeTable(T::CapacityFor(0));
+  std::vector<uint32_t> ids;
+  for (uint32_t id = 1; t->Upsert(B(K(id)), V(id)) != T::UpsertResult::kFull; id++) {
+    ids.push_back(id);
+  }
+  ASSERT_EQ(t->capacity(), ids.size()) << "every slot is reachable (D-010)";
+  ASSERT_GT(ids.size(), size_t{T::kMaxDeleteBatches});
+  const T::DeferStats before = t->defer_stats();
+  constexpr rcu::ReaderId kReader = 30;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+
+  size_t returned = 0;
+  for (const uint32_t id : ids) {
+    ASSERT_TRUE(t->Erase(B(K(id))));
+    returned++;
+  }
+  EXPECT_EQ(ids.size(), returned);
+  T::DeferStats s = t->defer_stats();
+  EXPECT_EQ(ids.size(), s.held);
+  EXPECT_EQ(before.freed, s.freed);
+  EXPECT_EQ(ids.size() - T::kMaxDeleteBatches, s.merged - before.merged);
+  EXPECT_EQ(0u, t->size());
+  EXPECT_EQ(ids.size(), t->slots_in_use());
+
+  EXPECT_EQ(T::UpsertResult::kFull, t->Upsert(B(K(100000)), V(100000)));
+  EXPECT_EQ(T::InsertResult::Status::kFull,
+            t->InsertIfAbsent(B(K(100001)), V(100001)).status);
+  t->ReclaimAll();
+  s = t->defer_stats();
+  EXPECT_EQ(before.refused_full + 2, s.refused_full);
+  EXPECT_EQ(ids.size(), s.held) << "a slot was freed while the reader stalled";
+
+  domain.Quiescent(kReader);
+  t->ReclaimAll();
+  s = t->defer_stats();
+  EXPECT_EQ(0u, s.held);
+  EXPECT_EQ(ids.size(), s.freed - before.freed);
+  EXPECT_EQ(0u, t->slots_in_use());
+  EXPECT_EQ(T::UpsertResult::kInserted, t->Upsert(B(K(100000)), V(100000)));
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+}
+
+// D-208: past kMaxDeleteBatches grace periods in flight, a delete joins the
+// newest batch, counted, and that batch then waits for the delete's own,
+// later grace period -- never an earlier one. Reader A is online for every
+// delete; reader B comes online after the batch ring filled and before the
+// deletes that join it. Once A quiesces, every batch but the newest is free
+// (B was offline when they started); the newest -- the ring's last delete
+// and the joiners -- waits for B.
+TEST(ConcurrentExactTableTest, DeletesPastTheBatchRingJoinTheNewestUnderTheirOwnGracePeriod) {
+  using T = ConcurrentExactTable;
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  constexpr uint32_t kJoiners = 10;
+  constexpr uint32_t kDeletes = T::kMaxDeleteBatches + kJoiners;
+  auto t = MakeTable(T::CapacityFor(kDeletes));
+  for (uint32_t id = 0; id < kDeletes; id++) {
+    ASSERT_EQ(T::UpsertResult::kInserted, t->Upsert(B(K(id)), V(id)));
+  }
+  const T::DeferStats before = t->defer_stats();
+  constexpr rcu::ReaderId kA = 31, kB = 32;
+  ASSERT_TRUE(domain.Register(kA).has_value());
+  ASSERT_TRUE(domain.Register(kB).has_value());
+  domain.Online(kA);
+  for (uint32_t id = 0; id < T::kMaxDeleteBatches; id++) {
+    ASSERT_TRUE(t->Erase(B(K(id))));
+  }
+  EXPECT_EQ(before.merged, t->defer_stats().merged);
+  domain.Online(kB);
+  for (uint32_t id = T::kMaxDeleteBatches; id < kDeletes; id++) {
+    ASSERT_TRUE(t->Erase(B(K(id))));
+  }
+  T::DeferStats s = t->defer_stats();
+  EXPECT_EQ(kJoiners, s.merged - before.merged);
+  EXPECT_EQ(kDeletes, s.held);
+
+  domain.Quiescent(kA);
+  t->ReclaimAll();
+  s = t->defer_stats();
+  EXPECT_EQ(T::kMaxDeleteBatches - 1, s.freed - before.freed);
+  EXPECT_EQ(kJoiners + 1, s.held)
+      << "the newest batch was freed on a grace period older than its deletes'";
+
+  domain.Quiescent(kB);
+  t->ReclaimAll();
+  s = t->defer_stats();
+  EXPECT_EQ(0u, s.held);
+  EXPECT_EQ(kDeletes, s.freed - before.freed);
+  EXPECT_EQ(0u, t->slots_in_use());
+  domain.Offline(kA);
+  domain.Offline(kB);
+  domain.Unregister(kA);
+  domain.Unregister(kB);
+}
+
+// D-208's bound on one delete, the call a worker makes: an Erase frees at
+// most kFreeBatch held slots and checks at most kFreeBatch + 1 grace
+// periods, however many slots are held or ready. With a reader stalled it
+// checks one (the oldest) and frees none; once 512 are ready, each Erase
+// frees exactly min(kFreeBatch, ready left).
+TEST(ConcurrentExactTableTest, AnEraseFreesAtMostKFreeBatchAndChecksAtMostOneMore) {
+  using T = ConcurrentExactTable;
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  constexpr uint32_t kKeys = 4 * T::kMaxDeleteBatches;  // most deletes merge
+  auto t = MakeTable(T::CapacityFor(kKeys));
+  for (uint32_t id = 0; id < kKeys; id++) {
+    ASSERT_EQ(T::UpsertResult::kInserted, t->Upsert(B(K(id)), V(id)));
+  }
+  constexpr rcu::ReaderId kReader = 34;
+  ASSERT_TRUE(domain.Register(kReader).has_value());
+  domain.Online(kReader);
+
+  T::DeferStats last = t->defer_stats();
+  for (uint32_t id = 0; id < kKeys / 2; id++) {  // stalled: nothing ready
+    ASSERT_TRUE(t->Erase(B(K(id))));
+    const T::DeferStats s = t->defer_stats();
+    EXPECT_EQ(0u, s.freed - last.freed) << "erase " << id;
+    EXPECT_EQ(id == 0 ? 0u : 1u, s.checks - last.checks) << "erase " << id;
+    last = s;
+  }
+
+  domain.Quiescent(kReader);  // the 512 held are ready; later deletes are not
+  uint64_t ready = kKeys / 2;
+  for (uint32_t id = kKeys / 2; id < kKeys; id++) {
+    ASSERT_TRUE(t->Erase(B(K(id))));
+    const T::DeferStats s = t->defer_stats();
+    const uint64_t freed = s.freed - last.freed;
+    const uint64_t checks = s.checks - last.checks;
+    EXPECT_EQ(std::min<uint64_t>(T::kFreeBatch, ready), freed) << "erase " << id;
+    EXPECT_LE(checks, uint64_t{T::kFreeBatch} + 1) << "erase " << id;
+    if (freed == 0) {
+      EXPECT_EQ(1u, checks) << "erase " << id;
+    }
+    ready -= freed;
+    last = s;
+  }
+  EXPECT_EQ(0u, ready);
+  EXPECT_EQ(kKeys / 2, t->defer_stats().held);
+  domain.Quiescent(kReader);
+  t->ReclaimAll();
+  EXPECT_EQ(0u, t->defer_stats().held);
+  domain.Offline(kReader);
+  domain.Unregister(kReader);
+}
+
+// D-208's one producer at a time, under concurrency: a worker -- an online
+// reader that quiesces between rounds, as a BESS worker does between task
+// invocations -- learns flows and expires them while a control thread erases
+// and re-adds others, both writing one table (kShared: its writer lock
+// serializes them, as SharedFlowTable's lock serializes its directory's
+// writers). Afterwards each delete's slot was freed exactly once: the counts
+// agree, rte_hash's own count of taken slots is the live keys, the table
+// refills to its last slot (none lost), and every key has a slot of its own
+// (none freed twice).
+TEST(ConcurrentExactTableTest, WorkerAndControlDeletesFreeEverySlotExactlyOnce) {
+  using T = ConcurrentExactTable;
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  constexpr uint32_t kWorkerBase = 1u << 24u, kControlBase = 2u << 24u,
+                     kFillBase = 3u << 24u;
+  constexpr uint32_t kWindow = 512, kRounds = 4000, kPerRound = 8;
+  constexpr uint32_t kControlKeys = 2048, kControlOps = 20000;
+  auto made = T::Create(kKeyLen, T::CapacityFor(4096), domain, SOCKET_ID_ANY,
+                        T::Writers::kShared);
+  ASSERT_TRUE(made.has_value()) << made.error();
+  T &t = **made;
+  for (uint32_t i = 0; i < kControlKeys; i++) {
+    ASSERT_EQ(T::UpsertResult::kInserted, t.Upsert(B(K(kControlBase + i)), V(i)));
+  }
+  const T::DeferStats before = t.defer_stats();
+  constexpr rcu::ReaderId kWorker = 33;
+  ASSERT_TRUE(domain.Register(kWorker).has_value());
+  std::atomic<bool> go{false};
+  uint64_t worker_erases = 0, worker_failures = 0;
+  std::thread worker([&] {
+    domain.Online(kWorker);
+    while (!go.load()) {
+    }
+    uint32_t next = 0, oldest = 0;
+    for (uint32_t round = 0; round < kRounds; round++) {
+      for (uint32_t i = 0; i < kPerRound; i++, next++) {
+        const Key key = K(kWorkerBase + next);
+        uint64_t v = 0;
+        worker_failures += t.LookupBatch(B(key), kKeyLen, &v, 1);  // a miss
+        // Full while the control thread's deletes wait for this worker's
+        // quiescent state: report one and retry, as a worker's next round
+        // would.
+        while (t.InsertIfAbsent(B(key), next).status ==
+               T::InsertResult::Status::kFull) {
+          domain.Quiescent(kWorker);
+        }
+      }
+      for (; next - oldest > kWindow; oldest++) {  // expiry
+        worker_failures += !t.Erase(B(K(kWorkerBase + oldest)));
+        worker_erases++;
+      }
+      domain.Quiescent(kWorker);
+    }
+    domain.Offline(kWorker);
+  });
+  go = true;
+  uint64_t control_erases = 0, control_failures = 0;
+  for (uint32_t i = 0; i < kControlOps; i++) {
+    control_failures += !t.Erase(B(K(kControlBase + i)));
+    control_erases++;
+    // Full while deletes wait for the worker's quiescent state; each retry
+    // frees what is ready. The worker never waits on this thread.
+    while (t.Upsert(B(K(kControlBase + kControlKeys + i)), V(i)) ==
+           T::UpsertResult::kFull) {
+    }
+  }
+  worker.join();
+  domain.Unregister(kWorker);
+  EXPECT_EQ(0u, worker_failures);
+  EXPECT_EQ(0u, control_failures);
+
+  // No reader online: every grace period is over.
+  t.ReclaimAll();
+  const T::DeferStats s = t.defer_stats();
+  EXPECT_EQ(0u, s.held);
+  EXPECT_EQ(worker_erases + control_erases, s.freed - before.freed);
+  EXPECT_EQ(t.size(), t.slots_in_use());
+
+  for (uint32_t id = kFillBase; t.Upsert(B(K(id)), V(id)) != T::UpsertResult::kFull; id++) {
+  }
+  EXPECT_EQ(t.capacity(), t.size()) << "a slot was lost";
+  EXPECT_EQ(t.capacity(), t.slots_in_use());
+  std::vector<int> owners(t.capacity(), 0);
+  t.ForEach([&](ConstBytes key, uint64_t) {
+    const int32_t position = rte_hash_lookup(t.dpdk_table(), key.data());
+    ASSERT_GE(position, 0);
+    ASSERT_LT(static_cast<uint32_t>(position), t.capacity());
+    owners[static_cast<size_t>(position)]++;
+  });
+  EXPECT_EQ(std::vector<int>(t.capacity(), 1), owners) << "a slot was freed twice";
+}
+
+// The RCU contract (D-007; the table holds the slot since D-208),
+// deterministically: a deleted key's slot is not handed back while a
+// registered reader that was online before the delete has not reported
+// quiescence -- that reader may have matched the key and be about to load
+// its value (DPDK's LF lookup compares the key, then loads the value; a
+// reused slot would give it another key's value). Once the reader is
+// quiescent, the slot comes back.
 TEST(ConcurrentExactTableTest, ErasedSlotWaitsForOnlineReaders) {
   rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
   auto t = MakeTable(1024);
@@ -405,7 +657,7 @@ TEST(ConcurrentExactTableTest, ConcurrentReadersOnlySeeJustifiedAnswers) {
         continue;
       }
       // Transiently full while erased slots wait out a reader grace period;
-      // that is the defer queue working.
+      // that is the held slots working (D-208).
       if (t->Upsert(B(K(kStable + c)), V(kStable + c)) ==
           ConcurrentExactTable::UpsertResult::kFull) {
         full++;
@@ -577,6 +829,75 @@ TEST(ConcurrentExactTableTest, BytesMatchesCreate) {
     EXPECT_EQ(0u, bess::framework::MemoryCost<ConcurrentExactTable>::GlibcBytes(
                       kKeyLen, capacity, domain));
   }
+}
+
+// D-208, measured: what Create takes from the DPDK heaps is the rte_hash's
+// buckets, key store and free-slot ring (DPDK 25.11.3, lib/hash) plus the
+// held-slot rings -- 4 B per key slot and kMaxDeleteBatches 16-byte grace
+// periods -- within the heaps' element headers, and Bytes() says so. No RCU
+// defer queue: 24 B per slot, rounded up to a power of two (6 MiB here).
+TEST(ConcurrentExactTableTest, CreateTakesWhatBytesCountsAndNoDeferQueue) {
+  constexpr uint32_t kSlots = 3u << 16u;  // a CapacityFor size
+  // The heaps' element headers and alignment, the rte_hash struct, the ring's
+  // memzone and tailq entry (as RteHashBackendMemoryTest's bound).
+  constexpr size_t kHeaders = 16384;
+  const auto allocated = [] {
+    const utils::MemoryStatus status = utils::GetMemoryStatus();
+    return status.dpdk_heap_alloc_bytes + status.fallback_heap_alloc_bytes;
+  };
+  // Buckets of 8 entries, cache-line aligned (128 B on generic arm64); key
+  // entries of an 8-byte data pointer and the key, 16-byte aligned.
+  const size_t bucket = std::max<size_t>(64, RTE_CACHE_LINE_SIZE);
+  const size_t key_entry = (size_t{8} + kKeyLen + 15) / 16 * 16;
+  const size_t rte_hash = bucket * rte_align64pow2(kSlots) / 8 +
+                          key_entry * (size_t{kSlots} + 1) +
+                          4 * rte_align64pow2(kSlots + 1);
+  const size_t held = 4 * size_t{kSlots} +
+                      16 * size_t{ConcurrentExactTable::kMaxDeleteBatches};
+  rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  const size_t before = allocated();
+  auto table = ConcurrentExactTable::Create(kKeyLen, kSlots, domain);
+  ASSERT_TRUE(table.has_value()) << table.error();
+  const size_t taken = allocated() - before;
+  EXPECT_EQ(rte_hash + held, (*table)->bytes());
+  EXPECT_GE(taken, rte_hash + held);
+  EXPECT_LE(taken, rte_hash + held + kHeaders)
+      << "a defer queue takes " << 24 * rte_align64pow2(kSlots + 2) << " B";
+}
+
+// D-208: Create makes the rte_hash before its held-slot rings, so a table
+// whose hash cannot be made allocates nothing first. With the rings first, a
+// size rte_hash refuses (over 2^30 slots) took a ring of 4 B per slot before
+// the refusal: 3.4 GB in SharedFlowTableTest.CreateRejectsWhatTheDirectoryCannotHold.
+// Under a limit that admits nothing, the first admission Create asks for is
+// the one refused. It must be the hash's: no ring was attempted before the
+// hash, and no heap allocated anything.
+TEST(ConcurrentExactTableTest, CreateAsksForTheHashBeforeAnyRing) {
+  constexpr uint32_t kSlots = 4096;
+  utils::MemoryNode();  // DPDK up first, sized without the policy below
+  ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
+  const auto allocated = [] {
+    const utils::MemoryStatus status = utils::GetMemoryStatus();
+    return status.dpdk_heap_alloc_bytes + status.fallback_heap_alloc_bytes;
+  };
+  utils::MemoryPolicy saved = utils::memory_policy();  // a copy: the policy is replaced
+  utils::MemoryPolicy nothing;
+  nothing.limit_bytes = 1;  // refuses every admission
+  nothing.limit_source = "test";
+  const size_t before = allocated();
+  size_t refused = 0;
+  utils::SetMemoryPolicy(nothing);
+  try {
+    EXPECT_FALSE(
+        ConcurrentExactTable::Create(kKeyLen, kSlots, bess::runtime::runtime().rcu()).has_value());
+  } catch (const utils::MemoryRefused &e) {
+    refused = e.bytes();
+  }
+  utils::SetMemoryPolicy(std::move(saved));
+  EXPECT_EQ(detail::RteHashBytes(kSlots, kKeyLen), refused)
+      << "Create asked for " << refused << " B before the hash (the held ring is "
+      << 4 * kSlots << " B)";
+  EXPECT_EQ(before, allocated());
 }
 
 }  // namespace

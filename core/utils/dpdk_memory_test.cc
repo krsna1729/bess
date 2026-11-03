@@ -538,7 +538,12 @@ TEST(DpdkMemoryTest, FreeNeverGrowsResidentMemory) {
 // allocated (D-206): under a tight limit an admission that RSS alone would
 // let through is refused while the table is held, and freeing the table --
 // which faults it in -- stays within what was admitted. DPDK's heap gives
-// no page back, so RSS after the free is its peak.
+// no page back, so its resident pages after the free are their peak. The
+// heaps' pages (MemoryStatus, mincore), not RSS: RSS also counts the test's
+// own allocations, which ASan's quarantine never reuses, and the unwinder's
+// pages, mapped on a process's first throw -- 98,272 B past
+// `before + admitted` on the clang-asan lane. RSS is still bounded where the
+// table could land outside the heaps: while it is created and freed.
 TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
   bess::utils::MemoryNode();  // DPDK up: before it, has_hugepages is 1
   ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
@@ -551,8 +556,22 @@ TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
       bess::classifier::detail::RteHashBytes(params.entries, params.key_len);
   const MemoryPolicy policy = TightPolicy(admitted + 64 * kMB, 0);
   PolicyScope scope(policy);
+  // RSS growth outside the heaps across the create and the free (not the
+  // refusal check between them, whose log line and throw grew RSS by up to
+  // 454,656 B under ASan): 0 B on the fast build, 24,576-143,360 B under
+  // ASan (file order, alone, shuffle seeds 1-20). A table, or a part of
+  // one, that lands outside the heaps grows it past this.
+  constexpr int64_t kOffHeaps = int64_t{256} * 1024;
+  const auto heaps_resident = [] {
+    const bess::utils::MemoryStatus status = GetMemoryStatus();
+    return status.dpdk_heap_resident_bytes + status.fallback_heap_resident_bytes;
+  };
+  const auto grew = [](size_t from, size_t to) {
+    return static_cast<int64_t>(to) - static_cast<int64_t>(from);
+  };
   const uint64_t oom_kills = OomKills();
-  const size_t before = Rss();
+  const size_t before = heaps_resident();
+  const size_t rss_before = Rss();
   rte_hash *table = bess::classifier::detail::CreateRteHash(params);
   ASSERT_NE(table, nullptr);
   const size_t created = Rss();
@@ -561,9 +580,14 @@ TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
   const size_t by_rss = policy.limit_bytes - created - 4 * kMB;
   EXPECT_THROW(AdmitNormalMemory(by_rss), MemoryRefused)
       << "allocated but unfaulted DPDK memory was not counted";
+  const size_t freeing = Rss();
   rte_hash_free(table);
-  EXPECT_LE(Rss(), before + admitted)
-      << "freeing the table grew RSS past what was admitted";
+  const size_t freed = Rss();
+  const size_t after = heaps_resident();
+  EXPECT_LE(after, before + admitted)
+      << "freeing the table faulted in more than was admitted";
+  EXPECT_LE(grew(rss_before, created) + grew(freeing, freed) - grew(before, after), kOffHeaps)
+      << "creating and freeing the table grew RSS outside the DPDK heaps";
   EXPECT_EQ(OomKills(), oom_kills);
 }
 

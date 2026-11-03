@@ -194,7 +194,7 @@ GracePeriod RcuDomain::StartGracePeriod() {
   return token;
 }
 
-bool RcuDomain::IsGracePeriodComplete(GracePeriod token) const {
+bool RcuDomain::IsCompleteLockFree(GracePeriod token) const noexcept {
   if (token == 0) {
     return true;
   }
@@ -210,7 +210,7 @@ bool RcuDomain::IsGracePeriodComplete(GracePeriod token) const {
 }
 
 bool RcuDomain::IsComplete(GracePeriod token) const {
-  if (!IsGracePeriodComplete(token)) {
+  if (!IsCompleteLockFree(token)) {
     return false;
   }
 
@@ -291,7 +291,7 @@ size_t RcuDomain::ReclaimReady() {
     RetiredObject retired;
     {
       std::lock_guard<std::mutex> lock(retire_mutex_);
-      if (head_ == retired_.size() || !IsGracePeriodComplete(retired_[head_].token)) {
+      if (head_ == retired_.size() || !IsCompleteLockFree(retired_[head_].token)) {
         break;
       }
       retired = retired_[head_++];
