@@ -14479,6 +14479,20 @@ pod: `memory.max`, no swap, no `--mem_limit_mb`) could still get stuck at its bu
 What D-207 leaves free in glibc is the high water of the transactions after the refusal's trim. The test bounds the
 unattributed bytes at half the reserve (64 MiB); `oom` and `oom_kill` stay 0.
 
+**Correction (2026-11-03).** The 52 MiB was netted: two effects in DPDK's fixed `--no-huge` heap cancelled each other.
+- ExactMatch's rte_hash carried an RCU defer queue (D-002): 96 MiB admitted at 2.98M rules, only 0.65 MiB of it ever
+  touched.
+- The heap kept the pages of the tables freed as the rule table grew: 105 MiB of free blocks resident, because rte_free
+  zeroes a freed block and the native heap gives no page back (BP-3).
+
+Both were measured per heap element at 118d237a (`rte_malloc_dump_heaps` against `/proc/<pid>/pagemap`): the heap held
+200.4 MiB resident for 193.1 MiB allocated, and 97.8 MiB of the allocation was never touched. `MemoryStatus` now
+reports each heap's resident bytes (`dpdk_heap_resident_bytes`, `fallback_heap_resident_bytes`: mincore over its normal
+pages). The test bounds `unattributed_bytes − (heap resident − heap allocated)`, which equals `used − heap resident −
+(admitted − heap allocated) − baseline`, at the same 64 MiB. Over 3 runs at f6b9e95d the fields read the same 200.4
+and 193.1 MiB: unattributed 47.1–47.5 MiB, heaps +7.4, bounded 39.8–40.1 MiB. D-207's own commit was not
+re-measured, so it is [INFERENCE] that its 52 MiB was netted the same way (it attached the same defer queue).
+
 **1M sessions** (UPF appliance, `strict_budget.py trial --tree after`, 8000 MiB cgroup, normal pages; load, verify
 100K packets per direction, 1000 updates, teardown; each trial passed with `oom` = `oom_kill` = 0). Graph and masked
 depend on the RecordArena retire fix (bess#116, f59f3c8b): without it, the erase-only teardown at 1M is O(N²) and

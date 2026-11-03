@@ -382,7 +382,8 @@ cap (`hugepage_cap_bytes`, 0 for none, and `hugepage_cap_source`:
 admitted against it (`hugepage_table_bytes`), whether hugepages are charged
 to `memory.max` (`hugetlb_charged`: cgroup2 `memory_hugetlb_accounting`; then
 hugepage growth is admitted against the limit too), both heaps (`dpdk_heap_*`,
-`fallback_heap_*`), `refusals` so far, `spilled_bytes` (admitted for
+`fallback_heap_*`: size, allocated and, where a heap is normal pages,
+resident by mincore), `refusals` so far, `spilled_bytes` (admitted for
 hugepages, landed on normal pages because the heap ran out before the cap),
 and `modules`: what each module admitted before it allocated, by resource
 (`module`, `resource`, `admitted_bytes`, split by where it landed into
@@ -391,7 +392,10 @@ the objects hold now; the daemon's packet pool is module `bessd`, resource
 `packet_pool`), their sum (`admitted_bytes`), the working set nothing admits
 (`baseline_bytes`: binary, libraries, EAL, gRPC, measured when the control
 server starts) and what `used_bytes` holds beyond both (`unattributed_bytes`,
-D-207). A creation or transaction that needs more than
+D-207). A heap's resident less its allocated bytes is its share of
+`unattributed_bytes`: free blocks DPDK's native heap keeps resident count
+in it, and allocated bytes not yet touched count against it. A creation or
+transaction that needs more than
 `available_bytes` of normal pages, or more hugepages than the cap leaves when
 normal pages are forbidden, is refused with `RESOURCE_EXHAUSTED` (errno
 `ENOMEM`),

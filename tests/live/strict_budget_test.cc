@@ -5,8 +5,8 @@
 // comes from the cgroup, as in a Kubernetes pod). Rules are loaded until the
 // daemon refuses; then it must still answer and take changes, the kernel must
 // never have OOM-killed anything in the cgroup, and the memory the daemon
-// cannot attribute (used - admitted - baseline) must stay under a stated
-// bound. Skipped where `systemd-run --user --scope` cannot make the cgroup.
+// cannot attribute must stay under a stated bound. Skipped where
+// `systemd-run --user --scope` cannot make the cgroup.
 
 #include <grpcpp/grpcpp.h>
 
@@ -31,7 +31,19 @@ constexpr uint64_t kCapMiB = 512;
 // 20K-rule erase and insert: half the 128 MiB reserve. Mostly what glibc
 // keeps free in its two arenas (RT-1) from the last large transactions'
 // decoded copies, given back before any refusal (D-207); the other half of
-// the reserve is the margin for a request in flight. Measured: 52 MiB.
+// the reserve is the margin for a request in flight.
+//
+// Bounded: unattributed_bytes less what the DPDK heaps hold resident beyond
+// what they have allocated, (dpdk + fallback)_heap_(resident - alloc)_bytes;
+// that is
+//   used - heap resident - (admitted - heap allocated) - baseline:
+// the cgroup's memory beyond the heaps' measured pages, the admitted bytes
+// that are not on the heaps, and the baseline. The heaps count as resident,
+// both ways: free blocks still resident count against the bound (DPDK's
+// native heap keeps a freed table's pages, which rte_free zeroes), and
+// admitted bytes never touched no longer cancel them. Measured: 40 MiB
+// (unattributed 47, heaps +7: 105 MiB of free blocks resident, 98 allocated
+// and never touched, 96 of them an rte_hash RCU defer queue).
 constexpr int64_t kUnattributedBound = int64_t{64} * 1024 * 1024;
 constexpr uint32_t kBatch = 20000;
 
@@ -176,19 +188,32 @@ TEST(StrictBudgetTest, RefusesInsteadOfBeingKilledAndAccountsEveryByte) {
   const v2::MemoryStatus at = Status(daemon->address()).memory();
   EXPECT_LE(at.used_bytes(), at.limit_bytes());
   EXPECT_GT(at.refusals(), 0u);
+  // Normal pages: both heaps are charged to the cgroup and measured.
+  ASSERT_FALSE(at.hugepages());
+  const int64_t heap_resident =
+      static_cast<int64_t>(at.dpdk_heap_resident_bytes() + at.fallback_heap_resident_bytes());
+  const int64_t heap_alloc =
+      static_cast<int64_t>(at.dpdk_heap_alloc_bytes() + at.fallback_heap_alloc_bytes());
+  const int64_t unexplained = at.unattributed_bytes() - (heap_resident - heap_alloc);
   const std::string at_end = Breakdown(cgroup, daemon->pid());
-  EXPECT_LT(at.unattributed_bytes(), kUnattributedBound)
+  EXPECT_LT(unexplained, kUnattributedBound)
       << "used " << at.used_bytes() << " admitted " << at.admitted_bytes() << " baseline "
-      << at.baseline_bytes() << "\nat start: " << at_start << "\nat end: " << at_end;
+      << at.baseline_bytes() << " unattributed " << at.unattributed_bytes()
+      << " heaps resident " << heap_resident << " allocated " << heap_alloc
+      << "\nat start: " << at_start << "\nat end: " << at_end;
   const auto events = ReadKeyed(cgroup + "/memory.events");
   EXPECT_EQ(events.at("oom"), 0u);
   EXPECT_EQ(events.at("oom_kill"), 0u);
   ASSERT_TRUE(daemon->Alive());
+  constexpr double kMiB = 1048576.0;
   std::printf("[strict budget] %u rules, refused: %s; used %.1f MiB, admitted %.1f, baseline %.1f, "
-              "unattributed %.1f, events max %llu, THP %s\n",
-              loaded, refused.message.c_str(), at.used_bytes() / 1048576.0,
-              at.admitted_bytes() / 1048576.0, at.baseline_bytes() / 1048576.0,
-              at.unattributed_bytes() / 1048576.0,
+              "unattributed %.1f, heaps resident - allocated %+.1f (dpdk %.1f - %.1f, fallback "
+              "%.1f - %.1f), bounded %.1f, events max %llu, THP %s\n",
+              loaded, refused.message.c_str(), at.used_bytes() / kMiB, at.admitted_bytes() / kMiB,
+              at.baseline_bytes() / kMiB, at.unattributed_bytes() / kMiB,
+              (heap_resident - heap_alloc) / kMiB, at.dpdk_heap_resident_bytes() / kMiB,
+              at.dpdk_heap_alloc_bytes() / kMiB, at.fallback_heap_resident_bytes() / kMiB,
+              at.fallback_heap_alloc_bytes() / kMiB, unexplained / kMiB,
               static_cast<unsigned long long>(events.count("max") ? events.at("max") : 0),
               ThpMode().c_str());
   std::printf("[strict budget] at start: %s\n[strict budget] at end: %s\n", at_start.c_str(),

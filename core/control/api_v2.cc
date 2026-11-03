@@ -1126,8 +1126,10 @@ grpc::Status ControlV2Service::GetResourceStatus(
   }
   out->set_dpdk_heap_bytes(memory.dpdk_heap_bytes);
   out->set_dpdk_heap_alloc_bytes(memory.dpdk_heap_alloc_bytes);
+  out->set_dpdk_heap_resident_bytes(memory.dpdk_heap_resident_bytes);
   out->set_fallback_heap_bytes(memory.fallback_heap_bytes);
   out->set_fallback_heap_alloc_bytes(memory.fallback_heap_alloc_bytes);
+  out->set_fallback_heap_resident_bytes(memory.fallback_heap_resident_bytes);
   out->set_refusals(memory.refusals);
   out->set_spilled_bytes(memory.spilled_bytes);
   // What each module admitted, by resource (D-198) and by where it landed

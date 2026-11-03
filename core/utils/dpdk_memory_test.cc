@@ -18,6 +18,7 @@
 #include <rte_malloc.h>
 
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -564,6 +565,61 @@ TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
   EXPECT_LE(Rss(), before + admitted)
       << "freeing the table grew RSS past what was admitted";
   EXPECT_EQ(OomKills(), oom_kills);
+}
+
+// MemoryStatus's heap residency is what mincore counts over each heap's
+// pages (live_strict_budget bounds unattributed_bytes less it): touching Y
+// pages of a block of X, none of them resident, raises that heap's figure by
+// exactly Y pages and leaves the other heap's as it was -- on DPDK's
+// --no-huge heap (a memfd, so shmem) and on "bess-normal" (private
+// anonymous memory).
+TEST(DpdkMemoryTest, HeapResidentBytesCountTheTouchedPages) {
+  bess::utils::MemoryNode();  // DPDK up: before it, has_hugepages is 1
+  ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
+  // A touched page must fault one 4 KiB page, not a transparent huge page
+  // around it ("bess-normal" advises THP): THP off for this test.
+  struct ThpOff {
+    const int was = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+    ThpOff() { EXPECT_EQ(prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0), 0); }
+    ~ThpOff() { (void)prctl(PR_SET_THP_DISABLE, was > 0 ? 1 : 0, 0, 0, 0); }
+    ThpOff(const ThpOff &) = delete;
+    ThpOff &operator=(const ThpOff &) = delete;
+  } thp_off;
+  constexpr size_t kPage = 4096, kPages = 64, kTouched = 13;
+  constexpr size_t kBytes = kPages * kPage;
+  const int native = bess::utils::MemoryNode();
+  const int fallback = FallbackSocket(kBytes + kPage);
+  const auto grew = [](size_t before, size_t after) {
+    return static_cast<int64_t>(after) - static_cast<int64_t>(before);
+  };
+  for (const int socket : {native, fallback}) {
+    SCOPED_TRACE(socket == native ? "DPDK's --no-huge heap" : "bess-normal");
+    char *p = nullptr;
+    {
+      const bess::utils::HeapGuard guard;  // what allocates on "bess-normal"
+      p = static_cast<char *>(rte_malloc_socket(nullptr, kBytes, kPage, socket));
+    }
+    ASSERT_NE(p, nullptr);
+    // Page-aligned whole pages, so no element header among them. Made
+    // non-resident first: shmem pages punched out, anonymous ones dropped;
+    // either reads back as zeroes, as DPDK expects of a clean block.
+    if (madvise(p, kBytes, MADV_REMOVE) != 0) {
+      ASSERT_EQ(madvise(p, kBytes, MADV_DONTNEED), 0);
+    }
+    ASSERT_EQ(ResidentPages(p, kBytes), 0u);
+    const bess::utils::MemoryStatus before = GetMemoryStatus();
+    for (size_t i = 0; i < kTouched; i++) {
+      p[i * 4 * kPage] = 1;  // every fourth page
+    }
+    const bess::utils::MemoryStatus after = GetMemoryStatus();
+    EXPECT_EQ(ResidentPages(p, kBytes), kTouched);
+    constexpr auto kTouchedBytes = static_cast<int64_t>(kTouched * kPage);
+    EXPECT_EQ(grew(before.dpdk_heap_resident_bytes, after.dpdk_heap_resident_bytes),
+              socket == native ? kTouchedBytes : 0);
+    EXPECT_EQ(grew(before.fallback_heap_resident_bytes, after.fallback_heap_resident_bytes),
+              socket == fallback ? kTouchedBytes : 0);
+    DpdkFree(p);
+  }
 }
 
 // Predicted glibc costs (D-206: Router::GlibcBytes and every MemoryCost that

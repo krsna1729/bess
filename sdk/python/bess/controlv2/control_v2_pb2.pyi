@@ -960,7 +960,7 @@ class WorkerStatus(_message.Message):
     def __init__(self, cpu: _Optional[int] = ...) -> None: ...
 
 class MemoryStatus(_message.Message):
-    __slots__ = ("hugepages", "fallback", "limit_bytes", "limit_source", "reserve_bytes", "used_bytes", "available_bytes", "dpdk_heap_bytes", "dpdk_heap_alloc_bytes", "fallback_heap_bytes", "fallback_heap_alloc_bytes", "refusals", "hugepage_cap_bytes", "hugepage_table_bytes", "modules", "hugetlb_charged", "hugepage_cap_source", "spilled_bytes", "admitted_bytes", "baseline_bytes", "unattributed_bytes")
+    __slots__ = ("hugepages", "fallback", "limit_bytes", "limit_source", "reserve_bytes", "used_bytes", "available_bytes", "dpdk_heap_bytes", "dpdk_heap_alloc_bytes", "fallback_heap_bytes", "fallback_heap_alloc_bytes", "refusals", "hugepage_cap_bytes", "hugepage_table_bytes", "modules", "hugetlb_charged", "hugepage_cap_source", "spilled_bytes", "admitted_bytes", "baseline_bytes", "unattributed_bytes", "dpdk_heap_resident_bytes", "fallback_heap_resident_bytes")
     HUGEPAGES_FIELD_NUMBER: _ClassVar[int]
     FALLBACK_FIELD_NUMBER: _ClassVar[int]
     LIMIT_BYTES_FIELD_NUMBER: _ClassVar[int]
@@ -982,6 +982,8 @@ class MemoryStatus(_message.Message):
     ADMITTED_BYTES_FIELD_NUMBER: _ClassVar[int]
     BASELINE_BYTES_FIELD_NUMBER: _ClassVar[int]
     UNATTRIBUTED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    DPDK_HEAP_RESIDENT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    FALLBACK_HEAP_RESIDENT_BYTES_FIELD_NUMBER: _ClassVar[int]
     hugepages: bool
     fallback: bool
     limit_bytes: int
@@ -1003,7 +1005,9 @@ class MemoryStatus(_message.Message):
     admitted_bytes: int
     baseline_bytes: int
     unattributed_bytes: int
-    def __init__(self, hugepages: _Optional[bool] = ..., fallback: _Optional[bool] = ..., limit_bytes: _Optional[int] = ..., limit_source: _Optional[str] = ..., reserve_bytes: _Optional[int] = ..., used_bytes: _Optional[int] = ..., available_bytes: _Optional[int] = ..., dpdk_heap_bytes: _Optional[int] = ..., dpdk_heap_alloc_bytes: _Optional[int] = ..., fallback_heap_bytes: _Optional[int] = ..., fallback_heap_alloc_bytes: _Optional[int] = ..., refusals: _Optional[int] = ..., hugepage_cap_bytes: _Optional[int] = ..., hugepage_table_bytes: _Optional[int] = ..., modules: _Optional[_Iterable[_Union[ModuleMemory, _Mapping]]] = ..., hugetlb_charged: _Optional[bool] = ..., hugepage_cap_source: _Optional[str] = ..., spilled_bytes: _Optional[int] = ..., admitted_bytes: _Optional[int] = ..., baseline_bytes: _Optional[int] = ..., unattributed_bytes: _Optional[int] = ...) -> None: ...
+    dpdk_heap_resident_bytes: int
+    fallback_heap_resident_bytes: int
+    def __init__(self, hugepages: _Optional[bool] = ..., fallback: _Optional[bool] = ..., limit_bytes: _Optional[int] = ..., limit_source: _Optional[str] = ..., reserve_bytes: _Optional[int] = ..., used_bytes: _Optional[int] = ..., available_bytes: _Optional[int] = ..., dpdk_heap_bytes: _Optional[int] = ..., dpdk_heap_alloc_bytes: _Optional[int] = ..., fallback_heap_bytes: _Optional[int] = ..., fallback_heap_alloc_bytes: _Optional[int] = ..., refusals: _Optional[int] = ..., hugepage_cap_bytes: _Optional[int] = ..., hugepage_table_bytes: _Optional[int] = ..., modules: _Optional[_Iterable[_Union[ModuleMemory, _Mapping]]] = ..., hugetlb_charged: _Optional[bool] = ..., hugepage_cap_source: _Optional[str] = ..., spilled_bytes: _Optional[int] = ..., admitted_bytes: _Optional[int] = ..., baseline_bytes: _Optional[int] = ..., unattributed_bytes: _Optional[int] = ..., dpdk_heap_resident_bytes: _Optional[int] = ..., fallback_heap_resident_bytes: _Optional[int] = ...) -> None: ...
 
 class ModuleMemory(_message.Message):
     __slots__ = ("module", "resource", "admitted_bytes", "current_bytes", "hugepage_bytes", "normal_bytes", "glibc_bytes")
