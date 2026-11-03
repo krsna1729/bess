@@ -132,17 +132,20 @@ state through G, C or W.
 
 ### `ConcurrentExactTable` (exact match, mode C)
 
-- **What:** DPDK `rte_hash` created with `RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF`,
-  attached to the runtime QSBR in defer-queue mode (`rte_hash_rcu_qsbr_add`).
-  Keys have a fixed runtime length; values are up to 8 bytes, stored in
-  `rte_hash`'s data pointer.
+- **What:** DPDK `rte_hash` created with `RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF`
+  and no RCU attached: the table holds each deleted key's slot through a
+  grace period of the runtime QSBR itself, then frees it
+  (`rte_hash_free_key_with_position`; D-208). Keys have a fixed runtime
+  length; values are up to 8 bytes, stored in `rte_hash`'s data pointer.
 - **Writer API** (the command thread, serialized by the caller):
   - `Upsert(key, value)` → `kInserted` / `kUpdated` / `kFull`;
-  - `Erase(key)`;
+  - `Erase(key)`: never waits for readers, from a worker too; it frees up
+    to `kFreeBatch` (16) held slots whose grace period has passed;
   - `ForEach(fn)`;
-  - `Reclaim()`;
-  - `size()` (live entries) and `slots_in_use()` (live plus deleted slots
-    still waiting out a grace period).
+  - `Reclaim()` / `ReclaimAll()`;
+  - `size()` (live entries), `slots_in_use()` (live plus deleted slots
+    still waiting out a grace period) and `defer_stats()` (held, freed,
+    merged into the newest batch, adds refused full).
 - **Reader API:** `LookupBatch(keys, stride, values, n)` for up to 64 keys.
   It returns a hit mask; misses leave `values[i]` untouched.
   `LookupBatchPrehashed(keys, stride, sigs, values, n)` is the same lookup
@@ -752,7 +755,9 @@ The reasoning, rejected alternatives, evidence and revisit triggers are in
   exact match on lock-free `rte_hash`, with its lookup cost against the old
   table;
 - [D-002](decisions.md#d-002-rte_hash-flags-lf-qsbr-defer-queue-not-multi-writer-not-ext-table)
-  which `rte_hash` modes, and why;
+  which `rte_hash` modes, and why (amended by
+  [D-208](decisions.md#d-208-exact-tables-hold-their-deleted-key-slots-no-rte_hash-defer-queue):
+  no defer queue; the table holds deleted slots itself);
 - [D-003](decisions.md#d-003-ipv4-lpm-rte_lpm-updated-in-place-rte_fib-rejected)
   `rte_lpm` in place, and `rte_fib` rejected (amended by D-132: `rte_fib` is a
   selectable backend, `rte_lpm` the default);
@@ -816,7 +821,9 @@ the protection it guards made it fail, 3 runs out of 3.
 
 | behaviour | test |
 |---|---|
-| `rte_hash` LF + QSBR DQ: a deleted slot is not reused while a reader that was online before the delete is still unreported; it returns once the reader is quiescent | `ConcurrentExactTableTest.ErasedSlotWaitsForOnlineReaders` |
+| `rte_hash` LF, no RCU attached (D-208): a deleted slot is not reused while a reader that was online before the delete is still unreported; it returns once the reader is quiescent | `ConcurrentExactTableTest.ErasedSlotWaitsForOnlineReaders` |
+| `rte_hash` LF, no RCU attached: `rte_hash_del_key` keeps the slot allocated and never waits for readers, however many deletes a stalled reader holds back; `rte_hash_free_key_with_position` returns each held slot once | `ConcurrentExactTableTest.DeletesNeverWaitForStalledReaders`, `.DeleteStormWithAStalledReaderHoldsEverySlotAndNeverWaits`, `.WorkerAndControlDeletesFreeEverySlotExactlyOnce`, `SharedFlowTableTest.WorkerExpiryAndControlErasesFreeEachDirectorySlotOnce` |
+| `rte_hash` LF, no RCU attached: `rte_hash_create` allocates buckets, key store and free-slot ring, and no defer queue (`detail::RteHashBytes`) | `ConcurrentExactTableTest.CreateTakesWhatBytesCountsAndNoDeferQueue`, `RteHashBackendMemoryTest.AllocationFitsTheEstimateOnThisCacheLine` |
 | `rte_hash`: re-adding an existing key swaps its value in place and takes no new slot | `ConcurrentExactTableTest.InsertUpdateEraseAndIterate` |
 | `rte_lpm` + QSBR DQ: a freed tbl8 group is not handed to another /24 mid-grace-period; the next add reclaims it after quiescence | `RouteTableTest.FreedTbl8GroupWaitsForOnlineReaders` |
 | `rte_lpm`: arbitrary-order inserts and churn match an independent reference | `RouteTableTest.LargeArbitraryOrderMatchesReferenceThroughChurn` |

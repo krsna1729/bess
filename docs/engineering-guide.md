@@ -339,8 +339,9 @@ queue, loop over entries, tick or packet path:
   clean elements, so a `--no-huge` teardown made pages resident and was
   OOM-killed (D-206; U-1).
 - **Do not admit what nothing writes.** 64 counter planes for one worker
-  cost 3 KiB per ActionId (U-6); a defer queue sized to every entry is
-  40% of an exact table (CL-4).
+  cost 3 KiB per ActionId (U-6); a defer queue sized to every entry was
+  40% of an exact table (CL-4) until the table held its deleted slots
+  itself, 4 B each (D-208).
 - **Retained state is memory.** The transaction record window held about
   351 MiB at 1M sessions (CTL-2; D-206). Admit per chunk, not per node:
   each `Grow` reads cgroup files (CTL-4).

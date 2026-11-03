@@ -26,6 +26,7 @@
 #include "framework/memory_scope.h"
 #include "rcu/rcu_domain.h"
 #include "testing/allocation_faults.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::flow {
 namespace {
@@ -199,6 +200,76 @@ TEST_F(SharedFlowTableTest, MoreOutstandingBatchesThanTheTableTracksAreMerged) {
   EXPECT_EQ(EmplaceStatus::kFull, t->Emplace(kFlows, 0).status);
   domain_.Offline(kReader);
   domain_.Unregister(kReader);
+}
+
+// D-208 on the packet path. A worker -- an online reader that quiesces
+// between rounds, as a BESS worker does between task invocations -- creates
+// flows and expires them (Erase, as SharedConntrack's and SharedNat's Expire
+// do) while a control thread erases and recreates others; the table's lock
+// serializes both as the directory's writers. Each directory delete's key
+// slot is held, then freed once: at the end every delete is held or freed,
+// never both or neither, and rte_hash's own count of taken slots is the live
+// keys plus the held ones -- one more would be a slot lost, one fewer a slot
+// freed twice (ConcurrentExactTableTest.WorkerAndControlDeletesFreeEverySlot
+// ExactlyOnce refills a table to prove the same on the backend alone).
+TEST_F(SharedFlowTableTest, WorkerExpiryAndControlErasesFreeEachDirectorySlotOnce) {
+  constexpr rcu::ReaderId kWorker = 6;
+  constexpr uint64_t kWorkerBase = uint64_t{1} << 40u, kControlBase = uint64_t{2} << 40u;
+  constexpr uint64_t kWindow = 256, kRounds = 2000, kPerRound = 8;
+  constexpr uint64_t kControlFlows = 1024, kControlOps = 16000;
+  auto t = Make<Table>(kControlFlows + kWindow + kPerRound + 4096);
+  const classifier::ConcurrentExactTable &directory = t->directory().backend_for_testing();
+  for (uint64_t k = 0; k < kControlFlows; k++) {
+    ASSERT_TRUE(t->Emplace(kControlBase + k, k).created());
+  }
+  const auto before = directory.defer_stats();
+  ASSERT_TRUE(domain_.Register(kWorker).has_value());
+  std::atomic<bool> go{false};
+  uint64_t worker_erases = 0, worker_failures = 0;
+  std::thread worker([&] {
+    domain_.Online(kWorker);
+    while (!go.load()) {
+    }
+    uint64_t next = 0, oldest = 0;
+    for (uint64_t round = 0; round < kRounds; round++) {
+      for (uint64_t i = 0; i < kPerRound; i++, next++) {
+        // No free slot while the control thread's erases wait for this
+        // worker's quiescent state: report one and retry, as a worker's
+        // next round would.
+        while (!t->Emplace(kWorkerBase + next, next).created()) {
+          domain_.Quiescent(kWorker);
+        }
+      }
+      for (; next - oldest > kWindow; oldest++) {  // expiry
+        worker_failures += !t->Erase(kWorkerBase + oldest);
+        worker_erases++;
+      }
+      domain_.Quiescent(kWorker);
+    }
+    domain_.Offline(kWorker);
+  });
+  go = true;
+  uint64_t control_erases = 0, control_failures = 0;
+  for (uint64_t i = 0; i < kControlOps; i++) {
+    control_failures += !t->Erase(kControlBase + i);
+    control_erases++;
+    // The erased flows' table slots come back a grace period later, at a
+    // Reclaim(): a create may find none free until the worker quiesces. The
+    // worker never waits on this thread.
+    while (!t->Emplace(kControlBase + kControlFlows + i, i).created()) {
+      t->Reclaim();
+    }
+  }
+  worker.join();
+  domain_.Unregister(kWorker);
+  EXPECT_EQ(0u, worker_failures);
+  EXPECT_EQ(0u, control_failures);
+
+  const auto s = directory.defer_stats();
+  EXPECT_EQ(worker_erases + control_erases, s.held + (s.freed - before.freed));
+  EXPECT_GT(s.freed, before.freed);
+  EXPECT_EQ(directory.size() + s.held, directory.slots_in_use());
+  EXPECT_EQ(t->size(), directory.size());
 }
 
 TEST_F(SharedFlowTableTest, StaleHandleCannotReachAFlowThatReusedItsSlot) {
@@ -509,12 +580,18 @@ TEST_F(SharedFlowTableTest, CreateRejectsWhatTheDirectoryCannotHold) {
   EXPECT_EQ(FlowTableError::kInvalidCapacity,
             Table::Create(size_t{1} << 31, domain_).error());
   // rte_hash refuses more than 2^30 key slots; the table says so without having
-  // allocated its slot array first.
+  // allocated its slot array first, and the directory allocated nothing before
+  // rte_hash refused: no heap grew (the fallback heap never shrinks; the
+  // directory's held-slot ring, 4 B per slot, first took 3.4 GB here, D-208).
   FailingAllocator::Reset(-1);
   FailingAllocator::live = 0;
+  const utils::MemoryStatus before = utils::GetMemoryStatus();
   EXPECT_EQ(FlowTableError::kBackendFailed,
             FailingTable::Create(850'000'000, domain_).error());
   EXPECT_EQ(0, FailingAllocator::count) << "the slot array was allocated first";
+  const utils::MemoryStatus after = utils::GetMemoryStatus();
+  EXPECT_EQ(before.fallback_heap_bytes, after.fallback_heap_bytes);
+  EXPECT_EQ(before.dpdk_heap_bytes, after.dpdk_heap_bytes);
 }
 
 // -- placement and publication ------------------------------------------------

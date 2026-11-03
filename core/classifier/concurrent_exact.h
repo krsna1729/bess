@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -141,9 +142,10 @@ inline CmpFn SelectCmp(size_t width) noexcept {
 // A shared exact-match table updated in place while workers read it (G1.2
 // mode C). DPDK's `rte_hash` owns the algorithm and the concurrency: created
 // with RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF, lookups are lock-free and run
-// while one writer adds and deletes; a deleted key's slot is handed back only
-// after the runtime RcuDomain's QSBR grace period (rte_hash_rcu_qsbr_add,
-// defer-queue mode), the same wiring K7 uses for rte_lpm.
+// while one writer adds and deletes. A deleted key's slot is reused only
+// after a grace period of the runtime RcuDomain's QSBR: the table holds it
+// and hands it back itself (Decision D-208), the way K7's rte_lpm queue does
+// inside DPDK.
 //
 // Why not a generation swap: that rebuilds the whole table per insert
 // (ExactMatch: 47 ms per add at 100K rules). Here an insert or delete is one
@@ -162,6 +164,36 @@ inline CmpFn SelectCmp(size_t width) noexcept {
 // well, and its per-lcore free-slot cache has no guard for threads without
 // an lcore id (control threads). A shared table has a fixed capacity: it
 // cannot be copied to grow while workers write it.
+//
+// Deleted slots (Decision D-208, amending D-002). No RCU is attached to the
+// rte_hash, so the LF flag's NO_FREE_ON_DEL holds: rte_hash_del_key takes
+// the key out of its bucket, keeps its slot allocated and returns the slot's
+// position, and rte_hash_free_key_with_position hands it back later.
+// Lookups are untouched (they never read rte_hash's RCU state).
+//  - One producer. Every delete -- a control thread's, or a worker's
+//    (SharedFlowTable expiry) -- runs inside the table's writer
+//    serialization (the caller's for kSingle, writer_lock_ for kShared), as
+//    rte_hash's LF mode requires of every add and delete, and so does every
+//    free: rte_hash puts a slot back with a single-producer ring enqueue,
+//    which a failed add also does. The held positions are therefore a plain
+//    ring of capacity() entries (4 B each) that one writer at a time fills
+//    and drains -- no MPSC ring, no per-writer rings, no atomic
+//    read-modify-write -- and a held position is an allocated slot, so the
+//    ring cannot overflow.
+//  - Grace periods. Each delete starts one, after the key left its bucket,
+//    in a ring of kMaxDeleteBatches; when that is full, the delete joins the
+//    newest batch, whose grace period becomes the delete's own, later one
+//    (counted: DeferStats::merged) -- only later than necessary, never
+//    earlier.
+//  - Frees. On the writing thread: up to kFreeBatch ready slots per Erase
+//    and per add that finds no free slot; Reclaim, ReclaimAll and
+//    HasRoomForOne on demand (owners: the control thread).
+//  - Never a wait. A delete or a free takes no lock, allocates nothing and
+//    never waits for a grace period: starting one is an atomic add, checking
+//    one is loads (RcuDomain::StartGracePeriodLockFree, IsCompleteLockFree).
+//    While readers stall, held slots are bounded by the key store itself:
+//    once they exhaust it, an add is refused kFull (counted:
+//    DeferStats::refused_full) until readers pass a quiescent state.
 //
 // Sizing (Decision D-010). Capacity is key slots, fixed at creation; the
 // owner grows by building a larger table. Owners create tables with
@@ -182,6 +214,24 @@ class ConcurrentExactTable {
     enum class Status : uint8_t { kInserted, kExists, kFull } status;
     uint64_t value;  // the stored value: `value` if inserted, else the one
                      // already there (kExists)
+  };
+
+  // Deleted slots' grace periods in flight (D-208), at most; past it a
+  // delete joins the newest batch. One writer's peak deletes over a p99.9
+  // grace period (D-010: about 4.3M/s for 60 us), as kMinHeadroom.
+  static constexpr uint32_t kMaxDeleteBatches = 256;
+  // Held slots one Erase, one add that finds no free slot, or one Reclaim()
+  // frees at most: the batch DPDK's defer queue freed per call
+  // (RTE_HASH_RCU_DQ_RECLAIM_MAX), so a worker's delete stays O(1).
+  static constexpr uint32_t kFreeBatch = 16;
+
+  // What the deleted slots are doing (D-208); readable from any thread.
+  struct DeferStats {
+    uint64_t held = 0;          // slots of deleted keys awaiting a grace period
+    uint64_t freed = 0;         // slots handed back to rte_hash, ever
+    uint64_t merged = 0;        // deletes that joined the newest batch, ever
+    uint64_t refused_full = 0;  // adds refused kFull, ever
+    uint64_t checks = 0;        // grace periods checked by frees, ever
   };
 
   // Slots of reserve for deletes pending a grace period, at least: one
@@ -207,8 +257,9 @@ class ConcurrentExactTable {
          Writers writers = Writers::kSingle);
 
   // Memory (D-198): what Create allocates on the DPDK heap, the rte_hash for
-  // max(capacity, 8) keys with its QSBR defer queue (detail::RteHashBytes).
-  // Fixed: the table never grows; owners admit a bigger replacement.
+  // max(capacity, 8) keys (detail::RteHashBytes) and the deleted-slot rings
+  // (D-208: 4 B per key and kMaxDeleteBatches grace periods). Fixed: the
+  // table never grows; owners admit a bigger replacement.
   static size_t Bytes(uint32_t key_len, uint32_t capacity,
                       const rcu::RcuDomain &domain,
                       int socket = bess::utils::MemoryNode(),
@@ -235,13 +286,14 @@ class ConcurrentExactTable {
   // deletes still waiting out a grace period (reclaims what is ready first).
   bool HasRoomForOne();
 
-  // Reclaims every deleted slot whose grace period has passed.
+  // Frees every held slot whose grace period has passed.
   void ReclaimAll();
 
-  // Returns to the free list the deleted slots whose grace period has
-  // passed (up to DPDK's per-call batch). Adds and deletes do this on their
-  // own; exposed for owners and tests.
+  // Frees up to kFreeBatch held slots whose grace period has passed. Erases
+  // and adds do this on their own; exposed for owners and tests.
   void Reclaim();
+
+  DeferStats defer_stats() const noexcept;
 
   // Visits every entry: fn(ConstBytes key, uint64_t value). Writer thread
   // (a shared table holds its writer lock meanwhile).
@@ -286,7 +338,7 @@ class ConcurrentExactTable {
     return size_.load(std::memory_order_relaxed);
   }
   // Key slots taken: live entries plus deleted ones still waiting out a
-  // reader grace period in the QSBR defer queue.
+  // reader grace period (DeferStats::held).
   size_t slots_in_use() const noexcept {
     return static_cast<size_t>(rte_hash_count(table_));
   }
@@ -352,13 +404,31 @@ class ConcurrentExactTable {
   }
 
  private:
+  // A grace period for the deletes behind it in the held ring (D-208).
+  struct Batch {
+    rcu::GracePeriod token;  // started after the batch's last delete
+    uint32_t count;          // held positions, in ring order
+  };
+  static_assert(std::has_single_bit(kMaxDeleteBatches));
+
+  // The held-slot rings: a position per key slot, and the grace periods.
+  static size_t HeldBytes(uint32_t entries) noexcept {
+    return utils::DpdkArray<uint32_t>::Bytes(entries) +
+           utils::DpdkArray<Batch>::Bytes(kMaxDeleteBatches);
+  }
+
   ConcurrentExactTable(rte_hash *table, uint32_t key_len, uint32_t capacity,
-                       Writers writers)
+                       Writers writers, rcu::RcuDomain &domain,
+                       utils::DpdkArray<uint32_t> held,
+                       utils::DpdkArray<Batch> batches) noexcept
       : table_(table),
         key_len_(key_len),
         capacity_(capacity),
         writers_(writers),
-        hash_batch_(detail::SelectHashBatch(key_len)) {
+        hash_batch_(detail::SelectHashBatch(key_len)),
+        domain_(domain),
+        held_(std::move(held)),
+        batches_(std::move(batches)) {
     rte_spinlock_init(&writer_lock_);
   }
 
@@ -383,9 +453,13 @@ class ConcurrentExactTable {
     rte_spinlock_t *lock_;
   };
 
-  // Upsert/Reclaim bodies, with the writer lock held (or not needed).
+  // Bodies with the writer lock held (or not needed).
   UpsertResult UpsertLocked(ConstBytes key, uint64_t value);
-  void ReclaimLocked();
+  // A deleted key's slot, `position`, waits out a grace period started now.
+  void HoldLocked(uint32_t position) noexcept;
+  // Frees up to `limit` held slots whose grace period has passed, oldest
+  // first; returns how many.
+  uint32_t FreeReadyLocked(uint32_t limit) noexcept;
 
   rte_hash *table_;
   const uint32_t key_len_;
@@ -394,6 +468,23 @@ class ConcurrentExactTable {
   const detail::HashBatchFn hash_batch_;
   mutable rte_spinlock_t writer_lock_;
   std::atomic<size_t> size_{0};
+  rcu::RcuDomain &domain_;
+  // Held slots (D-208), off the line lookups read. Written only under the
+  // writer serialization; the counters are atomics (loads and stores, no
+  // read-modify-write) so that defer_stats() may read them from anywhere.
+  // held_ is a ring of capacity_ positions from held_head_; batches_ a ring
+  // of kMaxDeleteBatches from batch_head_, oldest first, whose counts add
+  // up to held_count_.
+  alignas(RTE_CACHE_LINE_SIZE) utils::DpdkArray<uint32_t> held_;
+  utils::DpdkArray<Batch> batches_;
+  uint32_t held_head_ = 0;
+  uint32_t batch_head_ = 0;
+  uint32_t batch_count_ = 0;
+  std::atomic<uint32_t> held_count_{0};
+  std::atomic<uint64_t> freed_{0};
+  std::atomic<uint64_t> merged_{0};
+  std::atomic<uint64_t> refused_full_{0};
+  std::atomic<uint64_t> checks_{0};
 };
 
 }  // namespace bess::classifier

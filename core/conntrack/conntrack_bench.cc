@@ -14,6 +14,13 @@
 //                            (7 packets: SYN, SYN-ACK, ACK, FIN, ACK, FIN,
 //                            ACK; ns per packet; connections recycled)
 //   BM_Expire/<conns>        ns per expired connection, all at once
+//   BM_ExpireShared/<conns>  the same for SharedConntrack as a worker expires:
+//                            Expire(now, 256) per batch (the module's
+//                            budget), then the worker's quiescent state;
+//                            each expiry erases the connection's key from
+//                            the shared directory (rte_hash), whose slot is
+//                            held for a grace period and freed by a later
+//                            erase (D-208)
 
 #include <benchmark/benchmark.h>
 
@@ -25,7 +32,9 @@
 #include <vector>
 
 #include "conntrack/conntrack.h"
+#include "conntrack/shared_conntrack.h"
 #include "packet_parse.h"
+#include "rcu/rcu_domain.h"
 
 namespace {
 
@@ -228,6 +237,46 @@ void BM_Expire(benchmark::State &state) {
       benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
 }
 
+void BM_ExpireShared(benchmark::State &state) {
+  const auto conns = static_cast<uint32_t>(state.range(0));
+  constexpr bess::rcu::ReaderId kWorker = 0;
+  bess::rcu::RcuDomain domain(1);
+  if (!domain.Register(kWorker).has_value()) {
+    state.SkipWithError("RcuDomain::Register failed");
+    return;
+  }
+  std::unique_ptr<SharedConntrack<>> ct;
+  uint64_t expired = 0;
+  for (auto _ : state) {
+    state.PauseTiming();
+    ct.reset();  // offline: the table's destructor waits for a grace period
+    ct = SharedConntrack<>::Create(conns + 64, domain).value();
+    for (uint32_t i = 0; i < conns; i++) {
+      auto f = V4(0x0a000000u + i, static_cast<uint16_t>(1024 + i % 60000), 0xc0a80001, 53, 17, 0);
+      ParsedFrame p;
+      (void)ParseFrame(f, p);
+      (void)ct->Track(f, p, i % 7);
+    }
+    domain.Online(kWorker);
+    state.ResumeTiming();
+    while (ct->size() > 0) {
+      expired += ct->Expire(1u << 20u, 256);
+      domain.Quiescent(kWorker);
+    }
+    state.PauseTiming();
+    domain.Offline(kWorker);
+    state.ResumeTiming();
+  }
+  ct.reset();
+  domain.Unregister(kWorker);
+  if (expired != static_cast<uint64_t>(state.iterations()) * conns) {
+    state.SkipWithError("not every connection expired");
+  }
+  state.counters["ns_per_conn"] = benchmark::Counter(
+      static_cast<double>(state.iterations()) * conns,
+      benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
+}
+
 // BM_TrackBatch/<case>/<conns>: cases 0-2 through TrackBatch, 32 packets a
 // call; ns per packet, comparable with BM_Track's.
 void BM_TrackBatch(benchmark::State &state) {
@@ -267,5 +316,6 @@ BENCHMARK(BM_Track)->ArgsProduct({{0, 1, 2}, {1024, 65536, 1048576}})->MinTime(0
 BENCHMARK(BM_Track)->Args({3, 1024})->Args({3, 65536})->MinTime(0.3);
 BENCHMARK(BM_TrackBatch)->ArgsProduct({{0, 1, 2}, {1024, 65536, 1048576}})->MinTime(0.3);
 BENCHMARK(BM_Expire)->Arg(65536)->Iterations(5);
+BENCHMARK(BM_ExpireShared)->Arg(65536)->Arg(262144)->Iterations(10);
 
 }  // namespace

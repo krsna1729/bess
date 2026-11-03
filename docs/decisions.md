@@ -305,6 +305,13 @@ The first two are pinned by tests (D-007).
 thread becomes necessary (then `MULTI_WRITER_ADD`, or per-writer shards per
 D-004).
 
+**Amended by D-208 (2026-11-03):** "DQ mode, default queue size" no longer
+holds. No RCU is attached to the `rte_hash`: the LF flag's `NO_FREE_ON_DEL`
+keeps a deleted key's slot allocated, and the table frees it itself after a
+grace period (`rte_hash_free_key_with_position`). That drops the defer queue
+(24 B per entry, a third of a 25-byte-key table) for 4 B per slot, and a
+delete still never waits for readers, from a worker too.
+
 ## D-003 IPv4 LPM: `rte_lpm` updated in place; `rte_fib` rejected
 
 **Status:** accepted.
@@ -1601,6 +1608,8 @@ each point checked first.**
     `ConcurrentExactTableTest.DeletesNeverWaitForStalledReaders` deletes
     every key of a full table with a stalled reader and requires prompt
     completion.
+  - Since D-208 no defer queue is attached, so the path is gone; the test
+    still pins that a delete never waits.
 
 **Cost of this amendment** (paired ABBA, 8 rounds, against fd836db2,
 native release, isolated): P-cores (2,4): no clear difference for
@@ -14520,3 +14529,132 @@ room that is not yet resident outweighs what nothing accounts for.
 **Revisit when:** the gRPC quota's coverage of receive buffers is measured (no test yet); unadmitted transaction
 transients (the decoded request, about 18 MiB per 20K-op transaction) are worth admitting; or DPDK's
 `malloc_heap_alloc` populate patch (D-206) lands.
+
+## D-208 Exact tables hold their deleted key slots: no `rte_hash` defer queue
+
+**Status:** accepted (2026-11-03). Amends D-002 ("DQ mode, default queue size"), an exception approved for this
+change.
+**Code:** `core/classifier/concurrent_exact.{h,cc}`, `core/classifier/rte_hash_exact.h` (`detail::RteHashBytes`),
+`core/rcu/rcu_domain.h` (`StartGracePeriodLockFree`, `IsCompleteLockFree`); tests beside each.
+
+**Problem.** D-002 attached the runtime QSBR to every `ConcurrentExactTable` in defer-queue mode with DPDK's
+default queue size, the table's slot count. That queue is 24 B × pow2(n + 2): a third of a 25-byte-key table (the
+UPF's F-TEID `SharedExactIndex`: 24 of its 72 MiB at 747,094 F-TEIDs; the Bytes table below, and the parent's
+failure of `CreateTakesWhatBytesCountsAndNoDeferQueue`). It cannot be made smaller: when it is full,
+`rte_hash_del_key` falls back to `rte_rcu_qsbr_synchronize` (DPDK 25.11.3 `rte_cuckoo_hash.c:1888-1902`), which
+blocks the deleting writer while a reader stalls. Nothing bounds the deletes per grace period (`ExactRuleResource`
+erases, masked inserts that cancel, SharedFlowTable expiry on workers).
+
+**Decision.** DPDK's external-RCU mode: no RCU is attached to the `rte_hash`. The LF flag implies
+`NO_FREE_ON_DEL`, so `rte_hash_del_key` takes the key out of its bucket, keeps its slot allocated and returns the
+slot's position (`rte_cuckoo_hash.c:1785`, `1869-1879`); `rte_hash_free_key_with_position` (`:1945-1971`) hands it
+back. Lookups are untouched: the lookup paths (`rte_cuckoo_hash.c:1444-1540`) never read `hash_rcu_cfg` or `dq`.
+- **Producers.** Control threads (ExactMatch, WildcardMatch tuples, `ExactRuleResource`, F-TEID admission) and
+  workers (SharedFlowTable, SharedConntrack and SharedNat expiry; `InsertIfAbsent` on first packets) all delete.
+  Every delete, add and free already runs inside the table's writer serialization -- the caller's for `kSingle`,
+  the table's spinlock for `kShared` (D-028) -- because these tables set neither `MULTI_WRITER_ADD` nor
+  `RW_CONCURRENCY` (`concurrent_exact.cc:49`), so rte_hash takes no writer lock (`rte_cuckoo_hash.c:239-247`) and
+  frees a slot with a single-producer ring enqueue (`:746`). So there is one producer at a time: the held positions
+  are a plain ring of capacity() × 4 B, filled and drained by whichever writer holds the serialization; no MPSC
+  ring, no per-writer rings, no atomic read-modify-write. A held position is an allocated slot, so the ring cannot
+  overflow.
+- **Grace periods.** Each delete starts its own grace period (`rte_rcu_qsbr_start`: one atomic add,
+  `rte_rcu_qsbr.h:460`), after the key left its bucket, into a ring of `kMaxDeleteBatches` (256) tokens. When that
+  ring is full, the delete joins the newest batch and the batch takes the delete's own, later token (counted:
+  `DeferStats::merged`): its slots are freed later than necessary, never earlier.
+- **Who frees, and when.** `rte_hash_free_key_with_position` runs on the writing thread, under the writer
+  serialization: each `Erase` first frees up to `kFreeBatch` (16) held slots whose grace period has passed; an add
+  that finds no free slot frees up to 16 and retries once; `Reclaim()`, `ReclaimAll()` and `HasRoomForOne()` free
+  on demand: control threads (`ExactRuleResource::PlacePending`, ExactMatch's and WildcardMatch's growth checks,
+  `SharedExactIndex::ReclaimAll`, SharedFlowTable's destructor). A check is `rte_rcu_qsbr_check` without waiting.
+- **Never a wait, never an allocation.** On a worker, a delete is the bucket store, one atomic add, a ring store,
+  at most 16 frees and at most 17 grace-period checks (`AnEraseFreesAtMostKFreeBatchAndChecksAtMostOneMore`). No
+  lock beyond the table's existing writer lock, no allocation (both rings are allocated at `Create`, on the memory
+  policy like the table), no grace-period wait. `Create` makes the `rte_hash` first and the rings after it, so a
+  size `rte_hash` refuses (over 2^30 slots) allocates nothing (`CreateAsksForTheHashBeforeAnyRing`). With the rings
+  first, the refused 850M-slot Create of `CreateRejectsWhatTheDirectoryCannotHold` was OOM-killed in a 5.5 GB scope
+  (5.3 GB peak).
+- **Bound.** Held slots are slots of the key store: while readers stall, they grow at most to the table's capacity.
+  An add past that is refused `kFull` (counted: `DeferStats::refused_full`), as any full table is (owners already
+  handle `kFull`, D-010), until readers pass a quiescent state.
+
+**Evidence.**
+
+| test | fix | parent (118d237a; the same scenario through the parent's API, held = `slots_in_use() - size()`) |
+|---|---|---|
+| `ConcurrentExactTableTest.DeleteStormWithAStalledReaderHoldsEverySlotAndNeverWaits`: every slot of a full table (768 = 3 × 256, so 512 deletes merge) deleted with a reader stalled; 0 deletes wait, held = 768, adds are refused full (counted), freed = 768 after the reader quiesces | passes | passes on its held/never-waits part (its queue is the table's size, D-002's documented behaviour); it has no refusal or merge counters |
+| `.DeletesPastTheBatchRingJoinTheNewestUnderTheirOwnGracePeriod`: 256 + 10 deletes, a second reader online for the last 10; merged = 10, and the newest batch (11 slots) waits for the second reader | passes | fails: 10 held, not 11 -- the parent queues one token per delete, it has no batch ring |
+| `.WorkerAndControlDeletesFreeEverySlotExactlyOnce`: a worker learns and expires 31,488 keys while a control thread erases 20,000 (one `kShared` table); freed = deletes, the table refills to its last slot, every key on its own slot | passes | passes (DPDK's queue also frees each slot once) |
+| `SharedFlowTableTest.WorkerExpiryAndControlErasesFreeEachDirectorySlotOnce`: the same through SharedFlowTable's directory | passes | passes |
+| `.DeletesNeverWaitForStalledReaders` (D-007) | passes | passes |
+| `.CreateTakesWhatBytesCountsAndNoDeferQueue`: 196,608 slots, `bytes()` = `RteHashBytes` + held rings, allocation within 16 KiB of it | passes | fails: `bytes()` 15,728,672 B, formula 10,227,744 B -- the 6 MiB defer queue |
+| `.AnEraseFreesAtMostKFreeBatchAndChecksAtMostOneMore`: 1,024 keys deleted (most merge); with a reader stalled each erase frees 0 and checks at most one grace period; once the first 512 are ready, each erase frees exactly min(16, ready left) and checks at most 17 | passes | n/a: the parent has no free or check counters |
+| `.CreateAsksForTheHashBeforeAnyRing`: 4,096 slots under a memory limit that admits nothing; the one admission refused is the hash's, 196,640 B (`RteHashBytes`), and no heap's allocated bytes change | passes | with the rings created first (this change's order swapped back): fails, 16,384 B refused -- the held ring |
+| `SharedFlowTableTest.CreateRejectsWhatTheDirectoryCannotHold`: 850M slots, which rte_hash refuses; neither heap grows (a secondary check of the order) | passes | with the rings first: OOM-killed in a 5.5 GB scope (5.3 GB peak) before any assert ran, so the order test above is the regression test |
+
+**Bytes**, `SharedExactIndex` with 25-byte keys (the UPF F-TEID), DPDK heap allocated by `Create` (x86-64,
+64-byte cache lines):
+
+| F-TEIDs | slots | parent `Bytes()` / allocated | D-208 `Bytes()` / allocated | saved |
+|---|---|---|---|---|
+| 747,094 | 786,432 | 75,497,520 / 75,500,352 (72.0 MiB) | 53,481,520 / 53,483,520 (51.0 MiB) | 21.0 MiB (29%) |
+| 1,494,204 | 1,572,864 | 150,994,992 / 150,997,824 (144.0 MiB) | 106,958,896 / 106,960,896 (102.0 MiB) | 42.0 MiB (29%) |
+
+**Cost** (paired ABBA, 8 rounds, parent 118d237a vs this change, release builds, worker CPU 11):
+
+| benchmark | parent | D-208 | paired ratio, median (min..max) | pairs D-208 faster |
+|---|---|---|---|---|
+| `conntrack_bench` `BM_ExpireShared/65536` (worker expiry: `Expire(now, 256)` then a quiescent state; each expiry erases a directory key) | 11.76 ms (179 ns/conn) | 6.13 ms (94 ns/conn) | 0.525 (0.496..0.531) | 8/8 |
+| `BM_ExpireShared/262144` | 52.7 ms (201 ns/conn) | 29.0 ms (111 ns/conn) | 0.544 (0.526..0.575) | 8/8 |
+| `BM_Expire/65536` (owned `Conntrack`, no `rte_hash`: a control) | 3.71 ms | 3.57 ms | 0.969 (0.930..1.169) | 7/8 |
+| `live_perf` `M.base` (ns/packet) | 10.39 | 10.34 | -0.5% | 4/8 slower |
+
+The shared expiry is about 45% cheaper per connection (ratios 0.525 and 0.544). `BM_Expire` never touches
+`rte_hash`; its ratio's range, 0.930..1.169, spans 1. `M.base` is level: -0.5%, 4 of 8 pairs slower.
+
+**Tail latency** (`shared_writer_bench` `BM_WorkerWriteLatency`: a worker's own writes on a `kShared` table, call by
+call; each step one `InsertIfAbsent` of a new flow and one `Erase` of its oldest, 16,384 live flows, a quiescent state
+every 32 steps, 2^20 steps. /1 adds a second reader that never quiesces, so every deleted slot is held and later
+deletes merge. Paired ABBA, 24 rounds, release, worker CPU 11. Median ns, parent → D-208, then the median paired ratio
+and the pairs in which D-208 was slower):
+
+| | insert p50 | p99 | p99.9 | max | erase p50 | p99 | p99.9 | max | ns/step |
+|---|---|---|---|---|---|---|---|---|---|
+| /0 readers quiesce | 109→104 (0.96, 2/24) | 331→300 (0.91, 4) | 1920→1928 (1.03, 15) | 92k→109k (1.05, 13) | 158→95 (0.60, 0) | 717→278 (0.39, 0) | 2226→414 (0.19, 0) | 122k→30k (0.25, 4) | 394→275 |
+| /1 one reader stalled | 104→104 (0.99, 9) | 266→290 (1.02, 12) | 399→431 (1.03, 15) | 17k→23k (1.19, 14) | 158→94 (0.60, 0) | 283→239 (0.77, 4) | 400→347 (0.83, 5) | 24k→16k (0.75, 8) | 322→265 |
+
+Erase is faster at every percentile: p99.9 0.19 with readers quiescing, 0.83 with one stalled. Insert p99.9 at 1.03
+is within the noise: D-208 was slower in 15 of 24 pairs, and the parent against itself (16 rounds) drifts 0.93..0.99
+in median (insert p99.9 0.955, 0.81..1.38). Each max is one call of 2^20 (`kLatencySteps`).
+
+**Consequences.**
+- Every exact table is 24 B per slot (rounded to a power of two) smaller and pays 4 B per slot and 4 KiB of tokens
+  (256 × 16 B `Batch`, `concurrent_exact.h` `HeldBytes`; `CreateTakesWhatBytesCountsAndNoDeferQueue`, the Bytes
+  table).
+- A worker's delete cannot block, whatever readers do: no RCU is attached, so the synchronize at
+  `rte_cuckoo_hash.c:1888-1902` is never reached (`DeleteStormWithAStalledReaderHoldsEverySlotAndNeverWaits`: 0
+  waited).
+- A batch that took a merged delete waits for the later grace period
+  (`DeletesPastTheBatchRingJoinTheNewestUnderTheirOwnGracePeriod`: 11 held where the parent holds 10): under more
+  than 256 deletes per grace period, slots come back later than DPDK's queue, one token per delete, returned them.
+  The headroom (D-010) and `kFull` cover that; `merged` counts it.
+- The table, not DPDK, now owns the reuse rule; `ErasedSlotWaitsForOnlineReaders` keeps pinning it.
+- `live_strict_budget` keeps D-207's bound as corrected there, `unattributed − (heap resident − heap allocated)` at
+  64 MiB, unchanged. At the refusal's 2.98M rules (release, 3 runs each, parent = the correction's commit):
+
+  | MiB | parent | D-208 |
+  |---|---|---|
+  | used | 282.4–282.9 | 241.8–245.7 |
+  | admitted | 208.0 | 124.0 |
+  | unattributed | 47.1–47.5 | 90.6–94.7 |
+  | heaps resident − allocated | +7.4 (DPDK 200.4 − 193.1) | +63.6 (DPDK 158.7 − 97.1, fallback 14.1 − 12.0) |
+  | bounded | 39.8–40.1 | 27.0–31.1 |
+
+  Admitted falls 84 MiB: the defer queue's 96 MiB goes (0.65 MiB of it was ever touched, D-207's correction) and the
+  held rings' 4 B per slot come. The untouched queue had netted out the DPDK heap's resident free blocks; D-208
+  adds none of those: per heap element (`rte_malloc_dump_heaps` against `/proc/<pid>/pagemap`, release, at
+  118d237a), free blocks resident in DPDK's heap were 105.1 MiB at the parent and 64.0 MiB with D-208.
+
+**Revisit when:** a DPDK upgrade changes `NO_FREE_ON_DEL` or `rte_hash_free_key_with_position`; `merged` is seen
+growing in production (then a larger token ring); or a second concurrent writer per table appears (the one-producer
+ring then needs per-writer rings).

@@ -19,6 +19,16 @@
 //
 // Args: variant, threads, lookups per insert. Reported: M inserts/s and M
 // lookups/s in total (each insert comes with one erase).
+//
+// BM_WorkerWriteLatency/<stalled>: the cost of each write a worker makes on
+// a kShared table, call by call -- one InsertIfAbsent of a new flow and one
+// Erase of its oldest per step, a quiescent state every 32 steps (a burst),
+// kLatencySteps steps after a kWindow fill. stalled 0: the worker is the only
+// reader; 1: a second reader is online and never quiesces, so no grace period
+// ends -- every deleted slot is held, the grace-period ring fills and later
+// deletes merge (D-208), and each call's frees find nothing ready. Reported:
+// p50 / p99 / p99.9 / max ns per call (rte_rdtsc_precise around it, timer
+// cost included), and ns per step.
 
 // rte_hash_rcu_qsbr_add is experimental in DPDK 25.11.
 #define ALLOW_EXPERIMENTAL_API 1
@@ -28,10 +38,12 @@
 #include <pthread.h>
 #include <sched.h>
 
+#include <rte_cycles.h>
 #include <rte_hash.h>
 #include <rte_hash_crc.h>
 #include <rte_lcore.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -277,5 +289,87 @@ BENCHMARK(BM_PacketPathWriters)
     ->ArgsProduct({{0, 1, 2, 3}, {1, 2, 4}, {32, 256}})
     ->UseRealTime()
     ->MinTime(1.0);
+
+constexpr uint32_t kLatencySteps = 1u << 20u;
+
+void BM_WorkerWriteLatency(benchmark::State &state) {
+  const bool stalled = state.range(0) != 0;
+  bess::rcu::RcuDomain &domain = bess::runtime::runtime().rcu();
+  constexpr bess::rcu::ReaderId kWorker = 30, kStalled = 31;
+  if (!domain.Register(kWorker).has_value() || !domain.Register(kStalled).has_value()) {
+    state.SkipWithError("reader ids taken");
+    return;
+  }
+  // Every slot a step can hold with no grace period ending, and the window.
+  const uint32_t capacity =
+      ConcurrentExactTable::CapacityFor(kWindow + kLatencySteps);
+  // Ticks per call, converted at the end: the TSC rate is known only once
+  // the first Create has brought DPDK up.
+  std::vector<uint32_t> insert_ticks(kLatencySteps), erase_ticks(kLatencySteps);
+  uint64_t step_ticks = 0;
+  for (auto _ : state) {
+    state.PauseTiming();
+    auto table = *ConcurrentExactTable::Create(
+        8, capacity, domain, SOCKET_ID_ANY,
+        ConcurrentExactTable::Writers::kShared);
+    uint64_t next = 0;
+    for (; next < kWindow; next++) {
+      table->InsertIfAbsent(Bytes(&next), next);
+    }
+    domain.Online(kWorker);
+    if (stalled) {
+      domain.Online(kStalled);
+    }
+    state.ResumeTiming();
+    const uint64_t start = rte_rdtsc_precise();
+    for (uint32_t i = 0; i < kLatencySteps; i++, next++) {
+      const uint64_t old = next - kWindow;
+      const uint64_t t0 = rte_rdtsc_precise();
+      const auto added = table->InsertIfAbsent(Bytes(&next), next);
+      const uint64_t t1 = rte_rdtsc_precise();
+      const bool erased = table->Erase(Bytes(&old));
+      const uint64_t t2 = rte_rdtsc_precise();
+      if (added.status != ConcurrentExactTable::InsertResult::Status::kInserted ||
+          !erased) {
+        state.SkipWithError("a write failed");
+        break;
+      }
+      insert_ticks[i] = static_cast<uint32_t>(t1 - t0);
+      erase_ticks[i] = static_cast<uint32_t>(t2 - t1);
+      if ((i & 31u) == 31u) {
+        domain.Quiescent(kWorker);
+      }
+    }
+    step_ticks = rte_rdtsc_precise() - start;
+    state.PauseTiming();
+    domain.Offline(kWorker);
+    if (stalled) {
+      domain.Offline(kStalled);
+    }
+    table.reset();
+    state.ResumeTiming();
+  }
+  domain.Unregister(kWorker);
+  domain.Unregister(kStalled);
+  domain.Drain();
+  const double ns_per_tick = 1e9 / static_cast<double>(rte_get_tsc_hz());
+  const auto report = [&](const char *name, std::vector<uint32_t> &ticks) {
+    std::sort(ticks.begin(), ticks.end());
+    const auto at = [&](double q) {
+      return static_cast<double>(ticks[static_cast<size_t>(q * (ticks.size() - 1))]) *
+             ns_per_tick;
+    };
+    const std::string n(name);
+    state.counters[n + "_p50"] = at(0.5);
+    state.counters[n + "_p99"] = at(0.99);
+    state.counters[n + "_p999"] = at(0.999);
+    state.counters[n + "_max"] = static_cast<double>(ticks.back()) * ns_per_tick;
+  };
+  report("insert", insert_ticks);
+  report("erase", erase_ticks);
+  state.counters["step_ns"] = static_cast<double>(step_ticks) * ns_per_tick / kLatencySteps;
+  state.SetLabel(stalled ? "a reader stalled" : "readers quiesce");
+}
+BENCHMARK(BM_WorkerWriteLatency)->Arg(0)->Arg(1)->Iterations(1)->UseRealTime();
 
 }  // namespace

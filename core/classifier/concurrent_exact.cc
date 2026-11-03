@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-// rte_hash_rcu_qsbr_dq_reclaim is experimental in DPDK 25.11.
-#define ALLOW_EXPERIMENTAL_API 1
-
 #include "classifier/concurrent_exact.h"
 
 #include <rte_hash_crc.h>
 
 #include <atomic>
-#include <cerrno>
 #include <new>
 
 #include "classifier/rte_hash_exact.h"
 #include "dpdk.h"
+#include "utils/logging.h"
 
 namespace bess::classifier {
+
+namespace {
+
+// A counter only the writer serialization writes: a load and a store, no
+// locked read-modify-write on the writer's path.
+template <typename T>
+void Add(std::atomic<T> &counter, T n) noexcept {
+  counter.store(counter.load(std::memory_order_relaxed) + n,
+                std::memory_order_relaxed);
+}
+
+}  // namespace
 
 std::expected<std::unique_ptr<ConcurrentExactTable>, std::string>
 ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
@@ -35,59 +44,63 @@ ConcurrentExactTable::Create(uint32_t key_len, uint32_t capacity,
   params.hash_func = rte_hash_crc;
   params.hash_func_init_val = 0;
   params.socket_id = socket;
+  // No RCU is attached (D-208): the LF flag alone keeps a deleted key's slot
+  // allocated (NO_FREE_ON_DEL) until this table frees it.
   params.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF;
   // On the memory policy: retried on the normal-page fallback heap when the
-  // socket is out of memory (MemoryRefused if that is not allowed).
-  rte_hash *table = detail::CreateRteHash(params);
+  // socket is out of memory (MemoryRefused if that is not allowed). First,
+  // so that a size rte_hash refuses (over 2^30 keys) allocates nothing.
+  std::unique_ptr<rte_hash, void (*)(rte_hash *)> table(
+      detail::CreateRteHash(params), rte_hash_free);
   if (table == nullptr) {
     return std::unexpected("rte_hash_create failed (capacity " +
                            std::to_string(capacity) + ")");
   }
   if (const detail::CmpFn cmp = detail::SelectCmp(key_len)) {
-    rte_hash_set_cmp_func(table, cmp);
+    rte_hash_set_cmp_func(table.get(), cmp);
   }
-  rte_hash_rcu_config rcu{};
-  rcu.v = domain.dpdk_qsbr();
-  rcu.mode = RTE_HASH_QSBR_MODE_DQ;
-  // The defer queue comes from DPDK's native heaps (SOCKET_ID_ANY), never
-  // the fallback heap: out of them is a memory refusal (D-198), not a
-  // failed table its owner would report as full. rte_errno stays 0 when its
-  // config's rte_zmalloc fails, ENOMEM when its ring's memzone does.
-  rte_errno = 0;
-  if (rte_hash_rcu_qsbr_add(table, &rcu) != 0) {
-    const int error = rte_errno;
-    rte_hash_free(table);
-    if (error == 0 || error == ENOMEM) {
-      utils::RefuseDpdkMemory(Bytes(key_len, capacity, domain));
-    }
-    return std::unexpected("rte_hash_rcu_qsbr_add failed");
-  }
+  // The held-slot rings, on the memory policy like the table
+  // (utils::DpdkAllocate: a refusal throws MemoryRefused, and `table` frees
+  // the hash).
+  utils::DpdkArray<uint32_t> held(params.entries, socket);
+  utils::DpdkArray<Batch> batches(kMaxDeleteBatches, socket);
   // Nothrow: a refusal here must free the hash rather than leak it.
-  auto *wrapper = new (std::nothrow) ConcurrentExactTable(table, key_len, params.entries, writers);
+  rte_hash *const raw = table.release();
+  auto *wrapper = new (std::nothrow)
+      ConcurrentExactTable(raw, key_len, params.entries, writers, domain,
+                           std::move(held), std::move(batches));
   if (wrapper == nullptr) {
-    rte_hash_free(table);
+    rte_hash_free(raw);
     throw std::bad_alloc();
   }
   return std::unique_ptr<ConcurrentExactTable>(wrapper);
 }
 
 ConcurrentExactTable::~ConcurrentExactTable() {
-  // Frees the defer queue too. Its entries must be past their grace period,
-  // or the queue's memory leaks (rte_rcu_qsbr_dq_delete does not wait).
-  // Owners guarantee that: a table is dropped only with the last generation
-  // that maps it, itself retired through the same QSBR variable after every
-  // delete on the table was enqueued.
+  // Held slots go with the table: they are slots of its own key store.
+  // Owners drop a table only with the last generation that maps it, retired
+  // through the same QSBR variable, so no reader is still inside it.
   rte_hash_free(table_);
 }
 
 size_t ConcurrentExactTable::Bytes(uint32_t key_len, uint32_t capacity,
                                    const rcu::RcuDomain & /*domain*/,
                                    int /*socket*/, Writers /*writers*/) {
-  return detail::RteHashBytes(std::max<uint32_t>(capacity, 8), key_len);
+  const uint32_t entries = std::max<uint32_t>(capacity, 8);
+  return detail::RteHashBytes(entries, key_len) + HeldBytes(entries);
 }
 
 size_t ConcurrentExactTable::bytes() const noexcept {
-  return detail::RteHashBytes(capacity_, key_len_);
+  return detail::RteHashBytes(capacity_, key_len_) + HeldBytes(capacity_);
+}
+
+ConcurrentExactTable::DeferStats ConcurrentExactTable::defer_stats()
+    const noexcept {
+  return {held_count_.load(std::memory_order_relaxed),
+          freed_.load(std::memory_order_relaxed),
+          merged_.load(std::memory_order_relaxed),
+          refused_full_.load(std::memory_order_relaxed),
+          checks_.load(std::memory_order_relaxed)};
 }
 
 ConcurrentExactTable::UpsertResult ConcurrentExactTable::Upsert(
@@ -111,8 +124,10 @@ ConcurrentExactTable::InsertResult ConcurrentExactTable::InsertIfAbsent(
   }
   void *const data = reinterpret_cast<void *>(static_cast<uintptr_t>(value));
   if (rte_hash_add_key_with_hash_data(table_, key.data(), sig, data) != 0) {
-    ReclaimLocked();
-    if (rte_hash_add_key_with_hash_data(table_, key.data(), sig, data) != 0) {
+    // As in UpsertLocked: free what is ready and retry once.
+    if (FreeReadyLocked(kFreeBatch) == 0 ||
+        rte_hash_add_key_with_hash_data(table_, key.data(), sig, data) != 0) {
+      Add(refused_full_, uint64_t{1});
       return {InsertResult::Status::kFull, 0};
     }
   }
@@ -128,13 +143,13 @@ ConcurrentExactTable::UpsertResult ConcurrentExactTable::UpsertLocked(
   // and update alike; the lookup tells them apart (size_ accounting).
   const hash_sig_t sig = rte_hash_hash(table_, key.data());
   const bool present = rte_hash_lookup_with_hash(table_, key.data(), sig) >= 0;
-  int ret = rte_hash_add_key_with_hash_data(table_, key.data(), sig, data);
-  if (ret != 0) {
-    // Deleted slots return to the free list only after readers pass a grace
-    // period; reclaim what is ready and retry once before reporting full.
-    ReclaimLocked();
-    ret = rte_hash_add_key_with_hash_data(table_, key.data(), sig, data);
-    if (ret != 0) {
+  if (rte_hash_add_key_with_hash_data(table_, key.data(), sig, data) != 0) {
+    // No free slot (or no place for the key): hand back held slots whose
+    // grace period has passed and retry once. Nothing waits: with readers
+    // stalled the add is refused, counted.
+    if (FreeReadyLocked(kFreeBatch) == 0 ||
+        rte_hash_add_key_with_hash_data(table_, key.data(), sig, data) != 0) {
+      Add(refused_full_, uint64_t{1});
       return UpsertResult::kFull;
     }
   }
@@ -161,29 +176,93 @@ bool ConcurrentExactTable::HasRoomForOne() {
 
 void ConcurrentExactTable::ReclaimAll() {
   WriterGuard guard(*this);
-  unsigned freed = 0, pending = 0, available = 0;
-  do {
-    rte_hash_rcu_qsbr_dq_reclaim(table_, &freed, &pending, &available);
-  } while (freed > 0 && pending > 0);
+  (void)FreeReadyLocked(UINT32_MAX);
 }
 
 void ConcurrentExactTable::Reclaim() {
   WriterGuard guard(*this);
-  ReclaimLocked();
+  (void)FreeReadyLocked(kFreeBatch);
 }
 
-void ConcurrentExactTable::ReclaimLocked() {
-  unsigned freed, pending, available;
-  rte_hash_rcu_qsbr_dq_reclaim(table_, &freed, &pending, &available);
+void ConcurrentExactTable::HoldLocked(uint32_t position) noexcept {
+  // Started after rte_hash_del_key took the key out of its bucket (a release
+  // store), as the RCU rules require: a reader that found the key before
+  // then is online at this token and must pass a quiescent state.
+  const rcu::GracePeriod token = domain_.StartGracePeriodLockFree();
+  const uint32_t held = held_count_.load(std::memory_order_relaxed);
+  // Never full: each held position is a distinct allocated slot.
+  promise(held < capacity_);
+  uint32_t tail = held_head_ + held;
+  if (tail >= capacity_) {
+    tail -= capacity_;
+  }
+  held_[tail] = position;
+  held_count_.store(held + 1, std::memory_order_relaxed);
+  if (batch_count_ == kMaxDeleteBatches) {
+    // Every grace period in flight has a batch: this delete joins the newest
+    // under its own, later grace period, which only delays that batch.
+    Batch &newest =
+        batches_[(batch_head_ + batch_count_ - 1) & (kMaxDeleteBatches - 1)];
+    newest.token = token;
+    newest.count++;
+    Add(merged_, uint64_t{1});
+  } else {
+    batches_[(batch_head_ + batch_count_) & (kMaxDeleteBatches - 1)] = {token,
+                                                                       1};
+    batch_count_++;
+  }
+}
+
+uint32_t ConcurrentExactTable::FreeReadyLocked(uint32_t limit) noexcept {
+  uint32_t freed = 0;
+  uint32_t checks = 0;
+  // Tokens grow along the ring (started in order under the serialization;
+  // a merge only raises the newest) and complete in order: stop at the
+  // first that has not. Each check that passes frees at least one slot, so
+  // a call makes at most limit + 1 checks.
+  while (batch_count_ > 0 && freed < limit) {
+    Batch &oldest = batches_[batch_head_];
+    checks++;
+    if (!domain_.IsCompleteLockFree(oldest.token)) {
+      break;
+    }
+    const uint32_t n = std::min(oldest.count, limit - freed);
+    for (uint32_t i = 0; i < n; i++) {
+      const int rc = rte_hash_free_key_with_position(
+          table_, static_cast<int32_t>(held_[held_head_]));
+      DCHECK_EQ(rc, 0);
+      held_head_ = held_head_ + 1 == capacity_ ? 0 : held_head_ + 1;
+    }
+    freed += n;
+    oldest.count -= n;
+    if (oldest.count == 0) {
+      batch_head_ = (batch_head_ + 1) & (kMaxDeleteBatches - 1);
+      batch_count_--;
+    }
+  }
+  if (checks > 0) {
+    Add(checks_, uint64_t{checks});
+  }
+  if (freed > 0) {
+    held_count_.store(held_count_.load(std::memory_order_relaxed) - freed,
+                      std::memory_order_relaxed);
+    Add(freed_, uint64_t{freed});
+  }
+  return freed;
 }
 
 bool ConcurrentExactTable::Erase(ConstBytes key) {
   promise(key.size() == key_len_);
   WriterGuard guard(*this);
-  if (rte_hash_del_key(table_, key.data()) < 0) {
+  // The slot stays allocated (NO_FREE_ON_DEL); rte_hash returns its position.
+  const int32_t position = rte_hash_del_key(table_, key.data());
+  if (position < 0) {
     return false;
   }
   size_.fetch_sub(1, std::memory_order_relaxed);
+  // Ready slots first, so their batches make room for this one's.
+  (void)FreeReadyLocked(kFreeBatch);
+  HoldLocked(static_cast<uint32_t>(position));
   return true;
 }
 
