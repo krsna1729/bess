@@ -176,31 +176,34 @@ size_t Fib6Bytes(const rte_fib6_conf &conf, size_t entry_bytes) {
          size_t{128} * static_cast<size_t>(conf.max_routes);
 }
 
-// A replacement built beside what it replaces (D-198): `bytes` admitted
-// through `growth` (when set) for the scope, refused by a throw before
-// anything is built, and given back when the scope ends -- the
-// replacement's on failure, or, once it is published, the replaced
-// instance's, retired to the RCU domain (which takes no callback, so its
-// bytes are given back at retirement, not when the grace period frees it).
-class ScopedGrowth {
+// A structure about to be built (D-198): `bytes` admitted through `growth`
+// (when set), refused by a throw before anything is built, and given back
+// when the scope ends unless Keep() says the structure is now held -- a build
+// that fails gives its admission back. A replaced structure's bytes are given
+// back by whoever retires it (the RCU domain takes no callback, so at
+// retirement, not when the grace period frees it).
+class PendingGrowth {
  public:
-  ScopedGrowth(utils::MemoryGrowth *growth, size_t bytes)
+  PendingGrowth(utils::MemoryGrowth *growth, size_t bytes)
       : growth_(growth), bytes_(bytes) {
-    if (growth_ != nullptr) {
+    if (growth_ != nullptr && bytes_ != 0) {
       growth_->Grow(bytes_);
     }
   }
-  ~ScopedGrowth() {
-    if (growth_ != nullptr) {
+  ~PendingGrowth() {
+    if (growth_ != nullptr && bytes_ != 0 && !kept_) {
       growth_->Shrink(bytes_);
     }
   }
-  ScopedGrowth(const ScopedGrowth &) = delete;
-  ScopedGrowth &operator=(const ScopedGrowth &) = delete;
+  PendingGrowth(const PendingGrowth &) = delete;
+  PendingGrowth &operator=(const PendingGrowth &) = delete;
+
+  void Keep() noexcept { kept_ = true; }
 
  private:
   utils::MemoryGrowth *const growth_;
   const size_t bytes_;
+  bool kept_ = false;
 };
 
 }  // namespace
@@ -220,17 +223,18 @@ size_t LpmRouteTable::InstanceBytes(const Config &config) noexcept {
 }
 
 std::expected<std::unique_ptr<LpmRouteTable::Instance>, RouteError>
-LpmRouteTable::NewInstance(uint32_t default_value) {
+LpmRouteTable::NewInstance(uint32_t default_value, bool build) {
+  auto instance = std::make_unique<Instance>();
+  instance->default_value.store(default_value, std::memory_order_relaxed);
+  if (!build) {
+    return instance;
+  }
   // Every allocation before the DPDK create: a refusal must not leave a table
   // (and its global name) behind.
   const std::string name = InstanceName(name_);
-  auto instance = std::make_unique<Instance>();
-  instance->default_value.store(default_value, std::memory_order_relaxed);
 
   if (config_.backend == RouteBackend::kRteFib) {
-    if (config_.max_routes > static_cast<uint32_t>(INT32_MAX)) {
-      return std::unexpected(RouteError::kBackendFailure);
-    }
+    // Create refused a config these do not fit.
     struct rte_fib_conf conf = {};
     conf.type = RTE_FIB_DIR24_8;
     conf.default_nh = kFibMiss;
@@ -243,9 +247,6 @@ LpmRouteTable::NewInstance(uint32_t default_value) {
     // otherwise fail where rte_lpm's cannot. (Changes and deletes never
     // allocate: deps/dpdk-patches/0005.) rte_fib rounds the pool up to a
     // multiple of 64.
-    if (config_.tbl8_groups == UINT32_MAX) {
-      return std::unexpected(RouteError::kBackendFailure);
-    }
     conf.dir24_8.num_tbl8 = config_.tbl8_groups + 1;
     struct rte_fib *fib = CreateOnPolicy(config_.socket, FibBytes(conf), [&](int socket) {
       return rte_fib_create(name.c_str(), socket, &conf);
@@ -330,14 +331,27 @@ LpmRouteTable::Create(std::string name, const Config &config,
   if (!RouteBackendSupported(config.backend)) {
     return std::unexpected(RouteError::kUnsupportedBackend);
   }
+  // What NewInstance hands rte_fib must fit its int and, with the extra
+  // group (FibAdmits), its pool count: refused here, before any route.
+  if (config.backend == RouteBackend::kRteFib &&
+      (config.max_routes > static_cast<uint32_t>(INT32_MAX) ||
+       config.tbl8_groups == UINT32_MAX)) {
+    return std::unexpected(RouteError::kBackendFailure);
+  }
   std::unique_ptr<LpmRouteTable> table(
       new LpmRouteTable(std::move(name), config, domain));
-  auto instance = table->NewInstance(kNoDefault);
-  if (!instance) {
-    return std::unexpected(instance.error());
-  }
-  table->live_.Initialize(std::move(*instance));
+  // No structure until a route longer than /0 (see the class comment).
+  table->live_.Initialize(std::make_unique<Instance>());
   return table;
+}
+
+void LpmRouteTable::PublishLocked(std::unique_ptr<Instance> fresh) {
+  const bool built = fresh->lpm != nullptr || fresh->fib != nullptr;
+  live_.Publish(std::move(fresh));
+  if (built_.exchange(built, std::memory_order_relaxed) && growth_ != nullptr) {
+    growth_->Shrink(InstanceBytes(config_));  // the replaced one, retired
+  }
+  domain_.ReclaimReady();
 }
 
 LpmRouteTable::~LpmRouteTable() {
@@ -363,6 +377,19 @@ std::expected<void, RouteError> LpmRouteTable::Upsert(Ipv4Prefix prefix,
     live->default_value.store(value, std::memory_order_release);
     default_ = value;
     return {};
+  }
+  if (!built_.load(std::memory_order_relaxed)) {
+    // The first route longer than /0 builds the structure, admitted first (a
+    // refusal throws: nothing changed), and publishes it holding the default
+    // alone, so readers see no change until the route is added below.
+    PendingGrowth admitted(growth_, InstanceBytes(config_));
+    auto fresh = NewInstance(default_.value_or(kNoDefault), /*build=*/true);
+    if (!fresh) {
+      return std::unexpected(fresh.error());
+    }
+    live = fresh->get();
+    PublishLocked(std::move(*fresh));
+    admitted.Keep();
   }
   // The shadow entries first: once the backend has the route, nothing can
   // fail (and an allocation that throws before it leaves nothing behind).
@@ -431,13 +458,12 @@ std::expected<void, RouteError> LpmRouteTable::Erase(Ipv4Prefix prefix) {
 
 std::expected<void, RouteError> LpmRouteTable::Clear() {
   std::lock_guard<std::mutex> lock(writer_mutex_);
-  const ScopedGrowth replacement(growth_, InstanceBytes(config_));
-  auto fresh = NewInstance(default_.value_or(kNoDefault));
+  // The default alone needs no structure (see the class comment).
+  auto fresh = NewInstance(default_.value_or(kNoDefault), /*build=*/false);
   if (!fresh) {
     return std::unexpected(fresh.error());
   }
-  live_.Publish(std::move(*fresh));
-  domain_.ReclaimReady();
+  PublishLocked(std::move(*fresh));
   rules_.clear();
   fib_blocks_.clear();
   return {};
@@ -459,8 +485,10 @@ std::expected<void, RouteError> LpmRouteTable::ReplaceAll(
   }
 
   std::lock_guard<std::mutex> lock(writer_mutex_);
-  const ScopedGrowth replacement(growth_, InstanceBytes(config_));
-  auto fresh = NewInstance(next_default.value_or(kNoDefault));
+  // A structure only for routes longer than /0 (see the class comment).
+  const bool build = !next_rules.empty();
+  PendingGrowth admitted(growth_, build ? InstanceBytes(config_) : 0);
+  auto fresh = NewInstance(next_default.value_or(kNoDefault), build);
   if (!fresh) {
     return std::unexpected(fresh.error());
   }
@@ -482,8 +510,8 @@ std::expected<void, RouteError> LpmRouteTable::ReplaceAll(
     }
   }
   // The one publication: a release store of the finished table.
-  live_.Publish(std::move(*fresh));
-  domain_.ReclaimReady();
+  PublishLocked(std::move(*fresh));
+  admitted.Keep();
   rules_ = std::move(next_rules);
   fib_blocks_ = std::move(next_blocks);
   default_ = next_default;
@@ -554,6 +582,7 @@ size_t Ipv6RouteTable::InstanceBytes(const Config &config) noexcept {
   return Fib6Bytes(conf, EntryBytes(config));
 }
 
+// rte_fib6_free takes NULL (an instance without a trie).
 Ipv6RouteTable::Instance::~Instance() { rte_fib6_free(fib); }
 
 std::expected<std::unique_ptr<Ipv6RouteTable>, RouteError>
@@ -571,13 +600,8 @@ Ipv6RouteTable::Create(std::string name, const Config &config,
   }
   std::unique_ptr<Ipv6RouteTable> table(
       new Ipv6RouteTable(std::move(name), config, domain));
-  std::lock_guard<std::mutex> lock(table->writer_mutex_);
-  auto instance = table->NewInstance();
-  if (!instance) {
-    return std::unexpected(instance.error());
-  }
-  table->live_.Initialize(std::move(*instance));
-  table->instances_.store(1, std::memory_order_relaxed);
+  // No trie until a prefix other than ::/0 (see the class comment).
+  table->live_.Initialize(table->NewInstance());
   return table;
 }
 
@@ -586,30 +610,36 @@ Ipv6RouteTable::~Ipv6RouteTable() {
   live_.ResetQuiesced();
 }
 
-std::expected<std::unique_ptr<Ipv6RouteTable::Instance>, RouteError>
-Ipv6RouteTable::NewInstance() {
-  // Every allocation before the DPDK create.
-  const std::string name = InstanceName(name_);
+std::unique_ptr<Ipv6RouteTable::Instance> Ipv6RouteTable::NewInstance() const {
   auto instance = std::make_unique<Instance>();
   instance->miss = config_.max_value + 1;
+  return instance;
+}
+
+std::expected<void, RouteError> Ipv6RouteTable::BuildTrie(Instance &instance) {
+  // Every allocation before the DPDK create.
+  const std::string name = InstanceName(name_);
   struct rte_fib6_conf conf = {};
   conf.type = RTE_FIB6_TRIE;
-  conf.default_nh = instance->miss;
+  conf.default_nh = instance.miss;
   // The bound is ours (Stage::UpsertLocked); the rib wants a pool to exist.
   conf.max_routes = static_cast<int>(std::max<uint32_t>(config_.max_routes, 1));
   conf.rib_ext_sz = 0;
   conf.trie.nh_sz = entry_bytes_ == 2 ? RTE_FIB6_TRIE_2B : RTE_FIB6_TRIE_4B;
   conf.trie.num_tbl8 = config_.tbl8_groups;
-  instance->fib = CreateOnPolicy(config_.socket, Fib6Bytes(conf, entry_bytes_), [&](int socket) {
+  PendingGrowth admitted(growth_, instance_bytes_);
+  instance.fib = CreateOnPolicy(config_.socket, Fib6Bytes(conf, entry_bytes_), [&](int socket) {
     return rte_fib6_create(name.c_str(), socket, &conf);
   });
-  if (instance->fib == nullptr) {
+  if (instance.fib == nullptr) {
     return std::unexpected(rte_errno == ENOMEM || rte_errno == ENOSPC
                                ? RouteError::kTableFull
                                : RouteError::kBackendFailure);
   }
+  admitted.Keep();
+  tries_.fetch_add(1, std::memory_order_relaxed);
   builds_++;
-  return instance;
+  return {};
 }
 
 int Ipv6RouteTable::Apply(Instance &instance, Ipv6Prefix prefix,
@@ -617,6 +647,10 @@ int Ipv6RouteTable::Apply(Instance &instance, Ipv6Prefix prefix,
   if (prefix.length() == 0) {
     instance.default_value = value.value_or(LpmRouteTable::kNoDefault);
     return 0;
+  }
+  if (instance.fib == nullptr) {
+    // No trie: no rule to delete, and no room for one.
+    return value ? -ENOENT : 0;
   }
   if (value) {
     return rte_fib6_add(instance.fib, AsDpdk(prefix.addr()), prefix.length(),
@@ -630,11 +664,14 @@ int Ipv6RouteTable::Apply(Instance &instance, Ipv6Prefix prefix,
 std::expected<std::unique_ptr<Ipv6RouteTable::Instance>, RouteError>
 Ipv6RouteTable::Build() {
   auto instance = NewInstance();
-  if (!instance) {
-    return instance;
+  if (RoutesLocked() != 0) {
+    if (auto built = BuildTrie(*instance); !built) {
+      return std::unexpected(built.error());
+    }
   }
   for (const auto &[prefix, value] : rules_) {
-    if (const int ret = Apply(**instance, prefix, value); ret != 0) {
+    if (const int ret = Apply(*instance, prefix, value); ret != 0) {
+      Released(*instance);
       return std::unexpected(FromDpdk(ret));  // the instance is freed
     }
   }
@@ -673,47 +710,36 @@ std::expected<void, RouteError> Ipv6RouteTable::PrepareSpare() {
       // A reader may still be in it: it goes to the RCU domain, and a fresh
       // spare is built from the rules.
       domain_.ReserveRetirements(1);
+      Released(*spare_);
       domain_.Retire(token, std::move(spare_));
-      SpareReleased();
       spare_lag_.clear();
     }
   }
   if (spare_ && !Replay(*spare_)) {
-    // A replay may need a transient tbl8 group a fresh build does not.
+    // A replay may need a transient tbl8 group a fresh build does not, or a
+    // trie the spare has not had yet.
+    Released(*spare_);
     spare_.reset();  // unpublished, or past its grace period
-    SpareReleased();
   }
   spare_lag_.clear();
   if (!spare_) {
-    // Admitted before it is built (D-198); given back if the build fails.
-    if (growth_ != nullptr) {
-      growth_->Grow(instance_bytes_);
-    }
-    std::expected<std::unique_ptr<Instance>, RouteError> built;
-    try {
-      built = Build();
-    } catch (...) {
-      if (growth_ != nullptr) {
-        growth_->Shrink(instance_bytes_);
-      }
-      throw;
-    }
+    // A trie it needs is admitted before it is built (D-198).
+    auto built = Build();
     if (!built) {
-      if (growth_ != nullptr) {
-        growth_->Shrink(instance_bytes_);
-      }
       return std::unexpected(built.error());
     }
     spare_ = std::move(*built);
-    instances_.fetch_add(1, std::memory_order_relaxed);
     spare_token_.reset();
     spare_unpublished_ = true;
   }
   return {};
 }
 
-void Ipv6RouteTable::SpareReleased() noexcept {
-  instances_.fetch_sub(1, std::memory_order_relaxed);
+void Ipv6RouteTable::Released(const Instance &instance) noexcept {
+  if (instance.fib == nullptr) {
+    return;
+  }
+  tries_.fetch_sub(1, std::memory_order_relaxed);
   if (growth_ != nullptr) {
     growth_->Shrink(instance_bytes_);
   }
@@ -786,8 +812,8 @@ void Ipv6RouteTable::AbortLocked(Stage &stage) noexcept {
   if (stage.broken_) {
     // A refused DPDK edit may have left the trie half written.
     if (spare_) {
+      Released(*spare_);
       spare_.reset();
-      SpareReleased();
     }
     spare_lag_.clear();
     spare_token_.reset();
@@ -914,6 +940,14 @@ std::expected<void, RouteError> Ipv6RouteTable::Stage::UpsertLocked(
   const bool counted = prefix.length() != 0;
   if (!current && counted && routes_ >= table_.config_.max_routes) {
     return std::unexpected(RouteError::kTableFull);
+  }
+  if (counted && table_.spare_->fib == nullptr) {
+    // The table's first prefix other than ::/0: the spare's trie, admitted
+    // first (a refusal throws, and the stage is as it was). Unpublished or
+    // past its grace period, the spare is edited in place.
+    if (auto built = table_.BuildTrie(*table_.spare_); !built) {
+      return std::unexpected(built.error());
+    }
   }
   // Everything that allocates, before the spare changes. Geometric: one
   // edit at a time must not copy the list on every call (RO-3).

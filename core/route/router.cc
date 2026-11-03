@@ -159,19 +159,13 @@ Router::Config Router::SizedConfig(const Config &config, size_t max_next_hops,
   return sized;
 }
 
-size_t Router::DomainBytes(const Config &config) noexcept {
-  return (config.ipv4 ? LpmRouteTable::InstanceBytes(*config.ipv4) : 0) +
-         (config.ipv6 ? Ipv6RouteTable::InstanceBytes(*config.ipv6) : 0);
-}
-
 size_t Router::Bytes(const std::string &name, const Config &config,
                      size_t max_next_hops, const rcu::RcuDomain &domain,
                      size_t max_domains, size_t max_groups,
                      const RouterResourceNames &resources) {
   // The constructor publishes the default domain's object: the domain
-  // slab's first chunk.
-  return DomainBytes(SizedConfig(config, max_next_hops, max_groups)) +
-         dataplane::SlotTable<DomainSlot, Domain>::Bytes(max_domains) +
+  // slab's first chunk. Its FIBs hold nothing until routed (route_table.h).
+  return dataplane::SlotTable<DomainSlot, Domain>::Bytes(max_domains) +
          utils::ObjectSlab<Domain>::chunk_bytes() +
          dataplane::SlotTable<NextHopId, NextHop>::Bytes(max_next_hops) +
          dataplane::SlotTable<NextHopGroupId, NextHopGroup>::Bytes(
@@ -1527,24 +1521,17 @@ std::expected<void, RouteError> Router::CreateDomainLocked(
   if (domains_.Contains(slot)) {
     return std::unexpected(RouteError::kDomainExists);
   }
-  // The domain's FIB set is admitted before it is built (D-198), and given
-  // back if anything below fails (the FIBs are freed by then).
-  const size_t fib_bytes = DomainBytes(config);
-  fib_memory_.Grow(fib_bytes, 0);
-  try {
-    auto object =
-        MakeDomain(name_ + "_d" + std::to_string(domain.value()), config, rcu_);
-    if (!object) {
-      fib_memory_.Shrink(fib_bytes, 0);
-      return std::unexpected(object.error());
-    }
-    object->set_memory_growth(&fib_memory_);
-    ReserveOneMore(domain_ids_);
-    domains_.Publish(slot, domains_.Make(std::move(*object)));
-  } catch (...) {
-    fib_memory_.Shrink(fib_bytes, 0);
-    throw;
+  // The domain's FIBs cost nothing until routed: each builds its DPDK
+  // structure for its first route other than the default, admitted then
+  // through fib_memory_ (D-198, route_table.h).
+  auto object =
+      MakeDomain(name_ + "_d" + std::to_string(domain.value()), config, rcu_);
+  if (!object) {
+    return std::unexpected(object.error());
   }
+  object->set_memory_growth(&fib_memory_);
+  ReserveOneMore(domain_ids_);
+  domains_.Publish(slot, domains_.Make(std::move(*object)));
   domain_ids_.insert(
       std::lower_bound(domain_ids_.begin(), domain_ids_.end(), domain), domain);
   return {};

@@ -308,7 +308,8 @@ struct RecordingGrowth final : utils::MemoryGrowth {
   size_t peak = 0;
 };
 
-// D-198: what Create allocates is known before it runs.
+// D-198: what Create allocates is known before it runs -- no DPDK structure:
+// the first route longer than /0 builds it, a default alone does not.
 TEST_P(RouteTableTest, MemoryCostIsWhatCreateAllocates) {
   const std::pair<uint32_t, uint32_t> sizes[] = {{1024, 256}, {4096, 1024}, {65536, 64}};
   for (const auto &[routes, tbl8] : sizes) {
@@ -324,32 +325,76 @@ TEST_P(RouteTableTest, MemoryCostIsWhatCreateAllocates) {
     EXPECT_EQ(framework::MemoryCost<LpmRouteTable>::Bytes(
                   std::string("route_cost"), config, rcu),
               (*table)->untyped().bytes());
+    EXPECT_EQ(0u, (*table)->bytes()) << "no structure at Create";
+    ASSERT_TRUE((*table)->Upsert(P(0, 0), Value(1)));
+    EXPECT_EQ(0u, (*table)->bytes()) << "nor for the default";
+    ASSERT_TRUE((*table)->Upsert(P(Ip(10, 0, 0, 0), 24), Value(2)));
+    EXPECT_EQ(LpmRouteTable::InstanceBytes(config), (*table)->bytes());
     EXPECT_GT((*table)->bytes(), size_t{64} << 20) << "a 2^24-entry tbl24";
   }
 }
 
-// Clear() and ReplaceAll() admit the replacement before they build it and
-// give it back once the replaced instance is retired; a refusal leaves the
-// table as it was.
-TEST_P(RouteTableTest, AReplacementIsAdmittedFirst) {
+// A structure is admitted before it is built, and a refusal leaves the table
+// as it was: the first route longer than /0, and ReplaceAll()'s replacement
+// (beside the live one, given back once it is retired). Clear() builds
+// nothing and gives the structure back; so does ReplaceAll() to a default.
+TEST_P(RouteTableTest, AStructureIsAdmittedBeforeItIsBuilt) {
   auto table = MakeTable();
   RecordingGrowth growth;
   table->set_memory_growth(&growth);
-  const size_t bytes = table->bytes();
-  ASSERT_TRUE(table->Upsert(P(Ip(10, 0, 0, 0), 8), Value(1)));
+  const size_t bytes = LpmRouteTable::InstanceBytes(table->untyped().config());
+  ASSERT_TRUE(table->Upsert(P(0, 0), Value(9)));
+  EXPECT_EQ(0u, growth.grown) << "a default alone builds nothing";
   growth.refuse = true;
-  EXPECT_THROW((void)table->Clear(), utils::MemoryRefused);
-  EXPECT_EQ(Value(1), table->Read().Lookup(Ip(10, 1, 1, 1))) << "unchanged";
+  EXPECT_THROW(
+      { [[maybe_unused]] const auto r = table->Upsert(P(Ip(10, 0, 0, 0), 8), Value(1)); },
+      utils::MemoryRefused);
+  EXPECT_EQ(Value(9), table->Read().Lookup(Ip(10, 1, 1, 1))) << "unchanged";
+  EXPECT_FALSE(table->Find(P(Ip(10, 0, 0, 0), 8)).has_value());
+  EXPECT_EQ(0u, table->bytes());
   growth.refuse = false;
+  ASSERT_TRUE(table->Upsert(P(Ip(10, 0, 0, 0), 8), Value(1)));
+  EXPECT_EQ(bytes, growth.grown);
+  EXPECT_EQ(bytes, table->bytes());
+  EXPECT_EQ(Value(1), table->Read().Lookup(Ip(10, 1, 1, 1)));
+  EXPECT_EQ(Value(9), table->Read().Lookup(Ip(11, 1, 1, 1)));
   ASSERT_TRUE(table->Clear());
-  EXPECT_FALSE(table->Read().Lookup(Ip(10, 1, 1, 1)).has_value());
-  EXPECT_EQ(bytes, growth.peak) << "one more instance while replacing";
-  EXPECT_EQ(0u, growth.grown) << "the replaced instance is given back";
-  EXPECT_EQ(bytes, table->bytes());
+  EXPECT_EQ(0u, growth.grown) << "Clear gives the structure back";
+  EXPECT_EQ(0u, table->bytes());
+  EXPECT_EQ(Value(9), table->Read().Lookup(Ip(10, 1, 1, 1))) << "the default stays";
+
   const LpmRouteTable::Rule rules[] = {{P(Ip(10, 0, 0, 0), 8), 2}};
+  growth.refuse = true;
+  EXPECT_THROW({ [[maybe_unused]] const auto r = table->untyped().ReplaceAll(rules); },
+               utils::MemoryRefused);
+  EXPECT_EQ(Value(9), table->Read().Lookup(Ip(10, 1, 1, 1))) << "unchanged";
+  growth.refuse = false;
   ASSERT_TRUE(table->untyped().ReplaceAll(rules));
-  EXPECT_EQ(0u, growth.grown);
+  EXPECT_EQ(bytes, growth.grown);
+  ASSERT_TRUE(table->untyped().ReplaceAll(rules));
+  EXPECT_EQ(2 * bytes, growth.peak) << "the replacement beside the live one";
+  EXPECT_EQ(bytes, growth.grown) << "the replaced one is given back";
   EXPECT_EQ(bytes, table->bytes());
+  const LpmRouteTable::Rule defaults[] = {{P(0, 0), 3}};
+  ASSERT_TRUE(table->untyped().ReplaceAll(defaults));
+  EXPECT_EQ(0u, growth.grown) << "a default alone holds nothing";
+  EXPECT_EQ(0u, table->bytes());
+  EXPECT_EQ(Value(3), table->Read().Lookup(Ip(10, 1, 1, 1)));
+}
+
+// A table without a structure answers from its default, or misses, for a
+// lone lookup and a batch alike.
+TEST_P(RouteTableTest, AnUnbuiltTableAnswersFromItsDefault) {
+  auto table = MakeTable();
+  const std::array<uint32_t, 3> keys = {Ip(10, 0, 0, 1), Ip(11, 0, 0, 1), 0};
+  std::array<uint32_t, 3> values;
+  EXPECT_FALSE(table->Read().Lookup(Ip(10, 0, 0, 1)).has_value());
+  EXPECT_EQ(0u, table->Read().LookupBatch(keys, values));
+  ASSERT_TRUE(table->Upsert(P(0, 0), Value(5)));
+  EXPECT_EQ(Value(5), table->Read().Lookup(Ip(10, 0, 0, 1)));
+  EXPECT_EQ(0b111u, table->Read().LookupBatch(keys, values));
+  EXPECT_EQ((std::array<uint32_t, 3>{5, 5, 5}), values);
+  EXPECT_EQ(0u, table->bytes());
 }
 
 TEST_P(RouteTableTest, BatchMaskWithoutDefault) {
@@ -699,9 +744,10 @@ TEST_P(RouterTest, MemoryCostIsWhatCreateAllocates) {
   }
 }
 
-// A new domain's FIBs and a new slab chunk are admitted before they are
-// allocated, and a refusal changes nothing; a removed domain's FIBs are
-// given back.
+// A domain's FIB structure and a new slab chunk are admitted before they are
+// allocated, and a refusal changes nothing: a new domain costs nothing until
+// a route other than the default builds its FIB, and a removed domain's FIBs
+// are given back.
 TEST_P(RouterTest, GrowthIsAdmittedFirst) {
   LpmRouteTable::Config v4 = bess::testing::TestRouteConfig();
   const Router::Config config{.ipv4 = v4};
@@ -713,19 +759,31 @@ TEST_P(RouterTest, GrowthIsAdmittedFirst) {
   router->set_memory_growth(&growth);
   const size_t before = router->bytes();
   growth.refuse = true;
-  EXPECT_THROW((void)router->CreateDomain(RouteDomainId(1), config), utils::MemoryRefused);
-  EXPECT_FALSE(router->HasDomain(RouteDomainId(1)));
   EXPECT_THROW((void)router->SetNextHop(NextHopId(1), Hop(1, 1)), utils::MemoryRefused);
   EXPECT_EQ(before, router->bytes());
   growth.refuse = false;
   ASSERT_TRUE(router->CreateDomain(RouteDomainId(1), config));
-  const size_t fib = LpmRouteTable::InstanceBytes(v4);
-  EXPECT_EQ(fib, growth.grown);
-  EXPECT_EQ(before + fib, router->bytes());
+  EXPECT_EQ(0u, growth.grown) << "a domain's FIB is not built until routed";
   ASSERT_TRUE(router->SetNextHop(NextHopId(1), Hop(1, 1)));
   const size_t chunk = utils::ObjectSlab<NextHop>::chunk_bytes();
+  EXPECT_EQ(chunk, growth.grown);
+  ASSERT_TRUE(router->SetRoute(RouteDomainId(1), P(0, 0), NextHopId(1)));
+  EXPECT_EQ(chunk, growth.grown) << "nor by its default route";
+  const Ipv4Prefix net = P(Ip(10, 0, 0, 0), 8);
+  growth.refuse = true;
+  EXPECT_THROW(
+      { [[maybe_unused]] const auto r = router->SetRoute(RouteDomainId(1), net, NextHopId(1)); },
+      utils::MemoryRefused);
+  EXPECT_EQ(1u, router->route_count(RouteDomainId(1)));
+  EXPECT_EQ(1u, router->RouteReferences(NextHopId(1)));
+  EXPECT_EQ(before + chunk, router->bytes());
+  growth.refuse = false;
+  ASSERT_TRUE(router->SetRoute(RouteDomainId(1), net, NextHopId(1)));
+  const size_t fib = LpmRouteTable::InstanceBytes(v4);
   EXPECT_EQ(fib + chunk, growth.grown);
   EXPECT_EQ(before + fib + chunk, router->bytes());
+  ASSERT_TRUE(router->RemoveRoute(RouteDomainId(1), net));
+  ASSERT_TRUE(router->RemoveRoute(RouteDomainId(1), P(0, 0)));
   ASSERT_TRUE(router->RemoveDomain(RouteDomainId(1)));
   EXPECT_EQ(chunk, growth.grown);
   EXPECT_EQ(before + chunk, router->bytes());
@@ -1767,9 +1825,10 @@ void ExpectAgrees6(const Ipv6RouteTable &table, const std::map<Ipv6Prefix, uint3
   }
 }
 
-// D-198: Create's cost is one instance; the first change admits the spare
-// before it builds it, and a refusal changes nothing.
-TEST(Ipv6RouteTableTest, MemoryCostAndTheSpareAdmission) {
+// D-198: Create builds no trie, and neither does ::/0; the first other prefix
+// admits one before it builds it (a refusal changes nothing), and the next
+// change admits the spare's.
+TEST(Ipv6RouteTableTest, MemoryCostAndTheTrieAdmissions) {
   for (const uint32_t tbl8 : {64u, 1024u, 8192u}) {
     const auto config = Cfg6(64, tbl8);
     auto &rcu = bess::runtime::runtime().rcu();
@@ -1777,20 +1836,46 @@ TEST(Ipv6RouteTableTest, MemoryCostAndTheSpareAdmission) {
     EXPECT_EQ(framework::MemoryCost<Ipv6RouteTable>::Bytes(std::string("v6_test"),
                                                            config, rcu),
               table->bytes());
+    EXPECT_EQ(0u, table->bytes());
   }
   auto table = MakeTable6();
-  const size_t one = table->bytes();
+  const size_t one = Ipv6RouteTable::InstanceBytes(Cfg6());
   RecordingGrowth growth;
   table->set_memory_growth(&growth);
+  ASSERT_TRUE(table->Upsert(P6("::", 0), 1));
+  EXPECT_EQ(0u, growth.grown) << "::/0 alone builds no trie";
+  EXPECT_EQ(0u, table->builds());
+  EXPECT_EQ(1u, table->Read().Lookup(V6("2001:db8::1")));
   growth.refuse = true;
   EXPECT_THROW((void)table->Upsert(P6("2001:db8::", 32), 7), utils::MemoryRefused);
   EXPECT_FALSE(table->Find(P6("2001:db8::", 32)).has_value());
-  EXPECT_EQ(one, table->bytes());
-  EXPECT_EQ(1u, table->builds());
+  EXPECT_EQ(0u, table->bytes());
+  EXPECT_EQ(0u, table->builds());
+  EXPECT_EQ(1u, table->Read().Lookup(V6("2001:db8::1"))) << "unchanged";
   growth.refuse = false;
   ASSERT_TRUE(table->Upsert(P6("2001:db8::", 32), 7));
-  EXPECT_EQ(one, growth.grown) << "the spare";
+  EXPECT_EQ(one, growth.grown) << "one trie";
+  EXPECT_EQ(one, table->bytes());
+  EXPECT_EQ(7u, table->Read().Lookup(V6("2001:db8::1")));
+  EXPECT_EQ(1u, table->Read().Lookup(V6("3000::1")));
+  ASSERT_TRUE(table->Upsert(P6("2001:db9::", 32), 8));
+  EXPECT_EQ(2 * one, growth.grown) << "and the spare's";
   EXPECT_EQ(2 * one, table->bytes());
+}
+
+// A table without a trie answers from ::/0, or misses, for a lone lookup and
+// a batch alike.
+TEST(Ipv6RouteTableTest, ATableWithoutATrieAnswersFromItsDefault) {
+  auto table = MakeTable6();
+  const std::array<bess::utils::Ipv6Address, 2> addrs = {V6("2001:db8::1"), V6("::")};
+  std::array<uint32_t, 2> values;
+  EXPECT_EQ(LpmRouteTable::kNoDefault, table->Read().LookupOrMiss(addrs[0]));
+  EXPECT_EQ(0u, table->Read().LookupBatch(addrs, values));
+  ASSERT_TRUE(table->Upsert(P6("::", 0), 4));
+  EXPECT_EQ(4u, table->Read().LookupOrMiss(addrs[0]));
+  EXPECT_EQ(0b11u, table->Read().LookupBatch(addrs, values));
+  EXPECT_EQ((std::array<uint32_t, 2>{4, 4}), values);
+  EXPECT_EQ(0u, table->builds());
 }
 
 TEST(Ipv6RouteTableTest, LongestPrefixMatchFromTheDefaultToHostRoutesAndTheTopOfTheSpace) {
@@ -2104,11 +2189,12 @@ TEST(Ipv6RouteTableTest, BackToBackStagesReplayOrRebuildTheSpare) {
     table->Committed(domain.StartGracePeriod());
     ExpectAgrees6(*table, rules, addrs);
   };
-  EXPECT_EQ(1u, table->builds()) << "the first live instance";
+  EXPECT_EQ(0u, table->builds()) << "Create builds no trie";
   apply({{P6("2001:db8:1::", 48), 1}, {P6("2001:db8:2::", 48), 2}});
-  EXPECT_EQ(2u, table->builds()) << "the first spare";
+  EXPECT_EQ(1u, table->builds()) << "the first route builds one, in the spare";
   // No reader online: every grace period completes at once.
   apply({{P6("2001:db8:1::", 48), std::nullopt}, {P6("2001:db8:3::", 48), 3}});
+  EXPECT_EQ(2u, table->builds()) << "the replaced instance had no trie to replay into";
   apply({{P6("2001:db8:2::", 48), 5}, {P6("::", 0), 6}});
   apply({{P6("2001:db8:1::", 48), 1}, {P6("::", 0), std::nullopt}});
   EXPECT_EQ(2u, table->builds()) << "the replaced instance was reused";
@@ -2147,20 +2233,20 @@ TEST(Ipv6RouteTableTest, AnAbortedStageReusesANeverPublishedSpare) {
   constexpr uint32_t kReader = 24;
   ASSERT_TRUE(domain.Register(kReader).has_value());
   domain.Online(kReader);
-  EXPECT_EQ(1u, table->builds()) << "the first live instance";
+  EXPECT_EQ(0u, table->builds()) << "Create builds no trie";
   for (int attempt = 0; attempt < 3; attempt++) {
     auto stage = table->BeginStage();
     ASSERT_TRUE(stage);
     ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:1::", 48), 1));
     table->Abort(**stage);
-    EXPECT_EQ(2u, table->builds()) << "attempt " << attempt << ": one spare, reused";
+    EXPECT_EQ(1u, table->builds()) << "attempt " << attempt << ": one spare, reused";
   }
   auto stage = table->BeginStage();
   ASSERT_TRUE(stage);
   ASSERT_TRUE((*stage)->Upsert(P6("2001:db8:2::", 48), 2));
   table->Commit(**stage);
   table->Committed(domain.StartGracePeriod());
-  EXPECT_EQ(2u, table->builds());
+  EXPECT_EQ(1u, table->builds());
   const std::vector<bess::utils::Ipv6Address> addrs = {V6("2001:db8:1::1"),
                                                        V6("2001:db8:2::1")};
   ExpectAgrees6(*table, {{P6("2001:db8:2::", 48), 2}}, addrs);

@@ -33,6 +33,7 @@
 #include "route/router.h"
 #include "testing/allocation_faults.h"
 #include "testing/route_backends.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::route {
 namespace {
@@ -1541,6 +1542,174 @@ TEST_P(RouterTransactionTest, Ipv6PublicationDoesNotAllocate) {
   EXPECT_EQ(Egress6Of(*router, "2001:db8:3::1"), 1);
   EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:1::1"), 2);
   EXPECT_EQ(Egress6Of(*router, d1, "3000::1"), -1);
+  Settle();
+}
+
+// -- FIB structures: built when routed -------------------------------------------
+
+// What a router admits through its growth hook (D-198); refuses every growth
+// while `refuse` is set.
+struct RecordingGrowth final : utils::MemoryGrowth {
+  void Grow(size_t bytes, size_t /*glibc_bytes*/) override {
+    if (refuse) {
+      throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit, bytes,
+                                 "refused by the test");
+    }
+    grown += bytes;
+  }
+  void Shrink(size_t bytes, size_t /*glibc_bytes*/) noexcept override { grown -= bytes; }
+  bool refuse = false;
+  size_t grown = 0;
+};
+
+// The egress `dst` resolves to in `domain`, or -1 for a miss.
+int EgressIn(const Router &router, RouteDomainId domain, uint32_t dst) {
+  const NextHop *hop = router.Resolve(domain, dst);
+  return hop == nullptr ? -1 : static_cast<int>(hop->egress.value());
+}
+
+// The transport router of krsna1729/upf's deploy/appliance.yaml
+// (datapath/upf_appliance_slow.cc): both families with 64 routes and the
+// default tbl8 groups, 4096 next hops, domains 0-2.
+constexpr size_t kDeployHops = 4096;
+constexpr size_t kDeployDomains = 3;
+Router::Config DeployConfig() {
+  Router::Config config{.ipv4 = bess::testing::TestRouteConfig(),
+                        .ipv6 = Ipv6RouteTable::Config{}};
+  config.ipv4->max_routes = 64;
+  config.ipv6->max_routes = 64;
+  return config;
+}
+
+// That router enrolled in `engine`, admitting through `growth`, with the
+// deploy's routes applied: /0 and ::/0 in domains 1 and 2 (each domain made
+// by that write, D-158), each through its own next hop.
+std::unique_ptr<Router> MakeDeployRouter(TransactionEngine &engine,
+                                         RecordingGrowth &growth) {
+  auto made = Router::Create("deploy", DeployConfig(), kDeployHops,
+                             bess::runtime::runtime().rcu(), kDeployDomains);
+  EXPECT_TRUE(made.has_value());
+  if (!made) {
+    return nullptr;
+  }
+  Router &router = **made;
+  router.set_memory_growth(&growth);
+  EXPECT_TRUE(router.Enroll(engine.registry()));
+  const RouteDomainId d1(1), d2(2);
+  EXPECT_EQ(engine
+                .Apply(std::vector<Op>{router.SetNextHopOp(NextHopId(1), Hop(1)),
+                                       router.SetNextHopOp(NextHopId(2), Hop(2)),
+                                       router.SetNextHopOp(NextHopId(3), Hop(3)),
+                                       router.SetNextHopOp(NextHopId(4), Hop(4)),
+                                       router.SetRouteOp(d1, P(0, 0), NextHopId(1)),
+                                       router.SetRouteOp(d1, P6("::", 0), NextHopId(2)),
+                                       router.SetRouteOp(d2, P(0, 0), NextHopId(3)),
+                                       router.SetRouteOp(d2, P6("::", 0), NextHopId(4))})
+                .outcome,
+            Outcome::kApplied);
+  return std::move(*made);
+}
+
+// The deploy's routes build no FIB structure: a default is kept beside the
+// structure, so domain 0 (never routed) and domains 1 and 2 (routed by their
+// defaults) admit nothing for their six tables, and the router holds what
+// Create admitted plus a next-hop slab chunk -- less than one rte_lpm. (Each
+// domain used to admit an rte_lpm and an rte_fib6 as it was created, and a
+// second rte_fib6 at its first IPv6 change.)
+TEST_P(RouterTransactionTest, DefaultRoutesAloneBuildNoFib) {
+  RecordingGrowth growth;
+  auto router = MakeDeployRouter(engine_, growth);
+  ASSERT_TRUE(router);
+  const RouteDomainId d1(1), d2(2);
+  EXPECT_EQ(3u, router->domain_count());
+  EXPECT_EQ(EgressIn(*router, d1, Ip(198, 51, 100, 9)), 1);
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8::9"), 2);
+  EXPECT_EQ(EgressIn(*router, d2, Ip(198, 51, 100, 9)), 3);
+  EXPECT_EQ(Egress6Of(*router, d2, "2001:db8::9"), 4);
+  EXPECT_EQ(EgressOf(*router, Ip(198, 51, 100, 9)), -1) << "domain 0 holds no route";
+  const size_t created = Router::Bytes("deploy", DeployConfig(), kDeployHops,
+                                       bess::runtime::runtime().rcu(), kDeployDomains);
+  std::printf("[router] deploy routes: %zu bytes held (%zu admitted by Create, %zu grown)\n",
+              router->bytes(), created, growth.grown);
+  EXPECT_EQ(created + growth.grown, router->bytes());
+  const Router::Config deploy = DeployConfig();
+  if (!deploy.ipv4.has_value()) GTEST_FAIL() << "deploy has IPv4";
+  EXPECT_LT(router->bytes(), LpmRouteTable::InstanceBytes(*deploy.ipv4))
+      << "no FIB structure";
+  Settle();
+}
+
+// The first route other than a default builds its family's structure alone,
+// admitted before it is built: a /24 exactly one rte_lpm (or rte_fib) and no
+// rte_fib6, then a /48 exactly one rte_fib6 trie, with readers on the
+// default until each route is placed. More IPv4 routes build nothing; IPv6's
+// next change builds the spare's trie.
+TEST_P(RouterTransactionTest, TheFirstRouteBuildsOneFamilysTable) {
+  RecordingGrowth growth;
+  auto router = MakeDeployRouter(engine_, growth);
+  ASSERT_TRUE(router);
+  const RouteDomainId d1(1);
+  const Router::Config config = DeployConfig();
+  if (!config.ipv4.has_value() || !config.ipv6.has_value()) GTEST_FAIL() << "deploy has both";
+  Ipv6RouteTable::Config v6 = *config.ipv6;
+  v6.max_value = kDeployHops;  // the router's own (Create sizes it)
+  const size_t lpm = LpmRouteTable::InstanceBytes(*config.ipv4);
+  const size_t trie = Ipv6RouteTable::InstanceBytes(v6);
+  const size_t base = growth.grown;
+  ASSERT_EQ(Apply({router->SetRouteOp(d1, P(Ip(198, 51, 100, 0), 24), NextHopId(3))}).outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(lpm, growth.grown - base) << "one IPv4 structure and no IPv6 one";
+  EXPECT_EQ(EgressIn(*router, d1, Ip(198, 51, 100, 9)), 3);
+  EXPECT_EQ(EgressIn(*router, d1, Ip(203, 0, 113, 9)), 1) << "the default";
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:1::9"), 2) << "IPv6 on its default";
+  ASSERT_EQ(Apply({router->SetRouteOp(d1, P6("2001:db8:1::", 48), NextHopId(4))}).outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(lpm + trie, growth.grown - base) << "one IPv6 trie";
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:1::9"), 4);
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:2::9"), 2) << "the default";
+  ASSERT_EQ(Apply({router->SetRouteOp(d1, P(Ip(198, 51, 101, 0), 24), NextHopId(3)),
+                   router->SetRouteOp(d1, P6("2001:db8:2::", 48), NextHopId(4))})
+                .outcome,
+            Outcome::kApplied);
+  EXPECT_EQ(lpm + 2 * trie, growth.grown - base) << "IPv4 nothing more, IPv6 its spare";
+  EXPECT_EQ(EgressIn(*router, kDefaultRouteDomainId, Ip(198, 51, 100, 9)), -1)
+      << "domain 0 untouched";
+  Settle();
+}
+
+// The admission of that first build refuses like any other (D-206): the
+// route write fails -- utils::MemoryRefused out of the engine, which the
+// control boundary returns as RESOURCE_EXHAUSTED -- and the router is as it
+// was: no route, no reference, no bytes, readers on the default. With memory,
+// the same writes apply.
+TEST_P(RouterTransactionTest, ARefusedFirstBuildLeavesTheRouterUnchanged) {
+  RecordingGrowth growth;
+  auto router = MakeDeployRouter(engine_, growth);
+  ASSERT_TRUE(router);
+  const RouteDomainId d1(1);
+  const auto state = [&] {
+    std::string s = std::to_string(router->route_count()) + "/" +
+                    std::to_string(router->bytes()) + "/" + std::to_string(growth.grown) +
+                    "/g" + std::to_string(engine_.generation());
+    for (uint32_t id = 1; id <= 4; id++) {
+      s += " r" + std::to_string(router->RouteReferences(NextHopId(id)));
+    }
+    s += " " + std::to_string(EgressIn(*router, d1, Ip(198, 51, 100, 9)));
+    s += " " + std::to_string(Egress6Of(*router, d1, "2001:db8:1::9"));
+    return s;
+  };
+  const std::string before = state();
+  const Op v4 = router->SetRouteOp(d1, P(Ip(198, 51, 100, 0), 24), NextHopId(3));
+  const Op v6 = router->SetRouteOp(d1, P6("2001:db8:1::", 48), NextHopId(4));
+  growth.refuse = true;
+  EXPECT_THROW((void)Apply({v4}), utils::MemoryRefused);
+  EXPECT_EQ(before, state()) << "IPv4";
+  EXPECT_THROW((void)Apply({v6}), utils::MemoryRefused);
+  EXPECT_EQ(before, state()) << "IPv6";
+  growth.refuse = false;
+  ASSERT_EQ(Apply({v4, v6}).outcome, Outcome::kApplied);
+  EXPECT_EQ(EgressIn(*router, d1, Ip(198, 51, 100, 9)), 3);
+  EXPECT_EQ(Egress6Of(*router, d1, "2001:db8:1::9"), 4);
   Settle();
 }
 

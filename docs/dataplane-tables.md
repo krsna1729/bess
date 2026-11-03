@@ -303,11 +303,14 @@ refused. An unset port bound is 65535, not 0, because the proto field is
 - **What:** DPDK `rte_lpm` changed in place by one serialized writer, with
   lock-free readers. Freed tbl8 groups are recycled only after a QSBR grace
   period (`rte_lpm_rcu_qsbr_add`, defer queue). The `/0` route is kept beside
-  the table as an atomic default.
+  the table as an atomic default, so the `rte_lpm` is built, and admitted,
+  only at the first route other than `/0`; until then lookups answer from the
+  default.
 - **Semantics:**
   - each route change is atomic to readers;
   - a sequence of changes is not one transaction;
-  - `Clear()` builds a fresh table and swaps it.
+  - `Clear()` swaps in an empty table, with no `rte_lpm` until the next
+    route other than `/0`.
 - **`Router`:** adds next hops (`NextHopId` → `NextHop`) in a `SlotTable`
   (mode C), so a neighbour change publishes one next-hop object: 63 ns at
   any table size, against 1.2 µs at 1K and 101 µs at 64K next hops when the
@@ -871,7 +874,7 @@ Run a benchmark pinned to one isolated core. The tables above name each one.
 | plain vs staged body rule | `modules_table_scale_bench`, `classifier_cuckoo_scale_bench` |
 | `rte_fib` backend (correctness, D-130/D-132) | `route_route_test` (`RteFibTest.*`, every build) and the `/Fib` instances of the route tests; `route_bench`, `fib_bench` and `live_perf M.router/fib` for cost |
 | LPM lookup and update cost | `route_bench` |
-| the Router's destination path at scale (route count × destination spread), LPM and FIB | `live_perf --tests M.router,M.router/s256,M.router/s64k,M.router/r2560s64k,M.router/r2560,M.router/r10240,M.router/r65536,M.router/r2560s64k-fib` |
+| the Router's destination path at scale (route count × destination spread), LPM and FIB; and with only the default route, no FIB structure | `live_perf --tests M.router,M.router/default,M.router/s256,M.router/s64k,M.router/r2560s64k,M.router/r2560,M.router/r10240,M.router/r65536,M.router/r2560s64k-fib` |
 | meters, counters, RCU | `meter_bench`, `stats_bench`, `rcu_bench` |
 
 ### Classifier result placement: live comparison

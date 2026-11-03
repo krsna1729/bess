@@ -3,6 +3,7 @@
 #ifndef BESS_ROUTE_ROUTE_TABLE_H_
 #define BESS_ROUTE_ROUTE_TABLE_H_
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <compare>
@@ -157,12 +158,19 @@ inline constexpr bool RouteBackendSupported(RouteBackend backend) {
 // stated plainly: each route change is atomic to readers (a lookup sees the
 // old or the new answer, never a mix or garbage), but a *sequence* of changes
 // is not one atomic transaction. Wholesale replacement -- Clear(), or
-// ReplaceAll() with a new rule set -- still builds a fresh table and publishes
-// it through RcuPtr, since that is both faster than deleting rule by rule and
-// atomic.
+// ReplaceAll() with a new rule set -- publishes a fresh table through RcuPtr,
+// since that is both faster than deleting rule by rule and atomic.
 //
 // The /0 route is kept beside the DPDK structure (rte_lpm's depth starts at
-// 1; rte_fib keeps the same model) as an atomic default value.
+// 1; rte_fib keeps the same model) as an atomic default value. So the
+// structure (64 MiB of tbl24 whatever the rule count) is built only for a
+// route longer than /0: a table holding at most its default -- a route
+// domain a deployment routes by default alone -- has none, and its readers
+// answer from the default (or miss) without one. The first such route builds
+// it, admitted first (set_memory_growth), and publishes it empty but for the
+// default, so readers see no change until the route itself is added in place.
+// Clear(), and ReplaceAll() with no such route, publish a table without one.
+// A table whose last such route is erased keeps its structure.
 //
 // The backend is chosen per table (Config::backend) and fixed for its life.
 // Readers branch on it once per Read()-batch call, never per packet in a
@@ -184,25 +192,30 @@ class LpmRouteTable {
   static std::expected<std::unique_ptr<LpmRouteTable>, RouteError> Create(
       std::string name, const Config &config, rcu::RcuDomain &domain);
 
-  // What Create allocates (D-198): one DPDK structure, InstanceBytes(config).
-  // The table object, its Instance and its rule map are small glibc pieces,
-  // not counted.
-  static size_t Bytes(const std::string & /*name*/, const Config &config,
+  // What Create allocates (D-198): no DPDK structure -- the first route
+  // longer than /0 builds it (see the class comment), admitted then. The
+  // table object, its Instance and its rule map are small glibc pieces, not
+  // counted.
+  static size_t Bytes(const std::string & /*name*/, const Config & /*config*/,
                       const rcu::RcuDomain & /*domain*/) noexcept {
-    return InstanceBytes(config);
+    return 0;
   }
   // One rte_lpm or rte_fib of `config`, as DPDK 25.11 allocates it on the
   // socket asked for (route_table.cc: LpmBytes, FibBytes); the RCU defer
   // queue is not counted.
   static size_t InstanceBytes(const Config &config) noexcept;
-  // What the table holds: its live instance. A replaced one is given back
-  // when it is retired (see set_memory_growth), so this does not change.
-  size_t bytes() const noexcept { return InstanceBytes(config_); }
-  // The admission Clear() and ReplaceAll() ask before they build the
-  // replacement instance beside the live one (D-198): a refusal throws
-  // utils::MemoryRefused and changes nothing. The replaced instance goes to
-  // the RCU domain, which takes no callback: its bytes are given back when
-  // it is retired, not when the grace period frees it. Control path only.
+  // What the table holds: its live instance's structure, InstanceBytes once
+  // built, else nothing. A replaced one is given back when it is retired (see
+  // set_memory_growth). Any thread.
+  size_t bytes() const noexcept {
+    return built_.load(std::memory_order_relaxed) ? InstanceBytes(config_) : 0;
+  }
+  // The admission a DPDK structure asks before it is built (D-198): the
+  // first route longer than /0, and Clear() and ReplaceAll() for the
+  // replacement instance beside the live one. A refusal throws
+  // utils::MemoryRefused and changes nothing. A replaced instance goes to the
+  // RCU domain, which takes no callback: its bytes are given back when it is
+  // retired, not when the grace period frees it. Control path only.
   void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
     growth_ = growth;
   }
@@ -218,8 +231,9 @@ class LpmRouteTable {
   std::expected<void, RouteError> Upsert(Ipv4Prefix prefix, uint32_t value);
   std::expected<void, RouteError> Erase(Ipv4Prefix prefix);
 
-  // Removes every non-default route by publishing a fresh empty table; the
-  // default route is kept (what rte_lpm_delete_all meant).
+  // Removes every non-default route by publishing a table without a
+  // structure, whose bytes are given back; the default route is kept (what
+  // rte_lpm_delete_all meant). Builds nothing, so is never refused.
   std::expected<void, RouteError> Clear();
 
   struct Rule {
@@ -228,13 +242,13 @@ class LpmRouteTable {
   };
 
   // Replaces every route -- the default included -- with `rules` as one
-  // publication. The replacement is built in a fresh rte_lpm beside the live
+  // publication. The replacement is built in a fresh structure beside the live
   // one, so every rule and tbl8 group it needs is placed (and a shortage
   // found) before anything is visible: on any error the live table is
   // untouched. Readers then see the old rule set or the new one, never a mix,
   // and the old table is retired through the RCU domain. A prefix named more
   // than once takes its last value. Cost is a table build (see above), not an
-  // in-place update.
+  // in-place update; `rules` without a route longer than /0 build nothing.
   std::expected<void, RouteError> ReplaceAll(std::span<const Rule> rules);
 
   // Control-side reads of the authoritative rule set (rte_lpm cannot be read
@@ -279,8 +293,9 @@ class LpmRouteTable {
   // fits rte_fib's 4-byte next hops (at most 2^31 - 1) and is never a route.
   static constexpr uint32_t kFibMiss = kMaxValue + 1;
 
-  // One DPDK structure (exactly one of `lpm` and `fib`) and the default route
-  // that goes with it.
+  // At most one DPDK structure (`lpm` or `fib`; neither until a route longer
+  // than /0 is added, see the class comment) and the default route that goes
+  // with it.
   struct Instance {
     ~Instance();
     struct rte_lpm *lpm = nullptr;
@@ -292,8 +307,13 @@ class LpmRouteTable {
       : name_(std::move(name)), config_(config), domain_(domain),
         live_(domain) {}
 
+  // An instance with `default_value`, and its DPDK structure when `build`
+  // (which the caller has admitted).
   std::expected<std::unique_ptr<Instance>, RouteError> NewInstance(
-      uint32_t default_value);
+      uint32_t default_value, bool build);
+  // Publishes `fresh` and retires the live instance, giving back its
+  // structure's bytes if it had one (D-198). With writer_mutex_ held.
+  void PublishLocked(std::unique_ptr<Instance> fresh);
   // The backend's add and delete, with its return codes (0 or -errno).
   static int AddRule(Instance &instance, Ipv4Prefix prefix, uint32_t value);
   static int DeleteRule(Instance &instance, Ipv4Prefix prefix);
@@ -319,6 +339,8 @@ class LpmRouteTable {
   // rte_fib only: the blocks FibAdmits counts.
   FibBlocks fib_blocks_;
   utils::MemoryGrowth *growth_ = nullptr;
+  // The live instance has a DPDK structure (bytes(), any thread).
+  std::atomic<bool> built_{false};
 };
 
 class LpmRouteTable::View {
@@ -329,18 +351,19 @@ class LpmRouteTable::View {
   // kNoDefault (above every value) for a miss: Lookup() without the optional,
   // for per-packet callers.
   uint32_t LookupOrMiss(uint32_t addr) const noexcept {
-    if (instance_->fib != nullptr) {
+    uint32_t value;
+    if (instance_->lpm != nullptr) {
+      if (rte_lpm_lookup(instance_->lpm, addr, &value) == 0) {
+        return value;
+      }
+    } else if (instance_->fib != nullptr) {
       uint64_t nh;
       rte_fib_lookup_bulk(instance_->fib, &addr, &nh, 1);
       if (nh != kFibMiss) {
         return static_cast<uint32_t>(nh);
       }
-      return instance_->default_value.load(std::memory_order_relaxed);
     }
-    uint32_t value;
-    if (rte_lpm_lookup(instance_->lpm, addr, &value) == 0) {
-      return value;
-    }
+    // Neither: no route longer than /0, so there is no structure to ask.
     return instance_->default_value.load(std::memory_order_relaxed);
   }
 
@@ -372,16 +395,18 @@ inline uint64_t LpmRouteTable::View::LookupBatch(
   promise(addrs.size() == values.size() && addrs.size() <= kMaxBatch);
   const uint32_t def = instance_->default_value.load(std::memory_order_relaxed);
   uint64_t hits = 0;
-  if (instance_->fib != nullptr) {
-    hits = LookupBatchFib(addrs, values, def);
-  } else {
-    const struct rte_lpm *lpm = instance_->lpm;
+  if (const struct rte_lpm *lpm = instance_->lpm; lpm != nullptr) {
     for (size_t i = 0; i < addrs.size(); i++) {
       uint32_t v;
       const uint32_t hit = rte_lpm_lookup(lpm, addrs[i], &v) == 0;
       hits |= uint64_t{hit} << i;
       values[i] = hit ? v : def;
     }
+  } else if (instance_->fib != nullptr) {
+    hits = LookupBatchFib(addrs, values, def);
+  } else {
+    // No structure: every address takes the default, or misses.
+    std::fill(values.begin(), values.end(), def);
   }
   if (def != kNoDefault) {
     hits = addrs.size() == 64 ? ~uint64_t{0}
@@ -439,11 +464,16 @@ inline LpmRouteTable::View LpmRouteTable::Read() const noexcept {
 // Entries are 2 bytes when both `max_value` + 1 (the miss marker) and
 // `tbl8_groups` fit rte_fib6's 2-byte next hop (2^15 - 1: entries hold value
 // << 1, and trie_create refuses more tbl8 groups than a next hop can name),
-// else 4 bytes. Memory per instance: tbl24 is 2^24 entries (32 MiB at 2 bytes,
+// else 4 bytes. Memory per trie: tbl24 is 2^24 entries (32 MiB at 2 bytes,
 // 64 MiB at 4) plus `tbl8_groups` x 256 entries (4 MiB / 8 MiB for the default
-// 8192 groups) plus the rib's 2 x max_routes nodes. A table holds one instance
-// until its first change and two after; a spare retired before its grace
-// period ended lives until the grace period does.
+// 8192 groups) plus the rib's 2 x max_routes nodes. As LpmRouteTable keeps
+// its /0, an instance has a trie only for prefixes other than ::/0: a table
+// holding at most ::/0 has none, and its readers answer from the default (or
+// miss) without one. The first such prefix a change adds builds the spare's
+// trie, admitted first (set_memory_growth), and the instance it replaces gets
+// one when a later change's replay needs it: a routed table holds two tries.
+// A spare retired before its grace period ended lives until the grace period
+// does.
 //
 // Two ways to write. Upsert()/Erase() are one-change transactions (the direct
 // API). A Stage composes several: BeginStage() readies the spare, the Stage's
@@ -471,31 +501,31 @@ class Ipv6RouteTable {
   class View;
 
   // kValueOutOfRange for a max_value past LpmRouteTable::kMaxValue;
-  // kTableFull when DPDK has no memory for the instance.
+  // kBackendFailure for more routes than the rib can count.
   static std::expected<std::unique_ptr<Ipv6RouteTable>, RouteError> Create(
       std::string name, const Config &config, rcu::RcuDomain &domain);
 
-  // What Create allocates (D-198): one rte_fib6, InstanceBytes(config). The
-  // table object, its Instance and its rule map are small glibc pieces, not
-  // counted.
-  static size_t Bytes(const std::string & /*name*/, const Config &config,
+  // What Create allocates (D-198): no trie -- the first prefix other than
+  // ::/0 builds one (see the class comment), admitted then. The table object,
+  // its Instance and its rule map are small glibc pieces, not counted.
+  static size_t Bytes(const std::string & /*name*/, const Config & /*config*/,
                       const rcu::RcuDomain & /*domain*/) noexcept {
-    return InstanceBytes(config);
+    return 0;
   }
   // One rte_fib6 TRIE of `config` (entry size EntryBytes(config)), as DPDK
   // 25.11 allocates it on the socket asked for (route_table.cc: Fib6Bytes).
   static size_t InstanceBytes(const Config &config) noexcept;
-  // What the table holds: its live instance and, after the first change, the
-  // spare (any thread).
+  // What the table holds: the tries of its live instance and its spare (any
+  // thread).
   size_t bytes() const noexcept {
-    return instances_.load(std::memory_order_relaxed) * instance_bytes_;
+    return tries_.load(std::memory_order_relaxed) * instance_bytes_;
   }
-  // The admission a spare asks before it is built (D-198): the first change
-  // builds a second instance, and one built while the old spare is still in
-  // its grace period is briefly a third. A refusal throws
-  // utils::MemoryRefused and changes nothing. A spare dropped or handed to the
-  // RCU domain (which takes no callback) gives its bytes back then, not when
-  // the grace period frees it. Control path only.
+  // The admission a trie asks before it is built (D-198): the first prefix
+  // other than ::/0 builds one, a later change a second for the spare, and
+  // one built while the old spare is still in its grace period is briefly a
+  // third. A refusal throws utils::MemoryRefused and changes nothing. A spare
+  // dropped or handed to the RCU domain (which takes no callback) gives its
+  // bytes back then, not when the grace period frees it. Control path only.
   void set_memory_growth(utils::MemoryGrowth *growth) noexcept {
     growth_ = growth;
   }
@@ -526,8 +556,8 @@ class Ipv6RouteTable {
   }
   const Config &config() const noexcept { return config_; }
   size_t entry_bytes() const noexcept { return entry_bytes_; }
-  // rte_fib6 instances built so far: the first live one, then a spare
-  // whenever none could be reused (see the class comment).
+  // rte_fib6 tries built so far: the first for a prefix other than ::/0, then
+  // a spare's whenever none could be reused (see the class comment).
   size_t builds() const;
 
   // -- transactions ------------------------------------------------------------
@@ -555,8 +585,9 @@ class Ipv6RouteTable {
  private:
   using Rules = std::map<Ipv6Prefix, uint32_t>;
 
-  // One rte_fib6 and the default route that goes with it. Readers see it
-  // only while it is live, and it is edited only while it is not.
+  // The default route and, once the table has held a prefix other than ::/0,
+  // one rte_fib6 (see the class comment). Readers see it only while it is
+  // live, and it is edited only while it is not.
   struct Instance {
     ~Instance();
     struct rte_fib6 *fib = nullptr;
@@ -573,7 +604,9 @@ class Ipv6RouteTable {
         live_(domain) {}
 
   // With writer_mutex_ held.
-  std::expected<std::unique_ptr<Instance>, RouteError> NewInstance();
+  std::unique_ptr<Instance> NewInstance() const;
+  // Builds `instance`'s trie, admitted first (D-198).
+  std::expected<void, RouteError> BuildTrie(Instance &instance);
   std::expected<std::unique_ptr<Instance>, RouteError> Build();
   bool Replay(Instance &instance);
   std::expected<void, RouteError> PrepareSpare();
@@ -582,12 +615,13 @@ class Ipv6RouteTable {
   void AbortLocked(Stage &stage) noexcept;
   size_t RoutesLocked() const noexcept;
   // rte_fib6_add (a value) or rte_fib6_delete (none), or the default for
-  // ::/0. 0 or -errno; deleting an absent rule is 0.
+  // ::/0. 0 or -errno; deleting an absent rule is 0, adding one to an
+  // instance without a trie -ENOENT.
   static int Apply(Instance &instance, Ipv6Prefix prefix,
                    std::optional<uint32_t> value);
-  // A spare no longer held (dropped, or retired to the RCU domain): its
-  // bytes leave bytes() and the growth hook (D-198).
-  void SpareReleased() noexcept;
+  // An instance no longer held (dropped, or retired to the RCU domain): its
+  // trie's bytes, if it has one, leave bytes() and the growth hook (D-198).
+  void Released(const Instance &instance) noexcept;
 
   const std::string name_;
   const Config config_;
@@ -609,8 +643,8 @@ class Ipv6RouteTable {
   std::vector<Ipv6Prefix> spare_lag_;
   bool stage_open_ = false;
   size_t builds_ = 0;
-  // Instances the table holds: the live one and the spare (bytes()).
-  std::atomic<size_t> instances_{0};
+  // Tries the table holds, in the live instance and the spare (bytes()).
+  std::atomic<size_t> tries_{0};
   utils::MemoryGrowth *growth_ = nullptr;
 };
 
@@ -623,7 +657,10 @@ class Ipv6RouteTable::Stage {
 
   // kValueOutOfRange past max_value; kTableFull for a new prefix past
   // max_routes or tbl8 groups the spare lacks. A refused DPDK edit leaves the
-  // stage unusable (kBackendFailure for every later edit): abort it.
+  // stage unusable (kBackendFailure for every later edit): abort it. The
+  // table's first prefix other than ::/0 builds the spare's trie: a refused
+  // admission throws utils::MemoryRefused, and a failed build returns its
+  // error, both with the stage as it was.
   std::expected<void, RouteError> Upsert(Ipv6Prefix prefix, uint32_t value);
   // kNotFound for a prefix the staged table does not hold.
   std::expected<void, RouteError> Erase(Ipv6Prefix prefix);
@@ -663,6 +700,9 @@ class Ipv6RouteTable::View {
   // The value for `addr`, falling back to the default route, or
   // LpmRouteTable::kNoDefault for a miss.
   uint32_t LookupOrMiss(const utils::Ipv6Address &addr) const noexcept {
+    if (instance_->fib == nullptr) {  // no prefix other than ::/0
+      return instance_->default_value;
+    }
     uint64_t nh;
     rte_fib6_lookup_bulk(instance_->fib, AsDpdk(&addr), &nh, 1);
     return nh != instance_->miss ? static_cast<uint32_t>(nh)
@@ -682,15 +722,20 @@ class Ipv6RouteTable::View {
   uint64_t LookupBatch(std::span<const utils::Ipv6Address> addrs,
                        std::span<uint32_t> values) const noexcept {
     promise(addrs.size() == values.size() && addrs.size() <= kMaxBatch);
-    uint64_t nh[kMaxBatch];
-    rte_fib6_lookup_bulk(instance_->fib, AsDpdk(addrs.data()), nh,
-                         static_cast<int>(addrs.size()));
     const uint32_t def = instance_->default_value;
     uint64_t hits = 0;
-    for (size_t i = 0; i < addrs.size(); i++) {
-      const bool hit = nh[i] != instance_->miss;
-      hits |= uint64_t{hit} << i;
-      values[i] = hit ? static_cast<uint32_t>(nh[i]) : def;
+    if (instance_->fib == nullptr) {
+      // No trie: every address takes the default, or misses.
+      std::fill(values.begin(), values.end(), def);
+    } else {
+      uint64_t nh[kMaxBatch];
+      rte_fib6_lookup_bulk(instance_->fib, AsDpdk(addrs.data()), nh,
+                           static_cast<int>(addrs.size()));
+      for (size_t i = 0; i < addrs.size(); i++) {
+        const bool hit = nh[i] != instance_->miss;
+        hits |= uint64_t{hit} << i;
+        values[i] = hit ? static_cast<uint32_t>(nh[i]) : def;
+      }
     }
     if (def != LpmRouteTable::kNoDefault) {
       hits = addrs.size() == 64 ? ~uint64_t{0}

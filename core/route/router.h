@@ -259,8 +259,11 @@ struct RouterResourceNames {
 // writes into a domain creates it (D-158, CreateDomainLocked), and
 // `max_domains` bounds the ids instead of allocating them, so a router
 // configured for many network instances pays only for the ones that hold
-// routes. D-046 records why a dense SlotTable and not a map or a rebuilt
-// vector.
+// routes. Within a domain, each family's DPDK structure (64 MiB of rte_lpm
+// tbl24, 32-64 MiB of rte_fib6 trie) is built by its first route other than
+// the default (route_table.h), so domain 0 and a domain routed by its
+// defaults alone cost only their small table objects. D-046 records why a
+// dense SlotTable and not a map or a rebuilt vector.
 //
 // Update modes, stated plainly:
 //
@@ -385,12 +388,13 @@ class Router {
       rcu::RcuDomain &domain, size_t max_domains = 1, size_t max_groups = 0,
       const RouterResourceNames &resources = {});
 
-  // What Create allocates (D-198): the default domain's FIBs (DPDK, the
-  // route tables' InstanceBytes), the three id tables' slots and states
+  // What Create allocates (D-198): the three id tables' slots and states
   // (DPDK, SlotTable::Bytes) with the domain slab's first chunk (the default
   // domain's object), and the per-id control vectors and the router itself
   // (glibc, GlibcBytes: malloc's chunks, utils::MallocChunkBytes, D-206) --
-  // what bytes() counts after Create. Same arguments as Create.
+  // what bytes() counts after Create. No FIB structure: the default domain's
+  // are built when routed, as every domain's (see the class comment). Same
+  // arguments as Create.
   static size_t Bytes(const std::string &name, const Config &config,
                       size_t max_next_hops, const rcu::RcuDomain &domain,
                       size_t max_domains = 1, size_t max_groups = 0,
@@ -404,10 +408,10 @@ class Router {
   // control vectors. The sorted domain-id list and the transaction scratch
   // are not counted.
   size_t bytes() const noexcept;
-  // The admission everything the router grows by asks first (D-198): a
-  // domain's FIB set before CreateDomain (or a transaction writing into a
-  // new domain) builds it, a FIB's replacement or IPv6 spare, and each new
-  // slab chunk of the domain, next-hop and group tables. A refusal throws
+  // The admission everything the router grows by asks first (D-198): a FIB's
+  // DPDK structure before its first route other than the default builds it
+  // (route_table.h), a FIB's replacement or IPv6 spare, and each new slab
+  // chunk of the domain, next-hop and group tables. A refusal throws
   // utils::MemoryRefused and changes nothing. A removed domain's FIBs are
   // given back when they are retired to the RCU domain. Control path only.
   void set_memory_growth(utils::MemoryGrowth *growth) noexcept;
@@ -415,8 +419,9 @@ class Router {
   bool has_ipv4() const noexcept { return domain_config_.ipv4.has_value(); }
   bool has_ipv6() const noexcept { return domain_config_.ipv6.has_value(); }
 
-  // The FIBs that exist across all domains, per family (an IPv6 table counts
-  // once, however many rte_fib6 instances it holds).
+  // The FIBs (route tables) that exist across all domains, per family,
+  // whether or not routed yet (an IPv6 table counts once, however many
+  // rte_fib6 tries it holds).
   struct FibCounts {
     size_t ipv4 = 0;
     size_t ipv6 = 0;
@@ -500,8 +505,9 @@ class Router {
   // A domain's FIB is created when it is first needed: explicitly here, or by
   // the first route a transaction writes into it (D-158), so `max_domains` is a
   // bound on the ids rather than an allocation -- a router configured for many
-  // network instances pays for the ones that hold routes. A domain created on
-  // demand is sized like the default one.
+  // network instances pays for the ones that hold routes, and a FIB's DPDK
+  // structure only once it holds a route other than the default (see the
+  // class comment). A domain created on demand is sized like the default one.
   //
   // Adds domain `domain` (0 < domain < max_domains) with its own FIBs sized by
   // `config`, which must enable exactly the router's families
@@ -949,14 +955,12 @@ class Router {
   // value, max_next_hops + max_groups.
   static Config SizedConfig(const Config &config, size_t max_next_hops,
                             size_t max_groups);
-  // One domain's FIB set for `config` (D-198): what MakeDomain allocates.
-  static size_t DomainBytes(const Config &config) noexcept;
 
   // What every domain's FIBs hold, and the hook they grow through (D-198):
-  // each FIB admits its replacement or IPv6 spare here, as CreateDomain
-  // admits a new domain's FIB set and RemoveDomain gives one back. Forwards
-  // to the router's own hook (set_memory_growth) when there is one; counts
-  // either way, so bytes() follows the FIBs without walking the domains.
+  // each FIB admits its DPDK structure, replacement or IPv6 spare here, and
+  // RemoveDomain gives a domain's back. Forwards to the router's own hook
+  // (set_memory_growth) when there is one; counts either way, so bytes()
+  // follows the FIBs without walking the domains.
   class FibMemory final : public utils::MemoryGrowth {
    public:
     explicit FibMemory(size_t bytes) noexcept : bytes_(bytes) {}
