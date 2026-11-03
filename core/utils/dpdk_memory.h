@@ -345,6 +345,10 @@ struct MemoryStatus {
   std::string limit_source;
   size_t dpdk_heap_bytes = 0, dpdk_heap_alloc_bytes = 0;  // native heap(s)
   size_t fallback_heap_bytes = 0, fallback_heap_alloc_bytes = 0;  // "bess-normal"
+  // Resident now, by mincore, where a heap is normal pages (DPDK's --no-huge
+  // heap, "bess-normal"); 0 for a hugepage heap. Walks DPDK's memseg lists
+  // under its memory hotplug lock: control path, never a validator callback.
+  size_t dpdk_heap_resident_bytes = 0, fallback_heap_resident_bytes = 0;
   uint64_t refusals = 0;  // MemoryRefused thrown so far
   // Admitted hugepage bytes that landed on normal pages because the heap ran
   // out before the cap (D-206), since startup.

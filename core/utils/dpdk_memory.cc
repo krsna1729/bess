@@ -185,50 +185,66 @@ size_t ResidentBytes(const void *base, size_t len) {
   return pages * kPage;
 }
 
-// What the normal-page DPDK heaps have allocated beyond what is resident
-// (D-206): DPDK's rte_zmalloc leaves a clean element untouched and rte_free
-// zeroes it, so a table a DPDK library allocates internally (rte_hash,
-// rte_lpm, rte_fib) faults in as it is written or freed, not when it is
-// allocated -- and a measurement alone would admit past bytes already
-// handed out, which the teardown then faults in over the limit. Per heap of
-// 4 KiB pages (DPDK's --no-huge heap; "bess-normal", which DPDK clears when
-// a chunk is added), its allocated bytes (rte_malloc_get_socket_stats) less
-// its resident ones (mincore over its memseg lists). Resident pages are
-// already in the measurement: only the unfaulted part is added, nothing
-// twice. DpdkFree gives a freed block's pages back; what a library frees
-// (rte_free inside rte_hash_free) stays resident, and such free holes hide
-// unfaulted allocations, a bound on how much it can miss. Control path;
-// takes the memory hotplug lock, so never from a validator callback.
-size_t UnfaultedHeapBytes() {
-  if (!IsDpdkInitialized()) {
-    return 0;
-  }
-  struct Heap {
-    int socket;
-    size_t resident;
-  };
-  std::vector<Heap> heaps;
+// The resident bytes of each normal-page DPDK heap (DPDK's --no-huge heap;
+// "bess-normal", which DPDK clears when a chunk is added), by socket id:
+// mincore over its memseg lists (ResidentBytes: 0 for a list mincore
+// refuses). Hugepage heaps are left out: their mapped pages are all
+// resident. Control path; takes the memory hotplug lock, so never from a
+// validator callback.
+struct HeapResidency {
+  int socket;
+  size_t resident;
+};
+std::vector<HeapResidency> NormalHeapResidency() {
+  std::vector<HeapResidency> heaps;
   rte_memseg_list_walk(
       [](const rte_memseg_list *msl, void *arg) {
         if (msl->heap == 0 || msl->page_sz >= RTE_PGSIZE_2M ||
             msl->base_va == nullptr) {
           return 0;
         }
-        auto &found = *static_cast<std::vector<Heap> *>(arg);
+        auto &found = *static_cast<std::vector<HeapResidency> *>(arg);
         const size_t resident = ResidentBytes(msl->base_va, msl->len);
-        auto it = std::find_if(found.begin(), found.end(), [&](const Heap &h) {
+        auto it = std::find_if(found.begin(), found.end(), [&](const HeapResidency &h) {
           return h.socket == msl->socket_id;
         });
         if (it == found.end()) {
-          found.push_back(Heap{msl->socket_id, resident});
+          found.push_back(HeapResidency{msl->socket_id, resident});
         } else {
           it->resident += resident;
         }
         return 0;
       },
       &heaps);
+  return heaps;
+}
+
+size_t ResidentOn(const std::vector<HeapResidency> &heaps, int socket) {
+  const auto it = std::find_if(heaps.begin(), heaps.end(), [socket](const HeapResidency &h) {
+    return h.socket == socket;
+  });
+  return it == heaps.end() ? 0 : it->resident;
+}
+
+// What the normal-page DPDK heaps have allocated beyond what is resident
+// (D-206): DPDK's rte_zmalloc leaves a clean element untouched and rte_free
+// zeroes it, so a table a DPDK library allocates internally (rte_hash,
+// rte_lpm, rte_fib) faults in as it is written or freed, not when it is
+// allocated -- and a measurement alone would admit past bytes already
+// handed out, which the teardown then faults in over the limit. Per heap,
+// its allocated bytes (rte_malloc_get_socket_stats) less its resident ones
+// (NormalHeapResidency). Resident pages are already in the measurement:
+// only the unfaulted part is added, nothing twice. DpdkFree gives a freed
+// block's pages back; what a library frees (rte_free inside rte_hash_free)
+// stays resident, and such free holes hide unfaulted allocations, a bound on
+// how much it can miss. Control path; takes the memory hotplug lock, so never
+// from a validator callback.
+size_t UnfaultedHeapBytes() {
+  if (!IsDpdkInitialized()) {
+    return 0;
+  }
   size_t unfaulted = 0;
-  for (const Heap &heap : heaps) {
+  for (const HeapResidency &heap : NormalHeapResidency()) {
     rte_malloc_socket_stats stats{};
     if (rte_malloc_get_socket_stats(heap.socket, &stats) == 0 &&
         stats.heap_allocsz_bytes > heap.resident) {
@@ -794,17 +810,21 @@ MemoryStatus GetMemoryStatus() {
   }
   status.hugepages = NativeHugepages();
   rte_malloc_socket_stats stats{};
+  const std::vector<HeapResidency> resident = NormalHeapResidency();
   // External heaps are not among rte_socket_count()'s sockets.
   for (unsigned i = 0; i < rte_socket_count(); i++) {
-    if (rte_malloc_get_socket_stats(rte_socket_id_by_idx(i), &stats) == 0) {
+    const int socket = rte_socket_id_by_idx(i);
+    if (rte_malloc_get_socket_stats(socket, &stats) == 0) {
       status.dpdk_heap_bytes += stats.heap_totalsz_bytes;
       status.dpdk_heap_alloc_bytes += stats.heap_allocsz_bytes;
     }
+    status.dpdk_heap_resident_bytes += ResidentOn(resident, socket);
   }
   const int fallback = FallbackHeap::Get().socket();
   if (fallback >= 0 && rte_malloc_get_socket_stats(fallback, &stats) == 0) {
     status.fallback_heap_bytes = stats.heap_totalsz_bytes;
     status.fallback_heap_alloc_bytes = stats.heap_allocsz_bytes;
+    status.fallback_heap_resident_bytes = ResidentOn(resident, fallback);
   }
   return status;
 }

@@ -5347,8 +5347,17 @@ type MemoryStatus struct {
 	AdmittedBytes     uint64 `protobuf:"varint,19,opt,name=admitted_bytes,json=admittedBytes,proto3" json:"admitted_bytes,omitempty"`
 	BaselineBytes     uint64 `protobuf:"varint,20,opt,name=baseline_bytes,json=baselineBytes,proto3" json:"baseline_bytes,omitempty"`
 	UnattributedBytes int64  `protobuf:"varint,21,opt,name=unattributed_bytes,json=unattributedBytes,proto3" json:"unattributed_bytes,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Of dpdk_heap_bytes and fallback_heap_bytes, what is resident now:
+	// mincore over the heaps' normal pages (DPDK's --no-huge heap,
+	// "bess-normal"); 0 for a hugepage heap, whose mapped pages are all
+	// resident. Each less its *_alloc_bytes is that heap's share of
+	// unattributed_bytes: positive for free blocks still resident (DPDK's
+	// native heap keeps a freed block's pages, which rte_free zeroes),
+	// negative for allocated bytes not touched yet.
+	DpdkHeapResidentBytes     uint64 `protobuf:"varint,22,opt,name=dpdk_heap_resident_bytes,json=dpdkHeapResidentBytes,proto3" json:"dpdk_heap_resident_bytes,omitempty"`
+	FallbackHeapResidentBytes uint64 `protobuf:"varint,23,opt,name=fallback_heap_resident_bytes,json=fallbackHeapResidentBytes,proto3" json:"fallback_heap_resident_bytes,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *MemoryStatus) Reset() {
@@ -5524,6 +5533,20 @@ func (x *MemoryStatus) GetBaselineBytes() uint64 {
 func (x *MemoryStatus) GetUnattributedBytes() int64 {
 	if x != nil {
 		return x.UnattributedBytes
+	}
+	return 0
+}
+
+func (x *MemoryStatus) GetDpdkHeapResidentBytes() uint64 {
+	if x != nil {
+		return x.DpdkHeapResidentBytes
+	}
+	return 0
+}
+
+func (x *MemoryStatus) GetFallbackHeapResidentBytes() uint64 {
+	if x != nil {
+		return x.FallbackHeapResidentBytes
 	}
 	return 0
 }
@@ -7301,7 +7324,7 @@ const file_control_v2_proto_rawDesc = "" +
 	"\fhas_capacity\x18\x03 \x01(\bR\vhasCapacity\x12\x1a\n" +
 	"\bcapacity\x18\x04 \x01(\x04R\bcapacity\" \n" +
 	"\fWorkerStatus\x12\x10\n" +
-	"\x03cpu\x18\x01 \x01(\rR\x03cpu\"\xea\x06\n" +
+	"\x03cpu\x18\x01 \x01(\rR\x03cpu\"\xe4\a\n" +
 	"\fMemoryStatus\x12\x1c\n" +
 	"\thugepages\x18\x01 \x01(\bR\thugepages\x12\x1a\n" +
 	"\bfallback\x18\x02 \x01(\bR\bfallback\x12\x1f\n" +
@@ -7326,7 +7349,9 @@ const file_control_v2_proto_rawDesc = "" +
 	"\rspilled_bytes\x18\x12 \x01(\x04R\fspilledBytes\x12%\n" +
 	"\x0eadmitted_bytes\x18\x13 \x01(\x04R\radmittedBytes\x12%\n" +
 	"\x0ebaseline_bytes\x18\x14 \x01(\x04R\rbaselineBytes\x12-\n" +
-	"\x12unattributed_bytes\x18\x15 \x01(\x03R\x11unattributedBytes\"\xf9\x01\n" +
+	"\x12unattributed_bytes\x18\x15 \x01(\x03R\x11unattributedBytes\x127\n" +
+	"\x18dpdk_heap_resident_bytes\x18\x16 \x01(\x04R\x15dpdkHeapResidentBytes\x12?\n" +
+	"\x1cfallback_heap_resident_bytes\x18\x17 \x01(\x04R\x19fallbackHeapResidentBytes\"\xf9\x01\n" +
 	"\fModuleMemory\x12\x16\n" +
 	"\x06module\x18\x01 \x01(\tR\x06module\x12\x1a\n" +
 	"\bresource\x18\x02 \x01(\tR\bresource\x12%\n" +

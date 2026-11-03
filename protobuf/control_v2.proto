@@ -842,6 +842,15 @@ message MemoryStatus {
   uint64 admitted_bytes = 19;
   uint64 baseline_bytes = 20;
   int64 unattributed_bytes = 21;
+  // Of dpdk_heap_bytes and fallback_heap_bytes, what is resident now:
+  // mincore over the heaps' normal pages (DPDK's --no-huge heap,
+  // "bess-normal"); 0 for a hugepage heap, whose mapped pages are all
+  // resident. Each less its *_alloc_bytes is that heap's share of
+  // unattributed_bytes: positive for free blocks still resident (DPDK's
+  // native heap keeps a freed block's pages, which rte_free zeroes),
+  // negative for allocated bytes not touched yet.
+  uint64 dpdk_heap_resident_bytes = 22;
+  uint64 fallback_heap_resident_bytes = 23;
 }
 
 // What one module admitted for one of its resources (a table, a pool, a
