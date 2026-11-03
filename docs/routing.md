@@ -187,15 +187,21 @@ nothing, and publication allocates nothing. A spare that was built and never
 published needs no grace period: an aborted transaction leaves it editable,
 and the next one replays it rather than building a new instance.
 
-Memory per IPv6 domain follows from that. One instance is the 2^24-entry
-tbl24 plus `max_ipv6_tbl8s` × 256 entries plus the rib's 2 × `max_ipv6_routes`
-nodes. Entries are 2 bytes while `max_next_hops + max_groups` and
-`max_ipv6_tbl8s` both fit in 32,767, else 4 bytes. At 2-byte entries an
-instance is 32 MiB + 512 B × `max_ipv6_tbl8s` (36 MiB at the default 8192),
-and a domain holds one instance until its first change and two after: about
-2 × (32 MiB + 512 B × `max_ipv6_tbl8s`) plus the rib, double that at 4-byte
-entries. Lower `max_ipv6_tbl8s` to what the route set needs when many domains
-carry IPv6.
+Memory per domain follows from that. A family's DPDK structures are built by
+the domain's first route of that family other than the default (/0, ::/0),
+admitted then: the default is kept beside them, so a domain routed by its
+defaults alone, like domain 0 when nothing routes it, holds none and answers
+from the default. IPv4 is one rte_lpm (64 MiB tbl24, 1 KiB per
+`max_ipv4_tbl8s`, 8 B per `max_ipv4_routes`) or rte_fib. One IPv6 instance is
+the 2^24-entry tbl24 plus `max_ipv6_tbl8s` × 256 entries plus the rib's 2 ×
+`max_ipv6_routes` nodes.
+Entries are 2 bytes while `max_next_hops + max_groups` and `max_ipv6_tbl8s`
+both fit in 32,767, else 4 bytes. At 2-byte entries an instance is 32 MiB +
+512 B × `max_ipv6_tbl8s` (36 MiB at the default 8192). A domain's first IPv6
+route other than ::/0 builds one; the next change builds the second, so a
+routed domain holds about 2 × (32 MiB + 512 B × `max_ipv6_tbl8s`) plus the
+rib, double that at 4-byte entries. Lower `max_ipv6_tbl8s` to what the route
+set needs when many domains carry IPv6.
 
 An interface address also implies a **local route** (D-178): the address itself is this node's, so a packet to
 it is delivered here and never forwarded. `route::DerivedRoutes::Derive(interfaces)` returns both routes per

@@ -621,8 +621,9 @@ CommandResponse Router::Init(const bess::pb::RouterArg &arg) {
   }
 
   // Everything the router holds is admitted before any of it is allocated
-  // (D-198), so a router that does not fit is refused whole: the router (the
-  // default domain's FIBs and the slot tables), the resolver and its rings.
+  // (D-198), so a router that does not fit is refused whole: the router (its
+  // slot tables; a FIB's DPDK structure is admitted by the route that builds
+  // it), the resolver and its rings.
   bess::framework::MemoryScope &memory = init_context().memory();
   bess::framework::MemoryLease router_memory = memory.LeaseFor<route::Router>(
       "router", name(), config, max_next_hops, init_context().rcu(), max_domains,

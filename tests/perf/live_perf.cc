@@ -518,6 +518,21 @@ Builder MRouter(const std::string &backend) {
   };
 }
 
+// M.router with only the default route: a deploy's transport router, whose
+// routes are all /0. Every packet resolves to the default kept beside the FIB
+// structure, which the table never builds (route_table.h).
+std::vector<std::string> MRouterDefault(Build &b) {
+  b.Mod("Router", "rt",
+        R"({"mode": "ROUTE_MODE_DESTINATION", "max_ipv4_routes": 512, "max_next_hops": 2})");
+  b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 1})", "RouterNextHopValue",
+          R"({"egress_gate": 1, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})");
+  b.Entry("rt/next_hops", "RouterNextHopIdKey", R"({"id": 2})", "RouterNextHopValue",
+          R"({"egress_gate": 0, "dst_mac": "AgAAAAAC", "src_mac": "AgAAAAAB"})");
+  b.Entry("rt/routes", "RouterRouteKey", R"({"ipv4": "0.0.0.0", "prefix_length": 0})",
+          "RouterRouteValue", R"({"next_hop_id": 2})");
+  return MBase(b, {{"rt", 2}});
+}
+
 // M.router with the two magnitudes that decide what a destination lookup
 // costs: `routes` /24 prefixes and `dest_span` destination addresses the
 // traffic draws from, both starting at 11.0.0.0. The prefixes are consecutive,
@@ -1009,6 +1024,7 @@ std::vector<Test> Catalogue() {
       {"M.session", 'M', MSession},
       {"M.router", 'M', MRouter("ROUTE_BACKEND_LPM")},
       {"M.router/fib", 'M', MRouter("ROUTE_BACKEND_FIB")},
+      {"M.router/default", 'M', MRouterDefault},
       {"M.router/s256", 'M', MRouterScale(256, 256u)},
       {"M.router/s64k", 'M', MRouterScale(256, 1u << 16u)},
       {"M.router/r2560s64k", 'M', MRouterScale(2560, 1u << 16u)},
