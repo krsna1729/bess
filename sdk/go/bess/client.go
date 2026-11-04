@@ -845,8 +845,8 @@ func (c *Client) administer(ctx context.Context, in proto.Message, name func(epo
 // runs the module: PauseWorkers first). Other failures are an
 // *InvalidRequestError whose Detail carries the action's errno (ErrnoValue).
 func (c *Client) InvokeAction(ctx context.Context, module, action string, arg proto.Message) (*anypb.Any, error) {
-	packed, err := anypb.New(arg)
-	if err != nil {
+	packed := new(anypb.Any)
+	if err := pack(packed, arg); err != nil {
 		return nil, fmt.Errorf("bess: packing the argument of %s %s: %w", module, action, err)
 	}
 	epoch, err := c.knownEpoch(ctx)
@@ -944,8 +944,8 @@ func (b *PipelineBuilder) pack(arg proto.Message) *anypb.Any {
 	if arg == nil || b.err != nil {
 		return nil
 	}
-	a, err := anypb.New(arg)
-	if err != nil {
+	a := new(anypb.Any)
+	if err := pack(a, arg); err != nil {
 		b.err = err
 	}
 	return a
@@ -1144,15 +1144,15 @@ func (t *Transaction) Upsert(r Resource, key, value proto.Message) error {
 	if err := checkType(r, "value", value, r.ValueType); err != nil {
 		return err
 	}
-	k, err := anypb.New(key)
-	if err != nil {
+	op := new(packedOp)
+	if err := pack(&op.key, key); err != nil {
 		return &InvalidRequestError{Message: err.Error()}
 	}
-	v, err := anypb.New(value)
-	if err != nil {
+	if err := pack(&op.value, value); err != nil {
 		return &InvalidRequestError{Message: err.Error()}
 	}
-	t.ops = append(t.ops, &pb.TransactionOp{Resource: r.Name, Key: k, Value: v})
+	op.op.Resource, op.op.Key, op.op.Value = r.Name, &op.key, &op.value
+	t.ops = append(t.ops, &op.op)
 	return nil
 }
 
@@ -1167,11 +1167,12 @@ func (t *Transaction) Set(r Resource, value proto.Message) error {
 	if err := checkType(r, "value", value, r.ValueType); err != nil {
 		return err
 	}
-	v, err := anypb.New(value)
-	if err != nil {
+	op := new(packedOp)
+	if err := pack(&op.value, value); err != nil {
 		return &InvalidRequestError{Message: err.Error()}
 	}
-	t.ops = append(t.ops, &pb.TransactionOp{Resource: r.Name, Value: v})
+	op.op.Resource, op.op.Value = r.Name, &op.value
+	t.ops = append(t.ops, &op.op)
 	return nil
 }
 
@@ -1186,12 +1187,20 @@ func (t *Transaction) Erase(r Resource, key proto.Message) error {
 	if err := checkType(r, "key", key, r.KeyType); err != nil {
 		return err
 	}
-	k, err := anypb.New(key)
-	if err != nil {
+	op := new(packedOp)
+	if err := pack(&op.key, key); err != nil {
 		return &InvalidRequestError{Message: err.Error()}
 	}
-	t.ops = append(t.ops, &pb.TransactionOp{Resource: r.Name, Erase: true, Key: k})
+	op.op.Resource, op.op.Erase, op.op.Key = r.Name, true, &op.key
+	t.ops = append(t.ops, &op.op)
 	return nil
+}
+
+// packedOp is one operation and the Anys it carries, allocated together: they
+// live exactly as long as each other, in the transaction's ops.
+type packedOp struct {
+	op         pb.TransactionOp
+	key, value anypb.Any
 }
 
 func checkType(r Resource, what string, m proto.Message, want string) error {
