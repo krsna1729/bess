@@ -1132,11 +1132,8 @@ func (t *Transaction) bind(r Resource) error {
 
 // Upsert adds key -> value to the map resource r, or replaces its value.
 func (t *Transaction) Upsert(r Resource, key, value proto.Message) error {
-	if err := t.bind(r); err != nil {
+	if err := t.upsertable(r); err != nil {
 		return err
-	}
-	if r.Kind == pb.TransactionResource_KIND_SINGLETON {
-		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a singleton: Set its value", r.Name)}
 	}
 	if err := checkType(r, "key", key, r.KeyType); err != nil {
 		return err
@@ -1158,11 +1155,8 @@ func (t *Transaction) Upsert(r Resource, key, value proto.Message) error {
 
 // Set sets the singleton resource r to value (D-129).
 func (t *Transaction) Set(r Resource, value proto.Message) error {
-	if err := t.bind(r); err != nil {
+	if err := t.settable(r); err != nil {
 		return err
-	}
-	if r.Kind != pb.TransactionResource_KIND_SINGLETON {
-		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a map: Upsert its entries", r.Name)}
 	}
 	if err := checkType(r, "value", value, r.ValueType); err != nil {
 		return err
@@ -1178,11 +1172,8 @@ func (t *Transaction) Set(r Resource, value proto.Message) error {
 
 // Erase removes key from the map resource r.
 func (t *Transaction) Erase(r Resource, key proto.Message) error {
-	if err := t.bind(r); err != nil {
+	if err := t.erasable(r); err != nil {
 		return err
-	}
-	if r.Kind == pb.TransactionResource_KIND_SINGLETON {
-		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a singleton: it is set, not erased", r.Name)}
 	}
 	if err := checkType(r, "key", key, r.KeyType); err != nil {
 		return err
@@ -1193,6 +1184,83 @@ func (t *Transaction) Erase(r Resource, key proto.Message) error {
 	}
 	op.op.Resource, op.op.Erase, op.op.Key = r.Name, true, &op.key
 	t.ops = append(t.ops, &op.op)
+	return nil
+}
+
+// Encoded is a message in its wire form, of the type the operation's resource
+// names for it. A controller that writes the wire form itself hands it over
+// as it is, rather than building a message only for the SDK to marshal it
+// again. The SDK does not check the bytes: the daemon parses them as the
+// resource's type and refuses the transaction where they do not parse. The
+// bytes are sent as they are, so the caller must not change them before the
+// transaction is committed.
+type Encoded []byte
+
+// UpsertEncoded is Upsert of a key and value already encoded as r.KeyType and
+// r.ValueType.
+func (t *Transaction) UpsertEncoded(r Resource, key, value Encoded) error {
+	if err := t.upsertable(r); err != nil {
+		return err
+	}
+	op := new(packedOp)
+	op.key.TypeUrl, op.key.Value = typeURL(r.KeyType), key
+	op.value.TypeUrl, op.value.Value = typeURL(r.ValueType), value
+	op.op.Resource, op.op.Key, op.op.Value = r.Name, &op.key, &op.value
+	t.ops = append(t.ops, &op.op)
+	return nil
+}
+
+// SetEncoded is Set of a value already encoded as r.ValueType.
+func (t *Transaction) SetEncoded(r Resource, value Encoded) error {
+	if err := t.settable(r); err != nil {
+		return err
+	}
+	op := new(packedOp)
+	op.value.TypeUrl, op.value.Value = typeURL(r.ValueType), value
+	op.op.Resource, op.op.Value = r.Name, &op.value
+	t.ops = append(t.ops, &op.op)
+	return nil
+}
+
+// EraseEncoded is Erase of a key already encoded as r.KeyType.
+func (t *Transaction) EraseEncoded(r Resource, key Encoded) error {
+	if err := t.erasable(r); err != nil {
+		return err
+	}
+	op := new(packedOp)
+	op.key.TypeUrl, op.key.Value = typeURL(r.KeyType), key
+	op.op.Resource, op.op.Erase, op.op.Key = r.Name, true, &op.key
+	t.ops = append(t.ops, &op.op)
+	return nil
+}
+
+func (t *Transaction) upsertable(r Resource) error {
+	if err := t.bind(r); err != nil {
+		return err
+	}
+	if r.Kind == pb.TransactionResource_KIND_SINGLETON {
+		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a singleton: Set its value", r.Name)}
+	}
+	return nil
+}
+
+func (t *Transaction) settable(r Resource) error {
+	if err := t.bind(r); err != nil {
+		return err
+	}
+	if r.Kind != pb.TransactionResource_KIND_SINGLETON {
+		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a map: Upsert its entries", r.Name)}
+	}
+	return nil
+}
+
+func (t *Transaction) erasable(r Resource) error {
+	if err := t.bind(r); err != nil {
+		return err
+	}
+	if r.Kind == pb.TransactionResource_KIND_SINGLETON {
+		return &InvalidRequestError{Message: fmt.Sprintf("resource %q is a singleton: it is set, not erased", r.Name)}
+	}
 	return nil
 }
 
