@@ -38,8 +38,7 @@ func packerOf(md protoreflect.MessageDescriptor) *packer {
 	if p != nil && p.md == md {
 		return p
 	}
-	// anypb.New's URL: the prefix every protobuf runtime resolves.
-	p = &packer{md: md, url: "type.googleapis.com/" + string(name), partial: !reachesRequired(md, nil)}
+	p = &packer{md: md, url: typeURL(string(name)), partial: !reachesRequired(md, nil)}
 	packers.Lock()
 	if packers.byName == nil {
 		packers.byName = map[protoreflect.FullName]*packer{}
@@ -84,4 +83,28 @@ func pack(a *anypb.Any, m proto.Message) error {
 	}
 	a.TypeUrl, a.Value = p.url, b
 	return nil
+}
+
+// typeURLs holds the Any type URL of each type name the SDK packs: built once
+// per name, not once per operation.
+var typeURLs struct {
+	sync.RWMutex
+	byName map[string]string
+}
+
+func typeURL(name string) string {
+	typeURLs.RLock()
+	url, ok := typeURLs.byName[name]
+	typeURLs.RUnlock()
+	if ok {
+		return url
+	}
+	url = "type.googleapis.com/" + name // anypb.New's: the prefix every runtime resolves
+	typeURLs.Lock()
+	if typeURLs.byName == nil {
+		typeURLs.byName = map[string]string{}
+	}
+	typeURLs.byName[name] = url
+	typeURLs.Unlock()
+	return url
 }
