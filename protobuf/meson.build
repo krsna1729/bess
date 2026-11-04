@@ -61,6 +61,7 @@ test(
   depends: core_cpp_proto_targets,
   is_parallel: false,
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_public_proto_closure', 0).to_string()},
 )
 test(
   'check_installed_headers_self_test',
@@ -68,6 +69,7 @@ test(
   args: [files('../tools/check_installed_headers.py'), '--self-test'],
   is_parallel: false,
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_installed_headers_self_test', 0).to_string()},
 )
 
 

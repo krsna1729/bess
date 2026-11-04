@@ -46,6 +46,42 @@ std::string ReadFile(const std::string &path) {
   return std::string(std::istreambuf_iterator<char>(in), {});
 }
 
+std::string CgroupOf(const std::string &pid) {
+  std::ifstream in("/proc/" + pid + "/cgroup");
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.starts_with("0::")) {
+      return line.substr(3);
+    }
+  }
+  return "";
+}
+
+// A daemon started under a launcher (`systemd-run --scope`) is in a cgroup of
+// its own, outside the test's: its peak is not in the test's memory.peak.
+// Before that cgroup goes away with the daemon, its memory.peak goes to the
+// file tools/run_capped.py names, which adds it to the test's peak and holds
+// the sum to the test's declaration (tests/memory/meson.build).
+void ReportCgroupPeak(pid_t pid) {
+  const char *report = std::getenv("BESS_TEST_MEM_REPORT");
+  if (report == nullptr || *report == '\0') {
+    return;
+  }
+  const std::string cgroup = CgroupOf(std::to_string(pid));
+  if (cgroup == CgroupOf("self")) {
+    return;  // the launcher kept it in the test's cgroup: already counted
+  }
+  std::ifstream peak_file("/sys/fs/cgroup" + cgroup + "/memory.peak");
+  uint64_t peak = 0;
+  if (cgroup.empty() || !(peak_file >> peak)) {
+    ADD_FAILURE() << "no memory.peak for bessd's cgroup '" << cgroup
+                  << "': its memory cannot be counted against the test's declaration";
+    return;
+  }
+  std::ofstream(report, std::ios::app)
+      << "bessd(" << cgroup.substr(cgroup.rfind('/') + 1) << ") " << peak << "\n";
+}
+
 }  // namespace
 
 std::string Env(const char *name) {
@@ -351,7 +387,11 @@ void Daemon::Start(int port) {
   log_path_ = log_template;
   keep_log_ = false;  // a fresh daemon: this run's log is this run's to remove
   std::vector<std::string> argv = launcher_;
-  argv.insert(argv.end(), {Env("BESSD"), "-f", "--mem_backing=normal", "-p",
+  // 32768 packet buffers, not bessd's 262144 (opts.cc): every live test
+  // passes with them, and the default pool is resident on normal pages, in
+  // every live test's memory declaration (tests/memory/meson.build). A
+  // test's own --buffers comes later and wins.
+  argv.insert(argv.end(), {Env("BESSD"), "-f", "--mem_backing=normal", "--buffers=32768", "-p",
                            std::to_string(port), "-skip_root_check"});
   argv.insert(argv.end(), flags_.begin(), flags_.end());
   posix_spawn_file_actions_t actions;
@@ -389,6 +429,9 @@ void Daemon::Start(int port) {
 int Daemon::Shutdown() {
   if (pid_ <= 0) {
     return -1;
+  }
+  if (!launcher_.empty()) {
+    ReportCgroupPeak(pid_);
   }
   (void)client_->Shutdown();  // it answers, then stops
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);

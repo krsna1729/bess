@@ -51,7 +51,8 @@ if get_option('build_tests')
     'sample_plugin_load',
     live_sample_plugin,
     depends: [bessd, bessctl_link, sample_plugin, incompatible_probe],
-    env: live_env + {'BESS_PLUGIN_DIR': meson.current_build_dir()},
+    env: live_env + {'BESS_PLUGIN_DIR': meson.current_build_dir(),
+                     'BESS_TEST_MEM_MB': test_memory_mb.get('sample_plugin_load', 0).to_string()},
     suite: 'plugin',
     is_parallel: false,
     timeout: 120,
@@ -77,6 +78,7 @@ if get_option('build_tests')
     'sample_plugin_sequential_update',
     sample_plugin_unit,
     is_parallel: false,
-    env: {'LD_LIBRARY_PATH': dpdk_libdir},
+    env: {'LD_LIBRARY_PATH': dpdk_libdir,
+          'BESS_TEST_MEM_MB': test_memory_mb.get('sample_plugin_sequential_update', 0).to_string()},
   )
 endif

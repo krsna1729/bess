@@ -157,8 +157,10 @@ TEST_F(ConformanceTest, Go) {
                        bess::live::kSteeringResource);
   }
   std::vector<std::string> argv = *go;
-  for (const char *a : {"test", "-count=1", "-v", "-tags", "live", "-run", "TestConformance",
-                        "./bess"}) {
+  // Two packages compiled at once, not one per CPU: the build is most of
+  // this test's memory, which is declared (tests/memory/meson.build).
+  for (const char *a : {"test", "-p=2", "-count=1", "-v", "-tags", "live", "-run",
+                        "TestConformance", "./bess"}) {
     argv.push_back(a);
   }
   const auto run = bess::live::RunProgramIn(sdk_go, argv, "", std::chrono::seconds(600));

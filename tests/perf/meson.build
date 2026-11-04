@@ -27,4 +27,5 @@ perf_daemon_stop_test = executable(
   include_directories: include_directories('.'),
   dependencies: [gtest_dep, dependency('gtest_main', method: 'pkg-config')],
 )
-test('perf_daemon_stop_test', perf_daemon_stop_test)
+test('perf_daemon_stop_test', perf_daemon_stop_test,
+     env: {'BESS_TEST_MEM_MB': test_memory_mb.get('perf_daemon_stop_test', 0).to_string()})

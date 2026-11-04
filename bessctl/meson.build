@@ -52,5 +52,6 @@ if get_option('build_tests')
        executable('bessctl_manifest_test', 'manifest_test.cc',
                   dependencies: [bessctl_dep, gtest_dep,
                                  dependency('gtest_main', method: 'pkg-config')]),
+       env: {'BESS_TEST_MEM_MB': test_memory_mb.get('bessctl_manifest_test', 0).to_string()},
        suite: 'bessctl')
 endif

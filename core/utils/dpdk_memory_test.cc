@@ -279,17 +279,26 @@ TEST_F(DpdkMemoryTest, FallbackHeapChunksAskForTransparentHugepages) {
 // FallbackChunkCap (256 MiB without a limit) for small tables: a load of
 // 8 MiB tables over four growths. Doubling to 1 GiB, the fourth was 512 MiB
 // (1 GiB further on: 2.2-5.9 s under one RPC at 1.2M sessions).
+//
+// Each table's pages go back to the kernel once it is allocated: the blocks
+// stay allocated, so the heap grows exactly as it would, but the test holds
+// one chunk resident at a time (the one DPDK clears as it adds it), not the
+// 704 MiB of four (tests/memory/meson.build).
 TEST_F(DpdkMemoryTest, FallbackHeapGrowsByAtMostTheChunkCap) {
   if (rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
   }
   const int socket = FallbackSocket(kMB);
+  const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
   std::vector<void *> tables;
   size_t heap = GetMemoryStatus().fallback_heap_bytes;
   size_t growths = 0, largest = 0;
   while (growths < 4 && tables.size() < 256) {  // 2 GiB at most
     tables.push_back(DpdkAllocate(8 * kMB, 64, socket));
     ASSERT_NE(tables.back(), nullptr);
+    char *block = static_cast<char *>(tables.back());
+    const size_t skip = (page - reinterpret_cast<uintptr_t>(block) % page) % page;
+    ASSERT_EQ(0, madvise(block + skip, (8 * kMB - skip) / page * page, MADV_DONTNEED));
     const size_t now = GetMemoryStatus().fallback_heap_bytes;
     if (now != heap) {
       growths++;

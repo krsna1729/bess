@@ -195,6 +195,19 @@ jobs:
           sudo mount -t hugetlbfs nodev /mnt/huge
           grep -E 'HugePages_Total|Hugepagesize' /proc/meminfo
 
+      # Each test runs in a `systemd-run --user --scope` of its own, its
+      # memory held there (tools/run_capped.py, docs/testing.md#memory). A
+      # hosted runner's user has no user manager until it lingers; without one
+      # the wrapper falls back to wait4's ru_maxrss and sets no kernel limit,
+      # so the wrapper's self-test is told a scope is required here.
+      - name: User manager for the test scopes
+        run: |
+          sudo loginctl enable-linger "$USER"
+          for _ in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+          echo "BESS_TEST_MEM_REQUIRE_SCOPE=1" >> "$GITHUB_ENV"
+
       - name: Install build dependencies
         run: |
           sudo bash env/install-deps.sh runtime
