@@ -34,7 +34,7 @@ while [ $# -gt 1 ]; do
   if [ "$1" = -i ]; then echo $$ > "$2"; fi
   shift
 done
-trap 'kill $!; exit 143' TERM
+trap 'kill $!; wait $!; exit 143' TERM
 sleep 1000 &
 echo ready
 wait

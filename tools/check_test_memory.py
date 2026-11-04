@@ -152,9 +152,10 @@ PEAK = re.compile(r'run_capped: [^:]*: declared (\d+) MiB, peak ([0-9.]+) MiB')
 
 
 def peaks(build_dir, as_json):
-    """What meson's last run logged (meson-logs/testlog.json)."""
+    """What meson's last run logged, including --wrapper's suffixed log."""
     out = {}
-    log = build_dir / 'meson-logs' / 'testlog.json'
+    log = max((build_dir / 'meson-logs').glob('testlog*.json'),
+              key=lambda path: path.stat().st_mtime_ns)
     for line in log.read_text().splitlines():
         entry = json.loads(line)
         text = (entry.get('stdout') or '') + (entry.get('stderr') or '')
@@ -217,6 +218,29 @@ def self_test():
         failures.append(f'-j3 over the limit not reported: {problems}')
     if any(p.startswith('meson test -j1') for p in problems):
         failures.append('-j1 reported over the limit')
+    # Installed projects use --wrapper, which changes the log basename.
+    # Its rows must be visible to CI's calibration, with either Meson name format.
+    import contextlib
+    import io
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        build = Path(tmp)
+        (build / 'meson-logs').mkdir()
+        entries = [
+            {'name': 'bess:sdk / lease_table_test',
+             'stderr': 'run_capped: lease_table_test: declared 64 MiB, peak 20.5 MiB'},
+            {'name': 'sdk - bess:static_router',
+             'stderr': 'run_capped: static_router: declared 512 MiB, peak 300.0 MiB'},
+        ]
+        (build / 'meson-logs/testlog-run_capped.py.json').write_text(
+            '\n'.join(json.dumps(entry) for entry in entries))
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            peaks(build, True)
+        if json.loads(captured.getvalue()) != {
+                'lease_table_test': {'declared': 64, 'peak': 20.5},
+                'static_router': {'declared': 512, 'peak': 300.0}}:
+            failures.append('wrapper log peaks or test names were not recovered')
     for f in failures:
         print('FAIL', f)
     print('self-test: ' + ('FAILED' if failures else 'ok'))

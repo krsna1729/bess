@@ -20,4 +20,4 @@ test('static_router',
   executable('static_router', 'static_router.cc',
     include_directories: include_directories('../appliances'),
     dependencies: [bess_static_dep]),
-  env: {'BESS_TEST_MEM_MB': '64'})
+  env: {'BESS_TEST_MEM_MB': '512'})
