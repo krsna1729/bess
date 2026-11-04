@@ -161,9 +161,9 @@ def peaks(build_dir, as_json):
         found = PEAK.findall(text)
         if found:
             declared, peak = found[-1]
-            # testlog names a test "SUITE - PROJECT:NAME"; the table, NAME.
-            out[entry['name'].rpartition(':')[2]] = {'declared': int(declared),
-                                                    'peak': float(peak)}
+            # Meson versions use "SUITE - PROJECT:NAME" or "PROJECT / NAME".
+            name = entry['name'].rpartition(':')[2].rpartition(' / ')[2]
+            out[name] = {'declared': int(declared), 'peak': float(peak)}
     if as_json:
         print(json.dumps(out, indent=1, sort_keys=True))
         return 0

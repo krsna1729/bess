@@ -4,12 +4,12 @@
 # setup's wrapper, runs it in a cgroup at 1.5x that and fails it when its peak
 # is above it; tools/check_test_memory.py (suite `architecture`) fails when a
 # test has no entry, when an entry is above the 1024 MiB ceiling without a
-# `# above the ceiling:` comment, or when `meson test` at -j1 or -j3 could need
-# more than 2048 MiB at once.
+# `# above the ceiling:` comment, or when the scheduled declaration sum at
+# `meson test -j1` or `-j3` exceeds 2048 MiB (not a gross cgroup ceiling).
 #
-# Calibration: the peak `meson test` measured, the larger of the plain -O1
-# and release builds' (docs/testing.md#memory has both), times 1.25, rounded
-# up to 8 MiB. Measure a new test with
+# Calibration: the larger peak across local plain -O1/release and CI's
+# uninstrumented compiler/architecture lanes, with at least 25% headroom,
+# rounded up to 8 MiB (docs/testing.md#memory). Measure a new test with
 #   BESS_TEST_MEM_MEASURE=1 meson test -C BUILD NAME
 # and read "run_capped: ... peak" in its log.
 test_memory_mb = {
@@ -27,7 +27,7 @@ test_memory_mb = {
   'check_layer_includes_self_test': 24,
   'check_limits': 24,
   'check_limits_self_test': 24,
-  'check_link_graph': 64,
+  'check_link_graph': 256,
   'check_link_graph_self_test': 24,
   'check_public_proto_closure': 32,
   'check_scaling': 32,
@@ -39,7 +39,7 @@ test_memory_mb = {
   'classifier_bench': 88,
   'classifier_classifier_api_test': 24,
   'classifier_classifier_test': 24,
-  'classifier_concurrent_exact_test': 72,
+  'classifier_concurrent_exact_test': 144,
   'classifier_concurrent_masked_test': 144,
   'classifier_cuckoo_exact_test': 24,
   'classifier_cuckoo_scale_bench': 648,
@@ -69,9 +69,9 @@ test_memory_mb = {
   'cli_mode_test': 24,
   'conntrack_bench': 816,
   'conntrack_conntrack_model_test': 24,
-  'conntrack_conntrack_test': 24,
+  'conntrack_conntrack_test': 32,
   'conntrack_fuzz_corpus': 24,
-  'conntrack_shared_conntrack_test': 80,
+  'conntrack_shared_conntrack_test': 144,
   'control_admin_v2_test': 272,
   'control_api_server_test': 200,
   'control_api_v2_test': 344,
@@ -117,8 +117,8 @@ test_memory_mb = {
   'flow_expiry_bench': 200,
   'flow_expiry_consumer_test': 24,
   'flow_flow_index_test': 24,
-  'flow_reference_apps_test': 64,
-  'flow_shared_flow_table_test': 96,
+  'flow_reference_apps_test': 144,
+  'flow_shared_flow_table_test': 192,
   'flow_worker_flow_table_test': 32,
   'framework_exact_match_table_test': 272,
   'framework_instance_registry_test': 24,
@@ -237,7 +237,7 @@ test_memory_mb = {
   'nat_fuzz_corpus': 24,
   'nat_nat_model_test': 24,
   'nat_nat_test': 32,
-  'nat_nat_usage_test': 64,
+  'nat_nat_usage_test': 144,
   'nat_shared_nat_test': 120,
   'object_table_bench': 488,
   'occupancy_bench': 88,
@@ -254,7 +254,7 @@ test_memory_mb = {
   'packet_parse_test': 24,
   'packet_pool_test': 744,
   'packet_reshape_test': 72,
-  'packet_test': 72,
+  'packet_test': 104,
   'packet_tx_checksum_bench': 168,
   'packet_tx_checksum_test': 72,
   'perf_daemon_stop_test': 24,
@@ -313,8 +313,8 @@ test_memory_mb = {
   'utils_copy_bench': 40,
   'utils_copy_test': 24,
   'utils_cuckoo_map_bench': 528,
-  'utils_cuckoo_map_test': 40,
-  'utils_dpdk_memory_test': 400,
+  'utils_cuckoo_map_test': 512,
+  'utils_dpdk_memory_test': 600,
   'utils_dpdk_slab_test': 144,
   'utils_endian_test': 24,
   'utils_ether_test': 24,

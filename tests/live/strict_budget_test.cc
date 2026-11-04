@@ -10,6 +10,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <cstdlib>
 #include <format>
 #include <fstream>
 #include <map>
@@ -127,8 +128,8 @@ TEST(StrictBudgetTest, RefusesInsteadOfBeingKilledAndAccountsEveryByte) {
   // whole `meson test`'s peak is that slice's (tools/run_capped.py).
   std::vector<std::string> launcher = {"systemd-run", "--user", "--scope", "-q",
                                        "--unit=" + unit};
-  if (const std::string slice = bess::live::Env("BESS_TEST_MEM_SLICE"); !slice.empty()) {
-    launcher.push_back("--slice=" + slice);
+  if (const char *slice = std::getenv("BESS_TEST_MEM_SLICE"); slice != nullptr && *slice) {
+    launcher.push_back("--slice=" + std::string(slice));
   }
   launcher.insert(launcher.end(), {"-p", std::format("MemoryMax={}M", kCapMiB), "-p",
                                    "MemorySwapMax=0"});
