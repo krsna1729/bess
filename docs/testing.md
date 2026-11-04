@@ -464,4 +464,4 @@ their own `test()`.
 | `utils_time_test` | 24 | 15.5 | 15.5 |
 | `utils_trie_test` | 24 | 15.3 | 15.2 |
 | `lease_table_test` | 64 | - | - |
-| `static_router` | 64 | - | - |
+| `static_router` | 512 | - | - |

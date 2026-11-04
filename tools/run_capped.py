@@ -165,7 +165,8 @@ def exit_like(status):
     sys.stderr.flush()
     if status > 128 and status - 128 < signal.NSIG:
         sig = status - 128
-        signal.signal(sig, signal.SIG_DFL)
+        if sig not in (signal.SIGKILL, signal.SIGSTOP):
+            signal.signal(sig, signal.SIG_DFL)
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # the test dumped, if anyone
         os.kill(os.getpid(), sig)
     sys.exit(status)
@@ -262,6 +263,9 @@ def self_test(hog):
         elif want != 'oom' and peak < touch_mb:
             failures.append(f'{mode} {touch_mb}/{declared_mb}: peak {peak} MiB is below the '
                             f'{touch_mb} MiB touched')
+        if want == 'oom' and r.returncode != -signal.SIGKILL:
+            failures.append(f'{mode} {touch_mb}/{declared_mb}: kernel kill was not '
+                            f'propagated as SIGKILL (status {r.returncode})')
 
     scope_ok = bool(shutil.which('systemd-run')) and subprocess.run(
         ['systemd-run', '--user', '--scope', '-q', 'true'], capture_output=True).returncode == 0
