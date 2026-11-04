@@ -354,6 +354,13 @@ pkg.generate(
   requires: ['libglog', 'protobuf'],
 )
 
+# Every test declares its memory (tests/memory/meson.build: test_memory_mb)
+# and runs under tools/run_capped.py, which holds it to that: a cgroup of its
+# own at 1.5x the declaration, and a failure when its peak is above it
+# (docs/testing.md#memory).
+subdir('tests/memory')
+add_test_setup('capped', exe_wrapper: find_program('tools/run_capped.py'), is_default: true)
+
 subdir('protobuf')
 subdir('sdk/cpp')
 subdir('bessctl')
@@ -364,6 +371,22 @@ if get_option('build_tests')
   subdir('tests/live')
   subdir('tests/perf')
 endif
+# Every test declares memory; the scheduled declaration sum at -j1 and -j3
+# is within 2048 MiB (not a gross cgroup cap; docs/testing.md#the-suite).
+test(
+  'check_test_memory',
+  python,
+  args: [files('tools/check_test_memory.py'), '--build-dir', meson.project_build_root()],
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_test_memory', 0).to_string()},
+  suite: 'architecture',
+)
+test(
+  'check_test_memory_self_test',
+  python,
+  args: [files('tools/check_test_memory.py'), '--self-test'],
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_test_memory_self_test', 0).to_string()},
+  suite: 'architecture',
+)
 
 # What this build is made of (M26): version, commit, compilers, options, the
 # DPDK pin and every dependency's version, and an SPDX SBOM from the same

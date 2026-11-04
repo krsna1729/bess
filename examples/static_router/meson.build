@@ -14,7 +14,10 @@ project('static_router', 'cpp',
 # it against the staged install.
 bess_static_dep = dependency('bess-dev-static', required: true)
 
+# Its most memory, MiB: BESS's CI runs it through tools/run_capped.py, which
+# fails it above that (docs/testing.md#memory).
 test('static_router',
   executable('static_router', 'static_router.cc',
     include_directories: include_directories('../appliances'),
-    dependencies: [bess_static_dep]))
+    dependencies: [bess_static_dep]),
+  env: {'BESS_TEST_MEM_MB': '64'})

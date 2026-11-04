@@ -381,6 +381,13 @@ point with `AllocationFaults`/`ForEachFailurePoint` (8c4a4433).
   (58aa8765, 641ed215); size contention to your CPUs (f9f665f4).
 - **Take CPUs from the affinity mask** (9ce02101, b9a7fe91), and write
   scratch under the run's directory, not a shared `/tmp` (637d67f4).
+- **A test declares its memory** in `tests/memory/meson.build` and is
+  failed above it (`tools/run_capped.py`); `check_test_memory` fails a test
+  with no declaration, one over 1024 MiB without a written reason, and a
+  suite over 2048 MiB at `-j1` or `-j3`. Prove a shape at a small N: a
+  transaction's cost at 64 meters and at 8000 is the same
+  (`ATransactionCostsWhatItChangesNotWhatIsInstalled`,
+  `core/meter/meter_resource_test.cc`) ([testing.md](testing.md#memory)).
 
 ## 13. Toolchain traps
 

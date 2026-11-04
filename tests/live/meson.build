@@ -65,7 +65,7 @@ foreach source : live_test_sources
     name,
     exe,
     depends: [bessd, bessctl_link] + sdk_cpp_test_targets,
-    env: env,
+    env: env + {'BESS_TEST_MEM_MB': test_memory_mb.get(name, 0).to_string()},
     suite: 'live',
     is_parallel: false,
     timeout: 600,

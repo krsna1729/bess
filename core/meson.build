@@ -534,7 +534,8 @@ if get_option('build_tests')
       check "$2" ctl --help
       ''', 'sh', bessctl_link.full_path(), bessd.full_path()],
     depends: [bessd, bessctl_link],
-    env: {'LD_LIBRARY_PATH': dpdk_libdir},
+    env: {'LD_LIBRARY_PATH': dpdk_libdir,
+          'BESS_TEST_MEM_MB': test_memory_mb.get('bessctl_multicall', 0).to_string()},
     suite: 'bessctl',
   )
 endif
@@ -1055,7 +1056,8 @@ foreach source : (get_option('build_tests') ? unit_test_sources : [])
     unit_exe,
     is_parallel: false,
     workdir: test_workdir,
-    env: {'LD_LIBRARY_PATH': dpdk_libdir},
+    env: {'LD_LIBRARY_PATH': dpdk_libdir,
+          'BESS_TEST_MEM_MB': test_memory_mb.get(test_name, 0).to_string()},
   )
   # Placement as a container sees it: bessd started inside a two-CPU set
   # (D-027).
@@ -1067,7 +1069,8 @@ foreach source : (get_option('build_tests') ? unit_test_sources : [])
       depends: unit_exe,
       is_parallel: false,
       workdir: test_workdir,
-      env: {'LD_LIBRARY_PATH': dpdk_libdir},
+      env: {'LD_LIBRARY_PATH': dpdk_libdir,
+            'BESS_TEST_MEM_MB': test_memory_mb.get(test_name + '_in_two_cpus', 0).to_string()},
     )
   endif
 endforeach
@@ -1077,6 +1080,7 @@ test(
   args: [files('../tools/check_includes.py'), '--root', meson.project_source_root()],
   is_parallel: false,
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_layer_includes', 0).to_string()},
 )
 test(
   'check_layer_includes_self_test',
@@ -1084,6 +1088,7 @@ test(
   args: [files('../tools/check_includes.py'), '--self-test'],
   is_parallel: false,
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_layer_includes_self_test', 0).to_string()},
 )
 # Every fixed limit has a row in docs/limits.md.
 test(
@@ -1091,12 +1096,14 @@ test(
   python,
   args: [files('../tools/check_limits.py'), '--root', meson.project_source_root()],
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_limits', 0).to_string()},
 )
 test(
   'check_limits_self_test',
   python,
   args: [files('../tools/check_limits.py'), '--self-test'],
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_limits_self_test', 0).to_string()},
 )
 # Growth that scales with entries names its bound (`// scale:`; DSA audit).
 test(
@@ -1104,12 +1111,14 @@ test(
   python,
   args: [files('../tools/check_scaling.py'), '--root', meson.project_source_root()],
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_scaling', 0).to_string()},
 )
 test(
   'check_scaling_self_test',
   python,
   args: [files('../tools/check_scaling.py'), '--self-test'],
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_scaling_self_test', 0).to_string()},
 )
 # Architecture code stays in core/arch/ or in an owner's *_kernels.{h,cc} file
 # (BESS_ARCH_* conditions only, with a portable branch); the allowlist
@@ -1120,6 +1129,7 @@ test(
   args: [files('../tools/check_arch.py'), '--root', meson.project_source_root()],
   is_parallel: false,
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_arch', 0).to_string()},
 )
 test(
   'check_arch_self_test',
@@ -1127,6 +1137,7 @@ test(
   args: [files('../tools/check_arch.py'), '--self-test'],
   is_parallel: false,
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_arch_self_test', 0).to_string()},
 )
 test(
   'check_link_graph_self_test',
@@ -1134,6 +1145,7 @@ test(
   args: [files('../tools/check_link_graph.py'), '--self-test'],
   is_parallel: false,
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_link_graph_self_test', 0).to_string()},
 )
 # The real check reads the built archives; the dependency list makes
 # `meson test` build them first.
@@ -1149,6 +1161,7 @@ test(
             bess_sdk_embedded_lib, bess_ctl_lib],
   is_parallel: false,
   suite: 'architecture',
+  env: {'BESS_TEST_MEM_MB': test_memory_mb.get('check_link_graph', 0).to_string()},
 )
 
 if get_option('build_benchmarks')
@@ -1208,6 +1221,34 @@ if get_option('build_benchmarks')
     'utils_copy_bench': ['utils/copy_bench.cc', benchmark_main_dep],
     'utils_cuckoo_map_bench': ['utils/cuckoo_map_bench.cc', benchmark_main_dep],
   }
+  # `meson test` runs each benchmark as a smoke test, each case for at least
+  # 0.001 s (--benchmark_min_time), within its memory declaration
+  # (tests/memory/meson.build). The cases below are left out of that run, or
+  # sized down, for their memory (each case's peak: docs/testing.md#memory);
+  # the runs that measure (tools/bench_trend.py, tools/ab_bench.py) run the
+  # binary itself, every case.
+  benchmark_smoke = {
+    # 16384, 32768 and 65536 classes: 395, 782 and 1555 MiB a case (each run
+    # alone), and each set-up leaves more behind: with the 16384s, 713 MiB
+    # alone and 1142 with meson's MALLOC_PERTURB_, which writes every block
+    # glibc hands out and takes back.
+    'traffic_class_bench': {'args': ['--benchmark_filter=-/(16384|32768|65536)(/|$)']},
+    # 1M and 4M entries: up to 978 MiB a case, and each key and value
+    # width's fixture stays built for the rest of the run.
+    'classifier_cuckoo_scale_bench': {'args': ['--benchmark_filter=-/(1048576|4194304)/']},
+    # 4 real route domains (64 MiB of tbl24 each), not 16, and no
+    # 65536-route FIB: what each case leaves on the DPDK heap adds up.
+    'route_route_domain_bench': {'args': ['--benchmark_filter=-^BM_Fib/65536$'],
+                                 'env': {'BESS_DOMAIN_BENCH_MAX': '4'}},
+    # Normal pages, not hugepages: a 1 GiB hugepage is charged whole to the
+    # test's cgroup (memory_hugetlb_accounting). No hugepage cap with them.
+    'flow_bench': {'env': {'BESSD_MEM_BACKING': 'normal', 'BESSD_MEM_HUGEPAGE_MB': '0'}},
+    # 4M entries: 570 MiB, and the cases' fixtures add up.
+    'modules_table_scale_bench': {'args': ['--benchmark_filter=-/4194304']},
+    # 1M rules: 634 MiB.
+    'modules_exact_match_transaction_bench': {
+      'args': ['--benchmark_filter=-^BM_ModuleClassify/1000000/']},
+  }
   benchmark_targets = []
   foreach benchmark_name, benchmark_spec : benchmark_sources
     benchmark_exe = executable(
@@ -1219,14 +1260,17 @@ if get_option('build_benchmarks')
       build_rpath: runtime_rpath,
     )
     benchmark_targets += benchmark_exe
+    smoke = benchmark_smoke.get(benchmark_name, {})
     test(
       benchmark_name,
       benchmark_exe,
-      args: ['--benchmark_min_time=0.001s'],
+      args: ['--benchmark_min_time=0.001s'] + smoke.get('args', []),
       is_parallel: false,
       suite: 'benchmarks',
       timeout: 1800,
-      env: {'LD_LIBRARY_PATH': dpdk_libdir},
+      env: {'LD_LIBRARY_PATH': dpdk_libdir,
+            'BESS_TEST_MEM_MB': test_memory_mb.get(benchmark_name, 0).to_string()}
+           + smoke.get('env', {}),
     )
   endforeach
   run_target(
@@ -1293,7 +1337,8 @@ if get_option('build_fuzzers')
       args: fuzz_test_args + [meson.current_source_dir() / 'fuzz' / 'corpus' / fuzz_name],
       suite: 'fuzz',
       timeout: 300,
-      env: {'LD_LIBRARY_PATH': dpdk_libdir},
+      env: {'LD_LIBRARY_PATH': dpdk_libdir,
+            'BESS_TEST_MEM_MB': test_memory_mb.get(fuzz_name + '_fuzz_corpus', 0).to_string()},
     )
   endforeach
   run_target(

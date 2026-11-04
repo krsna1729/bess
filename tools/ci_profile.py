@@ -403,6 +403,12 @@ def step_layers(s):
     s.run([sys.executable, s.root / 'tools' / 'check_arch.py'])
     s.run([sys.executable, s.root / 'tools' / 'check_limits.py', '--self-test'])
     s.run([sys.executable, s.root / 'tools' / 'check_limits.py'])
+    # Every test declares memory; scheduled declarations fit 2048 MiB at
+    # -j1 and -j3 (not a gross cgroup cap; docs/testing.md#the-suite).
+    # Read the configured build's test list.
+    s.run([sys.executable, s.root / 'tools' / 'check_test_memory.py', '--self-test'])
+    s.run([sys.executable, s.root / 'tools' / 'check_test_memory.py',
+           '--build-dir', s.build_dir])
     # The local DPDK patch series (D-131): names, trailers, and that it
     # applies in order to a pristine extraction.
     s.run([sys.executable, s.root / 'tools' / 'bootstrap_dpdk.py', '--check-patches'])
@@ -433,9 +439,16 @@ def step_test(s):
         # ("failed to parse suppressions"), so they go in LSAN_OPTIONS.
         env['LSAN_OPTIONS'] = ('suppressions=' + str(s.root / 'tools' / 'lsan.supp'))
         env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1:external_symbolizer_path=' + symbolizer()
-        s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs',
-               '--no-suite', 'live',
-               '--timeout-multiplier', '6'], env=env)
+        # The declarations are the uninstrumented builds' (the other lanes
+        # hold every test to them); ASan's shadow and quarantine are its own,
+        # so here each peak is recorded and printed, not failed on.
+        env['BESS_TEST_MEM_MEASURE'] = '1'
+        try:
+            s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs',
+                   '--no-suite', 'live',
+                   '--timeout-multiplier', '6'], env=env)
+        finally:
+            print_test_peaks(s)
         return
     if s.sanitize == 'thread':
         step_test_tsan(s)
@@ -446,8 +459,18 @@ def step_test(s):
     # 80% of the test step). A local `test` still runs them, as it always has.
     skip = (['--no-suite', 'benchmarks']
             if os.environ.get('GITHUB_ACTIONS') == 'true' else [])
-    s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs', *skip],
-          env=s.env_with_dpdk())
+    try:
+        s.run(['meson', 'test', '-C', s.build_dir, '--no-rebuild', '--print-errorlogs', *skip],
+              env=s.env_with_dpdk())
+    finally:
+        print_test_peaks(s)
+
+
+def print_test_peaks(s, build_dir=None):
+    """Each test's declared memory and measured peak (tools/run_capped.py)."""
+    if not s.dry_run:
+        subprocess.run([sys.executable, s.root / 'tools' / 'check_test_memory.py',
+                        '--peaks', build_dir or s.build_dir], cwd=s.root)
 
 
 def step_test_tsan(s):
@@ -465,8 +488,13 @@ def step_test_tsan(s):
             tests.append((name, rest[0] if rest else '*'))
     s.run(['meson', 'compile', '-C', s.build_dir, '-j', s.jobs,
            *[f'core/{name}' for name, _ in tests]], env=env)
+    # Each through tools/run_capped.py, as meson would run it, its peak
+    # recorded: TSan's shadow memory is its own, so not held to the
+    # uninstrumented builds' declarations (as the ASan lane).
     for name, test_filter in tests:
-        s.run([s.build_dir / 'core' / name, f'--gtest_filter={test_filter}'], env=env,
+        s.run([sys.executable, s.root / 'tools' / 'run_capped.py',
+               s.build_dir / 'core' / name, f'--gtest_filter={test_filter}'],
+              env=dict(env, BESS_TEST_MEM_MEASURE='1'),
               cwd=s.build_dir / 'core')
 
 
@@ -589,15 +617,20 @@ def step_verify_install(s):
     battery = s.root / 'build' / f'battery-{s.name}'
     shutil.rmtree(battery, ignore_errors=True)
     s.run(['meson', 'setup', battery, 'examples/sdk_battery'], env=env)
-    s.run(['meson', 'test', '-C', battery, '--print-errorlogs'], env=env)
+    # Their own projects, so the wrapper is given here: each test declares
+    # its memory (BESS_TEST_MEM_MB) and runs under tools/run_capped.py.
+    capped = ['--wrapper', str(s.root / 'tools' / 'run_capped.py')]
+    s.run(['meson', 'test', '-C', battery, '--print-errorlogs', *capped], env=env)
+    print_test_peaks(s, battery)
     # R1's application as a program without bessd, linked from the installed
     # route, dataplane and RCU archives and DPDK (D-095); it forwards a frame.
     static_router = s.root / 'build' / f'static-router-{s.name}'
     shutil.rmtree(static_router, ignore_errors=True)
     s.run(['meson', 'setup', static_router, 'examples/static_router'], env=env)
-    s.run(['meson', 'test', '-C', static_router, '--print-errorlogs'],
+    s.run(['meson', 'test', '-C', static_router, '--print-errorlogs', *capped],
           env={**env, 'LD_LIBRARY_PATH': os.pathsep.join(
               filter(None, [s.dpdk_libdir(), env.get('LD_LIBRARY_PATH')]))})
+    print_test_peaks(s, static_router)
     # API samples, one per public library, compiled from the install (M23).
     samples = s.root / 'build' / f'samples-{s.name}'
     shutil.rmtree(samples, ignore_errors=True)

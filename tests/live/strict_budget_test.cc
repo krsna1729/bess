@@ -15,6 +15,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "control_v2.grpc.pb.h"
 #include "live_daemon.h"
@@ -122,10 +123,16 @@ TEST(StrictBudgetTest, RefusesInsteadOfBeingKilledAndAccountsEveryByte) {
   if (bess::live::RunProgram({"systemd-run", "--user", "--scope", "-q", "true"}).status != 0) {
     GTEST_SKIP() << "systemd-run --user --scope cannot make a cgroup here";
   }
-  auto daemon = Daemon::LaunchUnder(
-      {"systemd-run", "--user", "--scope", "-q", "--unit=" + unit,
-       "-p", std::format("MemoryMax={}M", kCapMiB), "-p", "MemorySwapMax=0"},
-      {"--buffers=4096"});
+  // In the slice the memory wrapper's scopes go to, when it names one: a
+  // whole `meson test`'s peak is that slice's (tools/run_capped.py).
+  std::vector<std::string> launcher = {"systemd-run", "--user", "--scope", "-q",
+                                       "--unit=" + unit};
+  if (const std::string slice = bess::live::Env("BESS_TEST_MEM_SLICE"); !slice.empty()) {
+    launcher.push_back("--slice=" + slice);
+  }
+  launcher.insert(launcher.end(), {"-p", std::format("MemoryMax={}M", kCapMiB), "-p",
+                                   "MemorySwapMax=0"});
+  auto daemon = Daemon::LaunchUnder(launcher, {"--buffers=4096"});
   ASSERT_GT(daemon->pid(), 0);
   const std::string cgroup = CgroupOf(daemon->pid());
   ASSERT_NE(cgroup.find(unit), std::string::npos) << cgroup;
