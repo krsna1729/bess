@@ -28,16 +28,18 @@ namespace fs = std::filesystem;
 
 // Run as a script, its command line is "/bin/sh DIR/bessd.parent -f -p PORT
 // -i PIDFILE", which no `pkill -f "bessd .* -p PORT "` matches. "ready" on
-// standard output once the pid is written and SIGTERM is handled.
+// standard output once the pid is written. It then becomes its sleep (exec,
+// same pid), which SIGTERM's default action ends: no trap and no child. A
+// trap waiting on a background sleep missed the SIGTERM under dash, so the
+// stop fell back to SIGKILL and the orphaned sleep held meson's output pipe
+// until the suite's timeout.
 constexpr const char *kStandIn = R"(#!/bin/sh
 while [ $# -gt 1 ]; do
   if [ "$1" = -i ]; then echo $$ > "$2"; fi
   shift
 done
-trap 'kill $!; wait $!; exit 143' TERM
-sleep 1000 &
 echo ready
-wait
+exec sleep 1000
 )";
 
 TEST(DaemonStopTest, StopsACopyNamedForItsRoleByThePidItWrote) {
