@@ -65,8 +65,10 @@ memory is their own.
 - this page's table does not list a test with its declaration.
 
 A new test is calibrated with `BESS_TEST_MEM_MEASURE=1 meson test -C BUILD
-NAME` (it reports its peak and fails on none): declare the peak times 1.25,
-rounded up to 8 MiB, the larger of an `-O1` and a release build's.
+NAME` (it reports its peak and fails on none): declare at least the peak
+times 1.25, rounded up to 8 MiB, using the largest uninstrumented local or CI
+compiler/architecture measurement. A kernel-killed run is only a lower bound;
+finish its calibration with enough headroom to observe a completed run.
 
 ### The suite
 
@@ -87,6 +89,8 @@ Evidence: the enforced runs' meson logs (`enf-fast-j1`, `enf-fast-j3`,
 `memory.peak`. Each run has exactly one intended OOM kill from the runner
 self-test. These are measured outcomes under a 2048 MiB enforcing slice,
 not proof that every host or future run will fit that limit.
+The [recorded command and outcomes](https://github.com/krsna1729/bess/pull/142#issuecomment-6630142618)
+also preserve the per-test maximum and runner self-test results.
 
 The declaration scheduler calculation is **1048 MiB** at both `-j1` and
 `-j3` (`check_test_memory.py`, `route_route_test` runs alone). That is not a
@@ -131,9 +135,11 @@ The full benchmark commands remain in the measuring tools; only the
 
 ### Every test
 
-Declared: the calibration run's peak (`BESS_TEST_MEM_MEASURE=1 meson test
--j1`, 2026-11-04; page cache then still counted) times 1.25, rounded up to
-8 MiB. Peak: the larger diagnostic from the enforced `-j1` and `-j3` runs
+Declared: local calibration (`BESS_TEST_MEM_MEASURE=1 meson test -j1`,
+2026-11-04; page cache then still counted), with at least 25% headroom,
+rounded up to 8 MiB, raised where CI measured more (run
+[41826189434](https://github.com/krsna1729/bess/actions/runs/41826189434)).
+Peak: the larger diagnostic from the local enforced `-j1` and `-j3` runs
 for that build, by `run_capped.py`, MiB. `-O1`:
 `build/fast` (`-Dbuildtype=plain -Dcpp_args=-O1,-g0 -Dcpu=native`, no
 benchmarks); release: `-Dbuildtype=release -Dcpu=x86-64-v3
@@ -167,7 +173,7 @@ their own `test()`.
 | `modules_router_test` | 440 | 344.6 | 345.9 |
 | `live_bessctl` | 408 | 296.3 | 307.6 |
 | `route_router_transaction_test` | 408 | 322.8 | 323.0 |
-| `utils_dpdk_memory_test` | 400 | 314.3 | 314.5 |
+| `utils_dpdk_memory_test` | 600 | 314.3 | 314.5 |
 | `meter_bench` | 368 | - | 292.6 |
 | `bessctl_manifest_test` | 352 | 275.2 | 275.3 |
 | `control_api_v2_test` | 344 | 271.2 | 272.8 |
@@ -307,14 +313,14 @@ their own `test()`.
 | `mempool_bench` | 112 | - | 85.6 |
 | `packet_checksum_bench` | 112 | - | 84.3 |
 | `packet_bench` | 104 | - | 79.3 |
-| `flow_shared_flow_table_test` | 96 | 75.6 | 75.8 |
+| `flow_shared_flow_table_test` | 192 | 75.6 | 75.8 |
 | `classifier_bench` | 88 | - | 66.7 |
 | `control_maintenance_loop_test` | 88 | 66.8 | 67.0 |
 | `occupancy_bench` | 88 | - | 67.5 |
 | `packet_edit_plan_bench` | 88 | - | 66.5 |
-| `conntrack_shared_conntrack_test` | 80 | 59.1 | 58.8 |
+| `conntrack_shared_conntrack_test` | 144 | 59.1 | 58.8 |
 | `drivers_pcap_test` | 80 | 62.6 | 63.1 |
-| `classifier_concurrent_exact_test` | 72 | 51.6 | 52.1 |
+| `classifier_concurrent_exact_test` | 144 | 51.6 | 52.1 |
 | `classifier_typed_bench` | 72 | - | 52.8 |
 | `control_transaction_fuzz_corpus` | 72 | - | 55.4 |
 | `packet_checksum_test` | 72 | 53.4 | 53.6 |
@@ -322,14 +328,14 @@ their own `test()`.
 | `packet_edit_plan_test` | 72 | 53.4 | 53.1 |
 | `packet_mutation_test` | 72 | 53.1 | 53.2 |
 | `packet_reshape_test` | 72 | 53.2 | 53.9 |
-| `packet_test` | 72 | 53.2 | 53.6 |
+| `packet_test` | 104 | 53.2 | 53.6 |
 | `packet_tx_checksum_test` | 72 | 53.6 | 54.0 |
-| `check_link_graph` | 64 | 46.2 | 46.4 |
+| `check_link_graph` | 256 | 46.2 | 46.4 |
 | `classifier_rte_hash_exact_test` | 64 | 50.6 | 50.8 |
 | `dataplane_rebuild_resource_test` | 64 | 49.7 | 49.8 |
-| `flow_reference_apps_test` | 64 | 49.3 | 49.4 |
+| `flow_reference_apps_test` | 144 | 49.3 | 49.4 |
 | `meter_meter_test` | 64 | 48.9 | 48.8 |
-| `nat_nat_usage_test` | 64 | 49.5 | 49.4 |
+| `nat_nat_usage_test` | 144 | 49.5 | 49.4 |
 | `runtime_malloc_policy_test` | 64 | 49.4 | 49.3 |
 | `runtime_simd_width_test` | 64 | 48.3 | 48.8 |
 | `utils_bpf_program_test` | 64 | 50.6 | 50.3 |
@@ -357,7 +363,7 @@ their own `test()`.
 | `tunnel_bench` | 40 | - | 29.4 |
 | `utils_checksum_bench` | 40 | - | 29.4 |
 | `utils_copy_bench` | 40 | - | 29.4 |
-| `utils_cuckoo_map_test` | 40 | 27.3 | 27.5 |
+| `utils_cuckoo_map_test` | 512 | 27.3 | 27.5 |
 | `check_arch` | 32 | 22.1 | 22.1 |
 | `check_public_proto_closure` | 32 | 20.1 | 20.1 |
 | `check_scaling` | 32 | 19.9 | 19.8 |
@@ -400,7 +406,7 @@ their own `test()`.
 | `classifier_typed_exact_test` | 24 | 15.2 | 15.3 |
 | `cli_mode_test` | 24 | 15.2 | 15.2 |
 | `conntrack_conntrack_model_test` | 24 | 15.2 | 15.2 |
-| `conntrack_conntrack_test` | 24 | 16.3 | 16.3 |
+| `conntrack_conntrack_test` | 32 | 16.3 | 16.3 |
 | `conntrack_fuzz_corpus` | 24 | - | 15.3 |
 | `dataplane_batch_stages_test` | 24 | 15.3 | 15.3 |
 | `dataplane_continuation_test` | 24 | 15.4 | 15.1 |
