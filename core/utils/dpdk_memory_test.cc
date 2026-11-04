@@ -3,6 +3,9 @@
 // Dataplane memory policy (Decision D-198): refusals instead of OOM kills,
 // normal pages only when declared. Tests run DPDK as the test binaries bring
 // it up, lazily and normally without hugepages.
+// Not --gtest_repeat safe: the fallback heap keeps its chunks for the process
+// lifetime (FallbackHeap adds them, never removes one) and DPDK's native heap
+// its pages (BP-3), so a repeat starts on what the last iteration left.
 
 #include "utils/dpdk_memory.h"
 
@@ -53,10 +56,7 @@ constexpr size_t kMB = size_t{1} << 20;
 // Sets a policy for one test and restores the default after it.
 class PolicyScope {
  public:
-  explicit PolicyScope(MemoryPolicy policy) {
-    bess::utils::MemoryNode();  // DPDK up first, sized without this policy
-    SetMemoryPolicy(std::move(policy));
-  }
+  explicit PolicyScope(MemoryPolicy policy) { SetMemoryPolicy(std::move(policy)); }
   ~PolicyScope() { SetMemoryPolicy(MemoryPolicy{}); }
   PolicyScope(const PolicyScope &) = delete;
   PolicyScope &operator=(const PolicyScope &) = delete;
@@ -71,7 +71,17 @@ MemoryPolicy TightPolicy(size_t headroom, size_t reserve) {
   return policy;
 }
 
-TEST(DpdkMemoryTest, MemoryRefusedCarriesReasonBytesAndMessage) {
+// Every test starts with DPDK up, sized without any test's policy, so the
+// limit TightPolicy measures includes DPDK's --no-huge heap. Brought up only
+// by PolicyScope, after TightPolicy had measured, it was not: run first,
+// AWouldBeRefusalTrimsGlibcFirst's limit sat below what the process then used
+// and its 48 MiB was refused outright, without the trim.
+class DpdkMemoryTest : public ::testing::Test {
+ protected:
+  void SetUp() override { bess::utils::MemoryNode(); }
+};
+
+TEST_F(DpdkMemoryTest, MemoryRefusedCarriesReasonBytesAndMessage) {
   const MemoryRefused refused(MemoryRefused::Reason::kNormalLimit, 4096,
                               "memory limit: no");
   EXPECT_EQ(refused.reason(), MemoryRefused::Reason::kNormalLimit);
@@ -85,7 +95,7 @@ TEST(DpdkMemoryTest, MemoryRefusedCarriesReasonBytesAndMessage) {
   }
 }
 
-TEST(DpdkMemoryTest, AdmitNormalMemoryRefusesPastLimitLessReserve) {
+TEST_F(DpdkMemoryTest, AdmitNormalMemoryRefusesPastLimitLessReserve) {
   // Without a limit everything is admitted.
   EXPECT_NO_THROW(AdmitNormalMemory(size_t{1} << 40));
 
@@ -108,7 +118,7 @@ TEST(DpdkMemoryTest, AdmitNormalMemoryRefusesPastLimitLessReserve) {
 // so erases succeed at the limit where every other admission is refused; a
 // removal stage's prepaid allocations are not checked at all. A scope only
 // raises the level and restores the one it found.
-TEST(DpdkMemoryTest, HeadroomLevels) {
+TEST_F(DpdkMemoryTest, HeadroomLevels) {
   using bess::utils::Headroom;
   PolicyScope scope(TightPolicy(508 * kMB, 512 * kMB));  // 4 MiB past it
   EXPECT_THROW(AdmitNormalMemory(1 * kMB), MemoryRefused);
@@ -134,7 +144,7 @@ TEST(DpdkMemoryTest, HeadroomLevels) {
 // D-207: free memory glibc retains in its arenas is given back (RT-1's trim)
 // before an admission is refused on it; one past the limit itself is
 // refused without a trim.
-TEST(DpdkMemoryTest, AWouldBeRefusalTrimsGlibcFirst) {
+TEST_F(DpdkMemoryTest, AWouldBeRefusalTrimsGlibcFirst) {
   PolicyScope scope(TightPolicy(64 * kMB, 32 * kMB));
   const uint64_t trims = bess::runtime::malloc_trims();
   EXPECT_THROW(AdmitNormalMemory(48 * kMB), MemoryRefused);
@@ -163,14 +173,18 @@ size_t ResidentPages(const void *p, size_t bytes) {
 // was reused -- a teardown and reload was refused. DpdkFree gives the whole
 // pages inside a freed block back. Limit = usage + 0.7 L: allocate 0.4 L,
 // write it, free it (at most its 2 edge pages stay resident), admit 0.4 L
-// again -- ten rounds, no refusal.
-TEST(DpdkMemoryTest, FreedHeapMemoryIsReadmitted) {
-  bess::utils::MemoryNode();
+// again -- ten rounds, no refusal. The fallback heap keeps the chunks earlier
+// tests added and grows by twice the last one, so a free block for 0.4 L is
+// reserved first, without a limit: otherwise the first round's growth asks
+// for 128 MiB or more, which the limit refuses (a counted refusal) before the
+// heap takes just 0.4 L.
+TEST_F(DpdkMemoryTest, FreedHeapMemoryIsReadmitted) {
   if (rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
   }
   constexpr size_t kL = 160 * kMB;
   constexpr size_t kReserve = 16 * kMB;
+  FallbackSocket(kL / 10 * 4);
   PolicyScope scope(TightPolicy(kL / 10 * 7 + kReserve, kReserve));
   const uint64_t refusals = GetMemoryStatus().refusals;
   for (int round = 0; round < 10; round++) {
@@ -184,8 +198,7 @@ TEST(DpdkMemoryTest, FreedHeapMemoryIsReadmitted) {
   EXPECT_EQ(GetMemoryStatus().refusals, refusals);
 }
 
-TEST(DpdkMemoryTest, NoHugeAllocationPastTheLimitIsRefused) {
-  bess::utils::MemoryNode();
+TEST_F(DpdkMemoryTest, NoHugeAllocationPastTheLimitIsRefused) {
   if (rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
   }
@@ -202,8 +215,7 @@ TEST(DpdkMemoryTest, NoHugeAllocationPastTheLimitIsRefused) {
   }
 }
 
-TEST(DpdkMemoryTest, FallbackHeapOnlyWhereAllowed) {
-  bess::utils::MemoryNode();
+TEST_F(DpdkMemoryTest, FallbackHeapOnlyWhereAllowed) {
   if (rte_eal_has_hugepages()) {
     // Hugepages with --mem_fallback=false: refused, naming the flag.
     MemoryPolicy forbid;
@@ -249,8 +261,7 @@ std::string VmFlagsOf(const void *p) {
 
 // RT-1: bessd confines THP to advised memory under THP "always", so the
 // fallback heap, which holds the tables under --no-huge, advises its chunks.
-TEST(DpdkMemoryTest, FallbackHeapChunksAskForTransparentHugepages) {
-  bess::utils::MemoryNode();
+TEST_F(DpdkMemoryTest, FallbackHeapChunksAskForTransparentHugepages) {
   if (rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
   }
@@ -268,8 +279,7 @@ TEST(DpdkMemoryTest, FallbackHeapChunksAskForTransparentHugepages) {
 // FallbackChunkCap (256 MiB without a limit) for small tables: a load of
 // 8 MiB tables over four growths. Doubling to 1 GiB, the fourth was 512 MiB
 // (1 GiB further on: 2.2-5.9 s under one RPC at 1.2M sessions).
-TEST(DpdkMemoryTest, FallbackHeapGrowsByAtMostTheChunkCap) {
-  bess::utils::MemoryNode();
+TEST_F(DpdkMemoryTest, FallbackHeapGrowsByAtMostTheChunkCap) {
   if (rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
   }
@@ -294,7 +304,7 @@ TEST(DpdkMemoryTest, FallbackHeapGrowsByAtMostTheChunkCap) {
   EXPECT_LE(largest, bess::utils::detail::FallbackChunkCap(0));
 }
 
-TEST(DpdkMemoryTest, FallbackChunkCapKeepsTheHeapWithinItsMemsegLists) {
+TEST_F(DpdkMemoryTest, FallbackChunkCapKeepsTheHeapWithinItsMemsegLists) {
   constexpr size_t kGiB = 1024 * kMB;
   EXPECT_EQ(256 * kMB, bess::utils::detail::FallbackChunkCap(0));
   EXPECT_EQ(256 * kMB, bess::utils::detail::FallbackChunkCap(3 * kGiB));
@@ -308,7 +318,7 @@ TEST(DpdkMemoryTest, FallbackChunkCapKeepsTheHeapWithinItsMemsegLists) {
 // this one creates rte_hash tables on that heap and checks every key: no
 // guarded allocation starts during a give-back, and no table loses what was
 // written to it.
-TEST(DpdkMemoryTest, AGiveBackNeverOverlapsAnAllocation) {
+TEST_F(DpdkMemoryTest, AGiveBackNeverOverlapsAnAllocation) {
   const int socket = FallbackSocket(kMB);
   auto create = [socket](const std::string &name) {
     rte_hash_parameters params{};
@@ -356,8 +366,7 @@ TEST(DpdkMemoryTest, AGiveBackNeverOverlapsAnAllocation) {
 
 // AdmitTable (D-198): the policy-aware admission MemoryScope calls before a
 // table is allocated.
-TEST(DpdkMemoryTest, AdmitTableFollowsTheBacking) {
-  bess::utils::MemoryNode();
+TEST_F(DpdkMemoryTest, AdmitTableFollowsTheBacking) {
   if (!rte_eal_has_hugepages()) {
     // Normal pages: admitted against the limit, nothing counted.
     PolicyScope scope(TightPolicy(64 * kMB, 32 * kMB));
@@ -405,7 +414,7 @@ TEST(DpdkMemoryTest, AdmitTableFollowsTheBacking) {
 // memory_hugetlb_accounting, D-198), a table is also admitted against the
 // limit for the whole pages the heap must map for it; nothing if the heap
 // already holds it.
-TEST(DpdkMemoryTest, HugepageChargeIsTheWholePagesTheHeapMustAdd) {
+TEST_F(DpdkMemoryTest, HugepageChargeIsTheWholePagesTheHeapMustAdd) {
   using bess::utils::detail::HugepageCharge;
   constexpr size_t kGB = size_t{1} << 30;
   EXPECT_EQ(HugepageCharge(kMB, 2 * kMB, kGB), 0u);
@@ -416,8 +425,7 @@ TEST(DpdkMemoryTest, HugepageChargeIsTheWholePagesTheHeapMustAdd) {
   EXPECT_EQ(HugepageCharge(3 * kMB, 0, 0), 3 * kMB);  // page size unknown
 }
 
-TEST(DpdkMemoryTest, ChargedHugepagesAreAdmittedAgainstTheLimit) {
-  bess::utils::MemoryNode();
+TEST_F(DpdkMemoryTest, ChargedHugepagesAreAdmittedAgainstTheLimit) {
   if (!rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK runs on normal pages (BESSD_MEM_BACKING)";
   }
@@ -452,7 +460,7 @@ TEST(DpdkMemoryTest, ChargedHugepagesAreAdmittedAgainstTheLimit) {
 }
 
 // DpdkArray states what it allocates (D-198: what a module admits for it).
-TEST(DpdkMemoryTest, DpdkArrayBytesMatchesTheConstructor) {
+TEST_F(DpdkMemoryTest, DpdkArrayBytesMatchesTheConstructor) {
   struct Stamp {
     uint64_t a, b;
   };
@@ -464,7 +472,7 @@ TEST(DpdkMemoryTest, DpdkArrayBytesMatchesTheConstructor) {
   }
 }
 
-TEST(DpdkMemoryTest, StatusReflectsThePolicy) {
+TEST_F(DpdkMemoryTest, StatusReflectsThePolicy) {
   MemoryPolicy policy = TightPolicy(1024 * kMB, 128 * kMB);
   policy.fallback = false;
   const size_t limit = policy.limit_bytes;
@@ -515,8 +523,7 @@ uint64_t OomKills() {
 // its admission, so freeing it never grows RSS (D-206): DPDK zeroes a clean
 // element on free, which used to fault an admitted but untouched table in at
 // teardown and OOM-kill bessd near its cgroup limit.
-TEST(DpdkMemoryTest, FreeNeverGrowsResidentMemory) {
-  bess::utils::MemoryNode();  // DPDK up: before it, has_hugepages is 1
+TEST_F(DpdkMemoryTest, FreeNeverGrowsResidentMemory) {
   ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
   constexpr size_t kBytes = 64 * kMB;
   const MemoryPolicy policy = TightPolicy(kBytes + 32 * kMB, 0);
@@ -544,8 +551,7 @@ TEST(DpdkMemoryTest, FreeNeverGrowsResidentMemory) {
 // pages, mapped on a process's first throw -- 98,272 B past
 // `before + admitted` on the clang-asan lane. RSS is still bounded where the
 // table could land outside the heaps: while it is created and freed.
-TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
-  bess::utils::MemoryNode();  // DPDK up: before it, has_hugepages is 1
+TEST_F(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
   ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
   rte_hash_parameters params{};
   params.name = "dpdk_memory_test";
@@ -597,8 +603,7 @@ TEST(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
 // exactly Y pages and leaves the other heap's as it was -- on DPDK's
 // --no-huge heap (a memfd, so shmem) and on "bess-normal" (private
 // anonymous memory).
-TEST(DpdkMemoryTest, HeapResidentBytesCountTheTouchedPages) {
-  bess::utils::MemoryNode();  // DPDK up: before it, has_hugepages is 1
+TEST_F(DpdkMemoryTest, HeapResidentBytesCountTheTouchedPages) {
   ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
   // A touched page must fault one 4 KiB page, not a transparent huge page
   // around it ("bess-normal" advises THP): THP off for this test.
@@ -653,7 +658,7 @@ TEST(DpdkMemoryTest, HeapResidentBytesCountTheTouchedPages) {
 // moves it. Which chunk a block gets depends on the heap's free chunks
 // (a free chunk 16 bytes past what is needed is handed out whole), so the
 // earlier tests' frees decide which sizes take the extra 16.
-TEST(DpdkMemoryTest, MallocChunkBytesBoundsWhatMallocTakes) {
+TEST_F(DpdkMemoryTest, MallocChunkBytesBoundsWhatMallocTakes) {
 #if BESS_ADDRESS_SANITIZER
   GTEST_SKIP() << "ASan replaces glibc malloc; its chunks are not glibc's";
 #endif
