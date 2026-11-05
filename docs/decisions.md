@@ -14666,6 +14666,15 @@ ring then needs per-writer rings).
 
 **Status:** accepted (2026-11-05, maintainer decision: "4K or hugepages only, keep it predictable"). Amends D-064
 (MacTable's `MADV_HUGEPAGE`) and RT-1 of D-207 (THP confined to advised memory).
+**Amended (2026-11-05, maintainer request):** `MacTable` and `PackedMacTable` now allocate their lookup and cold
+arrays through `DpdkAllocate`/`DpdkFree`. `GlibcBytes` counts only the table object; `BasicFdb::GlibcBytes`
+subtracts its table's heap arrays, retaining its aging wheel and flood groups on glibc. Existing module leases
+therefore place and report the arrays as reserved hugetlb or normal pages, with the same cap/fallback/refusal
+policy as other framework tables. Partial construction failure returns null and frees the first array.
+`MemoryScopeTest.L2ArraysFollowPlacementAndReleaseTheirHeapBytes` checks actual heap allocation, backing
+accounts and teardown for both table types, including a packed table without cold storage, on native and forced
+fallback heaps; it fails against the previous glibc allocators. The normal-page lookup costs below remain
+historical measurements, not measurements of the new allocation path.
 **Code:** `core/runtime/malloc_policy.{h,cc}` (`DisableThp`), `core/main.cc`, `core/utils/dpdk_memory.cc`
 (`FallbackHeap::EnsureLocked`), `core/l2/mac_table.h`, `core/l2/packed_mac_table.h`; tests
 `MallocPolicyTest.DisableThpTakesItFromTheWholeProcess`,
@@ -14712,10 +14721,8 @@ aligned). A refused prctl is logged as a warning. Hugepages remain available as 
 - A table's time to become resident no longer depends on the host's fragmentation. The bytes resident are the
   bytes touched, at 4 KiB granularity: a `malloc_trim` or `MADV_DONTNEED` frees what it names, with no huge page
   left charged until the kernel splits it.
-- 1M-entry L2 lookups are 10-20% slower (TLB misses; the table above). The L2 tables are glibc memory, not the
-  framework's heaps, so `--mem_backing=hugepages` does not give them hugetlb pages either.
+- The original all-glibc L2 tables made 1M-entry lookups 10-20% slower without THP (table above). The amendment
+  routes their arrays through the framework, so reserved hugetlb pages can now cover them.
 - Normal-page backing at scale pays 4 KiB TLB reach everywhere; deployments that need the reach reserve hugepages.
 
-**Revisit when:** an L2 table of 1M entries or more is on a measured critical path (then allocate it from the
-framework's heaps, which are hugetlb under `--mem_backing=hugepages`); or a kernel offers THP without direct
-compaction at fault for one process.
+**Revisit when:** a kernel offers THP without direct compaction at fault for one process.

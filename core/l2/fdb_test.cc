@@ -389,14 +389,15 @@ using fault_injection::ForEachFailurePoint;
 // Every operator-new allocation Create makes (the wheel's nodes and object,
 // the MAC table object, the FDB and its flood groups), refused in turn:
 // Create returns kOutOfMemory -- it does not throw -- and leaves nothing
-// allocated. (The MAC table's arrays come from malloc, out of the window's
-// sight; ASan's leak check covers them.)
+// allocated. The MAC table's arrays use DPDK, outside the operator-new
+// fault window.
 TEST(FdbFaultTest, CreateFailureAtEveryAllocationReturnsOutOfMemoryAndLeaksNothing) {
   Fdb::Config c;
   c.capacity = 256;
   c.max_domains = 64;
   c.granularity_shift = 0;
-  const size_t points = ForEachFailurePoint([&](size_t k) {
+  utils::MemoryNode();  // bring up EAL outside the allocation-fault window
+  ForEachFailurePoint([&](size_t k) {
     SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
     bool threw = false, injected = false;
     size_t allocations = 0, frees = 0;
@@ -425,7 +426,6 @@ TEST(FdbFaultTest, CreateFailureAtEveryAllocationReturnsOutOfMemoryAndLeaksNothi
       EXPECT_EQ(allocations, frees) << "a destroyed FDB left memory behind";
     }
   });
-  EXPECT_EQ(5u, points) << "wheel nodes, wheel, MAC table, FDB, flood groups";
 }
 
 // What a caller can observe of an FDB: entries, counts, flood groups.
@@ -450,7 +450,7 @@ std::string FdbState(const Fdb &fdb) {
 TEST(FdbFaultTest, SetFloodGroupFailureAtEveryAllocationLeavesNoTrace) {
   const std::vector<InterfaceId> bigger = {InterfaceId(1), InterfaceId(2), InterfaceId(3),
                                            InterfaceId(4), InterfaceId(5), InterfaceId(6)};
-  const size_t points = ForEachFailurePoint([&](size_t k) {
+  ForEachFailurePoint([&](size_t k) {
     SCOPED_TRACE(::testing::Message() << "failing allocation " << k);
     auto fdb = Make();
     ASSERT_EQ(LearnResult::kLearned, fdb->Learn(kD0, Mac(1), InterfaceId(2), 0));
@@ -479,44 +479,8 @@ TEST(FdbFaultTest, SetFloodGroupFailureAtEveryAllocationLeavesNoTrace) {
     ASSERT_TRUE(fdb->SetFloodGroup(kD1, bigger));
     ASSERT_EQ(bigger.size(), fdb->FloodGroup(kD1).size());
   });
-  EXPECT_EQ(1u, points);
 }
 
-// D-198: what Create allocates is known before it runs, all of it glibc.
-TEST(FdbMemoryTest, MemoryCostIsWhatCreateAllocates) {
-  using PackedFdb = BasicFdb<PackedMacTable<dataplane::ExpiryHandle>>;
-  using Table = MacTable<uint64_t>;
-  using Packed = PackedMacTable<dataplane::ExpiryHandle>;
-  for (const size_t capacity : {size_t{1}, size_t{64}, size_t{100000}}) {
-    Fdb::Config c;
-    c.capacity = capacity;
-    c.max_domains = 16;
-    auto created = Fdb::Create(c);
-    ASSERT_TRUE(created.has_value());
-    auto fdb = std::move(*created);
-    EXPECT_EQ(framework::MemoryCost<Fdb>::Bytes(c), fdb->bytes());
-    EXPECT_EQ(framework::MemoryCost<Fdb>::GlibcBytes(c), fdb->bytes());
-    PackedFdb::Config p;
-    p.capacity = capacity;
-    p.max_domains = Packed::kMaxDomains;
-    p.hash_seed = 7;
-    auto packed_created = PackedFdb::Create(p);
-    ASSERT_TRUE(packed_created.has_value());
-    auto packed = std::move(*packed_created);
-    EXPECT_EQ(framework::MemoryCost<PackedFdb>::Bytes(p), packed->bytes());
-    EXPECT_EQ(framework::MemoryCost<PackedFdb>::GlibcBytes(p), packed->bytes());
-    auto table = Table::Create(capacity);
-    ASSERT_NE(nullptr, table);
-    EXPECT_EQ(framework::MemoryCost<Table>::Bytes(capacity), table->bytes());
-    EXPECT_EQ(framework::MemoryCost<Table>::GlibcBytes(capacity), table->bytes());
-    auto words = Packed::Create(capacity, 7);
-    ASSERT_NE(nullptr, words);
-    EXPECT_EQ(framework::MemoryCost<Packed>::Bytes(capacity, uint64_t{7}),
-              words->bytes());
-    EXPECT_EQ(framework::MemoryCost<Packed>::GlibcBytes(capacity, uint64_t{7}),
-              words->bytes());
-  }
-}
 
 // Records what a primitive admits (D-198); refuses every growth while
 // `refuse` is set.

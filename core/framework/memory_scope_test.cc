@@ -4,6 +4,9 @@
 // whole, released with the owner, accounted per module and resource.
 
 #include "framework/memory_scope.h"
+#include "l2/fdb.h"
+#include "l2/mac_table.h"
+#include "l2/packed_mac_table.h"
 
 #include <gtest/gtest.h>
 
@@ -237,6 +240,56 @@ class NativeAsHugepages {
   NativeAsHugepages &operator=(const NativeAsHugepages &) = delete;
 };
 
+// The real L2 arrays must follow the lease's placement, not merely declare
+// the right byte count. Check both native and forced-fallback heaps, with
+// and without a cold array, and ensure teardown returns all allocations.
+template <typename T>
+void CheckL2Placement(bool normal) {
+  MemoryPolicy policy;
+  if (normal) {
+    policy.hugepage_cap_bytes = bess::utils::HugepageTableBytes() + 1;
+  }
+  NativeAsHugepages backing(policy);
+  const std::string name = "l2_placement";
+  MemoryScope scope(&name);
+  constexpr size_t capacity = 65536;
+  const size_t arrays = T::Bytes(capacity) - sizeof(T);
+  const auto before = bess::utils::GetMemoryStatus();
+  {
+    auto lease = scope.LeaseFor<T>("table", capacity);
+    auto table = T::Create(capacity);
+    ASSERT_NE(table, nullptr);
+    const auto account = Row(name, "table");
+    if (!account.has_value()) {
+      FAIL() << "the table lease has no resource account";
+      return;
+    }
+    const auto &row = *account;
+    EXPECT_EQ(row.glibc_bytes, sizeof(T));
+    EXPECT_EQ(row.normal_bytes, normal ? arrays : 0);
+    EXPECT_EQ(row.hugepage_bytes, normal ? 0 : arrays);
+    const auto during = bess::utils::GetMemoryStatus();
+    const size_t allocated = normal
+        ? during.fallback_heap_alloc_bytes - before.fallback_heap_alloc_bytes
+        : during.dpdk_heap_alloc_bytes - before.dpdk_heap_alloc_bytes;
+    EXPECT_GE(allocated, arrays);
+    EXPECT_LT(allocated, arrays + 4096);  // DPDK headers and alignment only
+  }
+  const auto after = bess::utils::GetMemoryStatus();
+  EXPECT_EQ(after.fallback_heap_alloc_bytes, before.fallback_heap_alloc_bytes);
+  EXPECT_EQ(after.dpdk_heap_alloc_bytes, before.dpdk_heap_alloc_bytes);
+  EXPECT_EQ(scope.admitted_bytes(), 0u);
+}
+
+TEST(MemoryScopeTest, L2ArraysFollowPlacementAndReleaseTheirHeapBytes) {
+  struct NoCold {};
+  for (const bool normal : {false, true}) {
+    CheckL2Placement<bess::l2::MacTable<bess::dataplane::ExpiryHandle>>(normal);
+    CheckL2Placement<bess::l2::PackedMacTable<bess::dataplane::ExpiryHandle>>(normal);
+    CheckL2Placement<bess::l2::PackedMacTable<NoCold, bess::dataplane::SingleWriter>>(normal);
+  }
+}
+
 // The memory node heap's largest free block less `room`, taken unarmed (no
 // admission), so the next allocation larger than `room` cannot fit there.
 class FillNativeHeap {
@@ -256,6 +309,24 @@ class FillNativeHeap {
  private:
   void *filler_ = nullptr;
 };
+
+template <typename T>
+void CheckL2AllocationRefusal(size_t first_array_bytes) {
+  MemoryPolicy policy;
+  policy.fallback = false;
+  NativeAsHugepages backing(policy);
+  FillNativeHeap full(first_array_bytes + kMB / 2);
+  const size_t before = bess::utils::GetMemoryStatus().dpdk_heap_alloc_bytes;
+  // The first array fits, but the second does not. Create keeps its
+  // nullptr-on-allocation-failure contract and frees the first array.
+  EXPECT_EQ(T::Create(65536), nullptr);
+  EXPECT_EQ(bess::utils::GetMemoryStatus().dpdk_heap_alloc_bytes, before);
+}
+
+TEST(MemoryScopeTest, L2ColdArrayRefusalFreesTheAlreadyAllocatedLookupArray) {
+  CheckL2AllocationRefusal<bess::l2::MacTable<bess::dataplane::ExpiryHandle>>(2 * kMB);
+  CheckL2AllocationRefusal<bess::l2::PackedMacTable<bess::dataplane::ExpiryHandle>>(kMB);
+}
 
 TEST(MemoryScopeTest, PlacementIsHugepagesFirstThenNormalPagesAsTheyLand) {
   NativeAsHugepages backing;

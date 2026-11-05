@@ -144,6 +144,12 @@ for that build, by `run_capped.py`, MiB. `-O1`:
 `build/fast` (`-Dbuildtype=plain -Dcpp_args=-O1,-g0 -Dcpu=native`, no
 benchmarks); release: `-Dbuildtype=release -Dcpu=x86-64-v3
 -Dbuild_benchmarks=true -Dbuild_fuzzers=true`, GCC. `-`: not in that build.
+After the L2 table arrays moved to the framework heap, their standalone
+tests initialize EAL. The four L2 tests now declare 144 MiB; measured
+debugoptimized peaks are 111.1 MiB (`l2_fdb_test`), 111.3 MiB
+(`l2_fdb_model_test`), 111.6 MiB (`l2_mac_table_resource_test`), and
+111.4 MiB (`l2_packed_mac_table_test`). The old pre-EAL calibration values
+are removed below; these builds have not been recalibrated in -O1/release.
 The example projects' tests (`examples/*/meson.build`) declare theirs in
 their own `test()`.
 
@@ -339,7 +345,7 @@ their own `test()`.
 | `runtime_malloc_policy_test` | 64 | 49.4 | 49.3 |
 | `runtime_simd_width_test` | 64 | 48.3 | 48.8 |
 | `utils_bpf_program_test` | 64 | 50.6 | 50.3 |
-| `l2_fdb_test` | 56 | 43.7 | 43.7 |
+| `l2_fdb_test` | 144 | - | - |
 | `modules_exact_match_bench` | 48 | - | 35.8 |
 | `bessctl_multicall` | 40 | 29.9 | 31.1 |
 | `bessd_test` | 40 | 28.7 | 29.4 |
@@ -423,10 +429,10 @@ their own `test()`.
 | `framework_plugin_check_test` | 24 | 15.2 | 15.3 |
 | `framework_resource_bindings_test` | 24 | 15.2 | 15.3 |
 | `framework_threshold_table_test` | 24 | 15.2 | 15.3 |
-| `l2_fdb_model_test` | 24 | 15.2 | 15.2 |
+| `l2_fdb_model_test` | 144 | - | - |
 | `l2_mac_table_kernels_test` | 24 | 15.3 | 15.1 |
-| `l2_mac_table_resource_test` | 24 | 15.0 | 15.3 |
-| `l2_packed_mac_table_test` | 24 | 15.2 | 15.1 |
+| `l2_mac_table_resource_test` | 144 | - | - |
+| `l2_packed_mac_table_test` | 144 | - | - |
 | `nat_fuzz_corpus` | 24 | - | 15.4 |
 | `nat_nat_model_test` | 24 | 15.3 | 15.3 |
 | `offload_flow_rule_owner_test` | 24 | 15.3 | 15.3 |

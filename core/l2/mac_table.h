@@ -5,7 +5,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -16,6 +15,7 @@
 
 #include "dataplane/table_policy.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::l2 {
 
@@ -69,9 +69,11 @@ class MacTable {
       return nullptr;
     }
     const size_t bytes = buckets * sizeof(Bucket);
-    t->buckets_ = static_cast<Bucket *>(std::aligned_alloc(64, (bytes + 63) & ~size_t{63}));
-    t->cold_ = static_cast<Cold *>(std::malloc(buckets * kWays * sizeof(Cold)));
-    if (t->buckets_ == nullptr || t->cold_ == nullptr) {
+    try {
+      t->buckets_ = static_cast<Bucket *>(utils::DpdkAllocate(bytes, 64));
+      t->cold_ = static_cast<Cold *>(
+          utils::DpdkAllocate(buckets * kWays * sizeof(Cold), 64));
+    } catch (const std::bad_alloc &) {
       return nullptr;
     }
     std::memset(static_cast<void *>(t->buckets_), 0, bytes);
@@ -86,17 +88,17 @@ class MacTable {
     return t;
   }
 
-  // What Create allocates (D-198), all of it glibc: the buckets, the cold
-  // array and the table itself, as bytes() counts them.
+  // What Create allocates (D-198): the bucket and cold arrays on the
+  // framework heap; only the table object is glibc.
   static size_t Bytes(size_t capacity) noexcept {
     return BucketsFor(capacity) * (sizeof(Bucket) + kWays * sizeof(Cold)) +
            sizeof(MacTable);
   }
-  static size_t GlibcBytes(size_t capacity) noexcept { return Bytes(capacity); }
+  static size_t GlibcBytes(size_t /*capacity*/) noexcept { return sizeof(MacTable); }
 
   ~MacTable() {
-    std::free(buckets_);
-    std::free(cold_);
+    utils::DpdkFree(buckets_);
+    utils::DpdkFree(cold_);
   }
   MacTable(const MacTable &) = delete;
   MacTable &operator=(const MacTable &) = delete;

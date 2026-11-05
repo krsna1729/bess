@@ -676,7 +676,10 @@ reference to something missing.
 - **Table:** `MacTable`, a two-choice cuckoo table whose 64-byte bucket holds
   four contiguous keys (one vector compare), their values and flags; the aging
   timer sits in a cold array beside it. Fixed capacity, sized for 50% load;
-  on glibc's 4 KiB pages: bessd takes no transparent huge pages (D-209).
+  its bucket/slot and cold arrays use the framework heap: reserved hugetlb
+  pages while available, otherwise normal pages if fallback is allowed.
+  Only the small table object remains on glibc. The FDB's wheel and flood
+  groups remain glibc-backed and admitted separately. No THP (D-209).
 - **Use:** one worker owns it (learning writes it on the packet path). It is
   not mode C by default: the table is a type parameter (`BasicFdb<Storage>`,
   D-073), and `PackedMacTable<Cold, SingleWriter|MultiWriter>` gives one
