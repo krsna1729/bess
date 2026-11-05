@@ -259,18 +259,19 @@ std::string VmFlagsOf(const void *p) {
   return "";
 }
 
-// RT-1: bessd confines THP to advised memory under THP "always", so the
-// fallback heap, which holds the tables under --no-huge, advises its chunks.
-TEST_F(DpdkMemoryTest, FallbackHeapChunksAskForTransparentHugepages) {
+// The fallback heap holds the tables under --no-huge on 4 KiB pages only: its
+// chunks never ask for transparent hugepages (VmFlags "hg"), whose faults
+// compact memory directly and make a table's cost depend on the host's
+// fragmentation (runtime::DisableThp).
+TEST_F(DpdkMemoryTest, FallbackHeapChunksNeverAskForTransparentHugepages) {
   if (rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK has hugepages (BESSD_MEM_BACKING)";
   }
-  if (!std::ifstream("/sys/kernel/mm/transparent_hugepage/enabled")) {
-    GTEST_SKIP() << "no THP in this kernel";
-  }
   void *p = DpdkAllocate(kMB, 64, FallbackSocket(kMB));
   ASSERT_NE(p, nullptr);
-  EXPECT_NE(VmFlagsOf(p).find(" hg"), std::string::npos) << VmFlagsOf(p);
+  const std::string flags = VmFlagsOf(p);
+  ASSERT_NE(flags, "") << "no smaps entry for the block";
+  EXPECT_EQ(flags.find(" hg"), std::string::npos) << flags;
   DpdkFree(p);
 }
 
@@ -615,7 +616,8 @@ TEST_F(DpdkMemoryTest, LibraryTableFreeStaysWithinTheLimit) {
 TEST_F(DpdkMemoryTest, HeapResidentBytesCountTheTouchedPages) {
   ASSERT_EQ(rte_eal_has_hugepages(), 0) << "tests run on normal pages";
   // A touched page must fault one 4 KiB page, not a transparent huge page
-  // around it ("bess-normal" advises THP): THP off for this test.
+  // around it: bessd's main() disables THP (runtime::DisableThp), a test
+  // process does not, so THP off for this test.
   struct ThpOff {
     const int was = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
     ThpOff() { EXPECT_EQ(prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0), 0); }

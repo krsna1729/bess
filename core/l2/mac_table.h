@@ -13,7 +13,6 @@
 #include <span>
 #include <type_traits>
 
-#include <sys/mman.h>
 
 #include "dataplane/table_policy.h"
 #include "utils/common.h"
@@ -48,7 +47,6 @@ class MacTable {
   static constexpr size_t kMaxBatch = 64;
   static constexpr uint64_t kEmptyKey = ~uint64_t{0};
   static constexpr uint32_t kNotFound = ~uint32_t{0};
-  static constexpr size_t kHugePage = size_t{2} << 20;
   // The whole 64-bit word is the key (the FDB packs domain and MAC into it),
   // and a value is 16 bits.
   static constexpr size_t kMaxDomains = 65535;
@@ -70,19 +68,11 @@ class MacTable {
     if (t == nullptr) {
       return nullptr;
     }
-    // A large table is 2 MiB-aligned and asks for transparent huge pages: a
-    // lookup reads one random line, and with 4 KiB pages it also misses the
-    // TLB.
     const size_t bytes = buckets * sizeof(Bucket);
-    const size_t align = bytes >= kHugePage ? kHugePage : 64;
-    t->buckets_ = static_cast<Bucket *>(
-        std::aligned_alloc(align, (bytes + align - 1) & ~(align - 1)));
+    t->buckets_ = static_cast<Bucket *>(std::aligned_alloc(64, (bytes + 63) & ~size_t{63}));
     t->cold_ = static_cast<Cold *>(std::malloc(buckets * kWays * sizeof(Cold)));
     if (t->buckets_ == nullptr || t->cold_ == nullptr) {
       return nullptr;
-    }
-    if (align == kHugePage) {
-      (void)madvise(t->buckets_, bytes, MADV_HUGEPAGE);  // advisory
     }
     std::memset(static_cast<void *>(t->buckets_), 0, bytes);
     for (size_t b = 0; b < buckets; b++) {

@@ -45,15 +45,12 @@ int main(int argc, char *argv[]) {
 
   bess::startup::BlockTerminationSignals();  // before any thread exists
   bess::runtime::CapMallocArenas();  // RT-1: also before any thread exists
-  const bess::runtime::ThpConfinement thp = bess::runtime::ConfineThpToAdvised();
+  const bool thp_disabled = bess::runtime::DisableThp();  // before any thread exists
   FLAGS_logbuflevel = -1;
   FLAGS_colorlogtostderr = true;
   google::InitGoogleLogging(argv[0]);
-  if (thp == bess::runtime::ThpConfinement::kConfined) {
-    LOG(INFO) << "THP is \"always\" here: bessd takes it only where advised (the tables' heap)";
-  } else if (thp == bess::runtime::ThpConfinement::kRefused) {
-    LOG(WARNING) << "THP is \"always\" and the kernel predates PR_THP_DISABLE_EXCEPT_ADVISED "
-                    "(Linux 6.18): glibc's arenas stay on THP";
+  if (!thp_disabled) {
+    PLOG(WARNING) << "PR_SET_THP_DISABLE refused: memory may get transparent hugepages";
   }
   // See debug.cc's InstallFailureFunction call sites for why this cast is
   // needed under Clang (GoPanic's [[noreturn]] doesn't implicitly convert

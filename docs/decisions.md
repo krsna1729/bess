@@ -5730,6 +5730,8 @@ field edits are needed (a branch-free op for each); or code generation (a JIT, o
 
 **Status:** accepted (2026-10-04), experimental API. **Needs review (user):** L2Forward is not moved onto the
 library (below).
+**Amended by D-209 (2026-11-05):** the tables no longer ask for transparent huge pages; they are 64-byte aligned on
+4 KiB pages (1M-entry lookups 10-20% slower).
 **Code:** `core/l2/fdb.h`, `core/l2/mac_table.h` (new, header-only, installed experimental), `core/l2/fdb_test.cc`,
 `core/l2/fdb_bench.cc`, `core/modules/bridge.{h,cc}`, `core/modules/bridge_test.cc`, `core/meson.build`,
 `tools/check_includes.py`, `tools/api_classes.json`, `docs/dataplane-tables.md`.
@@ -5751,7 +5753,8 @@ flow substrate, a MAC-specialised table), and the modules rebuilt as thin adapte
   in the low 16 bits, MAC above), their 16-bit values and flags; one vector compare probes a bucket. The empty
   marker is the all-ones word (domain 0xFFFF with the broadcast MAC, never a valid key). The timer handle lives in
   a cold array beside the table, moved with its slot. Sized for 50% load; inserts into two full buckets move
-  entries along a breadth-first path. Tables of 2 MiB or more are 2 MiB-aligned with `MADV_HUGEPAGE`.
+  entries along a breadth-first path. Tables of 2 MiB or more were 2 MiB-aligned with `MADV_HUGEPAGE` (until D-209:
+  64-byte aligned, 4 KiB pages).
 - Bridge is rebuilt on it: gate g is interface g + 1 (`DROP_GATE` included), the protobuf arguments and commands
   are unchanged, learning and forwarding are the same (hairpin drop, flood to every connected output gate but the
   ingress one). Two differences: static entries are bounded (`size` + 1,024, ENOSPC beyond; before, unbounded),
@@ -14658,3 +14661,61 @@ in median (insert p99.9 0.955, 0.81..1.38). Each max is one call of 2^20 (`kLate
 **Revisit when:** a DPDK upgrade changes `NO_FREE_ON_DEL` or `rte_hash_free_key_with_position`; `merged` is seen
 growing in production (then a larger token ring); or a second concurrent writer per table appears (the one-producer
 ring then needs per-writer rings).
+
+## D-209 bessd takes no transparent hugepages: 4 KiB pages or reserved hugepages only
+
+**Status:** accepted (2026-11-05, maintainer decision: "4K or hugepages only, keep it predictable"). Amends D-064
+(MacTable's `MADV_HUGEPAGE`) and RT-1 of D-207 (THP confined to advised memory).
+**Code:** `core/runtime/malloc_policy.{h,cc}` (`DisableThp`), `core/main.cc`, `core/utils/dpdk_memory.cc`
+(`FallbackHeap::EnsureLocked`), `core/l2/mac_table.h`, `core/l2/packed_mac_table.h`; tests
+`MallocPolicyTest.DisableThpTakesItFromTheWholeProcess`,
+`DpdkMemoryTest.FallbackHeapChunksNeverAskForTransparentHugepages`.
+
+**Problem.** bessd had two sources of memory, 4 KiB pages (`--mem_backing=normal`) and reserved hugetlb pages
+(`--mem_backing=hugepages`), plus a third it did not choose: transparent hugepages. Under THP "always" it set
+`PR_SET_THP_DISABLE` with `PR_THP_DISABLE_EXCEPT_ADVISED` (Linux 6.18) and advised (`MADV_HUGEPAGE`) the
+"bess-normal" heap's chunks and the L2 tables of 2 MiB or more. An advised fault under THP defrag "madvise"
+compacts memory directly, so how long a table took to become resident depended on how fragmented the host's free
+memory was. The UPF's 1M-session graph apply on normal pages, same binaries, same host
+(`.scratch/evidence/churn-96c69885/million-major-realchange` against
+`.scratch/evidence/urr-events/million-major-normal` in the UPF tree), from the large table's growth to the next
+256 MB growth:
+
+| host state | free order ≥ 9 blocks | interval | apply |
+|---|---|---|---|
+| after boot | available | 1.24 s (05:06:44.58 → 45.83) | done |
+| days later, after `drop_caches` + `compact_memory` | 0 | 8.74 s (11:50:24.85 → 33.59) | failed: `bessctl: no answer: status 4` (the SDK's 5 s attempt deadline) |
+
+**Decision.** No memory of bessd gets transparent hugepages. `main()` calls `runtime::DisableThp()`,
+`prctl(PR_SET_THP_DISABLE, 1)` (Linux 3.15), before any thread exists; it holds for every thread and against any
+`madvise`. The heap's and the L2 tables' `MADV_HUGEPAGE` goes, and with it the tables' 2 MiB alignment (64-byte
+aligned). A refused prctl is logged as a warning. Hugepages remain available as reserved hugetlb pages through
+`--mem_backing=hugepages`, which the framework admits and charges up front (D-206).
+
+**Evidence.**
+- The parent advised the heap: `FallbackHeapChunksNeverAskForTransparentHugepages` fails on 9795f9a5 with
+  `VmFlags: rd wr mr mw me ac sd hg`; it passes here. Unit suite (debugoptimized, no live/python/benchmarks):
+  234 ok, 0 failed.
+- Lookup cost of 4 KiB pages for 1M-entry L2 tables, `l2_fdb_bench` `BM_L2Lookup/<backend>/1048576/<stream>/32`,
+  ns per batch of 32, `tools/ab_bench.py` 8 paired rounds on one CPU. A: the parent binary as the parent bessd ran
+  it (advised, 2 MiB-aligned, THP "always"). B: this binary under an inherited `PR_SET_THP_DISABLE`, as bessd now
+  runs. B was slower in 8 of 8 rounds of every row:
+
+  | backend, stream | A | B | B/A median (min..max) |
+  |---|---|---|---|
+  | 0 `Fdb` over `MacTable`, uniform hit | 501.3 | 549.5 | 1.095 (1.075..1.106) |
+  | 0 `Fdb` over `MacTable`, miss | 656.4 | 733.2 | 1.118 (1.112..1.133) |
+  | 7 raw `PackedMacTable` (L2Forward), uniform hit | 236.2 | 280.7 | 1.199 (1.049..1.227) |
+  | 7 raw `PackedMacTable` (L2Forward), miss | 242.0 | 291.3 | 1.201 (1.100..1.265) |
+
+**Consequences.**
+- A table's time to become resident no longer depends on the host's fragmentation. The bytes resident are the
+  bytes touched, at 4 KiB granularity: a `malloc_trim` or `MADV_DONTNEED` frees what it names, with no huge page
+  left charged until the kernel splits it.
+- 1M-entry L2 lookups are 10-20% slower (TLB misses; the table above). The L2 tables are glibc memory, not the
+  framework's heaps, so `--mem_backing=hugepages` does not give them hugetlb pages either.
+- Normal-page backing at scale pays 4 KiB TLB reach everywhere; deployments that need the reach reserve hugepages.
+
+**Revisit when:** an L2 table of 1M entries or more is on a measured critical path (then allocate it from the
+framework's heaps, which are hugetlb under `--mem_backing=hugepages`); or a kernel offers THP without direct
+compaction at fault for one process.

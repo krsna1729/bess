@@ -415,14 +415,6 @@ class FallbackHeap {
       throw std::bad_alloc();
     }
     ReturnPages(static_cast<char *>(va) + kPage, chunk - 2 * kPage);
-    // The tables keep transparent hugepages where bessd confines THP to
-    // advised memory (runtime::ConfineThpToAdvised, RT-1): the blocks made
-    // resident later (Prefault) get them. Advised only now, after the clear
-    // and the give-back: advised before, DPDK's clear faulted the chunk in
-    // as huge pages with direct compaction (3x slower; 1.9 s for 1 GiB) only
-    // for ReturnPages to drop them. Advice only: a host whose THP is "never"
-    // ignores it, and a failure costs only that.
-    (void)madvise(va, chunk, MADV_HUGEPAGE);
     last_chunk_ = chunk;
     LOG(INFO) << "Normal-page fallback heap " << kFallbackHeap << " grew by "
               << Mb(chunk) << " (" << bytes << " bytes asked for)";
