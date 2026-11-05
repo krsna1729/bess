@@ -197,9 +197,9 @@ class BasicFdb {
     return fdb;
   }
 
-  // What Create allocates (D-198), all of it glibc: the aging wheel, the
-  // table, one (empty) flood group per domain and the FDB itself, as bytes()
-  // counts them. Flood groups grow in SetFloodGroup (set_memory_growth).
+  // What Create allocates (D-198): the table arrays on the framework heap;
+  // the aging wheel, table object, empty flood groups and FDB on glibc.
+  // Flood groups grow in SetFloodGroup (set_memory_growth).
   static size_t Bytes(const Config &config) noexcept {
     size_t table;
     if constexpr (requires { Table::Bytes(config.capacity, config.hash_seed); }) {
@@ -211,7 +211,10 @@ class BasicFdb {
            table + config.max_domains * sizeof(FloodGroupList::value_type) +
            sizeof(BasicFdb);
   }
-  static size_t GlibcBytes(const Config &config) noexcept { return Bytes(config); }
+  static size_t GlibcBytes(const Config &config) noexcept {
+    return Bytes(config) - Table::Bytes(config.capacity) +
+           Table::GlibcBytes(config.capacity);
+  }
 
   // The admission a flood group asks before it grows (D-198): SetFloodGroup
   // admits the members it adds room for, and refuses (utils::MemoryRefused)

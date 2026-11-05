@@ -6,7 +6,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #if defined(BESS_PACKED_MAC_TABLE_TESTING)
 #include <functional>
@@ -25,6 +24,7 @@
 #include "dataplane/table_policy.h"
 #include "l2/mac_table_kernels.h"
 #include "utils/common.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::l2 {
 
@@ -152,11 +152,13 @@ class PackedMacTable {
       return nullptr;
     }
     const size_t bytes = buckets * kWays * sizeof(uint64_t);
-    t->slots_ = static_cast<uint64_t *>(std::aligned_alloc(64, (bytes + 63) & ~size_t{63}));
-    if constexpr (kHasCold) {
-      t->cold_ = static_cast<Cold *>(std::malloc(buckets * kWays * sizeof(Cold)));
-    }
-    if (t->slots_ == nullptr || (kHasCold && t->cold_ == nullptr)) {
+    try {
+      t->slots_ = static_cast<uint64_t *>(utils::DpdkAllocate(bytes, 64));
+      if constexpr (kHasCold) {
+        t->cold_ = static_cast<Cold *>(
+            utils::DpdkAllocate(buckets * kWays * sizeof(Cold), 64));
+      }
+    } catch (const std::bad_alloc &) {
       return nullptr;
     }
     std::memset(static_cast<void *>(t->slots_), 0, bytes);
@@ -168,21 +170,20 @@ class PackedMacTable {
     return t;
   }
 
-  // What Create allocates (D-198), all of it glibc: the slot words, the cold
-  // array when Cold is not empty, and the table itself, as bytes() counts
-  // them.
+  // What Create allocates (D-198): the slot words and optional cold array on
+  // the framework heap; only the table object is glibc.
   static size_t Bytes(size_t capacity, uint64_t /*seed*/ = 0) noexcept {
     return BucketsFor(capacity) * kWays *
                (sizeof(uint64_t) + (kHasCold ? sizeof(Cold) : 0)) +
            sizeof(PackedMacTable);
   }
-  static size_t GlibcBytes(size_t capacity, uint64_t seed = 0) noexcept {
-    return Bytes(capacity, seed);
+  static size_t GlibcBytes(size_t /*capacity*/, uint64_t /*seed*/ = 0) noexcept {
+    return sizeof(PackedMacTable);
   }
 
   ~PackedMacTable() {
-    std::free(slots_);
-    std::free(cold_);  // null without a cold array
+    utils::DpdkFree(slots_);
+    utils::DpdkFree(cold_);  // null without a cold array
   }
   PackedMacTable(const PackedMacTable &) = delete;
   PackedMacTable &operator=(const PackedMacTable &) = delete;
