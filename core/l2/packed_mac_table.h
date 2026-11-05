@@ -19,7 +19,6 @@
 #include <span>
 #include <type_traits>
 
-#include <sys/mman.h>
 
 #include "arch/cpu.h"
 #include "arch/crc32c.h"
@@ -81,7 +80,6 @@ class PackedMacTable {
   static constexpr uint32_t kNotFound = ~uint32_t{0};
   static constexpr size_t kMaxDomains = 1;
   static constexpr uint32_t kMaxValue = (1u << 14) - 1;
-  static constexpr size_t kHugePage = size_t{2} << 20;
   // A reader's retries after a miss while moves run. The writer's move path is
   // short, but a writer that is preempted inside one must not stall readers:
   // past this many the miss stands (for L2Forward: the default gate, once).
@@ -154,16 +152,12 @@ class PackedMacTable {
       return nullptr;
     }
     const size_t bytes = buckets * kWays * sizeof(uint64_t);
-    const size_t align = bytes >= kHugePage ? kHugePage : 64;
-    t->slots_ = static_cast<uint64_t *>(std::aligned_alloc(align, (bytes + align - 1) & ~(align - 1)));
+    t->slots_ = static_cast<uint64_t *>(std::aligned_alloc(64, (bytes + 63) & ~size_t{63}));
     if constexpr (kHasCold) {
       t->cold_ = static_cast<Cold *>(std::malloc(buckets * kWays * sizeof(Cold)));
     }
     if (t->slots_ == nullptr || (kHasCold && t->cold_ == nullptr)) {
       return nullptr;
-    }
-    if (align == kHugePage) {
-      (void)madvise(t->slots_, bytes, MADV_HUGEPAGE);  // advisory
     }
     std::memset(static_cast<void *>(t->slots_), 0, bytes);
     if constexpr (kHasCold) {

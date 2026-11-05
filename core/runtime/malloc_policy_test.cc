@@ -163,31 +163,14 @@ TEST(MallocPolicyTest, FreeBoundIsAQuarterOfTheReserve) {
   EXPECT_EQ(48 * kMiB, MallocFreeBound(192 * kMiB));
 }
 
-TEST(MallocPolicyTest, ThpModeIsTheBracketedWord) {
-  EXPECT_EQ("always", ThpModeOf("[always] madvise never\n"));
-  EXPECT_EQ("madvise", ThpModeOf("always [madvise] never\n"));
-  EXPECT_EQ("", ThpModeOf(""));
-  EXPECT_EQ("", ThpModeOf("always madvise never"));
-}
-
-// Under THP "always" the process keeps THP only where advised: the "except
-// advised" flag, never a full disable (the tables' heap advises its chunks).
-TEST(MallocPolicyTest, ThpAlwaysIsConfinedToAdvisedMemory) {
-  std::ifstream in("/sys/kernel/mm/transparent_hugepage/enabled");
-  std::string text;
-  std::getline(in, text);
-  const ThpConfinement got = ConfineThpToAdvised();
-  if (ThpModeOf(text) != "always") {
-    EXPECT_EQ(ThpConfinement::kNotNeeded, got);
-    EXPECT_EQ(0, prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0));
-    return;
-  }
-  if (got == ThpConfinement::kRefused) {
-    EXPECT_EQ(0, prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0)) << "no full disable on an old kernel";
-    GTEST_SKIP() << "the kernel predates PR_THP_DISABLE_EXCEPT_ADVISED (Linux 6.18)";
-  }
-  EXPECT_EQ(ThpConfinement::kConfined, got);
-  EXPECT_EQ(1 | (1 << 1), prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0));  // 1 | EXCEPT_ADVISED
+// bessd's memory is 4 KiB pages or reserved hugetlb pages, never THP: the
+// disable is total (state 1), not "except advised" (1 | 1 << 1), so an
+// madvise(MADV_HUGEPAGE) anywhere in the process gets none either.
+TEST(MallocPolicyTest, DisableThpTakesItFromTheWholeProcess) {
+  const auto was = static_cast<unsigned long>(prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0));
+  ASSERT_TRUE(DisableThp());
+  EXPECT_EQ(1, prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0));
+  (void)prctl(PR_SET_THP_DISABLE, was & 1UL, was & ~1UL, 0, 0);  // the state, then its flags
 }
 
 }  // namespace

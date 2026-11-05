@@ -676,7 +676,7 @@ reference to something missing.
 - **Table:** `MacTable`, a two-choice cuckoo table whose 64-byte bucket holds
   four contiguous keys (one vector compare), their values and flags; the aging
   timer sits in a cold array beside it. Fixed capacity, sized for 50% load;
-  tables of 2 MiB or more ask for transparent huge pages.
+  on glibc's 4 KiB pages: bessd takes no transparent huge pages (D-209).
 - **Use:** one worker owns it (learning writes it on the packet path). It is
   not mode C by default: the table is a type parameter (`BasicFdb<Storage>`,
   D-073), and `PackedMacTable<Cold, SingleWriter|MultiWriter>` gives one

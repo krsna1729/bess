@@ -8,14 +8,12 @@
 // threads that each held a transient copy left that much resident per arena,
 // unaccounted, until the daemon ran out of its reserve. bessd caps the arenas
 // before any thread starts and, after large releases or once glibc holds a
-// bound's worth of new free bytes, hands freed pages back. Under THP "always"
-// it also keeps transparent hugepages to the memory that asks for them (the
-// tables' "bess-normal" heap, utils/dpdk_memory.cc), off glibc's arenas.
+// bound's worth of new free bytes, hands freed pages back. It also takes
+// transparent hugepages from the whole process (DisableThp).
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <string_view>
 
 namespace bess::runtime {
 
@@ -31,26 +29,18 @@ inline constexpr std::chrono::seconds kMallocFreeCheckPeriod{1};
 // it before any thread exists.
 void CapMallocArenas() noexcept;
 
-// The THP mode in the text of /sys/kernel/mm/transparent_hugepage/enabled:
-// the bracketed word ("always", "madvise", "never"), or empty.
-std::string_view ThpModeOf(std::string_view enabled) noexcept;
-
-enum class ThpConfinement {
-  kNotNeeded,  // THP is not "always" here: glibc gets none unasked
-  kConfined,   // only advised memory (MADV_HUGEPAGE) gets THP
-  kRefused,    // the kernel predates the flag: THP left as it was
-};
-
-// Under THP "always", prctl(PR_SET_THP_DISABLE, 1,
-// PR_THP_DISABLE_EXCEPT_ADVISED): the process gets THP only where it advises
-// MADV_HUGEPAGE, as under "madvise". glibc's arenas then stay on 4 KiB pages:
-// a trim that gives back part of a huge page left all of it charged to the
-// cgroup until the kernel split it, while the reused part faulted new pages
-// beside it, so trimming raised memory.current (live_strict_budget: 6 of 15
-// runs over the unattributed bound). Never a full disable, which would take
-// THP from the tables too; a kernel without the flag is left alone. Inherited
-// by every thread, so bessd's main() calls it before any thread exists.
-ThpConfinement ConfineThpToAdvised() noexcept;
+// prctl(PR_SET_THP_DISABLE, 1): no memory of the process gets transparent
+// hugepages, whatever the host's THP mode or an madvise says. bessd's memory
+// is 4 KiB pages (--mem_backing=normal) or hugetlb pages it reserved and
+// admitted (--mem_backing=hugepages, not THP), so a table costs the same time
+// and bytes on every host. THP made both depend on the host's free-memory
+// fragmentation: a fault in advised memory compacts directly, and with no free
+// 2 MiB block the 1M-session graph apply took 8.7 s instead of 1.2 s and failed
+// bessctl's 5 s attempt deadline. A trim that gave back part of a huge page
+// also left all of it charged until the kernel split it. Inherited by every
+// thread, so bessd's main() calls it before any thread exists. Returns false
+// when the kernel refused (it has the flag since Linux 3.15).
+bool DisableThp() noexcept;
 
 // Admitted bytes given back (framework::MemoryScope's release paths: an
 // erase, a shrink, a module's teardown). Any thread; one relaxed atomic add.
