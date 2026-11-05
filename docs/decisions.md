@@ -2710,6 +2710,13 @@ Two engine gaps surfaced while building it:
   while replacing a released referent restores counts held by surviving
   referrers. A referrer whose referent is absent can be erased but cannot
   publish a new value naming that absent resource.
+  Since 2026-11-05, reconciliation reuses existing nodes and long-key storage:
+  zero counts, recount, then erase zero-count nodes. Only newly bound references
+  at registration allocate. Clearing and rebuilding the whole ledger made
+  teardown abort with `MemoryRefused` after a 1M-session fill reached admission.
+  `TeardownKeepsSurvivingReferencesWhenGrowthIsRefused` fails on that parent and
+  passes with reuse; a real normal-page run refused at 953,461 sessions under
+  a 2,800 MiB policy limit, then shut down gracefully with zero OOM kills.
 
 **Evidence:**
 

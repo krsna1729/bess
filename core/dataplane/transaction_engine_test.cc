@@ -1861,5 +1861,72 @@ TEST(TransactionEngineMemoryTest, ReferenceLedgerIsAdmittedExactly) {
   EXPECT_EQ(0u, growth.net) << "the engine gave its ledger back";
 }
 
+// A 16-byte key exercises the ledger's separately allocated key storage:
+// finding an existing node must not allocate a temporary key.
+struct WideId {
+  using rep_type = uint64_t;
+  explicit WideId(uint64_t v = 0) : low(v) {}
+  uint64_t value() const { return low; }
+  uint64_t low, high = 0;
+};
+
+TEST(TransactionEngineMemoryTest, TeardownKeepsSurvivingReferencesWhenGrowthIsRefused) {
+  struct LimitedGrowth final : utils::MemoryGrowth {
+    bool refuse = false;
+    size_t net = 0;
+    void Grow(size_t bytes, size_t) override {
+      if (refuse) {
+        throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit,
+                                  bytes, "ledger growth refused");
+      }
+      net += bytes;
+    }
+    void Shrink(size_t bytes, size_t) noexcept override { net -= bytes; }
+  } growth;
+  auto &domain = bess::runtime::runtime().rcu();
+  SlotTable<WideId, Meter> target_table(8);
+  SlotResource<WideId, Meter> targets("targets", target_table);
+  SlotTable<ActionId, Action> kept(8), dropped(8);
+  SlotTable<MeterId, Meter> unused(8);
+  const ResourceKey first = EncodeKey(WideId(1)), second = EncodeKey(WideId(2));
+  const auto refs = [&](const Action &a) {
+    return std::vector<Reference>{{"targets", a.gate == 1 ? first : second}};
+  };
+  SlotResource<ActionId, Action> kept_res("kept", kept, refs, {"targets"});
+  SlotResource<ActionId, Action> dropped_res("dropped", dropped, refs, {"targets"});
+  SlotResource<MeterId, Meter> unused_res("unused", unused);
+  {
+    TransactionEngine engine(domain, &growth);
+    ASSERT_TRUE(engine.Register(&targets));
+    ASSERT_TRUE(engine.Register(&kept_res));
+    ASSERT_TRUE(engine.Register(&dropped_res));
+    ASSERT_TRUE(engine.Register(&unused_res));
+    ASSERT_EQ(engine.Apply(std::vector<Op>{
+        Op::Upsert("targets", first, std::any(Meter(1))),
+        Op::Upsert("targets", second, std::any(Meter(2))),
+        Op::Upsert("kept", EncodeKey(ActionId(1)), std::any(Action{1, MeterId(0)})),
+        Op::Upsert("dropped", EncodeKey(ActionId(1)), std::any(Action{1, MeterId(0)})),
+        Op::Upsert("dropped", EncodeKey(ActionId(2)), std::any(Action{2, MeterId(0)}))})
+                  .outcome, Outcome::kApplied);
+    ASSERT_EQ(engine.ReferenceCount("targets", first), 2u);
+    ASSERT_EQ(engine.ReferenceCount("targets", second), 1u);
+    const size_t held = growth.net;
+    growth.refuse = true;
+    ASSERT_TRUE(engine.ReleaseForTeardown(std::vector<std::string>{"unused"}));
+    EXPECT_EQ(growth.net, held);
+    EXPECT_EQ(engine.ReferenceCount("targets", first), 2u);
+    EXPECT_EQ(engine.ReferenceCount("targets", second), 1u);
+    ASSERT_TRUE(engine.ReleaseForTeardown(std::vector<std::string>{"dropped"}));
+    EXPECT_EQ(engine.ReferenceCount("targets", first), 1u);
+    EXPECT_EQ(engine.ReferenceCount("targets", second), 0u);
+    EXPECT_LT(growth.net, held);
+    EXPECT_EQ(engine.Apply(std::vector<Op>{Op::Erase("targets", first)}).outcome,
+              Outcome::kRejected);
+    ASSERT_TRUE(engine.ReleaseForTeardown(std::vector<std::string>{"kept", "targets"}));
+    domain.Drain();
+  }
+  EXPECT_EQ(growth.net, 0u);
+}
+
 }  // namespace
 }  // namespace bess::dataplane

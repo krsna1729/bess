@@ -169,7 +169,11 @@ TransactionEngine::LedgerKey::operator std::string_view() const noexcept {
 
 void TransactionEngine::RebuildIncomingLocked() {
   for (auto &[name, reg] : resources_) {
-    reg->incoming.clear();
+    // Releasing resources can only remove references. Keep existing nodes
+    // and long-key storage so teardown needs no new ledger admission.
+    for (auto &[key, count] : reg->incoming) {
+      count = 0;
+    }
   }
   for (const auto &[name, reg] : resources_) {
     reg->resource->VisitReferences([&](const Reference &ref) {
@@ -178,10 +182,18 @@ void TransactionEngine::RebuildIncomingLocked() {
           target == nullptr ? nullptr
                             : Holder(target, ref.key, /*in_transaction=*/false);
       if (holder != nullptr) {
-        ++holder->incoming.try_emplace(LedgerKey(ref.key, ledger_growth_), 0)
-              .first->second;
+        auto it = holder->incoming.find(std::string_view(ref.key));
+        if (it == holder->incoming.end()) {
+          // Registration may bind a previously dangling reference.
+          it = holder->incoming.try_emplace(
+              LedgerKey(ref.key, ledger_growth_), 0).first;
+        }
+        ++it->second;
       }
     });
+  }
+  for (auto &[name, reg] : resources_) {
+    std::erase_if(reg->incoming, [](const auto &entry) { return entry.second == 0; });
   }
 }
 
