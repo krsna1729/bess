@@ -487,6 +487,11 @@ class Client:
             return dict(self._resources)
 
     def resource(self, name):
+        with self._lock:
+            if self._resources is not None:
+                found = self._resources.get(name)
+                if found is not None:
+                    return found
         found = self.resources().get(name)
         if found is None:
             # One miss re-reads: a listing read before a module was added would

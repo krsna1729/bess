@@ -410,11 +410,13 @@ func (c *Client) DaemonEpoch() (uint64, bool) {
 // Resources lists every transactional resource, by name (cached unless
 // refresh).
 func (c *Client) Resources(ctx context.Context, refresh bool) (map[string]Resource, error) {
-	c.mu.Lock()
-	cached := maps.Clone(c.resources)
-	c.mu.Unlock()
-	if cached != nil && !refresh {
-		return cached, nil // a copy: the caller may edit it
+	if !refresh {
+		c.mu.Lock()
+		cached := maps.Clone(c.resources)
+		c.mu.Unlock()
+		if cached != nil {
+			return cached, nil // a copy: the caller may edit it
+		}
 	}
 	actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
 	defer cancel()
@@ -578,6 +580,14 @@ func (c *Client) Metrics(ctx context.Context) ([]*pb.MetricSample, error) {
 // Resource is the resource name; InvalidRequestError if no module
 // registered it.
 func (c *Client) Resource(ctx context.Context, name string) (Resource, error) {
+	// Return the cached value, not a clone of every resource. Resources keeps
+	// its map private; a Resource is a value with no mutable fields.
+	c.mu.Lock()
+	cached, ok := c.resources[name]
+	c.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
 	for _, refresh := range []bool{false, true} {
 		all, err := c.Resources(ctx, refresh)
 		if err != nil {
@@ -1311,12 +1321,14 @@ func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 // outcome is asked for; the request is sent again only once GetTransaction
 // answered "not known" under the epoch the commit started with.
 func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, epoch uint64) (*Applied, error) {
-	if _, known := c.DaemonEpoch(); !known {
+	current, known := c.DaemonEpoch()
+	if !known {
 		if _, err := c.Resources(ctx, true); err != nil { // learn the epoch before sending
 			return nil, err
 		}
+		current, _ = c.DaemonEpoch()
 	}
-	if current, _ := c.DaemonEpoch(); current != epoch {
+	if current != epoch {
 		return nil, &StaleResourceError{Bound: epoch, Daemon: current}
 	}
 	backoff := c.retry.BusyBackoff
