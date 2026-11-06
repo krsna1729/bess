@@ -377,22 +377,26 @@ Daemon &Daemon::Shared() {
 
 Daemon::~Daemon() { Stop(); }
 
-void Daemon::Start(int port) {
-  if (port == 0) {
-    port = FreePort();
-  }
-  address_ = "localhost:" + std::to_string(port);
+void Daemon::Start(std::string_view address) {
   char log_template[] = "/tmp/bessd-live-XXXXXX";
   const int log_fd = mkstemp(log_template);
   log_path_ = log_template;
+  if (!address.empty()) {
+    address_ = address;
+  } else if (const char *rpc = std::getenv("BESS_TEST_RPC");
+             rpc != nullptr && std::string_view(rpc) == "unix") {
+    address_ = "unix:" + log_path_ + ".sock";
+  } else {
+    address_ = "localhost:" + std::to_string(FreePort());
+  }
   keep_log_ = false;  // a fresh daemon: this run's log is this run's to remove
   std::vector<std::string> argv = launcher_;
   // 32768 packet buffers, not bessd's 262144 (opts.cc): every live test
   // passes with them, and the default pool is resident on normal pages, in
   // every live test's memory declaration (tests/memory/meson.build). A
   // test's own --buffers comes later and wins.
-  argv.insert(argv.end(), {Env("BESSD"), "-f", "--mem_backing=normal", "--buffers=32768", "-p",
-                           std::to_string(port), "-skip_root_check"});
+  argv.insert(argv.end(), {Env("BESSD"), "-f", "--mem_backing=normal", "--buffers=32768",
+                           "--grpc_url=" + address_, "-skip_root_check"});
   argv.insert(argv.end(), flags_.begin(), flags_.end());
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);
@@ -494,6 +498,9 @@ int Daemon::Shutdown() {
 
 void Daemon::Stop() {
   (void)Shutdown();
+  if (address_.starts_with("unix:")) {
+    unlink(address_.c_str() + 5);
+  }
   if (!log_path_.empty()) {
     if (keep_log_) {
       LOG(INFO) << "bessd's log is kept at " << log_path_;
@@ -527,9 +534,8 @@ void Daemon::Restart() {
 }
 
 void Daemon::RestartInPlace() {
-  const int port = std::stoi(address_.substr(address_.rfind(':') + 1));
   Stop();
-  Start(port);
+  Start(address_);
 }
 
 std::unique_ptr<bess::sdk::Client> Daemon::NewClient() const {

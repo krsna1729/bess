@@ -147,7 +147,8 @@ class Daemon {
  private:
   Daemon() = default;
   explicit Daemon(std::vector<std::string> flags) : flags_(std::move(flags)) {}
-  void Start(int port = 0);  // 0: a free port
+  // Empty: a fresh endpoint; BESS_TEST_RPC=unix exercises the same suites on UDS.
+  void Start(std::string_view address = {});
   void Stop();
 
   std::vector<std::string> launcher_;

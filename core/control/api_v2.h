@@ -59,9 +59,10 @@ inline constexpr int kMaxMessageBytes = 64 << 20;
 // it, server reflection -- so orchestrators and generic tools (grpcurl) work
 // without BESS's protos.
 void PrepareControlServer();
-// Per builder: message size limits, and under a memory limit (D-207) the
-// receive bound MaxReceiveBytes() and a gRPC resource quota of a quarter of
-// the reserve on what gRPC itself buffers.
+// Per builder: one minimum / sixteen maximum idle synchronous pollers, created
+// on demand (active handlers, including streams, are separate), message limits,
+// and under a memory limit (D-207) the receive bound MaxReceiveBytes() and a gRPC
+// quota of a quarter of the reserve on what gRPC itself buffers.
 void ConfigureControlServer(grpc::ServerBuilder *builder);
 // The largest request accepted (D-207): kMaxMessageBytes, or under a memory
 // limit an eighth of the reserve when that is smaller -- a request is

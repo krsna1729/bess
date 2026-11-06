@@ -94,6 +94,19 @@ TEST(ApiServerTest, ServesAndStopsOnAdminShutdown) {
   ASSERT_TRUE(up) << "the API server never answered on " << sock;
   ASSERT_NE(0u, epoch) << "the daemon epoch an earlier answer carries";
 
+  // A long-lived Control handler must leave room for Admin on the same
+  // connection, and server shutdown must wake its event-log wait.
+  grpc::ClientContext watch_context;
+  watch_context.set_deadline(std::chrono::system_clock::now() +
+                             std::chrono::seconds(5));
+  v2::WatchEventsRequest watch_request;
+  watch_request.set_daemon_epoch(epoch);
+  auto control = v2::Control::NewStub(channel);
+  auto watch = control->WatchEvents(&watch_context, watch_request);
+  v2::Event event;
+  EXPECT_TRUE(watch->Read(&event));
+  EXPECT_EQ("bess.start", event.type());
+
   {
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() +
@@ -107,6 +120,11 @@ TEST(ApiServerTest, ServesAndStopsOnAdminShutdown) {
     const grpc::Status status = admin->Shutdown(&context, request, &response);
     EXPECT_TRUE(status.ok()) << "Admin.Shutdown: " << status.error_message();
   }
+
+  while (watch->Read(&event)) {
+  }
+  EXPECT_EQ(grpc::StatusCode::UNAVAILABLE, watch->Finish().error_code())
+      << "the event log must close before server shutdown waits for streams";
 
   for (int i = 0; i < 200 && !returned.load(); i++) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));

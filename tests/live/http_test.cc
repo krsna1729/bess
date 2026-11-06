@@ -410,6 +410,10 @@ TEST_F(HttpTest, StatusPage) {
 TEST(HttpDefaultTest, OffWithoutTheFlag) {
   Daemon &daemon = Daemon::Shared();
   ASSERT_TRUE(daemon.Alive());
+  if (daemon.address().starts_with("unix:")) {
+    EXPECT_TRUE(ListeningPorts(daemon.pid()).empty());
+    return;
+  }
   const int grpc_port = std::stoi(daemon.address().substr(daemon.address().rfind(':') + 1));
   EXPECT_EQ(std::set<int>{grpc_port}, ListeningPorts(daemon.pid()));
 }
