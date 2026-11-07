@@ -57,7 +57,6 @@ void ApiServer::Run() {
   bess::control::AdminV2Service admin_v2(control_plane, service_v2.epoch());
   builder_->RegisterService(&service_v2);
   builder_->RegisterService(&admin_v2);
-  builder_->SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, 1);
   bess::control::ConfigureControlServer(builder_.get());
 
   // Worker-to-control module requests (TP4, D-077), delivered under the

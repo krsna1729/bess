@@ -370,7 +370,7 @@ class Client {
   SleepFn sleep_;
 
   mutable std::mutex mu_;
-  std::optional<std::map<std::string, sdk::Resource>> resources_;
+  std::optional<std::map<std::string, sdk::Resource, std::less<>>> resources_;
   std::optional<uint64_t> epoch_;
 };
 

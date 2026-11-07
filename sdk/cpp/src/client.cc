@@ -249,7 +249,8 @@ Result<std::map<std::string, sdk::Resource>> Client::Resources(bool refresh) {
   {
     std::lock_guard lock(mu_);
     if (resources_ && !refresh) {
-      return *resources_;  // a copy: the caller may edit it
+      // A public listing owns its map; a single-resource lookup does not copy it.
+      return std::map<std::string, sdk::Resource>(resources_->begin(), resources_->end());
     }
   }
   auto r = Unary<pb::ListTransactionResourcesResponse>(
@@ -274,11 +275,19 @@ Result<std::map<std::string, sdk::Resource>> Client::Resources(bool refresh) {
   }
   ObserveEpoch(r->daemon_epoch());
   std::lock_guard lock(mu_);
-  resources_ = found;
+  resources_.emplace(found.begin(), found.end());
   return found;
 }
 
 Result<sdk::Resource> Client::Resource(std::string_view name) {
+  {
+    std::lock_guard lock(mu_);
+    if (resources_) {
+      if (auto it = resources_->find(name); it != resources_->end()) {
+        return it->second;
+      }
+    }
+  }
   for (const bool refresh : {false, true}) {
     auto all = Resources(refresh);
     if (!all) {

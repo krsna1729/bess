@@ -935,6 +935,16 @@ int MaxReceiveBytes() {
 }
 
 void ConfigureControlServer(grpc::ServerBuilder *builder) {
+  // A synchronous handler temporarily stops polling. gRPC starts a replacement
+  // when that leaves fewer than MIN_POLLERS, then reuses the handler only if
+  // there is room below MAX_POLLERS. With both at 1, every isolated RPC starts
+  // a thread and retires its handler. Two idle pollers fix isolated calls but
+  // still churn under pipelined bursts. Retain room for eight concurrent
+  // writers plus concurrent reads/reporting; threads are created on demand.
+  // These bound idle pollers, not active handlers: watches and slow resource
+  // readers must not prevent other Control or Admin calls from being served.
+  builder->SetSyncServerOption(grpc::ServerBuilder::MIN_POLLERS, 1);
+  builder->SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, 16);
   builder->SetMaxReceiveMessageSize(MaxReceiveBytes());
   builder->SetMaxSendMessageSize(kMaxMessageBytes);
   const bess::utils::MemoryPolicy &policy = bess::utils::memory_policy();

@@ -297,6 +297,29 @@ func TestTypesAreCheckedBeforeAnythingIsSent(t *testing.T) {
 	}
 }
 
+func TestResourceListingsCannotChangeCachedHandles(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(&fake{epoch: 7}, 4)
+	for _, refresh := range []bool{false, true} {
+		all, err := h.c.Resources(ctx, refresh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := all[resource]
+		delete(all, resource)
+		all[singleton] = Resource{Name: "changed"}
+
+		got, err := h.c.Resource(ctx, resource)
+		if err != nil || got != want {
+			t.Fatalf("refresh=%v: resource=%+v, want %+v; %v", refresh, got, want, err)
+		}
+		cached, err := h.c.Resources(ctx, false)
+		if err != nil || cached[resource] != want || cached[singleton].Name != singleton {
+			t.Fatalf("refresh=%v: cached resources=%+v; %v", refresh, cached, err)
+		}
+	}
+}
+
 func TestApplied(t *testing.T) {
 	h := newHarness(&fake{applies: []step{answer(applied, 1)}}, 4)
 	a, err := h.commit(t)
