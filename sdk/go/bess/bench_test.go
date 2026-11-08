@@ -162,6 +162,20 @@ func benchMessage(file protoreflect.FileDescriptor, name string, i int) proto.Me
 	return m
 }
 
+// BenchmarkResourceLookup measures the warm lookup a schema-driven compiler
+// repeats per change. Build and Commit bind their handle before timing, so
+// they cannot show the cost of cloning the cached resource catalog.
+func BenchmarkResourceLookup(b *testing.B) {
+	c, _, _ := benchClient(b, 1)
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := c.Resource(ctx, "bench/rules"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkCommit is one transaction of `ops` upserts, built and committed: the
 // SDK's bookkeeping, request assembly, protobuf marshalling, the gRPC round trip
 // on a loopback connection, and the response's handling. The transaction is
