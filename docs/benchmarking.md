@@ -233,12 +233,33 @@ ten-second windows at that shape reduced TCP 1K/s p99 by 8.8%, Unix 1K/s by
 did not change between campaigns: the longer diagnostic does not erase
 the original observations or qualify every other tail.
 
-One primary zero-update packet-rate case fell by paired 3.2%, with all four
-pairs agreeing; other packet points varied. In the longer eight-client/
-eight-operation checks, paired packet-rate changes were -0.3% at TCP 1K/s,
--0.9% at Unix 1K/s and -1.5% at Unix maximum rate, below the 3% rule.
-This establishes a control-throughput/CPU improvement, not a universal
-dataplane improvement.
+Five of the 13 zero-update packet-rate cases declined in **all four pairs**:
+
+| Transport / control | Clients | Ops in the run's update phases | Paired idle packet-rate change |
+|---|---:|---:|---:|
+| TCP / P | 1 | 2 | -3.2% |
+| TCP / E | 8 | 2 | -1.3% |
+| Unix / P | 1 | 2 | -1.4% |
+| Unix / P | 1 | 8 | -1.6% |
+| Unix / P | 8 | 2 | -2.2% |
+
+Only one breaches the 3% rule, but the consistent sign of the smaller losses
+must not be dismissed as noise. Their cause remains unattributed.
+
+A separate live affinity probe used the same `taskset -c 6,8` and
+`--control_cpus=6` settings during eight-client churn. At both revisions,
+every sampled gRPC synchronous-server, event-engine and global-timer thread
+had allowed CPU 6 only; the packet worker had CPU 8. No RPC-worker affinity
+leak onto the packet CPU was observed. The data file retains the complete
+sampled masks, including DPDK auxiliary threads seen on 8 and 6 during the
+setup/client lifecycle at both revisions; this probe does not attribute their
+CPU cost or the idle-rate loss.
+
+In the longer eight-client/eight-operation checks, paired packet-rate changes
+were -0.3% at TCP 1K/s, -0.9% at Unix 1K/s and -1.5% at Unix maximum rate.
+Those separate cells do not cancel the consistent primary losses, and a
+sub-threshold change does not prove parity. This establishes a control-
+throughput/CPU improvement, not a universal dataplane improvement.
 
 ### Reproduction
 

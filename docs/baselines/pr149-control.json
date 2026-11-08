@@ -10644,12 +10644,269 @@
   "limits": [
     "Primary Go TCP three-core/GOMAXPROCS3 block contains large temporal outliers; its mixed medians are not a clean win.",
     "The separate Go TCP diagnostic changes to one client core/GOMAXPROCS1 and three-second windows; it does not replace the first block or establish its cause.",
-    "Short-window native p99 regressions and one 3.2% idle packet-rate regression remain in primary samples. Selected ten-second native diagnostics improved, without deleting the primary results.",
+    "Five of 13 zero-update packet-rate cases declined in all four pairs (paired 1.3\u20133.2%); only one crosses 3%. The consistent sign is not dismissed as noise. Its cause remains unattributed. Short-window native p99 regressions remain in primary samples; selected ten-second diagnostics do not erase them.",
     "Native 100K targets are closed-loop pacing ceilings; report actual rate, not 100K capacity or open-loop loss/backlog.",
     "Go and C++ use different preloads/construction paths: compare revisions within each client, not languages.",
     "Existing Go Build and Commit fixtures prebind the handle and bypass Resource lookup; unchanged allocation figures are expected.",
     "The new warm lookup benchmark was applied identically to both source revisions; production code was not changed for the comparison.",
     "No memory cap or performance threshold was raised."
   ],
-  "raw_evidence": "Laptop-local /home/krsna1729/Projects/upf/.scratch/evidence/bess-control-149; complete daemon logs and host time series are not shipped with a fresh checkout; per-window measurements are retained here."
+  "raw_evidence": "Laptop-local /home/krsna1729/Projects/upf/.scratch/evidence/bess-control-149; complete daemon logs and host time series are not shipped with a fresh checkout; per-window measurements are retained here.",
+  "idle_rate_consistent_declines": [
+    {
+      "transport": "tcp",
+      "control_cpu": 6,
+      "clients": 1,
+      "ops": 2,
+      "paired_ratio": 0.968252755157089,
+      "pair_ratio_range": [
+        0.9246575342465754,
+        0.9792196776929603
+      ],
+      "negative_pairs": 4
+    },
+    {
+      "transport": "tcp",
+      "control_cpu": 12,
+      "clients": 8,
+      "ops": 2,
+      "paired_ratio": 0.9867209206947196,
+      "pair_ratio_range": [
+        0.9588607594936709,
+        0.9914182475158084
+      ],
+      "negative_pairs": 4
+    },
+    {
+      "transport": "uds",
+      "control_cpu": 6,
+      "clients": 1,
+      "ops": 2,
+      "paired_ratio": 0.9857295586943162,
+      "pair_ratio_range": [
+        0.9591397849462366,
+        0.995268817204301
+      ],
+      "negative_pairs": 4
+    },
+    {
+      "transport": "uds",
+      "control_cpu": 6,
+      "clients": 1,
+      "ops": 8,
+      "paired_ratio": 0.9838111872249693,
+      "pair_ratio_range": [
+        0.9719148936170213,
+        0.988860325621251
+      ],
+      "negative_pairs": 4
+    },
+    {
+      "transport": "uds",
+      "control_cpu": 6,
+      "clients": 8,
+      "ops": 2,
+      "paired_ratio": 0.9776933631095737,
+      "pair_ratio_range": [
+        0.9590827338129496,
+        0.9905405405405405
+      ],
+      "negative_pairs": 4
+    }
+  ],
+  "affinity_diagnostic": {
+    "kind": "placement investigation, not a performance comparison",
+    "launch_cpu_set": "6,8",
+    "control_cpu": 6,
+    "packet_cpu": 8,
+    "observation_interval_seconds": 0.05,
+    "coverage": "during pipeline/churn client and after client completion; sampled distinct thread IDs are not total thread creations",
+    "observed_threads": {
+      "before": [
+        {
+          "name": "bess-worker-0",
+          "allowed_cpus": "8",
+          "distinct_threads": 1,
+          "example_tids": [
+            3345433
+          ]
+        },
+        {
+          "name": "bessd",
+          "allowed_cpus": "6",
+          "distinct_threads": 3,
+          "example_tids": [
+            3345342,
+            3345368,
+            3345387
+          ]
+        },
+        {
+          "name": "dpdk-intr",
+          "allowed_cpus": "6",
+          "distinct_threads": 1,
+          "example_tids": [
+            3345365
+          ]
+        },
+        {
+          "name": "dpdk-intr",
+          "allowed_cpus": "8",
+          "distinct_threads": 1,
+          "example_tids": [
+            3345365
+          ]
+        },
+        {
+          "name": "dpdk-telemet-v2",
+          "allowed_cpus": "6",
+          "distinct_threads": 1,
+          "example_tids": [
+            3345366
+          ]
+        },
+        {
+          "name": "dpdk-telemet-v2",
+          "allowed_cpus": "8",
+          "distinct_threads": 1,
+          "example_tids": [
+            3345366
+          ]
+        },
+        {
+          "name": "event_engine",
+          "allowed_cpus": "6",
+          "distinct_threads": 16,
+          "example_tids": [
+            3345369,
+            3345370,
+            3345371,
+            3345372,
+            3345373
+          ]
+        },
+        {
+          "name": "grpc_global_tim",
+          "allowed_cpus": "6",
+          "distinct_threads": 1,
+          "example_tids": [
+            3345367
+          ]
+        },
+        {
+          "name": "grpcpp_sync_ser",
+          "allowed_cpus": "6",
+          "distinct_threads": 69,
+          "example_tids": [
+            3345407,
+            3345431,
+            3345432,
+            3345435,
+            3345440
+          ]
+        },
+        {
+          "name": "lifeguard",
+          "allowed_cpus": "6",
+          "distinct_threads": 1,
+          "example_tids": [
+            3345385
+          ]
+        }
+      ],
+      "after": [
+        {
+          "name": "bess-worker-0",
+          "allowed_cpus": "8",
+          "distinct_threads": 1,
+          "example_tids": [
+            3354663
+          ]
+        },
+        {
+          "name": "bessd",
+          "allowed_cpus": "6",
+          "distinct_threads": 3,
+          "example_tids": [
+            3354576,
+            3354602,
+            3354621
+          ]
+        },
+        {
+          "name": "dpdk-intr",
+          "allowed_cpus": "6",
+          "distinct_threads": 1,
+          "example_tids": [
+            3354598
+          ]
+        },
+        {
+          "name": "dpdk-intr",
+          "allowed_cpus": "8",
+          "distinct_threads": 1,
+          "example_tids": [
+            3354598
+          ]
+        },
+        {
+          "name": "dpdk-telemet-v2",
+          "allowed_cpus": "6",
+          "distinct_threads": 1,
+          "example_tids": [
+            3354599
+          ]
+        },
+        {
+          "name": "dpdk-telemet-v2",
+          "allowed_cpus": "8",
+          "distinct_threads": 1,
+          "example_tids": [
+            3354599
+          ]
+        },
+        {
+          "name": "event_engine",
+          "allowed_cpus": "6",
+          "distinct_threads": 16,
+          "example_tids": [
+            3354603,
+            3354604,
+            3354605,
+            3354606,
+            3354607
+          ]
+        },
+        {
+          "name": "grpc_global_tim",
+          "allowed_cpus": "6",
+          "distinct_threads": 1,
+          "example_tids": [
+            3354601
+          ]
+        },
+        {
+          "name": "grpcpp_sync_ser",
+          "allowed_cpus": "6",
+          "distinct_threads": 11,
+          "example_tids": [
+            3354620,
+            3354641,
+            3354684,
+            3354685,
+            3354686
+          ]
+        },
+        {
+          "name": "lifeguard",
+          "allowed_cpus": "6",
+          "distinct_threads": 1,
+          "example_tids": [
+            3354619
+          ]
+        }
+      ]
+    },
+    "conclusion": "All sampled gRPC server, event-engine and global-timer threads had allowed CPU6 only at both revisions. No reused RPC worker was observed eligible for CPU8. DPDK auxiliary threads were observed on CPU8 and CPU6 during setup/client lifecycle at both revisions; no causal packet-rate attribution is made."
+  }
 }
