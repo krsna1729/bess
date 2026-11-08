@@ -111,6 +111,191 @@ GetPipeline — the client derives no topology); `--allow-dirty-placement`
 silences the warning. Numbers taken while siblings compete measure contention,
 so treat a warned run as the caveat says.
 
+## Control RPC worker reuse: PR #149
+
+Measured 2026-11-08: clean parent `f5d94731` against merged `529e5374`,
+using this repository's `live_transaction_bench`, Go `bessbench`, and Go
+`BenchmarkBuild`/`BenchmarkCommit`. The shipped control path is faster, but
+not every short-window tail or packet-rate point improves.
+
+[Per-window measurements and binary hashes](baselines/pr149-control.json)
+retain all 120 primary live runs, 24 diagnostic live runs, SDK samples and
+the anomalous results. Full daemon logs and host observations remain
+laptop-local under the UPF workspace's `.scratch/evidence/bess-control-149/`;
+a fresh BESS checkout has the measurements, not those logs.
+
+### Conditions and comparison
+
+- Intel Core i9-13900H; GCC 16.2.1, release `-O3 -DNDEBUG`,
+  `-march=x86-64-v3`, no LTO/sanitizers; DPDK 25.11.3, gRPC 1.84.0.
+  Both revisions used the same configured build directory and dependencies,
+  separate installed stages, and their own matching C++ SDK library.
+  Go clients used Go 1.27.2 with `GOWORK=off`, `GOGC=100`.
+- AC connected, turbo off, balanced profile, powersave governor and
+  `balance_performance` EPP throughout. Each campaign started after package
+  temperature <=55 C and fan <=3000 RPM for 60 seconds. Observed temperatures
+  were 49–65 C; the package throttle counter did not increase.
+  Laptop power/thermal helpers are outside the repository.
+- Control on P-core CPU 6, packet worker on CPU 8, clients on CPUs 2/4/10.
+  The E-core check moves only control to CPU 12. This is process affinity,
+  not exclusive cpuset isolation; the desktop remained running.
+- Fresh daemon per run, normal-page backing, 32,768 packet buffers and a
+  1,536 MiB daemon limit. The bounded service had no swap and
+  `LimitRTTIME=infinity`. All 144 clients and daemons exited cleanly.
+- Four adjacent pairs in `A B B A A B B A` order. Values below are medians;
+  gains are medians of paired B/A ratios, not ratios of the two medians.
+  Apply the existing +/-3%, 3-of-4-sign rule, not a cross-machine threshold.
+  No profiler or race detector was present during measurement; the existing
+  benchmark's timing/CPU counters and approximately 1 Hz laptop observations
+  were retained. No build or heavy analysis ran alongside the timed campaigns.
+
+### C++ live control
+
+Each client owns 32,768 resident rules and one connection. Transactions contain
+equal upserts and erases, with individual acknowledgements and bounded
+concurrency. Each primary run sweeps `0,1000,10000,100000,max` for one second
+per point. The table below is the **actual maximum transaction rate**, not
+the configured 100K pacing ceiling.
+
+| Transport / control | Clients | Ops/transaction | Parent tx/s | Merged tx/s | Paired gain |
+|---|---:|---:|---:|---:|---:|
+| TCP / P | 1 | 2 | 5,327.5 | 7,584 | 43.2% |
+| TCP / P | 1 | 8 | 4,169 | 5,073 | 22.0% |
+| TCP / P | 1 | 16 | 3,140 | 3,750 | 21.0% |
+| TCP / P | 8 | 2 | 7,965.5 | 14,560 | 83.0% |
+| TCP / P | 8 | 8 | 7,099.5 | 10,602 | 49.2% |
+| TCP / P | 8 | 16 | 6,280 | 8,300 | 33.5% |
+| Unix / P | 1 | 2 | 6,112.5 | 8,059 | 31.2% |
+| Unix / P | 1 | 8 | 4,482.5 | 5,459.5 | 22.5% |
+| Unix / P | 1 | 16 | 3,440 | 3,954 | 16.0% |
+| Unix / P | 8 | 2 | 9,099 | 15,257.5 | 67.7% |
+| Unix / P | 8 | 8 | 7,956 | 11,139.5 | 40.4% |
+| Unix / P | 8 | 16 | 6,873.5 | 8,770.5 | 27.2% |
+| TCP / E | 8 | 2 | 3,472 | 6,154 | 77.2% |
+
+All 13 rate gains agreed in all four pairs. Process CPU minus packet-worker
+CPU per completed transaction fell by paired 28.8–49.5% at these points.
+The primary and diagnostic C++ windows retained hit fraction 0.50 and no busy
+answers; the Go sweeps also reported no busy answers.
+
+The 100K label is not 100K capacity: these clients are closed-loop and simply
+fall behind their schedule. This is neither an open-loop loss/backlog test
+nor an N4 session-rate rating. Go and C++ use different preload and message
+construction paths, so these measurements compare revisions within each
+client, not one language against the other.
+
+### Go live control and warm lookup
+
+The original three-client-core TCP block had large temporal outliers in both
+revisions, including several merged arms. Its mixed medians are not a clean
+TCP win. The separate TCP diagnostic uses one client P-core (CPU 4),
+`GOMAXPROCS=1` and three-second windows. The Unix primary keeps CPUs 2/4/10,
+`GOMAXPROCS=3` and one-second windows. Do not use these rows to compare
+transports or attribute the original TCP outlier cause.
+
+| Go fixture | Ops/transaction | Parent p50, us | Merged p50, us | Paired reduction |
+|---|---:|---:|---:|---:|
+| TCP, single-core diagnostic | 2 | 129.0 | 81.8 | 36.6% |
+| TCP, single-core diagnostic | 8 | 149.4 | 101.0 | 32.5% |
+| TCP, single-core diagnostic | 16 | 166.6 | 119.8 | 28.0% |
+| TCP, single-core diagnostic | 32 | 208.6 | 158.7 | 23.9% |
+| Unix, primary | 2 | 135.1 | 90.7 | 32.6% |
+| Unix, primary | 8 | 153.5 | 106.6 | 30.6% |
+| Unix, primary | 16 | 171.5 | 126.0 | 26.5% |
+| Unix, primary | 32 | 204.0 | 167.7 | 17.6% |
+
+Each p50 improvement agreed in all four pairs. Some p99 pairs crossed parity;
+the full per-run tails remain in the data rather than becoming a universal
+latency guarantee.
+
+The existing Go `Build` and bufconn `Commit` benchmarks were unchanged:
+paired time ratios 0.992–1.016, with identical bytes/allocations. They bind
+their resource before timing and therefore bypass the changed lookup path.
+`BenchmarkResourceLookup` now measures that missing warm-cache path in the
+same benchmark file. Applied identically to both revisions, four pairs gave:
+
+| Warm resource lookup | Parent | Merged |
+|---|---:|---:|
+| Median ns/lookup | 352.6 | 31.535 |
+| Bytes/lookup | 752 | 0 |
+| Allocations/lookup | 2 | 0 |
+
+This is a paired 11.18x cache-lookup speedup, not an 11x RPC or N4 speedup.
+The complete Go SDK tests passed under `-race` with the added benchmark.
+
+### Tails and packet-rate limits
+
+Do not discard the primary short-window regressions. For example, TCP with
+eight clients/eight operations at 1K/s had a paired p99 increase of 46.3%,
+and Unix with the same shape at maximum rate increased 8.5%. Separate
+ten-second windows at that shape reduced TCP 1K/s p99 by 8.8%, Unix 1K/s by
+8.2% and Unix maximum-rate p99 by 26.2%, all four pairs agreeing. The code
+did not change between campaigns: the longer diagnostic does not erase
+the original observations or qualify every other tail.
+
+Five of the 13 zero-update packet-rate cases declined in **all four pairs**:
+
+| Transport / control | Clients | Ops in the run's update phases | Paired idle packet-rate change |
+|---|---:|---:|---:|
+| TCP / P | 1 | 2 | -3.2% |
+| TCP / E | 8 | 2 | -1.3% |
+| Unix / P | 1 | 2 | -1.4% |
+| Unix / P | 1 | 8 | -1.6% |
+| Unix / P | 8 | 2 | -2.2% |
+
+Only one breaches the 3% rule, but the consistent sign of the smaller losses
+must not be dismissed as noise. Their cause remains unattributed.
+
+A separate live affinity probe used the same `taskset -c 6,8` and
+`--control_cpus=6` settings during eight-client churn. At both revisions,
+every sampled gRPC synchronous-server, event-engine and global-timer thread
+had allowed CPU 6 only; the packet worker had CPU 8. No RPC-worker affinity
+leak onto the packet CPU was observed. The data file retains the complete
+sampled masks, including DPDK auxiliary threads seen on 8 and 6 during the
+setup/client lifecycle at both revisions; this probe does not attribute their
+CPU cost or the idle-rate loss.
+
+In the longer eight-client/eight-operation checks, paired packet-rate changes
+were -0.3% at TCP 1K/s, -0.9% at Unix 1K/s and -1.5% at Unix maximum rate.
+Those separate cells do not cancel the consistent primary losses, and a
+sub-threshold change does not prove parity. This establishes a control-
+throughput/CPU improvement, not a universal dataplane improvement.
+
+### Reproduction
+
+Build both commits with identical release options, and preserve each matching
+installed SDK library. Alternate fresh daemons in the order above. These are
+the workload commands; choose the corresponding version's executable and
+`LD_LIBRARY_PATH`. Start the daemon from a bounded service whose realtime
+runtime limit permits packet workers, not a terminal with a zero limit.
+
+```sh
+# Daemon, for each revision's installed stage:
+taskset -c 6,8 "$stage/bin/bessd" --mem_backing=normal \
+  --mem_limit_mb=1536 --buffers=32768 -skip_root_check \
+  --grpc_url="$endpoint" --control_cpus=6 -f -logtostderr
+
+# C++ client; vary clients (1,8), upserts/erases (1,4,8) and TCP/Unix endpoint:
+taskset -c 2,4,10 "$build/tests/perf/live_transaction_bench" \
+  --grpc-url "$endpoint" --worker-core 8 --daemon-pid "$pid" \
+  --clients 8 --sessions 32768 --upserts 1 --erases 1 \
+  --duration 1 --rates 0,1000,10000,100000,max
+
+# Go live single-core diagnostic:
+GOWORK=off go -C sdk/go build -o /tmp/bessbench ./cmd/bessbench
+GOGC=100 GOMAXPROCS=1 taskset -c 4 /tmp/bessbench \
+  -addr "$endpoint" -worker-core 8 -seconds 3s -shapes 2,8,16,32 -json
+
+# Warm lookup: use the identical added benchmark at each revision.
+GOWORK=off GOMAXPROCS=1 go -C sdk/go test -c -o /tmp/bess-sdk.test ./bess
+GOGC=100 GOMAXPROCS=1 taskset -c 10 /tmp/bess-sdk.test -test.run='^$' \
+  -test.bench='^BenchmarkResourceLookup$' -test.benchtime=1s -test.benchmem
+```
+
+The nightly hosted-runner subset deliberately excludes live/paced workloads
+([benchmark trends](benchmark-trends.md#the-measured-subset)). Do not turn
+these laptop results into a fixed hosted-runner pass/fail threshold.
+
 ## The firewall table
 
 `classifier_firewall_table_bench` (`core/classifier/firewall_table_bench.cc`)
