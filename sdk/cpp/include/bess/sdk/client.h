@@ -226,6 +226,10 @@ class Client {
   // Connects to bessd's gRPC endpoint (no TLS, like bessd).
   static std::unique_ptr<Client> Dial(const std::string &target,
                                       RetryPolicy retry = {});
+  // Bounded persistent transaction streams; all other RPCs are unchanged.
+  // Lost attempts use the ordinary GetTransaction/epoch resolution.
+  static Result<std::unique_ptr<Client>> DialTransactionStreams(
+      const std::string &target, int concurrency, RetryPolicy retry = {});
 
   // Uses `transport` (a test's, or another channel's). `sleep` waits between
   // busy retries (default: std::this_thread::sleep_for).

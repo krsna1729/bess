@@ -74,6 +74,11 @@ class ControlStub:
                 request_serializer=control__v2__pb2.ApplyTransactionRequest.SerializeToString,
                 response_deserializer=control__v2__pb2.ApplyTransactionResponse.FromString,
                 _registered_method=True)
+        self.TransactionChannel = channel.stream_stream(
+                '/bess.pb.v2.Control/TransactionChannel',
+                request_serializer=control__v2__pb2.TransactionChannelRequest.SerializeToString,
+                response_deserializer=control__v2__pb2.TransactionChannelResponse.FromString,
+                _registered_method=True)
         self.GetTransaction = channel.unary_unary(
                 '/bess.pb.v2.Control/GetTransaction',
                 request_serializer=control__v2__pb2.GetTransactionRequest.SerializeToString,
@@ -162,6 +167,12 @@ class ControlServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ApplyTransaction(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TransactionChannel(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -257,6 +268,11 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.ApplyTransaction,
                     request_deserializer=control__v2__pb2.ApplyTransactionRequest.FromString,
                     response_serializer=control__v2__pb2.ApplyTransactionResponse.SerializeToString,
+            ),
+            'TransactionChannel': grpc.stream_stream_rpc_method_handler(
+                    servicer.TransactionChannel,
+                    request_deserializer=control__v2__pb2.TransactionChannelRequest.FromString,
+                    response_serializer=control__v2__pb2.TransactionChannelResponse.SerializeToString,
             ),
             'GetTransaction': grpc.unary_unary_rpc_method_handler(
                     servicer.GetTransaction,
@@ -515,6 +531,33 @@ class Control:
             '/bess.pb.v2.Control/ApplyTransaction',
             control__v2__pb2.ApplyTransactionRequest.SerializeToString,
             control__v2__pb2.ApplyTransactionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TransactionChannel(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/bess.pb.v2.Control/TransactionChannel',
+            control__v2__pb2.TransactionChannelRequest.SerializeToString,
+            control__v2__pb2.TransactionChannelResponse.FromString,
             options,
             channel_credentials,
             insecure,

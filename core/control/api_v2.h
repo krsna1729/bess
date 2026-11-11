@@ -46,7 +46,8 @@ grpc::Status ToStatus(const ControlError &error,
 // Refused before any side effect: INVALID_ARGUMENT for 0, FAILED_PRECONDITION
 // with ErrorDetail EPOCH_MISMATCH for another; nullopt if it is `epoch`.
 std::optional<grpc::Status> RefuseOtherEpoch(uint64_t sent, uint64_t epoch,
-                                             grpc::ServerContext *context);
+    grpc::ServerContext *context,
+    std::optional<pb::v2::ErrorDetail> *error = nullptr);
 
 // The control server's settings, shared by bessd and the tests (D-026).
 // Messages up to kMaxMessageBytes each way: gRPC's 4 MiB default caps one
@@ -123,6 +124,10 @@ class ControlV2Service final : public pb::v2::Control::Service {
       grpc::ServerContext *context,
       const pb::v2::ApplyTransactionRequest *request,
       pb::v2::ApplyTransactionResponse *response) override;
+  grpc::Status TransactionChannel(
+      grpc::ServerContext *context,
+      grpc::ServerReaderWriter<pb::v2::TransactionChannelResponse,
+                               pb::v2::TransactionChannelRequest> *stream) override;
   grpc::Status GetTransaction(
       grpc::ServerContext *context,
       const pb::v2::GetTransactionRequest *request,
@@ -155,6 +160,12 @@ class ControlV2Service final : public pb::v2::Control::Service {
                            grpc::ServerWriter<pb::v2::Event> *writer) override;
 
  private:
+  grpc::Status ApplyTransactionImpl(
+      grpc::ServerContext *context,
+      const pb::v2::ApplyTransactionRequest *request,
+      pb::v2::ApplyTransactionResponse *response,
+      std::chrono::system_clock::time_point deadline,
+      std::optional<pb::v2::ErrorDetail> *error);
   ControlPlane &control_plane_;
   DataplaneTransactions transactions_;
 };

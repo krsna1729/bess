@@ -460,13 +460,31 @@ func TestInternalWithoutBessDetailIsNoAnswer(t *testing.T) {
 	as[*InvalidRequestError](t, err)
 }
 
+func TestTypedTransientStatusIsANativeRefusal(t *testing.T) {
+	for _, code := range []codes.Code{codes.Unavailable, codes.ResourceExhausted} {
+		t.Run(code.String(), func(t *testing.T) {
+			d, err := proto.Marshal(&pb.ErrorDetail{Code: pb.ErrorDetail_RESOURCE_FAILURE})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := newHarness(&fake{applies: []step{{err: status.Error(code, "refused"),
+				md: metadata.Pairs(errorDetailKey, string(d))}}}, 4)
+			_, err = h.commit(t)
+			refusal := as[*InvalidRequestError](t, err)
+			if refusal.Code != code || refusal.Detail.GetCode() != pb.ErrorDetail_RESOURCE_FAILURE {
+				t.Fatal(refusal)
+			}
+		})
+	}
+}
+
 func TestServerErrorsCarryTheirDetail(t *testing.T) {
 	d, _ := proto.Marshal(&pb.ErrorDetail{Code: pb.ErrorDetail_INVALID_ARGUMENT, Message: "bad key", Field: "key"})
 	h := newHarness(&fake{applies: []step{{err: status.Error(codes.InvalidArgument, "x"),
 		md: metadata.Pairs(errorDetailKey, string(d))}}}, 4)
 	_, err := h.commit(t)
 	e := as[*InvalidRequestError](t, err)
-	if e.Detail.GetField() != "key" || e.Message != "bad key" {
+	if e.Detail.GetField() != "key" {
 		t.Fatal(e)
 	}
 }

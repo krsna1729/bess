@@ -73,6 +73,7 @@ func run() (err error) {
 	stageMeasureAcks := flag.Bool("stage-measure-acks", false, "diagnostic per-Commit latency clocks; corroborate overhead with otherwise identical plain runs")
 	stageGraphOnly := flag.Bool("stage-graph-only", false, "create the idle eight-stage graph, emit fixture JSON, and leave it installed; requires -stages")
 	stageKeepGraph := flag.Bool("stage-keep-graph", false, "leave the stage fixture installed after measurement")
+	transactionStreams := flag.Int("transaction-streams", 0, "persistent transaction stream leases, 1..64; zero uses unary transactions")
 	flag.Parse()
 	if (*stageGraphOnly || *stageKeepGraph) && *stagesFlag == "" {
 		return errors.New("-stage-graph-only and -stage-keep-graph require -stages")
@@ -100,7 +101,12 @@ func run() (err error) {
 	ctx, cancel := context.WithTimeout(signals, *timeout)
 	defer cancel()
 
-	client, err := bess.Dial(*addr)
+	var client *bess.Client
+	if *transactionStreams == 0 {
+		client, err = bess.Dial(*addr)
+	} else {
+		client, err = bess.DialTransactionStreams(*addr, *transactionStreams)
+	}
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", *addr, err)
 	}

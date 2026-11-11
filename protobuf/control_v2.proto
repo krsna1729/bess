@@ -529,6 +529,30 @@ message ApplyTransactionResponse {
   bool replayed = 3;  // the recorded outcome of an earlier identical request
 }
 
+// Persistent transaction RPC. Each stream has one unacknowledged attempt at a
+// time; parallel callers lease separate streams. There is no application queue
+// or batched acknowledgement. Cancelling a stream leaves its sent attempt
+// UNKNOWN, resolved with GetTransaction exactly as for a lost unary response.
+message TransactionChannelRequest {
+  uint64 attempt_id = 1;  // nonzero, echoed even for a refused request
+  ApplyTransactionRequest transaction = 2;
+  // Remaining per-attempt budget when sent, starting when this frame is read.
+  // Zero: only the stream deadline. Negative: INVALID_ARGUMENT, nothing applied.
+  int64 timeout_ns = 3;
+}
+
+message TransactionChannelResponse {
+  uint64 attempt_id = 1;
+  oneof result {
+    ApplyTransactionResponse transaction = 2;
+    ErrorDetail error = 5;
+  }
+  // Per-frame gRPC status, not the stream status. ErrorDetail alone cannot
+  // distinguish UNAVAILABLE from RESOURCE_EXHAUSTED.
+  int32 status_code = 3;
+  string status_message = 4;
+}
+
 message GetTransactionRequest {
   string request_id = 1;
 }
@@ -894,6 +918,8 @@ service Control {
 
   rpc ApplyTransaction(ApplyTransactionRequest)
       returns (ApplyTransactionResponse) {}
+  rpc TransactionChannel(stream TransactionChannelRequest)
+      returns (stream TransactionChannelResponse) {}
   rpc GetTransaction(GetTransactionRequest) returns (GetTransactionResponse) {}
   rpc ListMetrics(ListMetricsRequest) returns (ListMetricsResponse) {}
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse) {}

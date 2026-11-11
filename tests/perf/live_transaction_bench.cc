@@ -110,6 +110,7 @@ struct Options {
   int stage_iterations = 5000;
   std::string stage_locality = "hot";
   std::string stage_mode = "message";
+  int transaction_streams = 0;
 
   // How many blocks the traffic generator must cover: every process's.
   int blocks() const { return blocks_total > 0 ? blocks_total : clients; }
@@ -897,6 +898,8 @@ int Main(int argc, char **argv) {
       o.stage_iterations = std::stoi(value());
     } else if (a == "--stage-mode") {
       o.stage_mode = value();
+    } else if (a == "--transaction-streams") {
+      o.transaction_streams = std::stoi(value());
     } else if (a == "--stage-locality") {
       o.stage_locality = value();
     } else if (a == "--keep") {
@@ -909,6 +912,7 @@ int Main(int argc, char **argv) {
                    "  [--upserts N] [--erases N] [--keep]\n"
                    "  [--stage-counts 1,2,3,4,8 --stage-iterations 1..65536 --stage-locality hot|spread]\n"
                    "  [--stage-mode message|encoded]\n"
+                   "  [--transaction-streams 1..64] (zero/default: unary transactions)\n"
                    "  [--attach] [--block-offset K] [--blocks-total T]  (several processes, one\n"
                    "  daemon: the first builds with --blocks-total --keep, the rest --attach with\n"
                    "  their own --block-offset)\n");
@@ -945,9 +949,17 @@ int Main(int argc, char **argv) {
   }
   // Busy answers are retried quickly and often: the bench measures them.
   const auto dial = [&] {
-    return bess::sdk::Client::Dial(
-        o.grpc_url,
-        bess::sdk::RetryPolicy{.attempts = 16, .busy_backoff = std::chrono::microseconds(10)});
+    const bess::sdk::RetryPolicy retry{
+        .attempts = 16, .busy_backoff = std::chrono::microseconds(10)};
+    if (o.transaction_streams != 0) {
+      auto client = bess::sdk::Client::DialTransactionStreams(
+          o.grpc_url, o.transaction_streams, retry);
+      if (!client) {
+        throw std::runtime_error(client.error().message);
+      }
+      return std::move(*client);
+    }
+    return bess::sdk::Client::Dial(o.grpc_url, retry);
   };
   auto client = dial();
   if (!o.stages.empty()) {

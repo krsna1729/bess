@@ -28,6 +28,7 @@ const (
 	Control_PlanPipeline_FullMethodName             = "/bess.pb.v2.Control/PlanPipeline"
 	Control_ApplyPipeline_FullMethodName            = "/bess.pb.v2.Control/ApplyPipeline"
 	Control_ApplyTransaction_FullMethodName         = "/bess.pb.v2.Control/ApplyTransaction"
+	Control_TransactionChannel_FullMethodName       = "/bess.pb.v2.Control/TransactionChannel"
 	Control_GetTransaction_FullMethodName           = "/bess.pb.v2.Control/GetTransaction"
 	Control_ListMetrics_FullMethodName              = "/bess.pb.v2.Control/ListMetrics"
 	Control_GetCapabilities_FullMethodName          = "/bess.pb.v2.Control/GetCapabilities"
@@ -50,6 +51,7 @@ type ControlClient interface {
 	PlanPipeline(ctx context.Context, in *PlanPipelineRequest, opts ...grpc.CallOption) (*PlanPipelineResponse, error)
 	ApplyPipeline(ctx context.Context, in *ApplyPipelineRequest, opts ...grpc.CallOption) (*ApplyPipelineResponse, error)
 	ApplyTransaction(ctx context.Context, in *ApplyTransactionRequest, opts ...grpc.CallOption) (*ApplyTransactionResponse, error)
+	TransactionChannel(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[TransactionChannelRequest, TransactionChannelResponse], error)
 	GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*GetTransactionResponse, error)
 	ListMetrics(ctx context.Context, in *ListMetricsRequest, opts ...grpc.CallOption) (*ListMetricsResponse, error)
 	GetCapabilities(ctx context.Context, in *GetCapabilitiesRequest, opts ...grpc.CallOption) (*GetCapabilitiesResponse, error)
@@ -157,6 +159,19 @@ func (c *controlClient) ApplyTransaction(ctx context.Context, in *ApplyTransacti
 	return out, nil
 }
 
+func (c *controlClient) TransactionChannel(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[TransactionChannelRequest, TransactionChannelResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[1], Control_TransactionChannel_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[TransactionChannelRequest, TransactionChannelResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_TransactionChannelClient = grpc.BidiStreamingClient[TransactionChannelRequest, TransactionChannelResponse]
+
 func (c *controlClient) GetTransaction(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*GetTransactionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetTransactionResponse)
@@ -199,7 +214,7 @@ func (c *controlClient) GetSchema(ctx context.Context, in *GetSchemaRequest, opt
 
 func (c *controlClient) WatchEvents(ctx context.Context, in *WatchEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[1], Control_WatchEvents_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[2], Control_WatchEvents_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +273,7 @@ type ControlServer interface {
 	PlanPipeline(context.Context, *PlanPipelineRequest) (*PlanPipelineResponse, error)
 	ApplyPipeline(context.Context, *ApplyPipelineRequest) (*ApplyPipelineResponse, error)
 	ApplyTransaction(context.Context, *ApplyTransactionRequest) (*ApplyTransactionResponse, error)
+	TransactionChannel(grpc.BidiStreamingServer[TransactionChannelRequest, TransactionChannelResponse]) error
 	GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error)
 	ListMetrics(context.Context, *ListMetricsRequest) (*ListMetricsResponse, error)
 	GetCapabilities(context.Context, *GetCapabilitiesRequest) (*GetCapabilitiesResponse, error)
@@ -299,6 +315,9 @@ func (UnimplementedControlServer) ApplyPipeline(context.Context, *ApplyPipelineR
 }
 func (UnimplementedControlServer) ApplyTransaction(context.Context, *ApplyTransactionRequest) (*ApplyTransactionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ApplyTransaction not implemented")
+}
+func (UnimplementedControlServer) TransactionChannel(grpc.BidiStreamingServer[TransactionChannelRequest, TransactionChannelResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method TransactionChannel not implemented")
 }
 func (UnimplementedControlServer) GetTransaction(context.Context, *GetTransactionRequest) (*GetTransactionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTransaction not implemented")
@@ -481,6 +500,13 @@ func _Control_ApplyTransaction_Handler(srv interface{}, ctx context.Context, dec
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _Control_TransactionChannel_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ControlServer).TransactionChannel(&grpc.GenericServerStream[TransactionChannelRequest, TransactionChannelResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_TransactionChannelServer = grpc.BidiStreamingServer[TransactionChannelRequest, TransactionChannelResponse]
 
 func _Control_GetTransaction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetTransactionRequest)
@@ -688,6 +714,12 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "ReadResource",
 			Handler:       _Control_ReadResource_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "TransactionChannel",
+			Handler:       _Control_TransactionChannel_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 		{
 			StreamName:    "WatchEvents",
