@@ -27,6 +27,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -63,7 +64,22 @@ func run() (err error) {
 	baseFlag := flag.String("address-base", "0x0b000000", "first key address")
 	asJSON := flag.Bool("json", false, "print the sweep, the floor and the comparison as JSON")
 	timeout := flag.Duration("timeout", 5*time.Minute, "how long the whole run may take")
+	stagesFlag := flag.String("stages", "", "seeded distinct-stage replacements, e.g. 1,2,3,4,8; emits individual receipts as JSON")
+	stageIterations := flag.Int("stage-iterations", 1000, "measured transactions per stage count, excluding one cold transaction")
+	stageMode := flag.String("stage-mode", "encoded", "stage SDK construction: encoded or message")
+	stageLocality := flag.String("stage-locality", "hot", "stage key working set: hot or spread")
+	stageResident := flag.Int("stage-resident", 1024, "seeded entries in each of all eight stages")
+	stageConcurrency := flag.Int("stage-concurrency", 1, "bounded stage callers: power of two in 1..64; parallel callers require spread keys and must divide resident entries")
+	stageMeasureAcks := flag.Bool("stage-measure-acks", false, "diagnostic per-Commit latency clocks; corroborate overhead with otherwise identical plain runs")
+	stageGraphOnly := flag.Bool("stage-graph-only", false, "create the idle eight-stage graph, emit fixture JSON, and leave it installed; requires -stages")
+	stageKeepGraph := flag.Bool("stage-keep-graph", false, "leave the stage fixture installed after measurement")
 	flag.Parse()
+	if (*stageGraphOnly || *stageKeepGraph) && *stagesFlag == "" {
+		return errors.New("-stage-graph-only and -stage-keep-graph require -stages")
+	}
+	if *stageGraphOnly && *noGraph {
+		return errors.New("-stage-graph-only cannot be combined with -no-graph")
+	}
 
 	shapes, err := shapeList(*shapesFlag)
 	if err != nil {
@@ -93,6 +109,22 @@ func run() (err error) {
 
 	cfg := bench.Config{Addr: *addr, Resource: *resource, Shapes: shapes,
 		Seconds: *seconds, Preload: *preload, PktSize: *pktSize, Gates: *gates, Base: uint32(base)}
+	if *stagesFlag != "" {
+		counts, parseErr := shapeList(*stagesFlag)
+		if parseErr != nil {
+			return parseErr
+		}
+		results, stageErr := bench.RunStages(ctx, client, bench.StageConfig{
+			Counts: counts, Iterations: *stageIterations, Mode: *stageMode,
+			Locality: *stageLocality, Resident: *stageResident, Concurrency: *stageConcurrency,
+			MeasureAcks: *stageMeasureAcks,
+			WorkerCore:  *workerCore, Force: *force, NoGraph: *noGraph,
+			GraphOnly: *stageGraphOnly, KeepGraph: *stageKeepGraph,
+		})
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return errors.Join(stageErr, enc.Encode(results))
+	}
 	if !*noGraph {
 		cleanup, applyErr := bench.ApplyGraph(ctx, client, cfg, *workerCore, *force)
 		if cleanup != nil {

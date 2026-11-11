@@ -87,39 +87,46 @@ func ApplyGraph(ctx context.Context, c *bess.Client, cfg Config, workerCore int,
 		Modules: []*pb.Module{},
 		Workers: []*pb.Worker{{Wid: 0, Core: proto.Int32(int32(workerCore))}},
 	}
-	sourceArg, err := arg("Source", map[string]any{"pkt_size": cfg.PktSize})
-	if err != nil {
-		return nil, err
-	}
-	updateArg, err := arg("RandomUpdate", map[string]any{"fields": []any{map[string]any{
-		"offset": 26, "size": 4, "min": cfg.Base, "max": cfg.Base + LiveAddrs - 1}}})
-	if err != nil {
-		return nil, err
-	}
-	matchArg, err := arg("ExactMatch", map[string]any{"fields": []any{map[string]any{
-		"offset": 26, "num_bytes": 4}}})
-	if err != nil {
-		return nil, err
-	}
-	pipeline.Modules = append(pipeline.Modules,
-		&pb.Module{Name: "src", Mclass: "Source", Arg: sourceArg},
-		&pb.Module{Name: "rnd", Mclass: "RandomUpdate", Arg: updateArg},
-		&pb.Module{Name: MatchModule, Mclass: "ExactMatch", Arg: matchArg},
-	)
-	for gate := 0; gate <= cfg.Gates; gate++ {
-		pipeline.Modules = append(pipeline.Modules, &pb.Module{
-			Name: fmt.Sprintf("sink%d", gate), Mclass: "Sink"})
-	}
-	chain := func(up, down string) {
-		pipeline.Connections = append(pipeline.Connections,
-			&pb.Connection{Upstream: up, Ogate: 0, Downstream: down, Igate: 0})
-	}
-	chain("src", "rnd")
-	chain("rnd", MatchModule)
-	for gate := 0; gate <= cfg.Gates; gate++ {
-		pipeline.Connections = append(pipeline.Connections, &pb.Connection{
-			Upstream: MatchModule, Ogate: uint32(gate),
-			Downstream: fmt.Sprintf("sink%d", gate), Igate: 0})
+	if cfg.Stages > 0 {
+		pipeline, err = stagePipeline(cfg.Stages, arg)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		sourceArg, err := arg("Source", map[string]any{"pkt_size": cfg.PktSize})
+		if err != nil {
+			return nil, err
+		}
+		updateArg, err := arg("RandomUpdate", map[string]any{"fields": []any{map[string]any{
+			"offset": 26, "size": 4, "min": cfg.Base, "max": cfg.Base + LiveAddrs - 1}}})
+		if err != nil {
+			return nil, err
+		}
+		matchArg, err := arg("ExactMatch", map[string]any{"fields": []any{map[string]any{
+			"offset": 26, "num_bytes": 4}}})
+		if err != nil {
+			return nil, err
+		}
+		pipeline.Modules = append(pipeline.Modules,
+			&pb.Module{Name: "src", Mclass: "Source", Arg: sourceArg},
+			&pb.Module{Name: "rnd", Mclass: "RandomUpdate", Arg: updateArg},
+			&pb.Module{Name: MatchModule, Mclass: "ExactMatch", Arg: matchArg},
+		)
+		for gate := 0; gate <= cfg.Gates; gate++ {
+			pipeline.Modules = append(pipeline.Modules, &pb.Module{
+				Name: fmt.Sprintf("sink%d", gate), Mclass: "Sink"})
+		}
+		chain := func(up, down string) {
+			pipeline.Connections = append(pipeline.Connections,
+				&pb.Connection{Upstream: up, Ogate: 0, Downstream: down, Igate: 0})
+		}
+		chain("src", "rnd")
+		chain("rnd", MatchModule)
+		for gate := 0; gate <= cfg.Gates; gate++ {
+			pipeline.Connections = append(pipeline.Connections, &pb.Connection{
+				Upstream: MatchModule, Ogate: uint32(gate),
+				Downstream: fmt.Sprintf("sink%d", gate), Igate: 0})
+		}
 	}
 
 	remove := func(cctx context.Context) error {

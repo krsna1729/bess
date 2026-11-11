@@ -49,6 +49,9 @@
 #include <utility>
 #include <vector>
 
+#include <google/protobuf/struct.pb.h>
+#include <google/protobuf/util/json_util.h>
+
 #include "bess/sdk/client.h"
 #include "placement_check.h"
 #include "schema_types.h"
@@ -86,6 +89,7 @@ struct Options {
   bool allow_dirty_placement = false;  // print no placement warning
   int clients = 1;                     // committers, each with its own connection
   int daemon_pid = 0;                  // for the daemon-side CPU split (0: skip)
+  bool counter_window = false;  // bracket existing persistent Metrics RPCs
   // Several bench processes against one daemon need disjoint rule space: this
   // one owns blocks [block_offset, block_offset + clients), out of
   // `blocks_total` the built pipeline's traffic generator covers. `attach`
@@ -102,6 +106,10 @@ struct Options {
   int upserts = 1;  // rules added per transaction
   int erases = 1;   // rules dropped per transaction
   bool keep = false;  // leave the pipeline applied for the next client
+  std::vector<int> stages;  // nonempty: idle seeded stage floor, not packet churn
+  int stage_iterations = 5000;
+  std::string stage_locality = "hot";
+  std::string stage_mode = "message";
 
   // How many blocks the traffic generator must cover: every process's.
   int blocks() const { return blocks_total > 0 ? blocks_total : clients; }
@@ -432,13 +440,259 @@ struct DaemonCpu {
   }
 };
 
+void ValidateStageOptions(const Options &o) {
+  if (o.clients != 1 || o.stage_iterations < 1 || o.stage_iterations > 65536 ||
+      (o.stage_locality != "hot" && o.stage_locality != "spread")) {
+    throw std::runtime_error("stage floor needs one client, 1..65536 iterations and hot/spread locality");
+  }
+  if (o.stage_mode != "message" && o.stage_mode != "encoded") {
+    throw std::runtime_error("stage mode must be message or encoded");
+  }
+  for (int n : o.stages) {
+    if (n != 1 && n != 2 && n != 3 && n != 4 && n != 8) {
+      throw std::runtime_error("stage counts must be 1,2,3,4,8");
+    }
+  }
+}
+
+std::string StageJson(const google::protobuf::Struct &fields) {
+  std::string json;
+  const auto status = google::protobuf::util::MessageToJsonString(fields, &json);
+  if (!status.ok()) {
+    throw std::runtime_error("stage JSON: " + std::string(status.message()));
+  }
+  return json;
+}
+
+// The same idle eight-resource fixture as the in-process and Go stage ladders,
+// through the public C++ SDK and a real daemon. Input messages or wire bytes
+// are prepared; NewTransaction, packing (message mode), Commit and receipts are timed.
+// All eight resident sets remain present at every modified-prefix count.
+bool StageFloor(bess::sdk::Client &client, const Options &o) {
+  google::protobuf::Struct failure;
+  auto &evidence = *failure.mutable_fields();
+  std::ostringstream measurements;
+  const char *phase = "setup";
+  int stages = 0, ordinal = 0, accepted = 0;
+  bool first = true;
+  try {
+    ValidateStageOptions(o);
+    Types types(client);
+    auto caps = client.Capabilities();
+    if (!caps) {
+      throw std::runtime_error("stage capabilities: " + caps.error().message);
+    }
+    const uint64_t epoch = caps->daemon_epoch();
+    constexpr int resident = 1024;
+    std::vector<bess::sdk::Resource> resources;
+    bess::sdk::PipelineQuery query;
+    query.include_resources = true;
+    for (int i = 0; i < 8; ++i) {
+      auto resource = client.Resource("stage" + std::to_string(i) + "/rules");
+      if (!resource || resource->kind != v2::TransactionResource::KIND_MAP ||
+          resource->daemon_epoch != epoch ||
+          resource->key_type != "bess.pb.ExactMatchRuleKey" ||
+          resource->value_type != "bess.pb.ExactMatchRuleValue") {
+        throw std::runtime_error("stage floor needs the caller's idle eight-stage graph");
+      }
+      query.resources.push_back(resource->name);
+      resources.push_back(std::move(*resource));
+    }
+    std::vector<std::unique_ptr<google::protobuf::Message>> keys;
+    std::map<std::string, int> expected_keys;
+    std::vector<const std::string *> key_wire;
+    keys.reserve(resident);
+    key_wire.reserve(resident);
+    for (int slot = 0; slot < resident; ++slot) {
+      keys.push_back(types.Make("ExactMatchRuleKey",
+          R"({"fields":[{"value_bin":")" + Base64(Be32(0x0b000001u + slot)) + R"("}]})"));
+      const auto entry = expected_keys.emplace(keys.back()->SerializeAsString(), slot).first;
+      key_wire.push_back(&entry->first);
+    }
+    auto gate1 = types.Make("ExactMatchRuleValue", R"({"gate":1})");
+    auto gate2 = types.Make("ExactMatchRuleValue", R"({"gate":2})");
+    const std::string value1 = gate1->SerializeAsString(), value2 = gate2->SerializeAsString();
+    auto snapshot = client.Pipeline(query);
+    if (!snapshot) {
+      throw std::runtime_error("stage snapshot: " + snapshot.error().message);
+    }
+    if (snapshot->version.daemon_epoch != epoch || snapshot->pipeline.resources_size() != 8) {
+      throw std::runtime_error("stage snapshot epoch or resource count mismatch");
+    }
+    if (!snapshot->workers.empty() || !snapshot->pipeline.workers().empty() ||
+        !snapshot->pipeline.tasks().empty()) {
+      throw std::runtime_error("stage fixture requires a worker-free, task-free idle graph");
+    }
+    std::vector<bool> seen_resources(8);
+    for (const auto &contents : snapshot->pipeline.resources()) {
+      const auto found = std::find(query.resources.begin(), query.resources.end(), contents.name());
+      if (found == query.resources.end() || seen_resources[found - query.resources.begin()]) {
+        throw std::runtime_error("stage snapshot has unexpected or duplicate resource " + contents.name());
+      }
+      seen_resources[found - query.resources.begin()] = true;
+      if (contents.entries_size() != 0 && contents.entries_size() != resident) {
+        throw std::runtime_error(contents.name() + " must be empty or have exactly 1024 fixture entries");
+      }
+      std::vector<bool> seen_keys(resident);
+      for (const auto &entry : contents.entries()) {
+        const auto key = expected_keys.find(entry.key().value());
+        if (entry.key().type_url() != "type.googleapis.com/bess.pb.ExactMatchRuleKey" ||
+            entry.value().type_url() != "type.googleapis.com/bess.pb.ExactMatchRuleValue" ||
+            key == expected_keys.end() || seen_keys[key->second] ||
+            (entry.value().value() != value1 && entry.value().value() != value2)) {
+          throw std::runtime_error(contents.name() + " contains unexpected keys or incompatible fixture contents");
+        }
+        seen_keys[key->second] = true;
+      }
+    }
+    const auto record_evidence = [&](const v2::TransactionRecord &record) {
+      evidence["record_request_id"].set_string_value(record.request_id());
+      evidence["outcome"].set_string_value(v2::TransactionRecord::Outcome_Name(record.outcome()));
+      evidence["record_ops"].set_number_value(record.ops_size());
+      evidence["generation"].set_string_value(std::to_string(record.generation()));
+      int applied_ops = 0;
+      for (const auto &op : record.ops()) {
+        applied_ops += op.status() == v2::TransactionOpResult::STATUS_APPLIED;
+      }
+      evidence["applied_ops"].set_number_value(applied_ops);
+    };
+    const auto sdk_error = [&](const bess::sdk::Error &error) {
+      evidence["error_kind"].set_number_value(static_cast<int>(error.kind));
+      evidence["grpc_code"].set_number_value(static_cast<int>(error.code));
+      evidence["attempts"].set_number_value(error.attempts);
+      evidence["after_unknown_attempt"].set_bool_value(error.after_unknown_attempt);
+      if (error.record) {
+        record_evidence(*error.record);
+      }
+    };
+    const auto commit = [&](bess::sdk::Transaction &tx, int ops) {
+      auto result = tx.Commit();
+      if (!result) {
+        evidence["request_id"].set_string_value(tx.request_id());
+        evidence["expected_ops"].set_number_value(ops);
+        sdk_error(result.error());
+        throw std::runtime_error("stage commit: " + result.error().message);
+      }
+      bool valid = !result->replayed && result->daemon_epoch == epoch &&
+          result->request_id == tx.request_id() &&
+          result->record.request_id() == tx.request_id() &&
+          result->record.outcome() == v2::TransactionRecord::OUTCOME_APPLIED &&
+          result->record.ops_size() == ops;
+      for (const auto &op : result->record.ops()) {
+        valid = valid && op.status() == v2::TransactionOpResult::STATUS_APPLIED;
+      }
+      if (!valid) {
+        evidence["request_id"].set_string_value(tx.request_id());
+        evidence["applied_request_id"].set_string_value(result->request_id);
+        evidence["expected_ops"].set_number_value(ops);
+        evidence["daemon_epoch"].set_string_value(std::to_string(result->daemon_epoch));
+        evidence["expected_epoch"].set_string_value(std::to_string(epoch));
+        evidence["replayed"].set_bool_value(result->replayed);
+        record_evidence(result->record);
+        throw std::runtime_error("incorrect individual stage receipt");
+      }
+    };
+    const auto upsert = [&](bess::sdk::Transaction &tx, const bess::sdk::Resource &r,
+                            int slot, int gate) {
+      const auto result = o.stage_mode == "encoded"
+          ? tx.UpsertEncoded(r, *key_wire[slot], gate == 1 ? value1 : value2)
+          : tx.Upsert(r, *keys[slot], gate == 1 ? *gate1 : *gate2);
+      if (!result) {
+        evidence["request_id"].set_string_value(tx.request_id());
+        evidence["resource"].set_string_value(r.name);
+        sdk_error(result.error());
+        throw std::runtime_error("stage upsert: " + result.error().message);
+      }
+    };
+    for (int n : o.stages) {
+      stages = n;
+      accepted = 0;
+      phase = "seed";
+      ordinal = 0;
+      for (const auto &r : resources) {
+        for (int begin = 0; begin < resident; begin += 512) {
+          auto tx = client.NewTransaction();
+          for (int i = begin; i < begin + 512; ++i) {
+            upsert(tx, r, i, 1);
+          }
+          commit(tx, 512);
+        }
+      }
+      const auto apply = [&](uint64_t index) {
+        const uint64_t working_set = o.stage_locality == "hot" ? 1 : resident;
+        const int slot = static_cast<int>(index % working_set);
+        const int gate = index / working_set % 2 == 0 ? 2 : 1;
+        auto tx = client.NewTransaction();
+        for (int stage = 0; stage < n; ++stage) {
+          upsert(tx, resources[stage], slot, gate);
+        }
+        commit(tx, n);
+      };
+      phase = "cold";
+      apply(0);
+      const auto daemon_before = o.daemon_pid > 0
+          ? std::optional<DaemonCpu>(DaemonCpu::Read(o.daemon_pid)) : std::nullopt;
+      phase = "warm";
+      const uint64_t cpu_before = ProcessCpuNs();
+      const auto start = Clock::now();
+      for (int i = 0; i < o.stage_iterations; ++i) {
+        ordinal = i + 1;
+        apply(static_cast<uint64_t>(ordinal));
+        ++accepted;
+      }
+      const auto end = Clock::now();
+      const double wall_ns = std::chrono::duration<double, std::nano>(end - start).count();
+      const uint64_t cpu_ns = ProcessCpuNs() - cpu_before;
+      phase = "observation";
+      const auto daemon_after = o.daemon_pid > 0
+          ? std::optional<DaemonCpu>(DaemonCpu::Read(o.daemon_pid)) : std::nullopt;
+      measurements << (first ? "" : ",") << "{\"stages\":" << n
+                   << ",\"ops_per_transaction\":" << n << ",\"accepted\":" << accepted
+                   << ",\"started_monotonic_ns\":"
+                   << std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count()
+                   << ",\"ended_monotonic_ns\":"
+                   << std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count()
+                   << ",\"mean_wall_ns\":" << wall_ns / accepted
+                   << ",\"mean_client_process_cpu_ns\":" << double(cpu_ns) / accepted;
+      if (daemon_before && daemon_after) {
+        measurements << ",\"mean_daemon_process_cpu_ns\":"
+                     << double(daemon_after->process_ns - daemon_before->process_ns) / accepted;
+      }
+      measurements << "}";
+      first = false;
+    }
+  } catch (const std::exception &e) {
+    evidence["error"].set_string_value(e.what());
+    evidence["phase"].set_string_value(phase);
+    evidence["stages"].set_number_value(stages);
+    evidence["ordinal"].set_number_value(ordinal);
+    evidence["accepted"].set_number_value(accepted);
+    std::printf("{\"kind\":\"cpp-sdk-%s-stage\",\"ok\":false,\"measurements\":[%s],"
+                "\"failure\":%s}\n", o.stage_mode == "encoded" ? "encoded" : "message",
+                measurements.str().c_str(), StageJson(failure).c_str());
+    return false;
+  }
+  std::printf("{\"kind\":\"cpp-sdk-%s-stage\",\"resident_per_stage\":1024,"
+              "\"registered_stages\":8,\"concurrency\":1,\"ok\":true,\"measurements\":[%s]}\n",
+              o.stage_mode.c_str(), measurements.str().c_str());
+  return true;
+}
+
+
 // One rate point: every client commits its own slice at its share of `rate`
 // until the deadline, then the aggregate rate and the pooled latency are
 // reported. With `--clients 1` this is the single synchronous client the
 // recorded numbers were taken with.
 void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &o, int rate) {
   const double busy_before = bench.Busy();
-  const auto before = bench.GatePackets();
+  std::pair<Clock::time_point, Clock::time_point> before_bounds{}, after_bounds{};
+  const auto gate_packets = [&](auto &bounds) {
+    if (o.counter_window) bounds.first = Clock::now();
+    auto packets = bench.GatePackets();
+    if (o.counter_window) bounds.second = Clock::now();
+    return packets;
+  };
+  const auto before = gate_packets(before_bounds);
   std::optional<DaemonCpu> cpu_before;
   const uint64_t client_cpu_before = ProcessCpuNs();
   if (o.daemon_pid > 0) {
@@ -487,7 +741,7 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
   }
   const double client_cpu_s =
       double(ProcessCpuNs() - client_cpu_before) / 1e9;  // every client thread
-  const auto after = bench.GatePackets();
+  const auto after = gate_packets(after_bounds);
   double total = 0, misses = 0;
   for (const auto &[gate, pkts] : after) {
     const auto it = before.find(gate);
@@ -496,6 +750,34 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
     if (gate == "0") {
       misses = d;
     }
+  }
+  if (o.counter_window) {
+    const auto ns = [](Clock::time_point t) {
+      return static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
+    };
+    const double lower = std::chrono::duration<double>(after_bounds.first - before_bounds.second).count();
+    const double upper = std::chrono::duration<double>(after_bounds.second - before_bounds.first).count();
+    std::printf("# counter_window {\"rate\":%d,\"packets\":%.0f,"
+                "\"before_begin_ns\":%lld,\"before_end_ns\":%lld,"
+                "\"after_begin_ns\":%lld,\"after_end_ns\":%lld,"
+                "\"elapsed_min_s\":%.9f,\"elapsed_max_s\":%.9f,"
+                "\"legacy_elapsed_s\":%.9f",
+                rate, total, ns(before_bounds.first), ns(before_bounds.second),
+                ns(after_bounds.first), ns(after_bounds.second), lower, upper, elapsed);
+    if (cpu_before && cpu_after) {
+      uint64_t worker_ns = 0;
+      for (const auto &thread : DaemonCpu::Deltas(*cpu_before, *cpu_after)) {
+        if (thread.name.rfind("bess-worker", 0) == 0) worker_ns += thread.ns;
+      }
+      const uint64_t process_ns = cpu_after->process_ns - cpu_before->process_ns;
+      std::printf(",\"daemon_process_cpu_ns\":%llu,\"worker_cpu_ns\":%llu,"
+                  "\"non_worker_cpu_ns\":%llu",
+                  static_cast<unsigned long long>(process_ns),
+                  static_cast<unsigned long long>(worker_ns),
+                  static_cast<unsigned long long>(process_ns > worker_ns ? process_ns - worker_ns : 0));
+    }
+    std::printf("}\n");
   }
   std::sort(latency.begin(), latency.end());
   if (latency.empty()) {
@@ -573,6 +855,8 @@ int Main(int argc, char **argv) {
       o.clients = std::stoi(value());
     } else if (a == "--daemon-pid") {
       o.daemon_pid = std::stoi(value());
+    } else if (a == "--counter-window") {
+      o.counter_window = true;
     } else if (a == "--block-offset") {
       o.block_offset = std::stoi(value());
     } else if (a == "--blocks-total") {
@@ -602,17 +886,37 @@ int Main(int argc, char **argv) {
       o.upserts = std::stoi(value());
     } else if (a == "--erases") {
       o.erases = std::stoi(value());
+    } else if (a == "--stage-counts") {
+      const std::string list = value();
+      for (size_t pos = 0; pos <= list.size();) {
+        const size_t comma = std::min(list.find(',', pos), list.size());
+        o.stages.push_back(std::stoi(list.substr(pos, comma - pos)));
+        pos = comma + 1;
+      }
+    } else if (a == "--stage-iterations") {
+      o.stage_iterations = std::stoi(value());
+    } else if (a == "--stage-mode") {
+      o.stage_mode = value();
+    } else if (a == "--stage-locality") {
+      o.stage_locality = value();
     } else if (a == "--keep") {
       o.keep = true;
     } else {
       std::fprintf(stderr,
                    "usage: live_transaction_bench [--grpc-url HOST:PORT] [--worker-core C|auto]\n"
-                   "  [--clients N] [--daemon-pid PID] [--allow-dirty-placement]\n"
+                   "  [--clients N] [--daemon-pid PID] [--allow-dirty-placement] [--counter-window]\n"
                    "  [--sessions N] [--pkt-size B] [--duration S] [--rates R,...|max] [--rounds N]\n"
                    "  [--upserts N] [--erases N] [--keep]\n"
+                   "  [--stage-counts 1,2,3,4,8 --stage-iterations 1..65536 --stage-locality hot|spread]\n"
+                   "  [--stage-mode message|encoded]\n"
                    "  [--attach] [--block-offset K] [--blocks-total T]  (several processes, one\n"
                    "  daemon: the first builds with --blocks-total --keep, the rest --attach with\n"
                    "  their own --block-offset)\n");
+      for (int j = 1; j < argc; ++j) {
+        if (std::string(argv[j]) == "--stage-counts") {
+          throw std::runtime_error("unknown stage option: " + a);
+        }
+      }
       return 2;
     }
   }
@@ -636,6 +940,9 @@ int Main(int argc, char **argv) {
                              std::to_string(o.clients) + " clients does not fit in " +
                              std::to_string(o.blocks()) + " blocks");
   }
+  if (!o.stages.empty()) {
+    ValidateStageOptions(o);
+  }
   // Busy answers are retried quickly and often: the bench measures them.
   const auto dial = [&] {
     return bess::sdk::Client::Dial(
@@ -643,6 +950,9 @@ int Main(int argc, char **argv) {
         bess::sdk::RetryPolicy{.attempts = 16, .busy_backoff = std::chrono::microseconds(10)});
   };
   auto client = dial();
+  if (!o.stages.empty()) {
+    return StageFloor(*client, o) ? 0 : 1;
+  }
   Bench bench(*client, o);
   bench.Build();
   std::printf("# %d upserts + %d erases per transaction\n", o.upserts, o.erases);
@@ -683,6 +993,22 @@ int main(int argc, char **argv) {
   try {
     return Main(argc, argv);
   } catch (const std::exception &e) {
+    try {
+      for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--stage-counts") {
+          google::protobuf::Struct failure;
+          (*failure.mutable_fields())["error"].set_string_value(e.what());
+          (*failure.mutable_fields())["phase"].set_string_value("cli");
+          std::printf("{\"kind\":\"cpp-sdk-message-stage\",\"ok\":false,"
+                      "\"measurements\":[],\"failure\":%s}\n", StageJson(failure).c_str());
+          break;
+        }
+      }
+    } catch (const std::exception &serialization_error) {
+      if (std::fprintf(stderr, "failure JSON: %s\n", serialization_error.what()) < 0) {
+        return 1;
+      }
+    }
     std::fprintf(stderr, "live_transaction_bench: %s\n", e.what());
     return 1;
   }
