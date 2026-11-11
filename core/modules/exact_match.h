@@ -157,20 +157,16 @@ class ExactMatch final : public Module {
 
   CommandResponse AddFieldOne(const bess::pb::Field &field,
                               const bess::pb::FieldData &mask, int idx);
-  // Turns a rule's protobuf fields into `rule`'s field list, validating the
-  // count against the module's configured fields.
-  Error RuleFieldsFromPb(const RepeatedPtrField<bess::pb::FieldData> &fields,
-                         std::vector<std::vector<uint8_t>> *rule);
 
   // Builds a generation over `table`; nullptr with *err set on failure. Runs
   // on the control plane, off the data path. Cost is the plan, not the rules.
   GenerationPtr Build(
       std::shared_ptr<bess::classifier::ConcurrentExactTable> table,
       gate_idx_t default_gate, Error *err);
-  // Packs a rule's fields into the dense table key, validating each field's
-  // size against the configuration.
-  Error PackKey(const std::vector<std::vector<uint8_t>> &fields,
-                std::vector<std::byte> *key) const;
+  // Decodes protobuf fields straight into the dense owned key, validating
+  // field counts and binary widths without intermediate field buffers.
+  std::expected<bess::dataplane::ResourceKey, std::string> PackKey(
+      const RepeatedPtrField<bess::pb::FieldData> &fields) const;
   // A new, empty table sized for `rules` entries plus headroom (D-010),
   // admitted as "rules" before it is built (D-198; refusal throws
   // MemoryRefused). The returned pointer owns the admission too: it is

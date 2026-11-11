@@ -175,6 +175,42 @@ TEST_F(ExactMatchTransactionTest, RulesAreAResourceWhileTheModuleExists) {
   EXPECT_EQ(Apply({Add("em", 1, 2, 5)}).outcome, Outcome::kApplied);
 }
 
+TEST_F(ExactMatchTransactionTest, CodecKeysOwnTheirDecodedBytes) {
+  ASSERT_NE(CreateEm("em"), nullptr);
+  const auto *resource = Engine().FindResource("em/rules");
+  ASSERT_NE(resource, nullptr);
+  const auto *codec =
+      bess::framework::ResourceBindings::ProcessDefault().Find(*resource);
+  ASSERT_NE(codec, nullptr);
+  const std::string type_url = "type.googleapis.com/bess.pb.ExactMatchRuleKey";
+  bess::pb::ExactMatchRuleKey wire;
+  wire.add_fields()->set_value_int(0x123456789abcdef0ULL);
+  wire.add_fields()->set_value_int(0x10002);
+  auto integer = codec->Key(type_url, wire.SerializeAsString());
+  ASSERT_TRUE(integer.has_value());
+  // Integer fields keep the low bytes, in little-endian order.
+  const std::string expected("\xf0\xde\xbc\x9a\x02\x00", 6);
+  EXPECT_EQ(*integer, expected);
+
+  wire.Clear();
+  wire.add_fields()->set_value_bin(expected.data(), 4);
+  wire.add_fields()->set_value_bin(expected.data() + 4, 2);
+  auto binary = codec->Key(type_url, wire.SerializeAsString());
+  ASSERT_TRUE(binary.has_value());
+  EXPECT_EQ(*binary, expected);
+
+  // Neither later input mutation nor another decode can overwrite an owned
+  // key that a transaction is keeping for its later reserve phase.
+  wire.Clear();
+  wire.add_fields();
+  wire.add_fields();
+  auto unset = codec->Key(type_url, wire.SerializeAsString());
+  ASSERT_TRUE(unset.has_value());
+  EXPECT_EQ(*unset, std::string(6, '\0'));
+  EXPECT_EQ(*integer, expected);
+  EXPECT_EQ(*binary, expected);
+}
+
 TEST_F(ExactMatchTransactionTest, OneTransactionChangesSeveralModules) {
   ExactMatch *ul = CreateEm("ul");
   ExactMatch *dl = CreateEm("dl");

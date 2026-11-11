@@ -213,30 +213,41 @@ bool ExactMatch::FieldMask(size_t i, classifier::Normalization *out,
   return true;
 }
 
-Error ExactMatch::PackKey(const std::vector<std::vector<uint8_t>> &fields,
-                         std::vector<std::byte> *key) const {
+std::expected<bess::dataplane::ResourceKey, std::string> ExactMatch::PackKey(
+    const RepeatedPtrField<bess::pb::FieldData> &fields) const {
   const std::vector<bess::framework::KeyField> &specs = keys_.fields();
-  if (fields.size() != specs.size()) {
-    return std::make_pair(
-        EINVAL, bess::utils::Format("rule should have %zu fields (has %zu)",
-                                    specs.size(), fields.size()));
+  if (fields.size() != static_cast<int>(specs.size())) {
+    return std::unexpected(bess::utils::Format(
+        "rule should have %zu fields (has %d)", specs.size(), fields.size()));
   }
-  // Rule bytes are packed densely in field order WITHOUT applying the mask --
-  // the legacy table copied rule bytes verbatim while masking only extracted
-  // packet/metadata bytes. Preserve that distinction.
-  key->clear();
-  for (size_t i = 0; i < fields.size(); i++) {
+  // Decode straight into the owned key (at most kMaxKeyBytes), without
+  // materializing per-field vectors or a second packed byte buffer. Rule
+  // bytes remain unmasked: only extracted packet/metadata bytes are masked.
+  bess::dataplane::ResourceKey key(keys_.key_size(), '\0');
+  char *out = key.data();
+  for (int i = 0; i < fields.size(); i++) {
     const size_t want = static_cast<size_t>(specs[i].size);
-    if (fields[i].size() != want) {
-      return std::make_pair(
-          EINVAL,
-          bess::utils::Format("rule field %zu should have size %zu (has %zu)",
-                              i, want, fields[i].size()));
+    const bess::pb::FieldData &field = fields.Get(i);
+    if (field.encoding_case() == bess::pb::FieldData::kValueBin) {
+      const std::string &bytes = field.value_bin();
+      if (bytes.size() != want) {
+        return std::unexpected(bess::utils::Format(
+            "rule field %zu should have size %zu (has %zu)",
+            static_cast<size_t>(i), want, bytes.size()));
+      }
+      std::memcpy(out, bytes.data(), want);
+    } else {
+      // Preserve the wire contract: integers use their low `want` bytes in
+      // little-endian order, and an unset encoding is integer zero.
+      uint64_t value = field.value_int();
+      for (size_t j = 0; j < want; j++) {
+        out[j] = static_cast<char>(value & 0xffu);
+        value >>= 8u;
+      }
     }
-    const auto *bytes = reinterpret_cast<const std::byte *>(fields[i].data());
-    key->insert(key->end(), bytes, bytes + want);
+    out += want;
   }
-  return std::make_pair(0, std::string());
+  return key;
 }
 
 std::expected<std::shared_ptr<classifier::ConcurrentExactTable>, Error>
@@ -512,17 +523,7 @@ CommandResponse ExactMatch::Init(const bess::pb::ExactMatchArg &arg) {
                           bess::pb::ExactMatchRuleValue>>(
       [this](const bess::pb::ExactMatchRuleKey &key)
           -> std::expected<bess::dataplane::ResourceKey, std::string> {
-        std::vector<std::vector<uint8_t>> fields;
-        Error err = RuleFieldsFromPb(key.fields(), &fields);
-        std::vector<std::byte> packed;
-        if (!err.first) {
-          err = PackKey(fields, &packed);
-        }
-        if (err.first) {
-          return std::unexpected(err.second);
-        }
-        return bess::dataplane::ResourceKey(
-            reinterpret_cast<const char *>(packed.data()), packed.size());
+        return PackKey(key.fields());
       },
       [this](const bess::pb::ExactMatchRuleValue &value)
           -> std::expected<std::any, std::string> {
@@ -751,37 +752,6 @@ bool ExactMatch::SetFusedKernelEnabled(bool enabled, Error *err) {
 std::string ExactMatch::GetDesc() const {
   return bess::utils::Format("%zu fields, %zu rules", keys_.size(),
                              table_->size());
-}
-
-Error ExactMatch::RuleFieldsFromPb(
-    const RepeatedPtrField<bess::pb::FieldData> &fields,
-    std::vector<std::vector<uint8_t>> *rule) {
-  const std::vector<bess::framework::KeyField> &specs = keys_.fields();
-  if (fields.size() != static_cast<int>(specs.size())) {
-    return std::make_pair(
-        EINVAL, bess::utils::Format("rule should have %zu fields (has %d)",
-                                    specs.size(), fields.size()));
-  }
-
-  for (auto i = 0; i < fields.size(); i++) {
-    int field_size = specs[i].size;
-
-    bess::pb::FieldData current = fields.Get(i);
-
-    if (current.encoding_case() == bess::pb::FieldData::kValueBin) {
-      const std::string &f_obj = fields.Get(i).value_bin();
-      rule->push_back(std::vector<uint8_t>(f_obj.begin(), f_obj.end()));
-    } else {
-      rule->emplace_back();
-      uint64_t rule64 = current.value_int();
-      for (int j = 0; j < field_size; j++) {
-        rule->back().push_back(rule64 & 0xFFULL);
-        rule64 >>= 8;
-      }
-    }
-  }
-
-  return std::make_pair(0, std::string());
 }
 
 ADD_MODULE(ExactMatch, "em", "Multi-field classifier with an exact match table")
