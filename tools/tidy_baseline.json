@@ -95,8 +95,7 @@
       "cppcoreguidelines-narrowing-conversions": 1
     },
     "core/modules/exact_match.cc": {
-      "cppcoreguidelines-narrowing-conversions": 2,
-      "performance-unnecessary-copy-initialization": 1
+      "cppcoreguidelines-narrowing-conversions": 2
     },
     "core/modules/flowgen.cc": {
       "bugprone-integer-division": 1,
