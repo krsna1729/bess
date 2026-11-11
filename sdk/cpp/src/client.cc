@@ -854,6 +854,25 @@ Result<void> Transaction::Upsert(const Resource &r,
   return {};
 }
 
+Result<void> Transaction::UpsertEncoded(const Resource &r, std::string_view key,
+                                       std::string_view value) {
+  if (auto ok = Bind(r); !ok) {
+    return ok;
+  }
+  if (r.kind == pb::TransactionResource::KIND_SINGLETON) {
+    return std::unexpected(MakeError(ErrorKind::kInvalidRequest,
+                                     "resource \"" + r.name + "\" is a singleton: Set its value"));
+  }
+  pb::TransactionOp op;
+  op.set_resource(r.name);
+  op.mutable_key()->set_type_url("type.googleapis.com/" + r.key_type);
+  op.mutable_key()->set_value(key.data(), key.size());
+  op.mutable_value()->set_type_url("type.googleapis.com/" + r.value_type);
+  op.mutable_value()->set_value(value.data(), value.size());
+  ops_.push_back(std::move(op));
+  return {};
+}
+
 Result<void> Transaction::Erase(const Resource &r,
                                 const google::protobuf::Message &key) {
   if (auto ok = Bind(r); !ok) {

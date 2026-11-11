@@ -62,6 +62,15 @@ rather than being skipped, because a missed crossing is a missed quota; so does
 a gap in the daemon's log or a restart, which the helper raises instead of
 passing over, so a controller re-reads its counters and watches again.
 
+## Prepared values
+
+Go `UpsertEncoded`, `SetEncoded` and `EraseEncoded` accept `bess.Encoded`
+protobuf wire bytes and borrow them until Commit returns. C++
+`Transaction::UpsertEncoded` copies its key/value bytes into the transaction.
+Both still use discovered resource types; the native service validates all
+encodings and rejects the entire transaction on malformed input. Ordinary
+message operations remain available.
+
 ## Resources: maps and singletons (D-129)
 
 A module's state is its init argument and its resources; what it does that
