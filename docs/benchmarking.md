@@ -451,6 +451,36 @@ not offered-arrival/N4 queue latency. Plain runs omit the per-call clocks,
 sample array and latency fields. Match payloads, caller bound and binary;
 report the observed arm's overhead against both surrounding plain controls.
 
+Both public SDKs also offer opt-in persistent gRPC transaction leases. Go uses
+`DialTransactionStreams(target, N, ...)` or
+`NewClientWithTransactionStreams(conn, retry, N)`; C++ uses
+`Client::DialTransactionStreams(target, N, retry)`. N is 1..64. Existing Dial
+remains unary. These factories retain the complete ordinary control/admin API;
+only ApplyTransaction uses the public `Control.TransactionChannel` RPC.
+The benchmark flags are Go `-transaction-streams N` and C++
+`--transaction-streams N`; zero/default selects unary. Match stream leases to
+the bounded callers when comparing transports. C++ stage measurements still
+have one caller, even when the pool permits more.
+
+Each lease has one unacknowledged attempt, not multiple pipelined attempts on
+one stream. Parallel callers use separate bounded leases. Frames carry the
+unchanged ApplyTransactionRequest, a per-stream correlation ID and a remaining
+attempt budget. There is no application work queue or batched acknowledgement.
+The existing gRPC message limit also bounds each outstanding frame's wire size.
+Native processing retains admission, epochs, atomicity, replay, events, and
+per-attempt typed status/details. The budget starts when the native service
+reads the frame; client deadline/cancellation retires that lease. It is not a
+transaction rollback or a guarantee that a sent operation did not apply.
+Missing/mismatched acknowledgement or EOF remains UNKNOWN and uses the same
+GetTransaction recovery; never retry it with a new request ID.
+
+Go Close cancels owned streams but preserves a borrowed connection. The
+unresponsive-peer regression test covers waiting/active deadlines and lease
+cancellation isolation. `BESS_BENCH_URL` enables the live Go tests against an
+owned idle eight-stage fixture: lost native APPLIED acknowledgement resolves
+through the real replay record and table; closing streams preserves a borrowed
+channel. Do not point these mutation tests at a production graph.
+
 Do not subtract same-core in-process RPC from a separate-core Go client and
 label the result a language cost. Do not subtract this generic replacement
 fixture from an N4 establishment/delete cycle. UPF's compiler fixture checks

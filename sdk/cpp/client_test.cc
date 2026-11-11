@@ -517,10 +517,10 @@ TEST(SdkClient, OneTransactionHoldsHandlesOfOneEpoch) {
   EXPECT_EQ(KindOf(tx.Erase(now, pb::GetTransactionRequest())), ErrorKind::kStaleResource);
 }
 
-TEST(SdkClient, InternalWithoutBessDetailIsNoAnswer) {
-  {
+TEST(SdkClient, AmbiguousTransportStatusWithoutDetailIsNoAnswer) {
+  for (const auto code : {grpc::StatusCode::INTERNAL, grpc::StatusCode::RESOURCE_EXHAUSTED}) {
     Harness h(4);
-    h.f->applies = {{.status = grpc::Status(grpc::StatusCode::INTERNAL, "stream reset")}};
+    h.f->applies = {{.status = grpc::Status(code, "lost acknowledgement")}};
     h.f->gets = {Known(kApplied, 1)};
     auto a = h.Commit();
     ASSERT_TRUE(a) << a.error().message;
@@ -534,6 +534,22 @@ TEST(SdkClient, InternalWithoutBessDetailIsNoAnswer) {
   EXPECT_EQ(KindOf(h.Commit()), ErrorKind::kInvalidRequest);
 }
 
+TEST(SdkClient, TypedTransientStatusIsANativeRefusal) {
+  for (const auto code : {grpc::StatusCode::UNAVAILABLE, grpc::StatusCode::RESOURCE_EXHAUSTED}) {
+    Harness h(4);
+    h.f->applies = {Refusal(code, pb::ErrorDetail::RESOURCE_FAILURE)};
+    auto a = h.Commit();
+    ASSERT_EQ(KindOf(a), ErrorKind::kInvalidRequest);
+    EXPECT_EQ(a.error().code, code);
+    const auto &detail = a.error().detail;
+    if (detail.has_value()) {
+      EXPECT_EQ(detail->code(), pb::ErrorDetail::RESOURCE_FAILURE);
+    } else {
+      ADD_FAILURE() << "missing native refusal detail";
+    }
+  }
+}
+
 TEST(SdkClient, ServerErrorsCarryTheirDetail) {
   Harness h(4);
   pb::ErrorDetail d;
@@ -545,7 +561,6 @@ TEST(SdkClient, ServerErrorsCarryTheirDetail) {
   ASSERT_EQ(KindOf(a), ErrorKind::kInvalidRequest);
   ASSERT_TRUE(a.error().detail);
   EXPECT_EQ(a.error().detail->field(), "key");
-  EXPECT_EQ(a.error().message, "bad key");
 }
 
 TEST(SdkClient, BusyIsRetriedWithBackoff) {

@@ -62,7 +62,7 @@ rather than being skipped, because a missed crossing is a missed quota; so does
 a gap in the daemon's log or a restart, which the helper raises instead of
 passing over, so a controller re-reads its counters and watches again.
 
-## Prepared values
+## Prepared values and persistent transaction streams
 
 Go `UpsertEncoded`, `SetEncoded` and `EraseEncoded` accept `bess.Encoded`
 protobuf wire bytes and borrow them until Commit returns. C++
@@ -70,6 +70,33 @@ protobuf wire bytes and borrow them until Commit returns. C++
 Both still use discovered resource types; the native service validates all
 encodings and rejects the entire transaction on malformed input. Ordinary
 message operations remain available.
+
+Go and C++ optionally use the public `Control.TransactionChannel` bidi RPC:
+
+| Client | Factory | Ownership |
+|---|---|---|
+| Go | `DialTransactionStreams(target, N, ...)` | Owns connection and streams |
+| Go | `NewClientWithTransactionStreams(conn, retry, N)` | Borrows connection; Close cancels its streams only |
+| C++ | `Client::DialTransactionStreams(target, N, retry)` | Returns `Result<std::unique_ptr<Client>>`; owns connection and streams |
+
+N is 1..64 leases. Each lease has one outstanding attempt, with an individual
+correlated acknowledgement; parallel callers lease separate persistent streams.
+There is no batched acknowledgement or application queue. Existing Dial remains
+unary, and all other control/admin/action/snapshot/report APIs remain available
+over the ordinary channel. Opt-in requires the daemon's advertised
+`TransactionChannel` RPC; there is no silent unary fallback.
+
+Native admission, epochs, replay, atomicity and events are unchanged. A remaining
+attempt budget is carried in each frame and starts when the server reads it.
+Client deadline/cancellation is active during stream creation too and retires
+only that lease, not the transaction's possible effects. A successful frame
+must contain a record for the original request ID. Missing/foreign records,
+locally oversized acknowledgements and EOF remain UNKNOWN; the SDK uses ordinary
+GetTransaction recovery and exact-ID/payload retry rules. Go/C++ distinguish an
+untyped transport RESOURCE_EXHAUSTED from an actual typed native refusal.
+Pool size and existing per-message limits bound outstanding wire bytes,
+not decoded-memory reservations. See [benchmarking](benchmarking.md#transaction-stage-floor-ladder)
+for matched unary/stream flags and the required plain-run controls.
 
 ## Resources: maps and singletons (D-129)
 

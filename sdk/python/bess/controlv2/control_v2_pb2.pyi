@@ -637,6 +637,30 @@ class ApplyTransactionResponse(_message.Message):
     replayed: bool
     def __init__(self, record: _Optional[_Union[TransactionRecord, _Mapping]] = ..., daemon_epoch: _Optional[int] = ..., replayed: _Optional[bool] = ...) -> None: ...
 
+class TransactionChannelRequest(_message.Message):
+    __slots__ = ("attempt_id", "transaction", "timeout_ns")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    TRANSACTION_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUT_NS_FIELD_NUMBER: _ClassVar[int]
+    attempt_id: int
+    transaction: ApplyTransactionRequest
+    timeout_ns: int
+    def __init__(self, attempt_id: _Optional[int] = ..., transaction: _Optional[_Union[ApplyTransactionRequest, _Mapping]] = ..., timeout_ns: _Optional[int] = ...) -> None: ...
+
+class TransactionChannelResponse(_message.Message):
+    __slots__ = ("attempt_id", "transaction", "error", "status_code", "status_message")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    TRANSACTION_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    STATUS_CODE_FIELD_NUMBER: _ClassVar[int]
+    STATUS_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    attempt_id: int
+    transaction: ApplyTransactionResponse
+    error: ErrorDetail
+    status_code: int
+    status_message: str
+    def __init__(self, attempt_id: _Optional[int] = ..., transaction: _Optional[_Union[ApplyTransactionResponse, _Mapping]] = ..., error: _Optional[_Union[ErrorDetail, _Mapping]] = ..., status_code: _Optional[int] = ..., status_message: _Optional[str] = ...) -> None: ...
+
 class GetTransactionRequest(_message.Message):
     __slots__ = ("request_id",)
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]

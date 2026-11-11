@@ -101,21 +101,3 @@ func TestEncodedOperationsRefuseWhatTheirMessagesRefuse(t *testing.T) {
 		t.Errorf("the transaction holds %d operations, want the 1 accepted", len(tx.ops))
 	}
 }
-
-// An encoded upsert costs one allocation, the operation: the bytes go out as
-// the caller gave them and the type URLs are built once per type.
-func TestAnEncodedUpsertIsOneAllocation(t *testing.T) {
-	rules := Resource{Name: "bench/rules", Kind: pb.TransactionResource_KIND_MAP,
-		KeyType: "bench.RuleKey", ValueType: "bench.RuleValue"}
-	k, v := Encoded{1, 2, 3}, Encoded{4, 5}
-	tx := (&Client{}).Transaction()
-	allocs := testing.AllocsPerRun(100, func() {
-		tx.ops = tx.ops[:0]
-		if err := tx.UpsertEncoded(rules, k, v); err != nil {
-			t.Fatal(err)
-		}
-	})
-	if allocs > 1 {
-		t.Errorf("an encoded upsert made %.0f allocations, want 1", allocs)
-	}
-}

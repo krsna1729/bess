@@ -9,6 +9,7 @@
 #include "bess/sdk/client.h"
 #include "bess/sdk/transport.h"
 #include "control_v2.grpc.pb.h"
+#include "transaction_stream.h"
 
 namespace bess::sdk {
 namespace {
@@ -35,8 +36,12 @@ class GrpcEventStream final : public EventStream {
 
 class GrpcTransportImpl final : public Transport {
  public:
-  explicit GrpcTransportImpl(std::shared_ptr<grpc::Channel> channel)
-      : stub_(pb::Control::NewStub(channel)), admin_(pb::Admin::NewStub(channel)) {}
+  explicit GrpcTransportImpl(const std::shared_ptr<grpc::Channel> &channel, size_t stream_limit = 0)
+      : stub_(pb::Control::NewStub(channel)), admin_(pb::Admin::NewStub(channel)) {
+    if (stream_limit != 0) {
+      streams_ = std::make_unique<TransactionStreamPool>(stub_.get(), stream_limit);
+    }
+  }
 
 #define BESS_SDK_GRPC_UNARY(Stub, Rpc)                                    \
   grpc::Status Rpc(Deadline deadline, const pb::Rpc##Request &req,        \
@@ -49,7 +54,17 @@ class GrpcTransportImpl final : public Transport {
     }                                                                     \
     return status;                                                        \
   }
-  BESS_SDK_GRPC_UNARY(stub_, ApplyTransaction)
+  grpc::Status ApplyTransaction(Deadline deadline, const pb::ApplyTransactionRequest &req,
+                                 pb::ApplyTransactionResponse *resp, Trailers *trailers) override {
+    if (streams_) {
+      return streams_->Apply(deadline, req, resp, trailers);
+    }
+    grpc::ClientContext ctx;
+    ctx.set_deadline(deadline);
+    auto status = stub_->ApplyTransaction(&ctx, req, resp);
+    if (!status.ok()) CopyTrailers(ctx, trailers);
+    return status;
+  }
   BESS_SDK_GRPC_UNARY(stub_, GetTransaction)
   BESS_SDK_GRPC_UNARY(stub_, ListTransactionResources)
   BESS_SDK_GRPC_UNARY(stub_, GetCapabilities)
@@ -80,21 +95,36 @@ class GrpcTransportImpl final : public Transport {
  private:
   std::unique_ptr<pb::Control::Stub> stub_;
   std::unique_ptr<pb::Admin::Stub> admin_;
+  std::unique_ptr<TransactionStreamPool> streams_;
 };
+
+std::shared_ptr<grpc::Channel> MakeChannel(const std::string &target) {
+  grpc::ChannelArguments args;
+  args.SetMaxReceiveMessageSize(kMaxMessageBytes);
+  args.SetMaxSendMessageSize(kMaxMessageBytes);
+  return grpc::CreateCustomChannel(target, grpc::InsecureChannelCredentials(), args);
+}
 
 }  // namespace
 
 std::shared_ptr<Transport> GrpcTransport(const std::string &target) {
-  grpc::ChannelArguments args;
-  args.SetMaxReceiveMessageSize(kMaxMessageBytes);
-  args.SetMaxSendMessageSize(kMaxMessageBytes);
-  return std::make_shared<GrpcTransportImpl>(grpc::CreateCustomChannel(
-      target, grpc::InsecureChannelCredentials(), args));
+  return std::make_shared<GrpcTransportImpl>(MakeChannel(target));
 }
 
 std::unique_ptr<Client> Client::Dial(const std::string &target,
                                      RetryPolicy retry) {
   return std::make_unique<Client>(GrpcTransport(target), retry);
+}
+
+Result<std::unique_ptr<Client>> Client::DialTransactionStreams(
+    const std::string &target, int concurrency, RetryPolicy retry) {
+  if (concurrency < 1 || concurrency > 64) {
+    Error error;
+    error.message = "transaction streams require 1..64 callers";
+    return std::unexpected(std::move(error));
+  }
+  return std::make_unique<Client>(
+      std::make_shared<GrpcTransportImpl>(MakeChannel(target), concurrency), retry);
 }
 
 }  // namespace bess::sdk

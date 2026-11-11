@@ -635,7 +635,7 @@ grpc::Status ToStatus(const ControlError &error,
 
 // Declared in api_v2.h; the Admin service refuses with it too.
 std::optional<grpc::Status> RefuseOtherEpoch(uint64_t sent, uint64_t epoch,
-                                             grpc::ServerContext *context) {
+    grpc::ServerContext *context, std::optional<v2::ErrorDetail> *error) {
   if (sent == epoch) {
     return std::nullopt;
   }
@@ -657,7 +657,11 @@ std::optional<grpc::Status> RefuseOtherEpoch(uint64_t sent, uint64_t epoch,
   if (context != nullptr) {
     context->AddTrailingMetadata("bess-error-bin", detail.SerializeAsString());
   }
-  return grpc::Status(code, detail.message());
+  grpc::Status status(code, detail.message());
+  if (error != nullptr) {
+    error->emplace(std::move(detail));
+  }
+  return status;
 }
 
 // -- service ------------------------------------------------------------------------
@@ -1008,7 +1012,16 @@ static void EmitTransactionEvent(const v2::TransactionRecord &r) {
 grpc::Status ControlV2Service::ApplyTransaction(
     grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,
     v2::ApplyTransactionResponse *response) {
-  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
+  return ApplyTransactionImpl(context, request, response, context->deadline(), nullptr);
+}
+
+grpc::Status ControlV2Service::ApplyTransactionImpl(
+    grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,
+    v2::ApplyTransactionResponse *response,
+    std::chrono::system_clock::time_point deadline,
+    std::optional<v2::ErrorDetail> *error) {
+  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(),
+                                     error == nullptr ? context : nullptr, error)) {
     return *refused;
   }
   // Resources' tables are DPDK structures; commands writing the same tables
@@ -1028,7 +1041,7 @@ grpc::Status ControlV2Service::ApplyTransaction(
       // Decided before the attempt, so the engine counts a BUSY it will not
       // answer as a retry, never as an answer it has to take back.
       const bool may_retry = retry < kBusyRetries && !context->IsCancelled() &&
-                             std::chrono::system_clock::now() + backoff < context->deadline();
+                             std::chrono::system_clock::now() + backoff < deadline;
       applied = transactions_.Apply(*request, may_retry ? dataplane::TransactionEngine::OnBusy::kRetry
                                                         : dataplane::TransactionEngine::OnBusy::kAnswer);
       if (!may_retry || !applied ||
@@ -1043,10 +1056,62 @@ grpc::Status ControlV2Service::ApplyTransaction(
     backoff *= 2;
   }
   if (!applied) {
-    return ToStatus(applied.error(), context);
+    if (error != nullptr) {
+      error->emplace(ToProto(applied.error()));
+    }
+    return ToStatus(applied.error(), error == nullptr ? context : nullptr);
   }
   *response = std::move(*applied);
   return grpc::Status::OK;
+}
+
+grpc::Status ControlV2Service::TransactionChannel(
+    grpc::ServerContext *context,
+    grpc::ServerReaderWriter<v2::TransactionChannelResponse,
+                             v2::TransactionChannelRequest> *stream) {
+  for (;;) {
+    // Destroy each decoded frame after its acknowledgement. Idle streams do
+    // not retain a controller's largest request outside the gRPC quota.
+    v2::TransactionChannelRequest request;
+    if (!stream->Read(&request)) {
+      return grpc::Status::OK;
+    }
+    v2::TransactionChannelResponse response;
+    response.set_attempt_id(request.attempt_id());
+    std::optional<v2::ErrorDetail> error;
+    grpc::Status status;
+    if (request.attempt_id() == 0 || !request.has_transaction() ||
+        request.timeout_ns() < 0) {
+      error.emplace();
+      error->set_code(v2::ErrorDetail::INVALID_ARGUMENT);
+      error->set_field(request.attempt_id() == 0 ? "attempt_id" :
+                       !request.has_transaction() ? "transaction" : "timeout_ns");
+      error->set_message("invalid transaction channel frame");
+      status = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error->message());
+    } else {
+      auto deadline = context->deadline();
+      if (request.timeout_ns() > 0) {
+        const auto now = std::chrono::system_clock::now();
+        const auto budget = std::chrono::nanoseconds(request.timeout_ns());
+        if (deadline > now && budget < deadline - now) {
+          deadline = now + budget;
+        }
+      }
+      status = ApplyTransactionImpl(context, &request.transaction(),
+                                    response.mutable_transaction(), deadline, &error);
+    }
+    if (!status.ok()) {
+      response.clear_transaction();
+      response.set_status_code(status.error_code());
+      response.set_status_message(status.error_message());
+      if (error.has_value()) {
+        *response.mutable_error() = std::move(error.value());
+      }
+    }
+    if (!stream->Write(response)) {
+      return grpc::Status::OK;
+    }
+  }
 }
 
 grpc::Status ControlV2Service::GetTransaction(

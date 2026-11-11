@@ -353,12 +353,13 @@ type Client struct {
 	retry RetryPolicy
 	sleep func(time.Duration)
 
-	mu         sync.Mutex
-	resources  map[string]Resource
-	epoch      uint64
-	epochKnown bool
-	conn       *grpc.ClientConn
-	control    pb.ControlClient // the generated client, for Control()
+	mu             sync.Mutex
+	resources      map[string]Resource
+	epoch          uint64
+	epochKnown     bool
+	conn           *grpc.ClientConn
+	control        pb.ControlClient // the generated client, for Control()
+	closeTransport context.CancelFunc
 }
 
 // Dial connects to bessd's gRPC endpoint (no TLS, like bessd).
@@ -392,8 +393,11 @@ func newClient(t transport, retry RetryPolicy, sleep func(time.Duration)) *Clien
 	return &Client{t: t, retry: retry, sleep: sleep}
 }
 
-// Close closes a connection Dial opened.
+// Close cancels owned transaction streams and closes a connection Dial opened.
 func (c *Client) Close() error {
+	if c.closeTransport != nil {
+		c.closeTransport()
+	}
 	if c.conn != nil {
 		return c.conn.Close()
 	}
@@ -1434,14 +1438,12 @@ func finish(rec *pb.TransactionRecord, replayed bool, epoch uint64, unknownAttem
 	return nil, fmt.Errorf("bess: unexpected outcome %v", rec.GetOutcome())
 }
 
-// noAnswer: a failed call that says nothing about the outcome: timeouts,
-// losses, cancellation, and INTERNAL/UNKNOWN without BESS's error detail (a
-// reset stream, a handler that died after recording).
+// noAnswer: without BESS's typed refusal detail these statuses can follow an
+// applied operation, including a locally rejected oversized acknowledgement.
 func noAnswer(err error, md metadata.MD) bool {
 	switch status.Code(err) {
-	case codes.DeadlineExceeded, codes.Unavailable, codes.Canceled:
-		return true
-	case codes.Internal, codes.Unknown:
+	case codes.DeadlineExceeded, codes.Unavailable, codes.Canceled,
+		codes.Internal, codes.Unknown, codes.ResourceExhausted:
 		return len(md.Get(errorDetailKey)) == 0
 	}
 	return false

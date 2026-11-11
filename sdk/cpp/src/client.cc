@@ -20,17 +20,16 @@ Error MakeError(ErrorKind kind, std::string message) {
   return e;
 }
 
-// A failed call that says nothing about the outcome: timeouts, losses,
-// cancellation, and INTERNAL/UNKNOWN without BESS's error detail (a reset
-// stream, a handler that died after recording).
+// Without BESS's typed refusal detail these statuses can follow an applied
+// operation, including a locally rejected oversized acknowledgement.
 bool NoAnswer(const grpc::Status &status, const Trailers &trailers) {
   switch (status.error_code()) {
     case grpc::StatusCode::DEADLINE_EXCEEDED:
     case grpc::StatusCode::UNAVAILABLE:
     case grpc::StatusCode::CANCELLED:
-      return true;
     case grpc::StatusCode::INTERNAL:
     case grpc::StatusCode::UNKNOWN:
+    case grpc::StatusCode::RESOURCE_EXHAUSTED:
       return !trailers.contains(kErrorDetailKey);
     default:
       return false;

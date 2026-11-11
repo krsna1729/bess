@@ -77,7 +77,7 @@ sdk_cpp_test_targets = []
 if get_option('build_tests')
   sdk_cpp_test = executable(
     'sdk_cpp_client_test',
-    'client_test.cc',
+    ['client_test.cc', 'stream_test.cc'],
     implicit_include_directories: false,
     dependencies: [bess_sdk_dep, gtest_dep, dependency('gtest_main', method: 'pkg-config')],
   )
