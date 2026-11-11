@@ -529,28 +529,41 @@ message ApplyTransactionResponse {
   bool replayed = 3;  // the recorded outcome of an earlier identical request
 }
 
-// Persistent transaction RPC. Each stream has one unacknowledged attempt at a
-// time; parallel callers lease separate streams. There is no application queue
-// or batched acknowledgement. Cancelling a stream leaves its sent attempt
-// UNKNOWN, resolved with GetTransaction exactly as for a lost unary response.
+// Persistent transaction RPC. Each stream has one unacknowledged frame at a
+// time; parallel callers lease separate streams. A frame carries 1..64
+// independent transactions, applied in order, each atomic on its own and
+// answered by its own result. Cancelling a stream leaves the transactions of
+// its sent frame UNKNOWN, each resolved with GetTransaction exactly as for a
+// lost unary response.
 message TransactionChannelRequest {
-  uint64 attempt_id = 1;  // nonzero, echoed even for a refused request
-  ApplyTransactionRequest transaction = 2;
-  // Remaining per-attempt budget when sent, starting when this frame is read.
-  // Zero: only the stream deadline. Negative: INVALID_ARGUMENT, nothing applied.
+  uint64 attempt_id = 1;  // nonzero, echoed even for a refused frame
+  repeated ApplyTransactionRequest transactions = 2;
+  // Remaining budget when sent, shared by the frame's transactions, starting
+  // when this frame is read. Zero: only the stream deadline. Negative:
+  // INVALID_ARGUMENT, nothing applied.
   int64 timeout_ns = 3;
+}
+
+// One transaction's answer: its record, or its gRPC status and, for a typed
+// native refusal, the ErrorDetail that the unary call carries in trailers.
+message TransactionChannelResult {
+  oneof result {
+    ApplyTransactionResponse transaction = 1;
+    ErrorDetail error = 2;
+  }
+  // ErrorDetail alone cannot distinguish UNAVAILABLE from RESOURCE_EXHAUSTED.
+  int32 status_code = 3;
+  string status_message = 4;
 }
 
 message TransactionChannelResponse {
   uint64 attempt_id = 1;
-  oneof result {
-    ApplyTransactionResponse transaction = 2;
-    ErrorDetail error = 5;
-  }
-  // Per-frame gRPC status, not the stream status. ErrorDetail alone cannot
-  // distinguish UNAVAILABLE from RESOURCE_EXHAUSTED.
+  // One per transaction, in request order. Empty when the frame itself was
+  // refused (status_code below): then nothing in it was applied.
+  repeated TransactionChannelResult results = 2;
   int32 status_code = 3;
   string status_message = 4;
+  ErrorDetail error = 5;
 }
 
 message GetTransactionRequest {

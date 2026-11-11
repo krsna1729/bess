@@ -462,14 +462,16 @@ The benchmark flags are Go `-transaction-streams N` and C++
 the bounded callers when comparing transports. C++ stage measurements still
 have one caller, even when the pool permits more.
 
-Each lease has one unacknowledged attempt, not multiple pipelined attempts on
-one stream. Parallel callers use separate bounded leases. Frames carry the
-unchanged ApplyTransactionRequest, a per-stream correlation ID and a remaining
-attempt budget. There is no application work queue or batched acknowledgement.
-The existing gRPC message limit also bounds each outstanding frame's wire size.
+Each stream has one unacknowledged frame. A frame carries 1..64 independent
+ApplyTransactionRequests, a per-stream correlation ID and a remaining budget
+shared by the frame; the response has one result per transaction, in order.
+The Go client combines the commits already queued behind a busy stream, without
+a timer; C++ sends one transaction per frame. Parallel callers beyond the
+streams queue. The existing gRPC message limit also bounds each frame's wire size.
 Native processing retains admission, epochs, atomicity, replay, events, and
-per-attempt typed status/details. The budget starts when the native service
-reads the frame; client deadline/cancellation retires that lease. It is not a
+per-transaction typed status/details. The budget starts when the native service
+reads the frame; a frame's stream is cancelled once all its callers stop
+waiting. That is not a
 transaction rollback or a guarantee that a sent operation did not apply.
 Missing/mismatched acknowledgement or EOF remains UNKNOWN and uses the same
 GetTransaction recovery; never retry it with a new request ID.

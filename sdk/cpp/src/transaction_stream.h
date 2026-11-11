@@ -104,10 +104,10 @@ class TransactionStreamPool {
     struct Frame {
       pb::TransactionChannelRequest value;
       explicit Frame(const pb::ApplyTransactionRequest &request) {
-        value.unsafe_arena_set_allocated_transaction(
+        value.mutable_transactions()->UnsafeArenaAddAllocated(
             const_cast<pb::ApplyTransactionRequest *>(&request));
       }
-      ~Frame() { (void)value.unsafe_arena_release_transaction(); }
+      ~Frame() { (void)value.mutable_transactions()->UnsafeArenaReleaseLast(); }
     } frame(request);
     pb::TransactionChannelResponse reply;
     std::unique_ptr<Lease> lease;
@@ -167,23 +167,35 @@ class TransactionStreamPool {
     if (reply.attempt_id() != frame.value.attempt_id()) {
       return grpc::Status(grpc::StatusCode::UNKNOWN, "transaction acknowledgement does not match attempt");
     }
-    if (reply.status_code() == grpc::StatusCode::OK) {
-      if (!reply.has_transaction() || reply.has_error() ||
-          !reply.transaction().has_record() ||
-          reply.transaction().record().request_id() != request.request_id()) {
+    // A refused frame has no results; this client sends one transaction per frame.
+    const bool refused = reply.results_size() == 0;
+    if (refused ? reply.status_code() == grpc::StatusCode::OK
+                : reply.results_size() != 1 || reply.status_code() != grpc::StatusCode::OK) {
+      return grpc::Status(grpc::StatusCode::UNKNOWN, "invalid transaction acknowledgement frame");
+    }
+    pb::TransactionChannelResult refusal;
+    if (refused) {
+      refusal.set_status_code(reply.status_code());
+      refusal.set_status_message(reply.status_message());
+      if (reply.has_error()) *refusal.mutable_error() = reply.error();
+    }
+    pb::TransactionChannelResult &result = refused ? refusal : *reply.mutable_results(0);
+    if (result.status_code() == grpc::StatusCode::OK) {
+      if (!result.has_transaction() || !result.transaction().has_record() ||
+          result.transaction().record().request_id() != request.request_id()) {
         return grpc::Status(grpc::StatusCode::UNKNOWN, "invalid transaction acknowledgement record");
       }
-      *response = std::move(*reply.mutable_transaction());
+      *response = std::move(*result.mutable_transaction());
       release.reusable = true;
       return grpc::Status::OK;
     }
-    if (reply.status_code() < 0 || reply.status_code() > grpc::StatusCode::UNAUTHENTICATED ||
-        !reply.has_error() || reply.has_transaction()) {
+    if (result.status_code() < 0 || result.status_code() > grpc::StatusCode::UNAUTHENTICATED ||
+        !result.has_error()) {
       return grpc::Status(grpc::StatusCode::UNKNOWN, "invalid transaction error acknowledgement");
     }
-    trailers->emplace(kErrorDetailKey, reply.error().SerializeAsString());
+    trailers->emplace(kErrorDetailKey, result.error().SerializeAsString());
     release.reusable = true;
-    return grpc::Status(static_cast<grpc::StatusCode>(reply.status_code()), reply.status_message());
+    return grpc::Status(static_cast<grpc::StatusCode>(result.status_code()), result.status_message());
   }
 
  private:

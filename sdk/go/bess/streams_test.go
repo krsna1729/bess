@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -102,6 +103,117 @@ func TestTransactionStreamDeadlineReleasesLeaseWithoutCancellingOtherCaller(t *t
 	read := start(readCtx)
 	awaitReceipt()
 	awaitCode(read, codes.DeadlineExceeded)
+}
+
+// Answers each transaction by request ID; "refused" gets a typed refusal.
+type batchingTransactionPeer struct {
+	pb.UnimplementedControlServer
+	frames  chan int
+	release chan struct{}
+}
+
+func (s *batchingTransactionPeer) TransactionChannel(stream grpc.BidiStreamingServer[pb.TransactionChannelRequest, pb.TransactionChannelResponse]) error {
+	for first := true; ; first = false {
+		frame, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		s.frames <- len(frame.GetTransactions())
+		if first {
+			<-s.release
+		}
+		reply := &pb.TransactionChannelResponse{AttemptId: frame.GetAttemptId()}
+		for _, tx := range frame.GetTransactions() {
+			result := &pb.TransactionChannelResult{Result: &pb.TransactionChannelResult_Transaction{
+				Transaction: &pb.ApplyTransactionResponse{Record: &pb.TransactionRecord{RequestId: tx.GetRequestId()}}}}
+			if tx.GetRequestId() == "refused" {
+				result = &pb.TransactionChannelResult{StatusCode: int32(codes.FailedPrecondition), StatusMessage: "stale",
+					Result: &pb.TransactionChannelResult_Error{Error: &pb.ErrorDetail{Code: pb.ErrorDetail_EPOCH_MISMATCH}}}
+			}
+			reply.Results = append(reply.Results, result)
+		}
+		if err := stream.Send(reply); err != nil {
+			return err
+		}
+	}
+}
+
+func TestTransactionStreamQueuedCommitsShareFrameWithOwnResults(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := &batchingTransactionPeer{frames: make(chan int, 4), release: make(chan struct{})}
+	server := grpc.NewServer()
+	pb.RegisterControlServer(server, peer)
+	go server.Serve(listener)
+	defer server.Stop()
+	conn, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client, err := NewClientWithTransactionStreams(conn, DefaultRetryPolicy(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type answer struct {
+		response *pb.ApplyTransactionResponse
+		trailer  metadata.MD
+		err      error
+	}
+	start := func(id string) <-chan answer {
+		result := make(chan answer, 1)
+		go func() {
+			response, trailer, err := client.t.apply(ctx, &pb.ApplyTransactionRequest{RequestId: id})
+			result <- answer{response, trailer, err}
+		}()
+		return result
+	}
+	frameSize := func() int {
+		t.Helper()
+		select {
+		case n := <-peer.frames:
+			return n
+		case <-ctx.Done():
+			t.Fatal("frame did not reach peer")
+			return 0
+		}
+	}
+	ids := []string{"first", "second", "refused", "fourth"}
+	answers := []<-chan answer{start(ids[0])}
+	if n := frameSize(); n != 1 {
+		t.Fatalf("first frame carried %d transactions, want 1", n)
+	}
+	for _, id := range ids[1:] {
+		answers = append(answers, start(id))
+	}
+	queue := client.t.(*transactionStreams).queue
+	for len(queue) < len(ids)-1 {
+		if ctx.Err() != nil {
+			t.Fatal("callers did not queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(peer.release)
+	if n := frameSize(); n != len(ids)-1 {
+		t.Fatalf("queued commits used a frame of %d, want %d", n, len(ids)-1)
+	}
+	for i, result := range answers {
+		got := <-result
+		if ids[i] == "refused" {
+			if status.Code(got.err) != codes.FailedPrecondition || len(got.trailer.Get(errorDetailKey)) != 1 {
+				t.Fatalf("refused member: %v %v", got.err, got.trailer)
+			}
+			continue
+		}
+		if got.err != nil || got.response.GetRecord().GetRequestId() != ids[i] {
+			t.Fatalf("%s got %v %v", ids[i], got.response, got.err)
+		}
+	}
 }
 
 func TestTransactionStreamCancellationInterruptsLeaseCreation(t *testing.T) {

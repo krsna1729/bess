@@ -4,6 +4,7 @@ package bess
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/krsna1729/bess/sdk/go/controlv2"
@@ -14,10 +15,13 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// DialTransactionStreams keeps a bounded set of persistent transaction streams.
-// Each leased stream has exactly one unacknowledged attempt. Other control and
-// administration RPCs use the ordinary channel. A lost stream is UNKNOWN and
-// goes through the same GetTransaction resolution as a lost unary response.
+// DialTransactionStreams keeps up to concurrency persistent transaction
+// streams, each with one unacknowledged frame. A stream's worker sends every
+// commit already queued, up to 64, in its next frame; it never waits to fill
+// one. Each transaction keeps its own result. Other control and administration
+// RPCs use the ordinary channel. A lost frame leaves its transactions UNKNOWN,
+// each going through the same GetTransaction resolution as a lost unary
+// response.
 func DialTransactionStreams(target string, concurrency int, opts ...grpc.DialOption) (*Client, error) {
 	if concurrency < 1 || concurrency > 64 {
 		return nil, fmt.Errorf("bess: transaction streams require 1..64 callers")
@@ -41,10 +45,18 @@ func NewClientWithTransactionStreams(conn grpc.ClientConnInterface, retry RetryP
 	return c, nil
 }
 
+// maxFrameTransactions is the daemon's per-frame bound (kMaxChannelTransactions).
+const maxFrameTransactions = 64
+
 func enableTransactionStreams(c *Client, concurrency int) {
 	ctx, cancel := context.WithCancel(context.Background())
-	c.t = &transactionStreams{transport: c.t, client: c.control, ctx: ctx,
-		slots: make(chan struct{}, concurrency), idle: make(chan *transactionStream, concurrency)}
+	t := &transactionStreams{transport: c.t, client: c.control, ctx: ctx,
+		idle:  make(chan *transactionStream, concurrency),
+		queue: make(chan *queuedTransaction, concurrency*maxFrameTransactions)}
+	for range concurrency {
+		t.idle <- nil // a stream opened on first use
+	}
+	c.t = t
 	c.closeTransport = cancel
 }
 
@@ -52,101 +64,244 @@ type transactionStreams struct {
 	transport
 	client pb.ControlClient
 	ctx    context.Context
-	slots  chan struct{}
 	idle   chan *transactionStream
+	queue  chan *queuedTransaction
 }
 
-type transactionStream struct {
-	stream pb.Control_TransactionChannelClient
-	cancel context.CancelFunc
-	next   uint64
+type queuedTransaction struct {
+	ctx     context.Context
+	request *pb.ApplyTransactionRequest
+	claimed atomic.Bool // by a caller to send it, or by its own caller to withdraw it
+	done    chan streamResult
 }
 
+type streamResult struct {
+	response *pb.ApplyTransactionResponse
+	trailer  metadata.MD
+	err      error
+}
+
+// apply sends request on an idle stream itself, with whatever is already
+// queued, so a lone caller has no handoff. With no idle stream it queues, and
+// waits for its result or for a stream, whichever comes first.
 func (t *transactionStreams) apply(ctx context.Context, request *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, status.FromContextError(err).Err()
+	}
+	q := &queuedTransaction{ctx: ctx, request: request, done: make(chan streamResult, 1)}
 	select {
-	case t.slots <- struct{}{}:
+	case s := <-t.idle:
+		q.claimed.Store(true)
+		return t.drive(s, q)
+	default:
+	}
+	select {
+	case t.queue <- q:
 	case <-ctx.Done():
 		return nil, nil, status.FromContextError(ctx.Err()).Err()
 	case <-t.ctx.Done():
 		return nil, nil, status.FromContextError(t.ctx.Err()).Err()
 	}
-	defer func() { <-t.slots }()
-	if err := ctx.Err(); err != nil {
-		return nil, nil, status.FromContextError(err).Err()
+	idle := t.idle
+	for {
+		select {
+		case r := <-q.done:
+			return r.response, r.trailer, r.err
+		case s := <-idle:
+			if q.claimed.CompareAndSwap(false, true) {
+				return t.drive(s, q)
+			}
+			t.idle <- s
+			idle = nil // another caller sent it; wait for its result
+		case <-ctx.Done():
+			// Withdrawn before anyone took it, or sent and now UNKNOWN: either
+			// way the commit path resolves it as a lost unary answer.
+			q.claimed.Store(true)
+			return nil, nil, status.FromContextError(ctx.Err()).Err()
+		case <-t.ctx.Done():
+			q.claimed.Store(true)
+			return nil, nil, status.FromContextError(t.ctx.Err()).Err()
+		}
 	}
-	var lease *transactionStream
-	var streamCtx context.Context
+}
+
+// drive sends q, which its caller has claimed, and the queued commits that fit,
+// on s, then returns s to the idle set.
+func (t *transactionStreams) drive(s *transactionStream, q *queuedTransaction) (*pb.ApplyTransactionResponse, metadata.MD, error) {
+	batch := []*queuedTransaction{q}
+drain:
+	for len(batch) < maxFrameTransactions {
+		select {
+		case other := <-t.queue:
+			batch = t.take(batch, other)
+		default:
+			break drain
+		}
+	}
+	if len(batch) == 1 {
+		t.idle <- t.send(s, batch)
+		r := <-q.done
+		return r.response, r.trailer, r.err
+	}
+	// Other callers' answers must not hold this caller past its own deadline.
+	go func() { t.idle <- t.send(s, batch) }()
 	select {
-	case lease = <-t.idle:
-	default:
-		var cancel context.CancelFunc
-		streamCtx, cancel = context.WithCancel(t.ctx)
-		lease = &transactionStream{cancel: cancel}
+	case r := <-q.done:
+		return r.response, r.trailer, r.err
+	case <-q.ctx.Done():
+		return nil, nil, status.FromContextError(q.ctx.Err()).Err()
+	case <-t.ctx.Done():
+		return nil, nil, status.FromContextError(t.ctx.Err()).Err()
 	}
-	// Cancelling an attempt retires its entire lease. It cannot cancel another
-	// caller: no other attempt is ever outstanding on that stream.
-	stopCancel := context.AfterFunc(ctx, lease.cancel)
-	reusable := false
+}
+
+func (t *transactionStreams) take(batch []*queuedTransaction, q *queuedTransaction) []*queuedTransaction {
+	if !q.claimed.CompareAndSwap(false, true) {
+		return batch // withdrawn, or already sent by another caller
+	}
+	if err := q.ctx.Err(); err != nil {
+		q.done <- streamResult{err: status.FromContextError(err).Err()} // never sent
+		return batch
+	}
+	return append(batch, q)
+}
+
+type transactionStream struct {
+	ctx    context.Context
+	stream pb.Control_TransactionChannelClient
+	cancel context.CancelFunc
+	next   uint64
+}
+
+// send writes one frame and answers each transaction in it. It returns the
+// stream to reuse, or nil after any failure that retires it.
+func (t *transactionStreams) send(s *transactionStream, batch []*queuedTransaction) (next *transactionStream) {
+	if s == nil {
+		ctx, cancel := context.WithCancel(t.ctx)
+		s = &transactionStream{ctx: ctx, cancel: cancel}
+	}
+	// Once every caller in the frame stops waiting, nobody needs its answers:
+	// cancel the stream, so a silent daemon cannot pin this caller's driver.
+	var abandoned func() bool
+	if len(batch) == 1 {
+		stop := context.AfterFunc(batch[0].ctx, s.cancel)
+		abandoned = func() bool { return !stop() }
+	} else {
+		var waiting atomic.Int32
+		waiting.Store(int32(len(batch)))
+		stops := make([]func() bool, len(batch))
+		for i, q := range batch {
+			stops[i] = context.AfterFunc(q.ctx, func() {
+				if waiting.Add(-1) == 0 {
+					s.cancel()
+				}
+			})
+		}
+		abandoned = func() bool {
+			fired := 0
+			for _, stop := range stops {
+				if !stop() {
+					fired++
+				}
+			}
+			return fired == len(stops)
+		}
+	}
 	defer func() {
-		stopped := stopCancel()
-		if reusable && stopped && ctx.Err() == nil && t.ctx.Err() == nil {
-			t.idle <- lease
-		} else {
-			lease.cancel()
+		if abandoned() && next != nil {
+			s.cancel()
+			next = nil
 		}
 	}()
-	if lease.stream == nil {
-		var err error
-		lease.stream, err = t.client.TransactionChannel(streamCtx)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				err = status.FromContextError(ctxErr).Err()
+	fail := func(err error) *transactionStream {
+		for _, q := range batch {
+			if ctxErr := q.ctx.Err(); ctxErr != nil {
+				q.done <- streamResult{err: status.FromContextError(ctxErr).Err()}
+			} else {
+				q.done <- streamResult{err: err}
 			}
-			return nil, nil, err
+		}
+		s.cancel()
+		return nil
+	}
+	if s.stream == nil {
+		stream, err := t.client.TransactionChannel(s.ctx)
+		if err != nil {
+			return fail(err)
+		}
+		s.stream = stream
+	}
+	s.next++
+	frame := &pb.TransactionChannelRequest{AttemptId: s.next,
+		Transactions: make([]*pb.ApplyTransactionRequest, len(batch))}
+	// The frame's shared budget is its latest member deadline; a member without
+	// one leaves only the stream deadline. Members whose own deadline passes
+	// first return to their callers and resolve as UNKNOWN.
+	var latest time.Time
+	bounded := true
+	for i, q := range batch {
+		frame.Transactions[i] = q.request
+		if deadline, ok := q.ctx.Deadline(); !ok {
+			bounded = false
+		} else if deadline.After(latest) {
+			latest = deadline
 		}
 	}
-	lease.next++
-	frame := &pb.TransactionChannelRequest{AttemptId: lease.next, Transaction: request}
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
+	if bounded {
+		remaining := time.Until(latest)
 		if remaining <= 0 {
-			return nil, nil, status.Error(codes.DeadlineExceeded, "transaction attempt expired")
+			return fail(status.Error(codes.DeadlineExceeded, "transaction attempt expired"))
 		}
 		frame.TimeoutNs = remaining.Nanoseconds()
 	}
-	if err := lease.stream.Send(frame); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			err = status.FromContextError(ctxErr).Err()
-		}
-		return nil, nil, err
+	if err := s.stream.Send(frame); err != nil {
+		return fail(err)
 	}
-	reply, err := lease.stream.Recv()
+	reply, err := s.stream.Recv()
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			err = status.FromContextError(ctxErr).Err()
-		}
-		return nil, nil, err
+		return fail(err)
 	}
 	if reply.GetAttemptId() != frame.GetAttemptId() {
-		return nil, nil, status.Error(codes.Unknown, "transaction acknowledgement does not match attempt")
+		return fail(status.Error(codes.Unknown, "transaction acknowledgement does not match attempt"))
 	}
-	code := codes.Code(reply.GetStatusCode())
-	if code == codes.OK {
-		if reply.GetTransaction() == nil || reply.GetError() != nil ||
-			reply.GetTransaction().GetRecord() == nil ||
-			reply.GetTransaction().GetRecord().GetRequestId() != request.GetRequestId() {
-			return nil, nil, status.Error(codes.Unknown, "invalid transaction acknowledgement record")
+	results := reply.GetResults()
+	if len(results) == 0 {
+		// A refused frame: nothing in it was applied.
+		if reply.GetStatusCode() == 0 || reply.GetError() == nil {
+			return fail(status.Error(codes.Unknown, "invalid transaction acknowledgement frame"))
 		}
-		reusable = true
-		return reply.GetTransaction(), nil, nil
+		r := frameResult(&pb.TransactionChannelResult{StatusCode: reply.GetStatusCode(),
+			StatusMessage: reply.GetStatusMessage(),
+			Result:        &pb.TransactionChannelResult_Error{Error: reply.GetError()}}, "")
+		for _, q := range batch {
+			q.done <- r
+		}
+		return s
 	}
-	if code > codes.Unauthenticated || reply.GetError() == nil || reply.GetTransaction() != nil {
-		return nil, nil, status.Error(codes.Unknown, "invalid transaction error acknowledgement")
+	if len(results) != len(batch) || reply.GetStatusCode() != 0 {
+		return fail(status.Error(codes.Unknown, "invalid transaction acknowledgement frame"))
 	}
-	wire, err := proto.Marshal(reply.GetError())
+	for i, q := range batch {
+		q.done <- frameResult(results[i], q.request.GetRequestId())
+	}
+	return s
+}
+
+// frameResult is one transaction's answer; requestID is empty for a refused frame.
+func frameResult(result *pb.TransactionChannelResult, requestID string) streamResult {
+	code := codes.Code(result.GetStatusCode())
+	if code == codes.OK {
+		if requestID == "" || result.GetTransaction().GetRecord().GetRequestId() != requestID {
+			return streamResult{err: status.Error(codes.Unknown, "invalid transaction acknowledgement record")}
+		}
+		return streamResult{response: result.GetTransaction()}
+	}
+	if code > codes.Unauthenticated || result.GetError() == nil {
+		return streamResult{err: status.Error(codes.Unknown, "invalid transaction error acknowledgement")}
+	}
+	wire, err := proto.Marshal(result.GetError())
 	if err != nil {
-		return nil, nil, status.Error(codes.Unknown, "cannot decode transaction error acknowledgement")
+		return streamResult{err: status.Error(codes.Unknown, "cannot decode transaction error acknowledgement")}
 	}
-	reusable = true
-	return nil, metadata.Pairs(errorDetailKey, string(wire)), status.Error(code, reply.GetStatusMessage())
+	return streamResult{trailer: metadata.Pairs(errorDetailKey, string(wire)), err: status.Error(code, result.GetStatusMessage())}
 }

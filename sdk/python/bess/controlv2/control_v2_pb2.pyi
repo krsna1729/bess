@@ -638,28 +638,40 @@ class ApplyTransactionResponse(_message.Message):
     def __init__(self, record: _Optional[_Union[TransactionRecord, _Mapping]] = ..., daemon_epoch: _Optional[int] = ..., replayed: _Optional[bool] = ...) -> None: ...
 
 class TransactionChannelRequest(_message.Message):
-    __slots__ = ("attempt_id", "transaction", "timeout_ns")
+    __slots__ = ("attempt_id", "transactions", "timeout_ns")
     ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
-    TRANSACTION_FIELD_NUMBER: _ClassVar[int]
+    TRANSACTIONS_FIELD_NUMBER: _ClassVar[int]
     TIMEOUT_NS_FIELD_NUMBER: _ClassVar[int]
     attempt_id: int
-    transaction: ApplyTransactionRequest
+    transactions: _containers.RepeatedCompositeFieldContainer[ApplyTransactionRequest]
     timeout_ns: int
-    def __init__(self, attempt_id: _Optional[int] = ..., transaction: _Optional[_Union[ApplyTransactionRequest, _Mapping]] = ..., timeout_ns: _Optional[int] = ...) -> None: ...
+    def __init__(self, attempt_id: _Optional[int] = ..., transactions: _Optional[_Iterable[_Union[ApplyTransactionRequest, _Mapping]]] = ..., timeout_ns: _Optional[int] = ...) -> None: ...
 
-class TransactionChannelResponse(_message.Message):
-    __slots__ = ("attempt_id", "transaction", "error", "status_code", "status_message")
-    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+class TransactionChannelResult(_message.Message):
+    __slots__ = ("transaction", "error", "status_code", "status_message")
     TRANSACTION_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
     STATUS_CODE_FIELD_NUMBER: _ClassVar[int]
     STATUS_MESSAGE_FIELD_NUMBER: _ClassVar[int]
-    attempt_id: int
     transaction: ApplyTransactionResponse
     error: ErrorDetail
     status_code: int
     status_message: str
-    def __init__(self, attempt_id: _Optional[int] = ..., transaction: _Optional[_Union[ApplyTransactionResponse, _Mapping]] = ..., error: _Optional[_Union[ErrorDetail, _Mapping]] = ..., status_code: _Optional[int] = ..., status_message: _Optional[str] = ...) -> None: ...
+    def __init__(self, transaction: _Optional[_Union[ApplyTransactionResponse, _Mapping]] = ..., error: _Optional[_Union[ErrorDetail, _Mapping]] = ..., status_code: _Optional[int] = ..., status_message: _Optional[str] = ...) -> None: ...
+
+class TransactionChannelResponse(_message.Message):
+    __slots__ = ("attempt_id", "results", "status_code", "status_message", "error")
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    RESULTS_FIELD_NUMBER: _ClassVar[int]
+    STATUS_CODE_FIELD_NUMBER: _ClassVar[int]
+    STATUS_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    attempt_id: int
+    results: _containers.RepeatedCompositeFieldContainer[TransactionChannelResult]
+    status_code: int
+    status_message: str
+    error: ErrorDetail
+    def __init__(self, attempt_id: _Optional[int] = ..., results: _Optional[_Iterable[_Union[TransactionChannelResult, _Mapping]]] = ..., status_code: _Optional[int] = ..., status_message: _Optional[str] = ..., error: _Optional[_Union[ErrorDetail, _Mapping]] = ...) -> None: ...
 
 class GetTransactionRequest(_message.Message):
     __slots__ = ("request_id",)

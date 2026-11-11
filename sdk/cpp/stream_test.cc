@@ -24,8 +24,8 @@ class MalformedAckPeer final : public v2::Control::Service {
     if (!stream->Read(&frame)) return grpc::Status::OK;
     v2::TransactionChannelResponse reply;
     reply.set_attempt_id(frame.attempt_id());
-    auto *transaction = reply.mutable_transaction();
-    transaction->set_daemon_epoch(frame.transaction().daemon_epoch());
+    auto *transaction = reply.add_results()->mutable_transaction();
+    transaction->set_daemon_epoch(frame.transactions(0).daemon_epoch());
     if (!missing_record_) {
       transaction->mutable_record()->set_request_id("a-different-request");
       transaction->mutable_record()->set_outcome(v2::TransactionRecord::OUTCOME_APPLIED);

@@ -914,70 +914,85 @@ TEST_F(ConsistencyRpcTest, TheDaemonWaitsOutBusyWithinABound) {
   EXPECT_EQ(count(Outcome::kApplied), applied + 1);
 }
 
-TEST_F(ConsistencyRpcTest, PersistentChannelKeepsIndividualErrorsAndReplay) {
+TEST_F(ConsistencyRpcTest, PersistentChannelFrameKeepsIndividualErrorsAndReplay) {
   grpc::ClientContext context;
   context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
   auto channel = stub_->TransactionChannel(&context);
-  auto exchange = [&](uint64_t attempt, v2::ApplyTransactionRequest transaction,
+  auto exchange = [&](uint64_t attempt, std::vector<v2::ApplyTransactionRequest> transactions,
                       int64_t timeout = 1000000000) {
     v2::TransactionChannelRequest request;
     request.set_attempt_id(attempt);
     request.set_timeout_ns(timeout);
-    *request.mutable_transaction() = std::move(transaction);
+    for (auto &transaction : transactions) {
+      *request.add_transactions() = std::move(transaction);
+    }
     EXPECT_TRUE(channel->Write(request));
     v2::TransactionChannelResponse response;
     EXPECT_TRUE(channel->Read(&response));
     EXPECT_EQ(attempt, response.attempt_id());
     return response;
   };
-  auto transaction = Request("stream-first", Level::CONSISTENCY_REFERENTIAL,
-                             {Op("meters", 1, 1)});
-  transaction.set_daemon_epoch(service_->epoch());
-  const auto first = exchange(1, transaction);
-  ASSERT_EQ(grpc::StatusCode::OK, first.status_code());
-  ASSERT_TRUE(first.has_transaction());
-  EXPECT_EQ(v2::TransactionRecord::OUTCOME_APPLIED,
-            first.transaction().record().outcome());
-  const auto replay = exchange(2, transaction);
-  ASSERT_TRUE(replay.has_transaction());
-  EXPECT_TRUE(replay.transaction().replayed());
-  EXPECT_EQ(first.transaction().record().generation(),
-            replay.transaction().record().generation());
-
-  transaction.set_request_id("stream-refused");
-  transaction.set_daemon_epoch(service_->epoch() + 1);
-  const auto stale = exchange(3, transaction);
-  EXPECT_EQ(grpc::StatusCode::FAILED_PRECONDITION, stale.status_code());
-  EXPECT_FALSE(stale.has_transaction());
-  ASSERT_TRUE(stale.has_error());
-  EXPECT_EQ(v2::ErrorDetail::EPOCH_MISMATCH, stale.error().code());
-  EXPECT_EQ(service_->epoch(), stale.error().daemon_epoch());
-  transaction.set_daemon_epoch(service_->epoch());
-  const auto bad_budget = exchange(4, transaction, -1);
-  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, bad_budget.status_code());
-  EXPECT_EQ("timeout_ns", bad_budget.error().field());
-  {
+  auto known = [&](const std::string &request_id) {
     grpc::ClientContext get_context;
     v2::GetTransactionRequest get;
-    get.set_request_id("stream-refused");
-    v2::GetTransactionResponse known;
-    ASSERT_TRUE(stub_->GetTransaction(&get_context, get, &known).ok());
-    EXPECT_FALSE(known.known());
-  }
-  transaction.set_request_id("stream-malformed");
-  transaction.mutable_ops(0)->mutable_value()->set_value("\xff", 1);
-  const auto rejected = exchange(5, transaction);
+    get.set_request_id(request_id);
+    v2::GetTransactionResponse response;
+    EXPECT_TRUE(stub_->GetTransaction(&get_context, get, &response).ok());
+    return response.known();
+  };
+  auto first = Request("stream-first", Level::CONSISTENCY_REFERENTIAL, {Op("meters", 1, 1)});
+  first.set_daemon_epoch(service_->epoch());
+  auto stale = first;
+  stale.set_request_id("stream-refused");
+  stale.set_daemon_epoch(service_->epoch() + 1);
+  auto malformed = first;
+  malformed.set_request_id("stream-malformed");
+  malformed.mutable_ops(0)->mutable_value()->set_value("\xff", 1);
+  auto last = Request("stream-after-error", Level::CONSISTENCY_REFERENTIAL, {Op("meters", 2, 2)});
+  last.set_daemon_epoch(service_->epoch());
+
+  // One frame: each transaction is answered on its own, in order; a refusal
+  // or rejection does not stop the ones after it.
+  const auto frame = exchange(1, {first, first, stale, malformed, last});
+  EXPECT_EQ(grpc::StatusCode::OK, frame.status_code());
+  ASSERT_EQ(5, frame.results_size());
+  const auto &applied = frame.results(0);
+  ASSERT_TRUE(applied.has_transaction());
+  EXPECT_EQ(v2::TransactionRecord::OUTCOME_APPLIED, applied.transaction().record().outcome());
+  const auto &replay = frame.results(1);
+  ASSERT_TRUE(replay.has_transaction());
+  EXPECT_TRUE(replay.transaction().replayed());
+  EXPECT_EQ(applied.transaction().record().generation(),
+            replay.transaction().record().generation());
+  const auto &refused = frame.results(2);
+  EXPECT_EQ(grpc::StatusCode::FAILED_PRECONDITION, refused.status_code());
+  ASSERT_TRUE(refused.has_error());
+  EXPECT_EQ(v2::ErrorDetail::EPOCH_MISMATCH, refused.error().code());
+  EXPECT_EQ(service_->epoch(), refused.error().daemon_epoch());
+  EXPECT_FALSE(known("stream-refused"));
+  const auto &rejected = frame.results(3);
   ASSERT_TRUE(rejected.has_transaction());
-  EXPECT_EQ(v2::TransactionRecord::OUTCOME_REJECTED,
-            rejected.transaction().record().outcome());
-  transaction = Request("stream-after-error", Level::CONSISTENCY_REFERENTIAL,
-                         {Op("meters", 2, 2)});
-  transaction.set_daemon_epoch(service_->epoch());
-  const auto last = exchange(6, transaction);
-  ASSERT_TRUE(last.has_transaction());
-  EXPECT_EQ(v2::TransactionRecord::OUTCOME_APPLIED,
-            last.transaction().record().outcome());
-  EXPECT_FALSE(last.transaction().replayed());
+  EXPECT_EQ(v2::TransactionRecord::OUTCOME_REJECTED, rejected.transaction().record().outcome());
+  const auto &after = frame.results(4);
+  ASSERT_TRUE(after.has_transaction());
+  EXPECT_EQ(v2::TransactionRecord::OUTCOME_APPLIED, after.transaction().record().outcome());
+  EXPECT_FALSE(after.transaction().replayed());
+
+  // A refused frame has no results and applies nothing in it.
+  auto unsent = Request("stream-bad-budget", Level::CONSISTENCY_REFERENTIAL, {Op("meters", 3, 3)});
+  unsent.set_daemon_epoch(service_->epoch());
+  const auto bad_budget = exchange(2, {unsent}, -1);
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, bad_budget.status_code());
+  EXPECT_EQ(0, bad_budget.results_size());
+  EXPECT_EQ("timeout_ns", bad_budget.error().field());
+  EXPECT_FALSE(known("stream-bad-budget"));
+  std::vector<v2::ApplyTransactionRequest> oversized(bess::control::kMaxChannelTransactions + 1, unsent);
+  oversized[0].set_request_id("stream-oversized");
+  const auto too_many = exchange(3, std::move(oversized));
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, too_many.status_code());
+  EXPECT_EQ(0, too_many.results_size());
+  EXPECT_EQ("transactions", too_many.error().field());
+  EXPECT_FALSE(known("stream-oversized"));
   EXPECT_TRUE(channel->WritesDone());
   EXPECT_TRUE(channel->Finish().ok());
 }

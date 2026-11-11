@@ -57,6 +57,7 @@ Columns:
 | Transaction history kept | 4,096 records | `DataplaneTransactions::kMaxRecords` | No | oldest record dropped |
 | Transaction history bytes | 4 MiB (`bessd/transaction_records`) | `DataplaneTransactions::kMaxRecordBytes` | No | oldest record dropped (the newest is always kept) |
 | Pending reference cascades | 4,096 | `TransactionEngine::kMaxPendingCascades` | No | transaction answered BUSY (retry) |
+| Transactions in one `TransactionChannel` frame | 64 | `kMaxChannelTransactions` (`control/api_v2.h`) | No | the frame is refused with INVALID_ARGUMENT (field `transactions`); nothing in it is applied |
 
 ## Modules
 
