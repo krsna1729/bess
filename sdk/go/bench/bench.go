@@ -82,6 +82,8 @@ type Config struct {
 	// a daemon with a pipeline is refused rather than replaced.
 	ApplyGraph bool `json:"apply_graph,omitempty"`
 	WorkerCore int  `json:"worker_core,omitempty"` // that graph's worker CPU; default 2, never the control CPU
+	// Stages selects the seeded multi-resource replacement fixture, not churn.
+	Stages int `json:"stages,omitempty"`
 }
 
 // WithDefaults fills in what a caller left out, so a caller can spread the

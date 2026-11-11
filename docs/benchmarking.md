@@ -184,6 +184,18 @@ nor an N4 session-rate rating. Go and C++ use different preload and message
 construction paths, so these measurements compare revisions within each
 client, not one language against the other.
 
+For idle packet-rate diagnostics use `--rates 0 --duration 10 --counter-window`.
+The optional `# counter_window` JSON brackets the benchmark's existing Metrics
+calls on its persistent SDK connection; it adds no RPC and no per-packet clock.
+It reports raw packet deltas, minimum/maximum counter elapsed times and the
+legacy thread-loop denominator separately. With `--daemon-pid`, process/worker
+CPU deltas are included even at zero transactions (10-ms process-stat ticks;
+per-thread runtime uses nanosecond `schedstat` counters).
+Keep the ordinary plain run as a reference and retain both counter-time bounds;
+a new `bessctl metrics` process per endpoint includes CLI startup and is not a
+precise substitute. This option does not change the default table or old data.
+
+
 ### Go live control and warm lookup
 
 The original three-client-core TCP block had large temporal outliers in both
@@ -295,6 +307,158 @@ GOGC=100 GOMAXPROCS=1 taskset -c 10 /tmp/bess-sdk.test -test.run='^$' \
 The nightly hosted-runner subset deliberately excludes live/paced workloads
 ([benchmark trends](benchmark-trends.md#the-measured-subset)). Do not turn
 these laptop results into a fixed hosted-runner pass/fail threshold.
+
+## Transaction-stage floor ladder
+
+Measure the native in-process floor first. Then add codecs, public service,
+RPC and SDK construction without changing the resource payload.
+
+The fixture keeps **eight** connected `ExactMatch` modules, `stage0` through
+`stage7`, with 1,024 seeded entries each and no Source or active packet reader.
+A transaction replaces one existing entry in each of the first **1, 2, 3, 4 or
+8 distinct resources**. Stage count is not the number of updates in one table.
+Keys are one four-byte field at offset 26: `BE32(0x0b000001 + slot)`.
+The value's gate alternates 1/2 on each key revisit, including spread runs.
+All gates lead to the next stage or the final sink. This graph implies no
+resource-reference edges. ExactMatch uses its public default growth policy;
+an absent fixed `Resource::Capacity()` is not a zero capacity or an error.
+
+`core/modules_exact_match_transaction_bench` provides these native cases:
+
+- `BM_StageOwned`: typed `TransactionEngine::ApplyOwned` under the control
+  lock. This excludes public epoch, deduplication, receipt and event work.
+- `BM_StageAdapter`: `DataplaneTransactions::Apply`, including codecs,
+  deterministic digest and the bounded admitted receipt ledger.
+- `BM_StageService`: the direct public `ControlV2Service` handler.
+- `BM_StageProto`: request and receipt serialization/parsing around that handler.
+- `BM_StageTcp` and `BM_StageUnix`: generated C++ gRPC stubs to that service
+  in the benchmark process. Client and server CPU are both in process CPU.
+
+Setup, seeding and a separate cold call are outside the warm loop. Warm native
+work includes reusable input mutation, application and individual outcome
+validation. Hot and spread localities are separate. One writer is the floor;
+eight writers are a separate contention experiment. Every public transaction
+has a unique ID, epoch, full receipt and per-operation status check. Client
+observation storage is bounded; do not archive every full client receipt in a
+minimum-cost loop. The normal server receipt policy remains enabled.
+
+Both SDK stage runners accept **1..65536 iterations**, inclusive, and validate
+that limit before graph changes or transaction-array allocation. Go accepts
+1..32768 resident entries per stage; use 1024 to match the C++ and native fixture.
+Before any seeding or timing, the SDK runners read the eight named map resources
+through the public resource-bearing pipeline snapshot API and check the daemon
+epoch, ExactMatch key/value types, and contents. Each table must be empty or
+contain exactly the requested resident population (1024 in C++), with every
+encoded fixture key present exactly once and only the encoded gate-1/gate-2
+values. Partial tables, extra or substituted keys, duplicate keys, and
+incompatible values/types are rejected without erasing caller-owned entries.
+An empty graph can therefore be seeded, and a previously measured exact fixture
+can be attached and reseeded. Configured or observed workers and task placements
+are rejected, even if paused: the stage floor requires a dedicated worker-free,
+task-free graph rather than assuming there are no packet readers. These are
+single-writer precondition checks, not protection against another controller
+changing contents or starting workers after the snapshot.
+
+Go `-stage-graph-only` creates/inspects the graph but does not seed it:
+`retained_entries` is the observed entry count (zero for a fresh graph), while
+`target_entries` is the intended seeded population. Successful seeding updates
+the retained count. Prebuilt Go transactions are released after each Commit,
+including a failed Commit, so transaction-local cached results do not archive
+all warm receipts. Replayed receipts are not accepted as fresh stage work.
+C++ stage output is one complete JSON object even on failure, with `ok:false`,
+completed measurements, and bounded failure context (phase, prefix, ordinal,
+accepted count, and request/receipt outcome evidence when available); failure
+exits nonzero. Its ordinary packet-churn output is unchanged.
+
+Build and run after setting the dependency library path for this release tree:
+
+```sh
+ninja -C "$build" core/modules_exact_match_transaction_bench \
+  tests/perf/live_transaction_bench
+GOWORK=off go -C sdk/go build -o /tmp/bessbench ./cmd/bessbench
+
+BESSD_MEM_LIMIT_MB=512 taskset -c 6 \
+  "$build/core/modules_exact_match_transaction_bench" \
+  --benchmark_filter='BM_Stage.*/stages:(1|2|3|4|8)/spread:(0|1)/.*threads:1$' \
+  --benchmark_min_time=1s --benchmark_repetitions=3 \
+  --benchmark_out=native-stages.json --benchmark_out_format=json
+```
+
+Use `UseRealTime`/whole-process CPU block means, not the benchmark caller's
+thread CPU alone: thread CPU misses RPC server work. Check JSON for skipped/
+error cases even when Google Benchmark exits zero. Preserve every repeat,
+including non-monotonic rows. A cold-call scalar is not a latency distribution.
+The in-process fixture excludes normal daemon maintenance; it is not a full
+daemon or UPF capacity rating.
+
+For a topology-matched language comparison, start an otherwise empty real
+daemon on a separate control core. Both SDKs use its normal maintenance,
+validation, publication and receipt behavior. Each command below has one
+synchronous caller. Use the same transport, resident set and key locality:
+
+```sh
+# Create the idle graph once; do not replace an unrelated existing pipeline.
+GOGC=100 GOMAXPROCS=1 taskset -c 4 /tmp/bessbench \
+  -addr "$endpoint" -stages 1 -stage-graph-only
+
+# Public C++ SDK: prepared messages, timed transaction build/pack/Commit.
+LD_LIBRARY_PATH="$build/sdk/cpp:$LD_LIBRARY_PATH" taskset -c 4 \
+  "$build/tests/perf/live_transaction_bench" --grpc-url "$endpoint" \
+  --daemon-pid "$daemon_pid" --stage-counts 1,2,3,4,8 \
+  --stage-iterations 5000 --stage-locality hot --stage-mode message
+
+# Public Go SDK: separate build, prebuilt Commit, and reseeded build+Commit.
+GOGC=100 GOMAXPROCS=1 taskset -c 4 /tmp/bessbench \
+  -addr "$endpoint" -no-graph -stages 1,2,3,4,8 \
+  -stage-iterations 5000 -stage-resident 1024 \
+  -stage-mode message -stage-locality hot
+```
+
+Repeat with `spread`, Unix gRPC, reversed stage order and `encoded` mode in
+both clients. C++ `--stage-mode encoded` uses `Transaction::UpsertEncoded`:
+the SDK copies the caller's protobuf wire bytes and the daemon validates them
+against the resource schema before applying anything. Go `-stage-mode encoded`
+borrows the bytes until Commit returns. Neither mode changes the public
+transaction, epoch, replay, atomicity or individual-receipt contract.
+Keep prepared-wire and ordinary message packing results separate.
+
+Stage output includes accepted counts and block wall/client-process CPU means.
+`started_monotonic_ns` and `ended_monotonic_ns` bracket each warm block using
+`CLOCK_MONOTONIC`; use those windows to exclude setup/seed/schema/teardown from
+profiles. They add no per-call clocks. The C++ daemon CPU option uses `/proc`
+ticks, so short-cell values have coarse resolution. Go daemon CPU must be
+observed separately. Always pair a sampled run with otherwise identical plain
+runs; report observer cost rather than correcting the result by an assumed
+constant.
+
+Go `-stage-concurrency N` selects bounded callers (powers of two in 1..64).
+Parallel callers require `spread`, a resident set divisible by N, and at least
+N iterations. Each caller owns a disjoint strided key lane and waits for its
+individual receipt before advancing; revisits still alternate the value.
+Seeding and the cold transaction remain serial and outside the warm window.
+Build remains serial; Commit and build+Commit use the selected caller bound.
+Parallel output retains accepted counts and the last outcome per caller,
+including failed/unknown outcomes before stopping further work.
+At N > 1, block `mean_wall_ns` is wall time divided by accepted operations:
+the inverse of throughput, **not** individual acknowledgement latency. Tail
+latencies need a separate observer run corroborated by a plain run.
+Use `-stage-measure-acks` only for that diagnostic observer run. It emits
+sample count, p50 and p99 using the existing Shape quantile convention, for
+each prebuilt Commit and combined-phase Commit. Clocks bracket SDK Commit plus
+individual-receipt validation, including retries; combined-phase build work
+is outside these acknowledgement clocks. This is closed-loop caller latency,
+not offered-arrival/N4 queue latency. Plain runs omit the per-call clocks,
+sample array and latency fields. Match payloads, caller bound and binary;
+report the observed arm's overhead against both surrounding plain controls.
+
+Do not subtract same-core in-process RPC from a separate-core Go client and
+label the result a language cost. Do not subtract this generic replacement
+fixture from an N4 establishment/delete cycle. UPF's compiler fixture checks
+its actual 1/2/3/4/8 resource combinations separately; codecs, rule types,
+dependencies, operation mix and counter actions differ. Keep plain runs as
+the reference for separately sampled arms, and qualify packets, reporting,
+restart and the intended resident population before publishing an equipment
+rate. None of these benchmarks makes a 100K PFCP-session claim.
 
 ## The firewall table
 
