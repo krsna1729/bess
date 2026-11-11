@@ -83,6 +83,8 @@ void RecordMemoryBaseline();
 // grace period is ~11 us, or one task invocation when that is longer, D-012).
 inline constexpr int kBusyRetries = 5;
 inline constexpr std::chrono::microseconds kBusyFirstBackoff{200};
+// TransactionChannel accepts at most this many transactions in one frame.
+inline constexpr int kMaxChannelTransactions = 64;
 
 class ControlV2Service final : public pb::v2::Control::Service {
  public:

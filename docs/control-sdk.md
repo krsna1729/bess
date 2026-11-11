@@ -79,17 +79,22 @@ Go and C++ optionally use the public `Control.TransactionChannel` bidi RPC:
 | Go | `NewClientWithTransactionStreams(conn, retry, N)` | Borrows connection; Close cancels its streams only |
 | C++ | `Client::DialTransactionStreams(target, N, retry)` | Returns `Result<std::unique_ptr<Client>>`; owns connection and streams |
 
-N is 1..64 leases. Each lease has one outstanding attempt, with an individual
-correlated acknowledgement; parallel callers lease separate persistent streams.
-There is no batched acknowledgement or application queue. Existing Dial remains
+N is 1..64 streams. Each stream has one outstanding frame of 1..64 independent
+transactions; each transaction is applied atomically on its own and answered
+by its own correlated result. The Go client sends every commit already queued
+behind a busy stream in its next frame, without waiting to fill it; C++ sends
+one transaction per frame. Existing Dial remains
 unary, and all other control/admin/action/snapshot/report APIs remain available
 over the ordinary channel. Opt-in requires the daemon's advertised
 `TransactionChannel` RPC; there is no silent unary fallback.
 
 Native admission, epochs, replay, atomicity and events are unchanged. A remaining
-attempt budget is carried in each frame and starts when the server reads it.
-Client deadline/cancellation is active during stream creation too and retires
-only that lease, not the transaction's possible effects. A successful frame
+budget is carried in each frame, shared by its transactions, and starts when the
+server reads it; Go uses the latest member deadline. A refused frame (zero
+attempt ID, negative budget, 0 or more than 64 transactions) has no results and
+applies nothing. Client deadline/cancellation is active during stream creation
+too. A frame's stream is cancelled once all its callers stop waiting; that is
+not a rollback of the transactions' possible effects. A successful result
 must contain a record for the original request ID. Missing/foreign records,
 locally oversized acknowledgements and EOF remain UNKNOWN; the SDK uses ordinary
 GetTransaction recovery and exact-ID/payload retry rules. Go/C++ distinguish an

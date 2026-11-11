@@ -179,12 +179,16 @@ type corruptNativeAckStream struct {
 
 func (s *corruptNativeAckStream) Recv() (*pb.TransactionChannelResponse, error) {
 	reply, err := s.Control_TransactionChannelClient.Recv()
-	if err == nil && reply.GetTransaction().GetRecord().GetOutcome() == pb.TransactionRecord_OUTCOME_APPLIED &&
+	if err != nil || len(reply.GetResults()) == 0 {
+		return reply, err
+	}
+	applied := reply.GetResults()[0].GetTransaction()
+	if applied.GetRecord().GetOutcome() == pb.TransactionRecord_OUTCOME_APPLIED &&
 		s.client.corrupted.CompareAndSwap(false, true) {
 		if s.client.missingRecord {
-			reply.GetTransaction().Record = nil
+			applied.Record = nil
 		} else {
-			reply.GetTransaction().Record.RequestId = "a-different-native-request"
+			applied.Record.RequestId = "a-different-native-request"
 		}
 	}
 	return reply, err

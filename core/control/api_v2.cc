@@ -1078,16 +1078,16 @@ grpc::Status ControlV2Service::TransactionChannel(
     }
     v2::TransactionChannelResponse response;
     response.set_attempt_id(request.attempt_id());
-    std::optional<v2::ErrorDetail> error;
-    grpc::Status status;
-    if (request.attempt_id() == 0 || !request.has_transaction() ||
+    const int count = request.transactions_size();
+    if (request.attempt_id() == 0 || count == 0 || count > kMaxChannelTransactions ||
         request.timeout_ns() < 0) {
-      error.emplace();
+      v2::ErrorDetail *error = response.mutable_error();
       error->set_code(v2::ErrorDetail::INVALID_ARGUMENT);
       error->set_field(request.attempt_id() == 0 ? "attempt_id" :
-                       !request.has_transaction() ? "transaction" : "timeout_ns");
+                       request.timeout_ns() < 0 ? "timeout_ns" : "transactions");
       error->set_message("invalid transaction channel frame");
-      status = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error->message());
+      response.set_status_code(grpc::StatusCode::INVALID_ARGUMENT);
+      response.set_status_message(error->message());
     } else {
       auto deadline = context->deadline();
       if (request.timeout_ns() > 0) {
@@ -1097,15 +1097,19 @@ grpc::Status ControlV2Service::TransactionChannel(
           deadline = now + budget;
         }
       }
-      status = ApplyTransactionImpl(context, &request.transaction(),
-                                    response.mutable_transaction(), deadline, &error);
-    }
-    if (!status.ok()) {
-      response.clear_transaction();
-      response.set_status_code(status.error_code());
-      response.set_status_message(status.error_message());
-      if (error.has_value()) {
-        *response.mutable_error() = std::move(error.value());
+      for (const auto &transaction : request.transactions()) {
+        v2::TransactionChannelResult *result = response.add_results();
+        std::optional<v2::ErrorDetail> error;
+        const grpc::Status status = ApplyTransactionImpl(
+            context, &transaction, result->mutable_transaction(), deadline, &error);
+        if (!status.ok()) {
+          result->clear_transaction();
+          result->set_status_code(status.error_code());
+          result->set_status_message(status.error_message());
+          if (error.has_value()) {
+            *result->mutable_error() = std::move(error.value());
+          }
+        }
       }
     }
     if (!stream->Write(response)) {
