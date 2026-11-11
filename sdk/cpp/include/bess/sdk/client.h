@@ -385,6 +385,10 @@ class Transaction {
   // Adds key -> value to the map resource `r`, or replaces its value.
   Result<void> Upsert(const Resource &r, const google::protobuf::Message &key,
                       const google::protobuf::Message &value);
+  // Already encoded as r.key_type / r.value_type. Bytes are copied; the daemon
+  // validates their encoding before applying the transaction, as for Upsert.
+  Result<void> UpsertEncoded(const Resource &r, std::string_view key,
+                             std::string_view value);
   // Removes `key` from the map resource `r`.
   Result<void> Erase(const Resource &r, const google::protobuf::Message &key);
   // Sets the singleton resource `r` to `value` (D-129).

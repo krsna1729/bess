@@ -385,6 +385,19 @@ TEST(SdkClient, TypesAreCheckedBeforeAnythingIsSent) {
   EXPECT_TRUE(h.f->sent.empty());
 }
 
+TEST(SdkClient, EncodedUpsertsRespectResourceShapeAndEpoch) {
+  Harness h(4);
+  auto r = h.c->Resource(kResource);
+  ASSERT_TRUE(r);
+  auto singleton = *r;
+  singleton.kind = pb::TransactionResource::KIND_SINGLETON;
+  auto tx = h.c->NewTransaction();
+  EXPECT_EQ(KindOf(tx.UpsertEncoded(singleton, {}, {})), ErrorKind::kInvalidRequest);
+  auto other_epoch = *r;
+  ++other_epoch.daemon_epoch;
+  EXPECT_EQ(KindOf(tx.UpsertEncoded(other_epoch, {}, {})), ErrorKind::kStaleResource);
+}
+
 TEST(SdkClient, Applied) {
   Harness h(4);
   h.f->applies = {Answer(kApplied, 1)};
