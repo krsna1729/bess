@@ -1109,6 +1109,7 @@ type Transaction struct {
 
 	c           *Client
 	ops         []*pb.TransactionOp
+	packed      []packedOp // the current block of ops; see newOp
 	expected    uint64
 	hasExpected bool
 	snapshot    bool
@@ -1155,7 +1156,7 @@ func (t *Transaction) Upsert(r Resource, key, value proto.Message) error {
 	if err := checkType(r, "value", value, r.ValueType); err != nil {
 		return err
 	}
-	op := new(packedOp)
+	op := t.newOp()
 	if err := pack(&op.key, key); err != nil {
 		return &InvalidRequestError{Message: err.Error()}
 	}
@@ -1175,7 +1176,7 @@ func (t *Transaction) Set(r Resource, value proto.Message) error {
 	if err := checkType(r, "value", value, r.ValueType); err != nil {
 		return err
 	}
-	op := new(packedOp)
+	op := t.newOp()
 	if err := pack(&op.value, value); err != nil {
 		return &InvalidRequestError{Message: err.Error()}
 	}
@@ -1192,7 +1193,7 @@ func (t *Transaction) Erase(r Resource, key proto.Message) error {
 	if err := checkType(r, "key", key, r.KeyType); err != nil {
 		return err
 	}
-	op := new(packedOp)
+	op := t.newOp()
 	if err := pack(&op.key, key); err != nil {
 		return &InvalidRequestError{Message: err.Error()}
 	}
@@ -1216,7 +1217,7 @@ func (t *Transaction) UpsertEncoded(r Resource, key, value Encoded) error {
 	if err := t.upsertable(r); err != nil {
 		return err
 	}
-	op := new(packedOp)
+	op := t.newOp()
 	op.key.TypeUrl, op.key.Value = typeURL(r.KeyType), key
 	op.value.TypeUrl, op.value.Value = typeURL(r.ValueType), value
 	op.op.Resource, op.op.Key, op.op.Value = r.Name, &op.key, &op.value
@@ -1229,7 +1230,7 @@ func (t *Transaction) SetEncoded(r Resource, value Encoded) error {
 	if err := t.settable(r); err != nil {
 		return err
 	}
-	op := new(packedOp)
+	op := t.newOp()
 	op.value.TypeUrl, op.value.Value = typeURL(r.ValueType), value
 	op.op.Resource, op.op.Value = r.Name, &op.value
 	t.ops = append(t.ops, &op.op)
@@ -1241,11 +1242,25 @@ func (t *Transaction) EraseEncoded(r Resource, key Encoded) error {
 	if err := t.erasable(r); err != nil {
 		return err
 	}
-	op := new(packedOp)
+	op := t.newOp()
 	op.key.TypeUrl, op.key.Value = typeURL(r.KeyType), key
 	op.op.Resource, op.op.Erase, op.op.Key = r.Name, true, &op.key
 	t.ops = append(t.ops, &op.op)
 	return nil
+}
+
+// newOp hands out the next op from blocks the transaction owns, each as large
+// as the ops before it (the first holds four), growing the op list alongside:
+// a 16-op transaction allocates 6 times rather than 21 and holds no spare op.
+// A full block is left where it is, so ops already handed out never move.
+func (t *Transaction) newOp() *packedOp {
+	if len(t.packed) == cap(t.packed) {
+		n := max(4, len(t.ops))
+		t.packed = make([]packedOp, 0, n)
+		t.ops = slices.Grow(t.ops, n)
+	}
+	t.packed = t.packed[:len(t.packed)+1]
+	return &t.packed[len(t.packed)-1]
 }
 
 func (t *Transaction) upsertable(r Resource) error {
