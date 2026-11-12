@@ -225,7 +225,7 @@ func (t *transactionStreams) send(s *transactionStream, batch []*queuedTransacti
 		return nil
 	}
 	if s.stream == nil {
-		stream, err := t.client.TransactionChannel(s.ctx)
+		stream, err := t.client.TransactionChannel(s.ctx, grpc.ForceCodecV2(transactionChannelCodec))
 		if err != nil {
 			return fail(err)
 		}
