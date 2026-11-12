@@ -1070,9 +1070,12 @@ grpc::Status ControlV2Service::TransactionChannel(
     grpc::ServerReaderWriter<v2::TransactionChannelResponse,
                              v2::TransactionChannelRequest> *stream) {
   for (;;) {
-    // Destroy each decoded frame after its acknowledgement. Idle streams do
-    // not retain a controller's largest request outside the gRPC quota.
-    v2::TransactionChannelRequest request;
+    // Destroy each decoded frame, with its arena, after its acknowledgement.
+    // Idle streams do not retain a controller's largest request outside the
+    // gRPC quota. The arena turns a batched frame's per-op messages and
+    // strings into a few block allocations.
+    google::protobuf::Arena arena;
+    auto &request = *google::protobuf::Arena::Create<v2::TransactionChannelRequest>(&arena);
     if (!stream->Read(&request)) {
       return grpc::Status::OK;
     }
