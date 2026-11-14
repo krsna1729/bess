@@ -5004,7 +5004,7 @@ type Event struct {
 	Source      string                 `protobuf:"bytes,5,opt,name=source,proto3" json:"source,omitempty"`
 	Generation  uint64                 `protobuf:"varint,6,opt,name=generation,proto3" json:"generation,omitempty"`
 	Fields      map[string]string      `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// "bess.gap": events [gap_from, gap_to) are no longer held.
+	// "bess.gap": observations [gap_from, gap_to) aged out or were memory-refused.
 	GapFrom       uint64 `protobuf:"varint,8,opt,name=gap_from,json=gapFrom,proto3" json:"gap_from,omitempty"`
 	GapTo         uint64 `protobuf:"varint,9,opt,name=gap_to,json=gapTo,proto3" json:"gap_to,omitempty"`
 	unknownFields protoimpl.UnknownFields

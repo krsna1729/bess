@@ -725,7 +725,7 @@ message GetSchemaResponse {
 // source "bessd": "bess.start" first (its sequence is where the stream starts,
 // with the daemon_epoch); "bess.restart" before it when the caller's sequence
 // or epoch is from before a restart (the stream then starts live);
-// "bess.gap" when what was asked for is older than the daemon still holds;
+// "bess.gap" when observations aged out or were refused under memory pressure;
 // "bess.progress" (with a types filter) carrying the last sequence passed
 // over, so a reconnect resumes there. Sequences restart with the daemon.
 
@@ -746,7 +746,7 @@ message Event {
   string source = 5;
   uint64 generation = 6;
   map<string, string> fields = 7;
-  // "bess.gap": events [gap_from, gap_to) are no longer held.
+  // "bess.gap": observations [gap_from, gap_to) aged out or were memory-refused.
   uint64 gap_from = 8;
   uint64 gap_to = 9;
 }
