@@ -13,15 +13,17 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "dataplane/worker_id.h"
+#include "utils/dpdk_memory.h"
 
 namespace bess::stats {
 
 // Operational events (M25 phase 2, D-084): control-plane observations, never
-// per-packet logs. Each has a sequence number (per daemon epoch, gapless while
-// the log holds it), a type, a source, a monotonic time, the transaction
+// per-packet logs. Each has a sequence number (per daemon epoch; memory
+// refusals leave explicit gaps), a type, a source, a monotonic time, the transaction
 // generation and string fields; the application gives types and fields their
 // meaning.
 struct Event {
@@ -53,8 +55,10 @@ static_assert(sizeof(WorkerEvent) == 64);
 // visible in the log as a "bess.events_lost" event.
 //
 // Control side: Emit() appends directly; DrainWorkers() (the maintenance loop,
-// every tick) moves what workers posted into the log. The log holds the last
-// `log_capacity` events; a reader that asks for older ones gets a gap.
+// every tick) moves what workers posted into the log. The log holds up to
+// `log_capacity` events. Memory pressure can refuse an observation: its sequence
+// is skipped and memory_lost() counts it, without affecting the observed command.
+// Readers receive explicit gaps for both refused and aged-out observations.
 //
 // Readers (any thread, e.g. a WatchEvents stream): Read() waits up to a
 // timeout for events at or after a sequence. Close() wakes every reader for
@@ -62,12 +66,18 @@ static_assert(sizeof(WorkerEvent) == 64);
 class EventHub {
  public:
   static constexpr int kMaxWorkers = 64;
+  static constexpr size_t kDefaultLogCapacity = 16384;
+  static constexpr size_t kDefaultRingCapacity = 256;
 
   // The log's events are heap objects (strings and a field map): about
   // 0.5 KiB each, so the default 16384 holds about 8 MiB when full. Worker
   // events reach the log only through DrainWorkers (the maintenance loop):
   // with the loop off, a worker's 257th event is refused and counted.
-  explicit EventHub(size_t log_capacity = 16384, size_t ring_capacity = 256);
+  // `growth`, when supplied by the owner, admits all retained storage and
+  // must outlive this hub. Read() returns independent, caller-owned copies.
+  explicit EventHub(size_t log_capacity = kDefaultLogCapacity,
+                    size_t ring_capacity = kDefaultRingCapacity,
+                    utils::MemoryGrowth *growth = nullptr);
   ~EventHub();
   EventHub(const EventHub &) = delete;
   EventHub &operator=(const EventHub &) = delete;
@@ -91,15 +101,16 @@ class EventHub {
   // poster that keeps what it would post for later (EventThrottle).
   bool Full(dataplane::WorkerId wid) const noexcept;
 
-  // Control side.
+  // Control side. A memory-refused observation still consumes its returned
+  // sequence and wakes readers. Retention allocation failures never propagate.
   uint64_t Emit(std::string type, std::string source, std::map<std::string, std::string> fields,
                 uint64_t generation = 0);
   size_t DrainWorkers();
 
   struct ReadResult {
     std::vector<Event> events;
-    // When `from` had aged out of the log: [gap_from, gap_to) were lost to
-    // this reader; events start at gap_to.
+    // [gap_from, gap_to) were refused or aged out; events start at gap_to.
+    // Each batch is contiguous: a later interior gap starts the next Read().
     uint64_t gap_from = 0;
     uint64_t gap_to = 0;
     uint64_t next = 0;  // the sequence to ask for next
@@ -112,26 +123,57 @@ class EventHub {
 
   uint64_t next_sequence() const;
   uint64_t lost() const noexcept;  // worker events refused by full rings, all workers
+  uint64_t memory_lost() const noexcept;  // observations refused by log memory
 
  private:
+  template <typename T>
+  using Allocator = utils::AdmittedGlibcAllocator<T>;
+  using Text = std::basic_string<char, std::char_traits<char>, Allocator<char>>;
+  using ValueNames = std::vector<Text, Allocator<Text>>;
+  struct TextLess {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const noexcept {
+      return a < b;
+    }
+  };
+  using Fields = std::map<Text, Text, TextLess,
+                          Allocator<std::pair<const Text, Text>>>;
+  struct StoredEvent {
+    explicit StoredEvent(utils::MemoryGrowth *growth);
+    void SetField(std::string_view key, std::string_view value);
+    void SetField(std::string_view key, uint64_t value);
+    uint64_t sequence = 0;
+    uint64_t time_ns = 0;
+    uint64_t generation = 0;
+    Text type;
+    Text source;
+    Fields fields;
+  };
   struct Ring;
+  struct RingDelete {
+    void operator()(Ring *ring) const noexcept;
+  };
   struct Type {
-    std::string name;
-    std::vector<std::string> value_names;
-    std::string source_prefix;
+    Text name;
+    ValueNames value_names;
+    Text source_prefix;
   };
 
-  uint64_t AppendLocked(Event e);
+  uint64_t AppendLocked(StoredEvent event);
+  uint64_t LoseLocked() noexcept;
 
   const size_t log_capacity_;
-  std::array<std::unique_ptr<Ring>, kMaxWorkers> rings_;
-  std::vector<Type> types_;  // control side (RegisterType, DrainWorkers)
+  // The injected hook outlives all retained storage. Post and Full never use it.
+  utils::MemoryGrowth *const growth_;
+  std::array<std::unique_ptr<Ring, RingDelete>, kMaxWorkers> rings_;
+  std::vector<Type, Allocator<Type>> types_;  // RegisterType, DrainWorkers
   mutable std::mutex mutex_;
   std::condition_variable cv_;
-  std::deque<Event> log_;
+  std::deque<StoredEvent, Allocator<StoredEvent>> log_;
   uint64_t next_sequence_ = 1;
+  std::atomic<uint64_t> memory_lost_{0};
   bool closed_ = false;
-  std::vector<std::string> source_names_;  // NamedSource ids, without kNamedSource
+  std::vector<Text, Allocator<Text>> source_names_;  // ids without kNamedSource
 };
 
 }  // namespace bess::stats

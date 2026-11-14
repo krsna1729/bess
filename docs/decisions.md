@@ -7253,9 +7253,10 @@ worker ever waiting. Design: `.scratch/design/m25_observability.md` section 2.
   posts a registered type, a source id and up to six values, never blocking; a full ring refuses and counts, and the
   next accepted event carries the count, which the log shows as `bess.events_lost`. The maintenance loop moves worker
   events into the log every tick (the hub has its own lock, not the control-plane lock).
-- The log: the last 16,384 events, each with a sequence (gapless per daemon epoch), monotonic time, generation, type,
-  source and string fields. Control-plane events are appended directly: a `bess.transaction` per transaction the
-  daemon decided (outcome, request id, operations, generation; a replay decided nothing new).
+- The log: up to the last 16,384 retained events, each with a sequence (per daemon epoch), monotonic time, generation,
+  type, source and string fields. Control-plane events are appended directly: a `bess.transaction` per transaction the
+  daemon decided (outcome, request id, operations, generation; a replay decided nothing new), subject to the
+  best-effort operational-observation memory policy below.
 - `control_v2.WatchEvents(from_sequence, types, daemon_epoch)`: server streaming from a sequence (0: the next event).
   Stream-control events: `bess.start` first (where the stream starts, under which epoch, so a client that loses the
   stream before any event still resumes there); `bess.restart` before it when the caller's epoch differs or its
@@ -7266,9 +7267,21 @@ worker ever waiting. Design: `.scratch/design/m25_observability.md` section 2.
 - SDK (Python generator, Go channel): resume where the stream stopped on a transport failure; a restart raises
   `DaemonRestarted` (the caller's state from earlier events is gone; re-read and watch from 0); a saved sequence is
   resumed with its epoch. Go closes its error channel when the stream ends.
-- Memory: 1 MiB of rings; the log holds 16,384 events of about 0.5 KiB (heap strings and fields), about 8 MiB full.
-  Worker events need the maintenance loop: with it off, a worker's ring fills after 256 events and the rest are
-  refused and counted.
+- Memory (counted-loss extension approved 2026-11-14): the owner injects a memory growth hook into `EventHub`; bessd
+  supplies a lifetime-owned `MemoryLease` for `bessd/event_hub`. Ring objects/storage, registration/source metadata,
+  retained deque storage and every retained string/map node use `AdmittedGlibcAllocator`, charging actual glibc chunks
+  and releasing them with the storage. Reader copies and producer/RPC temporaries remain caller-owned, outside this
+  account. Worker events need the maintenance loop: with it off, a worker's ring fills after 256 events and the rest
+  are refused and counted.
+- Operational observations are best effort under memory pressure, not forwarding state or durable transaction
+  recovery records. A failed retained-payload or deque allocation consumes that observation's sequence, increments
+  `bess_events_memory_lost_total` and wakes readers without another allocation. It never turns a committed command
+  into an error or terminates maintenance. No failed-observation queue or retry backlog is retained. Worker slots
+  are consumed after each attempted observation, including a separately sequenced loss marker when present;
+  `bess_events_lost_total` remains the worker-ring refusal count. `Post` still never allocates or blocks.
+- A read returns at most one initial gap and one contiguous event batch, stopping before an interior memory gap;
+  the next read reports that gap. A trailing gap is returned even if no later event succeeds. `WatchEvents` reports
+  both memory-refused and aged-out sequences as `bess.gap`. History capacity and payload contents are not reduced.
 - Modules: `init_context().events()` behind `BESS_CAP_EVENTS`, the context's last member.
 
 **Evidence.** Fast build: 139/139 (layer and link graphs: `bess_host -> bess_stats` added for the shutdown close),

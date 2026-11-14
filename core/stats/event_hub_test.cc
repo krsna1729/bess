@@ -21,6 +21,292 @@ namespace {
 using dataplane::WorkerId;
 using std::chrono::milliseconds;
 
+class EventMemory final : public utils::MemoryGrowth {
+ public:
+  void Grow(size_t bytes, size_t glibc_bytes) override {
+    EXPECT_EQ(bytes, glibc_bytes);
+    calls++;
+    if (refuse || calls == refuse_at) {
+      throw utils::MemoryRefused(utils::MemoryRefused::Reason::kNormalLimit,
+                                 bytes, "event test budget");
+    }
+    held += bytes;
+  }
+  void Shrink(size_t bytes, size_t glibc_bytes) noexcept override {
+    EXPECT_EQ(bytes, glibc_bytes);
+    EXPECT_LE(bytes, held);
+    held -= bytes;
+  }
+
+  size_t held = 0;
+  size_t calls = 0;
+  size_t refuse_at = 0;
+  bool refuse = false;
+};
+
+TEST(EventHubTest, RingsAndRegistrationMetadataReleaseTheirAdmission) {
+  EventMemory memory;
+  {
+    EventHub hub(8, 4, &memory);
+    EXPECT_GT(memory.held, sizeof(WorkerEvent) * EventHub::kMaxWorkers * 4);
+    const size_t rings = memory.held;
+    const std::string type(80, 't');
+    const std::string field(80, 'f');
+    const std::string source(80, 's');
+    const uint32_t id = hub.RegisterType(type, {field, field}, "prefix");
+    const uint32_t named = hub.NamedSource(source);
+    EXPECT_GT(memory.held, rings + type.size() + 2 * field.size() + source.size());
+    const size_t registered = memory.held;
+    const size_t calls = memory.calls;
+    memory.refuse = true;
+    EXPECT_EQ(id, hub.RegisterType(type, {field, field}, "prefix"));
+    EXPECT_EQ(named, hub.NamedSource(source));
+    WorkerEvent event;
+    event.type = id;
+    event.source = named;
+    event.values[0] = 7;
+    event.values[1] = 9;
+    EXPECT_FALSE(hub.Full(WorkerId{0}));
+    for (int i = 0; i < 4; i++) {
+      EXPECT_TRUE(hub.Post(WorkerId{0}, event));
+    }
+    EXPECT_TRUE(hub.Full(WorkerId{0}));
+    EXPECT_FALSE(hub.Post(WorkerId{0}, event));
+    EXPECT_EQ(1u, hub.lost());
+    EXPECT_EQ(calls, memory.calls);
+    EXPECT_EQ(registered, memory.held);
+    memory.refuse = false;
+    EXPECT_EQ(4u, hub.DrainWorkers());
+    const auto got = hub.Read(1, 8, milliseconds(0));
+    ASSERT_EQ(4u, got.events.size());
+    EXPECT_EQ(type, got.events[0].type);
+    EXPECT_EQ(source, got.events[0].source);
+    EXPECT_EQ("9", got.events[0].fields.at(field));
+  }
+  EXPECT_EQ(0u, memory.held);
+}
+
+TEST(EventHubTest, RefusedRingConstructionReleasesCompletedRings) {
+  EventMemory memory;
+  memory.refuse_at = 5;
+  EXPECT_THROW((EventHub{8, 4, &memory}), utils::MemoryRefused);
+  EXPECT_EQ(0u, memory.held);
+}
+
+TEST(EventHubTest, RefusedRegistrationLeavesIdsAndAdmissionUnchanged) {
+  EventMemory memory;
+  {
+    EventHub hub(8, 4, &memory);
+    const size_t rings = memory.held;
+    const std::string name(80, 'n');
+    memory.refuse = true;
+    EXPECT_THROW(hub.RegisterType(name, {"value"}), utils::MemoryRefused);
+    EXPECT_THROW(hub.NamedSource(name), utils::MemoryRefused);
+    EXPECT_EQ(rings, memory.held);
+    memory.refuse = false;
+    EXPECT_EQ(0u, hub.RegisterType(name, {"value"}));
+    EXPECT_EQ(EventHub::kNamedSource, hub.NamedSource(name));
+  }
+  EXPECT_EQ(0u, memory.held);
+}
+
+TEST(EventHubTest, RetainedPayloadIsAdmittedAndReaderCopiesOutliveTheHub) {
+  EventMemory memory;
+  EventHub::ReadResult copy;
+  const std::string type(80, 't');
+  const std::string source(80, 's');
+  const std::string key(80, 'k');
+  const std::string value(8192, 'v');
+  {
+    EventHub hub(2, 2, &memory);
+    const size_t empty = memory.held;
+    EXPECT_EQ(1u, hub.Emit(type, source, {{key, value}}, 42));
+    EXPECT_GT(memory.held, empty + type.size() + source.size() + key.size() + value.size());
+    copy = hub.Read(1, 2, milliseconds(0));
+    const size_t full = memory.held;
+    hub.Emit("small", "source", {});
+    hub.Emit("small", "source", {});
+    EXPECT_LT(memory.held, full);
+    EXPECT_EQ(0u, hub.memory_lost());
+    const auto evicted = hub.Read(1, 2, milliseconds(0));
+    EXPECT_EQ(1u, evicted.gap_from);
+    EXPECT_EQ(2u, evicted.gap_to);
+    ASSERT_EQ(2u, evicted.events.size());
+  }
+  EXPECT_EQ(0u, memory.held);
+  ASSERT_EQ(1u, copy.events.size());
+  EXPECT_EQ(type, copy.events[0].type);
+  EXPECT_EQ(source, copy.events[0].source);
+  EXPECT_EQ(value, copy.events[0].fields.at(key));
+  EXPECT_EQ(42u, copy.events[0].generation);
+}
+
+TEST(EventHubTest, EveryPayloadAdmissionFailureReleasesPartialStorageAndReportsAGap) {
+  const std::string text(80, 't');
+  size_t allocations = 0;
+  {
+    EventMemory memory;
+    EventHub hub(8, 2, &memory);
+    const size_t before = memory.calls;
+    hub.Emit(text, text, {{text, text}});
+    allocations = memory.calls - before;
+  }
+  ASSERT_GE(allocations, 5u);  // type, source, key, value and field-map node
+  for (size_t fail = 1; fail <= allocations; fail++) {
+    SCOPED_TRACE(fail);
+    EventMemory memory;
+    {
+      EventHub hub(8, 2, &memory);
+      const size_t empty = memory.held;
+      memory.refuse_at = memory.calls + fail;
+      EXPECT_EQ(1u, hub.Emit(text, text, {{text, text}}));
+      EXPECT_EQ(empty, memory.held);
+      EXPECT_EQ(1u, hub.memory_lost());
+      EXPECT_EQ(2u, hub.next_sequence());
+      const auto refused = hub.Read(1, 8, milliseconds(0));
+      EXPECT_TRUE(refused.events.empty());
+      EXPECT_EQ(1u, refused.gap_from);
+      EXPECT_EQ(2u, refused.gap_to);
+      EXPECT_EQ(2u, refused.next);
+      memory.refuse_at = 0;
+      EXPECT_EQ(2u, hub.Emit(text, text, {{text, text}}));
+      const auto recovered = hub.Read(1, 8, milliseconds(0));
+      ASSERT_EQ(1u, recovered.events.size());
+      EXPECT_EQ(2u, recovered.events[0].sequence);
+      EXPECT_EQ(text, recovered.events[0].fields.at(text));
+    }
+    EXPECT_EQ(0u, memory.held);
+  }
+}
+
+TEST(EventHubTest, RefusedDequeGrowthKeepsPreviousEventsAndMakesNoHiddenGap) {
+  EventMemory memory;
+  {
+    EventHub hub(64, 2, &memory);
+    hub.Emit("small", "source", {});  // Establish an older readable observation.
+    memory.refuse = true;
+    uint64_t refused = 0;
+    for (int i = 0; i < 64; i++) {
+      const uint64_t sequence = hub.Emit("small", "source", {});
+      if (hub.memory_lost() != 0) {
+        refused = sequence;
+        break;
+      }
+    }
+    ASSERT_GT(refused, 1u);
+    EXPECT_EQ(1u, hub.memory_lost());
+    auto kept = hub.Read(1, 64, milliseconds(0));
+    EXPECT_EQ(refused - 1, kept.events.size());
+    EXPECT_EQ(0u, kept.gap_to);
+    EXPECT_EQ(refused, kept.next);
+    memory.refuse = false;
+    EXPECT_EQ(refused + 1, hub.Emit("small", "source", {}));
+    const auto gap = hub.Read(kept.next, 64, milliseconds(0));
+    EXPECT_EQ(refused, gap.gap_from);
+    EXPECT_EQ(refused + 1, gap.gap_to);
+    ASSERT_EQ(1u, gap.events.size());
+    EXPECT_EQ(refused + 1, gap.events[0].sequence);
+  }
+  EXPECT_EQ(0u, memory.held);
+}
+
+TEST(EventHubTest, ReadersReportInteriorAndTrailingMemoryGapsWithoutSkippingEvents) {
+  EventMemory memory;
+  EventHub hub(8, 2, &memory);
+  hub.Emit("x", "s", {{"i", "1"}});
+  hub.Emit("x", "s", {{"i", "2"}});
+  memory.refuse = true;
+  EXPECT_EQ(3u, hub.Emit("x", "s", {{"i", "3"}}));
+  EXPECT_EQ(4u, hub.Emit("x", "s", {{"i", "4"}}));
+  memory.refuse = false;
+  hub.Emit("x", "s", {{"i", "5"}});
+  hub.Emit("x", "s", {{"i", "6"}});
+  memory.refuse = true;
+  EXPECT_EQ(7u, hub.Emit("x", "s", {{"i", "7"}}));
+  EXPECT_EQ(3u, hub.memory_lost());
+  const auto before = hub.Read(1, 8, milliseconds(0));
+  ASSERT_EQ(2u, before.events.size());
+  EXPECT_EQ(0u, before.gap_to);
+  EXPECT_EQ(3u, before.next);
+  const auto interior = hub.Read(before.next, 8, milliseconds(0));
+  EXPECT_EQ(3u, interior.gap_from);
+  EXPECT_EQ(5u, interior.gap_to);
+  ASSERT_EQ(2u, interior.events.size());
+  EXPECT_EQ(5u, interior.events.front().sequence);
+  EXPECT_EQ(6u, interior.events.back().sequence);
+  EXPECT_EQ(7u, interior.next);
+  const auto trailing = hub.Read(interior.next, 8, milliseconds(0));
+  EXPECT_EQ(7u, trailing.gap_from);
+  EXPECT_EQ(8u, trailing.gap_to);
+  EXPECT_TRUE(trailing.events.empty());
+  EXPECT_EQ(8u, trailing.next);
+  const auto future = hub.Read(99, 8, milliseconds(0));
+  EXPECT_TRUE(future.events.empty());
+  EXPECT_EQ(0u, future.gap_to);
+  EXPECT_EQ(99u, future.next);
+}
+
+TEST(EventHubTest, MemoryLossAloneWakesAWaitingReaderWithoutAllocatingAnotherEvent) {
+  EventMemory memory;
+  EventHub hub(8, 2, &memory);
+  memory.refuse = true;
+  std::atomic<bool> entering{false}, woke{false};
+  std::thread reader([&] {
+    entering.store(true);
+    const auto got = hub.Read(1, 8, milliseconds(10000));
+    EXPECT_TRUE(got.events.empty());
+    EXPECT_EQ(1u, got.gap_from);
+    EXPECT_EQ(2u, got.gap_to);
+    EXPECT_EQ(2u, got.next);
+    woke.store(true);
+  });
+  while (!entering.load()) {
+    std::this_thread::yield();
+  }
+  hub.Emit("x", "s", {{"key", "value"}});
+  const auto deadline = std::chrono::steady_clock::now() + milliseconds(1000);
+  while (!woke.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  const bool woke_before_close = woke.load();
+  hub.Close();  // Always unblock cleanup if loss notification regresses.
+  reader.join();
+  EXPECT_TRUE(woke_before_close);
+  EXPECT_EQ(1u, hub.memory_lost());
+}
+
+TEST(EventHubTest, WorkerMemoryLossConsumesAcceptedSlotsAndCountsFailedLossMarkers) {
+  EventMemory memory;
+  {
+    EventHub hub(8, 2, &memory);
+    WorkerEvent event;
+    event.type = hub.RegisterType("worker.test", {"number"}, "source");
+    event.values[0] = UINT64_MAX;
+    EXPECT_TRUE(hub.Post(WorkerId{0}, event));
+    EXPECT_TRUE(hub.Post(WorkerId{0}, event));
+    EXPECT_FALSE(hub.Post(WorkerId{0}, event));
+    memory.refuse = true;
+    EXPECT_EQ(2u, hub.DrainWorkers());
+    EXPECT_FALSE(hub.Full(WorkerId{0}));
+    EXPECT_EQ(2u, hub.memory_lost());
+    EXPECT_TRUE(hub.Post(WorkerId{0}, event));
+    EXPECT_EQ(1u, hub.DrainWorkers());  // lost marker plus the accepted event
+    EXPECT_EQ(4u, hub.memory_lost());
+    EXPECT_EQ(1u, hub.lost());
+    EXPECT_EQ(0u, hub.DrainWorkers());  // no replay of consumed slots or markers
+    memory.refuse = false;
+    EXPECT_TRUE(hub.Post(WorkerId{0}, event));
+    EXPECT_EQ(1u, hub.DrainWorkers());
+    const auto recovered = hub.Read(1, 8, milliseconds(0));
+    EXPECT_EQ(1u, recovered.gap_from);
+    EXPECT_EQ(5u, recovered.gap_to);
+    ASSERT_EQ(1u, recovered.events.size());
+    EXPECT_EQ(5u, recovered.events[0].sequence);
+    EXPECT_EQ("18446744073709551615", recovered.events[0].fields.at("number"));
+  }
+  EXPECT_EQ(0u, memory.held);
+}
+
 TEST(EventHubTest, WorkerEventsBecomeTypedEventsInOrderAndLossIsCounted) {
   EventHub hub(1024, 4);
   const uint32_t t = hub.RegisterType("table.pressure", {"size", "capacity"}, "nat");

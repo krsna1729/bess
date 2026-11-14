@@ -263,6 +263,9 @@ RuntimeState::RuntimeState()
             static_cast<double>(transactions_->generation()));
     w.Counter("bess_events_lost_total", "Worker events refused by a full ring",
               static_cast<double>(events_.lost()));
+    w.Counter("bess_events_memory_lost_total",
+              "Operational event observations refused by log memory",
+              static_cast<double>(events_.memory_lost()));
     w.Gauge("bess_events_next_sequence", "The sequence number the next event gets",
             static_cast<double>(events_.next_sequence()));
     w.Gauge("bess_transaction_pending_cascades",

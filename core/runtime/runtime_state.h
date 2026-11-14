@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "framework/instance_registry.h"
+#include "framework/memory_scope.h"
 #include "stats/event_hub.h"
 #include "stats/metric_registry.h"
 #include "framework/module_requests.h"
@@ -225,7 +226,12 @@ class RuntimeState {
 
   // Before everything that registers a source in it.
   stats::MetricRegistry metrics_;
-  stats::EventHub events_;
+  // Before events_: its admitted allocations release through this lease.
+  framework::MemoryLease event_memory_ =
+      framework::MemoryAccounts::Process().Lease("event_hub", 0);
+  stats::EventHub events_{stats::EventHub::kDefaultLogCapacity,
+                          stats::EventHub::kDefaultRingCapacity,
+                          event_memory_.growth()};
   // First: modules (below) release their leases on it as they are destroyed.
   framework::InstanceRegistry instances_;
   // Before modules_ for the same reason: a module's endpoints unregister as it
