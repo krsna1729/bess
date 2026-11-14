@@ -65,11 +65,11 @@ const MaxMessageBytes = 64 << 20
 
 // -- errors --------------------------------------------------------------------
 
-// InvalidRequestError: refused before anything was applied (bad resource,
-// key or value, or a request id reused with other contents).
+// InvalidRequestError: this call was refused before anything was applied
+// (bad resource, key or value, capacity, or a request id reused with other contents).
 type InvalidRequestError struct {
 	Message string
-	Code    codes.Code      // the call's status code (codes.OK: refused by the client)
+	Code    codes.Code      // the refusal's gRPC status (codes.OK: local validation)
 	Detail  *pb.ErrorDetail // the server's detail, when it sent one
 }
 
@@ -351,7 +351,7 @@ func (t grpcTransport) admin(ctx context.Context, in proto.Message) (proto.Messa
 type Client struct {
 	t     transport
 	retry RetryPolicy
-	sleep func(time.Duration)
+	sleep func(context.Context, time.Duration) error
 
 	mu             sync.Mutex
 	resources      map[string]Resource
@@ -381,16 +381,27 @@ func Dial(target string, opts ...grpc.DialOption) (*Client, error) {
 // NewClient uses an existing connection.
 func NewClient(conn grpc.ClientConnInterface, retry RetryPolicy) *Client {
 	c := newClient(grpcTransport{c: pb.NewControlClient(conn), a: pb.NewAdminClient(conn)},
-		retry, time.Sleep)
+		retry, retryWait)
 	c.control = pb.NewControlClient(conn)
 	return c
 }
 
-func newClient(t transport, retry RetryPolicy, sleep func(time.Duration)) *Client {
+func newClient(t transport, retry RetryPolicy, sleep func(context.Context, time.Duration) error) *Client {
 	if retry.Attempts < 1 {
 		retry.Attempts = 1
 	}
 	return &Client{t: t, retry: retry, sleep: sleep}
+}
+
+func retryWait(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // Close cancels owned transaction streams and closes a connection Dial opened.
@@ -559,7 +570,9 @@ func (c *Client) WatchEvents(ctx context.Context, from, epoch uint64, types ...s
 				errc <- translate(err, nil)
 				return
 			}
-			c.sleep(backoff)
+			if c.sleep(ctx, backoff) != nil {
+				return
+			}
 			backoff = min(backoff*2, time.Second)
 		}
 	}()
@@ -799,7 +812,9 @@ func (c *Client) pipelineCall(ctx context.Context, in proto.Message, retryBusy b
 			return nil, &PipelineConflictError{Message: detail.GetMessage(), Detail: detail}
 		case pb.ErrorDetail_RESOURCE_BUSY:
 			if retryBusy && attempt < c.retry.Attempts && ctx.Err() == nil {
-				c.sleep(backoff)
+				if err := c.sleep(ctx, backoff); err != nil {
+					return nil, err
+				}
 				backoff *= 2
 				continue
 			}
@@ -1207,8 +1222,8 @@ func (t *Transaction) Erase(r Resource, key proto.Message) error {
 // as it is, rather than building a message only for the SDK to marshal it
 // again. The SDK does not check the bytes: the daemon parses them as the
 // resource's type and refuses the transaction where they do not parse. The
-// bytes are sent as they are, so the caller must not change them before the
-// transaction is committed.
+// caller must not change the bytes before Commit returns, or between retries
+// of the same transaction. Stream drivers own their encoding after return.
 type Encoded []byte
 
 // UpsertEncoded is Upsert of a key and value already encoded as r.KeyType and
@@ -1331,6 +1346,7 @@ func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 	applied, err := t.c.commit(ctx, req, t.epoch)
 	if err == nil {
 		t.result = applied
+		t.ops, t.packed = nil, nil // only the cached result is needed for another Commit
 	}
 	return applied, err
 }
@@ -1353,20 +1369,40 @@ func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, ep
 	backoff := c.retry.BusyBackoff
 	var transportFailure, lastUnanswered codes.Code = codes.OK, codes.OK
 	unknownAttempt := false // a send of this commit went unanswered
+	resentAfterUnknown := false
+	resolve := func(rec *pb.TransactionRecord, replayed bool, answered uint64) (*Applied, error) {
+		// A newer rejection cannot prove that an earlier unanswered send
+		// did not apply before its result aged out of the replay window.
+		if resentAfterUnknown && rec.GetOutcome() == pb.TransactionRecord_OUTCOME_REJECTED {
+			return nil, &TransportError{RequestID: req.GetRequestId(), Code: lastUnanswered}
+		}
+		return finish(rec, replayed, answered, unknownAttempt)
+	}
 	send := true
-	for range c.retry.Attempts {
+	for attempt := range c.retry.Attempts {
 		if ctx.Err() != nil {
 			break
 		}
 		if send {
+			resentAfterUnknown = resentAfterUnknown || unknownAttempt
 			actx, cancel := context.WithTimeout(ctx, c.retry.AttemptTimeout)
 			r, md, err := c.t.apply(actx, req)
 			cancel()
 			if err != nil {
+				var local *notSent
+				if errors.As(err, &local) {
+					if unknownAttempt {
+						return nil, &TransportError{RequestID: req.GetRequestId(), Code: lastUnanswered}
+					}
+					return nil, local.error
+				}
 				if !noAnswer(err, md) {
 					d := errorDetail(md)
 					if d.GetCode() == pb.ErrorDetail_EPOCH_MISMATCH {
 						return nil, c.refusedEpoch(epoch, d)
+					}
+					if unknownAttempt {
+						return nil, &TransportError{RequestID: req.GetRequestId(), Code: lastUnanswered}
 					}
 					// A resource that changes only with its workers paused,
 					// while one runs (D-129): nothing was tried, and retrying
@@ -1387,11 +1423,13 @@ func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, ep
 			rec := r.GetRecord()
 			if rec.GetOutcome() == pb.TransactionRecord_OUTCOME_BUSY {
 				transportFailure = codes.OK
-				c.sleep(backoff)
+				if attempt+1 == c.retry.Attempts || c.sleep(ctx, backoff) != nil {
+					break
+				}
 				backoff *= 2
 				continue
 			}
-			return finish(rec, r.GetReplayed(), r.GetDaemonEpoch(), unknownAttempt)
+			return resolve(rec, r.GetReplayed(), r.GetDaemonEpoch())
 		}
 		known, rec, answered, err := c.GetTransaction(ctx, req.GetRequestId())
 		if err != nil {
@@ -1411,10 +1449,10 @@ func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, ep
 			return nil, err
 		}
 		if known {
-			return finish(rec, true, answered, unknownAttempt)
+			return resolve(rec, true, answered)
 		}
 		transportFailure = codes.OK
-		send = true // confirmed unseen under this epoch: sending again is safe
+		send = true // unseen now, but the earlier unanswered send can still apply
 	}
 	// Out of attempts (or the caller's context ended). After any unanswered
 	// send the outcome is unknown: "not known" means "not applied yet", and an

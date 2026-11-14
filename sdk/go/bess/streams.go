@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -48,11 +49,17 @@ func NewClientWithTransactionStreams(conn grpc.ClientConnInterface, retry RetryP
 // maxFrameTransactions is the daemon's per-frame bound (kMaxChannelTransactions).
 const maxFrameTransactions = 64
 
+// All accepted requests together fit one maximum-sized frame, including the
+// largest attempt ID and timeout. This bounds retained wire payloads even when
+// callers use every stream and the count-bounded queue at once.
+const maxPendingTransactionBytes = MaxMessageBytes - 22
+
 func enableTransactionStreams(c *Client, concurrency int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &transactionStreams{transport: c.t, client: c.control, ctx: ctx,
-		idle:  make(chan *transactionStream, concurrency),
-		queue: make(chan *queuedTransaction, concurrency*maxFrameTransactions)}
+		idle:    make(chan *transactionStream, concurrency),
+		queue:   make(chan *transactionSlot, concurrency*maxFrameTransactions),
+		pending: make(chan struct{}, 2*concurrency*maxFrameTransactions)}
 	for range concurrency {
 		t.idle <- nil // a stream opened on first use
 	}
@@ -62,17 +69,29 @@ func enableTransactionStreams(c *Client, concurrency int) {
 
 type transactionStreams struct {
 	transport
-	client pb.ControlClient
-	ctx    context.Context
-	idle   chan *transactionStream
-	queue  chan *queuedTransaction
+	client       pb.ControlClient
+	ctx          context.Context
+	idle         chan *transactionStream
+	queue        chan *transactionSlot
+	pending      chan struct{} // queued plus active requests, reserved before encoding
+	pendingBytes atomic.Int64
 }
 
 type queuedTransaction struct {
 	ctx     context.Context
-	request *pb.ApplyTransactionRequest
+	id      string
+	wire    []byte      // owned before a caller can return while a batch driver is sending
 	claimed atomic.Bool // by a caller to send it, or by its own caller to withdraw it
 	done    chan streamResult
+	bytes   int64 // request plus its repeated-message framing
+	slot    *transactionSlot
+}
+
+// A stale channel entry must not retain a completed result, a large request ID,
+// or a caller's context values. Its separately allocated slot is detached when
+// claimed or withdrawn; the first, unqueued caller needs no slot allocation.
+type transactionSlot struct {
+	request atomic.Pointer[queuedTransaction]
 }
 
 type streamResult struct {
@@ -81,26 +100,88 @@ type streamResult struct {
 	err      error
 }
 
+// notSent distinguishes local admission from an unanswered RPC. In particular,
+// a full local queue must not trigger GetTransaction for a request never sent.
+type notSent struct{ error }
+
+func (e *notSent) Unwrap() error { return e.error }
+
+func localCapacityRefusal() error {
+	const message = "client transaction budget exhausted"
+	return &notSent{&InvalidRequestError{Code: codes.ResourceExhausted, Message: message}}
+}
+
+func (t *transactionStreams) release(q *queuedTransaction) {
+	// Only the claimant releases a request. A withdrawn queue entry may stay
+	// in the channel until the next drain, but no longer pins its payload.
+	if q.slot != nil {
+		q.slot.request.Store(nil)
+	}
+	q.id = ""
+	q.wire = nil
+	t.pendingBytes.Add(-q.bytes)
+	<-t.pending
+}
+
 // apply sends request on an idle stream itself, with whatever is already
 // queued, so a lone caller has no handoff. With no idle stream it queues, and
 // waits for its result or for a stream, whichever comes first.
 func (t *transactionStreams) apply(ctx context.Context, request *pb.ApplyTransactionRequest) (*pb.ApplyTransactionResponse, metadata.MD, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, status.FromContextError(err).Err()
+		return nil, nil, &notSent{status.FromContextError(err).Err()}
 	}
-	q := &queuedTransaction{ctx: ctx, request: request, done: make(chan streamResult, 1)}
+	if err := t.ctx.Err(); err != nil {
+		return nil, nil, &notSent{status.FromContextError(err).Err()}
+	}
+	select {
+	case t.pending <- struct{}{}:
+	default:
+		return nil, nil, localCapacityRefusal()
+	}
+	size := int64(protowire.SizeTag(2) + protowire.SizeBytes(proto.Size(request)))
+	if size > maxPendingTransactionBytes {
+		<-t.pending
+		return nil, nil, &notSent{&InvalidRequestError{Code: codes.ResourceExhausted, Message: "transaction exceeds the stream message budget"}}
+	}
+	for {
+		used := t.pendingBytes.Load()
+		if size > maxPendingTransactionBytes-used {
+			<-t.pending
+			return nil, nil, localCapacityRefusal()
+		}
+		if t.pendingBytes.CompareAndSwap(used, used+size) {
+			break
+		}
+	}
+	// Snapshot on this caller, before handing off to a shared frame. Another
+	// member's deadline may keep that frame alive after this caller returns.
+	wire, err := (proto.MarshalOptions{UseCachedSize: true}).Marshal(request)
+	if err != nil {
+		t.pendingBytes.Add(-size)
+		<-t.pending
+		return nil, nil, &notSent{&InvalidRequestError{Message: err.Error()}}
+	}
+	q := &queuedTransaction{ctx: ctx, id: request.GetRequestId(), wire: wire,
+		done: make(chan streamResult, 1), bytes: size}
 	select {
 	case s := <-t.idle:
 		q.claimed.Store(true)
 		return t.drive(s, q)
 	default:
 	}
+	q.slot = &transactionSlot{}
+	q.slot.request.Store(q)
 	select {
-	case t.queue <- q:
+	case t.queue <- q.slot:
 	case <-ctx.Done():
-		return nil, nil, status.FromContextError(ctx.Err()).Err()
+		t.release(q)
+		return nil, nil, &notSent{status.FromContextError(ctx.Err()).Err()}
 	case <-t.ctx.Done():
-		return nil, nil, status.FromContextError(t.ctx.Err()).Err()
+		t.release(q)
+		return nil, nil, &notSent{status.FromContextError(t.ctx.Err()).Err()}
+	default:
+		t.release(q)
+		return nil, nil, localCapacityRefusal()
 	}
 	idle := t.idle
 	for {
@@ -114,12 +195,16 @@ func (t *transactionStreams) apply(ctx context.Context, request *pb.ApplyTransac
 			t.idle <- s
 			idle = nil // another caller sent it; wait for its result
 		case <-ctx.Done():
-			// Withdrawn before anyone took it, or sent and now UNKNOWN: either
-			// way the commit path resolves it as a lost unary answer.
-			q.claimed.Store(true)
+			if q.claimed.CompareAndSwap(false, true) {
+				t.release(q) // withdrawn before any driver could send it
+				return nil, nil, &notSent{status.FromContextError(ctx.Err()).Err()}
+			}
 			return nil, nil, status.FromContextError(ctx.Err()).Err()
 		case <-t.ctx.Done():
-			q.claimed.Store(true)
+			if q.claimed.CompareAndSwap(false, true) {
+				t.release(q)
+				return nil, nil, &notSent{status.FromContextError(t.ctx.Err()).Err()}
+			}
 			return nil, nil, status.FromContextError(t.ctx.Err()).Err()
 		}
 	}
@@ -155,12 +240,14 @@ drain:
 	}
 }
 
-func (t *transactionStreams) take(batch []*queuedTransaction, q *queuedTransaction) []*queuedTransaction {
-	if !q.claimed.CompareAndSwap(false, true) {
+func (t *transactionStreams) take(batch []*queuedTransaction, slot *transactionSlot) []*queuedTransaction {
+	q := slot.request.Swap(nil)
+	if q == nil || !q.claimed.CompareAndSwap(false, true) {
 		return batch // withdrawn, or already sent by another caller
 	}
 	if err := q.ctx.Err(); err != nil {
-		q.done <- streamResult{err: status.FromContextError(err).Err()} // never sent
+		t.release(q)
+		q.done <- streamResult{err: &notSent{status.FromContextError(err).Err()}} // never sent
 		return batch
 	}
 	return append(batch, q)
@@ -176,6 +263,11 @@ type transactionStream struct {
 // send writes one frame and answers each transaction in it. It returns the
 // stream to reuse, or nil after any failure that retires it.
 func (t *transactionStreams) send(s *transactionStream, batch []*queuedTransaction) (next *transactionStream) {
+	defer func() {
+		for _, q := range batch {
+			t.release(q)
+		}
+	}()
 	if s == nil {
 		ctx, cancel := context.WithCancel(t.ctx)
 		s = &transactionStream{ctx: ctx, cancel: cancel}
@@ -232,15 +324,14 @@ func (t *transactionStreams) send(s *transactionStream, batch []*queuedTransacti
 		s.stream = stream
 	}
 	s.next++
-	frame := &pb.TransactionChannelRequest{AttemptId: s.next,
-		Transactions: make([]*pb.ApplyTransactionRequest, len(batch))}
+	frame := &encodedTransactionFrame{attempt: s.next, requests: make([][]byte, len(batch))}
 	// The frame's shared budget is its latest member deadline; a member without
 	// one leaves only the stream deadline. Members whose own deadline passes
 	// first return to their callers and resolve as UNKNOWN.
 	var latest time.Time
 	bounded := true
 	for i, q := range batch {
-		frame.Transactions[i] = q.request
+		frame.requests[i] = q.wire
 		if deadline, ok := q.ctx.Deadline(); !ok {
 			bounded = false
 		} else if deadline.After(latest) {
@@ -252,16 +343,16 @@ func (t *transactionStreams) send(s *transactionStream, batch []*queuedTransacti
 		if remaining <= 0 {
 			return fail(status.Error(codes.DeadlineExceeded, "transaction attempt expired"))
 		}
-		frame.TimeoutNs = remaining.Nanoseconds()
+		frame.timeout = remaining.Nanoseconds()
 	}
-	if err := s.stream.Send(frame); err != nil {
+	if err := s.stream.SendMsg(frame); err != nil {
 		return fail(err)
 	}
 	reply, err := s.stream.Recv()
 	if err != nil {
 		return fail(err)
 	}
-	if reply.GetAttemptId() != frame.GetAttemptId() {
+	if reply.GetAttemptId() != frame.attempt {
 		return fail(status.Error(codes.Unknown, "transaction acknowledgement does not match attempt"))
 	}
 	results := reply.GetResults()
@@ -282,7 +373,7 @@ func (t *transactionStreams) send(s *transactionStream, batch []*queuedTransacti
 		return fail(status.Error(codes.Unknown, "invalid transaction acknowledgement frame"))
 	}
 	for i, q := range batch {
-		q.done <- frameResult(results[i], q.request.GetRequestId())
+		q.done <- frameResult(results[i], q.id)
 	}
 	return s
 }

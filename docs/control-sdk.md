@@ -65,11 +65,12 @@ passing over, so a controller re-reads its counters and watches again.
 ## Prepared values and persistent transaction streams
 
 Go `UpsertEncoded`, `SetEncoded` and `EraseEncoded` accept `bess.Encoded`
-protobuf wire bytes and borrow them until Commit returns. C++
-`Transaction::UpsertEncoded` copies its key/value bytes into the transaction.
-Both still use discovered resource types; the native service validates all
-encodings and rejects the entire transaction on malformed input. Ordinary
-message operations remain available.
+protobuf wire bytes. Keep them immutable until Commit returns **and between
+retries of that transaction**. The stream driver takes its own encoded snapshot
+before asynchronous use, so a cancelled caller can reuse its inputs after return.
+C++ `Transaction::UpsertEncoded` copies key/value bytes into the transaction.
+Both use discovered resource types; malformed input is rejected atomically.
+Ordinary message operations remain available.
 
 Go and C++ optionally use the public `Control.TransactionChannel` bidi RPC:
 
@@ -99,9 +100,38 @@ must contain a record for the original request ID. Missing/foreign records,
 locally oversized acknowledgements and EOF remain UNKNOWN; the SDK uses ordinary
 GetTransaction recovery and exact-ID/payload retry rules. Go/C++ distinguish an
 untyped transport RESOURCE_EXHAUSTED from an actual typed native refusal.
-Pool size and existing per-message limits bound outstanding wire bytes,
-not decoded-memory reservations. See [benchmarking](benchmarking.md#transaction-stage-floor-ladder)
-for matched unary/stream flags and the required plain-run controls.
+Go stream admission bounds the physical queue at `N * 64`, all pending
+transactions (including reservations before encoding) at `2 * N * 64`, and the
+combined wire size of accepted queued/active requests at 64 MiB minus 22 bytes
+of frame overhead. A full budget or individually oversized request is refused
+before sending as `InvalidRequestError` with `Code == codes.ResourceExhausted`.
+An earlier unanswered send still makes the outcome UNKNOWN: a later local or
+native refusal, or a newer rejection after resending, cannot erase that
+uncertainty. An original rejection recovered before any resend remains definite.
+
+Cancelled, unclaimed queue entries detach their context, identity and payload
+immediately; claimed requests retain their reservation until their driver exits.
+Each request is encoded once into owned bytes; scatter/gather frame headers
+avoid a second whole-frame copy. Successful Go transactions keep their cached
+result, not operation payloads. Retry/reconnect backoff honors caller cancellation.
+
+Go packing memoization is optional and bounded: at most 4096 names and 1 MiB
+of name bytes in the weak packer cache; the URL cache has the same entry bound
+and a 1 MiB combined key/value byte bound. Descriptor graphs are not kept alive
+by packer memoization. Bypassing a full cache still validates required fields
+and packs normally.
+Powered ABBA `BenchmarkBuild` checks retained the same bytes/allocations across
+1/2/8/11/32-operation shapes; bounded weak memoization cost about 8–9% in the
+8/11/32-operation warm protobuf-build shapes. This trades some lookup CPU for
+descriptor lifetime safety. It is not an RPC latency or prepared-byte result.
+
+These are count, logical-string and wire-payload bounds, not a heap/RSS/cgroup
+guarantee. Caller-owned builders/results, descriptors and gRPC buffers need
+separate headroom. C++ pool size and per-message limits bound its outstanding
+frames; this Go-client audit does not establish equivalent allocator ownership
+bounds for every C++/Python API. See
+[benchmarking](benchmarking.md#transaction-stage-floor-ladder) for matched
+unary/stream flags and required plain-run controls.
 
 ## Resources: maps and singletons (D-129)
 

@@ -3,15 +3,23 @@
 package bess
 
 import (
+	"strings"
 	"sync"
+	"weak"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-// packer is how one message type goes into an Any, worked out once per type
-// rather than once per operation: its type URL, and whether marshalling may
+const (
+	maxTypeCacheNames = 4096
+	maxTypeCacheBytes = 1 << 20
+	typeURLPrefix     = "type.googleapis.com/"
+)
+
+// packer memoizes how one message type goes into an Any while its weak cache
+// entry lives: its type URL, and whether marshalling may
 // skip the required-field check. Only a proto2 type can declare a required
 // field. For a type that reaches none, the check is a walk of the message that
 // can find nothing, and on a dynamic message (a schema-driven controller's) it
@@ -22,29 +30,56 @@ type packer struct {
 	partial bool
 }
 
-// packers holds one packer per type name. A descriptor of the same name from
-// a newer schema replaces the older one, so the map is bounded by the type
-// names a process uses, not by how often it refreshes a schema.
+// Packing is optional memoization, not an owner of dynamic schema graphs.
+// Weak entries may expire at collection; bounded, owned names cannot retain
+// a large descriptor/string backing allocation after a schema refresh.
 var packers struct {
 	sync.RWMutex
-	byName map[protoreflect.FullName]*packer
+	byName map[protoreflect.FullName]weak.Pointer[packer]
+	bytes  int // owned name bytes; map metadata is bounded by maxTypeCacheNames
 }
 
 func packerOf(md protoreflect.MessageDescriptor) *packer {
 	name := md.FullName()
 	packers.RLock()
-	p := packers.byName[name]
+	p := packers.byName[name].Value()
 	packers.RUnlock()
 	if p != nil && p.md == md {
 		return p
 	}
+	// Descriptor walks stay outside the global cache lock: a cold type must
+	// not hold up unrelated warm types.
 	p = &packer{md: md, url: typeURL(string(name)), partial: !reachesRequired(md, nil)}
-	packers.Lock()
-	if packers.byName == nil {
-		packers.byName = map[protoreflect.FullName]*packer{}
+	if len(name) > maxTypeCacheBytes {
+		return p
 	}
-	packers.byName[name] = p
-	packers.Unlock()
+	// Clone replacements too: assigning an equal string key can replace the
+	// map's stored key with a view into the caller's much larger allocation.
+	owned := protoreflect.FullName(strings.Clone(string(name)))
+	packers.Lock()
+	defer packers.Unlock()
+	if current := packers.byName[name].Value(); current != nil && current.md == md {
+		return current
+	}
+	if _, exists := packers.byName[name]; !exists &&
+		(len(packers.byName) >= maxTypeCacheNames || packers.bytes+len(name) > maxTypeCacheBytes) {
+		for key, entry := range packers.byName {
+			if entry.Value() == nil {
+				delete(packers.byName, key)
+				packers.bytes -= len(key)
+			}
+		}
+	}
+	if _, exists := packers.byName[name]; !exists {
+		if len(packers.byName) >= maxTypeCacheNames || packers.bytes+len(name) > maxTypeCacheBytes {
+			return p // uncached packing still performs the full validation
+		}
+		packers.bytes += len(name)
+	}
+	if packers.byName == nil {
+		packers.byName = make(map[protoreflect.FullName]weak.Pointer[packer])
+	}
+	packers.byName[owned] = weak.Make(p)
 	return p
 }
 
@@ -85,26 +120,45 @@ func pack(a *anypb.Any, m proto.Message) error {
 	return nil
 }
 
-// typeURLs holds the Any type URL of each type name the SDK packs: built once
-// per name, not once per operation.
+// typeURLs keeps bounded owned names and URLs. A full cache merely computes an
+// uncached URL; it never changes the wire or refuses an otherwise valid request.
 var typeURLs struct {
 	sync.RWMutex
 	byName map[string]string
+	bytes  int
 }
 
 func typeURL(name string) string {
+	if len(name) > (maxTypeCacheBytes-len(typeURLPrefix))/2 {
+		return typeURLPrefix + name
+	}
 	typeURLs.RLock()
 	url, ok := typeURLs.byName[name]
+	cost := 0
+	room := false
+	if !ok {
+		cost = 2*len(name) + len(typeURLPrefix)
+		room = len(typeURLs.byName) < maxTypeCacheNames && typeURLs.bytes+cost <= maxTypeCacheBytes
+	}
 	typeURLs.RUnlock()
 	if ok {
 		return url
 	}
-	url = "type.googleapis.com/" + name // anypb.New's: the prefix every runtime resolves
-	typeURLs.Lock()
-	if typeURLs.byName == nil {
-		typeURLs.byName = map[string]string{}
+	url = typeURLPrefix + name
+	if !room {
+		return url
 	}
-	typeURLs.byName[name] = url
+	owned := strings.Clone(name)
+	typeURLs.Lock()
+	if cached, exists := typeURLs.byName[name]; exists {
+		url = cached
+	} else if len(typeURLs.byName) < maxTypeCacheNames && typeURLs.bytes+cost <= maxTypeCacheBytes {
+		if typeURLs.byName == nil {
+			typeURLs.byName = make(map[string]string)
+		}
+		typeURLs.byName[owned] = url
+		typeURLs.bytes += cost
+	}
 	typeURLs.Unlock()
 	return url
 }

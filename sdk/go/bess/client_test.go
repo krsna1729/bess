@@ -249,7 +249,11 @@ type harness struct {
 func newHarness(f *fake, attempts int) *harness {
 	h := &harness{f: f}
 	h.c = newClient(f, RetryPolicy{AttemptTimeout: time.Second, Attempts: attempts,
-		BusyBackoff: 10 * time.Millisecond}, func(d time.Duration) { h.sleeps = append(h.sleeps, d) })
+		BusyBackoff: 10 * time.Millisecond},
+		func(_ context.Context, d time.Duration) error {
+			h.sleeps = append(h.sleeps, d)
+			return nil
+		})
 	return h
 }
 
@@ -510,11 +514,22 @@ func TestOutOfAttemptsAfterAnUnansweredSendIsUnknownNotBusy(t *testing.T) {
 		{applies: []step{timeout()}, gets: []step{notKnown(1)}},
 		{applies: []step{timeout(), answer(busy, 1)}, gets: []step{notKnown(1)}},
 		{applies: []step{timeout(), timeout()}, gets: []step{notKnown(1), notKnown(1)}},
+		{applies: []step{timeout(), {err: localCapacityRefusal()}}, gets: []step{notKnown(1)}},
+		{applies: []step{timeout(), refusal(codes.FailedPrecondition, pb.ErrorDetail_RESOURCE_BUSY)}, gets: []step{notKnown(1)}},
+		{applies: []step{timeout(), refusal(codes.ResourceExhausted, pb.ErrorDetail_RESOURCE_FAILURE)}, gets: []step{notKnown(1)}},
+		{applies: []step{timeout(), answer(rejected, 1)}, gets: []step{notKnown(1)}},
+		{applies: []step{timeout(), timeout()}, gets: []step{notKnown(1), known(rejected, 1)}},
 	} {
-		h := newHarness(f, []int{2, 3, 4}[i])
+		h := newHarness(f, []int{2, 3, 4, 3, 3, 3, 3, 4}[i])
 		_, err := h.commit(t)
 		as[*TransportError](t, err)
 	}
+}
+
+func TestAnOriginalRejectionRecoveredWithoutResendingIsDefinite(t *testing.T) {
+	h := newHarness(&fake{applies: []step{timeout()}, gets: []step{known(rejected, 1)}}, 2)
+	_, err := h.commit(t)
+	as[*RejectedError](t, err)
 }
 
 func TestNoAnswerAtAllIsAnUnknownOutcome(t *testing.T) {
