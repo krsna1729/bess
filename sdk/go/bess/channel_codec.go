@@ -21,6 +21,38 @@ type channelCodec struct{ encoding.CodecV2 }
 
 var transactionChannelCodec = channelCodec{encoding.GetCodecV2("proto")}
 
+// Transaction requests are encoded once, on their caller before asynchronous
+// batching. Scatter/gather framing retains those owned bytes, rather than
+// copying every request into another frame-sized allocation.
+type encodedTransactionFrame struct {
+	attempt  uint64
+	timeout  int64
+	requests [][]byte
+}
+
+func (c channelCodec) Marshal(v any) (mem.BufferSlice, error) {
+	frame, ok := v.(*encodedTransactionFrame)
+	if !ok {
+		return c.CodecV2.Marshal(v)
+	}
+	// Capacity includes the largest two scalar fields and a tag plus five
+	// length bytes per request; header slices must never be invalidated by grow.
+	headers := make([]byte, 0, 22+6*len(frame.requests))
+	headers = protowire.AppendVarint(protowire.AppendTag(headers, 1, protowire.VarintType), frame.attempt)
+	if frame.timeout != 0 {
+		headers = protowire.AppendVarint(protowire.AppendTag(headers, 3, protowire.VarintType), uint64(frame.timeout))
+	}
+	buffers := make(mem.BufferSlice, 1, 1+2*len(frame.requests))
+	buffers[0] = mem.SliceBuffer(headers)
+	for _, request := range frame.requests {
+		start := len(headers)
+		headers = protowire.AppendTag(headers, 2, protowire.BytesType)
+		headers = protowire.AppendVarint(headers, uint64(len(request)))
+		buffers = append(buffers, mem.SliceBuffer(headers[start:]), mem.SliceBuffer(request))
+	}
+	return buffers, nil
+}
+
 func (c channelCodec) Unmarshal(data mem.BufferSlice, v any) error {
 	reply, ok := v.(*pb.TransactionChannelResponse)
 	if !ok {
