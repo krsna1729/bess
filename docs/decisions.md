@@ -13961,6 +13961,13 @@ is half built, and the status counts entries, not bytes (D-149 left `Module::Rep
   the control path takes a `utils::MemoryGrowth` hook and admits each delta; the scope is the module's own,
   released with it, and `GetResourceStatus.memory.modules` reports admitted and current bytes per module/resource
   (the packet pool as `bessd/packet_pool`). Module argument names are unchanged.
+- **Dormant ID space (2026-11-15).** `SlotTable<Id, T, true>` uses a bounded directory of stable
+  1024-ID pages; the default remains dense, with its existing direct packet lookup. `PacketStoreLimitsTable`
+  opts in. `SlotResource::Reserve` prepares and admits a missing page through the existing growth hook before
+  publication. Workers acquire-load fully initialized, release-published pages; publication itself allocates
+  nothing. Pages remain accounted capacity until table teardown, including capacity prepared before a later
+  transaction abort. Deferred removal and reuse still require their original grace periods. No configured ID
+  range is reduced. Packet-store, slot-table and transaction-engine contract targets pass.
 - **Hugepages can be charged to `memory.max`.** The Context's "hugepages are not charged" holds only when cgroup2 is
   mounted without `memory_hugetlb_accounting`. With it, a hugepage is charged when faulted in and a
   charge past `memory.max` is SIGBUS even with free pool pages (measured: a bessd holding one 1 GB page showed

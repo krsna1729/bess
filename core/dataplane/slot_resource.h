@@ -26,14 +26,14 @@ namespace dataplane {
 //
 // `references` names the keys a value refers to (for example, an action
 // object naming a meter), so the engine can order and check them.
-template <typename Id, typename T>
+template <typename Id, typename T, bool kPaged = false>
 class SlotResource : public Resource {
  public:
   using ReferencesFn = std::function<std::vector<Reference>(const T &)>;
 
   // `may_reference`: the resources `references` can name (declared, see
   // Resource).
-  SlotResource(std::string name, SlotTable<Id, T> &table,
+  SlotResource(std::string name, SlotTable<Id, T, kPaged> &table,
                ReferencesFn references = {},
                std::vector<std::string> may_reference = {})
       : Resource(std::move(name), std::move(may_reference)),
@@ -104,6 +104,7 @@ class SlotResource : public Resource {
       return std::unexpected("wrong value type");
     }
     const T *previous = table_.Current(id);
+    table_.PrepareSlot(id);
     // Make may add a slab chunk, admitted first through the table's growth
     // hook (D-198): its MemoryRefused refuses the transaction.
     Reservation reservation{
@@ -124,22 +125,22 @@ class SlotResource : public Resource {
  private:
   class PublishOp final : public StagedOp {
    public:
-    PublishOp(SlotTable<Id, T> &table, Id id,
-              typename SlotTable<Id, T>::Owned object)
+    PublishOp(SlotTable<Id, T, kPaged> &table, Id id,
+              typename SlotTable<Id, T, kPaged>::Owned object)
         : table_(table), id_(id), object_(std::move(object)) {}
     void Publish(Retirer &retirer) noexcept override {
       retirer.Retire(table_.Publish(id_, std::move(object_)));
     }
 
    private:
-    SlotTable<Id, T> &table_;
+    SlotTable<Id, T, kPaged> &table_;
     Id id_;
-    typename SlotTable<Id, T>::Owned object_;
+    typename SlotTable<Id, T, kPaged>::Owned object_;
   };
 
   class UnpublishOp final : public StagedOp {
    public:
-    UnpublishOp(SlotTable<Id, T> &table, Id id) : table_(table), id_(id) {}
+    UnpublishOp(SlotTable<Id, T, kPaged> &table, Id id) : table_(table), id_(id) {}
     void Publish(Retirer &retirer) noexcept override {
       table_.Retire(id_);  // absent now, readable until the cascade
       retirer.RemoveLater([&table = table_, id = id_](Retirer &later) {
@@ -148,11 +149,11 @@ class SlotResource : public Resource {
     }
 
    private:
-    SlotTable<Id, T> &table_;
+    SlotTable<Id, T, kPaged> &table_;
     Id id_;
   };
 
-  SlotTable<Id, T> &table_;
+  SlotTable<Id, T, kPaged> &table_;
   ReferencesFn references_;
 };
 
