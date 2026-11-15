@@ -280,6 +280,7 @@ PacketStoreFlowsResource::Reserve(const Op &op) {
   if (limits == nullptr) {
     return std::unexpected("wrong value type (want flow limits)");
   }
+  table_.PrepareSlot(id);
   // Make may add a slab chunk, admitted first through the table's growth
   // hook (D-198): its MemoryRefused refuses the transaction.
   reservation.staged =

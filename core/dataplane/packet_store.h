@@ -43,12 +43,13 @@ using PacketStoreFlowId = StrongId<PacketStoreFlowIdTag, uint32_t>;
 // The per-flow limits by flow id (BP-6): a dense table of `capacity` slots
 // fixed at creation, each entry an immutable object published on its own
 // (one release store; the replaced object is retired after a grace period),
-// so the owner looks a flow up with one acquire load and a transaction
-// costs what it changes, never a copy of the table. The slot array is
-// admitted with the table (Bytes(capacity)); objects come from its slab,
-// whose chunks are admitted through set_memory_growth. Packet-path state
-// (D-206, class P), all DPDK memory.
-using PacketStoreLimitsTable = SlotTable<PacketStoreFlowId, PacketStoreLimits>;
+// so the owner looks a flow up with two acquire loads and a transaction
+// costs what it changes, never a copy of the table. The directory of page
+// pointers is admitted with the table (Bytes(capacity)); objects come from its slab,
+// whose chunks are admitted through set_memory_growth. Its 1024-ID directory
+// pages are admitted by flow upserts before publication and retained until
+// teardown. Packet-path state (D-206, class P), all DPDK memory.
+using PacketStoreLimitsTable = SlotTable<PacketStoreFlowId, PacketStoreLimits, true>;
 
 struct PacketStoreConfig {
   uint32_t max_packets = 4096;           // packets held, all flows (> 0)

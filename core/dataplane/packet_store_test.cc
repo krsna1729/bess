@@ -39,6 +39,7 @@ std::unique_ptr<PacketStoreLimitsTable> Limits(
         {}) {
   auto table = std::make_unique<PacketStoreLimitsTable>(16);
   for (const auto &[id, limits] : entries) {
+    table->PrepareSlot(PacketStoreFlowId(id));
     (void)table->Publish(PacketStoreFlowId(id), table->Make(limits));
   }
   return table;
@@ -635,8 +636,42 @@ TEST_F(PacketStoreFlowsResourceTest, RefusedGrowthRefusesTheTransactionCleanly) 
   ASSERT_EQ(
       TransactionEngine::Outcome::kApplied,
       engine_.Apply(std::vector<Op>{Upsert(1, {}), Upsert(2, {})}).outcome);
-  EXPECT_EQ(utils::ObjectSlab<PacketStoreLimits>::chunk_bytes(), growth_.net());
+  EXPECT_EQ(PacketStoreLimitsTable::PageBytes() +
+                utils::ObjectSlab<PacketStoreLimits>::chunk_bytes(), growth_.net());
   EXPECT_EQ(2u, resource_.LiveCount());
+}
+
+TEST_F(PacketStoreFlowsResourceTest, LateSparsePagesPreserveExistingLimitsAndRefuseBeforePublication) {
+  EXPECT_EQ(PacketStoreLimitsTable::Bytes(kCapacity), table_.bytes());
+  ASSERT_EQ(TransactionEngine::Outcome::kApplied,
+            engine_.Apply(std::vector<Op>{Upsert(1023, {.timeout_ns = 7})}).outcome);
+  const auto *kept = table_.Lookup(PacketStoreFlowId(1023));
+  ASSERT_NE(nullptr, kept);
+  growth_.refuse = true;
+  EXPECT_THROW((void)engine_.Apply(std::vector<Op>{
+      Upsert(1024, {.timeout_ns = 8}), Upsert(kCapacity, {.timeout_ns = 9})}),
+      utils::MemoryRefused);
+  EXPECT_FALSE(resource_.Contains(EncodeKey(uint32_t{1024})));
+  EXPECT_FALSE(resource_.Contains(EncodeKey(uint32_t{kCapacity})));
+  EXPECT_EQ(kept, table_.Lookup(PacketStoreFlowId(1023)));
+  growth_.refuse = false;
+  ASSERT_EQ(TransactionEngine::Outcome::kApplied,
+            engine_.Apply(std::vector<Op>{
+                Upsert(1024, {.timeout_ns = 8}), Upsert(kCapacity, {.timeout_ns = 9})}).outcome);
+  EXPECT_EQ(kept, table_.Lookup(PacketStoreFlowId(1023)));
+  const auto *highest = table_.Lookup(PacketStoreFlowId(kCapacity));
+  ASSERT_NE(nullptr, highest);
+  EXPECT_EQ(std::optional<uint64_t>{9}, highest->timeout_ns);
+  ASSERT_EQ(TransactionEngine::Outcome::kApplied,
+            engine_.Apply(std::vector<Op>{Erase(kCapacity)}).outcome);
+  domain_.Drain();
+  const size_t retained = growth_.net();
+  ASSERT_EQ(TransactionEngine::Outcome::kApplied,
+            engine_.Apply(std::vector<Op>{Upsert(kCapacity, {.timeout_ns = 10})}).outcome);
+  EXPECT_EQ(retained, growth_.net()) << "reuse retains directory pages and slab capacity";
+  highest = table_.Lookup(PacketStoreFlowId(kCapacity));
+  ASSERT_NE(nullptr, highest);
+  EXPECT_EQ(std::optional<uint64_t>{10}, highest->timeout_ns);
 }
 
 // BP-6 (DP-2): a transaction costs what it changes, not a copy of the
