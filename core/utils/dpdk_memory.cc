@@ -653,7 +653,7 @@ void InstallHeapValidator() {
 
 TableBacking AdmitTable(size_t bytes, size_t glibc_bytes) {
   glibc_bytes = std::min(glibc_bytes, bytes);
-  if (!HugepageBacked()) {
+  if (glibc_bytes == bytes || !HugepageBacked()) {
     AdmitNormalMemory(bytes);
     return TableBacking::kNormal;
   }

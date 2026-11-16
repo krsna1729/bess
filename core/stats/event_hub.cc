@@ -169,7 +169,8 @@ uint64_t EventHub::LoseLocked() noexcept {
 }
 
 uint64_t EventHub::Emit(std::string type, std::string source,
-                        std::map<std::string, std::string> fields, uint64_t generation) {
+                        const std::map<std::string, std::string> &fields,
+                        uint64_t generation) {
   uint64_t seq;
   {
     std::lock_guard<std::mutex> guard(mutex_);

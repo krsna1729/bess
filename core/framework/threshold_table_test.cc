@@ -240,7 +240,7 @@ TEST(ThresholdTableTest, ATickAndAWorkerReportTheSameEventShape) {
   });
   hub.Run(std::chrono::milliseconds(5), 0);
   for (PendingEvent &e : hub.TakeEvents()) {  // what the maintenance loop does
-    log.Emit(std::move(e.type), std::move(e.source), std::move(e.fields));
+    log.Emit(std::move(e.type), std::move(e.source), e.fields);
   }
   stats::CrossingNotifier notifier(log, "urr0");
   ASSERT_TRUE(notifier.Note(dataplane::WorkerId(3), 42, 77, 70));

@@ -1,3 +1,4 @@
+#include "dpdk.h"
 #include "gate.h"
 #include "module.h"
 #include "port.h"
@@ -14,4 +15,5 @@ TEST(BuiltInRegistryTest, DiscoversLinkedComponents) {
   EXPECT_NE(ports.find("PMDPort"), ports.end());
   EXPECT_NE(gate_hooks.find("Track"), gate_hooks.end());
   EXPECT_FALSE(bess::global_resume_hooks.empty());
+  EXPECT_FALSE(bess::IsDpdkInitialized());
 }
