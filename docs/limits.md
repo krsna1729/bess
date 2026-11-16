@@ -58,6 +58,8 @@ Columns:
 | Transaction history bytes | 4 MiB (`bessd/transaction_records`) | `DataplaneTransactions::kMaxRecordBytes` | No | oldest record dropped (the newest is always kept) |
 | Pending reference cascades | 4,096 | `TransactionEngine::kMaxPendingCascades` | No | transaction answered BUSY (retry) |
 | Transactions in one `TransactionChannel` frame | 64 | `kMaxChannelTransactions` (`control/api_v2.h`) | No | the frame is refused with INVALID_ARGUMENT (field `transactions`); nothing in it is applied |
+| Event log capacity | 16,384 events (about 8 MiB when full) | `EventHub::kDefaultLogCapacity` (`stats/event_hub.h`) | `EventHub` constructor argument | a memory-refused observation consumes its sequence and reaches readers as a gap; `memory_lost()` counts it |
+| Worker event ring capacity | 256 events per worker | `EventHub::kDefaultRingCapacity` (`stats/event_hub.h`) | `EventHub` constructor argument | `Post` returns false and the refusal is counted; with the maintenance loop off, a worker's 257th event is refused |
 
 ## Modules
 

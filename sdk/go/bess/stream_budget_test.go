@@ -53,14 +53,14 @@ func TestTransactionStreamByteAdmissionAndWithdrawal(t *testing.T) {
 	}
 	start := func(callCtx context.Context, req *pb.ApplyTransactionRequest) <-chan error {
 		done := make(chan error, 1)
-		go func() { _, err := client.commit(callCtx, req, 7); done <- err }()
+		go func() { _, commitErr := client.commit(callCtx, req, 7); done <- commitErr }()
 		return done
 	}
 	await := func(done <-chan error) error {
 		t.Helper()
 		select {
-		case err := <-done:
-			return err
+		case commitErr := <-done:
+			return commitErr
 		case <-ctx.Done():
 			t.Fatal(ctx.Err())
 			return nil
@@ -92,8 +92,8 @@ func TestTransactionStreamByteAdmissionAndWithdrawal(t *testing.T) {
 		t.Fatalf("local capacity refusal: %v", e)
 	}
 	stopWaiting()
-	if err := await(waiting); status.Code(err) != codes.Canceled {
-		t.Fatalf("withdrawn request: %v", err)
+	if waitErr := await(waiting); status.Code(waitErr) != codes.Canceled {
+		t.Fatalf("withdrawn request: %v", waitErr)
 	}
 	// The withdrawn entry is still in the channel, but its bytes must no
 	// longer prevent a larger replacement from being admitted.
@@ -102,8 +102,8 @@ func TestTransactionStreamByteAdmissionAndWithdrawal(t *testing.T) {
 	replacement := start(replacementCtx, request("replacement", 32<<20))
 	awaitPending(56 << 20)
 	stopReplacement()
-	if err := await(replacement); status.Code(err) != codes.Canceled {
-		t.Fatalf("replacement request: %v", err)
+	if replacementErr := await(replacement); status.Code(replacementErr) != codes.Canceled {
+		t.Fatalf("replacement request: %v", replacementErr)
 	}
 	stopFirst()
 	as[*TransportError](t, await(first)) // sent cancellation is still UNKNOWN
