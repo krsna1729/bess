@@ -812,8 +812,8 @@ func (c *Client) pipelineCall(ctx context.Context, in proto.Message, retryBusy b
 			return nil, &PipelineConflictError{Message: detail.GetMessage(), Detail: detail}
 		case pb.ErrorDetail_RESOURCE_BUSY:
 			if retryBusy && attempt < c.retry.Attempts && ctx.Err() == nil {
-				if err := c.sleep(ctx, backoff); err != nil {
-					return nil, err
+				if sleepErr := c.sleep(ctx, backoff); sleepErr != nil {
+					return nil, sleepErr
 				}
 				backoff *= 2
 				continue
