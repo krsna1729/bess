@@ -103,7 +103,8 @@ class EventHub {
 
   // Control side. A memory-refused observation still consumes its returned
   // sequence and wakes readers. Retention allocation failures never propagate.
-  uint64_t Emit(std::string type, std::string source, std::map<std::string, std::string> fields,
+  uint64_t Emit(std::string type, std::string source,
+                const std::map<std::string, std::string> &fields,
                 uint64_t generation = 0);
   size_t DrainWorkers();
 

@@ -78,7 +78,7 @@ void MaintenanceLoop::Run() {
     std::vector<framework::PendingEvent> queued = tick_hub_.TakeEvents();
     if (events_ != nullptr) {
       for (framework::PendingEvent &e : queued) {
-        events_->Emit(std::move(e.type), std::move(e.source), std::move(e.fields));
+        events_->Emit(std::move(e.type), std::move(e.source), e.fields);
       }
       for (const ResourceFillWatch::Crossing &c : fills_result.crossed) {
         std::map<std::string, std::string> fields{
@@ -88,7 +88,7 @@ void MaintenanceLoop::Run() {
         if (c.capacity) {
           fields["capacity"] = std::to_string(*c.capacity);
         }
-        events_->Emit(kResourceFillEvent, ModuleOf(c.resource), std::move(fields));
+        events_->Emit(kResourceFillEvent, ModuleOf(c.resource), fields);
       }
     }
     if (sample) {
