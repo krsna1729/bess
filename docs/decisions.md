@@ -13973,8 +13973,11 @@ is half built, and the status counts entries, not bytes (D-149 left `Module::Rep
   charge past `memory.max` is SIGBUS even with free pool pages (measured: a bessd holding one 1 GB page showed
   `memory.current` 1090 MB, `memory.stat hugetlb 1073741824`). bessd reads the option from `/proc/self/mountinfo`
   (`MemoryPolicy::hugetlb_charged`, reported as `memory.hugetlb_charged`); then table admission also admits the
-  whole pages the heap must map against the limit, and a DPDK allocation validator on the memory node refuses any
-  heap growth past the cap or, when charged, past the limit (rte_malloc fails into the existing refusal). With
+  whole pages the heap must map against the limit -- pages of the size the heap actually maps: under `--in-memory`
+  DPDK also lists page sizes with none reserved (1 GiB beside reserved 2 MiB pages), largest first, and charging by
+  that unmapped size refused a 1M-session fill at 1.4 GB used (`detail::GrowthPageSize`) -- and a DPDK allocation
+  validator on the memory node refuses any heap growth past the cap or, when charged, past the limit (rte_malloc
+  fails into the existing refusal). With
   hugepage backing the cgroup's `hugetlb.<size>.max` caps the heap like `--mem_hugepage_mb` (the smaller wins), so
   DPDK refuses at it rather than faulting past it. bessd warns at startup when a charged limit is below the cap plus
   the reserve. The [kernel cgroup-v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html#mount-options)

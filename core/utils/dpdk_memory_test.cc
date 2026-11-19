@@ -435,6 +435,23 @@ TEST_F(DpdkMemoryTest, HugepageChargeIsTheWholePagesTheHeapMustAdd) {
   EXPECT_EQ(HugepageCharge(3 * kMB, 0, 0), 3 * kMB);  // page size unknown
 }
 
+// DPDK lists every page size the kernel offers, largest first; under
+// --in-memory that includes 1 GiB with no pages reserved beside reserved
+// 2 MiB pages. Charging by that unmapped size turned every table into a
+// 1 GiB admission and refused a 1M-session fill at 1.4 GB used.
+TEST_F(DpdkMemoryTest, GrowthPageSizeIsTheSizeTheHeapMaps) {
+  using bess::utils::detail::GrowthPageSize;
+  using bess::utils::detail::SegmentList;
+  constexpr size_t kGB = size_t{1} << 30;
+  const SegmentList only_2m_mapped[] = {{kGB, 0}, {kGB, 0}, {2 * kMB, 3}, {2 * kMB, 0}};
+  EXPECT_EQ(GrowthPageSize(only_2m_mapped), 2 * kMB);
+  const SegmentList both_mapped[] = {{kGB, 1}, {2 * kMB, 3}};
+  EXPECT_EQ(GrowthPageSize(both_mapped), kGB);
+  const SegmentList none_mapped[] = {{kGB, 0}, {2 * kMB, 0}};
+  EXPECT_EQ(GrowthPageSize(none_mapped), kGB);  // overcharges, never under-admits
+  EXPECT_EQ(GrowthPageSize({}), 0u);
+}
+
 TEST_F(DpdkMemoryTest, ChargedHugepagesAreAdmittedAgainstTheLimit) {
   if (!rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK runs on normal pages (BESSD_MEM_BACKING)";

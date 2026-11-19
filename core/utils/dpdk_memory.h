@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -191,6 +192,19 @@ namespace detail {
 // charged (D-198): nothing if the heap's largest free block holds it, else
 // the whole pages the heap must map for it (DPDK grows the heap by pages).
 size_t HugepageCharge(size_t bytes, size_t largest_free, size_t page_size);
+// One of DPDK's memory segment lists for a memory node: the page size it
+// maps and how many segments it holds now.
+struct SegmentList {
+  size_t page_size;
+  unsigned segments;
+};
+// The page size a hugepage heap grows by, from its node's segment lists.
+// DPDK makes a list for every page size the kernel offers, largest first;
+// under --in-memory that includes a size with no pages reserved (1 GiB
+// beside reserved 2 MiB pages), which it never maps. The largest size among
+// lists that hold segments, then; before anything is mapped, the largest
+// listed, which can only overcharge. 0 with no list.
+size_t GrowthPageSize(std::span<const SegmentList> lists) noexcept;
 // The largest chunk the "bess-normal" fallback heap grows by, but for a
 // single allocation larger than it: max(256 MiB, limit / 64). DPDK writes
 // every page of a chunk as it adds it, under one control call; the cap
