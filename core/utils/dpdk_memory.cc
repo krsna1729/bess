@@ -537,28 +537,36 @@ bool HugepageBacked() {
   return NativeHugepages();
 }
 
-// The page size of the memory node's hugepage heap: the first memory
-// segment list DPDK made for that socket (bessd maps one page size per
-// node). Read once, on the control path, never from a validator callback
-// (rte_memseg_list_walk takes the hotplug lock those run under).
+// The page size the memory node's hugepage heap grows by (GrowthPageSize).
+// Walked on the control path, never from a validator callback
+// (rte_memseg_list_walk takes the hotplug lock those run under). Kept once a
+// list holds segments: the packet pool maps the heap's first pages at
+// startup, so the walk repeats only before that.
 size_t HeapPageSize() {
-  static const size_t page = [] {
-    struct Find {
-      int socket;
-      size_t page;
-    } find{MemoryNode(), 0};
-    rte_memseg_list_walk(
-        [](const rte_memseg_list *msl, void *arg) {
-          auto *f = static_cast<Find *>(arg);
-          if (msl->external || msl->socket_id != f->socket) {
-            return 0;
-          }
-          f->page = msl->page_sz;
-          return 1;
-        },
-        &find);
-    return find.page;
-  }();
+  static std::atomic<size_t> mapped{0};
+  if (const size_t page = mapped.load(std::memory_order_relaxed); page != 0) {
+    return page;
+  }
+  struct Walk {
+    int socket;
+    std::vector<detail::SegmentList> lists;
+  } walk{MemoryNode(), {}};
+  rte_memseg_list_walk(
+      [](const rte_memseg_list *msl, void *arg) {
+        auto *w = static_cast<Walk *>(arg);
+        if (!msl->external && msl->socket_id == w->socket) {
+          w->lists.push_back({msl->page_sz, msl->memseg_arr.count});
+        }
+        return 0;
+      },
+      &walk);
+  const size_t page = detail::GrowthPageSize(walk.lists);
+  for (const detail::SegmentList &list : walk.lists) {
+    if (list.segments != 0) {
+      mapped.store(page, std::memory_order_relaxed);
+      break;
+    }
+  }
   return page;
 }
 
@@ -615,6 +623,18 @@ size_t HugepageCharge(size_t bytes, size_t largest_free, size_t page_size) {
     return 0;  // the heap holds it in pages it has already mapped
   }
   return page_size == 0 ? bytes : RoundUp(bytes, page_size);
+}
+
+size_t GrowthPageSize(std::span<const SegmentList> lists) noexcept {
+  size_t listed = 0;
+  size_t mapped = 0;
+  for (const SegmentList &list : lists) {
+    listed = std::max(listed, list.page_size);
+    if (list.segments != 0) {
+      mapped = std::max(mapped, list.page_size);
+    }
+  }
+  return mapped != 0 ? mapped : listed;
 }
 
 size_t FallbackChunkCap(size_t limit_bytes) noexcept {
