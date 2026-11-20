@@ -890,9 +890,9 @@ Op WMet(uint32_t id, uint32_t rate) {
 // the engine's first transaction (no scratch capacity yet), a transaction
 // larger than any before it, and one that starts by advancing a pending
 // removal cascade. Each failure must leave the state exactly as it was, and
-// the same transaction must then apply. A refusal Apply() absorbs (the
-// nothrow buffer std::stable_sort asks for, and does without) must leave the
-// transaction applied exactly as without it.
+// the same transaction must then apply. A refusal Apply() absorbs, if any (a
+// nothrow allocation it can do without), must leave the transaction applied
+// exactly as without it.
 TEST(LifecycleAllocationTest, FailureAtEveryAllocationLeavesNoTrace) {
   enum Setting { kFirstUse, kLarger, kAfterRemovals };
   auto chains = [](uint32_t first, uint32_t n) {

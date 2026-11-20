@@ -736,10 +736,14 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   for (size_t i = 0; i < n; i++) {
     w.reserve_order[i] = static_cast<uint32_t>(i);
   }
-  std::stable_sort(w.reserve_order.begin(), w.reserve_order.end(),
-                   [&](uint32_t a, uint32_t b) {
-                     return w.reg[a]->resource->rank() < w.reg[b]->resource->rank();
-                   });
+  // The index is the last key, so std::sort gives the stable order without
+  // the temporary buffer std::stable_sort allocates on every call.
+  std::sort(w.reserve_order.begin(), w.reserve_order.end(),
+            [&](uint32_t a, uint32_t b) {
+              const int ra = w.reg[a]->resource->rank();
+              const int rb = w.reg[b]->resource->rank();
+              return ra != rb ? ra < rb : a < b;
+            });
   // Room for the abort bookkeeping first: once a Reserve() has placed
   // something (a pending key), recording it for abort must not be able to
   // throw (external review: a failed push_back leaked the key).
@@ -950,7 +954,9 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   for (size_t i = 0; i < w.order.size(); i++) {
     w.order[i] = i;
   }
-  std::stable_sort(w.order.begin(), w.order.end(), [&](size_t a, size_t b) {
+  // Stable by staged index (the last key), without std::stable_sort's
+  // per-call buffer, as for the reserve order above.
+  std::sort(w.order.begin(), w.order.end(), [&](size_t a, size_t b) {
     const Op &x = ops[w.staged[a].op];
     const Op &y = ops[w.staged[b].op];
     const bool xu = x.kind == OpKind::kUpsert;
@@ -960,7 +966,10 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
     }
     const int rx = w.reg[w.staged[a].op]->resource->rank();
     const int ry = w.reg[w.staged[b].op]->resource->rank();
-    return xu ? rx < ry : rx > ry;
+    if (rx != ry) {
+      return xu ? rx < ry : rx > ry;
+    }
+    return a < b;
   });
 
   // Exactly what the resources declared (their Reserve() footprints): the
