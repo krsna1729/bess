@@ -196,8 +196,8 @@ TEST_F(TransactionCostTest, AllocationsPerTransaction) {
               owned1, owned8, adapter1, adapter8);
   EXPECT_LE(owned1, 2.0);
   EXPECT_LE(owned8, 9.0);
-  EXPECT_LE(adapter1, 11.25);
-  EXPECT_LE(adapter8, 56.25);
+  EXPECT_LE(adapter1, 10.25);
+  EXPECT_LE(adapter8, 46.25);
 }
 
 // The adapter resolves a transaction's resources under one acquisition of
