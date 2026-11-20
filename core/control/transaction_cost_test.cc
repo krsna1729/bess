@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,7 @@
 #include "control/dataplane_transactions.h"
 #include "dataplane/transaction_engine.h"
 #include "framework/resource_bindings.h"
+#include "framework/resource_codec.h"
 #include "modules/exact_match.h"
 #include "packet_pool.h"
 #include "pb/control_v2.grpc.pb.h"
@@ -153,26 +155,78 @@ class TransactionCostTest : public ::testing::Test {
     return static_cast<double>(allocations) / kMeasured;
   }
 
-  // Allocations per DataplaneTransactions::Apply of `stages` operations,
-  // steady state: unique request ids, receipts recorded, responses dropped.
-  double AdapterAllocations(size_t stages) {
-    size_t allocations = 0;
+  // What one DataplaneTransactions::Apply of `stages` operations allocates in
+  // the steady state (unique request ids, receipts recorded), next to what
+  // the protobuf library alone allocates for the same transaction: decoding
+  // its keys and values through the resources' codecs, and building the
+  // smallest response that says the same (the record, its request id, one
+  // result per operation with only its status, the results reserved once).
+  // Those two vary with the protobuf release; what remains is the adapter's
+  // and the engine's own.
+  struct AdapterCost {
+    double apply = 0;
+    double decode = 0;
+    double response = 0;
+  };
+  AdapterCost AdapterAllocations(size_t stages) {
+    std::vector<const bess::framework::ResourceCodec *> codecs;
+    for (size_t stage = 0; stage < stages; stage++) {
+      codecs.push_back(bess::framework::ResourceBindings::ProcessDefault().Find(*owned_[stage]));
+      EXPECT_NE(nullptr, codecs.back());
+    }
+    size_t apply = 0;
+    size_t decode = 0;
+    size_t response = 0;
     for (int i = 0; i < 8 + kMeasured; i++) {
       const v2::ApplyTransactionRequest request =
           Request(stages, static_cast<uint64_t>(i));
       auto lock = control_->AcquireLock();
-      AllocationFaults window;
-      auto result = adapter_->Apply(request);
-      if (i >= 8) {
-        allocations += window.allocations();
+      // Constructed in place (no move inside the window).
+      std::optional<bess::control::ControlResult<v2::ApplyTransactionResponse>> applied;
+      {
+        AllocationFaults window;
+        applied.emplace(adapter_->Apply(request));
+        if (i >= 8) {
+          apply += window.allocations();
+        }
       }
-      EXPECT_TRUE(result.has_value());
-      if (result) {
-        EXPECT_EQ(v2::TransactionRecord::OUTCOME_APPLIED, result->record().outcome());
-        EXPECT_EQ(static_cast<int>(stages), result->record().ops_size());
+      EXPECT_TRUE(applied->has_value());
+      if (!applied->has_value()) {
+        continue;
+      }
+      const v2::ApplyTransactionResponse &result = **applied;
+      EXPECT_EQ(v2::TransactionRecord::OUTCOME_APPLIED, result.record().outcome());
+      EXPECT_EQ(static_cast<int>(stages), result.record().ops_size());
+      if (i < 8) {
+        continue;
+      }
+      {
+        AllocationFaults window;
+        for (size_t stage = 0; stage < stages; stage++) {
+          const v2::TransactionOp &op = request.ops(static_cast<int>(stage));
+          EXPECT_TRUE(codecs[stage]->Key(op.key().type_url(), op.key().value()).has_value());
+          EXPECT_TRUE(codecs[stage]->Value(op.value().type_url(), op.value().value()).has_value());
+        }
+        decode += window.allocations();
+      }
+      {
+        AllocationFaults window;
+        v2::ApplyTransactionResponse minimal;
+        minimal.set_daemon_epoch(result.daemon_epoch());
+        v2::TransactionRecord *record = minimal.mutable_record();
+        record->set_request_id(result.record().request_id());
+        record->set_outcome(result.record().outcome());
+        record->set_generation(result.record().generation());
+        record->set_visibility(result.record().visibility());
+        record->mutable_ops()->Reserve(static_cast<int>(stages));
+        for (size_t stage = 0; stage < stages; stage++) {
+          record->add_ops()->set_status(v2::TransactionOpResult::STATUS_APPLIED);
+        }
+        response += window.allocations();
       }
     }
-    return static_cast<double>(allocations) / kMeasured;
+    return {static_cast<double>(apply) / kMeasured, static_cast<double>(decode) / kMeasured,
+            static_cast<double>(response) / kMeasured};
   }
 
   std::unique_ptr<ControlPlane> control_;
@@ -184,20 +238,27 @@ class TransactionCostTest : public ::testing::Test {
 // What one transaction allocates in the steady state, by boundary. The typed
 // engine: the result's operation list and each operation's staged work (the
 // resource's StagedOp), nothing of its own per call or per operation. The
-// adapter adds the codecs' decoded keys and values, the request's ops and
-// record, and its receipt.
+// adapter: beyond the engine's, the protobuf library's (decoding the
+// operations, building the response; measured alongside, as they vary with
+// the protobuf release) and a constant of its own (its decoded operation
+// list, among others), the same at 1 and at 8 operations: no empty error
+// string per result, no reallocation of the results as they grow.
 TEST_F(TransactionCostTest, AllocationsPerTransaction) {
   const double owned1 = OwnedAllocations(1);
   const double owned8 = OwnedAllocations(kStages);
-  const double adapter1 = AdapterAllocations(1);
-  const double adapter8 = AdapterAllocations(kStages);
-  std::printf("allocations per transaction: owned 1-op %.2f, 8-op %.2f; "
-              "adapter 1-op %.2f, 8-op %.2f\n",
-              owned1, owned8, adapter1, adapter8);
+  const AdapterCost adapter1 = AdapterAllocations(1);
+  const AdapterCost adapter8 = AdapterAllocations(kStages);
+  const double own1 = adapter1.apply - adapter1.decode - adapter1.response - owned1;
+  const double own8 = adapter8.apply - adapter8.decode - adapter8.response - owned8;
+  std::printf("allocations per transaction: owned 1-op %.2f, 8-op %.2f; adapter 1-op %.2f "
+              "(decode %.2f, response %.2f, own %.2f), 8-op %.2f (decode %.2f, response %.2f, "
+              "own %.2f)\n",
+              owned1, owned8, adapter1.apply, adapter1.decode, adapter1.response, own1,
+              adapter8.apply, adapter8.decode, adapter8.response, own8);
   EXPECT_LE(owned1, 2.0);
   EXPECT_LE(owned8, 9.0);
-  EXPECT_LE(adapter1, 10.25);
-  EXPECT_LE(adapter8, 46.25);
+  EXPECT_LE(own1, 2.25);
+  EXPECT_LE(own8, 2.25);
 }
 
 // The adapter resolves a transaction's resources under one acquisition of
