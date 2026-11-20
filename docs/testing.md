@@ -205,6 +205,7 @@ their own `test()`.
 | `control_scheduling_constraints_test` | 272 | 212.7 | 213.8 |
 | `control_thread_placement_test_in_two_cpus` | 272 | 211.4 | 212.1 |
 | `control_thread_placement_test` | 272 | 211.3 | 212.2 |
+| `control_transaction_cost_test` | 272 | - | 213.8 |
 | `framework_exact_match_table_test` | 272 | 216.6 | 217.0 |
 | `grace_period_bench` | 272 | - | 212.2 |
 | `modules_port_inc_test` | 272 | 211.7 | 212.2 |

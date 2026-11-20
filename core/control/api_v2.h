@@ -4,6 +4,7 @@
 #define BESS_CONTROL_API_V2_H_
 
 #include <chrono>
+#include <mutex>
 #include <optional>
 
 #include <grpcpp/server_builder.h>
@@ -162,12 +163,17 @@ class ControlV2Service final : public pb::v2::Control::Service {
                            grpc::ServerWriter<pb::v2::Event> *writer) override;
 
  private:
-  grpc::Status ApplyTransactionImpl(
+  // One transaction whose epoch was checked, with `lock` (the control-plane
+  // lock) held on entry and on return; it is released only while a BUSY
+  // answer is waited out. `error`: null for the unary RPC (the status goes
+  // to `context`), else where the channel's typed error goes.
+  grpc::Status ApplyTransactionLocked(
       grpc::ServerContext *context,
       const pb::v2::ApplyTransactionRequest *request,
       pb::v2::ApplyTransactionResponse *response,
       std::chrono::system_clock::time_point deadline,
-      std::optional<pb::v2::ErrorDetail> *error);
+      std::optional<pb::v2::ErrorDetail> *error,
+      std::unique_lock<std::mutex> &lock);
   ControlPlane &control_plane_;
   DataplaneTransactions transactions_;
 };

@@ -1012,18 +1012,19 @@ static void EmitTransactionEvent(const v2::TransactionRecord &r) {
 grpc::Status ControlV2Service::ApplyTransaction(
     grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,
     v2::ApplyTransactionResponse *response) {
-  return ApplyTransactionImpl(context, request, response, context->deadline(), nullptr);
+  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(), context)) {
+    return *refused;
+  }
+  auto lock = control_plane_.AcquireLock();
+  return ApplyTransactionLocked(context, request, response, context->deadline(), nullptr,
+                                lock);
 }
 
-grpc::Status ControlV2Service::ApplyTransactionImpl(
+grpc::Status ControlV2Service::ApplyTransactionLocked(
     grpc::ServerContext *context, const v2::ApplyTransactionRequest *request,
     v2::ApplyTransactionResponse *response,
     std::chrono::system_clock::time_point deadline,
-    std::optional<v2::ErrorDetail> *error) {
-  if (auto refused = RefuseOtherEpoch(request->daemon_epoch(), transactions_.epoch(),
-                                     error == nullptr ? context : nullptr, error)) {
-    return *refused;
-  }
+    std::optional<v2::ErrorDetail> *error, std::unique_lock<std::mutex> &lock) {
   // Resources' tables are DPDK structures; commands writing the same tables
   // run under the same lock.
   current_worker.SetNonWorker();
@@ -1036,24 +1037,23 @@ grpc::Status ControlV2Service::ApplyTransactionImpl(
   auto backoff = kBusyFirstBackoff;
   ControlResult<v2::ApplyTransactionResponse> applied;
   for (int retry = 0;; retry++) {
-    {
-      auto lock = control_plane_.AcquireLock();
-      // Decided before the attempt, so the engine counts a BUSY it will not
-      // answer as a retry, never as an answer it has to take back.
-      const bool may_retry = retry < kBusyRetries && !context->IsCancelled() &&
-                             std::chrono::system_clock::now() + backoff < deadline;
-      applied = transactions_.Apply(*request, may_retry ? dataplane::TransactionEngine::OnBusy::kRetry
-                                                        : dataplane::TransactionEngine::OnBusy::kAnswer);
-      if (!may_retry || !applied ||
-          applied->record().outcome() != v2::TransactionRecord::OUTCOME_BUSY) {
-        if (applied && !applied->replayed()) {
-          EmitTransactionEvent(applied->record());
-        }
-        break;
+    // Decided before the attempt, so the engine counts a BUSY it will not
+    // answer as a retry, never as an answer it has to take back.
+    const bool may_retry = retry < kBusyRetries && !context->IsCancelled() &&
+                           std::chrono::system_clock::now() + backoff < deadline;
+    applied = transactions_.Apply(*request, may_retry ? dataplane::TransactionEngine::OnBusy::kRetry
+                                                      : dataplane::TransactionEngine::OnBusy::kAnswer);
+    if (!may_retry || !applied ||
+        applied->record().outcome() != v2::TransactionRecord::OUTCOME_BUSY) {
+      if (applied && !applied->replayed()) {
+        EmitTransactionEvent(applied->record());
       }
+      break;
     }
+    lock.unlock();
     std::this_thread::sleep_for(backoff);
     backoff *= 2;
+    lock = control_plane_.AcquireLock();
   }
   if (!applied) {
     if (error != nullptr) {
@@ -1100,11 +1100,24 @@ grpc::Status ControlV2Service::TransactionChannel(
           deadline = now + budget;
         }
       }
+      // The whole frame under one acquisition of the control-plane lock, its
+      // transactions applied in order, each still atomic, deduplicated,
+      // recorded and announced on its own. The hold is bounded by the frame:
+      // at most kMaxChannelTransactions transactions, each within the
+      // engine's retire budget and the message limit; the lock is released
+      // between frames and while a BUSY answer is waited out.
+      auto lock = control_plane_.AcquireLock();
       for (const auto &transaction : request.transactions()) {
         v2::TransactionChannelResult *result = response.add_results();
         std::optional<v2::ErrorDetail> error;
-        const grpc::Status status = ApplyTransactionImpl(
-            context, &transaction, result->mutable_transaction(), deadline, &error);
+        grpc::Status status;
+        if (auto refused = RefuseOtherEpoch(transaction.daemon_epoch(), transactions_.epoch(),
+                                           nullptr, &error)) {
+          status = *refused;
+        } else {
+          status = ApplyTransactionLocked(context, &transaction, result->mutable_transaction(),
+                                          deadline, &error, lock);
+        }
         if (!status.ok()) {
           result->clear_transaction();
           result->set_status_code(status.error_code());
