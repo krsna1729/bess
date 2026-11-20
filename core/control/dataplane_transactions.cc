@@ -352,10 +352,16 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
     record.set_outcome(ToProto(result.outcome));
     record.set_generation(result.generation);
+    // One growth of the repeated field, and an error string only for the
+    // operation that has one: an empty proto3 string is the unset field,
+    // and setting it allocated a std::string per applied operation.
+    record.mutable_ops()->Reserve(static_cast<int>(result.ops.size()));
     for (const auto &op : result.ops) {
       auto *out = record.add_ops();
       out->set_status(ToProto(op.status));
-      out->set_error(op.error);
+      if (!op.error.empty()) {
+        out->set_error(op.error);
+      }
     }
   }
   record.set_request_id(id);
