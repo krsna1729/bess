@@ -65,7 +65,7 @@ TransactionEngine::Registration *TransactionEngine::Resolve(
 
 std::expected<void, std::string> TransactionEngine::Register(
     Resource *resource) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   if (resources_.contains(resource->name())) {
     return std::unexpected("resource '" + resource->name() +
                            "' is already registered");
@@ -246,7 +246,7 @@ std::expected<void, std::string> TransactionEngine::Unregister(
 
 std::expected<void, std::string> TransactionEngine::Unregister(
     std::span<const std::string> names) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   std::vector<Registration *> group;
   for (const std::string &name : names) {
     auto res = resources_.find(std::string_view(name));
@@ -334,7 +334,7 @@ std::expected<void, std::string> TransactionEngine::Unregister(
 
 std::expected<void, std::string> TransactionEngine::ReleaseForTeardown(
     std::span<const std::string> names) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   // Pending removal steps capture these resources' tables, and objects handed
   // to RCU are destroyed by code in the resource's module: neither may outlive
   // the release (as for Unregister).
@@ -407,13 +407,13 @@ std::expected<void, std::string> TransactionEngine::ReleaseForTeardown(
 }
 
 Resource *TransactionEngine::FindResource(std::string_view name) const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   auto it = resources_.find(name);
   return it == resources_.end() ? nullptr : it->second->resource;
 }
 
 std::vector<std::string> TransactionEngine::ResourceNames() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   std::vector<std::string> names;
   names.reserve(resources_.size());
   for (const auto &[name, reg] : resources_) {
@@ -475,18 +475,18 @@ ResourceRegistry::OwnedApplyResult ResourceRegistry::ApplyOwned(
 }
 
 uint64_t TransactionEngine::generation() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   return generation_;
 }
 
 void TransactionEngine::AdvanceGeneration() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   generation_++;
 }
 
 size_t TransactionEngine::ReferenceCount(const std::string &resource,
                                          const ResourceKey &key) const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   auto res = resources_.find(resource);
   if (res == resources_.end()) {
     return 0;
@@ -496,12 +496,12 @@ size_t TransactionEngine::ReferenceCount(const std::string &resource,
 }
 
 size_t TransactionEngine::pending_cascades() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   return cascades_.size();
 }
 
 size_t TransactionEngine::ReclaimRetired() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   return ReclaimRetiredLocked();
 }
 
@@ -623,7 +623,7 @@ TransactionEngine::OutcomeCounts TransactionEngine::outcome_counts() const {
 TransactionEngine::Result TransactionEngine::ApplyImpl(
     std::span<const Op> ops, std::optional<uint64_t> expected_generation,
     Consistency consistency, const std::span<const Resource *const> *owned) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  const auto lock = Lock();
   const size_t n = ops.size();
   // D-207: a transaction that only erases may use half the reserve, so a
   // daemon at its memory limit can always be emptied (utils::Headroom).

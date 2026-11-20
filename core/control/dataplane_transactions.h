@@ -95,6 +95,9 @@ class DataplaneTransactions {
   size_t bytes() const { return lease_.bytes(); }
 
  private:
+  // Operations whose resources Apply() resolves on the stack; a longer
+  // request resolves into a heap array.
+  static constexpr size_t kInlineOps = 64;
   using Text = std::basic_string<char, std::char_traits<char>,
                                  utils::AdmittedGlibcAllocator<char>>;
   using Positions =
