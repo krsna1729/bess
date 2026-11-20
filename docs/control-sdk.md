@@ -89,7 +89,10 @@ unary, and all other control/admin/action/snapshot/report APIs remain available
 over the ordinary channel. Opt-in requires the daemon's advertised
 `TransactionChannel` RPC; there is no silent unary fallback.
 
-Native admission, epochs, replay, atomicity and events are unchanged. A remaining
+Native admission, epochs, replay, atomicity and events are unchanged. The daemon
+applies a frame's transactions under one acquisition of its control-plane lock,
+released between frames and while a BUSY answer is waited out, so another
+control call waits for at most one frame (64 transactions) to finish. A remaining
 budget is carried in each frame, shared by its transactions, and starts when the
 server reads it; Go uses the latest member deadline. A refused frame (zero
 attempt ID, negative budget, 0 or more than 64 transactions) has no results and

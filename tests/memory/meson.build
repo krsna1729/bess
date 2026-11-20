@@ -86,6 +86,7 @@ test_memory_mb = {
   'control_scheduling_constraints_test': 272,
   'control_thread_placement_test': 272,
   'control_thread_placement_test_in_two_cpus': 272,
+  'control_transaction_cost_test': 272,
   'control_transaction_fuzz_corpus': 72,
   'dataplane_batch_stages_test': 24,
   'dataplane_continuation_test': 24,

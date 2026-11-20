@@ -3,6 +3,7 @@
 #ifndef BESS_CONTROL_CONTROL_PLANE_H_
 #define BESS_CONTROL_CONTROL_PLANE_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -95,7 +96,17 @@ class ControlPlane {
   // directly (the read-only RPC handlers). Temporary: reads move behind
   // snapshot-backed accessors as G0 progresses.
   std::unique_lock<std::mutex> AcquireLock() {
-    return std::unique_lock<std::mutex>(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    // Written only while holding the lock: a load and a store, no locked
+    // instruction.
+    lock_acquisitions_.store(lock_acquisitions_.load(std::memory_order_relaxed) + 1,
+                             std::memory_order_relaxed);
+    return lock;
+  }
+  // How many times AcquireLock() has taken the lock (only grows): what a
+  // test counts per RPC or per channel frame. Read without the lock.
+  uint64_t lock_acquisitions() const {
+    return lock_acquisitions_.load(std::memory_order_relaxed);
   }
 
   // -- ports --
@@ -293,6 +304,7 @@ class ControlPlane {
   // Locked by every public method, including the const readers (the snapshot
   // and validation paths), hence mutable.
   mutable std::mutex mutex_;
+  std::atomic<uint64_t> lock_acquisitions_{0};
 };
 
 }  // namespace control
