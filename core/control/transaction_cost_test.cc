@@ -127,11 +127,78 @@ class TransactionCostTest : public ::testing::Test {
     return request;
   }
 
+  // Allocations per typed ApplyOwned of `stages` operations, steady state.
+  double OwnedAllocations(size_t stages) {
+    TransactionEngine &engine = bess::runtime::runtime().transactions();
+    std::vector<Op> ops;
+    for (size_t stage = 0; stage < stages; stage++) {
+      ops.push_back(Op::Upsert(Resource(stage), StageKey(0),
+                               std::any(bess::classifier::RuleResult{1, {}})));
+    }
+    const std::span<const bess::dataplane::Resource *const> owned(owned_.data(), stages);
+    size_t allocations = 0;
+    for (int i = 0; i < 8 + kMeasured; i++) {
+      for (Op &op : ops) {
+        std::any_cast<bess::classifier::RuleResult>(&op.value)->gate =
+            static_cast<gate_idx_t>(1 + i % 2);
+      }
+      auto lock = control_->AcquireLock();
+      AllocationFaults window;
+      const TransactionEngine::Result result = engine.ApplyOwned(owned, ops);
+      EXPECT_EQ(TransactionEngine::Outcome::kApplied, result.outcome);
+      if (i >= 8) {
+        allocations += window.allocations();
+      }
+    }
+    return static_cast<double>(allocations) / kMeasured;
+  }
+
+  // Allocations per DataplaneTransactions::Apply of `stages` operations,
+  // steady state: unique request ids, receipts recorded, responses dropped.
+  double AdapterAllocations(size_t stages) {
+    size_t allocations = 0;
+    for (int i = 0; i < 8 + kMeasured; i++) {
+      const v2::ApplyTransactionRequest request =
+          Request(stages, static_cast<uint64_t>(i));
+      auto lock = control_->AcquireLock();
+      AllocationFaults window;
+      auto result = adapter_->Apply(request);
+      if (i >= 8) {
+        allocations += window.allocations();
+      }
+      EXPECT_TRUE(result.has_value());
+      if (result) {
+        EXPECT_EQ(v2::TransactionRecord::OUTCOME_APPLIED, result->record().outcome());
+        EXPECT_EQ(static_cast<int>(stages), result->record().ops_size());
+      }
+    }
+    return static_cast<double>(allocations) / kMeasured;
+  }
+
   std::unique_ptr<ControlPlane> control_;
   std::unique_ptr<ControlV2Service> service_;
   std::unique_ptr<DataplaneTransactions> adapter_;
   std::vector<const bess::dataplane::Resource *> owned_;
 };
+
+// What one transaction allocates in the steady state, by boundary. The typed
+// engine: the result's operation list and each operation's staged work (the
+// resource's StagedOp), nothing of its own per call or per operation. The
+// adapter adds the codecs' decoded keys and values, the request's ops and
+// record, and its receipt.
+TEST_F(TransactionCostTest, AllocationsPerTransaction) {
+  const double owned1 = OwnedAllocations(1);
+  const double owned8 = OwnedAllocations(kStages);
+  const double adapter1 = AdapterAllocations(1);
+  const double adapter8 = AdapterAllocations(kStages);
+  std::printf("allocations per transaction: owned 1-op %.2f, 8-op %.2f; "
+              "adapter 1-op %.2f, 8-op %.2f\n",
+              owned1, owned8, adapter1, adapter8);
+  EXPECT_LE(owned1, 2.0);
+  EXPECT_LE(owned8, 9.0);
+  EXPECT_LE(adapter1, 11.25);
+  EXPECT_LE(adapter8, 56.25);
+}
 
 // The adapter resolves a transaction's resources under one acquisition of
 // the engine's lock, then applies it under one more: two per transaction,
