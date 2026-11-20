@@ -591,7 +591,10 @@ reference to something missing.
   replacement binds without losing surviving referrers or inheriting
   references from released ones.
 - **`kBusy`:** when readers are slow to quiesce and reclamation is behind, a
-  transaction is refused retriably instead of waiting.
+  transaction is refused retriably instead of waiting. A `Reserve()` that
+  could go on only after a grace period it started has passed sets
+  `Reservation::busy` (staging nothing) for the same answer; it never calls
+  `Synchronize()` under the engine's lock (D-021 amendment 6).
 - **Declare each operation's footprint** in `Reserve()` (`Footprint{retires,
   removals, callbacks}`); the adapters do. Exceeding it is fatal: the
   engine reserved exactly that, so publication never allocates.
