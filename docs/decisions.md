@@ -1882,6 +1882,26 @@ keep.** Each finding was checked against the source before acting.
   modules, which the slice brings. Until then, D-022's benchmark
   classifies packets through real modules, not a full graph.
 
+**Amendment 6 (2026-11-20): a reservation that must wait for readers
+answers busy.**
+
+- **The miss.** The UPF session-major resource keeps one spare version per
+  session: a re-update writes over the slots the previous update replaced,
+  so it must wait until that update's grace period has passed. Its
+  `Reserve()` called `RcuDomain::Synchronize()` when the grace period was
+  still running, with the engine's lock and the control-plane lock held:
+  one slow grace period stalled every control RPC (engineering guide §11).
+- **The answer.** `Resource::Reservation::busy`: set, with nothing staged,
+  by a `Reserve()` that can go on only after a grace period has passed. The
+  engine aborts the transaction's earlier reservations and answers
+  `kBusy`, the outcome amendment 2 gave reclamation backpressure, so
+  callers need no new handling: `ApplyTransaction` sleeps its backoff with
+  the control-plane lock released (`kBusyFirstBackoff`, `kBusyRetries`),
+  and the SDKs retry a BUSY record.
+- **Test:** `TransactionEngineTest.AReservationThatMustWaitAnswersBusy`
+  (nothing reserved stays reserved, nothing built or published, one BUSY
+  answer, applied once the resource is ready).
+
 **Deferred (next increments):**
 
 - Router and the modules as resource providers (ExactMatch: D-022;

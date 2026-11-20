@@ -588,6 +588,14 @@ TransactionEngine::Result TransactionEngine::Reject(size_t n_ops,
   return result;
 }
 
+TransactionEngine::Result TransactionEngine::Busy(size_t n_ops) const {
+  Result result;
+  result.outcome = Outcome::kBusy;
+  result.generation = generation_;
+  result.ops.resize(n_ops);
+  return result;
+}
+
 TransactionEngine::Result TransactionEngine::Apply(std::span<const Op> ops,
                                                   std::optional<uint64_t> expected_generation,
                                                   Consistency consistency, OnBusy on_busy) {
@@ -787,6 +795,10 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
     if (!reserved) {
       return Reject(n, i, std::move(reserved.error()));
     }
+    if (reserved->busy) {
+      DCHECK(reserved->staged == nullptr) << "a busy reservation stages nothing";
+      return Busy(n);
+    }
     // Neither push can throw (both reserved for n): the reservation is
     // armed for abort before anything else that can fail runs.
     w.reservations.push_back(std::move(*reserved));
@@ -880,11 +892,7 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   if (domain_.pending_retired() + deferred_objects_ + may_retire >
           retire_budget ||
       cascades_.size() >= kMaxPendingCascades) {
-    Result result;
-    result.outcome = Outcome::kBusy;
-    result.generation = generation_;
-    result.ops.resize(n);
-    return result;
+    return Busy(n);
   }
 
   // -- references the transaction leaves behind -----------------------------

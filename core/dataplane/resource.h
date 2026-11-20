@@ -256,6 +256,14 @@ class Resource {
     // saves the engine two more lookups per operation.
     bool existed = false;
     std::vector<Reference> previous_references;
+    // Set, with nothing staged, when `op` can be reserved only after a grace
+    // period the resource started earlier has passed (the slots a previous
+    // version of the key still names, say). The transaction answers
+    // TransactionEngine::Outcome::kBusy with nothing attempted, and its
+    // caller retries after a backoff with no lock held. Waiting here instead
+    // (RcuDomain::Synchronize) would hold the engine's and the control
+    // plane's locks for the grace period (D-021 amendment 6).
+    bool busy = false;
   };
 
   // `references`: the resources this one's values may refer to. The engine
@@ -326,7 +334,8 @@ class Resource {
   // in ascending rank (every operation on a resource's referents first), and
   // a resource's own operations in request order; a resource that reserves
   // capacity must account for the earlier reservations of the same
-  // transaction.
+  // transaction. Never waits for readers: an operation that must wait out a
+  // grace period answers Reservation::busy.
   virtual std::expected<Reservation, std::string> Reserve(const Op &op) = 0;
 
   // Called once per transaction that reserved an operation here, after every

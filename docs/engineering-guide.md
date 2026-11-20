@@ -360,7 +360,8 @@ point with `AllocationFaults`/`ForEachFailurePoint` (8c4a4433).
 ## 11. Locks, RCU and worker-owned state
 
 - No destructor and no `Synchronize()` under a lock that they or a reader
-  take (2a5ff89c; D-021 amendment 2 answers kBusy); no grace-period wait
+  take (2a5ff89c; D-021 amendment 2 answers kBusy, and amendment 6 lets a
+  `Reserve()` answer it with `Reservation::busy`); no grace-period wait
   per item under a command lock (a85e9b38). One lock order: take the
   second lock after releasing the first (7225386e).
 - A freed id stays retiring for a grace period; a test that reuses it

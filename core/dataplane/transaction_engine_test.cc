@@ -296,6 +296,72 @@ TEST_F(TransactionEngineTest, PrepareBuildsOnceAfterEveryReservation) {
   EXPECT_EQ(idle.aborted, 2);
 }
 
+// A resource whose operation can be reserved only after a grace period it
+// started has passed (a key's previous version still readable): Reserve
+// answers busy until it is told the grace period passed.
+class Waiter final : public Resource {
+ public:
+  explicit Waiter(std::string name) : Resource(std::move(name)) {}
+  size_t LiveCount() const override { return 0; }
+  bool Contains(const ResourceKey &) const override { return false; }
+
+  std::expected<Reservation, std::string> Reserve(const Op &) override {
+    if (busy) {
+      Reservation r;
+      r.busy = true;
+      return r;
+    }
+    struct Staged final : StagedOp {
+      Waiter *w;
+      explicit Staged(Waiter *waiter) : w(waiter) {}
+      void Publish(Retirer &) noexcept override { w->published++; }
+    };
+    return Reservation{std::make_unique<Staged>(this), {}};
+  }
+  void EndTransaction() noexcept override { ended++; }
+
+  bool busy = true;
+  int published = 0;
+  int ended = 0;
+};
+
+// A resource that would have to wait for readers answers busy instead
+// (Reservation::busy, D-021 amendment 6): the transaction is kBusy with
+// nothing attempted -- the earlier reservations aborted, nothing built or
+// published, the generation unchanged -- counted as one BUSY answer, and the
+// same transaction applies once the grace period has passed.
+TEST_F(TransactionEngineTest, AReservationThatMustWaitAnswersBusy) {
+  Batcher batch("batch");
+  Waiter waiter("waiter");
+  TransactionEngine engine(domain_);
+  ASSERT_TRUE(engine.Register(&batch) && engine.Register(&waiter));
+  const std::vector<Op> ops = {Op::Upsert("batch", "a", std::any(1)),
+                               Op::Upsert("waiter", "k", std::any(1)),
+                               Op::Upsert("batch", "b", std::any(1))};
+  const uint64_t generation = engine.generation();
+
+  const auto busy = engine.Apply(ops);
+  ASSERT_EQ(busy.outcome, Outcome::kBusy);
+  EXPECT_EQ(busy.generation, generation);
+  ASSERT_EQ(busy.ops.size(), ops.size());
+  for (const auto &op : busy.ops) {
+    EXPECT_EQ(op.status, OpStatus::kNotApplied);
+  }
+  EXPECT_EQ(batch.aborted, 1) << "the reservation before the busy one";
+  EXPECT_EQ(batch.prepares, 0) << "a busy transaction builds nothing";
+  EXPECT_EQ(batch.published, 0);
+  EXPECT_EQ(batch.reserved, 0) << "EndTransaction ran";
+  EXPECT_EQ(waiter.ended, 1);
+  EXPECT_EQ(engine.generation(), generation);
+  EXPECT_EQ(engine.outcome_counts()[static_cast<size_t>(Outcome::kBusy)], 1u);
+
+  waiter.busy = false;
+  ASSERT_EQ(engine.Apply(ops).outcome, Outcome::kApplied);
+  EXPECT_EQ(batch.published, 2);
+  EXPECT_EQ(waiter.published, 1);
+  EXPECT_EQ(engine.generation(), generation + 1);
+}
+
 TEST_F(TransactionEngineTest, MissingReferentRejectsAndNothingIsVisible) {
   auto r = Apply({Met(7, 1000), Rule(10, 5)});  // action 5 does not exist
   ASSERT_EQ(r.outcome, Outcome::kRejected);

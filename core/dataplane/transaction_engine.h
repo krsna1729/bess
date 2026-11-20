@@ -96,8 +96,9 @@ class TransactionEngine {
     kApplied,
     kRejected,  // an operation failed; results say which and why
     kConflict,  // expected_generation did not match; nothing was attempted
-    kBusy,      // reclamation is behind (readers slow to quiesce); nothing
-                // was attempted -- retry later
+    kBusy,      // reclamation is behind (readers slow to quiesce), or an
+                // operation waits for a grace period (Reservation::busy);
+                // nothing was attempted -- retry later
     kUnsupported,  // the requested consistency cannot be provided by an
                    // operation's resource (ops say which); nothing was
                    // attempted and the request will not succeed as it stands
@@ -288,6 +289,8 @@ class TransactionEngine {
     return lock;
   }
   Result Reject(size_t n_ops, size_t failed, std::string error) const;
+  // The retriable answer with nothing attempted (Outcome::kBusy).
+  Result Busy(size_t n_ops) const;
   // `owned`: null for Apply(); for ApplyOwned(), the resources its operations
   // may name.
   Result ApplyImpl(std::span<const Op> ops, std::optional<uint64_t> expected_generation,
