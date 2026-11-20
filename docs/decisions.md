@@ -13865,8 +13865,8 @@ This is a correctness/control consumer, not a throughput or latency claim.
 
 ## D-198 Dataplane memory: hugepage-first, a declared fallback, a limit, one way to ask
 
-**Status:** proposed (2026-10-25). Completes D-029's part 2; replaces D-029's `-m` and `--no-huge` sizing;
-amends D-149's status report.
+**Status:** accepted (2026-11-20, on the evidence below; proposed 2026-10-25). Completes D-029's part 2;
+replaces D-029's `-m` and `--no-huge` sizing; amends D-149's status report.
 **Code:** `core/utils/dpdk_memory.{h,cc}` (`MemoryRefused`, `MemoryPolicy`, `AdmitNormalMemory`,
 `FallbackSocket`, `RefuseDpdkMemory`, `GetMemoryStatus`), `core/utils/dpdk_slab.h` (`ObjectSlab<T>`, new),
 `core/framework/memory_scope.{h,cc}` (`MemoryScope`, `MemoryCost<T>`, `MemoryAccounts`, new),
@@ -13987,10 +13987,61 @@ is half built, and the status counts entries, not bytes (D-149 left `Module::Rep
   `memory.max` must cover charged hugepages plus ordinary memory and the reserve; a separate hugepage request
   is not evidence that the memory controller excludes those pages.
 
-**Evidence:** pending -- (1) the memory model against capped measurements at 10K-100K sessions with and without
-hugepages; (2) an over-limit load refused with `RESOURCE_EXHAUSTED`, the daemon alive, no OOM kill; (3) ABBA of
-the packet path, before and after, at 100K and 1M sessions (zero cost or better, the performance contract);
-(4) the unit tests named above.
+**Evidence (2026-11-20, `develop` `dd22783d`, UPF plugin `main` `2a600a4`, session-major layout, 2 MiB pages
+reserved, `memory_hugetlb_accounting` on).** Raw runs: UPF `.scratch/evidence/d198-20261119/`.
+
+(1) The memory model against the kernel, 10K-100K sessions (`upf_ab --only appliance --layout session`,
+memory read after load). Model = `admitted_bytes` + `baseline_bytes` from `GetResourceStatus`. Kernel = bessd's
+`RssAnon + RssShmem + HugetlbPages`. `RssFile` (shared libraries, 43.4-43.9 MiB in every run) is outside both.
+
+| Sessions | Backing | Model MiB | Kernel MiB | Kernel - model |
+|---:|---|---:|---:|---:|
+| 10,000 | normal | 222.9 | 220.2 | -2.6 MiB (-1.2%) |
+| 10,000 | hugepages | 148.0 | 141.7 | -6.3 MiB (-4.4%) |
+| 30,000 | normal | 254.2 | 250.7 | -3.5 MiB (-1.4%) |
+| 30,000 | hugepages | 178.9 | 173.5 | -5.4 MiB (-3.1%) |
+| 100,000 | normal | 364.8 | 360.6 | -4.3 MiB (-1.2%) |
+| 100,000 | hugepages | 289.4 | 293.8 | +4.4 MiB (+1.5%) |
+
+The model is within 6.3 MiB (4.4%) of the private memory the kernel reports, at every size and with both
+backings. It never under-states by more than the 2 MiB-page rounding of the hugepage heap.
+
+(2) Over-limit loads are refused, not killed (`--mem_limit_mb=600`, 200K sessions offered, `--after-refusal`):
+
+| Backing | Refused at | Answer | After the refusal |
+|---|---|---|---|
+| normal | session 93,200 | `RESOURCE_EXHAUSTED` (8), `errno 12`: "refusing 10227744 bytes (9 MB) of normal-page memory: 468 MB in use, the limit is 600 MB less a 128 MB reserve" | daemon alive; refused batch refused again (8); 1,000/1,000 updates committed; 93,200 erased with 0 refused; 10,000 reloaded |
+| hugepages | session 186,600 | `RESOURCE_EXHAUSTED` (8), "refusing 20971520 bytes (20 MB) ... 467 MB in use" | same probes pass; `HugePages_Free` 1,024 after exit |
+
+Neither daemon was OOM-killed. A pipeline sized past the limit (400K capacity) is refused at apply, also with
+`RESOURCE_EXHAUSTED` and the daemon alive. The hugepage run admits twice as many sessions under the same limit
+because it starts with 25 MB more headroom: used 375 vs 400 MB after apply, with the packet pool admitted at
+82 MiB (DPDK pool) vs 128 MiB (plain pool). That headroom holds about 93K sessions of cold glibc state
+(session snapshots and F-TEID records: 31 + 20 MB at 186,600 sessions, about 270 B each).
+
+(3) ABBA of the packet path, hugepages against normal pages, one plugin build (`upf_ab --baseline-mem-backing
+normal --mem-backing hugepages`, UPF #83; 8 paired rounds of 2 s, burst 32, worker CPU 8, AC power, turbo off,
+no builds; each arm's bessd log confirms its backing; both arms' external bytes and per-rule counters
+IDENTICAL):
+
+| Sessions | Direction | Normal ns/pkt | Hugepages ns/pkt | Hugepages / normal [range] | Hugepages faster |
+|---:|---|---:|---:|---:|---:|
+| 100,000 | uplink | 219.82 | 204.60 | 0.932 [0.734-0.945] | 8/8 |
+| 100,000 | downlink | 223.73 | 214.58 | 0.961 [0.950-0.972] | 8/8 |
+| 1,000,000 | uplink | 297.83 | 274.82 | 0.923 [0.916-0.930] | 8/8 |
+| 1,000,000 | downlink | 264.80 | 241.01 | 0.911 [0.892-0.916] | 8/8 |
+
+The pre-D-198 sizing code no longer exists, so "before" is the normal-page fallback this decision declares.
+Hugepages are 4-9% cheaper per packet, and the gap grows with the table: fewer TLB misses on the 920 B session
+slots [INFERENCE]. At 1M the hugepage daemon held 1,310 MiB of hugetlb and 371 MiB RSS; the normal one 1,786 MiB
+RSS.
+
+(4) Unit tests: `classifier_concurrent_exact_test`, `dataplane_object_table{,_rcu,_publication}_test`,
+`dataplane_slot_table_test`, `meter_meter_set_test`, `runtime_startup_test`, `packet_pool_test`,
+`utils_dpdk_memory_test`, `utils_dpdk_slab_test` and `framework_memory_scope_test` pass (11/11) as CI runs them
+(normal-page EAL, hugepage behaviour simulated). `ChargedHugepagesAreAdmittedAgainstTheLimit` and
+`GrowthPageSizeIsTheSizeTheHeapMaps` also pass on real 2 MiB pages (`BESSD_MEM_BACKING=hugepages`). The
+simulated-hugepage tests are not valid under that setting: they fill a fixed normal-page heap to fake exhaustion.
 
 ## D-199 The meter set as an installed transactional resource; Meter is its adapter
 
