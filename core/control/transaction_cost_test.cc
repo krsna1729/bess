@@ -133,6 +133,25 @@ class TransactionCostTest : public ::testing::Test {
   std::vector<const bess::dataplane::Resource *> owned_;
 };
 
+// The adapter resolves a transaction's resources under one acquisition of
+// the engine's lock, then applies it under one more: two per transaction,
+// whatever its operation count.
+TEST_F(TransactionCostTest, AdapterTakesTheEngineLockTwicePerTransaction) {
+  TransactionEngine &engine = bess::runtime::runtime().transactions();
+  for (const size_t stages : {size_t{1}, kStages}) {
+    const v2::ApplyTransactionRequest request = Request(stages, 9000 + stages);
+    auto lock = control_->AcquireLock();
+    const uint64_t before = engine.lock_acquisitions();
+    auto result = adapter_->Apply(request);
+    const uint64_t taken = engine.lock_acquisitions() - before;
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(v2::TransactionRecord::OUTCOME_APPLIED, result->record().outcome());
+    std::printf("engine lock acquisitions per %zu-op transaction: %llu\n", stages,
+                static_cast<unsigned long long>(taken));
+    EXPECT_EQ(2u, taken) << stages << " operations";
+  }
+}
+
 TEST_F(TransactionCostTest, ChannelFrameTakesTheControlLockOnce) {
   grpc::ServerBuilder builder;
   bess::control::ConfigureControlServer(&builder);

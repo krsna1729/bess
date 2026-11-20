@@ -252,6 +252,22 @@ class TransactionEngine {
   // The registered resource with this name, or null. The pointer is valid
   // while it stays registered (callers hold the control-plane lock).
   Resource *FindResource(std::string_view name) const;
+  // FindResource() for `count` names under one acquisition of the engine's
+  // lock: calls found(i, resource or null) for the name name_of(i), in
+  // order. `found` runs under that lock and must not call the engine.
+  template <typename NameOf, typename Found>
+  void FindResources(size_t count, NameOf &&name_of, Found &&found) const {
+    const auto lock = Lock();
+    for (size_t i = 0; i < count; i++) {
+      auto it = resources_.find(std::string_view(name_of(i)));
+      found(i, it == resources_.end() ? nullptr : it->second->resource);
+    }
+  }
+  // How many times the engine's lock has been taken (only grows): what a
+  // test counts per transaction. Read without the lock.
+  uint64_t lock_acquisitions() const {
+    return lock_acquisitions_.load(std::memory_order_relaxed);
+  }
   // Registered resource names, sorted.
   std::vector<std::string> ResourceNames() const;
   // References to `key` of `resource` held by other resources' values.
@@ -262,6 +278,15 @@ class TransactionEngine {
   // More pending removal cascades than this and Apply() answers kBusy.
   static constexpr size_t kMaxPendingCascades = 4096;
 
+  // Takes the engine's lock and counts it (lock_acquisitions()).
+  std::unique_lock<std::mutex> Lock() const {
+    std::unique_lock<std::mutex> lock(mutex_);
+    // Written only while holding the lock: a load and a store, no locked
+    // instruction.
+    lock_acquisitions_.store(lock_acquisitions_.load(std::memory_order_relaxed) + 1,
+                             std::memory_order_relaxed);
+    return lock;
+  }
   Result Reject(size_t n_ops, size_t failed, std::string error) const;
   // `owned`: null for Apply(); for ApplyOwned(), the resources its operations
   // may name.
@@ -417,6 +442,7 @@ class TransactionEngine {
   rcu::RcuDomain &domain_;
   utils::MemoryGrowth *ledger_growth_;  // Registration::incoming's hook
   mutable std::mutex mutex_;
+  mutable std::atomic<uint64_t> lock_acquisitions_{0};
   StringMap<std::unique_ptr<Registration>> resources_;
   std::vector<Cascade> cascades_;
   // Objects that pending removal cascades will still retire (one per step).

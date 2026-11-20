@@ -186,20 +186,47 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
   }
 
+  // Each operation's resource and codec, looked up once for the busy check
+  // and the decoding below, under one acquisition of the engine's lock.
+  // Inline up to kInlineOps operations (no allocation); longer requests on
+  // the heap.
+  struct Named {
+    const dataplane::Resource *resource;
+    const framework::ResourceCodec *codec;
+  };
+  const int n = request.ops_size();
+  std::array<Named, kInlineOps> inline_named;
+  std::vector<Named> heap_named;
+  if (static_cast<size_t>(n) > kInlineOps) {
+    try {
+      heap_named.resize(static_cast<size_t>(n));
+    } catch (const std::bad_alloc &e) {
+      ControlError refused = OutOfMemory(e);
+      refused.field = "ops";
+      return std::unexpected(std::move(refused));
+    }
+  }
+  Named *const named = heap_named.empty() ? inline_named.data() : heap_named.data();
+  engine_.FindResources(
+      static_cast<size_t>(n),
+      [&](size_t i) -> const std::string & { return request.ops(static_cast<int>(i)).resource(); },
+      [&](size_t i, const dataplane::Resource *resource) { named[i].resource = resource; });
+  for (int i = 0; i < n; i++) {
+    named[i].codec = named[i].resource == nullptr ? nullptr : bindings_.Find(*named[i].resource);
+  }
+
   // A resource whose values workers read unsynchronized is refused while a
   // worker runs its module (D-129): nothing is attempted or recorded, as for
   // a thread-unsafe command; pause the workers and send the same request.
-  for (const v2::TransactionOp &op : request.ops()) {
-    const dataplane::Resource *resource = engine_.FindResource(op.resource());
-    const framework::ResourceCodec *codec =
-        resource == nullptr ? nullptr : bindings_.Find(*resource);
-    if (codec != nullptr && codec->Busy()) {
+  for (int i = 0; i < n; i++) {
+    if (named[i].codec != nullptr && named[i].codec->Busy()) {
+      const std::string &resource = request.ops(i).resource();
       return std::unexpected(ControlError{
           .code = ControlErrorCode::kResourceBusy,
           .err = EBUSY,
-          .message = "resource '" + op.resource() +
+          .message = "resource '" + resource +
                      "' changes only with its module's workers paused (a worker runs it)",
-          .object = op.resource(),
+          .object = resource,
           .field = "ops"});
     }
   }
@@ -235,16 +262,14 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
 
   // Decode every operation through its resource's codec; the first that
   // cannot be decoded rejects the transaction.
-  const int n = request.ops_size();
   std::vector<Op> ops;
   ops.reserve(static_cast<size_t>(n));
-  auto decode = [&](const v2::TransactionOp &op)
-      -> std::expected<Op, std::string> {
-    const dataplane::Resource *resource = engine_.FindResource(op.resource());
-    if (resource == nullptr) {
+  auto decode = [&](int i) -> std::expected<Op, std::string> {
+    const v2::TransactionOp &op = request.ops(i);
+    if (named[i].resource == nullptr) {
       return std::unexpected("unknown resource '" + op.resource() + "'");
     }
-    const framework::ResourceCodec *codec = bindings_.Find(*resource);
+    const framework::ResourceCodec *codec = named[i].codec;
     if (codec == nullptr) {
       return std::unexpected("resource '" + op.resource() +
                              "' is not reachable over the RPC");
@@ -276,7 +301,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   std::string error;
   try {
     for (int i = 0; i < n; i++) {
-      auto op = decode(request.ops(i));
+      auto op = decode(i);
       if (!op) {
         failed = i;
         error = std::move(op.error());
