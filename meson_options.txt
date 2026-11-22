@@ -41,3 +41,7 @@ option('static_binary',
        choices: ['none', 'standalone', 'fully_static'],
        value: 'none',
        description: 'Build standalone (all static dependencies + libstdc++) or fully static binary for release CI')
+option('transaction_trace',
+       type: 'boolean',
+       value: false,
+       description: 'Compile diagnostic USDT markers for TransactionChannel (requires sys/sdt.h)')

@@ -345,6 +345,7 @@ func (t *transactionStreams) send(s *transactionStream, batch []*queuedTransacti
 		}
 		frame.timeout = remaining.Nanoseconds()
 	}
+	traceFrame(s.ctx, "bess.send", frame.attempt, batch)
 	if err := s.stream.SendMsg(frame); err != nil {
 		return fail(err)
 	}
@@ -355,6 +356,7 @@ func (t *transactionStreams) send(s *transactionStream, batch []*queuedTransacti
 	if reply.GetAttemptId() != frame.attempt {
 		return fail(status.Error(codes.Unknown, "transaction acknowledgement does not match attempt"))
 	}
+	traceFrame(s.ctx, "bess.reply", frame.attempt, batch)
 	results := reply.GetResults()
 	if len(results) == 0 {
 		// A refused frame: nothing in it was applied.

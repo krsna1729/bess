@@ -52,6 +52,7 @@
 #include "runtime/numa_placement.h"
 #include "runtime/simd_width.h"
 #include "stats/event_hub.h"
+#include "control/transaction_trace.h"
 #include "control/wire_narrow.h"
 #include "worker.h"
 
@@ -1082,6 +1083,8 @@ grpc::Status ControlV2Service::TransactionChannel(
     v2::TransactionChannelResponse response;
     response.set_attempt_id(request.attempt_id());
     const int count = request.transactions_size();
+    BESS_TX_FRAME(request);
+    BESS_TX_POINT(frame_read, count);
     if (request.attempt_id() == 0 || count == 0 || count > kMaxChannelTransactions ||
         request.timeout_ns() < 0) {
       v2::ErrorDetail *error = response.mutable_error();
@@ -1106,8 +1109,11 @@ grpc::Status ControlV2Service::TransactionChannel(
       // at most kMaxChannelTransactions transactions, each within the
       // engine's retire budget and the message limit; the lock is released
       // between frames and while a BUSY answer is waited out.
+      BESS_TX_POINT(lock_request, 0);
       auto lock = control_plane_.AcquireLock();
+      BESS_TX_POINT(lock_acquired, 0);
       for (const auto &transaction : request.transactions()) {
+        BESS_TX_POINT(apply_enter, response.results_size());
         v2::TransactionChannelResult *result = response.add_results();
         std::optional<v2::ErrorDetail> error;
         grpc::Status status;
@@ -1126,9 +1132,14 @@ grpc::Status ControlV2Service::TransactionChannel(
             *result->mutable_error() = std::move(error.value());
           }
         }
+        BESS_TX_POINT(apply_leave, response.results_size() - 1);
       }
+      BESS_TX_POINT(lock_release, 0);
     }
-    if (!stream->Write(response)) {
+    BESS_TX_POINT(write_enter, 0);
+    const bool written = stream->Write(response);
+    BESS_TX_POINT(write_leave, written);
+    if (!written) {
       return grpc::Status::OK;
     }
   }

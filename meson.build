@@ -27,6 +27,13 @@ endif
 
 cpp = meson.get_compiler('cpp')
 
+if get_option('transaction_trace')
+  if not cpp.has_header('sys/sdt.h')
+    error('-Dtransaction_trace=true requires sys/sdt.h (systemtap-sdt-dev on Ubuntu)')
+  endif
+  add_project_arguments('-DBESS_TRANSACTION_TRACE', language: 'cpp')
+endif
+
 # Every profile links with mold: the fast loop, perf and release trees, and
 # CI. GNU ld took 2.3-3.5 s per bessd or test link, mold 0.1-0.3 s (D-048,
 # D-113). One linker everywhere: what CI links is what a developer links.

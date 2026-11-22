@@ -1343,7 +1343,9 @@ func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 	if t.hasExpected {
 		req.ExpectedGeneration = proto.Uint64(t.expected)
 	}
+	traceTransaction(ctx, "bess.commit_enter", t.RequestID)
 	applied, err := t.c.commit(ctx, req, t.epoch)
+	traceTransaction(ctx, "bess.commit_leave", t.RequestID)
 	if err == nil {
 		t.result = applied
 		t.ops, t.packed = nil, nil // only the cached result is needed for another Commit
