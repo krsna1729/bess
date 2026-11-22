@@ -118,6 +118,18 @@ Each request is encoded once into owned bytes; scatter/gather frame headers
 avoid a second whole-frame copy. Successful Go transactions keep their cached
 result, not operation payloads. Retry/reconnect backoff honors caller cancellation.
 
+For local diagnostics, build the daemon with `-Dtransaction_trace=true`
+(`sys/sdt.h` is required) and the Go application with `-tags transactiontrace`.
+Normal builds omit the markers. The `bess_tx` static probes mark the decoded
+frame, lock request/acquisition, each transaction's apply entry/return, the
+point before final unlock, and response write entry/return. The Go SDK logs
+Commit and channel send/decoded-reply boundaries in `runtime/trace`. Both use
+the first transaction's 128-bit hex ID and the wire attempt number as the
+frame key; apply and Go frame events also identify the slot. Reopened streams
+can reuse a key on retries; discard duplicate keys rather than pairing by
+time. A BUSY retry can unlock inside the apply interval. These are application
+boundaries, not socket timestamps or a public observability API.
+
 Go packing memoization is optional and bounded: at most 4096 names and 1 MiB
 of name bytes in the weak packer cache; the URL cache has the same entry bound
 and a 1 MiB combined key/value byte bound. Descriptor graphs are not kept alive
