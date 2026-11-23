@@ -249,11 +249,11 @@ class Reporter final : public Resource {
     if (op.kind == OpKind::kErase && !keys_.contains(op.key)) {
       return std::unexpected("not found");
     }
-    Reservation r{std::make_unique<Staged>(this, op), {}};
+    auto staged = std::make_unique<Staged>(this, op);
     if (op.kind == OpKind::kErase) {
-      r.observed = "counts of " + op.key;
+      staged->observed = "counts of " + op.key;
     }
-    return r;
+    return Reservation{std::move(staged), {}};
   }
 
  private:

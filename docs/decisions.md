@@ -14845,16 +14845,16 @@ Both are recorded in `krsna1729/upf` `docs/performance.md`, "Deletion worker
 time: the counter read is the largest wait". The round trip is the cost, not the
 datapath read, which takes one bounded hold of the session resource's lock.
 
-**Decision.** `Resource::Reservation` gains `observed`: bytes the operation
-returns to its caller. The engine moves them unchanged into the applied
-operation's `OpResult` before publication begins, so publication still
-allocates nothing. `TransactionOpResult.observed` carries them on the wire, and
-`TransactionRecord` keeps them: an answer, a retry of the same request id and
-`GetTransaction` all return the same bytes and never read again. An operation
-that was not applied carries none. A resource bounds what it returns (the
-session resource returns at most its session's `2 * kMaxActions` counter
-cells); the bytes count against the message limit, and the record's byte lease
-already evicts oldest-first.
+**Decision.** `Resource::StagedOp` gains `observed`: bytes the operation
+returns to its caller, set while the resource reserves it. The engine moves them
+unchanged into the applied operation's `OpResult` before publication begins, so
+publication still allocates nothing. `TransactionOpResult.observed` carries them
+on the wire, and `TransactionRecord` keeps them: an answer, a retry of the same
+request id and `GetTransaction` all return the same bytes and never read again.
+An operation that was not applied carries none. A resource bounds what it
+returns (the session resource returns at most its session's `2 * kMaxActions`
+counter cells); the bytes count against the message limit, and the record's byte
+lease already evicts oldest-first.
 
 **Consequences.**
 - A resource can serve a read-and-erase in one transaction instead of two

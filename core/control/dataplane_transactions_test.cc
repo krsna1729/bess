@@ -414,11 +414,11 @@ class ReportingResource final : public bess::dataplane::Resource {
         !keys_.contains(op.key)) {
       return std::unexpected("not found");
     }
-    Reservation r{std::make_unique<Staged>(this, op), {}};
+    auto staged = std::make_unique<Staged>(this, op);
     if (op.kind == bess::dataplane::OpKind::kErase) {
-      r.observed = "counters:" + op.key;
+      staged->observed = "counters:" + op.key;
     }
-    return r;
+    return Reservation{std::move(staged), {}};
   }
 
  private:

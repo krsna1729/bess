@@ -803,7 +803,7 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
     }
     // Neither push can throw (both reserved for n): the reservation is
     // armed for abort before anything else that can fail runs.
-    w.observed[i] = std::move(reserved->observed);
+    w.observed[i] = std::move(reserved->staged->observed);
     w.reservations.push_back(std::move(*reserved));
     Resource::Reservation &r = w.reservations.back();
     // Aborted with the rest from here on: any rejection below must undo
