@@ -362,6 +362,9 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
       if (!op.error.empty()) {
         out->set_error(op.error);
       }
+      if (!op.observed.empty()) {
+        out->set_observed(op.observed);
+      }
     }
   }
   record.set_request_id(id);
@@ -431,7 +434,11 @@ void DataplaneTransactions::CommitRecord(Records::node_type node,
   compact.set_visibility(record.visibility());
   for (int i = 0; i < record.ops_size(); i++) {
     const auto &op = record.ops(i);
-    if (op.status() != kept.common || !op.error().empty()) {
+    // What a resource returned is not the common shape: an operation that
+    // carries bytes is kept even when its status is the common one, or the
+    // replay would answer it with a bare status.
+    if (op.status() != kept.common || !op.error().empty() ||
+        !op.observed().empty()) {
       *compact.add_ops() = op;
       kept.at.push_back(static_cast<uint32_t>(i));
     }

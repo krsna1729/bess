@@ -684,6 +684,7 @@ curl -sN localhost:8080/v2/events
 | `RESOURCE_BUSY` on a resource that requires paused workers, while a worker runs its module (C++, Go) | `Busy` at once, with the daemon's detail: nothing was tried, and no retry helps until the workers are paused. Not retried, nothing asked. |
 | `OUTCOME_CONFLICT` | `Conflict` (nothing tried); the application decides what a moved generation means. `after_unknown_attempt`: an earlier send of the same commit went unanswered and may have applied. |
 | `OUTCOME_REJECTED` | `Rejected`, with each failing operation's index and error; nothing changed. |
+| An operation returns bytes with its result | They travel in the same record as its status (`observed`), so the answer, a retry and `GetTransaction` carry the same bytes; an operation that did not apply carries none. |
 | A refused call | `InvalidRequest`, with the server's `ErrorDetail` (code, field, object). |
 | A key or value of the wrong type | `InvalidRequest` before anything is sent. |
 | A singleton upserted or erased, a map set (C++, Go) | `InvalidRequest` before anything is sent. |

@@ -90,6 +90,9 @@ class TransactionEngine {
     // result ApplyBatched() returns, so a caller reporting a failure does not
     // have to map a batch-relative index back to its own request.
     std::string resource;
+    // What the operation returned (Resource::Reservation::observed). Set
+    // only when the operation was applied.
+    std::string observed;
   };
 
   enum class Outcome : uint8_t {
@@ -435,6 +438,7 @@ class TransactionEngine {
     std::vector<KeyRef> keys;
     std::vector<Resource::Reservation> reservations;
     std::vector<Staged> staged;
+    std::vector<std::string> observed;  // by operation index
     std::vector<uint32_t> removals_by_op;
     std::vector<Delta> deltas;
     std::vector<size_t> order;

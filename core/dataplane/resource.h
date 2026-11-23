@@ -264,6 +264,11 @@ class Resource {
     // (RcuDomain::Synchronize) would hold the engine's and the control
     // plane's locks for the grace period (D-021 amendment 6).
     bool busy = false;
+    // Bytes the operation returns to its caller (an erase may report what it
+    // removed). The engine moves them unchanged into the operation's result,
+    // so nothing is read again on a replay. The resource bounds their size;
+    // they count against the transaction's message limit.
+    std::string observed;
   };
 
   // `references`: the resources this one's values may refer to. The engine

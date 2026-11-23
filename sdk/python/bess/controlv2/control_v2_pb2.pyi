@@ -576,7 +576,7 @@ class ApplyTransactionRequest(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., expected_generation: _Optional[int] = ..., ops: _Optional[_Iterable[_Union[TransactionOp, _Mapping]]] = ..., consistency: _Optional[_Union[ApplyTransactionRequest.Consistency, str]] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
 
 class TransactionOpResult(_message.Message):
-    __slots__ = ("status", "error")
+    __slots__ = ("status", "error", "observed")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         STATUS_UNSPECIFIED: _ClassVar[TransactionOpResult.Status]
@@ -589,9 +589,11 @@ class TransactionOpResult(_message.Message):
     STATUS_NOT_APPLIED: TransactionOpResult.Status
     STATUS_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
+    OBSERVED_FIELD_NUMBER: _ClassVar[int]
     status: TransactionOpResult.Status
     error: str
-    def __init__(self, status: _Optional[_Union[TransactionOpResult.Status, str]] = ..., error: _Optional[str] = ...) -> None: ...
+    observed: bytes
+    def __init__(self, status: _Optional[_Union[TransactionOpResult.Status, str]] = ..., error: _Optional[str] = ..., observed: _Optional[bytes] = ...) -> None: ...
 
 class TransactionRecord(_message.Message):
     __slots__ = ("request_id", "outcome", "generation", "ops", "visibility")

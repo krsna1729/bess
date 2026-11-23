@@ -666,6 +666,8 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   w.reservations.clear();
   w.reservations.reserve(n);  // stable elements: views point into them
   w.staged.clear();
+  w.observed.clear();
+  w.observed.resize(n);
   w.removals_by_op.assign(n, 0);
   w.deltas.clear();
   w.touched.clear();
@@ -801,6 +803,7 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
     }
     // Neither push can throw (both reserved for n): the reservation is
     // armed for abort before anything else that can fail runs.
+    w.observed[i] = std::move(reserved->observed);
     w.reservations.push_back(std::move(*reserved));
     Resource::Reservation &r = w.reservations.back();
     // Aborted with the rest from here on: any rejection below must undo
@@ -1030,6 +1033,11 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
   Result applied;
   applied.outcome = Outcome::kApplied;
   applied.ops.assign(n, OpResult{OpStatus::kApplied, {}});
+  // What the resources returned travels with the result. Moved here, before
+  // publication, so nothing allocates once it starts.
+  for (size_t i = 0; i < n; i++) {
+    applied.ops[i].observed = std::move(w.observed[i]);
+  }
   applied.may_retire = may_retire;
 
   // -- publish: from here on nothing may fail, and nothing allocates --------
