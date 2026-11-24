@@ -484,6 +484,12 @@ message TransactionOpResult {
   }
   Status status = 1;
   string error = 2;
+  // What the operation's resource returned with it, when the operation was
+  // applied. Empty otherwise, and never carried by an operation that was not
+  // applied. It is recorded with the outcome, so a replay returns the same
+  // bytes instead of asking the resource again. A resource bounds what it
+  // returns here; the bytes count against the transaction's message limit.
+  bytes observed = 3;
 }
 
 message TransactionRecord {

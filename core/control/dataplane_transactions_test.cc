@@ -17,6 +17,7 @@
 #include <format>
 #include <initializer_list>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -380,6 +381,103 @@ TEST_F(DataplaneTransactionsTest, RecordsKeepOnlyTheResultsThatDiffer) {
   ASSERT_EQ(rejected.record().outcome(), v2::TransactionRecord::OUTCOME_REJECTED);
   ASSERT_EQ(rejected.record().ops(7).status(), v2::TransactionOpResult::STATUS_FAILED);
   EXPECT_EQ(Get("bad").record().SerializeAsString(), rejected.record().SerializeAsString());
+}
+
+// A resource that reports bytes with an erase, as the session resource reports
+// what a deleted session's counters measured.
+class ReportingResource final : public bess::dataplane::Resource {
+ public:
+  explicit ReportingResource(std::string name) : Resource(std::move(name)) {}
+  size_t LiveCount() const override { return keys_.size(); }
+  bool Contains(const bess::dataplane::ResourceKey &key) const override {
+    return keys_.contains(key);
+  }
+  void VisitReferences(
+      const std::function<void(const bess::dataplane::Reference &)> &) const override {}
+
+  std::expected<Reservation, std::string> Reserve(
+      const bess::dataplane::Op &op) override {
+    struct Staged final : bess::dataplane::StagedOp {
+      ReportingResource *r;
+      bess::dataplane::Op op;
+      Staged(ReportingResource *rep, bess::dataplane::Op o)
+          : r(rep), op(std::move(o)) {}
+      void Publish(bess::dataplane::Retirer &) noexcept override {
+        if (op.kind == bess::dataplane::OpKind::kUpsert) {
+          r->keys_.insert(op.key);
+        } else {
+          r->keys_.erase(op.key);
+        }
+      }
+    };
+    if (op.kind == bess::dataplane::OpKind::kErase &&
+        !keys_.contains(op.key)) {
+      return std::unexpected("not found");
+    }
+    auto staged = std::make_unique<Staged>(this, op);
+    if (op.kind == bess::dataplane::OpKind::kErase) {
+      staged->observed = "counters:" + op.key;
+    }
+    return Reservation{std::move(staged), {}};
+  }
+
+ private:
+  std::set<bess::dataplane::ResourceKey> keys_;
+};
+
+// What an operation returned is part of the record: a retry and
+// GetTransaction answer with the same bytes instead of reading again.
+TEST(TransactionObservationTest, ARecordKeepsWhatAnOperationReturned) {
+  InitRuntimeOnce();
+  bess::dataplane::TransactionEngine engine(bess::runtime::runtime().rcu());
+  ReportingResource res("rep");
+  ASSERT_TRUE(engine.Register(&res).has_value());
+  using google::protobuf::UInt32Value;
+  bess::framework::ResourceBindings bindings;
+  [[maybe_unused]] auto binding = bindings.Bind(
+      res,
+      std::make_shared<bess::framework::TypedCodec<UInt32Value, UInt32Value>>(
+          [](const UInt32Value &key)
+              -> std::expected<bess::dataplane::ResourceKey, std::string> {
+            return std::to_string(key.value());
+          },
+          [](const UInt32Value &value)
+              -> std::expected<std::any, std::string> {
+            return std::any(value.value());
+          },
+          [](const auto &) {}));
+  DataplaneTransactions transactions(engine, bindings, /*epoch=*/7);
+  UInt32Value one, two;
+  one.set_value(1);
+  two.set_value(2);
+
+  v2::ApplyTransactionRequest put;
+  put.set_request_id("obs-put");
+  auto *put_op = put.add_ops();
+  put_op->set_resource("rep");
+  Pack(put_op->mutable_key(), one);
+  Pack(put_op->mutable_value(), two);
+  ASSERT_TRUE(transactions.Apply(put).has_value());
+
+  v2::ApplyTransactionRequest del;
+  del.set_request_id("obs-del");
+  auto *del_op = del.add_ops();
+  del_op->set_resource("rep");
+  del_op->set_erase(true);
+  Pack(del_op->mutable_key(), one);
+  const auto applied = transactions.Apply(del);
+  ASSERT_TRUE(applied.has_value());
+  ASSERT_EQ(applied->record().ops_size(), 1);
+  EXPECT_EQ(applied->record().ops(0).status(),
+            v2::TransactionOpResult::STATUS_APPLIED);
+  EXPECT_EQ(applied->record().ops(0).observed(), "counters:1");
+
+  const auto replay = transactions.Apply(del);
+  ASSERT_TRUE(replay.has_value());
+  EXPECT_TRUE(replay->replayed());
+  EXPECT_EQ(replay->record().ops(0).observed(), "counters:1");
+  EXPECT_EQ(transactions.Get("obs-del").record().ops(0).observed(),
+            "counters:1");
 }
 
 // D-207: at the memory limit an upsert is refused with nothing applied, and

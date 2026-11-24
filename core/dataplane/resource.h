@@ -210,6 +210,13 @@ class StagedOp {
   // objects themselves are freed by the destructor; override for
   // reservations held elsewhere (reserved capacity, ids).
   virtual void Abort() noexcept {}
+  // Bytes the operation returns to its caller (an erase may report what it
+  // removed). The resource sets them in Reserve(), under the lock it already
+  // holds; the engine moves them unchanged into the operation's result before
+  // publication starts, so a replay never reads again and Publish() neither
+  // copies nor allocates them. The resource bounds their size; they count
+  // against the transaction's message limit.
+  std::string observed;
 };
 
 // The two levels at which a transaction can become visible to packets (M8,

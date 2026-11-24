@@ -3408,9 +3408,15 @@ func (x *ApplyTransactionRequest) GetDaemonEpoch() uint64 {
 }
 
 type TransactionOpResult struct {
-	state         protoimpl.MessageState     `protogen:"open.v1"`
-	Status        TransactionOpResult_Status `protobuf:"varint,1,opt,name=status,proto3,enum=bess.pb.v2.TransactionOpResult_Status" json:"status,omitempty"`
-	Error         string                     `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	state  protoimpl.MessageState     `protogen:"open.v1"`
+	Status TransactionOpResult_Status `protobuf:"varint,1,opt,name=status,proto3,enum=bess.pb.v2.TransactionOpResult_Status" json:"status,omitempty"`
+	Error  string                     `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	// What the operation's resource returned with it, when the operation was
+	// applied. Empty otherwise, and never carried by an operation that was not
+	// applied. It is recorded with the outcome, so a replay returns the same
+	// bytes instead of asking the resource again. A resource bounds what it
+	// returns here; the bytes count against the transaction's message limit.
+	Observed      []byte `protobuf:"bytes,3,opt,name=observed,proto3" json:"observed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3457,6 +3463,13 @@ func (x *TransactionOpResult) GetError() string {
 		return x.Error
 	}
 	return ""
+}
+
+func (x *TransactionOpResult) GetObserved() []byte {
+	if x != nil {
+		return x.Observed
+	}
+	return nil
 }
 
 type TransactionRecord struct {
@@ -7388,10 +7401,11 @@ const file_control_v2_proto_rawDesc = "" +
 	"\x17CONSISTENCY_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17CONSISTENCY_REFERENTIAL\x10\x01\x12\x1e\n" +
 	"\x1aCONSISTENCY_SCOPE_SNAPSHOT\x10\x02B\x16\n" +
-	"\x14_expected_generation\"\xcc\x01\n" +
+	"\x14_expected_generation\"\xe8\x01\n" +
 	"\x13TransactionOpResult\x12>\n" +
 	"\x06status\x18\x01 \x01(\x0e2&.bess.pb.v2.TransactionOpResult.StatusR\x06status\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"_\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\x12\x1a\n" +
+	"\bobserved\x18\x03 \x01(\fR\bobserved\"_\n" +
 	"\x06Status\x12\x16\n" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eSTATUS_APPLIED\x10\x01\x12\x11\n" +

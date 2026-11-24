@@ -221,6 +221,65 @@ TEST_F(TransactionEngineTest, PublishesUpsertsReferentsFirstAndErasesReferrersFi
   EXPECT_EQ(log, (std::vector<std::string>{"+b", "-c", "-b", "-a"}));
 }
 
+// A resource that reports bytes with an erase, the way the session resource
+// reports what a deleted session's counters measured.
+class Reporter final : public Resource {
+ public:
+  explicit Reporter(std::string name) : Resource(std::move(name)) {}
+  size_t LiveCount() const override { return keys_.size(); }
+  bool Contains(const ResourceKey &key) const override {
+    return keys_.contains(key);
+  }
+  void VisitReferences(
+      const std::function<void(const Reference &)> &) const override {}
+
+  std::expected<Reservation, std::string> Reserve(const Op &op) override {
+    struct Staged final : StagedOp {
+      Reporter *r;
+      Op op;
+      Staged(Reporter *rep, Op o) : r(rep), op(std::move(o)) {}
+      void Publish(Retirer &) noexcept override {
+        if (op.kind == OpKind::kUpsert) {
+          r->keys_.insert(op.key);
+        } else {
+          r->keys_.erase(op.key);
+        }
+      }
+    };
+    if (op.kind == OpKind::kErase && !keys_.contains(op.key)) {
+      return std::unexpected("not found");
+    }
+    auto staged = std::make_unique<Staged>(this, op);
+    if (op.kind == OpKind::kErase) {
+      staged->observed = "counts of " + op.key;
+    }
+    return Reservation{std::move(staged), {}};
+  }
+
+ private:
+  std::set<ResourceKey> keys_;
+};
+
+TEST_F(TransactionEngineTest, ReturnsWhatAnAppliedOperationObserves) {
+  Reporter r("r");
+  TransactionEngine engine(domain_);
+  ASSERT_TRUE(engine.Register(&r));
+  std::vector<Op> ops = {Op::Upsert("r", "k", std::any(1))};
+  ASSERT_EQ(engine.Apply(ops).outcome, Outcome::kApplied);
+
+  ops = {Op::Erase("r", "k")};
+  const auto applied = engine.Apply(ops);
+  ASSERT_EQ(applied.outcome, Outcome::kApplied);
+  ASSERT_EQ(applied.ops.size(), 1u);
+  EXPECT_EQ(applied.ops[0].observed, "counts of k");
+
+  // A refused operation changed nothing, so it returns nothing.
+  const auto refused = engine.Apply(ops);
+  ASSERT_EQ(refused.outcome, Outcome::kRejected);
+  ASSERT_EQ(refused.ops.size(), 1u);
+  EXPECT_TRUE(refused.ops[0].observed.empty());
+}
+
 // A resource that builds once per transaction (Resource::Prepare): it counts
 // what it was asked to do, and can be told to refuse the build.
 class Batcher final : public Resource {

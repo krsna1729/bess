@@ -14827,3 +14827,44 @@ aligned). A refused prctl is logged as a warning. Hugepages remain available as 
 - Normal-page backing at scale pays 4 KiB TLB reach everywhere; deployments that need the reach reserve hugepages.
 
 **Revisit when:** a kernel offers THP without direct compaction at fault for one process.
+
+## D-210 an applied operation may return bytes, and the record keeps them
+
+**Status:** accepted (2026-11-23).
+
+**Problem.** A control-plane writer sometimes needs what an operation removed
+as well as that it removed it: a UPF session deletion must report the counters
+measured before the session's rules go away (TS 29.244 5.2.2.3.1). That is a
+`get_counts` call before the transaction today, so one N4 message waits for two
+round trips into bessd. At 1M sessions, the Go blocking profile of the delete
+transaction trace (commit 358706b, `go tool trace -pprof=sync`) attributes 62%
+of a session worker's blocking to that read (49% waiting for a shared read
+round, 13% the call) and 38% to the erase's reply. A diagnostic UPF build that
+skipped the read doubled delete goodput at 20K offered, 7,306 -> 14,376/s.
+Both are recorded in `krsna1729/upf` `docs/performance.md`, "Deletion worker
+time: the counter read is the largest wait". The round trip is the cost, not the
+datapath read, which takes one bounded hold of the session resource's lock.
+
+**Decision.** `Resource::StagedOp` gains `observed`: bytes the operation
+returns to its caller, set while the resource reserves it. The engine moves them
+unchanged into the applied operation's `OpResult` before publication begins, so
+publication still allocates nothing. `TransactionOpResult.observed` carries them
+on the wire, and `TransactionRecord` keeps them: an answer, a retry of the same
+request id and `GetTransaction` all return the same bytes and never read again.
+An operation that was not applied carries none. A resource bounds what it
+returns (the session resource returns at most its session's `2 * kMaxActions`
+counter cells); the bytes count against the message limit, and the record's byte
+lease already evicts oldest-first.
+
+**Consequences.**
+- A resource can serve a read-and-erase in one transaction instead of two
+  control-plane calls, with the read ordered before the erase under the same
+  lock.
+- A record now holds bytes for every applied operation that returns them, which
+  is why `CommitRecord` keeps such an operation out of its common-status
+  compaction.
+- Nothing reads during publication; a refused transaction returns no bytes.
+
+**Evidence.** `TransactionEngineTest.ReturnsWhatAnAppliedOperationObserves` and
+`TransactionObservationTest.ARecordKeepsWhatAnOperationReturned` (the retry and
+`GetTransaction` carry the first answer's bytes).
