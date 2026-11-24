@@ -5193,6 +5193,37 @@ rather than one call site).
      ninja run follows a `.proto` edit (D-112), and mold in every profile (D-113; perf baselines must be mold on both
      sides). Cleanup 5: the tip at 149/149 locally with every live test; 8 scratch worktrees, 1 stale baseline tree and
      9 merged local branches removed, with the finished GNU ld A/B tree.
+168. **November: memory budget, transaction streams, and operation results
+     (2026-11-03..24).** Several landings answer the UPF tree's churn and
+     memory campaigns (krsna1729/upf #93, #103, #104); the streaming work also
+     closes G1.2c's production path.
+     Memory: D-206 places framework memory (hugepages first, normal pages past
+     them, glibc admitted exactly); D-207 admits, refuses or reports every
+     byte, and Status reports the DPDK heaps' resident bytes; D-208 exact
+     tables hold their deleted key slots and drop the rte_hash defer queue;
+     D-209 bessd takes no transparent hugepages; D-198's accepted fix charges
+     hugepage tables by the page size the heap maps (dd22783d, bess#153).
+     Teardown reuses reference ledger nodes (f5d94731), L2 lookup and cold
+     arrays moved to framework heaps (0da32d39), dormant ID state is
+     materialized in admitted control-path pages (a0e8f32d), EventHub storage
+     is admitted with memory-refused observations counted (714e91f2), and
+     pure-glibc admission skips DPDK init (e38f36d1). Control path: public
+     persistent `Control.TransactionChannel` streams (30985a7d), several
+     transactions per frame (d4e83009), per-frame arena decode (97a2aba7),
+     Go SDK stream allocation cuts (733ddb19) and bounded transaction
+     ownership (380753c0), prepared values (Go 9795f9a5, C++ bcbade53),
+     reused RPC workers and cached SDK resources (529e5374), one control lock
+     per frame (1c4b9e17), resource resolution under one engine lock
+     (7c1af5fb), operation ordering without a sort buffer (b06f003b), bounded
+     adapter allocations (afec5d6f), no empty error strings in records
+     (0546ae32), and a reservation that must wait for readers answers BUSY
+     instead of calling Synchronize under the lock (767725a6, D-021 amendment
+     6). Results: an applied operation may carry observed bytes, kept in the
+     record for retry and GetTransaction (1147c393, D-210,
+     krsna1729/upf#104); transaction frame identity markers compile out of
+     normal builds (ee0970ad, #157). Tests: per-test memory budgets are
+     declared and enforced in CI (d736de08); limits.md sizes a deployment from
+     the cost formulas (5187de61).
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -8799,13 +8830,16 @@ consumer-driven (D-008, §31.3 item 2).
   primitive (M8, D-050).** `ScopeCell`/`ScopeTable` (a packed meter+next-hop
   word that nothing used) were replaced by `dataplane::ScopeTable<Version>` /
   `ScopeResource<Version>`; a request can ask for `CONSISTENCY_SCOPE_SNAPSHOT`
-  and gets `VISIBILITY_SCOPE_SNAPSHOT`, or a typed refusal. No shipped module
-  uses it yet; `VISIBILITY_ATOMIC` is deprecated and never sent.
+  and gets `VISIBILITY_SCOPE_SNAPSHOT`, or a typed refusal. The reference
+  vSwitch's policy root is a shipped consumer (D-197); `VISIBILITY_ATOMIC` is
+  deprecated and never sent.
 - **Other G1.2 follow-ons:** the live Mpps benchmark (D-027) covers unary
   ExactMatch rule churn, not the full classifier→Meter→Router chain.
-  Full-chain failure injection under traffic, `ReplaceScope` and production
-  streaming/bulk RPC remain pending. The streaming proto in
-  `protobuf/tests/ingress_bench.proto` is benchmark-only.
+  Full-chain failure injection under traffic and `ReplaceScope` remain
+  pending. Production streaming is public: `Control.TransactionChannel`
+  carries 1..64 independent transactions per frame over 1..64 persistent
+  streams, driven by the Go and C++ SDKs (D-210). The proto in
+  `protobuf/tests/ingress_bench.proto` remains benchmark-only.
 - **G1.3 — `GetSystem` / `GetCapabilities`: PARTIAL.** `GetCapabilities` (version,
   RPCs, plugin API, classes, plugins, ports, resources) and `GetSchema` (every
   init and command argument type with its descriptors, D-105) are served;
@@ -10990,8 +11024,8 @@ drive the design.
 | # | priority | deliverable | removes from OMEC | non-UPF consumers | status |
 |---|---|---|---|---|---|
 | 1 | P0 | **G1.2b transaction engine and providers**: reserve/publish, dependency ordering, reference safety, retirement (D-021); ExactMatch, WildcardMatch, Router and Meter (D-022–D-024, D-032) | manual ordering, best-effort rollback | routers, firewalls, NAT | complete |
-| 2 | P0 | **G1.2c unary transaction RPC:** `ApplyTransaction`, `GetTransaction`, `ListTransactionResources`, `request_id`, generations and daemon epoch (D-025) | per-rule RPC orchestration and timeout ambiguity | any controller | unary path complete; production streaming/bulk RPC and SDKs pending |
-| 3 | P0 | **Scope-snapshot publication:** one pointer store selects a complete old or new immutable policy version | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | `ScopeTable`/`ScopeResource` and `CONSISTENCY_SCOPE_SNAPSHOT` complete with two test applications (D-050); no shipped module consumes it yet |
+| 2 | P0 | **G1.2c unary transaction RPC:** `ApplyTransaction`, `GetTransaction`, `ListTransactionResources`, `request_id`, generations and daemon epoch (D-025) | per-rule RPC orchestration and timeout ambiguity | any controller | unary path complete; persistent streams complete (Go, C++ SDKs); Python SDK rebuild in progress (D-146) |
+| 3 | P0 | **Scope-snapshot publication:** one pointer store selects a complete old or new immutable policy version | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | `ScopeTable`/`ScopeResource` and `CONSISTENCY_SCOPE_SNAPSHOT` complete with two test applications (D-050); the reference vSwitch's policy root is a shipped consumer (D-197); `ReplaceScope` pending |
 | 4 | P1 | **Generic session vertical slice** (D-032): ExactMatch → K5 Meter → Router, with the meter and next-hop ids in the rule's result record (D-172, D-174), programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; full-chain prepare-failure and Mpps-under-update gate pending |
 | 5 | P0 | **External plugin package** (`bess-dev`) with an explicit header contract | vendored BESS fork | out-of-tree module authors | curated 51-header source API and installed-plugin checks complete (D-037, D-041); no C++ ABI promise |
 | 6 | P1 | **K3.8 range backend** (arbitrary source/destination ranges and precedence), differential against scalar reference | Go ternary expansion and Cartesian products | ACL, firewall rules | complete (D-038) |
@@ -11173,9 +11207,12 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
      `CONSISTENCY_SCOPE_SNAPSHOT` over the RPC, refused (not downgraded) for
      resources that cannot provide it. The earlier packed `ScopeCell` word was
      deleted.
-   **Pending:** a shipped module that consumes a scope; full-chain
-   prepare-failure traffic/Mpps gate; production streaming/bulk RPC;
-   `ReplaceScope`; the C++ SDK and bessctl; G1.3 capabilities and G1.4 stats/events.
+   **Pending:** full-chain prepare-failure traffic/Mpps gate; `ReplaceScope`;
+   `GetSystem` (G1.3); G1.4 stats/events (D-210 now returns an operation's
+   final values with the removing transaction). Done since 2026-10-01: the
+   shipped scope consumer (D-197); production streaming (Go and C++ SDKs over
+   `Control.TransactionChannel`); the C++ SDK and bessctl (G1.6, G1.7; legacy
+   commands pending).
    Generic Mode W remains intentionally deferred until two consumers need it
    (D-008, item 2 above).
 7. **Graph changes without pauses:** publish connections and tasks via RCU.
@@ -11568,10 +11605,12 @@ Every hardware acceleration must retain a software fallback with identical BESS 
 10. **Optimize only after correctness and representative measurement.**
 11. **Hardware absence must not stall software architecture.**
 Closed: A, B-software, C-software, E, J (subsumed by K1), G0, K1–K7, K9,
-G1.1, G1.2a single-table updates, G1.2b transaction core, G1.2c unary RPC,
-and M2 curated plugin package.
-Partial: F, G1 (atomic scopes, streaming/SDK, capabilities, stats/events), H,
-and I. Not started: D and K8 (consumer-driven).
+G1.1, G1.2a single-table updates, G1.2b transaction core, G1.2c unary RPC and
+persistent transaction streams, G1.2d scope snapshots with a shipped consumer
+(D-197), G1.5, G1.6, G1.7 (legacy commands pending), G1.8, G1.9, and M2
+curated plugin package.
+Partial: F, G1 (`ReplaceScope`, full-chain gate, `GetSystem`, G1.4
+stats/events), H, and I. Not started: D and K8 (consumer-driven).
 ---
 
 
@@ -11583,20 +11622,26 @@ The current status below supersedes this baseline; detailed evidence remains
 in the dated entries above.
 
 Closed: A, B-software, C-software, E, J (subsumed by K1), G0, K1–K7, K9,
-G1.1, G1.2b transaction core, G1.2c unary RPC, and M2 curated plugin package.
-Partial: F, G1 (atomic scopes, streaming/SDK, capabilities, stats/events), H,
-and I. Not started: D and K8 (consumer-driven).
+G1.1, G1.2a, G1.2b transaction core, G1.2c unary RPC and persistent
+transaction streams, G1.2d scope snapshots with a shipped consumer (D-197),
+G1.5, G1.6, G1.7 (legacy commands pending), G1.8, G1.9, and M2 curated
+plugin package.
+Partial: F, G1 (`ReplaceScope`, full-chain gate, `GetSystem`, G1.4
+stats/events), H, and I. Not started: D and K8 (consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
-**Start here:** §14 G1 status and §31.3 remaining work, updated 2026-10-01.
-Historical entries below/above record what was planned at the time; do not
-reopen completed transaction core/providers or duplicate the D-032 session
-slice.
+**Start here:** §14 G1 status and §31.3 remaining work, updated 2026-11-24;
+entry 168 lists the November landings. Historical entries below/above record
+what was planned at the time; do not reopen completed transaction
+core/providers or duplicate the D-032 session slice.
 
-**Next software work:** integrate transaction-atomic `ScopeCell` publication
-and complete the full-chain failure-injection/Mpps gate; continue Phase L
-(section 27) as a parallel performance track. Production streaming, `ReplaceScope`,
-SDKs, G1.3 and G1.4 follow. Do not block software work on real-NIC validation.
+**Next software work:** G1.4 stats/events (D-210 carries an operation's final
+values with the removing transaction; `GetStats`/`WatchStats` and the event
+channel are the API work), `ReplaceScope`, and the full-chain
+failure-injection/Mpps gate; continue Phase L (section 27) as a parallel
+performance track. The unary control-path ceiling arms parked on 2026-10-17
+(performance-contract.md §4) resume when a consumer's numbers ask for them.
+Do not block software work on real-NIC validation.
 Benchmarks are run through `omarchy-benchmark` (pinned, isolated,
 performance governor); multithreaded gbench rows must self-pin each thread,
 because the EAL pins the main thread and isolated partitions do not load
