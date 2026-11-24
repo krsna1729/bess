@@ -5224,6 +5224,7 @@ rather than one call site).
      normal builds (ee0970ad, #157). Tests: per-test memory budgets are
      declared and enforced in CI (d736de08); limits.md sizes a deployment from
      the cost formulas (5187de61).
+
 ## Review process established this session
 
 For anything touching correctness-critical code (DPDK ABI/layout, build
@@ -11642,6 +11643,7 @@ failure-injection/Mpps gate; continue Phase L (section 27) as a parallel
 performance track. The unary control-path ceiling arms parked on 2026-10-17
 (performance-contract.md §4) resume when a consumer's numbers ask for them.
 Do not block software work on real-NIC validation.
+
 Benchmarks are run through `omarchy-benchmark` (pinned, isolated,
 performance governor); multithreaded gbench rows must self-pin each thread,
 because the EAL pins the main thread and isolated partitions do not load
