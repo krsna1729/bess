@@ -8,7 +8,10 @@
 //   - the fraction of packets that hit a rule (half the traffic targets live
 //     sessions, so ~0.5 confirms the rules steer packets);
 //   - transactions/s achieved, client-side commit latency p50/p99 (busy
-//     retries included), and the daemon's busy answers in the window.
+//     retries included), and the daemon's busy answers in the window;
+//   - with --fail-every N, a deliberately invalid transaction (one key
+//     upserted twice) after every Nth commit: it must be answered rejected,
+//     and a run that applies one (or refuses it differently) exits non-zero.
 //
 // A controller on the C++ SDK: the pipeline is desired state, the rules are
 // SDK transactions on `em/rules` (request ids, busy retries, typed outcomes),
@@ -67,6 +70,10 @@ using bess::perf::Types;
 constexpr uint32_t kBase = 0x0a000000;  // 10.0.0.0
 constexpr int kGates = 4;               // rules steer to gates 1..kGates; misses go to gate 0
 
+// Any injected transaction that was applied, or refused for a reason other
+// than the engine's rejection, fails the run after every thread has joined.
+long g_injection_unexpected = 0;
+
 // This thread's CPU time, and this process's (every client thread, gRPC's
 // included), both in nanoseconds: the client side of a commit has to be
 // visible, or a client-side ceiling looks like a daemon one.
@@ -111,6 +118,10 @@ struct Options {
   std::string stage_locality = "hot";
   std::string stage_mode = "message";
   int transaction_streams = 0;
+  // Every Nth committed transaction, also submit one the engine must refuse
+  // (one key upserted twice). 0 disables the check; the run fails if one is
+  // applied.
+  int fail_every = 0;
 
   // How many blocks the traffic generator must cover: every process's.
   int blocks() const { return blocks_total > 0 ? blocks_total : clients; }
@@ -214,14 +225,55 @@ class Committer {
       next_ += o_.upserts;
       oldest_ += o_.erases;
       done_++;
+      if (o_.fail_every > 0 && done_ % o_.fail_every == 0) {
+        InjectFailure();
+      }
     }
   }
 
   std::vector<double> TakeLatency() { return std::exchange(latency_, {}); }
   int TakeDone() { return std::exchange(done_, 0); }
   uint64_t TakeCpuNs() { return std::exchange(cpu_ns_, 0); }
+  long TakeInjected() { return std::exchange(injected_, 0); }
+  long TakeRejected() { return std::exchange(rejected_, 0); }
+  long TakeUnexpected() { return std::exchange(unexpected_, 0); }
+  double TakeInjectionSeconds() { return std::exchange(injection_seconds_, 0.0); }
 
  private:
+  // A transaction the engine must refuse: one key is upserted twice, which its
+  // one-operation-per-key rule rejects before applying anything. A busy answer
+  // is retried under a new request id; any applied or differently refused
+  // attempt is counted, not thrown, so the run can report it and fail.
+  void InjectFailure() {
+    injected_++;
+    while (true) {
+      bess::sdk::Transaction tx = client_.NewTransaction();
+      const int s = next_;
+      const auto key = Key(types_, o_, block_, s);
+      const auto value = Value(types_, s);
+      if (!tx.Upsert(rules_, *key, *value) || !tx.Upsert(rules_, *key, *value)) {
+        unexpected_++;
+        return;
+      }
+      const auto t0 = Clock::now();
+      const auto result = tx.Commit();
+      injection_seconds_ += std::chrono::duration<double>(Clock::now() - t0).count();
+      if (result) {
+        unexpected_++;  // applied: the engine did not refuse the duplicate
+        return;
+      }
+      if (result.error().kind == bess::sdk::ErrorKind::kBusy) {
+        continue;
+      }
+      if (result.error().kind == bess::sdk::ErrorKind::kRejected) {
+        rejected_++;
+        return;
+      }
+      unexpected_++;  // a different refusal is not the check this mode makes
+      return;
+    }
+  }
+
   bess::sdk::Client &client_;
   Types &types_;
   const Options &o_;
@@ -232,6 +284,10 @@ class Committer {
   int done_ = 0;
   uint64_t cpu_ns_ = 0;
   std::vector<double> latency_;
+  long injected_ = 0;
+  long rejected_ = 0;
+  long unexpected_ = 0;
+  double injection_seconds_ = 0.0;
 };
 
 class Bench {
@@ -740,6 +796,21 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
     done += c->TakeDone();
     thread_cpu_ns += c->TakeCpuNs();
   }
+  long injected = 0, rejected = 0, unexpected = 0;
+  double injection_seconds = 0;
+  for (Committer *c : committers) {
+    injected += c->TakeInjected();
+    rejected += c->TakeRejected();
+    unexpected += c->TakeUnexpected();
+    injection_seconds += c->TakeInjectionSeconds();
+  }
+  if (o.fail_every > 0) {
+    g_injection_unexpected += unexpected;
+    std::printf("# failure_injection {\"rate\":%d,\"attempted\":%ld,\"rejected\":%ld,"
+                "\"unexpected\":%ld,\"mean_us\":%.3f}\n",
+                rate, injected, rejected, unexpected,
+                rejected > 0 ? injection_seconds / rejected * 1e6 : 0.0);
+  }
   const double client_cpu_s =
       double(ProcessCpuNs() - client_cpu_before) / 1e9;  // every client thread
   const auto after = gate_packets(after_bounds);
@@ -900,6 +971,8 @@ int Main(int argc, char **argv) {
       o.stage_mode = value();
     } else if (a == "--transaction-streams") {
       o.transaction_streams = std::stoi(value());
+    } else if (a == "--fail-every") {
+      o.fail_every = std::stoi(value());
     } else if (a == "--stage-locality") {
       o.stage_locality = value();
     } else if (a == "--keep") {
@@ -913,6 +986,8 @@ int Main(int argc, char **argv) {
                    "  [--stage-counts 1,2,3,4,8 --stage-iterations 1..65536 --stage-locality hot|spread]\n"
                    "  [--stage-mode message|encoded]\n"
                    "  [--transaction-streams 1..64] (zero/default: unary transactions)\n"
+                   "  [--fail-every N] (every Nth commit also submits a transaction the engine\n"
+                   "  must refuse; the run fails if one is applied)\n"
                    "  [--attach] [--block-offset K] [--blocks-total T]  (several processes, one\n"
                    "  daemon: the first builds with --blocks-total --keep, the rest --attach with\n"
                    "  their own --block-offset)\n");
@@ -932,6 +1007,9 @@ int Main(int argc, char **argv) {
   }
   if (o.clients <= 0) {
     throw std::runtime_error("--clients must be positive");
+  }
+  if (o.fail_every < 0) {
+    throw std::runtime_error("--fail-every must be non-negative");
   }
   if (o.block_offset < 0) {
     throw std::runtime_error("--block-offset must not be negative");
@@ -996,7 +1074,7 @@ int Main(int argc, char **argv) {
     // against the same modules and the same traffic.
     bench.Reset();
   }
-  return 0;
+  return g_injection_unexpected > 0 ? 1 : 0;
 }
 
 }  // namespace
