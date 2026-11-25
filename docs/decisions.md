@@ -14868,3 +14868,35 @@ lease already evicts oldest-first.
 **Evidence.** `TransactionEngineTest.ReturnsWhatAnAppliedOperationObserves` and
 `TransactionObservationTest.ARecordKeepsWhatAnOperationReturned` (the retry and
 `GetTransaction` carry the first answer's bytes).
+
+## D-211 G1.4 closes on the shipped stats and event surfaces
+
+**Status:** accepted (2026-11-25).
+
+**Context.** The roadmap listed a generic resource statistics API,
+`GetStats(resource, keys)` and `WatchStats`, as the remaining G1.4 work. The
+pieces it was to stand on have since shipped: `stats::EventHub` and
+`WatchEvents` give a bounded, gap-explicit channel with per-worker rings
+(`event_hub.h`, `api_v2.cc`); `WatchCounters`/`watch_counters` narrow that
+stream to `bess.counter_threshold`; D-210 returns an operation's final values
+with the removing transaction; and a module reads its own counters through
+its actions (`get_counts`, `get_status`, `get_changes`). D-159 had already
+dropped the framework counter-source sweep and an arming RPC: the module owns
+its keys and its clock. The one consumer (the UPF) reads through the module
+actions and the transaction results.
+
+**Decision.** G1.4 is done on those surfaces. No generic `GetStats` or
+`WatchStats` RPC is added: a framework-side registry would have to know a
+module's key space and limit shape, which is the second mechanism D-159
+refused, and no consumer needs a uniform read. A future consumer that does
+opens a new decision with its requirement.
+
+**Consequences.** The G1 status, the roadmap's row 8 and 9, the pending list
+and the next-software-work list record the closure. `GetSystem` (G1.3),
+`ReplaceScope` and the full-chain failure-injection/Mpps gate remain the open
+G1 items.
+
+**Evidence.** `core/stats/event_hub_test.cc`, `core/control/api_server_test.cc`
+(the `WatchEvents` stream), `sdk/go/bess` and `sdk/python`'s watch helpers,
+`docs/plugin-api.md` ("Counter crossings", "Where a module's counters live"),
+and D-210's tests.
