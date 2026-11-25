@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -26,6 +27,16 @@ namespace bess::route {
 struct ConnectedRoute {
   // The interface's subnet: the address with its host bits cleared.
   Ipv4Prefix prefix;
+  // The hop to install for it: the interface, no neighbor resolved yet.
+  NextHop hop;
+};
+
+// The connected route for an interface's IPv6 address: the same arithmetic as
+// the IPv4 helper, with the prefix in the form the v6 table takes. A caller's
+// address selects the family by type; `length` above 128 is refused.
+struct ConnectedRouteV6 {
+  // The interface's subnet: the address with its host bits cleared.
+  Ipv6Prefix prefix;
   // The hop to install for it: the interface, no neighbor resolved yet.
   NextHop hop;
 };
@@ -47,6 +58,34 @@ inline std::optional<ConnectedRoute> ConnectedRouteFor(uint32_t address, uint8_t
   return ConnectedRoute{.prefix = *prefix,
                         .hop = NextHop{.egress = egress,
                                        .neighbor = NeighborState::kIncomplete}};
+}
+
+// The connected route for the interface `egress` whose own address is
+// `address` with prefix length `length`. The host bits are cleared here for
+// the same reason as IPv4: `Ipv6Prefix::Make` refuses them, and the mask is
+// the length's. `nullopt` when `length` is not a prefix length (above 128).
+inline std::optional<ConnectedRouteV6> ConnectedRouteFor(
+    utils::Ipv6Address address, uint8_t length, dataplane::InterfaceId egress) {
+  if (length > 128) {
+    return std::nullopt;
+  }
+  const size_t whole = length / 8;
+  const uint8_t bits = length % 8;
+  size_t clear_from = whole;
+  if (bits != 0) {
+    address.bytes[whole] &= static_cast<uint8_t>(0xffu << (8u - bits));
+    clear_from++;
+  }
+  for (size_t i = clear_from; i < sizeof(address.bytes); i++) {
+    address.bytes[i] = 0;
+  }
+  const auto prefix = Ipv6Prefix::Make(address, length);
+  if (!prefix) {
+    return std::nullopt;
+  }
+  return ConnectedRouteV6{
+      .prefix = *prefix,
+      .hop = NextHop{.egress = egress, .neighbor = NeighborState::kIncomplete}};
 }
 
 }  // namespace bess::route
