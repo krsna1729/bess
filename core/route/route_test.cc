@@ -220,6 +220,49 @@ TEST(ConnectedRouteTest, TheSubnetOfAnInterfaceAddress) {
   EXPECT_FALSE(ConnectedRouteFor(Ip(10, 0, 0, 1), 33, if1).has_value());
 }
 
+// The same arithmetic for an interface's IPv6 address: the host bits are
+// cleared, the hop is the interface with no neighbor resolved, and a length
+// above 128 is refused.
+TEST(ConnectedRouteTest, TheV6SubnetOfAnInterfaceAddress) {
+  const auto if1 = dataplane::InterfaceId{uint16_t{1}};
+  const auto v6 = [](const char *text) {
+    return bess::utils::ParseIpv6Address(text).value();
+  };
+  const auto address = v6("2001:db8:6::2a");
+
+  const auto subnet = ConnectedRouteFor(address, 64, if1);
+  ASSERT_TRUE(subnet.has_value());
+  if (!subnet) {
+    return;
+  }
+  EXPECT_EQ(v6("2001:db8:6::"), subnet->prefix.addr());
+  EXPECT_EQ(64, subnet->prefix.length());
+  EXPECT_EQ(if1, subnet->hop.egress);
+  EXPECT_EQ(NeighborState::kIncomplete, subnet->hop.neighbor);
+
+  // A length inside a byte masks that byte's low bits and clears the rest.
+  const auto partial = v6("2001:db8:6:0:ff00::1");
+  const auto sixty_five = ConnectedRouteFor(partial, 65, if1);
+  ASSERT_TRUE(sixty_five.has_value());
+  if (!sixty_five) {
+    return;
+  }
+  EXPECT_EQ(v6("2001:db8:6:0:8000::"), sixty_five->prefix.addr());
+
+  // The edges clear everything and nothing; 129 is not a prefix length.
+  const auto zero = ConnectedRouteFor(address, 0, if1);
+  const auto host = ConnectedRouteFor(address, 128, if1);
+  ASSERT_TRUE(zero.has_value());
+  ASSERT_TRUE(host.has_value());
+  if (!zero || !host) {
+    return;
+  }
+  EXPECT_TRUE(zero->prefix.addr().IsUnspecified());
+  EXPECT_EQ(address, host->prefix.addr());
+  EXPECT_EQ(128, host->prefix.length());
+  EXPECT_FALSE(ConnectedRouteFor(address, 129, if1).has_value());
+}
+
 class RouteTableTest : public bess::testing::RouteBackendTest {};
 class RouterTest : public bess::testing::RouteBackendTest {};
 class RouterGroupTest : public bess::testing::RouteBackendTest {};
