@@ -214,4 +214,160 @@ std::optional<uint8_t> PrefixLengthFromMask(uint32_t mask) {
   return static_cast<uint8_t>(32 - std::popcount(host_bits));
 }
 
+// --- IPv6 -------------------------------------------------------------------
+
+namespace {
+
+bool OrderV6(const DerivedRouteV6 &a, const DerivedRouteV6 &b) {
+  return std::tie(a.domain, a.prefix, a.kind) <
+         std::tie(b.domain, b.prefix, b.kind);
+}
+
+bool SameRouteV6(const DerivedRouteV6 &a, const DerivedRouteV6 &b) {
+  return a.domain == b.domain && a.prefix == b.prefix;
+}
+
+}  // namespace
+
+std::expected<DerivedRoutesV6, DerivationError> DerivedRoutesV6::Derive(
+    std::span<const InterfaceAddressV6> interfaces) {
+  std::vector<DerivedRouteV6> entries;
+  entries.reserve(interfaces.size() * 2);
+  for (const InterfaceAddressV6 &interface : interfaces) {
+    if (interface.interface == dataplane::kInvalidInterfaceId) {
+      return std::unexpected(DerivationError::kInvalidInterface);
+    }
+    if (interface.length > 128) {
+      return std::unexpected(DerivationError::kInvalidPrefixLength);
+    }
+    // A /128 address has no subnet beyond the address itself: its connected
+    // and local entries would share the key, and the local one is the honest
+    // meaning of the address.
+    if (HasFlag(interface.flags, DerivedRouteFlags::kConnected) &&
+        interface.length < 128) {
+      const auto connected =
+          ConnectedRouteFor(interface.address, interface.length, interface.interface);
+      if (!connected) {
+        // Only a length above 128 can fail, and it was checked above.
+        return std::unexpected(DerivationError::kInvalidPrefixLength);
+      }
+      entries.push_back(DerivedRouteV6{.domain = interface.domain,
+                                       .kind = DerivedRouteKind::kConnected,
+                                       .prefix = connected->prefix,
+                                       .interface = interface.interface,
+                                       .egress = interface.interface});
+    }
+    // The local route is the address itself: a packet to the node's own
+    // address is delivered here, not forwarded to the subnet's hop.
+    if (HasFlag(interface.flags, DerivedRouteFlags::kLocal)) {
+      const auto prefix = Ipv6Prefix::Make(interface.address, 128);
+      if (!prefix) {
+        return std::unexpected(DerivationError::kInvalidPrefixLength);
+      }
+      entries.push_back(DerivedRouteV6{.domain = interface.domain,
+                                       .kind = DerivedRouteKind::kLocal,
+                                       .prefix = *prefix,
+                                       .interface = interface.interface,
+                                       .egress = dataplane::kInvalidInterfaceId});
+    }
+  }
+
+  std::sort(entries.begin(), entries.end(), OrderV6);
+  std::vector<DerivedRouteV6> unique;
+  unique.reserve(entries.size());
+  for (const DerivedRouteV6 &entry : entries) {
+    if (!unique.empty() && SameRouteV6(unique.back(), entry)) {
+      // A duplicate input (the same address twice, or a /128 address whose
+      // local route is also its implicit connected one) collapses; two
+      // different interfaces deriving the same key is a conflict.
+      if (unique.back().kind == entry.kind &&
+          unique.back().interface == entry.interface) {
+        continue;
+      }
+      return std::unexpected(DerivationError::kConflictingRoute);
+    }
+    unique.push_back(entry);
+  }
+  return DerivedRoutesV6(std::move(unique));
+}
+
+const DerivedRouteV6 *DerivedRoutesV6::Find(const RouteKeyV6 &key) const noexcept {
+  const auto it = std::lower_bound(
+      entries_.begin(), entries_.end(), key,
+      [](const DerivedRouteV6 &entry, const RouteKeyV6 &wanted) {
+        return entry.key() < wanted;
+      });
+  if (it == entries_.end() || !(it->key() == key)) {
+    return nullptr;
+  }
+  return &*it;
+}
+
+std::expected<std::vector<dataplane::Op>, DerivationError> InstallationOpsV6(
+    const Router &router, std::span<const DerivedRouteV6> entries,
+    std::span<const NextHopId> hop_ids) {
+  if (entries.size() != hop_ids.size()) {
+    return std::unexpected(DerivationError::kHopCountMismatch);
+  }
+  std::vector<dataplane::Op> ops;
+  ops.reserve(entries.size() * 2);
+  std::set<RouteKeyV6> keys;
+  std::map<uint32_t, NextHop> id_hops;
+  for (size_t i = 0; i < entries.size(); i++) {
+    const DerivedRouteV6 &entry = entries[i];
+    const NextHopId id = hop_ids[i];
+    if (id == kInvalidNextHopId) {
+      return std::unexpected(DerivationError::kInvalidHopId);
+    }
+    if (entry.interface == dataplane::kInvalidInterfaceId) {
+      return std::unexpected(DerivationError::kInvalidRoute);
+    }
+    if (entry.IsLocal() ? entry.egress != dataplane::kInvalidInterfaceId
+                        : entry.egress != entry.interface) {
+      return std::unexpected(DerivationError::kInvalidRoute);
+    }
+    if (!keys.insert(entry.key()).second) {
+      return std::unexpected(DerivationError::kConflictingRoute);
+    }
+    const NextHop hop = entry.hop();
+    const auto [it, inserted] = id_hops.try_emplace(id.value(), hop);
+    if (!inserted && !SameHop(it->second, hop)) {
+      return std::unexpected(DerivationError::kDuplicateHopId);
+    }
+    if (inserted) {
+      ops.push_back(router.SetNextHopOp(id, hop));
+    }
+    ops.push_back(router.SetRouteOp(entry.domain, entry.prefix, id));
+  }
+  return ops;
+}
+
+std::vector<dataplane::Op> EraseOpsV6(const Router &router,
+                                      std::span<const RouteKeyV6> stale) {
+  std::vector<dataplane::Op> ops;
+  ops.reserve(stale.size());
+  for (const RouteKeyV6 &key : stale) {
+    ops.push_back(router.RemoveRouteOp(key.domain, key.prefix));
+  }
+  return ops;
+}
+
+std::vector<RouteKeyV6> StaleRouteKeysV6(
+    std::span<const DerivedRouteV6> previous,
+    std::span<const DerivedRouteV6> next) {
+  std::set<RouteKeyV6> next_keys;
+  for (const DerivedRouteV6 &entry : next) {
+    next_keys.insert(entry.key());
+  }
+  std::vector<RouteKeyV6> stale;
+  for (const DerivedRouteV6 &entry : previous) {
+    if (!next_keys.contains(entry.key())) {
+      stale.push_back(entry.key());
+    }
+  }
+  std::sort(stale.begin(), stale.end());
+  stale.erase(std::unique(stale.begin(), stale.end()), stale.end());
+  return stale;
+}
+
 }  // namespace bess::route
