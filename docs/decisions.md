@@ -14900,3 +14900,38 @@ G1 items.
 (the `WatchEvents` stream), `sdk/go/bess` and `sdk/python`'s watch helpers,
 `docs/plugin-api.md` ("Counter crossings", "Where a module's counters live"),
 and D-210's tests.
+
+## D-212 IPv6 connected and local routes derive by the same rules
+
+**Status:** accepted (2026-11-25).
+
+**Problem.** D-164 and D-178 derive the two routes an interface address
+implies: its subnet (the connected route, hop naming the interface with no
+neighbor resolved) and the address itself (the local route). The derivation
+library is typed on `Ipv4Prefix` and the v4 route key, which packs domain,
+address and length into 64 bits. Deployments with IPv6 interface addresses
+need the same arithmetic, and the Router already installs v6 routes
+(`SetRouteOp(RouteDomainId, Ipv6Prefix, ...)`, `rte_fib6`), but a controller
+has to derive them by hand.
+
+**Decision.** The library gains a v6 derivation with the same rules and
+refusals: `InterfaceAddressV6`, `DerivedRouteV6`, `DerivedRoutesV6`, and the
+installation, erase and stale-key plans (`InstallationOpsV6`, `EraseOpsV6`,
+`StaleRouteKeysV6`). The prefix length is the mask; host bits are cleared; a
+/128 address has no connected route distinct from its local route; duplicate
+inputs collapse; two interfaces deriving one key is a conflict; the order is
+(domain, prefix, kind). The v4 and v6 types are separate because their route
+keys are: a v6 key is a 16-byte prefix, while the v4 key is packed into 64
+bits. A variant would make every v4-only controller carry the v6 branch.
+
+**Consequences.** A controller can derive and install an IPv6 address's
+connected and local routes in one transaction, with the same failure
+semantics as v4. The v4 API is unchanged. Both families' routes still go
+through the same Router next-hop namespace, so one hop id can serve either.
+
+**Evidence.** `ConnectedRoutesV6Test` (subnet and host route, /0 and /128
+edges, 129 refused, flags, duplicates and conflicts, stale keys after an
+address change) and
+`Backend/ConnectedRoutesTest.IPv6InstallationOpsAreOneHopAndOneRoutePerEntry`
+(both backends; one hop and one route per entry, short id list refused, a
+duplicate key refused).

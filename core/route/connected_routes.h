@@ -186,6 +186,89 @@ std::vector<RouteKey> StaleRouteKeys(std::span<const DerivedRoute> previous,
 // 255.255.255.255 is /32.
 std::optional<uint8_t> PrefixLengthFromMask(uint32_t mask);
 
+// --- IPv6 -------------------------------------------------------------------
+//
+// The same two routes, rules and refusals for an interface's IPv6 addresses.
+// The v4 and v6 derivations are separate types because the Router's v4 and v6
+// resources have different keys: a v6 route key is a 16-byte prefix, not the
+// packed 64-bit v4 key, and mixing the families in one sorted set would need a
+// variant the v4-only controllers do not pay for.
+
+// One configured IPv6 interface address. `address` is network order; `length`
+// is the prefix length, and the mask that goes with it is derived.
+struct InterfaceAddressV6 {
+  dataplane::InterfaceId interface;
+  RouteDomainId domain = kDefaultRouteDomainId;
+  utils::Ipv6Address address{};
+  uint8_t length = 0;
+  DerivedRouteFlags flags = DerivedRouteFlags::kAll;
+};
+
+// A derived IPv6 route's stable key: domain and prefix, in the v6 table's key
+// space.
+struct RouteKeyV6 {
+  RouteDomainId domain = kDefaultRouteDomainId;
+  Ipv6Prefix prefix;
+
+  friend auto operator<=>(const RouteKeyV6 &, const RouteKeyV6 &) = default;
+  friend bool operator==(const RouteKeyV6 &, const RouteKeyV6 &) = default;
+};
+
+// One derived IPv6 route. `prefix` and `domain` are its stable key; `kind`
+// says whether `egress` forwards the subnet or `hop()` delivers locally.
+struct DerivedRouteV6 {
+  RouteDomainId domain = kDefaultRouteDomainId;
+  DerivedRouteKind kind = DerivedRouteKind::kConnected;
+  Ipv6Prefix prefix;
+  dataplane::InterfaceId interface = dataplane::kInvalidInterfaceId;
+  dataplane::InterfaceId egress = dataplane::kInvalidInterfaceId;
+
+  RouteKeyV6 key() const { return RouteKeyV6{.domain = domain, .prefix = prefix}; }
+  bool IsLocal() const { return kind == DerivedRouteKind::kLocal; }
+  NextHop hop() const { return IsLocal() ? LocalNextHop() : ConnectedHop(); }
+
+  friend bool operator==(const DerivedRouteV6 &, const DerivedRouteV6 &) = default;
+
+ private:
+  NextHop ConnectedHop() const {
+    return NextHop{.egress = egress, .neighbor = NeighborState::kIncomplete};
+  }
+};
+
+// The deterministic set of derived IPv6 routes: entries are sorted by
+// (domain, prefix address, prefix length, kind) and unique by key.
+class DerivedRoutesV6 {
+ public:
+  static std::expected<DerivedRoutesV6, DerivationError> Derive(
+      std::span<const InterfaceAddressV6> interfaces);
+
+  std::span<const DerivedRouteV6> entries() const noexcept { return entries_; }
+  size_t size() const noexcept { return entries_.size(); }
+  bool empty() const noexcept { return entries_.empty(); }
+  const DerivedRouteV6 *Find(const RouteKeyV6 &key) const noexcept;
+
+ private:
+  explicit DerivedRoutesV6(std::vector<DerivedRouteV6> entries)
+      : entries_(std::move(entries)) {}
+
+  std::vector<DerivedRouteV6> entries_;
+};
+
+// The operations that install `entries` through `router`'s v6 route resource,
+// with the same hop upsert, refusal and id rules as InstallationOps.
+std::expected<std::vector<dataplane::Op>, DerivationError> InstallationOpsV6(
+    const Router &router, std::span<const DerivedRouteV6> entries,
+    std::span<const NextHopId> hop_ids);
+
+// Operations that erase the v6 route keys in `stale`.
+std::vector<dataplane::Op> EraseOpsV6(const Router &router,
+                                      std::span<const RouteKeyV6> stale);
+
+// The v6 keys `previous` derives but `next` does not, sorted and unique.
+std::vector<RouteKeyV6> StaleRouteKeysV6(
+    std::span<const DerivedRouteV6> previous,
+    std::span<const DerivedRouteV6> next);
+
 }  // namespace bess::route
 
 #endif  // BESS_ROUTE_CONNECTED_ROUTES_H_

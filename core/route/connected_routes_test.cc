@@ -53,6 +53,37 @@ InterfaceAddress Iface(uint16_t id, uint32_t address, uint8_t length,
 
 std::vector<InterfaceAddress> One(const InterfaceAddress &address) { return {address}; }
 
+bess::utils::Ipv6Address V6(const char *text) {
+  const auto address = bess::utils::ParseIpv6Address(text);
+  if (!address) {
+    return bess::utils::Ipv6Address{};
+  }
+  return *address;
+}
+
+Ipv6Prefix P6(const char *text, uint8_t length) {
+  return Ipv6Prefix::Make(V6(text), length).value();
+}
+
+RouteKeyV6 Key6(const char *text, uint8_t length,
+                RouteDomainId domain = kDefaultRouteDomainId) {
+  return RouteKeyV6{.domain = domain, .prefix = P6(text, length)};
+}
+
+InterfaceAddressV6 Iface6(uint16_t id, const char *address, uint8_t length,
+                          RouteDomainId domain = kDefaultRouteDomainId,
+                          DerivedRouteFlags flags = DerivedRouteFlags::kAll) {
+  return InterfaceAddressV6{.interface = dataplane::InterfaceId(id),
+                            .domain = domain,
+                            .address = V6(address),
+                            .length = length,
+                            .flags = flags};
+}
+
+std::vector<InterfaceAddressV6> One6(const InterfaceAddressV6 &address) {
+  return {address};
+}
+
 std::vector<NextHopId> Ids(size_t n, uint32_t first = 1) {
   std::vector<NextHopId> ids;
   ids.reserve(n);
@@ -521,6 +552,117 @@ TEST_P(ConnectedRoutesTest, LocalDeliveryIsNotForwarding) {
   EXPECT_EQ(ForwardVerdict::kForward, out[2].verdict);
   EXPECT_EQ(ForwardVerdict::kNoRoute, out[3].verdict);
   Settle();
+}
+
+// --- IPv6 -------------------------------------------------------------------
+
+TEST(ConnectedRoutesV6Test, AnAddressDerivesTheSubnetAndItsOwnHostRoute) {
+  const auto derived = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8:6::4d", 64)));
+  ASSERT_TRUE(derived.has_value()) << DerivationErrorName(derived.error());
+  ASSERT_EQ(2u, derived->size());
+
+  const DerivedRouteV6 *connected = derived->Find(Key6("2001:db8:6::", 64));
+  ASSERT_NE(nullptr, connected);
+  EXPECT_EQ(DerivedRouteKind::kConnected, connected->kind);
+  EXPECT_EQ(dataplane::InterfaceId(uint16_t{1}), connected->interface);
+  EXPECT_EQ(dataplane::InterfaceId(uint16_t{1}), connected->egress);
+  EXPECT_EQ(NeighborState::kIncomplete, connected->hop().neighbor);
+
+  const DerivedRouteV6 *local = derived->Find(Key6("2001:db8:6::4d", 128));
+  ASSERT_NE(nullptr, local);
+  EXPECT_EQ(DerivedRouteKind::kLocal, local->kind);
+  EXPECT_EQ(dataplane::kInvalidInterfaceId, local->egress);
+  EXPECT_EQ(NextHopKind::kLocal, local->hop().kind);
+  EXPECT_EQ(nullptr, derived->Find(Key6("2001:db8:7::", 64)));
+}
+
+TEST(ConnectedRoutesV6Test, ThePrefixLengthEdges) {
+  const auto zero = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8::1", 0)));
+  ASSERT_TRUE(zero.has_value()) << DerivationErrorName(zero.error());
+  ASSERT_EQ(2u, zero->size());
+  const DerivedRouteV6 *all = zero->Find(Key6("::", 0));
+  ASSERT_NE(nullptr, all);
+  EXPECT_EQ(DerivedRouteKind::kConnected, all->kind);
+  EXPECT_EQ(0, all->prefix.length());
+
+  // A /128 address has no subnet beyond itself: only the local route.
+  const auto host = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8::1", 128)));
+  ASSERT_TRUE(host.has_value()) << DerivationErrorName(host.error());
+  ASSERT_EQ(1u, host->size());
+  EXPECT_EQ(DerivedRouteKind::kLocal, host->entries()[0].kind);
+  EXPECT_EQ(P6("2001:db8::1", 128), host->entries()[0].prefix);
+
+  const auto invalid = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8::1", 129)));
+  ASSERT_FALSE(invalid.has_value());
+  EXPECT_EQ(DerivationError::kInvalidPrefixLength, invalid.error());
+}
+
+TEST(ConnectedRoutesV6Test, FlagsSelectWhatIsDerived) {
+  const auto connected = DerivedRoutesV6::Derive(
+      One6(Iface6(1, "2001:db8:6::1", 64, kDefaultRouteDomainId,
+                  DerivedRouteFlags::kConnected)));
+  ASSERT_TRUE(connected.has_value()) << DerivationErrorName(connected.error());
+  ASSERT_EQ(1u, connected->size());
+  EXPECT_EQ(DerivedRouteKind::kConnected, connected->entries()[0].kind);
+
+  const auto local = DerivedRoutesV6::Derive(
+      One6(Iface6(1, "2001:db8:6::1", 64, kDefaultRouteDomainId,
+                  DerivedRouteFlags::kLocal)));
+  ASSERT_TRUE(local.has_value()) << DerivationErrorName(local.error());
+  ASSERT_EQ(1u, local->size());
+  EXPECT_EQ(DerivedRouteKind::kLocal, local->entries()[0].kind);
+  EXPECT_EQ(P6("2001:db8:6::1", 128), local->entries()[0].prefix);
+}
+
+TEST(ConnectedRoutesV6Test, DuplicatesCollapseAndTwoInterfacesConflict) {
+  // Two addresses on one interface share the connected route; their local
+  // routes differ. The shared entry is one, not two.
+  const std::vector<InterfaceAddressV6> one_interface = {
+      Iface6(1, "2001:db8:6::1", 64), Iface6(1, "2001:db8:6::2", 64)};
+  const auto shared = DerivedRoutesV6::Derive(one_interface);
+  ASSERT_TRUE(shared.has_value()) << DerivationErrorName(shared.error());
+  ASSERT_EQ(3u, shared->size());
+  EXPECT_NE(nullptr, shared->Find(Key6("2001:db8:6::", 64)));
+
+  // Two interfaces deriving the same key is the controller's conflict.
+  const std::vector<InterfaceAddressV6> two_interfaces = {
+      Iface6(1, "2001:db8:6::1", 64), Iface6(2, "2001:db8:6::2", 64)};
+  const auto conflict = DerivedRoutesV6::Derive(two_interfaces);
+  ASSERT_FALSE(conflict.has_value());
+  EXPECT_EQ(DerivationError::kConflictingRoute, conflict.error());
+}
+
+TEST(ConnectedRoutesV6Test, AnAddressChangeLeavesTheOldKeysStale) {
+  const auto before = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8:6::4d", 64)));
+  const auto after = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8:7::4d", 64)));
+  ASSERT_TRUE(before.has_value());
+  ASSERT_TRUE(after.has_value());
+  const auto stale = StaleRouteKeysV6(before->entries(), after->entries());
+  ASSERT_EQ(2u, stale.size());
+  EXPECT_EQ(Key6("2001:db8:6::", 64), stale[0]) << "the subnet sorts before its host";
+  EXPECT_EQ(Key6("2001:db8:6::4d", 128), stale[1]);
+}
+
+TEST_P(ConnectedRoutesTest, IPv6InstallationOpsAreOneHopAndOneRoutePerEntry) {
+  const auto derived = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8:6::4d", 64)));
+  ASSERT_TRUE(derived.has_value());
+  auto router = MakeRouter();
+  const auto ids = Ids(derived->size());
+  const auto ops = InstallationOpsV6(*router, derived->entries(), ids);
+  ASSERT_TRUE(ops.has_value()) << DerivationErrorName(ops.error());
+  EXPECT_EQ(derived->size() * 2, ops->size());  // each entry's hop and its route
+  EXPECT_EQ(0u, router->route_count()) << "building operations writes no table";
+
+  const auto short_ids = InstallationOpsV6(*router, derived->entries(), Ids(1));
+  ASSERT_FALSE(short_ids.has_value());
+  EXPECT_EQ(DerivationError::kHopCountMismatch, short_ids.error());
+
+  // The same route key twice is refused as a whole, like the v4 plan.
+  std::vector<DerivedRouteV6> twice(derived->entries().begin(), derived->entries().end());
+  twice.push_back(twice.front());
+  const auto duplicated = InstallationOpsV6(*router, twice, Ids(twice.size()));
+  ASSERT_FALSE(duplicated.has_value());
+  EXPECT_EQ(DerivationError::kConflictingRoute, duplicated.error());
 }
 
 BESS_INSTANTIATE_ROUTE_BACKENDS(ConnectedRoutesTest);
