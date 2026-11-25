@@ -111,6 +111,17 @@ GetPipeline — the client derives no topology); `--allow-dirty-placement`
 silences the warning. Numbers taken while siblings compete measure contention,
 so treat a warned run as the caveat says.
 
+`--fail-every N` also submits, after every Nth committed transaction, a
+transaction the engine must refuse: one rule key is upserted twice (its
+one-operation-per-key rule). Each rate prints one `# failure_injection` line
+with attempted/rejected/unexpected counts and the mean rejection latency; the
+process exits non-zero if one was applied or refused for another reason. A
+smoke run (4 clients, 8192 sessions, 1 upsert + 1 erase, 1000 tx/s for 2 s,
+this host) injected 200: 200 rejected, 0 unexpected, 344.9 us mean rejection
+latency, alongside 23.56 Mpps at the 0.50 hit fraction. This checks the
+engine's refusal and the forwarding state; the full session chain's
+failure/Mpps gate is separate work.
+
 ## Control RPC worker reuse: PR #149
 
 Measured 2026-11-08: clean parent `f5d94731` against merged `529e5374`,
