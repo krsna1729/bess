@@ -8845,9 +8845,14 @@ consumer-driven (D-008, §31.3 item 2).
   RPCs, plugin API, classes, plugins, ports, resources) and `GetSchema` (every
   init and command argument type with its descriptors, D-105) are served;
   `GetSystem` is not.
-- **G1.4 — resource stats and events: PENDING.** Existing port/traffic-class
-  stats are not per-resource transaction lifecycle stats. Gate counters are
-  in ListMetrics (`bess_gate_{packets,batches,bytes}_total`, D-116).
+- **G1.4 — resource stats and events: DONE at the shipped surface (D-211).**
+  The bounded event channel is `stats::EventHub` with `WatchEvents`
+  (sequence, explicit gaps, daemon epoch, per-worker rings);
+  `WatchCounters`/`watch_counters` narrow it to counter crossings; a module
+  reads its own stats through its actions (`get_counts`, `get_status`,
+  `get_changes`), and D-210 returns an operation's final values with the
+  removing transaction. No generic `GetStats`/`WatchStats` RPC: D-159's
+  owner rule and the one consumer decided against it (D-211).
 - **G1.5 — Go SDK: DONE** (`sdk/go`); it is the SDK for external controllers
   such as the UPF (D-104).
 - **G1.6 — C++ SDK: DONE** (`sdk/cpp`, `libbess-sdk` and the `bess-sdk` .deb).
@@ -10711,7 +10716,7 @@ stay in OMEC. Where it now stands against this roadmap:
 |---|---|---|
 | Reuse K1-K4 unchanged; no parallel RCU/packet/classifier/checksum systems | Honored | -- |
 | K5 metering as thin `rte_meter` adapter | **Done** (K5) | -- |
-| K6 worker-local counters/snapshots | **Done** (K6) | Stats API: G1.4 |
+| K6 worker-local counters/snapshots | **Done** (K6) | Stats API: closed (D-211) |
 | K7 routes/next hops on proven `rte_lpm`; `rte_fib` only after an oracle gate | **Done**; `rte_fib` passed the gate with D-130's fix and is a selectable backend (D-132) | -- |
 | **K7 route domains (`RouteDomainId`, VRF-like) for Network Instance** | **Missing** | **K7.1:** a domain id per `RouteTable`/`Router`, and `ApplyRouteSet(domain, routes)` |
 | IPv6 as a separate key/table family (no universal key) | Missing (K7 is IPv4) | K7.2 when the UPF v6 path starts (`rte_lpm6`) |
@@ -10720,7 +10725,7 @@ stay in OMEC. Where it now stands against this roadmap:
 | **`ActionId` vs `ResultSlot` contract**: a UPF typed classifier returns `ActionId` directly, with no `PackedValueStore` hop | Implicit only | Document in the K2/K3 sections alongside K3.8 (v4 "immediate" course correction) |
 | **K2/K3 update cost at 100K/1M entries and production PFCP rates** | **Measured: O(table) per insert** (ExactMatch 7.9 ms at 100K) | **G1.2a:** live tables with O(1) in-place inserts (section 14.5) |
 | Frequent session-state transaction; `request_id` idempotency; `Unknown` reconciliation; no client rollback | Planned | **G1.2** (section 14.5) |
-| Bounded dataplane->control event channel (DDN, URR thresholds, offload state) | Planned only as `WatchEvents` | **G1.4:** bounded, backpressure-aware, correlated to scope/action |
+| Bounded dataplane->control event channel (DDN, URR thresholds, offload state) | **Done** (`WatchEvents`/`EventHub`) | **G1.4 closed (D-211):** bounded, gap-explicit, per-worker rings; correlation in the event fields |
 | Packet replication (clone) | Done (K4 clone/copy) | -- |
 | **Bounded packet store** (for BUFF/BAR buffering; OMEC owns the policy) | **Missing** | **K9:** generic ownership-safe packet store with limits and release/discard, when BAR work starts |
 | Session-owner worker affinity; UL/DL same-owner RSS; worker handoff with direct action resolution | Partial (Phase L3 queues; C-HW RSS) | L3 (handoff) + C-HW H1 (effective directional inner/outer RSS) |
@@ -11031,8 +11036,8 @@ drive the design.
 | 5 | P0 | **External plugin package** (`bess-dev`) with an explicit header contract | vendored BESS fork | out-of-tree module authors | curated 51-header source API and installed-plugin checks complete (D-037, D-041); no C++ ABI promise |
 | 6 | P1 | **K3.8 range backend** (arbitrary source/destination ranges and precedence), differential against scalar reference | Go ternary expansion and Cartesian products | ACL, firewall rules | complete (D-038) |
 | 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance workarounds | VRFs, multi-tenant routers | complete (D-039; unified into `Router` by D-046) |
-| 8 | P1 | **G1.4 resource statistics API over K6** (`GetStats`/`WatchStats`) | per-object polling and custom aggregation | every NF | pending |
-| 9 | P1 | **K9 bounded packet store + G1.4 event channel** | custom buffering and unreliable notifications | NAT/ARP pending queues, punt paths | K9 packet store complete; event channel pending |
+| 8 | P1 | **G1.4 resource statistics API over K6** (`GetStats`/`WatchStats`) | per-object polling and custom aggregation | every NF | closed as realized (D-211): module actions, `WatchEvents`/`WatchCounters`, D-210 final values; no generic RPC |
+| 9 | P1 | **K9 bounded packet store + G1.4 event channel** | custom buffering and unreliable notifications | NAT/ARP pending queues, punt paths | K9 packet store complete; event channel complete (D-211: `WatchEvents`/`EventHub`) |
 | 10 | P2 | **Worker affinity and cross-worker handoff:** first expose the effective RSS configuration and queue-to-worker mapping, then generic handoff (DRR's ingress ring is the first instance, D-019) | UPF-specific queue plumbing, multi-worker limits | NAT, stateful firewall, DRR | queued |
 | 11 | P2 | **Narrow hardware steering:** a lifecycle-managed `rte_flow` interface for the flow shapes actually needed. Capabilities come from exact feature tests with conservative fallback, never driver-name guesses (the PMD's current GTP checksum inference by driver name is to be replaced) | UPF-maintained PMD code | N0 vif demux | queued |
 | later | -- | IPv6 routes, fragmentation/reassembly, more NIC features | remaining protocol limits | -- | -- |
@@ -11209,11 +11214,11 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
      resources that cannot provide it. The earlier packed `ScopeCell` word was
      deleted.
    **Pending:** full-chain prepare-failure traffic/Mpps gate; `ReplaceScope`;
-   `GetSystem` (G1.3); G1.4 stats/events (D-210 now returns an operation's
-   final values with the removing transaction). Done since 2026-10-01: the
-   shipped scope consumer (D-197); production streaming (Go and C++ SDKs over
-   `Control.TransactionChannel`); the C++ SDK and bessctl (G1.6, G1.7; legacy
-   commands pending).
+   `GetSystem` (G1.3). Done since 2026-10-01: the shipped scope consumer
+   (D-197); production streaming (Go and C++ SDKs over
+   `Control.TransactionChannel`); G1.4 stats/events on the shipped surfaces
+   (`WatchEvents`/`EventHub`, `WatchCounters`, D-210 final values; D-211); the
+   C++ SDK and bessctl (G1.6, G1.7; legacy commands pending).
    Generic Mode W remains intentionally deferred until two consumers need it
    (D-008, item 2 above).
 7. **Graph changes without pauses:** publish connections and tasks via RCU.
@@ -11610,8 +11615,7 @@ G1.1, G1.2a single-table updates, G1.2b transaction core, G1.2c unary RPC and
 persistent transaction streams, G1.2d scope snapshots with a shipped consumer
 (D-197), G1.5, G1.6, G1.7 (legacy commands pending), G1.8, G1.9, and M2
 curated plugin package.
-Partial: F, G1 (`ReplaceScope`, full-chain gate, `GetSystem`, G1.4
-stats/events), H, and I. Not started: D and K8 (consumer-driven).
+Partial: F, G1 (`ReplaceScope`, full-chain gate, `GetSystem`), H, and I. Not started: D and K8 (consumer-driven).
 ---
 
 
@@ -11627,18 +11631,15 @@ G1.1, G1.2a, G1.2b transaction core, G1.2c unary RPC and persistent
 transaction streams, G1.2d scope snapshots with a shipped consumer (D-197),
 G1.5, G1.6, G1.7 (legacy commands pending), G1.8, G1.9, and M2 curated
 plugin package.
-Partial: F, G1 (`ReplaceScope`, full-chain gate, `GetSystem`, G1.4
-stats/events), H, and I. Not started: D and K8 (consumer-driven).
+Partial: F, G1 (`ReplaceScope`, full-chain gate, `GetSystem`), H, and I. Not started: D and K8 (consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
-**Start here:** §14 G1 status and §31.3 remaining work, updated 2026-11-24;
+**Start here:** §14 G1 status and §31.3 remaining work, updated 2026-11-25;
 entry 168 lists the November landings. Historical entries below/above record
 what was planned at the time; do not reopen completed transaction
 core/providers or duplicate the D-032 session slice.
 
-**Next software work:** G1.4 stats/events (D-210 carries an operation's final
-values with the removing transaction; `GetStats`/`WatchStats` and the event
-channel are the API work), `ReplaceScope`, and the full-chain
+**Next software work:** `ReplaceScope` and the full-chain
 failure-injection/Mpps gate; continue Phase L (section 27) as a parallel
 performance track. The unary control-path ceiling arms parked on 2026-10-17
 (performance-contract.md §4) resume when a consumer's numbers ask for them.
