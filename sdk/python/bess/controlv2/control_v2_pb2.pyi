@@ -553,8 +553,16 @@ class TransactionOp(_message.Message):
     value: _any_pb2.Any
     def __init__(self, resource: _Optional[str] = ..., erase: _Optional[bool] = ..., key: _Optional[_Union[_any_pb2.Any, _Mapping]] = ..., value: _Optional[_Union[_any_pb2.Any, _Mapping]] = ...) -> None: ...
 
+class ScopeReplacement(_message.Message):
+    __slots__ = ("scope", "objects")
+    SCOPE_FIELD_NUMBER: _ClassVar[int]
+    OBJECTS_FIELD_NUMBER: _ClassVar[int]
+    scope: TransactionOp
+    objects: _containers.RepeatedCompositeFieldContainer[TransactionOp]
+    def __init__(self, scope: _Optional[_Union[TransactionOp, _Mapping]] = ..., objects: _Optional[_Iterable[_Union[TransactionOp, _Mapping]]] = ...) -> None: ...
+
 class ApplyTransactionRequest(_message.Message):
-    __slots__ = ("request_id", "expected_generation", "ops", "consistency", "daemon_epoch")
+    __slots__ = ("request_id", "expected_generation", "ops", "consistency", "daemon_epoch", "replace_scopes")
     class Consistency(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         CONSISTENCY_UNSPECIFIED: _ClassVar[ApplyTransactionRequest.Consistency]
@@ -568,12 +576,14 @@ class ApplyTransactionRequest(_message.Message):
     OPS_FIELD_NUMBER: _ClassVar[int]
     CONSISTENCY_FIELD_NUMBER: _ClassVar[int]
     DAEMON_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    REPLACE_SCOPES_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     expected_generation: int
     ops: _containers.RepeatedCompositeFieldContainer[TransactionOp]
     consistency: ApplyTransactionRequest.Consistency
     daemon_epoch: int
-    def __init__(self, request_id: _Optional[str] = ..., expected_generation: _Optional[int] = ..., ops: _Optional[_Iterable[_Union[TransactionOp, _Mapping]]] = ..., consistency: _Optional[_Union[ApplyTransactionRequest.Consistency, str]] = ..., daemon_epoch: _Optional[int] = ...) -> None: ...
+    replace_scopes: _containers.RepeatedCompositeFieldContainer[ScopeReplacement]
+    def __init__(self, request_id: _Optional[str] = ..., expected_generation: _Optional[int] = ..., ops: _Optional[_Iterable[_Union[TransactionOp, _Mapping]]] = ..., consistency: _Optional[_Union[ApplyTransactionRequest.Consistency, str]] = ..., daemon_epoch: _Optional[int] = ..., replace_scopes: _Optional[_Iterable[_Union[ScopeReplacement, _Mapping]]] = ...) -> None: ...
 
 class TransactionOpResult(_message.Message):
     __slots__ = ("status", "error", "observed")
