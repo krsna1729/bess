@@ -914,17 +914,96 @@ Result<void> Transaction::Set(const Resource &r, const google::protobuf::Message
   return {};
 }
 
+Result<void> Transaction::ReplaceScope(const Resource &scope,
+                                       const google::protobuf::Message &key,
+                                       const google::protobuf::Message &value,
+                                       std::span<const Object> objects) {
+  if (auto ok = Bind(scope); !ok) {
+    return ok;
+  }
+  if (auto ok = CheckType(scope, "key", key, scope.key_type); !ok) {
+    return ok;
+  }
+  if (auto ok = CheckType(scope, "value", value, scope.value_type); !ok) {
+    return ok;
+  }
+  pb::ScopeReplacement replacement;
+  pb::TransactionOp *op = replacement.mutable_scope();
+  op->set_resource(scope.name);
+  if (!op->mutable_key()->PackFrom(key) || !op->mutable_value()->PackFrom(value)) {
+    return std::unexpected(MakeError(ErrorKind::kInvalidRequest,
+                                     "cannot pack the scope key or value"));
+  }
+  for (const Object &object : objects) {
+    if (object.resource == nullptr || object.key == nullptr ||
+        object.value == nullptr) {
+      return std::unexpected(MakeError(
+          ErrorKind::kInvalidRequest, "a scope object needs a resource, key and value"));
+    }
+    if (auto ok = Bind(*object.resource); !ok) {
+      return ok;
+    }
+    if (object.resource->kind == pb::TransactionResource::KIND_SINGLETON) {
+      return std::unexpected(MakeError(
+          ErrorKind::kInvalidRequest,
+          "resource \"" + object.resource->name + "\" is a singleton"));
+    }
+    if (auto ok = CheckType(*object.resource, "key", *object.key,
+                            object.resource->key_type);
+        !ok) {
+      return ok;
+    }
+    if (auto ok = CheckType(*object.resource, "value", *object.value,
+                            object.resource->value_type);
+        !ok) {
+      return ok;
+    }
+    pb::TransactionOp *entry = replacement.add_objects();
+    entry->set_resource(object.resource->name);
+    if (!entry->mutable_key()->PackFrom(*object.key) ||
+        !entry->mutable_value()->PackFrom(*object.value)) {
+      return std::unexpected(MakeError(ErrorKind::kInvalidRequest,
+                                       "cannot pack a scope object"));
+    }
+  }
+  scopes_.push_back(std::move(replacement));
+  return {};
+}
+
+Result<void> Transaction::EraseScope(const Resource &scope,
+                                     const google::protobuf::Message &key) {
+  if (auto ok = Bind(scope); !ok) {
+    return ok;
+  }
+  if (auto ok = CheckType(scope, "key", key, scope.key_type); !ok) {
+    return ok;
+  }
+  pb::ScopeReplacement replacement;
+  pb::TransactionOp *op = replacement.mutable_scope();
+  op->set_resource(scope.name);
+  op->set_erase(true);
+  if (!op->mutable_key()->PackFrom(key)) {
+    return std::unexpected(MakeError(ErrorKind::kInvalidRequest,
+                                     "cannot pack the scope key"));
+  }
+  scopes_.push_back(std::move(replacement));
+  return {};
+}
+
 Result<Applied> Transaction::Commit(std::stop_token stop) {
   if (result_) {
     return *result_;
   }
-  if (ops_.empty()) {
+  if (ops_.empty() && scopes_.empty()) {
     return std::unexpected(MakeError(ErrorKind::kInvalidRequest, "empty transaction"));
   }
   pb::ApplyTransactionRequest req;
   req.set_request_id(request_id_);
   for (const auto &op : ops_) {
     *req.add_ops() = op;
+  }
+  for (const auto &replacement : scopes_) {
+    *req.add_replace_scopes() = replacement;
   }
   req.set_consistency(snapshot_
                           ? pb::ApplyTransactionRequest::CONSISTENCY_SCOPE_SNAPSHOT

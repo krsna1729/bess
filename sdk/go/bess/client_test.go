@@ -332,6 +332,41 @@ func TestApplied(t *testing.T) {
 	}
 }
 
+func TestReplaceScopePacksTheScopeAndItsObjects(t *testing.T) {
+	h := newHarness(&fake{applies: []step{answer(applied, 1)}}, 4)
+	ctx := context.Background()
+	r, err := h.c.Resource(ctx, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := &pb.GetTransactionRequest{RequestId: "k"}
+	value := &pb.ListTransactionResourcesRequest{}
+	tx := h.c.Transaction()
+	if err := tx.ReplaceScope(r, key, value, ScopeObject{Resource: r, Key: key, Value: value}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.f.sent) != 1 {
+		t.Fatalf("sent %d requests", len(h.f.sent))
+	}
+	req := h.f.sent[0]
+	if len(req.ReplaceScopes) != 1 {
+		t.Fatalf("replace scopes %d", len(req.ReplaceScopes))
+	}
+	replacement := req.ReplaceScopes[0]
+	if replacement.Scope == nil || replacement.Scope.Resource != resource || replacement.Scope.Erase {
+		t.Fatalf("scope %+v", replacement.Scope)
+	}
+	if len(replacement.Objects) != 1 || replacement.Objects[0].Resource != resource {
+		t.Fatalf("objects %+v", replacement.Objects)
+	}
+	if replacement.Scope.Key.GetTypeUrl() != "type.googleapis.com/"+keyType {
+		t.Fatalf("scope key type %q", replacement.Scope.Key.GetTypeUrl())
+	}
+}
+
 func TestATimeoutIsResolvedByAskingNotByResending(t *testing.T) {
 	h := newHarness(&fake{applies: []step{timeout()}, gets: []step{known(applied, 1)}}, 4)
 	a, err := h.commit(t)

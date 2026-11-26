@@ -44,6 +44,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -398,6 +399,25 @@ class Transaction {
   // Sets the singleton resource `r` to `value` (D-129).
   Result<void> Set(const Resource &r, const google::protobuf::Message &value);
 
+  // One entry a scope's new Version names: an upsert of key -> value on a map
+  // resource.
+  struct Object {
+    const Resource *resource = nullptr;
+    const google::protobuf::Message *key = nullptr;
+    const google::protobuf::Message *value = nullptr;
+  };
+  // Replaces a whole scope (D-050's ReplaceScope): the new Version (scope,
+  // key, value) and the entries it names. The daemon creates the objects
+  // referentially, switches the scope in one store, and retires the old
+  // Version's entries the new one drops, as one logical operation.
+  Result<void> ReplaceScope(const Resource &scope,
+                            const google::protobuf::Message &key,
+                            const google::protobuf::Message &value,
+                            std::span<const Object> objects = {});
+  // The deletion form: erases the scope; its Version's entries are retired.
+  Result<void> EraseScope(const Resource &scope,
+                          const google::protobuf::Message &key);
+
   // Applies every operation or none. A committed transaction returns its
   // result again without sending.
   Result<Applied> Commit(std::stop_token stop = {});
@@ -410,6 +430,7 @@ class Transaction {
   Client *client_;
   std::string request_id_;
   std::vector<pb::TransactionOp> ops_;
+  std::vector<pb::ScopeReplacement> scopes_;
   std::optional<uint64_t> expected_generation_;
   bool snapshot_ = false;
   std::optional<Applied> result_;

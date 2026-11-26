@@ -1124,6 +1124,7 @@ type Transaction struct {
 
 	c           *Client
 	ops         []*pb.TransactionOp
+	scopes      []*pb.ScopeReplacement
 	packed      []packedOp // the current block of ops; see newOp
 	expected    uint64
 	hasExpected bool
@@ -1197,6 +1198,76 @@ func (t *Transaction) Set(r Resource, value proto.Message) error {
 	}
 	op.op.Resource, op.op.Value = r.Name, &op.value
 	t.ops = append(t.ops, &op.op)
+	return nil
+}
+
+// ScopeObject is one entry a scope's new Version names: an upsert of Key ->
+// Value on a map resource.
+type ScopeObject struct {
+	Resource Resource
+	Key      proto.Message
+	Value    proto.Message
+}
+
+// ReplaceScope replaces a whole scope (D-050's ReplaceScope): the new Version
+// (scope, key, value) and the entries it names. The daemon creates the objects
+// referentially, switches the scope in one store, and retires the old
+// Version's entries the new one drops, as one logical operation.
+func (t *Transaction) ReplaceScope(scope Resource, key, value proto.Message, objects ...ScopeObject) error {
+	if err := t.upsertable(scope); err != nil {
+		return err
+	}
+	if err := checkType(scope, "key", key, scope.KeyType); err != nil {
+		return err
+	}
+	if err := checkType(scope, "value", value, scope.ValueType); err != nil {
+		return err
+	}
+	replacement := &pb.ScopeReplacement{Scope: &pb.TransactionOp{
+		Resource: scope.Name, Key: new(anypb.Any), Value: new(anypb.Any)}}
+	if err := pack(replacement.Scope.Key, key); err != nil {
+		return &InvalidRequestError{Message: err.Error()}
+	}
+	if err := pack(replacement.Scope.Value, value); err != nil {
+		return &InvalidRequestError{Message: err.Error()}
+	}
+	for _, object := range objects {
+		if err := t.upsertable(object.Resource); err != nil {
+			return err
+		}
+		if err := checkType(object.Resource, "key", object.Key, object.Resource.KeyType); err != nil {
+			return err
+		}
+		if err := checkType(object.Resource, "value", object.Value, object.Resource.ValueType); err != nil {
+			return err
+		}
+		entry := &pb.TransactionOp{Resource: object.Resource.Name, Key: new(anypb.Any), Value: new(anypb.Any)}
+		if err := pack(entry.Key, object.Key); err != nil {
+			return &InvalidRequestError{Message: err.Error()}
+		}
+		if err := pack(entry.Value, object.Value); err != nil {
+			return &InvalidRequestError{Message: err.Error()}
+		}
+		replacement.Objects = append(replacement.Objects, entry)
+	}
+	t.scopes = append(t.scopes, replacement)
+	return nil
+}
+
+// EraseScope is the deletion form: erases the scope; its Version's entries
+// are retired.
+func (t *Transaction) EraseScope(scope Resource, key proto.Message) error {
+	if err := t.erasable(scope); err != nil {
+		return err
+	}
+	if err := checkType(scope, "key", key, scope.KeyType); err != nil {
+		return err
+	}
+	op := &pb.TransactionOp{Resource: scope.Name, Erase: true, Key: new(anypb.Any)}
+	if err := pack(op.Key, key); err != nil {
+		return &InvalidRequestError{Message: err.Error()}
+	}
+	t.scopes = append(t.scopes, &pb.ScopeReplacement{Scope: op})
 	return nil
 }
 
@@ -1328,14 +1399,15 @@ func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 	if t.result != nil {
 		return t.result, nil
 	}
-	if len(t.ops) == 0 {
+	if len(t.ops) == 0 && len(t.scopes) == 0 {
 		return nil, &InvalidRequestError{Message: "empty transaction"}
 	}
 	req := &pb.ApplyTransactionRequest{
-		RequestId:   t.RequestID,
-		Ops:         t.ops,
-		Consistency: pb.ApplyTransactionRequest_CONSISTENCY_REFERENTIAL,
-		DaemonEpoch: t.epoch, // its resources' epoch: a restarted daemon refuses it (D-106)
+		RequestId:     t.RequestID,
+		Ops:           t.ops,
+		ReplaceScopes: t.scopes,
+		Consistency:   pb.ApplyTransactionRequest_CONSISTENCY_REFERENTIAL,
+		DaemonEpoch:   t.epoch, // its resources' epoch: a restarted daemon refuses it (D-106)
 	}
 	if t.snapshot {
 		req.Consistency = pb.ApplyTransactionRequest_CONSISTENCY_SCOPE_SNAPSHOT
@@ -1348,7 +1420,7 @@ func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 	traceTransaction(ctx, "bess.commit_leave", t.RequestID)
 	if err == nil {
 		t.result = applied
-		t.ops, t.packed = nil, nil // only the cached result is needed for another Commit
+		t.ops, t.packed, t.scopes = nil, nil, nil // only the cached result is needed for another Commit
 	}
 	return applied, err
 }

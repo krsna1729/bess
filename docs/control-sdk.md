@@ -189,6 +189,18 @@ tried (`FAILED_PRECONDITION`, `RESOURCE_BUSY`): C++ `kBusy`, Go `*BusyError`,
 with the daemon's detail, at once and not retried, since no retry helps until
 the workers are paused (Admin `PauseWorkers`, then `ResumeWorkers`).
 
+**Whole-scope replacement.** C++ `tx.ReplaceScope(scope, key, value, objects)`
+and Go `tx.ReplaceScope(scope, key, value, ScopeObject{...}...)` write a
+scope's complete new Version and the entries it names as one logical
+operation: the objects take effect first (nothing can name them yet), the
+scope switches in one store, and the old Version's entries the new one drops
+are retired if nothing else references them. `EraseScope` is the deletion
+form. The scope resource must provide scope-snapshot consistency; the daemon
+refuses another resource as the scope before attempting anything. A record
+lists the objects' results and the scope's last; a refused switch leaves the
+objects applied but unreferenced and the old Version visible, and a retry
+re-upserts them.
+
 ## Desired state
 
 The pipeline (ports, modules, connections, workers, traffic classes, and where
