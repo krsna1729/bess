@@ -409,6 +409,31 @@ TEST(SdkClient, Applied) {
   EXPECT_EQ(h.f->sent.size(), 1u);
 }
 
+TEST(SdkClient, ReplaceScopePacksTheScopeAndItsObjects) {
+  Harness h(4);
+  h.f->applies = {Answer(kApplied, 1)};
+  auto r = h.c->Resource(kResource);
+  ASSERT_TRUE(r);
+  pb::GetTransactionRequest key;
+  key.set_request_id("k");
+  pb::ListTransactionResourcesRequest value;
+  const Transaction::Object objects[] = {{&*r, &key, &value}};
+  Transaction tx = h.c->NewTransaction();
+  ASSERT_TRUE(tx.ReplaceScope(*r, key, value, objects));
+  ASSERT_TRUE(tx.Commit());
+  ASSERT_EQ(h.f->sent.size(), 1u);
+  const auto &req = h.f->sent[0];
+  ASSERT_EQ(req.replace_scopes_size(), 1);
+  const auto &replacement = req.replace_scopes(0);
+  EXPECT_EQ(replacement.scope().resource(), kResource);
+  EXPECT_FALSE(replacement.scope().erase());
+  EXPECT_EQ(replacement.scope().key().type_url(),
+            "type.googleapis.com/" + kKeyType);
+  ASSERT_EQ(replacement.objects_size(), 1);
+  EXPECT_EQ(replacement.objects(0).resource(), kResource);
+  EXPECT_FALSE(replacement.objects(0).erase());
+}
+
 TEST(SdkClient, ATimeoutIsResolvedByAskingNotByResending) {
   Harness h(4);
   h.f->applies = {Timeout()};
