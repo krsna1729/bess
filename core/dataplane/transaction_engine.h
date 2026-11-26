@@ -207,6 +207,24 @@ class TransactionEngine {
   Result ApplyOwned(std::span<const Resource *const> owned,
                     std::span<const Op> ops);
 
+  // One logical replacement of a scope's whole Version (D-050 follow-up,
+  // "ReplaceScope"): the `objects` the new Version names take effect
+  // referentially first (nothing can name them yet), then `scope` switches in
+  // one store under kScopeSnapshot, then the old Version's references the new
+  // one does not name are erased if nothing else references them. All phases
+  // run under one acquisition of the engine's lock: no transaction
+  // interleaves.
+  //
+  // `scope` is an upsert on a resource providing kScopeSnapshot, or an erase
+  // (the deletion form). If `objects` fail, nothing changed. If the switch
+  // fails, the objects remain applied -- no scope names them, and a retry
+  // re-upserts them -- and its result is the answer. A trailing erase that
+  // fails leaves those objects in place; it does not fail the replacement.
+  // Result.ops has one entry per object and the scope last.
+  Result ApplyReplaceScope(const Op &scope, std::span<const Op> objects,
+                           std::optional<uint64_t> expected_generation = std::nullopt,
+                           OnBusy on_busy = OnBusy::kAnswer);
+
   // Apply() with the operations split into transactions that each respect the
   // engine's retire budget. A caller whose op list is proportional to a
   // resource's contents - a clear of a map with many keys - cannot size a
@@ -299,6 +317,15 @@ class TransactionEngine {
   Result ApplyImpl(std::span<const Op> ops, std::optional<uint64_t> expected_generation,
                    Consistency consistency,
                    const std::span<const Resource *const> *owned);
+  // ApplyImpl()'s body; its caller holds the lock (ApplyReplaceScope runs
+  // several phases as one logical operation).
+  Result ApplyImplLocked(std::span<const Op> ops,
+                         std::optional<uint64_t> expected_generation,
+                         Consistency consistency,
+                         const std::span<const Resource *const> *owned);
+  // ReferenceCount() with the lock already held.
+  size_t ReferenceCountLocked(const std::string &resource,
+                              const ResourceKey &key) const;
   // Counts `result` in the outcome metrics (see outcome_counts()).
   Result Counted(Result result, OnBusy on_busy);
   size_t ReclaimRetiredLocked();
