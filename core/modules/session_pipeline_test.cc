@@ -8,9 +8,10 @@
 // desired-state planner destroys modules by name).
 //
 // Each stage's decision is driven in process; SessionPacketPathTest runs
-// packets through the connected modules (the ModuleHarness), and
-// tests/live/session_pipeline_test.cc writes transactions while a worker
-// forwards traffic.
+// packets through the connected modules (the ModuleHarness). A live gate that
+// writes these transactions while a worker forwards traffic is still open
+// (the full-chain prepare-failure/Mpps item); no such test exists in this
+// tree yet.
 
 #include <gtest/gtest.h>
 
