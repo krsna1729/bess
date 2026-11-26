@@ -68,10 +68,12 @@ using ScopeTable = SlotTable<ScopeId, Version>;
 // A transaction that touches several scopes: each scope switches atomically;
 // two scopes of one transaction switch one after the other, in publication
 // order, and no packet binds both. A Version that names objects created for it
-// -- a new action, a next hop -- is applied in two steps: create the
-// referents in a referential transaction (nothing can name them yet), then
-// switch the scope in a scope-snapshot one. Mixing both in one transaction is
-// refused (Outcome::kUnsupported).
+// -- a new action, a next hop -- is applied as one logical replacement with
+// TransactionEngine::ApplyReplaceScope(): the referents take effect
+// referentially (nothing can name them yet), the scope switches in one store,
+// and the old Version's references the new one drops are retired if nothing
+// else references them. A single Apply() that mixes both is still refused
+// (Outcome::kUnsupported).
 template <typename Version>
 class ScopeResource final : public SlotResource<ScopeId, Version> {
   using Base = SlotResource<ScopeId, Version>;

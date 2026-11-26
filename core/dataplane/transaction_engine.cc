@@ -487,6 +487,11 @@ void TransactionEngine::AdvanceGeneration() {
 size_t TransactionEngine::ReferenceCount(const std::string &resource,
                                          const ResourceKey &key) const {
   const auto lock = Lock();
+  return ReferenceCountLocked(resource, key);
+}
+
+size_t TransactionEngine::ReferenceCountLocked(const std::string &resource,
+                                               const ResourceKey &key) const {
   auto res = resources_.find(resource);
   if (res == resources_.end()) {
     return 0;
@@ -628,10 +633,92 @@ TransactionEngine::OutcomeCounts TransactionEngine::outcome_counts() const {
   return counts;
 }
 
+TransactionEngine::Result TransactionEngine::ApplyReplaceScope(
+    const Op &scope, std::span<const Op> objects,
+    std::optional<uint64_t> expected_generation, OnBusy on_busy) {
+  const auto lock = Lock();
+
+  // The old Version's references, before the switch replaces it.
+  std::vector<Reference> previous;
+  if (auto it = resources_.find(std::string_view(scope.resource));
+      it != resources_.end()) {
+    previous = it->second->resource->ReferencesOf(scope.key);
+  }
+
+  // 1. The new Version's objects, referentially: nothing can name them yet.
+  Result result;
+  if (!objects.empty()) {
+    result = ApplyImplLocked(objects, expected_generation,
+                             Consistency::kReferential, nullptr);
+    if (result.outcome != Outcome::kApplied) {
+      // scale: one result per object; the request's message bound caps objects.
+      result.ops.resize(objects.size() + 1);  // the scope was not attempted
+      return Counted(std::move(result), on_busy);
+    }
+  }
+
+  // What the new Version names (none for the erase form).
+  std::vector<Reference> next;
+  if (scope.kind == OpKind::kUpsert) {
+    if (auto it = resources_.find(std::string_view(scope.resource));
+        it != resources_.end()) {
+      next = it->second->resource->ReferencesOfValue(scope.value);
+    }
+  }
+
+  // 2. The scope switch, in one store.
+  const std::span<const Op> one(&scope, 1);
+  Result switched = ApplyImplLocked(
+      one, objects.empty() ? expected_generation : std::nullopt,
+      Consistency::kScopeSnapshot, nullptr);
+  Result combined;
+  combined.outcome = switched.outcome;
+  combined.generation = switched.generation;
+  combined.over_budget = switched.over_budget;
+  combined.may_retire = switched.may_retire;
+  combined.ops = std::move(result.ops);
+  // scale: one result per object plus the scope; the request's message bound
+  // caps objects.
+  combined.ops.resize(objects.size() + 1);
+  combined.ops.back() = switched.ops.empty() ? OpResult{} : switched.ops.front();
+  if (switched.outcome != Outcome::kApplied) {
+    return Counted(std::move(combined), on_busy);
+  }
+
+  // 3. The old Version's references the new one no longer names, and nothing
+  // else references, are erased. Best effort: the switch is already visible.
+  std::vector<Op> stale;
+  for (const Reference &ref : previous) {
+    if (ref.resource == scope.resource && ref.key == scope.key) {
+      continue;
+    }
+    if (std::find(next.begin(), next.end(), ref) != next.end()) {
+      continue;
+    }
+    const bool known =
+        resources_.find(std::string_view(ref.resource)) != resources_.end();
+    if (known && ReferenceCountLocked(ref.resource, ref.key) == 0) {
+      stale.push_back(Op::Erase(ref.resource, ref.key));
+    }
+  }
+  if (!stale.empty()) {
+    (void)ApplyImplLocked(stale, std::nullopt, Consistency::kReferential,
+                          nullptr);
+  }
+  combined.generation = generation_;
+  return Counted(std::move(combined), on_busy);
+}
+
 TransactionEngine::Result TransactionEngine::ApplyImpl(
     std::span<const Op> ops, std::optional<uint64_t> expected_generation,
     Consistency consistency, const std::span<const Resource *const> *owned) {
   const auto lock = Lock();
+  return ApplyImplLocked(ops, expected_generation, consistency, owned);
+}
+
+TransactionEngine::Result TransactionEngine::ApplyImplLocked(
+    std::span<const Op> ops, std::optional<uint64_t> expected_generation,
+    Consistency consistency, const std::span<const Resource *const> *owned) {
   const size_t n = ops.size();
   // D-207: a transaction that only erases may use half the reserve, so a
   // daemon at its memory limit can always be emptied (utils::Headroom).
