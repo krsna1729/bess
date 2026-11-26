@@ -127,10 +127,17 @@ a next hop (BE32 id 1..kGates); the setup transaction creates `mt/meters` and
 `rt/next_hops` first, and the rules reference them (the engine orders each
 rule after its references). The Mpps column and the counter window report the
 router's forwarded packets; the hit fraction still comes from the exact match.
-A 2 s smoke (2 clients, 1024 sessions, 1000 tx/s, `--fail-every 2`, this host,
-contended) served 5.47 Mpps at a 0.50 hit fraction and rejected 1000 of 1000
-injected duplicates (0 unexpected, 270.8 us mean); the daemon shut down
-cleanly. The ABBA campaign for record numbers remains open.
+A sweep on 2026-11-26 (4 clients, 8192 sessions, 1 upsert + 1 erase, 2 s per
+rate, `--fail-every 10`, the daemon pinned to CPUs 6,8 and the bench to 4; the
+host was shared with a browser, so the pins were the isolation) served
+5.27-5.43 Mpps at the 0.50 hit fraction from 1000 to 7796 tx/s with 0 busy
+answers; the daemon's packet worker used 0.99 core and its control side
+90-134 us per transaction. Every injected duplicate was rejected (200/200 at
+1000 tx/s, 1557/1557 at 10000, 1515/1515 at max; 0 unexpected; 361-425 us
+mean). A second sweep repeated the rates within 0.1-0.2 Mpps and at 1000 tx/s
+read 1125 us/tx process-wide (the worker's poll divided by the few
+transactions) against 218-224 at the higher rates. Record numbers on a quiet
+host remain open.
 
 ## Control RPC worker reuse: PR #149
 

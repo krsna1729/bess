@@ -11032,7 +11032,7 @@ drive the design.
 | 1 | P0 | **G1.2b transaction engine and providers**: reserve/publish, dependency ordering, reference safety, retirement (D-021); ExactMatch, WildcardMatch, Router and Meter (D-022–D-024, D-032) | manual ordering, best-effort rollback | routers, firewalls, NAT | complete |
 | 2 | P0 | **G1.2c unary transaction RPC:** `ApplyTransaction`, `GetTransaction`, `ListTransactionResources`, `request_id`, generations and daemon epoch (D-025) | per-rule RPC orchestration and timeout ambiguity | any controller | unary path complete; persistent streams complete (Go, C++ SDKs); Python SDK rebuild in progress (D-146) |
 | 3 | P0 | **Scope-snapshot publication:** one pointer store selects a complete old or new immutable policy version | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | `ScopeTable`/`ScopeResource` and `CONSISTENCY_SCOPE_SNAPSHOT` complete with two test applications (D-050); the reference vSwitch's policy root is a shipped consumer (D-197); `ReplaceScope` pending |
-| 4 | P1 | **Generic session vertical slice** (D-032): ExactMatch → K5 Meter → Router, with the meter and next-hop ids in the rule's result record (D-172, D-174), programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; full-chain prepare-failure and Mpps-under-update gate pending |
+| 4 | P1 | **Generic session vertical slice** (D-032): ExactMatch → K5 Meter → Router, with the meter and next-hop ids in the rule's result record (D-172, D-174), programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; the full-chain live gate is complete through `live_transaction_bench --chain session` (5.27-5.55 Mpps at the 0.50 hit fraction, every injected duplicate rejected; `docs/benchmarking.md`, 2026-11-26) |
 | 5 | P0 | **External plugin package** (`bess-dev`) with an explicit header contract | vendored BESS fork | out-of-tree module authors | curated 51-header source API and installed-plugin checks complete (D-037, D-041); no C++ ABI promise |
 | 6 | P1 | **K3.8 range backend** (arbitrary source/destination ranges and precedence), differential against scalar reference | Go ternary expansion and Cartesian products | ACL, firewall rules | complete (D-038) |
 | 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance workarounds | VRFs, multi-tenant routers | complete (D-039; unified into `Router` by D-046) |
@@ -11204,16 +11204,18 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
    typed unary RPC, reference-safe ExactMatch/WildcardMatch/Router/Meter
    providers, and the basic session vertical slice.
    - The live daemon creates/removes the rule, meter, route and next hop
-     transactionally, then checks packets. Its traffic-under-update test
-     churns ExactMatch rules and their meter/next-hop results, not the full
-     meter/route chain.
+     transactionally, then checks packets. The traffic-under-update bench
+     churns the rule and its meter/next-hop results through
+     `live_transaction_bench --chain session`, which forwards packets through
+     the meter and router (`docs/benchmarking.md`).
    - D-027's `live_transaction_bench.py` measures Mpps under unary ExactMatch
-     rule churn; it is not a measurement of the full session chain.
+     rule churn. The C++ bench's `--chain session` mode measures the full
+     session chain instead.
    - Scope snapshots (M8, D-050): `ScopeTable<Version>`/`ScopeResource` with
      `CONSISTENCY_SCOPE_SNAPSHOT` over the RPC, refused (not downgraded) for
      resources that cannot provide it. The earlier packed `ScopeCell` word was
      deleted.
-   **Pending:** full-chain prepare-failure traffic/Mpps gate; `ReplaceScope`;
+   **Pending:** `ReplaceScope`;
    `GetSystem` (G1.3). Done since 2026-10-01: the shipped scope consumer
    (D-197); production streaming (Go and C++ SDKs over
    `Control.TransactionChannel`); G1.4 stats/events on the shipped surfaces
