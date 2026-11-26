@@ -188,7 +188,8 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
 
   // The request's operations in application order: the plain ops, then each
   // scope replacement's objects and its scope last. The scope spans name each
-  // replacement's place in `flat`.
+  // replacement's place in `flat`. A request without replacements (the common
+  // path) keeps its operations where they are: no per-transaction allocation.
   struct ScopeSpan {
     size_t first_object;
     size_t objects;
@@ -196,30 +197,36 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   };
   std::vector<const v2::TransactionOp *> flat;
   std::vector<ScopeSpan> scopes;
-  try {
-    size_t total = static_cast<size_t>(request.ops_size());
-    for (const auto &replacement : request.replace_scopes()) {
-      total += replacement.objects_size() + 1;
-    }
-    flat.reserve(total);  // scale: one entry per request operation
-    for (const auto &op : request.ops()) {
-      flat.push_back(&op);
-    }
-    for (const auto &replacement : request.replace_scopes()) {
-      ScopeSpan span{flat.size(),
-                     static_cast<size_t>(replacement.objects_size()), 0};
-      for (const auto &object : replacement.objects()) {
-        flat.push_back(&object);
+  const bool phased = request.replace_scopes_size() > 0;
+  if (phased) {
+    try {
+      size_t total = static_cast<size_t>(request.ops_size());
+      for (const auto &replacement : request.replace_scopes()) {
+        total += replacement.objects_size() + 1;
       }
-      span.scope = flat.size();
-      flat.push_back(&replacement.scope());
-      scopes.push_back(span);
+      flat.reserve(total);  // scale: one entry per request operation
+      for (const auto &op : request.ops()) {
+        flat.push_back(&op);
+      }
+      for (const auto &replacement : request.replace_scopes()) {
+        ScopeSpan span{flat.size(),
+                       static_cast<size_t>(replacement.objects_size()), 0};
+        for (const auto &object : replacement.objects()) {
+          flat.push_back(&object);
+        }
+        span.scope = flat.size();
+        flat.push_back(&replacement.scope());
+        scopes.push_back(span);
+      }
+    } catch (const std::bad_alloc &e) {
+      ControlError refused = OutOfMemory(e);
+      refused.field = "ops";
+      return std::unexpected(std::move(refused));
     }
-  } catch (const std::bad_alloc &e) {
-    ControlError refused = OutOfMemory(e);
-    refused.field = "ops";
-    return std::unexpected(std::move(refused));
   }
+  const auto op_at = [&](int i) -> const v2::TransactionOp & {
+    return phased ? *flat[static_cast<size_t>(i)] : request.ops(i);
+  };
 
   // Each operation's resource and codec, looked up once for the busy check
   // and the decoding below, under one acquisition of the engine's lock.
@@ -229,7 +236,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     const dataplane::Resource *resource;
     const framework::ResourceCodec *codec;
   };
-  const int n = static_cast<int>(flat.size());
+  const int n = phased ? static_cast<int>(flat.size()) : request.ops_size();
   std::array<Named, kInlineOps> inline_named;
   std::vector<Named> heap_named;
   if (static_cast<size_t>(n) > kInlineOps) {
@@ -244,7 +251,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   Named *const named = heap_named.empty() ? inline_named.data() : heap_named.data();
   engine_.FindResources(
       static_cast<size_t>(n),
-      [&](size_t i) -> const std::string & { return flat[i]->resource(); },
+      [&](size_t i) -> const std::string & { return op_at(static_cast<int>(i)).resource(); },
       [&](size_t i, const dataplane::Resource *resource) { named[i].resource = resource; });
   for (int i = 0; i < n; i++) {
     named[i].codec = named[i].resource == nullptr ? nullptr : bindings_.Find(*named[i].resource);
@@ -272,7 +279,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   // a thread-unsafe command; pause the workers and send the same request.
   for (int i = 0; i < n; i++) {
     if (named[i].codec != nullptr && named[i].codec->Busy()) {
-      const std::string &resource = flat[i]->resource();
+      const std::string &resource = op_at(i).resource();
       return std::unexpected(ControlError{
           .code = ControlErrorCode::kResourceBusy,
           .err = EBUSY,
@@ -317,7 +324,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   std::vector<Op> ops;
   ops.reserve(static_cast<size_t>(n));
   auto decode = [&](int i) -> std::expected<Op, std::string> {
-    const v2::TransactionOp &op = *flat[i];
+    const v2::TransactionOp &op = op_at(i);
     if (named[i].resource == nullptr) {
       return std::unexpected("unknown resource '" + op.resource() + "'");
     }
@@ -400,18 +407,7 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
           combined.ops.insert(combined.ops.end(), r.ops.begin(), r.ops.end());
         };
         const size_t plain = static_cast<size_t>(request.ops_size());
-        if (plain > 0) {
-          auto r = engine_.Apply(std::span<const Op>(ops.data(), plain), expected,
-                                 dataplane::Consistency::kReferential, on_busy);
-          append(r);
-          first = false;
-          if (r.outcome != TransactionEngine::Outcome::kApplied) {
-            // scale: one result per request operation; the request bounds it.
-            combined.ops.resize(ops.size());
-            applied.emplace(std::move(combined));
-          }
-        }
-        if (!applied) {
+        auto apply_scopes = [&] {
           for (const ScopeSpan &span : scopes) {
             auto r = engine_.ApplyReplaceScope(
                 ops[span.scope],
@@ -423,16 +419,27 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
               break;
             }
           }
-          // scale: one result per request operation; the request bounds it.
-          combined.ops.resize(ops.size());
           if (combined.outcome == TransactionEngine::Outcome::kUnsupported &&
               any_applied) {
             // An unsupported phase after another applied is a rejection of
             // this phase, not a request that attempted nothing.
             combined.outcome = TransactionEngine::Outcome::kRejected;
           }
-          applied.emplace(std::move(combined));
+        };
+        if (plain > 0) {
+          auto r = engine_.Apply(std::span<const Op>(ops.data(), plain), expected,
+                                 dataplane::Consistency::kReferential, on_busy);
+          append(r);
+          first = false;
+          if (r.outcome == TransactionEngine::Outcome::kApplied) {
+            apply_scopes();
+          }
+        } else {
+          apply_scopes();
         }
+        // scale: one result per request operation; the request bounds it.
+        combined.ops.resize(ops.size());
+        applied.emplace(std::move(combined));
       }
     } catch (const std::bad_alloc &e) {
       ControlError refused = OutOfMemory(e);
