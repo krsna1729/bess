@@ -119,8 +119,18 @@ process exits non-zero if one was applied or refused for another reason. A
 smoke run (4 clients, 8192 sessions, 1 upsert + 1 erase, 1000 tx/s for 2 s,
 this host) injected 200: 200 rejected, 0 unexpected, 344.9 us mean rejection
 latency, alongside 23.56 Mpps at the 0.50 hit fraction. This checks the
-engine's refusal and the forwarding state; the full session chain's
-failure/Mpps gate is separate work.
+engine's refusal and the forwarding state.
+
+`--chain session` builds the G1 full chain instead: ExactMatch -> Meter ->
+Router. The rule's 8-byte result record names a shared meter (BE32 id 1) and
+a next hop (BE32 id 1..kGates); the setup transaction creates `mt/meters` and
+`rt/next_hops` first, and the rules reference them (the engine orders each
+rule after its references). The Mpps column and the counter window report the
+router's forwarded packets; the hit fraction still comes from the exact match.
+A 2 s smoke (2 clients, 1024 sessions, 1000 tx/s, `--fail-every 2`, this host,
+contended) served 5.47 Mpps at a 0.50 hit fraction and rejected 1000 of 1000
+injected duplicates (0 unexpected, 270.8 us mean); the daemon shut down
+cleanly. The ABBA campaign for record numbers remains open.
 
 ## Control RPC worker reuse: PR #149
 
