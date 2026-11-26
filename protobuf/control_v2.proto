@@ -435,6 +435,22 @@ message TransactionOp {
   google.protobuf.Any value = 4;    // not for erase
 }
 
+// One scope's whole replacement (M8 follow-up, "ReplaceScope"): the scope
+// Version (or the scope erased) and the entries it names. Applied as one
+// logical operation: the objects take effect referentially first (nothing can
+// name them yet), the scope switches in one store, then the old Version's
+// entries the new one drops are retired if nothing else references them.
+// The scope's resource must provide CONSISTENCY_SCOPE_SNAPSHOT.
+message ScopeReplacement {
+  // The scope: an upsert (key = the scope's key, value = the new Version) or
+  // an erase. It must be the last phase; its result is the scope's.
+  TransactionOp scope = 1;
+  // Entries the new Version names: upserts created before the switch, and
+  // erases the new state does not need (a key the old Version still names is
+  // refused by the reference check).
+  repeated TransactionOp objects = 2;
+}
+
 message ApplyTransactionRequest {
   // How the transaction must become visible to packets (M8, D-050). Two
   // different promises, never one rounded into the other:
@@ -472,6 +488,15 @@ message ApplyTransactionRequest {
   // FAILED_PRECONDITION with error detail EPOCH_MISMATCH, before any side
   // effect and before the request id is looked up (D-106).
   uint64 daemon_epoch = 5;
+  // Whole-scope replacements (D-050's ReplaceScope), in order. The plain
+  // `ops` apply referentially first; then each replacement: its objects
+  // referentially, its scope switch in one store, its old referents retired.
+  // Each replacement is atomic on its own; a failure stops the sequence, and
+  // the record's results say which phases applied. The record's ops cover
+  // the plain ops, then each replacement's objects and its scope last; its
+  // visibility is VISIBILITY_SCOPE_SNAPSHOT. `consistency` cannot weaken a
+  // scope switch: it always happens in one store.
+  repeated ScopeReplacement replace_scopes = 6;
 }
 
 message TransactionOpResult {

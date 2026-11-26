@@ -1095,4 +1095,72 @@ TEST_F(ConsistencyRpcTest, PersistentChannelFrameKeepsIndividualErrorsAndReplay)
   EXPECT_TRUE(channel->Finish().ok());
 }
 
+// ReplaceScope over the wire: the objects first, the scope switch in one
+// store, one record whose ops cover the phases in application order.
+TEST_F(ConsistencyRpcTest, ReplaceScopeAppliesItsObjectsThenTheScope) {
+  v2::ApplyTransactionRequest req;
+  req.set_request_id("replace-1");
+  auto *replacement = req.add_replace_scopes();
+  *replacement->mutable_scope() = Op("sessions", 1, 7);
+  *replacement->add_objects() = Op("meters", 1, 100);
+  v2::ApplyTransactionResponse response;
+  ASSERT_TRUE(Apply(req, &response).ok());
+  EXPECT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  EXPECT_EQ(response.record().visibility(),
+            v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
+  ASSERT_EQ(response.record().ops_size(), 2);
+  EXPECT_EQ(response.record().ops(0).status(), v2::TransactionOpResult::STATUS_APPLIED);
+  EXPECT_EQ(response.record().ops(1).status(), v2::TransactionOpResult::STATUS_APPLIED);
+  ASSERT_NE(Session(1), nullptr);
+  EXPECT_EQ(Session(1)->epoch, 7u);
+  ASSERT_NE(meters_.Lookup(MeterKey(1)), nullptr);
+  EXPECT_EQ(meters_.Lookup(MeterKey(1))->rate, 100u);
+
+  // The same id and contents replay the record, the scope level included.
+  v2::ApplyTransactionResponse again;
+  ASSERT_TRUE(Apply(req, &again).ok());
+  EXPECT_TRUE(again.replayed());
+  EXPECT_EQ(again.record().visibility(),
+            v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
+}
+
+TEST_F(ConsistencyRpcTest, ReplaceScopeAppliesPlainOpsBeforeTheScopes) {
+  v2::ApplyTransactionRequest req;
+  req.set_request_id("replace-2");
+  *req.add_ops() = Op("meters", 2, 200);
+  auto *replacement = req.add_replace_scopes();
+  *replacement->mutable_scope() = Op("sessions", 1, 8);
+  *replacement->add_objects() = Op("meters", 1, 100);
+  v2::ApplyTransactionResponse response;
+  ASSERT_TRUE(Apply(req, &response).ok());
+  EXPECT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  EXPECT_EQ(response.record().visibility(),
+            v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
+  ASSERT_EQ(response.record().ops_size(), 3);
+  for (int i = 0; i < response.record().ops_size(); i++) {
+    EXPECT_EQ(response.record().ops(i).status(),
+              v2::TransactionOpResult::STATUS_APPLIED)
+        << "op " << i;
+  }
+  ASSERT_NE(Session(1), nullptr);
+  EXPECT_EQ(Session(1)->epoch, 8u);
+  EXPECT_NE(meters_.Lookup(MeterKey(1)), nullptr);
+  EXPECT_NE(meters_.Lookup(MeterKey(2)), nullptr);
+}
+
+TEST_F(ConsistencyRpcTest, ReplaceScopeRefusesAReferentialScopeResource) {
+  v2::ApplyTransactionRequest req;
+  req.set_request_id("replace-3");
+  auto *replacement = req.add_replace_scopes();
+  *replacement->mutable_scope() = Op("meters", 1, 100);
+  v2::ApplyTransactionResponse response;
+  v2::ErrorDetail detail;
+  const grpc::Status status = Apply(req, &response, &detail);
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::UNIMPLEMENTED);
+  EXPECT_EQ(detail.code(), v2::ErrorDetail::UNSUPPORTED_TRANSACTION);
+  EXPECT_EQ(detail.field(), "replace_scopes");
+  EXPECT_EQ(detail.object(), "meters");
+  EXPECT_EQ(meters_.Lookup(MeterKey(1)), nullptr);
+}
+
 }  // namespace
