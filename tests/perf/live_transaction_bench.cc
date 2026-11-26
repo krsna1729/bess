@@ -24,6 +24,12 @@
 // one sweep prices an operation rather than a transaction. With more upserts
 // than erases the live set grows for the length of the run.
 //
+// --chain session replaces the per-gate sinks with ExactMatch -> Meter ->
+// Router: the rule's result record names a shared meter and a next hop, the
+// meter polices, and the router forwards on the hop's egress gate. The Mpps
+// column and the counter window then report the router's forwarded packets;
+// the hit fraction still comes from the exact match (gate 0 hit, gate 1 miss).
+//
 // Start bessd first (isolated as you benchmark anything else), e.g.
 //   omarchy-benchmark --cpu 2,4 --isolate -- sudo env ... bessd -k -f
 // then run this from another CPU:
@@ -122,6 +128,10 @@ struct Options {
   // (one key upserted twice). 0 disables the check; the run fails if one is
   // applied.
   int fail_every = 0;
+  // exact: ExactMatch -> Sink per gate (one resource, the rule). session:
+  // ExactMatch -> Meter -> Router, the rule's result naming the meter and
+  // next-hop entries (the G1 full-chain slice).
+  std::string chain = "exact";
 
   // How many blocks the traffic generator must cover: every process's.
   int blocks() const { return blocks_total > 0 ? blocks_total : clients; }
@@ -140,7 +150,19 @@ std::unique_ptr<google::protobuf::Message> Key(Types &types, const Options &o, i
                     R"({"fields": [{"value_bin": ")" + Base64(Be32(addr)) + R"("}]})");
 }
 
-std::unique_ptr<google::protobuf::Message> Value(Types &types, int session) {
+// The session chain's rule result record: the meter id then the next-hop id,
+// both BE32 (the classifier's result_fields read them that way). Gate 0 is the
+// meter; the router forwards on the hop's egress gate.
+std::string SessionResult(int session) {
+  return Base64(Be32(1) + Be32(1 + session % kGates));
+}
+
+std::unique_ptr<google::protobuf::Message> Value(Types &types, const Options &o,
+                                                 int session) {
+  if (o.chain == "session") {
+    return types.Make("ExactMatchRuleValue",
+                      R"({"gate": 0, "result": ")" + SessionResult(session) + R"("})");
+  }
   return types.Make("ExactMatchRuleValue",
                     R"({"gate": )" + std::to_string(1 + session % kGates) + "}");
 }
@@ -157,7 +179,7 @@ double Commit(bess::sdk::Client &client, Types &types, const Options &o,
   while (true) {
     bess::sdk::Transaction tx = client.NewTransaction();
     for (const int s : upserts) {
-      const auto ok = tx.Upsert(rules, *Key(types, o, block, s), *Value(types, s));
+      const auto ok = tx.Upsert(rules, *Key(types, o, block, s), *Value(types, o, s));
       if (!ok) {
         throw std::runtime_error("upsert: " + ok.error().message);
       }
@@ -178,6 +200,45 @@ double Commit(bess::sdk::Client &client, Types &types, const Options &o,
       throw std::runtime_error("commit: " + applied.error().message);
     }
     return seconds;
+  }
+}
+
+// The session chain's referenced entries: one meter every session shares and
+// one next hop per forwarded gate. They exist before the rules that name them
+// (the engine orders a rule after its references). One transaction, retried on
+// a busy answer.
+void SetupSession(bess::sdk::Client &client, Types &types,
+                  const bess::sdk::Resource &meters, const bess::sdk::Resource &hops) {
+  while (true) {
+    bess::sdk::Transaction tx = client.NewTransaction();
+    const auto meter_key = types.Make("MeterIdKey", R"({"id": 1})");
+    const auto meter_value = types.Make(
+        "MeterPolicyValue",
+        R"({"tr_tcm": {"committed_rate": 1099511627776,)"
+        R"("committed_burst": 1099511627776, "peak_rate": 1099511627776,)"
+        R"("peak_burst": 1099511627776}})");
+    const auto meter_ok = tx.Upsert(meters, *meter_key, *meter_value);
+    if (!meter_ok) {
+      throw std::runtime_error("session meter: " + meter_ok.error().message);
+    }
+    for (int gate = 1; gate <= kGates; gate++) {
+      const auto hop_key = types.Make("RouterNextHopIdKey",
+                                      R"({"id": )" + std::to_string(gate) + "}");
+      const auto hop_value = types.Make("RouterNextHopValue",
+                                        R"({"egress_gate": )" + std::to_string(gate) + "}");
+      const auto ok = tx.Upsert(hops, *hop_key, *hop_value);
+      if (!ok) {
+        throw std::runtime_error("session next hop: " + ok.error().message);
+      }
+    }
+    const auto applied = tx.Commit();
+    if (!applied) {
+      if (applied.error().kind == bess::sdk::ErrorKind::kBusy) {
+        continue;
+      }
+      throw std::runtime_error("session setup: " + applied.error().message);
+    }
+    return;
   }
 }
 
@@ -250,7 +311,7 @@ class Committer {
       bess::sdk::Transaction tx = client_.NewTransaction();
       const int s = next_;
       const auto key = Key(types_, o_, block_, s);
-      const auto value = Value(types_, s);
+      const auto value = Value(types_, o_, s);
       if (!tx.Upsert(rules_, *key, *value) || !tx.Upsert(rules_, *key, *value)) {
         unexpected_++;
         return;
@@ -312,9 +373,19 @@ class Bench {
           R"({"fields": [{"offset": 26, "size": 4, "min": )" + std::to_string(kBase) +
               R"(, "max": )" +
               std::to_string(kBase + 2 * o_.sessions * o_.blocks() - 1) + "}]}");
-      const auto em = types_.Make(types_.InitType("ExactMatch"),
-                                  R"({"fields": [{"offset": 26, "num_bytes": 4}]})");
-      const auto settings = types_.Make("ExactMatchSettings", R"({"default_gate": 0})");
+      const bool session = o_.chain == "session";
+      const std::string em_json = session
+          ? R"({"fields": [{"offset": 26, "num_bytes": 4}], "result_fields": [)"
+            R"({"attr_name": "meter_id", "value_offset": 0, "num_bytes": 4,)"
+            R"("reference": "mt/meters", "reference_key": "BE32"},)"
+            R"({"attr_name": "next_hop_id", "value_offset": 4, "num_bytes": 4,)"
+            R"("reference": "rt/next_hops", "reference_key": "BE32"}]})"
+          : R"({"fields": [{"offset": 26, "num_bytes": 4}]})";
+      const auto em = types_.Make(types_.InitType("ExactMatch"), em_json);
+      // The session chain's misses take gate 1; the exact chain's take gate 0.
+      const auto settings = types_.Make("ExactMatchSettings",
+                                        session ? R"({"default_gate": 1})"
+                                                : R"({"default_gate": 0})");
       bess::sdk::PipelineBuilder p;
       p.Worker(0, o_.worker_core, "")
           .Module("src", "Source", src.get())
@@ -322,9 +393,30 @@ class Bench {
           .Module("em", "ExactMatch", em.get())
           .Chain({"src", "rnd", "em"})
           .Setting("em/settings", *settings);
-      for (int gate = 0; gate <= kGates; gate++) {
-        const std::string sink = "sink" + std::to_string(gate);
-        p.Module(sink, "Sink", nullptr).Connect("em", gate, sink, 0);
+      if (session) {
+        const auto mt = types_.Make(
+            types_.InitType("Meter"),
+            R"({"capacity": 64, "id_attr": "meter_id", "cost": "METER_COST_BYTES"})");
+        const auto rt = types_.Make(
+            types_.InitType("Router"),
+            R"({"next_hop_attr": "next_hop_id", "max_next_hops": 64})");
+        p.Module("mt", "Meter", mt.get())
+            .Module("rt", "Router", rt.get())
+            .Connect("em", 0, "mt", 0)
+            .Module("sink_miss", "Sink", nullptr)
+            .Connect("em", 1, "sink_miss", 0)
+            .Module("sink_red", "Sink", nullptr)
+            .Connect("mt", 2, "sink_red", 0)
+            .Connect("mt", 0, "rt", 0);
+        for (int gate = 1; gate <= kGates; gate++) {
+          const std::string sink = "hop" + std::to_string(gate);
+          p.Module(sink, "Sink", nullptr).Connect("rt", gate, sink, 0);
+        }
+      } else {
+        for (int gate = 0; gate <= kGates; gate++) {
+          const std::string sink = "sink" + std::to_string(gate);
+          p.Module(sink, "Sink", nullptr).Connect("em", gate, sink, 0);
+        }
       }
       auto pipeline = p.Build();
       if (!pipeline) {
@@ -336,6 +428,17 @@ class Bench {
         throw std::runtime_error("em/rules: " + rules.error().message);
       }
       rules_ = *rules;
+    }
+    if (o_.chain == "session" && !o_.attach) {
+      auto meters = client_.Resource("mt/meters");
+      auto hops = client_.Resource("rt/next_hops");
+      if (!meters) {
+        throw std::runtime_error("mt/meters: " + meters.error().message);
+      }
+      if (!hops) {
+        throw std::runtime_error("rt/next_hops: " + hops.error().message);
+      }
+      SetupSession(client_, types_, *meters, *hops);
     }
     // Sessions 0 .. sessions-1 of every block this process owns live from the
     // start, loaded in transactions of 1000 rules each: a committer then only
@@ -374,19 +477,22 @@ class Bench {
     return std::move(*samples);
   }
 
-  // Packets out of each of em's gates, by gate label.
-  std::map<std::string, double> GatePackets() {
+  // Packets out of each of `module`'s gates, by gate label.
+  std::map<std::string, double> OutPackets(const char *module) {
     std::map<std::string, double> out;
     for (const v2::MetricSample &s : Metrics()) {
       const auto &l = s.labels();
       if (s.name() == "bess_gate_packets_total" && l.contains("module") &&
-          l.at("module") == "em" && l.contains("direction") && l.at("direction") == "out" &&
+          l.at("module") == module && l.contains("direction") && l.at("direction") == "out" &&
           l.contains("gate")) {
         out[l.at("gate")] = s.value();
       }
     }
     return out;
   }
+
+  std::map<std::string, double> GatePackets() { return OutPackets("em"); }
+  std::map<std::string, double> RouterPackets() { return OutPackets("rt"); }
 
   // The daemon's busy answers to transactions so far.
   double Busy() {
@@ -743,9 +849,15 @@ bool StageFloor(bess::sdk::Client &client, const Options &o) {
 void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &o, int rate) {
   const double busy_before = bench.Busy();
   std::pair<Clock::time_point, Clock::time_point> before_bounds{}, after_bounds{};
+  struct Packets {
+    std::map<std::string, double> em;
+    std::map<std::string, double> rt;
+  };
   const auto gate_packets = [&](auto &bounds) {
     if (o.counter_window) bounds.first = Clock::now();
-    auto packets = bench.GatePackets();
+    Packets packets{bench.GatePackets(), o.chain == "session"
+                                             ? bench.RouterPackets()
+                                             : std::map<std::string, double>{}};
     if (o.counter_window) bounds.second = Clock::now();
     return packets;
   };
@@ -815,14 +927,21 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
       double(ProcessCpuNs() - client_cpu_before) / 1e9;  // every client thread
   const auto after = gate_packets(after_bounds);
   double total = 0, misses = 0;
-  for (const auto &[gate, pkts] : after) {
-    const auto it = before.find(gate);
-    const double d = pkts - (it == before.end() ? 0 : it->second);
+  for (const auto &[gate, pkts] : after.em) {
+    const auto it = before.em.find(gate);
+    const double d = pkts - (it == before.em.end() ? 0 : it->second);
     total += d;
-    if (gate == "0") {
+    // The exact chain's misses take gate 0; the session chain's take gate 1.
+    if (gate == (o.chain == "session" ? "1" : "0")) {
       misses = d;
     }
   }
+  double forwarded = 0;
+  for (const auto &[gate, pkts] : after.rt) {
+    const auto it = before.rt.find(gate);
+    forwarded += pkts - (it == before.rt.end() ? 0 : it->second);
+  }
+  const double rate_packets = o.chain == "session" ? forwarded : total;
   if (o.counter_window) {
     const auto ns = [](Clock::time_point t) {
       return static_cast<long long>(
@@ -835,7 +954,7 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
                 "\"after_begin_ns\":%lld,\"after_end_ns\":%lld,"
                 "\"elapsed_min_s\":%.9f,\"elapsed_max_s\":%.9f,"
                 "\"legacy_elapsed_s\":%.9f",
-                rate, total, ns(before_bounds.first), ns(before_bounds.second),
+                rate, rate_packets, ns(before_bounds.first), ns(before_bounds.second),
                 ns(after_bounds.first), ns(after_bounds.second), lower, upper, elapsed);
     if (cpu_before && cpu_after) {
       uint64_t worker_ns = 0;
@@ -858,7 +977,7 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
   const double p50 = latency[latency.size() / 2];
   const double p99 = latency[std::min(latency.size() - 1, size_t(latency.size() * 0.99))];
   std::printf("%8s %8.2f %6.2f %10.0f %9.0f %9.0f %6.0f\n",
-              rate < 0 ? "max" : std::to_string(rate).c_str(), total / elapsed / 1e6,
+              rate < 0 ? "max" : std::to_string(rate).c_str(), rate_packets / elapsed / 1e6,
               total > 0 ? 1 - misses / total : 0.0, done / elapsed, p50 * 1e6, p99 * 1e6,
               bench.Busy() - busy_before);
   if (done > 0) {
@@ -973,6 +1092,8 @@ int Main(int argc, char **argv) {
       o.transaction_streams = std::stoi(value());
     } else if (a == "--fail-every") {
       o.fail_every = std::stoi(value());
+    } else if (a == "--chain") {
+      o.chain = value();
     } else if (a == "--stage-locality") {
       o.stage_locality = value();
     } else if (a == "--keep") {
@@ -983,6 +1104,8 @@ int Main(int argc, char **argv) {
                    "  [--clients N] [--daemon-pid PID] [--allow-dirty-placement] [--counter-window]\n"
                    "  [--sessions N] [--pkt-size B] [--duration S] [--rates R,...|max] [--rounds N]\n"
                    "  [--upserts N] [--erases N] [--keep]\n"
+                   "  [--chain exact|session] (session: ExactMatch -> Meter -> Router;\n"
+                   "  the rule's result record names the meter and next-hop entries)\n"
                    "  [--stage-counts 1,2,3,4,8 --stage-iterations 1..65536 --stage-locality hot|spread]\n"
                    "  [--stage-mode message|encoded]\n"
                    "  [--transaction-streams 1..64] (zero/default: unary transactions)\n"
@@ -1010,6 +1133,9 @@ int Main(int argc, char **argv) {
   }
   if (o.fail_every < 0) {
     throw std::runtime_error("--fail-every must be non-negative");
+  }
+  if (o.chain != "exact" && o.chain != "session") {
+    throw std::runtime_error("--chain must be exact or session");
   }
   if (o.block_offset < 0) {
     throw std::runtime_error("--block-offset must not be negative");
