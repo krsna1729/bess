@@ -443,10 +443,12 @@ func (ErrorDetail_Code) EnumDescriptor() ([]byte, []int) {
 //	  never a reference to something missing. Any resource can take part.
 //	CONSISTENCY_SCOPE_SNAPSHOT: every scope the transaction touches
 //	  switches from its whole old version to its whole new one in one
-//	  store. Only resources that are scope tables can take part; if any
-//	  operation names another, the call fails with UNIMPLEMENTED and error
-//	  detail UNSUPPORTED_TRANSACTION (field "consistency", object the
-//	  resource) and nothing is applied. It is never served as referential.
+//	  store. Only resources that are scope tables can take part (a scope
+//	  replacement's objects excepted: nothing can name them before its
+//	  switch, see replace_scopes); if any other operation names another,
+//	  the call fails with UNIMPLEMENTED and error detail
+//	  UNSUPPORTED_TRANSACTION (field "consistency", object the resource)
+//	  and nothing is applied. It is never served as referential.
 //
 // Unset (UNSPECIFIED) means CONSISTENCY_REFERENTIAL, which is all this
 // request could ask before the field existed.
@@ -3318,20 +3320,28 @@ func (x *TransactionOp) GetValue() *anypb.Any {
 	return nil
 }
 
-// One scope's whole replacement (M8 follow-up, "ReplaceScope"): the scope
-// Version (or the scope erased) and the entries it names. Applied as one
-// logical operation: the objects take effect referentially first (nothing can
-// name them yet), the scope switches in one store, then the old Version's
-// entries the new one drops are retired if nothing else references them.
-// The scope's resource must provide CONSISTENCY_SCOPE_SNAPSHOT.
+// One scope's whole replacement (D-213, "ReplaceScope"): the scope's new
+// Version (or the scope erased) and the entries it names. It is part of the
+// request's one transaction, all or nothing with the plain `ops` and the
+// other replacements: the objects publish first, the scope switches in one
+// store, and each entry the old Version named that nothing names afterwards
+// (and the request does not name) is erased with it. The scope's resource
+// must provide CONSISTENCY_SCOPE_SNAPSHOT whatever `consistency` says
+// (else UNIMPLEMENTED, error detail UNSUPPORTED_TRANSACTION, field
+// "replace_scopes"). An erased entry's id stays retiring for a grace period,
+// like any erased key: reusing it at once is refused as still retiring. To
+// get an entry's final values (an operation's `observed` bytes), erase it
+// explicitly as an object.
 type ScopeReplacement struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The scope: an upsert (key = the scope's key, value = the new Version) or
-	// an erase. It must be the last phase; its result is the scope's.
+	// an erase. Its result follows its objects' in the record.
 	Scope *TransactionOp `protobuf:"bytes,1,opt,name=scope,proto3" json:"scope,omitempty"`
-	// Entries the new Version names: upserts created before the switch, and
-	// erases the new state does not need (a key the old Version still names is
-	// refused by the reference check).
+	// Entries the new Version names, held to no consistency level because
+	// nothing can name them before the switch: an upsert of an entry something
+	// already references is refused (it would change in place, before the
+	// switch; change a shared entry with a plain op). Erases are allowed for
+	// entries nothing references afterwards.
 	Objects       []*TransactionOp `protobuf:"bytes,2,rep,name=objects,proto3" json:"objects,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3401,14 +3411,15 @@ type ApplyTransactionRequest struct {
 	// FAILED_PRECONDITION with error detail EPOCH_MISMATCH, before any side
 	// effect and before the request id is looked up (D-106).
 	DaemonEpoch uint64 `protobuf:"varint,5,opt,name=daemon_epoch,json=daemonEpoch,proto3" json:"daemon_epoch,omitempty"`
-	// Whole-scope replacements (D-050's ReplaceScope), in order. The plain
-	// `ops` apply referentially first; then each replacement: its objects
-	// referentially, its scope switch in one store, its old referents retired.
-	// Each replacement is atomic on its own; a failure stops the sequence, and
-	// the record's results say which phases applied. The record's ops cover
-	// the plain ops, then each replacement's objects and its scope last; its
-	// visibility is VISIBILITY_SCOPE_SNAPSHOT. `consistency` cannot weaken a
-	// scope switch: it always happens in one store.
+	// Whole-scope replacements (D-213), in the same transaction as `ops`: one
+	// reserve, one check, one generation, and nothing applied unless everything
+	// is. `consistency` is the plain ops' level; each replaced scope switches
+	// in one store either way. A (resource, key) may appear once in the whole
+	// request. The record's ops list, in this order, the plain ops, then each
+	// replacement's objects and its scope: a failed operation's index is its
+	// place in that list. The visibility is VISIBILITY_SCOPE_SNAPSHOT when
+	// `consistency` is CONSISTENCY_SCOPE_SNAPSHOT or the request has no plain
+	// ops, else VISIBILITY_DEPENDENCY_ORDERED.
 	ReplaceScopes []*ScopeReplacement `protobuf:"bytes,6,rep,name=replace_scopes,json=replaceScopes,proto3" json:"replace_scopes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -3988,6 +3988,14 @@ that binds once sees one whole version, and one that rebinds per field sees the 
 (`ScopeSnapshotFailureTest`) and stress tests with concurrent readers complete it; `transaction_engine_test.cc` adds
 the random model (`RandomTransactionsMatchAModel`) and the dangling-reference reader.
 
+**Amended by D-213 (2026-11-27):** §5's refusal no longer covers a scope replacement's objects. A request
+may carry scope replacements (`replace_scopes`, `TransactionEngine::ScopeReplacement`) in the same transaction
+as its plain operations: the objects of a replacement are held to no level, because nothing can name them before
+the switch and the engine refuses an object something already references; the replaced scope must provide
+`kScopeSnapshot` whatever the request asks; the plain operations are held to the level requested, as before. §1's
+"the level the transaction ran under" is the plain operations' level, or `VISIBILITY_SCOPE_SNAPSHOT` for a
+request of replacements only.
+
 | Model action | Code | Invariant checked |
 |---|---|---|
 | Prepare | `TransactionEngine::Apply` structure and prepare phases (`Resource::Prepare`) | a failure leaves nothing visible |
@@ -14935,3 +14943,72 @@ address change) and
 `Backend/ConnectedRoutesTest.IPv6InstallationOpsAreOneHopAndOneRoutePerEntry`
 (both backends; one hop and one route per entry, short id list refused, a
 duplicate key refused).
+
+## D-213 A scope replacement is part of one transaction
+
+**Status:** accepted (2026-11-27). Amends D-050 §1 and §5.
+**Code:** `core/dataplane/transaction_engine.{h,cc}` (`ScopeReplacement`, `RetiredKey`, `Apply(ops,
+replacements, ...)`; `ApplyReplaceScope` removed), `core/dataplane/{resource.h,slot_resource.h}`
+(`ReferencesOfValue` removed), `core/dataplane/scope.h`, `core/control/dataplane_transactions.cc`,
+`protobuf/control_v2.proto`, `docs/control-sdk.md`; tests beside each, `core/fuzz/control_transaction_fuzz.cc`.
+
+**Problem.** #167 and #168 applied a scope replacement in phases, each its own transaction under one lock:
+the objects referentially, then the switch under `kScopeSnapshot`, then a best-effort erase of the old
+Version's referents; the RPC ran the plain operations first, then each replacement. Review of those commits
+found:
+- The cleanup erase listed a referent once per reference, so a Version naming one meter twice refused itself
+  ("second operation on ... in one transaction"); it counted a reference to a D-187 key-held next hop on the
+  next-hop resource, where it is never counted, and erased a key that resource does not hold. Either way the
+  whole cleanup was refused, its result discarded, and every old referent leaked with a ledger count of 0.
+- BUSY, budget refusals and refusals of the cleanup were dropped silently.
+- A refused or BUSY switch left the objects applied; `kBusy` ("nothing was attempted") then came back after
+  something was applied, so the daemon's and the SDK's retry re-ran the request.
+- An object upsert of an entry the old Version names changed it in place before the switch.
+- Plain operations always ran referentially, whatever `consistency` asked (the downgrade D-050 forbids), and
+  the record reported `VISIBILITY_SCOPE_SNAPSHOT` for them; the same key could appear in plain operations,
+  objects and two replacements.
+
+**Decision.**
+- **One transaction.** `TransactionEngine::Apply(ops, replacements, expected_generation, consistency,
+  on_busy)`: `ops` holds the plain operations, then each replacement's objects and its scope; `replacements`
+  says where each one is. One structure check (one operation per key across all of it), one reserve, one
+  budget and backpressure check, one publication and one generation. Publication order already puts the
+  objects (lower rank) before the scope and erases last, and the reference check already accepts "erase the
+  referent and drop the reference" in one transaction.
+- **What retires is ledger arithmetic.** Each key a replaced scope's committed Version references is a
+  candidate once (deduplicated), unless the transaction names it or its resource does not hold it (D-187:
+  `Holder` of the reference is another registration, committed or bound in the transaction). After the
+  request's operations are reserved, a candidate whose committed count plus the transaction's deltas is 0 is
+  erased: an erase operation reserved like any other, referrers first so a retired action's meter is counted
+  without it. Its refusal, BUSY or budget overrun is the transaction's answer; a refusal is reported on the
+  scope, naming the key. `Result::retired` lists the retired keys with what their erase returned (D-210).
+  `ReferencesOfValue` and the engine's "what the new Version names" scan are gone.
+- **Objects must be new to readers.** An object upsert of a key with a non-zero count on its holder is
+  refused: something already names it, and changing it in place would be visible before the switch. A shared
+  entry is changed with a plain operation. Object erases stay: the reference check refuses one of a key named
+  afterwards, and erases publish after the switch.
+- **Levels.** The replaced scope's resource must provide `kScopeSnapshot` (`kUnsupported` otherwise); objects
+  are held to no level; plain operations to the one requested. The RPC passes `consistency` through and
+  reports the plain operations' level, or `VISIBILITY_SCOPE_SNAPSHOT` for a request of replacements only.
+- **The RPC adapter** makes one engine call, so BUSY and CONFLICT again mean nothing was tried, a REJECTED
+  record means nothing was applied, and outcomes count once per request. An erase-only request (plain erases
+  and `EraseScope`s with no objects) keeps D-207's erase headroom for its record. Because retirements touch
+  resources the request need not name, a referent resource whose codec says `Busy()` (D-129) refuses the
+  replacement up front, for each resource the scope resource declares.
+
+**Consequences.** A failure index in a record is a place in the flattened list (plain operations, then each
+replacement's objects and its scope), documented in `control_v2.proto` and `docs/control-sdk.md`. Retired
+keys are listed in the engine's `Result` only: the RPC record does not carry them, because a codec decodes
+keys but cannot encode one back into its typed message. A client that needs an entry's final values erases it
+explicitly as an object; its result carries them.
+
+**Evidence.** `ReplaceScopeTest.*` in `dataplane_scope_snapshot_test` (12: a Version naming one meter twice
+retires it once; a refused or BUSY switch and a refused retirement leave the old Version, no new object and the
+generation unchanged; an object the old Version names is refused; a key named twice across plain operations
+and replacements is refused; a scope-snapshot transaction's plain meter is `kUnsupported`);
+`KeyHolderTest.AReplacedScopeRetiresOnlyWhatItsResourceHolds` in `dataplane_transaction_engine_test` (a held
+id is skipped, the unheld one retired); `ConsistencyRpcTest.*` in `control_dataplane_transactions_test`
+(`ReplaceScopeRetiresTheOldVersionsReferents`, `ARefusedReplacementAppliesNothing`,
+`AKeyNamedTwiceInOneRequestIsRefused`, `ReplaceScopeKeepsTheRequestedLevelForPlainOps`, through the real
+server with a scope resource that references meters); the `control_transaction_fuzz` model now predicts
+requests with `replace_scopes` (seven new corpus seeds). The plain path's cost was not measured.

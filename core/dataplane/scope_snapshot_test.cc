@@ -66,15 +66,22 @@ struct Probe {
   size_t published = 0;                    // publication steps so far
   std::function<void(size_t)> on_step;     // called after each, with the count
   // Fails the fail_at-th Reserve() of the transaction (1-based, 0: never), by
-  // an error return or by throwing (an allocation failure).
+  // an error return or by throwing (an allocation failure); or answers it
+  // busy (Reservation::busy, nothing staged) when busy is set.
   int fail_at = 0;
   bool fail_by_throwing = false;
+  bool busy = false;
   int reserve_calls = 0;
 
   void Arm(int at, bool by_throwing) {
     fail_at = at;
     fail_by_throwing = by_throwing;
+    busy = false;
     reserve_calls = 0;
+  }
+  void ArmBusy(int at) {
+    Arm(at, false);
+    busy = true;
   }
   void Published() {
     ++published;
@@ -114,9 +121,6 @@ class Observed final : public Resource {
   std::vector<Reference> ReferencesOf(const ResourceKey &key) const override {
     return inner_.ReferencesOf(key);
   }
-  std::vector<Reference> ReferencesOfValue(const std::any &value) const override {
-    return inner_.ReferencesOfValue(value);
-  }
   void VisitReferences(
       const std::function<void(const Reference &)> &visit) const override {
     inner_.VisitReferences(visit);
@@ -130,6 +134,11 @@ class Observed final : public Resource {
 
   std::expected<Reservation, std::string> Reserve(const Op &op) override {
     if (probe_.fail_at != 0 && ++probe_.reserve_calls == probe_.fail_at) {
+      if (probe_.busy) {
+        Reservation busy;
+        busy.busy = true;
+        return busy;
+      }
       if (probe_.fail_by_throwing) {
         throw std::bad_alloc();
       }
@@ -1274,13 +1283,14 @@ TEST(ScopeSnapshotRefusalTest, ScopeOnlyRequestIsServedAtTheRequestedLevel) {
   Settle(w.engine, w.domain);
 }
 
-// -- ReplaceScope: referents, one switch, old referents retired --------------------------
+// -- ReplaceScope: referents, one switch, old referents retired (D-213) ---------------
 
-// A scope Version that names a meter, so a replacement has objects to create
-// and an old referent to retire.
+// A scope Version that names a meter, and optionally a second one (the same
+// meter named twice is a Version two rules of which share one meter).
 struct ReferencedVersion {
   uint32_t epoch = 0;
   uint32_t meter = 0;
+  uint32_t second = 0;  // none when 0
 };
 
 struct ReferencedWorld {
@@ -1288,18 +1298,34 @@ struct ReferencedWorld {
     EXPECT_TRUE(engine.Register(&meters_observed).has_value());
     EXPECT_TRUE(engine.Register(&sessions_observed).has_value());
   }
+  ~ReferencedWorld() { Settle(engine, domain); }
   static Op MeterOp(uint32_t id, uint32_t epoch) {
     return Op::Upsert("meters", EncodeKey(MeterId(id)), std::any(Meter{epoch}));
   }
-  static Op ScopeOp(uint32_t id, uint32_t epoch, uint32_t meter) {
+  static Op ScopeOp(uint32_t id, uint32_t epoch, uint32_t meter,
+                    uint32_t second = 0) {
     return Op::Upsert("sessions", EncodeKey(ScopeId(id)),
-                      std::any(ReferencedVersion{epoch, meter}));
+                      std::any(ReferencedVersion{epoch, meter, second}));
   }
   static Op EraseScope(uint32_t id) {
     return Op::Erase("sessions", EncodeKey(ScopeId(id)));
   }
   static std::vector<Reference> Refs(const ReferencedVersion &v) {
-    return {Reference{"meters", EncodeKey(MeterId(v.meter))}};
+    std::vector<Reference> refs{Reference{"meters", EncodeKey(MeterId(v.meter))}};
+    if (v.second != 0) {
+      refs.push_back(Reference{"meters", EncodeKey(MeterId(v.second))});
+    }
+    return refs;
+  }
+  // One replacement: `objects` then `scope`, as one transaction.
+  TransactionEngine::Result Replace(Op scope, std::vector<Op> objects = {}) {
+    const TransactionEngine::ScopeReplacement replacement{0, objects.size()};
+    objects.push_back(std::move(scope));
+    return engine.Apply(objects, std::span(&replacement, 1));
+  }
+  bool HasMeter(uint32_t id) const { return meters.Lookup(MeterId(id)) != nullptr; }
+  size_t Count(uint32_t meter) const {
+    return engine.ReferenceCount("meters", EncodeKey(MeterId(meter)));
   }
 
   rcu::RcuDomain domain{8};
@@ -1317,106 +1343,233 @@ struct ReferencedWorld {
 
 TEST(ReplaceScopeTest, ObjectsThenOneSwitchThenOldReferentsRetired) {
   ReferencedWorld w;
-  const auto first = w.engine.ApplyReplaceScope(
-      ReferencedWorld::ScopeOp(1, 1, 1),
-      std::vector<Op>{ReferencedWorld::MeterOp(1, 1)});
+  const auto first =
+      w.Replace(ReferencedWorld::ScopeOp(1, 1, 1), {ReferencedWorld::MeterOp(1, 1)});
   EXPECT_EQ(first.outcome, Outcome::kApplied);
   ASSERT_EQ(first.ops.size(), 2u);
   EXPECT_EQ(first.ops[0].status, OpStatus::kApplied);
   EXPECT_EQ(first.ops[1].status, OpStatus::kApplied);
+  EXPECT_TRUE(first.retired.empty());
   ASSERT_NE(w.sessions.Lookup(ScopeId(1)), nullptr);
   EXPECT_EQ(w.sessions.Lookup(ScopeId(1))->epoch, 1u);
-  EXPECT_NE(w.meters.Lookup(MeterId(1)), nullptr);
-  EXPECT_EQ(w.engine.ReferenceCount("meters", EncodeKey(MeterId(1))), 1u);
+  EXPECT_TRUE(w.HasMeter(1));
+  EXPECT_EQ(w.Count(1), 1u);
 
-  const auto second = w.engine.ApplyReplaceScope(
-      ReferencedWorld::ScopeOp(1, 2, 2),
-      std::vector<Op>{ReferencedWorld::MeterOp(2, 2)});
+  const uint64_t generation = w.engine.generation();
+  const auto second =
+      w.Replace(ReferencedWorld::ScopeOp(1, 2, 2), {ReferencedWorld::MeterOp(2, 2)});
   EXPECT_EQ(second.outcome, Outcome::kApplied);
+  EXPECT_EQ(second.generation, generation + 1) << "one transaction, one generation";
+  ASSERT_EQ(second.retired.size(), 1u);
+  EXPECT_EQ(second.retired[0].resource, "meters");
+  EXPECT_EQ(second.retired[0].key, EncodeKey(MeterId(1)));
   EXPECT_EQ(w.sessions.Lookup(ScopeId(1))->epoch, 2u);
   EXPECT_EQ(w.sessions.Lookup(ScopeId(1))->meter, 2u);
-  EXPECT_EQ(w.engine.ReferenceCount("meters", EncodeKey(MeterId(2))), 1u);
+  EXPECT_EQ(w.Count(2), 1u);
   Settle(w.engine, w.domain);
-  EXPECT_EQ(w.meters.Lookup(MeterId(1)), nullptr);
-  EXPECT_NE(w.meters.Lookup(MeterId(2)), nullptr);
+  EXPECT_FALSE(w.HasMeter(1));
+  EXPECT_TRUE(w.HasMeter(2));
 }
 
 TEST(ReplaceScopeTest, AReferentAnotherScopeNamesSurvives) {
   ReferencedWorld w;
-  ASSERT_EQ(w.engine
-                .ApplyReplaceScope(ReferencedWorld::ScopeOp(1, 1, 1),
-                                   std::vector<Op>{ReferencedWorld::MeterOp(1, 1)})
+  ASSERT_EQ(w.Replace(ReferencedWorld::ScopeOp(1, 1, 1), {ReferencedWorld::MeterOp(1, 1)})
                 .outcome,
             Outcome::kApplied);
-  ASSERT_EQ(w.engine.ApplyReplaceScope(ReferencedWorld::ScopeOp(2, 1, 1), {})
-                .outcome,
-            Outcome::kApplied);
-  EXPECT_EQ(w.engine.ReferenceCount("meters", EncodeKey(MeterId(1))), 2u);
+  ASSERT_EQ(w.Replace(ReferencedWorld::ScopeOp(2, 1, 1)).outcome, Outcome::kApplied);
+  EXPECT_EQ(w.Count(1), 2u);
 
-  ASSERT_EQ(w.engine
-                .ApplyReplaceScope(ReferencedWorld::ScopeOp(1, 2, 2),
-                                   std::vector<Op>{ReferencedWorld::MeterOp(2, 2)})
-                .outcome,
-            Outcome::kApplied);
+  const auto replaced =
+      w.Replace(ReferencedWorld::ScopeOp(1, 2, 2), {ReferencedWorld::MeterOp(2, 2)});
+  ASSERT_EQ(replaced.outcome, Outcome::kApplied);
+  EXPECT_TRUE(replaced.retired.empty());
   Settle(w.engine, w.domain);
-  EXPECT_NE(w.meters.Lookup(MeterId(1)), nullptr);  // scope 2 still names it
-  EXPECT_EQ(w.engine.ReferenceCount("meters", EncodeKey(MeterId(1))), 1u);
+  EXPECT_TRUE(w.HasMeter(1));  // scope 2 still names it
+  EXPECT_EQ(w.Count(1), 1u);
 }
 
-TEST(ReplaceScopeTest, ARefusedSwitchLeavesTheOldVersionAndTheNewObjects) {
+// B1 (review of #167): a Version naming one meter twice is counted twice; its
+// retirement must still be one erase, or the engine refuses the second
+// operation on the key and the meter leaks.
+TEST(ReplaceScopeTest, AnEntryTheOldVersionNamesTwiceIsRetiredOnce) {
   ReferencedWorld w;
-  ASSERT_EQ(w.engine
-                .ApplyReplaceScope(ReferencedWorld::ScopeOp(1, 1, 1),
-                                   std::vector<Op>{ReferencedWorld::MeterOp(1, 1)})
+  ASSERT_EQ(w.Replace(ReferencedWorld::ScopeOp(1, 1, 1, 1),
+                      {ReferencedWorld::MeterOp(1, 1)})
                 .outcome,
             Outcome::kApplied);
+  EXPECT_EQ(w.Count(1), 2u);
+  const auto replaced =
+      w.Replace(ReferencedWorld::ScopeOp(1, 2, 2), {ReferencedWorld::MeterOp(2, 2)});
+  ASSERT_EQ(replaced.outcome, Outcome::kApplied)
+      << replaced.ops[0].error << "|" << replaced.ops[1].error;
+  ASSERT_EQ(replaced.retired.size(), 1u);
+  Settle(w.engine, w.domain);
+  EXPECT_FALSE(w.HasMeter(1));
+  EXPECT_EQ(w.Count(1), 0u);
+}
+
+// Nothing of a replacement whose switch is refused is visible: not its new
+// objects (C3), and the generation does not move.
+TEST(ReplaceScopeTest, ARefusedSwitchLeavesNothingVisible) {
+  ReferencedWorld w;
+  ASSERT_EQ(w.Replace(ReferencedWorld::ScopeOp(1, 1, 1), {ReferencedWorld::MeterOp(1, 1)})
+                .outcome,
+            Outcome::kApplied);
+  const uint64_t generation = w.engine.generation();
   w.scope_probe.Arm(1, false);
-  const auto replaced = w.engine.ApplyReplaceScope(
-      ReferencedWorld::ScopeOp(1, 2, 2),
-      std::vector<Op>{ReferencedWorld::MeterOp(2, 2)});
+  const auto replaced =
+      w.Replace(ReferencedWorld::ScopeOp(1, 2, 2), {ReferencedWorld::MeterOp(2, 2)});
   EXPECT_EQ(replaced.outcome, Outcome::kRejected);
   ASSERT_EQ(replaced.ops.size(), 2u);
-  EXPECT_EQ(replaced.ops[0].status, OpStatus::kApplied);
+  EXPECT_EQ(replaced.ops[0].status, OpStatus::kNotApplied);
   EXPECT_EQ(replaced.ops[1].status, OpStatus::kFailed);
   EXPECT_EQ(w.sessions.Lookup(ScopeId(1))->epoch, 1u);  // the old version
-  EXPECT_NE(w.meters.Lookup(MeterId(2)), nullptr);      // unreferenced
-  EXPECT_EQ(w.engine.ReferenceCount("meters", EncodeKey(MeterId(2))), 0u);
+  EXPECT_FALSE(w.HasMeter(2));
+  EXPECT_TRUE(w.HasMeter(1));
+  EXPECT_EQ(w.engine.generation(), generation);
+}
+
+// C1/B4: BUSY on the switch is a BUSY of the whole replacement: nothing was
+// attempted, so a retry of the same request is exact.
+TEST(ReplaceScopeTest, ABusySwitchAttemptedNothing) {
+  ReferencedWorld w;
+  ASSERT_EQ(w.Replace(ReferencedWorld::ScopeOp(1, 1, 1), {ReferencedWorld::MeterOp(1, 1)})
+                .outcome,
+            Outcome::kApplied);
+  const uint64_t generation = w.engine.generation();
+  w.scope_probe.ArmBusy(1);
+  const auto busy =
+      w.Replace(ReferencedWorld::ScopeOp(1, 2, 2), {ReferencedWorld::MeterOp(2, 2)});
+  EXPECT_EQ(busy.outcome, Outcome::kBusy);
+  for (const auto &op : busy.ops) {
+    EXPECT_EQ(op.status, OpStatus::kNotApplied);
+  }
+  EXPECT_FALSE(w.HasMeter(2));
+  EXPECT_EQ(w.engine.generation(), generation);
+  w.scope_probe.Arm(0, false);
+  const auto retried =
+      w.Replace(ReferencedWorld::ScopeOp(1, 2, 2), {ReferencedWorld::MeterOp(2, 2)});
+  EXPECT_EQ(retried.outcome, Outcome::kApplied) << retried.ops[0].error;
 }
 
 TEST(ReplaceScopeTest, ARefusedObjectLeavesNothingVisible) {
   ReferencedWorld w;
   w.meter_probe.Arm(1, false);
-  const auto replaced = w.engine.ApplyReplaceScope(
-      ReferencedWorld::ScopeOp(1, 1, 1),
-      std::vector<Op>{ReferencedWorld::MeterOp(1, 1)});
+  const auto replaced =
+      w.Replace(ReferencedWorld::ScopeOp(1, 1, 1), {ReferencedWorld::MeterOp(1, 1)});
   EXPECT_EQ(replaced.outcome, Outcome::kRejected);
   ASSERT_EQ(replaced.ops.size(), 2u);
   EXPECT_EQ(replaced.ops[0].status, OpStatus::kFailed);
   EXPECT_EQ(replaced.ops[1].status, OpStatus::kNotApplied);
   EXPECT_EQ(w.sessions.Lookup(ScopeId(1)), nullptr);
-  EXPECT_EQ(w.meters.Lookup(MeterId(1)), nullptr);
+  EXPECT_FALSE(w.HasMeter(1));
+}
+
+// B3: the retirement of an old referent is part of the transaction. Refused,
+// it refuses the replacement -- on the scope, saying what it could not retire
+// -- and nothing changes; it is never dropped while the switch stays.
+TEST(ReplaceScopeTest, ARefusedRetirementRefusesTheReplacement) {
+  ReferencedWorld w;
+  ASSERT_EQ(w.Replace(ReferencedWorld::ScopeOp(1, 1, 1), {ReferencedWorld::MeterOp(1, 1)})
+                .outcome,
+            Outcome::kApplied);
+  const uint64_t generation = w.engine.generation();
+  w.meter_probe.Arm(2, false);  // 1: the new meter; 2: the old one's erase
+  const auto replaced =
+      w.Replace(ReferencedWorld::ScopeOp(1, 2, 2), {ReferencedWorld::MeterOp(2, 2)});
+  EXPECT_EQ(replaced.outcome, Outcome::kRejected);
+  ASSERT_EQ(replaced.ops.size(), 2u);
+  EXPECT_EQ(replaced.ops[0].status, OpStatus::kNotApplied);
+  EXPECT_EQ(replaced.ops[1].status, OpStatus::kFailed);
+  EXPECT_NE(replaced.ops[1].error.find("retiring meters/"), std::string::npos)
+      << replaced.ops[1].error;
+  EXPECT_EQ(w.sessions.Lookup(ScopeId(1))->epoch, 1u);
+  EXPECT_TRUE(w.HasMeter(1));
+  EXPECT_FALSE(w.HasMeter(2));
+  EXPECT_EQ(w.Count(1), 1u);
+  EXPECT_EQ(w.engine.generation(), generation);
+}
+
+// C2: an object something already names would change in place before the
+// switch, breaking the old Version for its readers: refused.
+TEST(ReplaceScopeTest, AnObjectTheOldVersionNamesIsRefused) {
+  ReferencedWorld w;
+  ASSERT_EQ(w.Replace(ReferencedWorld::ScopeOp(1, 1, 1), {ReferencedWorld::MeterOp(1, 1)})
+                .outcome,
+            Outcome::kApplied);
+  const auto replaced =
+      w.Replace(ReferencedWorld::ScopeOp(1, 2, 1), {ReferencedWorld::MeterOp(1, 9)});
+  EXPECT_EQ(replaced.outcome, Outcome::kRejected);
+  ASSERT_EQ(replaced.ops.size(), 2u);
+  EXPECT_EQ(replaced.ops[0].status, OpStatus::kFailed);
+  EXPECT_NE(replaced.ops[0].error.find("is referenced 1 time"), std::string::npos)
+      << replaced.ops[0].error;
+  EXPECT_EQ(w.meters.Lookup(MeterId(1))->epoch, 1u);
+  EXPECT_EQ(w.sessions.Lookup(ScopeId(1))->epoch, 1u);
+  // A plain operation may still change a shared entry (referentially).
+  EXPECT_EQ(w.engine.Apply(std::vector<Op>{ReferencedWorld::MeterOp(1, 9)}).outcome,
+            Outcome::kApplied);
 }
 
 TEST(ReplaceScopeTest, ErasingTheScopeRetiresItsReferents) {
   ReferencedWorld w;
-  ASSERT_EQ(w.engine
-                .ApplyReplaceScope(ReferencedWorld::ScopeOp(1, 1, 1),
-                                   std::vector<Op>{ReferencedWorld::MeterOp(1, 1)})
+  ASSERT_EQ(w.Replace(ReferencedWorld::ScopeOp(1, 1, 1), {ReferencedWorld::MeterOp(1, 1)})
                 .outcome,
             Outcome::kApplied);
-  const auto erased = w.engine.ApplyReplaceScope(ReferencedWorld::EraseScope(1), {});
+  const auto erased = w.Replace(ReferencedWorld::EraseScope(1));
   EXPECT_EQ(erased.outcome, Outcome::kApplied);
+  EXPECT_EQ(erased.retired.size(), 1u);
   Settle(w.engine, w.domain);
   EXPECT_EQ(w.sessions.Lookup(ScopeId(1)), nullptr);
-  EXPECT_EQ(w.meters.Lookup(MeterId(1)), nullptr);
+  EXPECT_FALSE(w.HasMeter(1));
+}
+
+// One transaction holds the plain operations and every replacement: a key
+// named twice across them is refused before anything is reserved (C5).
+TEST(ReplaceScopeTest, AKeyNamedTwiceAcrossPlainOpsAndReplacementsIsRefused) {
+  ReferencedWorld w;
+  std::vector<Op> ops{ReferencedWorld::MeterOp(1, 1), ReferencedWorld::MeterOp(1, 2),
+                      ReferencedWorld::ScopeOp(1, 1, 1)};
+  const TransactionEngine::ScopeReplacement replacement{1, 1};
+  const auto refused = w.engine.Apply(ops, std::span(&replacement, 1));
+  EXPECT_EQ(refused.outcome, Outcome::kRejected);
+  EXPECT_EQ(refused.ops[1].status, OpStatus::kFailed);
+  EXPECT_FALSE(w.HasMeter(1));
+
+  std::vector<Op> twice{ReferencedWorld::MeterOp(1, 1), ReferencedWorld::ScopeOp(1, 1, 1),
+                        ReferencedWorld::ScopeOp(1, 2, 1)};
+  const std::array<TransactionEngine::ScopeReplacement, 2> both{{{0, 1}, {2, 0}}};
+  const auto again = w.engine.Apply(twice, both);
+  EXPECT_EQ(again.outcome, Outcome::kRejected);
+  EXPECT_EQ(again.ops[2].status, OpStatus::kFailed);
+  EXPECT_EQ(w.sessions.Lookup(ScopeId(1)), nullptr);
+}
+
+// D-050 is amended, not dropped (D-213): a scope-snapshot transaction's plain
+// operations must still be on scope resources; a replacement's objects need
+// not be.
+TEST(ReplaceScopeTest, PlainOperationsKeepTheRequestedLevel) {
+  ReferencedWorld w;
+  std::vector<Op> ops{ReferencedWorld::MeterOp(5, 1), ReferencedWorld::MeterOp(1, 1),
+                      ReferencedWorld::ScopeOp(1, 1, 1)};
+  const TransactionEngine::ScopeReplacement replacement{1, 1};
+  const auto refused = w.engine.Apply(ops, std::span(&replacement, 1), std::nullopt,
+                                      Consistency::kScopeSnapshot);
+  EXPECT_EQ(refused.outcome, Outcome::kUnsupported);
+  EXPECT_EQ(refused.ops[0].status, OpStatus::kFailed);
+  EXPECT_FALSE(w.HasMeter(1));
+  EXPECT_FALSE(w.HasMeter(5));
+  const auto applied = w.engine.Apply(std::span(ops).subspan(1),
+                                      std::array{TransactionEngine::ScopeReplacement{0, 1}},
+                                      std::nullopt, Consistency::kScopeSnapshot);
+  EXPECT_EQ(applied.outcome, Outcome::kApplied) << applied.ops[0].error;
 }
 
 TEST(ReplaceScopeTest, AReferentialResourceCannotBeAScope) {
   ReferencedWorld w;
-  const auto refused =
-      w.engine.ApplyReplaceScope(ReferencedWorld::MeterOp(1, 1), {});
+  const auto refused = w.Replace(ReferencedWorld::MeterOp(1, 1));
   EXPECT_EQ(refused.outcome, Outcome::kUnsupported);
-  EXPECT_EQ(w.meters.Lookup(MeterId(1)), nullptr);
+  EXPECT_FALSE(w.HasMeter(1));
 }
 
 }  // namespace

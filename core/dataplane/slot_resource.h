@@ -62,13 +62,6 @@ class SlotResource : public Resource {
     const T *current = table_.Current(id);
     return current ? references_(*current) : std::vector<Reference>{};
   }
-  std::vector<Reference> ReferencesOfValue(const std::any &value) const override {
-    if (!references_) {
-      return {};
-    }
-    const T *object = std::any_cast<T>(&value);
-    return object == nullptr ? std::vector<Reference>{} : references_(*object);
-  }
   void VisitReferences(
       const std::function<void(const Reference &)> &visit) const override {
     if (!references_) {

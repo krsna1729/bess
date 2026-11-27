@@ -68,6 +68,12 @@ namespace dataplane {
 //     Each scope switches from its whole old version to its whole new one in
 //     a single store. Any other operation makes the engine answer
 //     Outcome::kUnsupported before reserving anything.
+//
+// A scope replacement (ScopeReplacement, D-213) is part of a transaction: the
+// entries its new Version names, the scope's switch, and the erases of the
+// old Version's entries that nothing references afterwards are reserved,
+// checked and published with the transaction's other operations, so the
+// whole transaction is still all or nothing.
 namespace internal {
 // Test-only: called with true as the publication phase starts and false as it
 // ends (a test counts allocations in between; none are allowed). Null in
@@ -88,16 +94,50 @@ class TransactionEngine {
     std::string error;  // for kFailed
     // The resource the operation named, when the engine knows it: set on a
     // result ApplyBatched() returns, so a caller reporting a failure does not
-    // have to map a batch-relative index back to its own request.
+    // have to map an index back to its own request.
     std::string resource;
     // What the operation returned (Resource::StagedOp::observed). Set only
     // when the operation was applied.
     std::string observed;
   };
 
+  // A key a scope replacement erased because the old Version named it and
+  // nothing references it after the transaction (D-213). Its id stays
+  // retiring for a grace period, like any erased key.
+  struct RetiredKey {
+    std::string resource;
+    ResourceKey key;
+    std::string observed;  // what its erase returned (D-210)
+  };
+
+  // A scope replacement among the operations given to Apply() (D-213):
+  // ops[first, first + objects) are the entries its new Version names and
+  // ops[first + objects] is the scope -- an upsert of the new Version, or its
+  // erase. Replacements follow each other in `ops`, after the plain
+  // operations.
+  //
+  //  - The scope's resource must provide kScopeSnapshot whatever the
+  //    transaction's consistency (else kUnsupported): it switches in one
+  //    store.
+  //  - An object is not held to the transaction's consistency: nothing can
+  //    name it before the switch. That is checked, not assumed: an object
+  //    upsert of a key something already references is refused, since
+  //    changing it in place would be visible before the switch. (Change a
+  //    shared entry with a plain operation.)
+  //  - Each key the old Version references that nothing references after
+  //    the transaction, that the transaction does not name, and that its
+  //    resource holds itself (a key held by a D-187 key holder, a bound next
+  //    hop, is the holder's) is erased in the same transaction and listed in
+  //    Result::retired. A refusal of such an erase is reported on the scope.
+  struct ScopeReplacement {
+    size_t first = 0;
+    size_t objects = 0;
+  };
+
   enum class Outcome : uint8_t {
     kApplied,
-    kRejected,  // an operation failed; results say which and why
+    kRejected,  // an operation failed; results say which and why; nothing
+                // was applied
     kConflict,  // expected_generation did not match; nothing was attempted
     kBusy,      // reclamation is behind (readers slow to quiesce), or an
                 // operation waits for a grace period (Reservation::busy);
@@ -111,6 +151,9 @@ class TransactionEngine {
     Outcome outcome = Outcome::kRejected;
     uint64_t generation = 0;      // after the transaction
     std::vector<OpResult> ops;    // one per operation, in request order
+    // When applied: the keys scope replacements erased (ScopeReplacement),
+    // referrers first.
+    std::vector<RetiredKey> retired;
     // The retire-budget refusal specifically: the transaction is well-formed
     // but would retire more objects than one batch allows, so it must be
     // split rather than fixed. ApplyBatched() reads it; a caller of Apply()
@@ -198,6 +241,14 @@ class TransactionEngine {
                std::optional<uint64_t> expected_generation = std::nullopt,
                Consistency consistency = Consistency::kReferential,
                OnBusy on_busy = OnBusy::kAnswer);
+  // Apply() with scope replacements among `ops` (ScopeReplacement): one
+  // transaction, all or nothing. `consistency` applies to the plain
+  // operations; each scope switches in one store either way.
+  Result Apply(std::span<const Op> ops,
+               std::span<const ScopeReplacement> replacements,
+               std::optional<uint64_t> expected_generation = std::nullopt,
+               Consistency consistency = Consistency::kReferential,
+               OnBusy on_busy = OnBusy::kAnswer);
 
   // Apply() with the defaults (no expected generation, referential, kBusy
   // answered), refused unless every operation's resource is one of `owned`
@@ -206,24 +257,6 @@ class TransactionEngine {
   // change hands between the check and the apply.
   Result ApplyOwned(std::span<const Resource *const> owned,
                     std::span<const Op> ops);
-
-  // One logical replacement of a scope's whole Version (D-050 follow-up,
-  // "ReplaceScope"): the `objects` the new Version names take effect
-  // referentially first (nothing can name them yet), then `scope` switches in
-  // one store under kScopeSnapshot, then the old Version's references the new
-  // one does not name are erased if nothing else references them. All phases
-  // run under one acquisition of the engine's lock: no transaction
-  // interleaves.
-  //
-  // `scope` is an upsert on a resource providing kScopeSnapshot, or an erase
-  // (the deletion form). If `objects` fail, nothing changed. If the switch
-  // fails, the objects remain applied -- no scope names them, and a retry
-  // re-upserts them -- and its result is the answer. A trailing erase that
-  // fails leaves those objects in place; it does not fail the replacement.
-  // Result.ops has one entry per object and the scope last.
-  Result ApplyReplaceScope(const Op &scope, std::span<const Op> objects,
-                           std::optional<uint64_t> expected_generation = std::nullopt,
-                           OnBusy on_busy = OnBusy::kAnswer);
 
   // Apply() with the operations split into transactions that each respect the
   // engine's retire budget. A caller whose op list is proportional to a
@@ -314,15 +347,11 @@ class TransactionEngine {
   Result Busy(size_t n_ops) const;
   // `owned`: null for Apply(); for ApplyOwned(), the resources its operations
   // may name.
-  Result ApplyImpl(std::span<const Op> ops, std::optional<uint64_t> expected_generation,
+  Result ApplyImpl(std::span<const Op> ops,
+                   std::span<const ScopeReplacement> replacements,
+                   std::optional<uint64_t> expected_generation,
                    Consistency consistency,
                    const std::span<const Resource *const> *owned);
-  // ApplyImpl()'s body; its caller holds the lock (ApplyReplaceScope runs
-  // several phases as one logical operation).
-  Result ApplyImplLocked(std::span<const Op> ops,
-                         std::optional<uint64_t> expected_generation,
-                         Consistency consistency,
-                         const std::span<const Resource *const> *owned);
   // ReferenceCount() with the lock already held.
   size_t ReferenceCountLocked(const std::string &resource,
                               const ResourceKey &key) const;
@@ -460,8 +489,17 @@ class TransactionEngine {
     size_t op;
     std::unique_ptr<StagedOp> work;
   };
+  // What an operation is to a scope replacement (ScopeReplacement).
+  enum class Role : uint8_t { kPlain, kObject, kScope };
+  // A key the old Version of a replaced scope references: erased with the
+  // transaction if nothing references it afterwards.
+  struct Candidate {
+    Registration *target;
+    ResourceKey key;
+    uint32_t scope;  // the scope operation that drops it
+  };
   struct Scratch {
-    std::vector<Registration *> reg;
+    std::vector<Registration *> reg;  // by operation index, retirements last
     std::vector<KeyRef> keys;
     std::vector<Resource::Reservation> reservations;
     std::vector<Staged> staged;
@@ -471,6 +509,11 @@ class TransactionEngine {
     std::vector<size_t> order;
     std::vector<uint32_t> reserve_order;  // operation indexes, by rank
     std::vector<Registration *> touched;
+    // Scope replacements only (empty otherwise).
+    std::vector<Role> role;
+    std::vector<Candidate> candidates;
+    std::vector<Op> retire;  // operation n + k erases retire[k]
+    std::vector<uint32_t> retire_scope;  // and is reported on this operation
   };
 
   rcu::RcuDomain &domain_;

@@ -16,6 +16,9 @@
 //               naming a group is an undeclared reference);
 //   "rules"     ExactMatchRuleKey (fields of 4 and 2 bytes) ->
 //               ExactMatchRuleValue; provides scope-snapshot consistency;
+//   "policies"  MeterIdKey -> RouterRouteValue; a scope table (scope-snapshot)
+//               whose Version may name a next hop (or a group, as a route);
+//               the scope of a request's replace_scopes (D-213);
 //   "hidden"    registered but not bound: unreachable over the RPC.
 //
 // Input: u64 daemon epoch, then up to 32 records of [u8 ctl] and, unless
@@ -38,6 +41,12 @@
 // reference ledger, the record count and Get(request_id), and each bound
 // resource's read-back (ResourceCodec::Entries) decodes through its codec to
 // exactly the committed state. List() is checked at the end.
+//
+// A request's replace_scopes join its plain ops in one transaction (D-213):
+// the model flattens them (plain ops, then each replacement's objects and its
+// scope), holds only the plain ops to the requested level, refuses an object
+// upsert of a next hop something names, and erases each next hop an old
+// policy Version named that nothing names afterwards.
 
 #include <any>
 #include <cstddef>
@@ -163,6 +172,12 @@ ValueResult RouteValue(const bess::pb::RouterRouteValue &value) {
   }
   return std::unexpected("a route names a next hop or a group");
 }
+KeyResult PolicyKey(const bess::pb::MeterIdKey &key) {
+  if (key.id() == 0) {
+    return std::unexpected("policy id 0 is invalid");
+  }
+  return EncodeKey(uint32_t{key.id()});
+}
 constexpr size_t kFieldSizes[] = {4, 2};
 KeyResult RuleKey(const bess::pb::ExactMatchRuleKey &key) {
   if (key.fields_size() != static_cast<int>(std::size(kFieldSizes))) {
@@ -248,6 +263,15 @@ void RuleRead(const ResourceKey &key, const Val &v,
   FUZZ_CHECK(v.blob.size() == sizeof(gate));
   std::memcpy(&gate, v.blob.data(), sizeof(gate));
   m->set_gate(gate);
+}
+void PolicyRead(const ResourceKey &key, const Val &v, bess::pb::MeterIdKey *k,
+                bess::pb::RouterRouteValue *m) {
+  k->set_id(IdOf(key));
+  if (v.next_hop != 0) {
+    m->set_next_hop_id(v.next_hop);
+  } else {
+    m->set_group_id(v.group);
+  }
 }
 
 // -- the fake resource ----------------------------------------------------------
@@ -414,6 +438,7 @@ constexpr const char *kNextHops = "next_hops";
 constexpr const char *kRoutes = "routes";
 constexpr const char *kRules = "rules";
 constexpr const char *kHidden = "hidden";
+constexpr const char *kPolicies = "policies";
 
 // The type_url rule, written independently of TypedCodec: the message is
 // named by the text after the url's last '/'; a url without '/' names none.
@@ -481,6 +506,9 @@ bool ModelDecode(const v2::TransactionOp &op, ModelOp *out) {
   if (op.resource() == kRules) {
     return ModelDecodeTyped(op, RuleKey, RuleValue, out);
   }
+  if (op.resource() == kPolicies) {
+    return ModelDecodeTyped(op, PolicyKey, RouteValue, out);
+  }
   return false;  // unknown, or "hidden" (not bound)
 }
 
@@ -500,7 +528,7 @@ std::string Contents(const v2::ApplyTransactionRequest &request) {
 struct Model {
   std::map<std::string, State> state{{kMeters, {}}, {kNextHops, {}},
                                      {kRoutes, {}}, {kRules, {}},
-                                     {kHidden, {}}};
+                                     {kHidden, {}}, {kPolicies, {}}};
   uint64_t generation = 0;
   struct Recorded {
     std::string contents;
@@ -512,12 +540,14 @@ struct Model {
   // left with the RCU domain and the engine's cascades.
   size_t last_retired = 0;
 
-  // References to next hop `key` held by the routes in `s`.
+  // References to next hop `key` held by the routes and policies in `s`.
   static size_t Refs(const std::map<std::string, State> &s,
                      const ResourceKey &key) {
     size_t n = 0;
-    for (const auto &[k, v] : s.at(kRoutes)) {
-      n += v.next_hop != 0 && EncodeKey(v.next_hop) == key;
+    for (const char *referrer : {kRoutes, kPolicies}) {
+      for (const auto &[k, v] : s.at(referrer)) {
+        n += v.next_hop != 0 && EncodeKey(v.next_hop) == key;
+      }
     }
     return n;
   }
@@ -541,12 +571,15 @@ struct Fixture {
                      Consistency::kReferential};
   MapResource rules{kRules, {}, false, Consistency::kScopeSnapshot};
   MapResource hidden{kHidden, {}, false, Consistency::kReferential};
+  MapResource policies{kPolicies, {kNextHops, "groups"}, false,
+                       Consistency::kScopeSnapshot};
   TransactionEngine engine{domain};
   bess::framework::ResourceBindings bindings;
   bess::framework::ResourceBinding meters_binding;
   bess::framework::ResourceBinding next_hops_binding;
   bess::framework::ResourceBinding routes_binding;
   bess::framework::ResourceBinding rules_binding;
+  bess::framework::ResourceBinding policies_binding;
   std::optional<DataplaneTransactions> tx;
 
   explicit Fixture(uint64_t epoch) {
@@ -555,6 +588,7 @@ struct Fixture {
     FUZZ_CHECK(engine.Register(&routes).has_value());
     FUZZ_CHECK(engine.Register(&rules).has_value());
     FUZZ_CHECK(engine.Register(&hidden).has_value());
+    FUZZ_CHECK(engine.Register(&policies).has_value());
     meters_binding = bindings.Bind(meters, Codec(MeterKey, MeterValue, MeterRead, meters));
     next_hops_binding =
         bindings.Bind(next_hops,
@@ -562,10 +596,13 @@ struct Fixture {
     routes_binding =
         bindings.Bind(routes, Codec(RouteKey, RouteValue, RouteRead, routes));
     rules_binding = bindings.Bind(rules, Codec(RuleKey, RuleValue, RuleRead, rules));
+    policies_binding =
+        bindings.Bind(policies, Codec(PolicyKey, RouteValue, PolicyRead, policies));
     tx.emplace(engine, bindings, epoch);
   }
   ~Fixture() {
     tx.reset();
+    policies_binding.Reset();
     rules_binding.Reset();
     routes_binding.Reset();
     next_hops_binding.Reset();
@@ -573,13 +610,38 @@ struct Fixture {
   }
 
   const MapResource &Get(const std::string &name) const {
-    return name == kMeters    ? meters
+    return name == kMeters     ? meters
            : name == kNextHops ? next_hops
            : name == kRoutes   ? routes
            : name == kRules    ? rules
+           : name == kPolicies ? policies
                                : hidden;
   }
 };
+
+// What an operation is to the request's scope replacements (D-213).
+enum class Role { kPlain, kObject, kScope };
+
+// The request's operations as the record lists them: the plain ops, then each
+// replacement's objects and its scope.
+std::vector<std::pair<const v2::TransactionOp *, Role>> Flatten(
+    const v2::ApplyTransactionRequest &request) {
+  std::vector<std::pair<const v2::TransactionOp *, Role>> flat;
+  for (const auto &op : request.ops()) {
+    flat.emplace_back(&op, Role::kPlain);
+  }
+  for (const auto &replacement : request.replace_scopes()) {
+    for (const auto &object : replacement.objects()) {
+      flat.emplace_back(&object, Role::kObject);
+    }
+    flat.emplace_back(&replacement.scope(), Role::kScope);
+  }
+  return flat;
+}
+
+bool ReferencesNextHops(const std::string &resource) {
+  return resource == kRoutes || resource == kPolicies;
+}
 
 // The model's prediction for `request`; on APPLIED, `after` is the new state.
 Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
@@ -607,10 +669,23 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
     }
   }
 
-  const int n = request.ops_size();
+  // A replaced scope on a registered resource that cannot switch in one store
+  // is refused before anything is decoded.
+  for (const auto &replacement : request.replace_scopes()) {
+    const std::string &resource = replacement.scope().resource();
+    if (resource == kMeters || resource == kNextHops || resource == kRoutes ||
+        resource == kHidden) {
+      e.error = ControlErrorCode::kUnsupportedTransaction;
+      e.error_object = resource;
+      return e;
+    }
+  }
+
+  const auto flat = Flatten(request);
+  const int n = static_cast<int>(flat.size());
   std::vector<ModelOp> ops(static_cast<size_t>(n));
   for (int i = 0; i < n; i++) {
-    if (!ModelDecode(request.ops(i), &ops[i])) {
+    if (!ModelDecode(*flat[i].first, &ops[i])) {
       e.outcome = v2::TransactionRecord::OUTCOME_REJECTED;
       e.failed = i;
       return e;
@@ -621,20 +696,28 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
     e.outcome = v2::TransactionRecord::OUTCOME_CONFLICT;
     return e;
   }
-  if (consistency == v2::ApplyTransactionRequest::CONSISTENCY_SCOPE_SNAPSHOT) {
-    for (int i = 0; i < n; i++) {
-      if (ops[i].resource != kRules) {
-        e.error = ControlErrorCode::kUnsupportedTransaction;
-        e.error_object = ops[i].resource;
-        return e;
-      }
-    }
-  }
   auto reject = [&](int i) {
     e.outcome = v2::TransactionRecord::OUTCOME_REJECTED;
     e.failed = i;
     return e;
   };
+  // Operation by operation: a plain op at the requested level (a replaced
+  // scope's resource was checked above; an object is held to none), and an
+  // object upsert only of a next hop nothing names.
+  const bool snapshot =
+      consistency == v2::ApplyTransactionRequest::CONSISTENCY_SCOPE_SNAPSHOT;
+  for (int i = 0; i < n; i++) {
+    if (flat[i].second == Role::kPlain && snapshot && ops[i].resource != kRules &&
+        ops[i].resource != kPolicies) {
+      e.error = ControlErrorCode::kUnsupportedTransaction;
+      e.error_object = ops[i].resource;
+      return e;
+    }
+    if (flat[i].second == Role::kObject && !ops[i].erase &&
+        ops[i].resource == kNextHops && Model::Refs(model.state, ops[i].key) != 0) {
+      return reject(i);
+    }
+  }
   // One operation per key.
   std::set<std::pair<std::string, ResourceKey>> seen;
   for (int i = 0; i < n; i++) {
@@ -643,15 +726,15 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
     }
   }
   // Reserve in ascending resource rank, request order within a rank (D-183):
-  // routes reference next hops, so they rank above the rest and reserve
-  // last; the failure is reported at the first operation that fails in that
-  // order.
+  // routes and policies reference next hops, so they rank above the rest and
+  // reserve last; the failure is reported at the first operation that fails
+  // in that order.
   std::vector<int> order(static_cast<size_t>(n));
   for (int i = 0; i < n; i++) {
     order[static_cast<size_t>(i)] = i;
   }
   std::stable_sort(order.begin(), order.end(), [&ops](int a, int b) {
-    return (ops[a].resource == kRoutes) < (ops[b].resource == kRoutes);
+    return ReferencesNextHops(ops[a].resource) < ReferencesNextHops(ops[b].resource);
   });
   size_t may_retire = 0;
   for (const int i : order) {
@@ -664,10 +747,38 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
       may_retire++;
     } else {
       may_retire += exists ? 1 : 0;
-      if (ops[i].resource == kRoutes && ops[i].value.group != 0) {
+      if (ReferencesNextHops(ops[i].resource) && ops[i].value.group != 0) {
         return reject(i);  // "groups" is declared but never registered
       }
     }
+  }
+
+  *after = model.state;
+  for (const ModelOp &op : ops) {
+    State &s = after->at(op.resource);
+    if (op.erase) {
+      s.erase(op.key);
+    } else {
+      s.insert_or_assign(op.key, op.value);
+    }
+  }
+  // Each next hop an old policy Version names that the request does not name
+  // and nothing names afterwards is erased with the transaction.
+  for (int i = 0; i < n; i++) {
+    if (flat[i].second != Role::kScope) {
+      continue;
+    }
+    auto old = model.state.at(kPolicies).find(ops[i].key);
+    if (old == model.state.at(kPolicies).end() || old->second.next_hop == 0) {
+      continue;
+    }
+    const ResourceKey key = EncodeKey(old->second.next_hop);
+    if (seen.contains({kNextHops, key}) || Model::Refs(*after, key) != 0 ||
+        !after->at(kNextHops).contains(key)) {
+      continue;
+    }
+    after->at(kNextHops).erase(key);
+    may_retire++;
   }
   constexpr size_t kBudget =
       bess::rcu::RcuDomain::kDefaultRetireHighWater / 2;
@@ -680,19 +791,12 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
 
   // References the transaction leaves: every next-hop key named after it must
   // exist after it. The engine reports the lowest such key.
-  *after = model.state;
-  for (const ModelOp &op : ops) {
-    State &s = after->at(op.resource);
-    if (op.erase) {
-      s.erase(op.key);
-    } else {
-      s.insert_or_assign(op.key, op.value);
-    }
-  }
   std::set<ResourceKey> named;
-  for (const auto &[k, v] : after->at(kRoutes)) {
-    if (v.next_hop != 0) {
-      named.insert(EncodeKey(v.next_hop));
+  for (const char *referrer : {kRoutes, kPolicies}) {
+    for (const auto &[k, v] : after->at(referrer)) {
+      if (v.next_hop != 0) {
+        named.insert(EncodeKey(v.next_hop));
+      }
     }
   }
   for (const ResourceKey &key : named) {
@@ -705,7 +809,7 @@ Expected Predict(const Model &model, const v2::ApplyTransactionRequest &request,
       }
     }
     for (int i = 0; i < n; i++) {
-      if (ops[i].resource == kRoutes && !ops[i].erase &&
+      if (ReferencesNextHops(ops[i].resource) && !ops[i].erase &&
           ops[i].value.next_hop != 0 &&
           EncodeKey(ops[i].value.next_hop) == key) {
         return reject(i);  // references a missing key
@@ -730,7 +834,7 @@ void CheckState(const Fixture &f, const Model &model) {
   FUZZ_CHECK(f.tx->records() == model.records.size());
   // Read-back (D-129): each bound resource's entries decode, through its own
   // codec, to exactly its committed state.
-  for (const char *name : {kMeters, kNextHops, kRoutes, kRules}) {
+  for (const char *name : {kMeters, kNextHops, kRoutes, kRules, kPolicies}) {
     const bess::framework::ResourceCodec *codec = f.bindings.Find(f.Get(name));
     FUZZ_CHECK(codec != nullptr);
     State read;
@@ -780,11 +884,14 @@ void ApplyOne(Fixture &f, Model &model, uint64_t epoch,
     return;
   }
 
-  const int n = request.ops_size();
+  const int n = static_cast<int>(Flatten(request).size());
   FUZZ_CHECK(record.request_id() == id);
+  // The level it ran under: plain ops at the requested one, replaced scopes
+  // in one store; only replacements is the scope level (D-213).
   FUZZ_CHECK(record.visibility() ==
              (request.consistency() ==
-                      v2::ApplyTransactionRequest::CONSISTENCY_SCOPE_SNAPSHOT
+                          v2::ApplyTransactionRequest::CONSISTENCY_SCOPE_SNAPSHOT ||
+                      (request.ops_size() == 0 && request.replace_scopes_size() > 0)
                   ? v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT
                   : v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED));
   FUZZ_CHECK(record.ops_size() == n);
@@ -845,6 +952,8 @@ void CheckList(const Fixture &f, const Model &model, uint64_t epoch) {
        bess::pb::MeterPolicyValue::descriptor()},
       {kNextHops, bess::pb::RouterNextHopIdKey::descriptor(),
        bess::pb::RouterNextHopValue::descriptor()},
+      {kPolicies, bess::pb::MeterIdKey::descriptor(),
+       bess::pb::RouterRouteValue::descriptor()},
       {kRoutes, bess::pb::RouterRouteKey::descriptor(),
        bess::pb::RouterRouteValue::descriptor()},
       {kRules, bess::pb::ExactMatchRuleKey::descriptor(),
