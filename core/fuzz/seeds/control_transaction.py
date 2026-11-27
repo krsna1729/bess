@@ -4,8 +4,9 @@
 Input: u64 epoch, then records [u8 ctl][u16 length][ApplyTransactionRequest]
 (ctl 0), or [u8 1] to apply the previous request again. Resources: "meters",
 "next_hops" (referenced by routes), "routes" (may name next hops, and groups
-that never register), "rules" (scope-snapshot capable), "hidden" (not bound),
-see the harness.
+that never register), "rules" (scope-snapshot capable), "policies" (a
+scope table whose Version names a next hop: the scope of replace_scopes,
+D-213), "hidden" (not bound), see the harness.
 """
 
 import struct
@@ -67,7 +68,22 @@ def erase_rule(a, b):
     return op("rules", ("ExactMatchRuleKey", rule_key(field_int(a), field_int(b))), erase=True)
 
 
-def request(ops=(), request_id=None, expected=None, consistency=None):
+def policy(i, next_hop_id=0, group_id=0):
+    return op("policies", ("MeterIdKey", meter_key(i)),
+              ("RouterRouteValue", route_value(next_hop_id, group_id)))
+
+
+def erase_policy(i):
+    return op("policies", ("MeterIdKey", meter_key(i)), erase=True)
+
+
+def replacement(scope, objects=()):
+    """A ScopeReplacement: the scope's op and the objects its Version names."""
+    return ld(1, scope) + b"".join(ld(2, o) for o in objects)
+
+
+def request(ops=(), request_id=None, expected=None, consistency=None,
+            replacements=()):
     out = b""
     if request_id is not None:
         out += ld(1, request_id)
@@ -76,6 +92,7 @@ def request(ops=(), request_id=None, expected=None, consistency=None):
     out += b"".join(ld(3, o) for o in ops)
     if consistency:
         out += u(4, consistency)
+    out += b"".join(ld(6, r) for r in replacements)
     return out
 
 
@@ -163,4 +180,40 @@ def seeds():
                                   erase_rule(1, 1)], request_id="c")),
                      REPEAT),
         "unparsable": seq(rec(b"\x0a\x05ab"), rec(request([meter(1)]))),
+        "replace_scope": seq(
+            rec(request(replacements=[replacement(policy(1, 7), [next_hop(7)])])),
+            rec(request(replacements=[replacement(policy(1, 8), [next_hop(8)])],
+                        request_id="r")),
+            REPEAT,
+            rec(request(replacements=[replacement(erase_policy(1))]))),
+        "replace_scope_shared": seq(
+            rec(request(replacements=[replacement(policy(1, 7), [next_hop(7)]),
+                                      replacement(policy(2, 7))])),
+            rec(request([meter(1)], replacements=[replacement(policy(1, 8), [next_hop(8)])])),
+            rec(request(replacements=[replacement(policy(2, 8))]))),
+        "replace_scope_refused": seq(
+            rec(request([meter(1)], request_id="x",
+                        replacements=[replacement(policy(1, 7), [next_hop(7)]),
+                                      replacement(policy(2, 9), [next_hop(3)])])),
+            REPEAT),
+        "replace_scope_object_referenced": seq(
+            rec(request(replacements=[replacement(policy(1, 7), [next_hop(7)])])),
+            rec(request(replacements=[replacement(policy(1, 7), [next_hop(7, 5)])])),
+            rec(request([next_hop(7, 5)]))),
+        "replace_scope_duplicate": seq(
+            rec(request([next_hop(7)], replacements=[replacement(policy(1, 7), [next_hop(7)])])),
+            rec(request(replacements=[replacement(policy(1, 7), [next_hop(7)]),
+                                      replacement(policy(1, 7))]))),
+        "replace_scope_unsupported": seq(
+            rec(request(replacements=[replacement(meter(1))])),
+            rec(request(replacements=[replacement(op("hidden", ("MeterIdKey", meter_key(1)),
+                                                     ("MeterPolicyValue", sr_tcm())))])),
+            rec(request([meter(1)], consistency=SNAPSHOT,
+                        replacements=[replacement(policy(1, 7), [next_hop(7)])]))),
+        "replace_scope_snapshot": seq(
+            rec(request([rule(1, 80, 3)], consistency=SNAPSHOT,
+                        replacements=[replacement(policy(1, 7), [next_hop(7)])])),
+            rec(request(consistency=SNAPSHOT,
+                        replacements=[replacement(policy(1, 8, 0), [next_hop(8),
+                                                                     erase_next_hop(7)])]))),
     }

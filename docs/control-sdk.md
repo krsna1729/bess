@@ -191,15 +191,21 @@ the workers are paused (Admin `PauseWorkers`, then `ResumeWorkers`).
 
 **Whole-scope replacement.** C++ `tx.ReplaceScope(scope, key, value, objects)`
 and Go `tx.ReplaceScope(scope, key, value, ScopeObject{...}...)` write a
-scope's complete new Version and the entries it names as one logical
-operation: the objects take effect first (nothing can name them yet), the
-scope switches in one store, and the old Version's entries the new one drops
-are retired if nothing else references them. `EraseScope` is the deletion
-form. The scope resource must provide scope-snapshot consistency; the daemon
-refuses another resource as the scope before attempting anything. A record
-lists the objects' results and the scope's last; a refused switch leaves the
-objects applied but unreferenced and the old Version visible, and a retry
-re-upserts them.
+scope's complete new Version and the entries it names; `EraseScope` is the
+deletion form. A replacement is part of the transaction's one apply (D-213):
+the plain operations, every replacement's objects and scope switch, and the
+erases of the entries an old Version named that nothing names afterwards are
+reserved, checked and published together, so the transaction is applied
+whole or not at all, and BUSY and CONFLICT still mean nothing was tried. The
+objects publish first, the scope switches in one store, the retired entries
+go last; their ids stay retiring for a grace period. An object something
+already references is refused (changing it would show before the switch;
+change a shared entry with a plain upsert), and a key appears once in the
+whole transaction. The scope resource must provide scope-snapshot
+consistency whatever the transaction asks; the transaction's consistency
+applies to its plain operations. A record lists the plain operations' results,
+then each replacement's objects and its scope, in the order the calls were
+made: a failure's index is its place in that list.
 
 ## Desired state
 

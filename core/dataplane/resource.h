@@ -311,12 +311,6 @@ class Resource {
   virtual std::vector<Reference> ReferencesOf(const ResourceKey &) const {
     return {};
   }
-  // The references `value` would hold if published (used to compute what a
-  // scope's replacement stops naming). None when the resource cannot describe
-  // a prospective value.
-  virtual std::vector<Reference> ReferencesOfValue(const std::any &) const {
-    return {};
-  }
   // Enumerates references held by all committed values. Called only when
   // registrations change, to reconcile the ledger after order-independent
   // teardown and rebinding. Resources that declare dependencies and keep

@@ -687,6 +687,10 @@ struct SessionVersion {
 struct MeterObject {
   uint32_t rate = 0;
 };
+// A scope Version that names one meter (D-213's retirements over the wire).
+struct PolicyVersion {
+  uint32_t meter = 0;
+};
 
 struct MeterTag;
 using MeterKey = bess::dataplane::StrongId<MeterTag, uint32_t>;
@@ -713,7 +717,8 @@ auto ReadBack(const bess::dataplane::SlotTable<Id, T> &table,
 // ordinary resource ("meters") behind the real RPC server and codecs; keys and
 // values travel as UInt32Value messages. The scope table is the in-tree
 // acceptance application of the scope-snapshot level; the meters cannot
-// provide it.
+// provide it. "policies" is a second scope table whose Version names a meter
+// (the value is the meter's id), so a replacement has referents to retire.
 class ConsistencyRpcTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -722,6 +727,19 @@ class ConsistencyRpcTest : public ::testing::Test {
     using google::protobuf::UInt32Value;
     ASSERT_TRUE(engine_.Register(&sessions_res_).has_value());
     ASSERT_TRUE(engine_.Register(&meters_res_).has_value());
+    ASSERT_TRUE(engine_.Register(&policies_res_).has_value());
+    policy_binding_ = bindings_.Bind(
+        policies_res_,
+        std::make_shared<TypedCodec<UInt32Value, UInt32Value>>(
+            [](const UInt32Value &key)
+                -> std::expected<bess::dataplane::ResourceKey, std::string> {
+              return bess::dataplane::EncodeKey(
+                  bess::dataplane::ScopeId(key.value()));
+            },
+            [](const UInt32Value &value) -> std::expected<std::any, std::string> {
+              return std::any(PolicyVersion{value.value()});
+            },
+            ReadBack(policies_, &PolicyVersion::meter)));
     session_binding_ = bindings_.Bind(
         sessions_res_,
         std::make_shared<TypedCodec<UInt32Value, UInt32Value>>(
@@ -813,6 +831,32 @@ class ConsistencyRpcTest : public ::testing::Test {
   const SessionVersion *Session(uint32_t scope) const {
     return sessions_.Lookup(bess::dataplane::ScopeId(scope));
   }
+  const PolicyVersion *Policy(uint32_t scope) const {
+    return policies_.Lookup(bess::dataplane::ScopeId(scope));
+  }
+  bool HasMeter(uint32_t id) const { return meters_.Lookup(MeterKey(id)) != nullptr; }
+  void Settle() {
+    while (engine_.ReclaimRetired() != 0) {
+    }
+    domain_.Drain();
+  }
+  static v2::TransactionOp Erase(const char *resource, uint32_t key) {
+    v2::TransactionOp op = Op(resource, key, 0);
+    op.set_erase(true);
+    op.clear_value();
+    return op;
+  }
+  // One replacement of policy `scope`: `objects`, then the Version naming
+  // `meter`.
+  static void AddPolicy(v2::ApplyTransactionRequest *req, uint32_t scope,
+                        uint32_t meter,
+                        std::initializer_list<v2::TransactionOp> objects) {
+    auto *replacement = req->add_replace_scopes();
+    *replacement->mutable_scope() = Op("policies", scope, meter);
+    for (const auto &object : objects) {
+      *replacement->add_objects() = object;
+    }
+  }
 
   // A retire budget of 4 (half the high water): BUSY is reachable with a few
   // meters.
@@ -823,9 +867,18 @@ class ConsistencyRpcTest : public ::testing::Test {
                                                               sessions_};
   bess::dataplane::SlotResource<MeterKey, MeterObject> meters_res_{"meters",
                                                                    meters_};
+  bess::dataplane::ScopeTable<PolicyVersion> policies_{16};
+  bess::dataplane::ScopeResource<PolicyVersion> policies_res_{
+      "policies", policies_,
+      [](const PolicyVersion &v) {
+        return std::vector<bess::dataplane::Reference>{
+            {"meters", bess::dataplane::EncodeKey(MeterKey(v.meter))}};
+      },
+      {"meters"}};
   bess::dataplane::TransactionEngine engine_{domain_};
   bess::framework::ResourceBindings bindings_;
-  bess::framework::ResourceBinding session_binding_, meter_binding_;
+  bess::framework::ResourceBinding session_binding_, meter_binding_,
+      policy_binding_;
   ControlPlane control_plane_;
   std::unique_ptr<ControlV2Service> service_;
   std::unique_ptr<grpc::Server> server_;
@@ -1124,7 +1177,9 @@ TEST_F(ConsistencyRpcTest, ReplaceScopeAppliesItsObjectsThenTheScope) {
             v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
 }
 
-TEST_F(ConsistencyRpcTest, ReplaceScopeAppliesPlainOpsBeforeTheScopes) {
+// Plain operations run at the level requested (referential here), so the
+// record says so: D-050 §1 reports the level the transaction ran under.
+TEST_F(ConsistencyRpcTest, ReplaceScopeAppliesPlainOpsWithTheScopes) {
   v2::ApplyTransactionRequest req;
   req.set_request_id("replace-2");
   *req.add_ops() = Op("meters", 2, 200);
@@ -1135,7 +1190,7 @@ TEST_F(ConsistencyRpcTest, ReplaceScopeAppliesPlainOpsBeforeTheScopes) {
   ASSERT_TRUE(Apply(req, &response).ok());
   EXPECT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
   EXPECT_EQ(response.record().visibility(),
-            v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
+            v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED);
   ASSERT_EQ(response.record().ops_size(), 3);
   for (int i = 0; i < response.record().ops_size(); i++) {
     EXPECT_EQ(response.record().ops(i).status(),
@@ -1146,6 +1201,130 @@ TEST_F(ConsistencyRpcTest, ReplaceScopeAppliesPlainOpsBeforeTheScopes) {
   EXPECT_EQ(Session(1)->epoch, 8u);
   EXPECT_NE(meters_.Lookup(MeterKey(1)), nullptr);
   EXPECT_NE(meters_.Lookup(MeterKey(2)), nullptr);
+}
+
+// C4: CONSISTENCY_SCOPE_SNAPSHOT holds for plain operations whatever else the
+// request carries -- a plain meter is refused, typed, with nothing applied.
+TEST_F(ConsistencyRpcTest, ReplaceScopeKeepsTheRequestedLevelForPlainOps) {
+  v2::ApplyTransactionRequest req;
+  req.set_request_id("replace-level");
+  req.set_consistency(Level::CONSISTENCY_SCOPE_SNAPSHOT);
+  *req.add_ops() = Op("meters", 2, 200);
+  AddPolicy(&req, 1, 1, {Op("meters", 1, 100)});
+  v2::ApplyTransactionResponse response;
+  v2::ErrorDetail detail;
+  EXPECT_EQ(Apply(req, &response, &detail).error_code(),
+            grpc::StatusCode::UNIMPLEMENTED);
+  EXPECT_EQ(detail.field(), "consistency");
+  EXPECT_EQ(detail.object(), "meters");
+  EXPECT_FALSE(HasMeter(1));
+  EXPECT_FALSE(HasMeter(2));
+  EXPECT_EQ(Policy(1), nullptr);
+
+  // Without the plain meter the request is all scopes: applied at that level.
+  req.clear_ops();
+  ASSERT_TRUE(Apply(req, &response).ok());
+  EXPECT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  EXPECT_EQ(response.record().visibility(),
+            v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT);
+}
+
+// D-213 over the wire: the old Version's meter is erased in the same
+// transaction as the switch, unless a Version still names it afterwards.
+TEST_F(ConsistencyRpcTest, ReplaceScopeRetiresTheOldVersionsReferents) {
+  v2::ApplyTransactionRequest first;
+  AddPolicy(&first, 1, 1, {Op("meters", 1, 100)});
+  AddPolicy(&first, 2, 3, {Op("meters", 3, 300)});
+  v2::ApplyTransactionResponse response;
+  ASSERT_TRUE(Apply(first, &response).ok());
+  ASSERT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  ASSERT_EQ(response.record().ops_size(), 4);
+
+  // Policy 1 moves to a new meter; policy 2 moves to policy 1's old meter,
+  // which keeps it; policy 2's old meter is named by nothing afterwards.
+  v2::ApplyTransactionRequest second;
+  second.set_request_id("replace-retire");
+  AddPolicy(&second, 1, 2, {Op("meters", 2, 200)});
+  AddPolicy(&second, 2, 1, {});
+  const uint64_t generation = engine_.generation();
+  ASSERT_TRUE(Apply(second, &response).ok());
+  ASSERT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED)
+      << response.record().ops(0).error() << "|" << response.record().ops(1).error();
+  EXPECT_EQ(response.record().generation(), generation + 1);
+  EXPECT_EQ(Policy(1)->meter, 2u);
+  EXPECT_EQ(Policy(2)->meter, 1u);
+  Settle();
+  EXPECT_TRUE(HasMeter(1)) << "policy 2 names it now";
+  EXPECT_TRUE(HasMeter(2));
+  EXPECT_FALSE(HasMeter(3)) << "named by no Version after the transaction";
+
+  // Erasing the scope retires its meter with it.
+  v2::ApplyTransactionRequest erase;
+  auto *replacement = erase.add_replace_scopes();
+  *replacement->mutable_scope() = Erase("policies", 1);
+  ASSERT_TRUE(Apply(erase, &response).ok());
+  ASSERT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  Settle();
+  EXPECT_EQ(Policy(1), nullptr);
+  EXPECT_FALSE(HasMeter(2));
+}
+
+// B4/C3: a refusal anywhere refuses the whole request -- plain ops, objects
+// and switch -- and the record names the failed operation in the flattened
+// layout (plain ops, then each replacement's objects and its scope).
+TEST_F(ConsistencyRpcTest, ARefusedReplacementAppliesNothing) {
+  v2::ApplyTransactionRequest req;
+  req.set_request_id("replace-refused");
+  *req.add_ops() = Op("meters", 4, 400);
+  AddPolicy(&req, 1, 1, {Op("meters", 1, 100)});
+  AddPolicy(&req, 2, 9, {Op("meters", 3, 300)});  // meter 9 exists nowhere
+  const uint64_t generation = engine_.generation();
+  v2::ApplyTransactionResponse response;
+  ASSERT_TRUE(Apply(req, &response).ok());
+  EXPECT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_REJECTED);
+  ASSERT_EQ(response.record().ops_size(), 5);
+  for (int i = 0; i < 5; i++) {
+    EXPECT_EQ(response.record().ops(i).status(),
+              i == 4 ? v2::TransactionOpResult::STATUS_FAILED
+                     : v2::TransactionOpResult::STATUS_NOT_APPLIED)
+        << "op " << i;
+  }
+  EXPECT_NE(response.record().ops(4).error().find("references missing"),
+            std::string::npos)
+      << response.record().ops(4).error();
+  EXPECT_EQ(engine_.generation(), generation);
+  EXPECT_FALSE(HasMeter(4));
+  EXPECT_FALSE(HasMeter(1));
+  EXPECT_FALSE(HasMeter(3));
+  EXPECT_EQ(Policy(1), nullptr);
+
+  // Recorded: the same id answers the same refusal, applying nothing.
+  v2::ApplyTransactionResponse again;
+  ASSERT_TRUE(Apply(req, &again).ok());
+  EXPECT_TRUE(again.replayed());
+  EXPECT_FALSE(HasMeter(4));
+}
+
+// C5: one (resource, key) once per request, across plain ops, objects and
+// scopes: refused before anything is applied.
+TEST_F(ConsistencyRpcTest, AKeyNamedTwiceInOneRequestIsRefused) {
+  v2::ApplyTransactionRequest req;
+  *req.add_ops() = Op("meters", 1, 50);
+  AddPolicy(&req, 1, 1, {Op("meters", 1, 100)});
+  v2::ApplyTransactionResponse response;
+  ASSERT_TRUE(Apply(req, &response).ok());
+  EXPECT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_REJECTED);
+  EXPECT_EQ(response.record().ops(1).status(), v2::TransactionOpResult::STATUS_FAILED);
+  EXPECT_FALSE(HasMeter(1));
+
+  v2::ApplyTransactionRequest scopes;
+  AddPolicy(&scopes, 1, 1, {Op("meters", 1, 100)});
+  AddPolicy(&scopes, 1, 1, {});
+  ASSERT_TRUE(Apply(scopes, &response).ok());
+  EXPECT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_REJECTED);
+  EXPECT_EQ(response.record().ops(2).status(), v2::TransactionOpResult::STATUS_FAILED);
+  EXPECT_EQ(Policy(1), nullptr);
+  EXPECT_FALSE(HasMeter(1));
 }
 
 TEST_F(ConsistencyRpcTest, ReplaceScopeRefusesAReferentialScopeResource) {

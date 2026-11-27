@@ -186,17 +186,12 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
   }
 
-  // The request's operations in application order: the plain ops, then each
-  // scope replacement's objects and its scope last. The scope spans name each
-  // replacement's place in `flat`. A request without replacements (the common
-  // path) keeps its operations where they are: no per-transaction allocation.
-  struct ScopeSpan {
-    size_t first_object;
-    size_t objects;
-    size_t scope;
-  };
+  // The request's operations in the engine's order: the plain ops, then each
+  // scope replacement's objects and its scope last (D-213). A record's results
+  // follow it. A request without replacements (the common path) keeps its
+  // operations where they are: no per-transaction allocation.
   std::vector<const v2::TransactionOp *> flat;
-  std::vector<ScopeSpan> scopes;
+  std::vector<TransactionEngine::ScopeReplacement> scopes;
   const bool phased = request.replace_scopes_size() > 0;
   if (phased) {
     try {
@@ -205,18 +200,16 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
         total += replacement.objects_size() + 1;
       }
       flat.reserve(total);  // scale: one entry per request operation
+      scopes.reserve(static_cast<size_t>(request.replace_scopes_size()));
       for (const auto &op : request.ops()) {
         flat.push_back(&op);
       }
       for (const auto &replacement : request.replace_scopes()) {
-        ScopeSpan span{flat.size(),
-                       static_cast<size_t>(replacement.objects_size()), 0};
+        scopes.push_back({flat.size(), static_cast<size_t>(replacement.objects_size())});
         for (const auto &object : replacement.objects()) {
           flat.push_back(&object);
         }
-        span.scope = flat.size();
         flat.push_back(&replacement.scope());
-        scopes.push_back(span);
       }
     } catch (const std::bad_alloc &e) {
       ControlError refused = OutOfMemory(e);
@@ -258,19 +251,43 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   }
 
   // A scope replacement's scope must switch in one store; refuse before
-  // anything is attempted, as for a scope-snapshot transaction.
-  for (const ScopeSpan &span : scopes) {
-    const Named &scope = named[span.scope];
-    if (scope.resource != nullptr &&
-        scope.resource->ProvidedConsistency() !=
-            dataplane::Consistency::kScopeSnapshot) {
-      const std::string &resource = flat[span.scope]->resource();
+  // anything is attempted, as for a scope-snapshot transaction. Its old
+  // Version's entries may be erased with it (D-213), in resources the request
+  // need not name: those the scope's resource may reference get the D-129
+  // check below too.
+  for (const TransactionEngine::ScopeReplacement &span : scopes) {
+    const size_t at = span.first + span.objects;
+    const dataplane::Resource *scope = named[at].resource;
+    if (scope == nullptr) {
+      continue;  // decoding below rejects it
+    }
+    const std::string &resource = flat[at]->resource();
+    if (scope->ProvidedConsistency() != dataplane::Consistency::kScopeSnapshot) {
       return std::unexpected(ControlError{
           .code = ControlErrorCode::kUnsupportedTransaction,
           .err = ENOTSUP,
           .message = "resource '" + resource + "' cannot switch a scope in one store",
           .object = resource,
           .field = "replace_scopes"});
+    }
+    // scale: the resources one scope resource declares, a handful.
+    for (const std::string &referent : scope->declared_references()) {
+      const dataplane::Resource *target = engine_.FindResource(referent);
+      const framework::ResourceCodec *codec =
+          target == nullptr ? nullptr : bindings_.Find(*target);
+      if (codec != nullptr && codec->Busy()) {
+        std::string message = "resource '" + referent;
+        message += "', whose entries replacing scope resource '";
+        message += resource;
+        message +=
+            "' may retire, changes only with its module's workers paused "
+            "(a worker runs it)";
+        return std::unexpected(ControlError{.code = ControlErrorCode::kResourceBusy,
+                                            .err = EBUSY,
+                                            .message = std::move(message),
+                                            .object = referent,
+                                            .field = "replace_scopes"});
+      }
     }
   }
 
@@ -296,11 +313,13 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   // apply again. Given back below unless the outcome is recorded.
   Records::node_type pending;
   // D-207: an erase-only transaction's record draws on the erase headroom,
-  // as the erases do in the engine.
+  // as the erases do in the engine; a replacement erasing its scope with no
+  // objects is one.
+  const auto erases = [](const v2::TransactionOp &op) { return op.erase(); };
   const utils::Headroom headroom(
-      request.replace_scopes_size() == 0 && request.ops_size() != 0 &&
-              std::all_of(request.ops().begin(), request.ops().end(),
-                          [](const v2::TransactionOp &op) { return op.erase(); })
+      n != 0 && (phased ? std::all_of(flat.begin(), flat.end(),
+                                      [&](const v2::TransactionOp *op) { return erases(*op); })
+                        : std::all_of(request.ops().begin(), request.ops().end(), erases))
           ? utils::Headroom::kErase
           : utils::Headroom::kNone);
   if (!id.empty()) {
@@ -384,63 +403,10 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
     std::optional<TransactionEngine::Result> applied;
     try {
-      if (request.replace_scopes_size() == 0) {
-        applied.emplace(engine_.Apply(ops, expected, consistency, on_busy));
-      } else {
-        // The plain ops referentially, then each scope replacement: its
-        // objects referentially, its switch in one store, its old referents.
-        TransactionEngine::Result combined;
-        combined.outcome = TransactionEngine::Outcome::kApplied;
-        combined.generation = engine_.generation();
-        // scale: one result per request operation; the request bounds it.
-        combined.ops.reserve(ops.size());
-        bool first = true;
-        bool any_applied = false;
-        auto append = [&](const TransactionEngine::Result &r) {
-          if (r.outcome != TransactionEngine::Outcome::kApplied &&
-              combined.outcome == TransactionEngine::Outcome::kApplied) {
-            combined.outcome = r.outcome;
-          }
-          any_applied = any_applied || r.outcome == TransactionEngine::Outcome::kApplied;
-          combined.generation = r.generation;
-          // scale: one result per operation of this phase; the request bounds it.
-          combined.ops.insert(combined.ops.end(), r.ops.begin(), r.ops.end());
-        };
-        const size_t plain = static_cast<size_t>(request.ops_size());
-        auto apply_scopes = [&] {
-          for (const ScopeSpan &span : scopes) {
-            auto r = engine_.ApplyReplaceScope(
-                ops[span.scope],
-                std::span<const Op>(ops.data() + span.first_object, span.objects),
-                first ? expected : std::nullopt, on_busy);
-            append(r);
-            first = false;
-            if (r.outcome != TransactionEngine::Outcome::kApplied) {
-              break;
-            }
-          }
-          if (combined.outcome == TransactionEngine::Outcome::kUnsupported &&
-              any_applied) {
-            // An unsupported phase after another applied is a rejection of
-            // this phase, not a request that attempted nothing.
-            combined.outcome = TransactionEngine::Outcome::kRejected;
-          }
-        };
-        if (plain > 0) {
-          auto r = engine_.Apply(std::span<const Op>(ops.data(), plain), expected,
-                                 dataplane::Consistency::kReferential, on_busy);
-          append(r);
-          first = false;
-          if (r.outcome == TransactionEngine::Outcome::kApplied) {
-            apply_scopes();
-          }
-        } else {
-          apply_scopes();
-        }
-        // scale: one result per request operation; the request bounds it.
-        combined.ops.resize(ops.size());
-        applied.emplace(std::move(combined));
-      }
+      // One transaction, the replacements included: BUSY and CONFLICT
+      // attempted nothing, and REJECTED applied nothing.
+      applied.emplace(phased ? engine_.Apply(ops, scopes, expected, consistency, on_busy)
+                             : engine_.Apply(ops, expected, consistency, on_busy));
     } catch (const std::bad_alloc &e) {
       ControlError refused = OutOfMemory(e);
       refused.field = "ops";
@@ -483,9 +449,12 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
     }
   }
   record.set_request_id(id);
+  // The level the transaction ran under (D-050 §1, D-213): plain operations
+  // at the one requested, each replaced scope in one store. A transaction
+  // that is only replacements ran wholly at the scope level.
   record.set_visibility(
-      request.replace_scopes_size() > 0 ||
-              consistency == dataplane::Consistency::kScopeSnapshot
+      consistency == dataplane::Consistency::kScopeSnapshot ||
+              (phased && request.ops_size() == 0)
           ? v2::TransactionRecord::VISIBILITY_SCOPE_SNAPSHOT
           : v2::TransactionRecord::VISIBILITY_DEPENDENCY_ORDERED);
   // BUSY and CONFLICT attempted nothing: the client retries under the id.

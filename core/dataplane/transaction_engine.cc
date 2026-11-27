@@ -604,12 +604,20 @@ TransactionEngine::Result TransactionEngine::Busy(size_t n_ops) const {
 TransactionEngine::Result TransactionEngine::Apply(std::span<const Op> ops,
                                                   std::optional<uint64_t> expected_generation,
                                                   Consistency consistency, OnBusy on_busy) {
-  return Counted(ApplyImpl(ops, expected_generation, consistency, nullptr), on_busy);
+  return Counted(ApplyImpl(ops, {}, expected_generation, consistency, nullptr), on_busy);
+}
+
+TransactionEngine::Result TransactionEngine::Apply(
+    std::span<const Op> ops, std::span<const ScopeReplacement> replacements,
+    std::optional<uint64_t> expected_generation, Consistency consistency,
+    OnBusy on_busy) {
+  return Counted(ApplyImpl(ops, replacements, expected_generation, consistency, nullptr),
+                 on_busy);
 }
 
 TransactionEngine::Result TransactionEngine::ApplyOwned(
     std::span<const Resource *const> owned, std::span<const Op> ops) {
-  return Counted(ApplyImpl(ops, std::nullopt, Consistency::kReferential, &owned),
+  return Counted(ApplyImpl(ops, {}, std::nullopt, Consistency::kReferential, &owned),
                  OnBusy::kAnswer);
 }
 
@@ -633,95 +641,15 @@ TransactionEngine::OutcomeCounts TransactionEngine::outcome_counts() const {
   return counts;
 }
 
-TransactionEngine::Result TransactionEngine::ApplyReplaceScope(
-    const Op &scope, std::span<const Op> objects,
-    std::optional<uint64_t> expected_generation, OnBusy on_busy) {
-  const auto lock = Lock();
-
-  // The old Version's references, before the switch replaces it.
-  std::vector<Reference> previous;
-  if (auto it = resources_.find(std::string_view(scope.resource));
-      it != resources_.end()) {
-    previous = it->second->resource->ReferencesOf(scope.key);
-  }
-
-  // 1. The new Version's objects, referentially: nothing can name them yet.
-  Result result;
-  if (!objects.empty()) {
-    result = ApplyImplLocked(objects, expected_generation,
-                             Consistency::kReferential, nullptr);
-    if (result.outcome != Outcome::kApplied) {
-      // scale: one result per object; the request's message bound caps objects.
-      result.ops.resize(objects.size() + 1);  // the scope was not attempted
-      return Counted(std::move(result), on_busy);
-    }
-  }
-
-  // What the new Version names (none for the erase form).
-  std::vector<Reference> next;
-  if (scope.kind == OpKind::kUpsert) {
-    if (auto it = resources_.find(std::string_view(scope.resource));
-        it != resources_.end()) {
-      next = it->second->resource->ReferencesOfValue(scope.value);
-    }
-  }
-
-  // 2. The scope switch, in one store.
-  const std::span<const Op> one(&scope, 1);
-  Result switched = ApplyImplLocked(
-      one, objects.empty() ? expected_generation : std::nullopt,
-      Consistency::kScopeSnapshot, nullptr);
-  Result combined;
-  combined.outcome = switched.outcome;
-  combined.generation = switched.generation;
-  combined.over_budget = switched.over_budget;
-  combined.may_retire = switched.may_retire;
-  combined.ops = std::move(result.ops);
-  // scale: one result per object plus the scope; the request's message bound
-  // caps objects.
-  combined.ops.resize(objects.size() + 1);
-  combined.ops.back() = switched.ops.empty() ? OpResult{} : switched.ops.front();
-  if (switched.outcome != Outcome::kApplied) {
-    return Counted(std::move(combined), on_busy);
-  }
-
-  // 3. The old Version's references the new one no longer names, and nothing
-  // else references, are erased. Best effort: the switch is already visible.
-  std::vector<Op> stale;
-  for (const Reference &ref : previous) {
-    if (ref.resource == scope.resource && ref.key == scope.key) {
-      continue;
-    }
-    if (std::find(next.begin(), next.end(), ref) != next.end()) {
-      continue;
-    }
-    const bool known =
-        resources_.find(std::string_view(ref.resource)) != resources_.end();
-    if (known && ReferenceCountLocked(ref.resource, ref.key) == 0) {
-      stale.push_back(Op::Erase(ref.resource, ref.key));
-    }
-  }
-  if (!stale.empty()) {
-    (void)ApplyImplLocked(stale, std::nullopt, Consistency::kReferential,
-                          nullptr);
-  }
-  combined.generation = generation_;
-  return Counted(std::move(combined), on_busy);
-}
-
 TransactionEngine::Result TransactionEngine::ApplyImpl(
-    std::span<const Op> ops, std::optional<uint64_t> expected_generation,
-    Consistency consistency, const std::span<const Resource *const> *owned) {
+    std::span<const Op> ops, std::span<const ScopeReplacement> replacements,
+    std::optional<uint64_t> expected_generation, Consistency consistency,
+    const std::span<const Resource *const> *owned) {
   const auto lock = Lock();
-  return ApplyImplLocked(ops, expected_generation, consistency, owned);
-}
-
-TransactionEngine::Result TransactionEngine::ApplyImplLocked(
-    std::span<const Op> ops, std::optional<uint64_t> expected_generation,
-    Consistency consistency, const std::span<const Resource *const> *owned) {
   const size_t n = ops.size();
   // D-207: a transaction that only erases may use half the reserve, so a
-  // daemon at its memory limit can always be emptied (utils::Headroom).
+  // daemon at its memory limit can always be emptied (utils::Headroom). The
+  // erases a scope replacement adds (ScopeReplacement) do not change that.
   const utils::Headroom headroom(
       n != 0 && std::ranges::all_of(
                     ops, [](const Op &op) { return op.kind == OpKind::kErase; })
@@ -751,13 +679,35 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
   w.reg.assign(n, nullptr);
   w.keys.clear();
   w.reservations.clear();
-  w.reservations.reserve(n);  // stable elements: views point into them
   w.staged.clear();
-  w.observed.clear();
-  w.observed.resize(n);
-  w.removals_by_op.assign(n, 0);
   w.deltas.clear();
   w.touched.clear();
+  w.role.clear();
+  w.candidates.clear();
+  w.retire.clear();
+  w.retire_scope.clear();
+
+  // -- scope replacements: what each operation is to them --------------------
+  if (!replacements.empty()) {
+    w.role.assign(n, Role::kPlain);
+    size_t next = 0;
+    // scale: one step per replacement and per object; the request bounds both.
+    for (const ScopeReplacement &r : replacements) {
+      if (r.first < next || r.first >= n || r.objects >= n - r.first) {
+        return Reject(n, std::min(r.first, n),
+                      "scope replacements must follow each other within the "
+                      "operations, each its objects then its scope");
+      }
+      for (size_t i = r.first; i < r.first + r.objects; i++) {
+        w.role[i] = Role::kObject;
+      }
+      w.role[r.first + r.objects] = Role::kScope;
+      next = r.first + r.objects + 1;
+    }
+  }
+  const auto role = [&](size_t i) {
+    return w.role.empty() ? Role::kPlain : w.role[i];
+  };
 
   // -- structure: known resources, one operation per key --------------------
   for (size_t i = 0; i < n; i++) {
@@ -776,21 +726,45 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
                     "resource '" + op.resource + "' is not owned by the caller");
     }
     w.reg[i] = it->second.get();
-    if (consistency == Consistency::kScopeSnapshot &&
-        w.reg[i]->resource->ProvidedConsistency() !=
-            Consistency::kScopeSnapshot) {
+    // A replaced scope switches in one store whatever the transaction's level;
+    // an object is held to no level, as nothing can name it yet (checked
+    // below); a plain operation is held to the level requested.
+    const Role r = role(i);
+    const bool snapshot =
+        r == Role::kScope ||
+        (r == Role::kPlain && consistency == Consistency::kScopeSnapshot);
+    if (snapshot && w.reg[i]->resource->ProvidedConsistency() !=
+                        Consistency::kScopeSnapshot) {
       // Not a rejection of the operation's content: this request can never
       // succeed against this resource. Said so, not served as referential.
       Result result = Reject(
           n, i,
           "resource '" + op.resource +
-              "' cannot take part in a scope-snapshot transaction: its "
-              "operations become visible one by one (referential)");
+              (r == Role::kScope
+                   ? "' cannot be a replaced scope"
+                   : "' cannot take part in a scope-snapshot transaction") +
+              ": its operations become visible one by one (referential)");
       result.outcome = Outcome::kUnsupported;
       return result;
     }
     if (op.kind == OpKind::kUpsert && !op.value.has_value()) {
       return Reject(n, i, "upsert without a value");
+    }
+    if (r == Role::kObject && op.kind == OpKind::kUpsert) {
+      // Changed in place, an entry something already names would be visible
+      // before the switch: the old Version would not be whole any more.
+      const Registration *holder = Holder(w.reg[i], op.key, /*in_transaction=*/false);
+      if (holder != nullptr) {
+        auto ref = holder->incoming.find(std::string_view(op.key));
+        if (ref != holder->incoming.end() && ref->second != 0) {
+          return Reject(n, i,
+                        Describe(op.resource, op.key) + " is referenced " +
+                            std::to_string(ref->second) +
+                            " time(s): a scope replacement's object must be "
+                            "new to readers (change a shared entry with a "
+                            "plain operation)");
+        }
+      }
     }
     w.keys.push_back(KeyRef{w.reg[i], op.key, static_cast<uint32_t>(i)});
   }
@@ -823,6 +797,73 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
                                                                   : kNone;
   };
 
+  // -- what replaced scopes may retire ---------------------------------------
+  // Each key an old Version references, once: erased below if nothing
+  // references it after the transaction. Not a key the transaction names (its
+  // operation decides), nor one a key holder holds (D-187: the reference is
+  // counted on the holder, and the key is the holder's to release).
+  for (size_t i = 0; i < n; i++) {
+    if (role(i) != Role::kScope) {
+      continue;
+    }
+    // scale: the references one Version holds; its resource bounds them.
+    for (Reference &ref : w.reg[i]->resource->ReferencesOf(ops[i].key)) {
+      Registration *target = Resolve(*w.reg[i], ref.resource);
+      if (target == nullptr ||
+          Holder(target, ref.key, /*in_transaction=*/false) != target ||
+          op_on(target, ref.key) != kNone) {
+        continue;
+      }
+      w.candidates.push_back(
+          Candidate{target, std::move(ref.key), static_cast<uint32_t>(i)});
+    }
+  }
+  if (!w.candidates.empty()) {
+    // A Version may name one entry twice, and two replaced scopes may share
+    // one: one erase per key, reported on the first scope that drops it.
+    std::sort(w.candidates.begin(), w.candidates.end(),
+              [](const Candidate &a, const Candidate &b) {
+                return a.target != b.target ? a.target < b.target
+                       : a.key != b.key     ? a.key < b.key
+                                            : a.scope < b.scope;
+              });
+    w.candidates.erase(
+        std::unique(w.candidates.begin(), w.candidates.end(),
+                    [](const Candidate &a, const Candidate &b) {
+                      return a.target == b.target && a.key == b.key;
+                    }),
+        w.candidates.end());
+    // Referrers first: an entry that names another (an action naming a
+    // meter) drops its reference before the other's count is read.
+    std::stable_sort(w.candidates.begin(), w.candidates.end(),
+                     [](const Candidate &a, const Candidate &b) {
+                       return a.target->resource->rank() > b.target->resource->rank();
+                     });
+  }
+
+  // Operation n + k is the erase of w.retire[k], added below.
+  const size_t capacity = n + w.candidates.size();
+  w.reg.resize(capacity, nullptr);
+  w.observed.clear();
+  w.observed.resize(capacity);
+  w.removals_by_op.assign(capacity, 0);
+  w.reservations.reserve(capacity);  // stable elements: views point into them
+  w.retire.reserve(w.candidates.size());  // stable too: deltas view its keys
+  w.retire_scope.reserve(w.candidates.size());
+  const auto op_at = [&](size_t i) -> const Op & {
+    return i < n ? ops[i] : w.retire[i - n];
+  };
+  // A refusal of an added erase is the replacement's: reported on its scope.
+  const auto reject = [&](size_t i, std::string error) {
+    if (i >= n) {
+      const size_t k = i - n;
+      error = "retiring " + Describe(w.retire[k].resource, w.retire[k].key) +
+              ", which the old Version named: " + error;
+      i = w.retire_scope[k];
+    }
+    return Reject(n, i, std::move(error));
+  };
+
   // -- reserve: all fallible work, nothing visible ---------------------------
   // In ascending resource rank (referents first), request order within a
   // rank: a referrer's Reserve() sees what the transaction does to the keys
@@ -844,8 +885,8 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
   // Room for the abort bookkeeping first: once a Reserve() has placed
   // something (a pending key), recording it for abort must not be able to
   // throw (external review: a failed push_back leaked the key).
-  w.staged.reserve(n);
-  w.touched.reserve(n);
+  w.staged.reserve(capacity);
+  w.touched.reserve(capacity);
   AbortGuard abort([&] {
     for (auto it = w.staged.rbegin(); it != w.staged.rend(); ++it) {
       it->work->Abort();
@@ -871,9 +912,9 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
   // Checked as the declarations add up, so a batch over it is refused after
   // reserving about a budget's worth, not all of it.
   const size_t retire_budget = domain_.retire_high_water() / 2;
-  for (const uint32_t index : w.reserve_order) {
-    const size_t i = index;
-    const Op &op = ops[i];
+  // Reserves operation i; a refusal is the transaction's answer.
+  auto reserve = [&](size_t i) -> std::optional<Result> {
+    const Op &op = op_at(i);
     Registration *reg = w.reg[i];
     if (!reg->touched) {
       w.touched.push_back(reg);  // cannot throw: reserved above
@@ -882,14 +923,14 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
     reg->last_op = static_cast<uint32_t>(i);
     auto reserved = reg->resource->Reserve(op);
     if (!reserved) {
-      return Reject(n, i, std::move(reserved.error()));
+      return reject(i, std::move(reserved.error()));
     }
     if (reserved->busy) {
       DCHECK(reserved->staged == nullptr) << "a busy reservation stages nothing";
       return Busy(n);
     }
-    // Neither push can throw (both reserved for n): the reservation is
-    // armed for abort before anything else that can fail runs.
+    // Neither push can throw (both reserved for every operation): the
+    // reservation is armed for abort before anything else that can fail runs.
     w.observed[i] = std::move(reserved->staged->observed);
     w.reservations.push_back(std::move(*reserved));
     Resource::Reservation &r = w.reservations.back();
@@ -924,7 +965,7 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
         // referent.
         Registration *target = Resolve(*reg, ref.resource);
         if (target == nullptr) {
-          return Reject(n, i,
+          return reject(i,
                         "undeclared reference: '" + reg->resource->name() +
                             "' may not reference '" + ref.resource +
                             "' (declare it when constructing the resource)");
@@ -934,7 +975,7 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
         // reserved its operations.
         Registration *holder = Holder(target, ref.key, /*in_transaction=*/true);
         if (holder == nullptr) {
-          return Reject(n, i,
+          return reject(i,
                         "references missing " + Describe(ref.resource, ref.key) +
                             " (its key holder '" +
                             target->resource->key_holder() +
@@ -945,7 +986,7 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
         // order depends on it.
         DCHECK_LT(holder->resource->rank(), reg->resource->rank());
         if (!holder->resource->DefersErase()) {
-          return Reject(n, i,
+          return reject(i,
                         "resource '" + holder->resource->name() +
                             "' cannot be referenced: its erases take effect "
                             "at once (Resource::DefersErase)");
@@ -971,7 +1012,84 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
       result.may_retire = may_retire;
       return result;
     }
+    return std::nullopt;
+  };
+  for (const uint32_t index : w.reserve_order) {
+    if (auto refused = reserve(index)) {
+      return std::move(*refused);
+    }
   }
+
+  // Merge the deltas per referent: sorted, then one entry per (target, key)
+  // with the summed change and the first operation that added a reference.
+  const auto delta_less = [](const Delta &a, const Delta &b) {
+    return a.target != b.target ? a.target < b.target : a.key < b.key;
+  };
+  const auto merge_deltas = [&] {
+    std::sort(w.deltas.begin(), w.deltas.end(), delta_less);
+    size_t out = 0;
+    for (size_t k = 0; k < w.deltas.size(); k++) {
+      if (out != 0 && w.deltas[out - 1].target == w.deltas[k].target &&
+          w.deltas[out - 1].key == w.deltas[k].key) {
+        w.deltas[out - 1].change += w.deltas[k].change;
+        w.deltas[out - 1].added_by =
+            std::min(w.deltas[out - 1].added_by, w.deltas[k].added_by);
+      } else {
+        w.deltas[out++] = w.deltas[k];
+      }
+    }
+    w.deltas.resize(out);
+  };
+  merge_deltas();
+
+  // -- retire what the old Versions named and nothing references now ---------
+  // The count each candidate is left with is ledger arithmetic: its committed
+  // count plus what the transaction changes, the erases added here included
+  // (referrers come first, so a retired action's meter is counted without
+  // it). An erase is reserved like any operation: refused, busy or over
+  // budget, it is the transaction's answer, and nothing was applied.
+  if (!w.candidates.empty()) {
+    const size_t merged = w.deltas.size();
+    for (const Candidate &c : w.candidates) {
+      // A key bound to the holder in this transaction is the holder's too.
+      if (Holder(c.target, c.key, /*in_transaction=*/true) != c.target) {
+        continue;
+      }
+      const std::string_view key(c.key);
+      auto current = c.target->incoming.find(key);
+      int64_t after = current == c.target->incoming.end()
+                          ? 0
+                          : static_cast<int64_t>(current->second);
+      const Delta probe{c.target, key, 0, kNone};
+      auto merged_end = w.deltas.begin() + static_cast<ptrdiff_t>(merged);
+      if (auto d = std::lower_bound(w.deltas.begin(), merged_end, probe, delta_less);
+          d != merged_end && d->target == c.target && d->key == key) {
+        after += d->change;
+      }
+      // scale: the references of the entries retired so far, which one
+      // Version's references bound.
+      for (size_t k = merged; k < w.deltas.size(); k++) {
+        if (w.deltas[k].target == c.target && w.deltas[k].key == key) {
+          after += w.deltas[k].change;
+        }
+      }
+      if (after > 0 || !c.target->resource->Contains(c.key)) {
+        continue;
+      }
+      const size_t i = n + w.retire.size();
+      // Neither push reallocates: both reserved for every candidate.
+      w.retire.push_back(Op::Erase(c.target->resource->name(), c.key));
+      w.retire_scope.push_back(c.scope);
+      w.reg[i] = c.target;
+      if (auto refused = reserve(i)) {
+        return std::move(*refused);
+      }
+    }
+    if (w.deltas.size() != merged) {
+      merge_deltas();
+    }
+  }
+  const size_t total = n + w.retire.size();
 
   // -- bounded backpressure -------------------------------------------------
   // Count what is queued and what pending removal cascades will still retire
@@ -986,27 +1104,6 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
   }
 
   // -- references the transaction leaves behind -----------------------------
-  // Merge the deltas per referent: sorted, then one entry per (target, key)
-  // with the summed change and the first operation that added a reference.
-  std::sort(w.deltas.begin(), w.deltas.end(),
-            [](const Delta &a, const Delta &b) {
-              return a.target != b.target ? a.target < b.target
-                                          : a.key < b.key;
-            });
-  {
-    size_t out = 0;
-    for (size_t k = 0; k < w.deltas.size(); k++) {
-      if (out != 0 && w.deltas[out - 1].target == w.deltas[k].target &&
-          w.deltas[out - 1].key == w.deltas[k].key) {
-        w.deltas[out - 1].change += w.deltas[k].change;
-        w.deltas[out - 1].added_by =
-            std::min(w.deltas[out - 1].added_by, w.deltas[k].added_by);
-      } else {
-        w.deltas[out++] = w.deltas[k];
-      }
-    }
-    w.deltas.resize(out);
-  }
   for (const Delta &d : w.deltas) {
     auto current = d.target->incoming.find(d.key);
     const int64_t after =
@@ -1043,7 +1140,7 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
   // After every check, so a refused or busy transaction builds nothing.
   for (Registration *r : w.touched) {
     if (auto prepared = r->resource->Prepare(); !prepared) {
-      return Reject(n, r->last_op, std::move(prepared.error()));
+      return reject(r->last_op, std::move(prepared.error()));
     }
   }
 
@@ -1055,8 +1152,8 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
   // Stable by staged index (the last key), without std::stable_sort's
   // per-call buffer, as for the reserve order above.
   std::sort(w.order.begin(), w.order.end(), [&](size_t a, size_t b) {
-    const Op &x = ops[w.staged[a].op];
-    const Op &y = ops[w.staged[b].op];
+    const Op &x = op_at(w.staged[a].op);
+    const Op &y = op_at(w.staged[b].op);
     const bool xu = x.kind == OpKind::kUpsert;
     const bool yu = y.kind == OpKind::kUpsert;
     if (xu != yu) {
@@ -1084,7 +1181,7 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
   std::vector<int> stage_ranks;
   Cascade cascade{0, {}, 0};
   if (footprint.removals != 0) {
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < total; i++) {
       if (w.removals_by_op[i] != 0) {
         stage_ranks.push_back(w.reg[i]->resource->rank());
       }
@@ -1095,7 +1192,7 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
     cascade.stages.resize(stage_ranks.size());
     for (size_t s_i = 0; s_i < stage_ranks.size(); s_i++) {
       size_t steps = 0;
-      for (size_t i = 0; i < n; i++) {
+      for (size_t i = 0; i < total; i++) {
         if (w.reg[i]->resource->rank() == stage_ranks[s_i]) {
           steps += w.removals_by_op[i];
         }
@@ -1124,6 +1221,12 @@ TransactionEngine::Result TransactionEngine::ApplyImplLocked(
   // publication, so nothing allocates once it starts.
   for (size_t i = 0; i < n; i++) {
     applied.ops[i].observed = std::move(w.observed[i]);
+  }
+  // scale: one entry per retired key, which the replaced Versions bound.
+  applied.retired.reserve(w.retire.size());
+  for (size_t k = 0; k < w.retire.size(); k++) {
+    applied.retired.push_back(RetiredKey{w.retire[k].resource, w.retire[k].key,
+                                         std::move(w.observed[n + k])});
   }
   applied.may_retire = may_retire;
 

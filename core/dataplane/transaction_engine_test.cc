@@ -23,6 +23,7 @@
 
 #include "classifier/exact_rule_resource.h"
 #include "runtime/runtime_state.h"
+#include "dataplane/scope.h"
 #include "dataplane/slot_resource.h"
 #include "dataplane/strong_id.h"
 #include "testing/allocation_faults.h"
@@ -1723,6 +1724,57 @@ TEST_F(KeyHolderTest, ARefusedTransactionLeavesNoHeldReference) {
   EXPECT_NE(r.ops[0].error.find("references missing shared/"),
             std::string::npos)
       << r.ops[0].error;
+}
+
+// A scope replacement retires the old Version's referents (D-213), counting a
+// reference to a held id on its holder (D-187): a held id is the holder's to
+// release and is skipped; an id the resource holds itself and nothing else
+// names is erased. B2 (review of #167): the held id read as unreferenced on
+// "shared", and its erase -- of a key "shared" does not have -- refused the
+// whole cleanup, so the unheld meter leaked too.
+TEST_F(KeyHolderTest, AReplacedScopeRetiresOnlyWhatItsResourceHolds) {
+  struct Policy {
+    uint32_t meter = 0;   // 0: none
+    uint32_t second = 0;  // 0: none
+  };
+  ScopeTable<Policy> policies(4);
+  ScopeResource<Policy> policies_res(
+      "policies", policies,
+      [](const Policy &p) {
+        std::vector<Reference> refs;
+        for (const uint32_t m : {p.meter, p.second}) {
+          if (m != 0) {
+            refs.push_back({"shared", EncodeKey(MeterId(m))});
+          }
+        }
+        return refs;
+      },
+      {"shared"});
+  Register();
+  ASSERT_TRUE(engine_.Register(&policies_res));
+  const auto replace = [&](Policy p) {
+    const std::vector<Op> ops{
+        Op::Upsert("policies", EncodeKey(ScopeId(1)), std::any(p))};
+    const TransactionEngine::ScopeReplacement replacement{0, 0};
+    return engine_.Apply(ops, std::span(&replacement, 1));
+  };
+  ASSERT_EQ(Apply({Put("held", 5), Put("shared", 6)}).outcome, Outcome::kApplied);
+  ASSERT_EQ(replace({5, 6}).outcome, Outcome::kApplied);
+  EXPECT_EQ(Count("held", 5), 1u);
+  EXPECT_EQ(Count("shared", 6), 1u);
+
+  const auto replaced = replace({});
+  ASSERT_EQ(replaced.outcome, Outcome::kApplied) << replaced.ops[0].error;
+  ASSERT_EQ(replaced.retired.size(), 1u);
+  EXPECT_EQ(replaced.retired[0].resource, "shared");
+  EXPECT_EQ(replaced.retired[0].key, EncodeKey(MeterId(6)));
+  EXPECT_EQ(Count("held", 5), 0u);
+  while (engine_.ReclaimRetired() != 0) {
+  }
+  domain_.Drain();
+  EXPECT_FALSE(shared_res_.Contains(EncodeKey(MeterId(6))));
+  EXPECT_TRUE(held_res_.Contains(EncodeKey(MeterId(5))));
+  ASSERT_TRUE(engine_.ReleaseForTeardown(std::vector<std::string>{"policies"}));
 }
 
 // The key holder is part of the declared graph: it binds when it registers,
