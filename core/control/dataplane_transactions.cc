@@ -461,14 +461,25 @@ ControlResult<v2::ApplyTransactionResponse> DataplaneTransactions::Apply(
   const bool attempted = record.outcome() == v2::TransactionRecord::OUTCOME_APPLIED ||
                          record.outcome() == v2::TransactionRecord::OUTCOME_REJECTED;
   if (!pending.empty() && attempted) {
+    const bool applied = record.outcome() == v2::TransactionRecord::OUTCOME_APPLIED;
     try {
+      // An applied record keeps what its operations returned (D-210), more
+      // than ReserveRecord admitted. The transaction is published, so its
+      // record spends what was admitted for it rather than asking the limit
+      // again (D-207), as the engine's retirement stage does.
+      const utils::Headroom prepaid(applied ? utils::Headroom::kPrepaid
+                                            : utils::Headroom::kNone);
       CommitRecord(std::move(pending), record);
+      window_slot.order = nullptr;
     } catch (const std::bad_alloc &e) {
-      // Only a rejection's errors can outgrow the reserved bytes (an applied
-      // record never does): nothing was applied.
-      return std::unexpected(OutOfMemory(e));
+      // A rejection applied nothing (D-213): refuse it, and its retry runs
+      // again. An applied transaction is answered with its record unkept,
+      // because the heap itself is out: a retry under the id then runs it
+      // again, which an erase answers "not found".
+      if (!applied) {
+        return std::unexpected(OutOfMemory(e));
+      }
     }
-    window_slot.order = nullptr;
   }
   *response.mutable_record() = std::move(record);
   return response;

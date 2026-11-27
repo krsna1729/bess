@@ -1305,7 +1305,10 @@ TransactionEngine::Result TransactionEngine::ApplyBatched(
     result.generation = generation_;
     return result;
   }
-  Result last;
+  // One result per request operation, every batch's at its place in `ops`:
+  // what an applied batch's operations returned (D-210) is kept.
+  Result all;
+  all.ops.resize(ops.size());  // scale: one result per request operation
   size_t offset = 0;
   // The fitted batch size carries over: a clear of N keys that fits B per
   // batch is found once (log2(N/B) refusals), not again after every batch.
@@ -1317,7 +1320,13 @@ TransactionEngine::Result TransactionEngine::ApplyBatched(
       Result result =
           Apply(ops.subspan(offset, take), std::nullopt, consistency);
       if (result.outcome == Outcome::kApplied) {
-        last = std::move(result);
+        std::move(result.ops.begin(), result.ops.end(),
+                  all.ops.begin() + static_cast<std::ptrdiff_t>(offset));
+        all.outcome = Outcome::kApplied;
+        all.generation = result.generation;
+        all.may_retire = result.may_retire;
+        offset += take;
+        take = FitBatch(result, take);
         break;
       }
       // Busy: reclamation is behind the readers and nothing in this batch was
@@ -1341,20 +1350,21 @@ TransactionEngine::Result TransactionEngine::ApplyBatched(
         continue;
       }
       // A real failure, or a single operation that cannot fit a batch alone:
-      // report it, naming its resource so the caller need not map a
-      // batch-relative index back to its own request.
+      // report it, naming its resource. The batches before it stay applied
+      // with their results; this batch's and the rest are not applied.
       for (size_t i = 0; i < result.ops.size(); i++) {
         if (result.ops[i].status == OpStatus::kFailed) {
           result.ops[i].resource = ops[offset + i].resource;
           break;
         }
       }
+      std::move(result.ops.begin(), result.ops.end(),
+                all.ops.begin() + static_cast<std::ptrdiff_t>(offset));
+      result.ops = std::move(all.ops);
       return result;
     }
-    offset += take;
-    take = FitBatch(last, take);
   }
-  return last;
+  return all;
 }
 
 size_t TransactionEngine::FitBatch(const Result &result, size_t take) const {

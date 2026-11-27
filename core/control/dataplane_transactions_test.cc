@@ -417,9 +417,15 @@ class ReportingResource final : public bess::dataplane::Resource {
     auto staged = std::make_unique<Staged>(this, op);
     if (op.kind == bess::dataplane::OpKind::kErase) {
       staged->observed = "counters:" + op.key;
+      if (on_erase) {
+        on_erase();
+      }
     }
     return Reservation{std::move(staged), {}};
   }
+
+  // Runs while an erase is reserved: what else happens before it applies.
+  std::function<void()> on_erase;
 
  private:
   std::set<bess::dataplane::ResourceKey> keys_;
@@ -478,6 +484,64 @@ TEST(TransactionObservationTest, ARecordKeepsWhatAnOperationReturned) {
   EXPECT_EQ(replay->record().ops(0).observed(), "counters:1");
   EXPECT_EQ(transactions.Get("obs-del").record().ops(0).observed(),
             "counters:1");
+}
+
+// An applied record carries what its operations returned, more than the
+// bytes reserved before the transaction ran. Recording it spends what was
+// admitted for it (utils::Headroom::kPrepaid): the transaction applied, so
+// the memory limit can no longer refuse its record, even when memory use
+// crossed the limit while it ran.
+TEST(TransactionObservationTest, AnAppliedRecordIsKeptPastTheLimit) {
+  InitRuntimeOnce();
+  bess::dataplane::TransactionEngine engine(bess::runtime::runtime().rcu());
+  ReportingResource res("rep");
+  ASSERT_TRUE(engine.Register(&res).has_value());
+  using google::protobuf::UInt32Value;
+  bess::framework::ResourceBindings bindings;
+  [[maybe_unused]] auto binding = bindings.Bind(
+      res,
+      std::make_shared<bess::framework::TypedCodec<UInt32Value, UInt32Value>>(
+          [](const UInt32Value &key)
+              -> std::expected<bess::dataplane::ResourceKey, std::string> {
+            return std::to_string(key.value());
+          },
+          [](const UInt32Value &value)
+              -> std::expected<std::any, std::string> {
+            return std::any(value.value());
+          },
+          [](const auto &) {}));
+  DataplaneTransactions transactions(engine, bindings, /*epoch=*/7);
+  UInt32Value one, two;
+  one.set_value(1);
+  two.set_value(2);
+  v2::ApplyTransactionRequest put;
+  put.set_request_id("full-put");
+  auto *put_op = put.add_ops();
+  put_op->set_resource("rep");
+  Pack(put_op->mutable_key(), one);
+  Pack(put_op->mutable_value(), two);
+  ASSERT_TRUE(transactions.Apply(put).has_value());
+
+  bess::utils::MemoryPolicy saved = bess::utils::memory_policy();
+  res.on_erase = [&saved] {
+    bess::utils::MemoryPolicy tight = saved;
+    tight.limit_bytes = size_t{1} << 20U;  // far below what the test holds
+    tight.limit_source = "test";
+    tight.reserve_bytes = 0;
+    bess::utils::SetMemoryPolicy(tight);
+  };
+  v2::ApplyTransactionRequest del;
+  del.set_request_id("full-del");
+  auto *del_op = del.add_ops();
+  del_op->set_resource("rep");
+  del_op->set_erase(true);
+  Pack(del_op->mutable_key(), one);
+  const auto applied = transactions.Apply(del);
+  bess::utils::SetMemoryPolicy(saved);
+  ASSERT_TRUE(applied.has_value()) << applied.error().message;
+  EXPECT_EQ(applied->record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  EXPECT_FALSE(res.Contains("1"));
+  EXPECT_EQ(transactions.Get("full-del").record().ops(0).observed(), "counters:1");
 }
 
 // D-207: at the memory limit an upsert is refused with nothing applied, and

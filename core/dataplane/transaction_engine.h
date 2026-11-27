@@ -269,9 +269,10 @@ class TransactionEngine {
   //
   // Convergence, not atomicity: the batches that applied stay applied, and the
   // caller's next Apply finishes the rest, the desired state being unchanged.
-  // On a failure the answer is that batch's Result, and its failed operation
-  // carries the resource name, so a caller reporting the error does not have to
-  // map a batch-relative index back to its own request.
+  // The answer has one result per operation of `ops`, in its order: the
+  // applied batches' results (what their operations returned included), then on
+  // a failure the failing batch's and kNotApplied for the rest, the outcome
+  // being the failing batch's. The failed operation carries its resource name.
   Result ApplyBatched(std::span<const Op> ops,
                       Consistency consistency = Consistency::kReferential);
   // The next batch size after `result` of a batch of `take` operations, for

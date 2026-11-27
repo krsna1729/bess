@@ -1801,10 +1801,7 @@ ControlResult<size_t> ControlPlane::ApplyResourcesLocked(
     default: {
       for (size_t i = 0; i < result.ops.size(); i++) {
         if (result.ops[i].status == dataplane::TransactionEngine::OpStatus::kFailed) {
-          // ApplyBatched() returns the failing batch's results, so the resource
-          // comes from there rather than from our own request order: a failure
-          // in batch k would otherwise be reported against operation i of the
-          // whole request, which is a different operation.
+          // The failed operation names its resource (ApplyBatched sets it).
           ControlError error = Err(EINVAL, "resource '%s': %s",
                                    result.ops[i].resource.c_str(),
                                    result.ops[i].error.c_str());
