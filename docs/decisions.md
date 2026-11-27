@@ -14870,12 +14870,19 @@ lease already evicts oldest-first.
   lock.
 - A record now holds bytes for every applied operation that returns them, which
   is why `CommitRecord` keeps such an operation out of its common-status
-  compaction.
+  compaction. Those bytes outgrow what `ReserveRecord` admitted before the
+  transaction ran, so an applied record is committed under
+  `utils::Headroom::kPrepaid` (D-207): once published, the limit cannot refuse
+  its record, and a heap that is truly out answers with the record unkept.
+- `ApplyBatched` returns one result per request operation, every applied
+  batch's included, so no batch's bytes are dropped.
 - Nothing reads during publication; a refused transaction returns no bytes.
 
 **Evidence.** `TransactionEngineTest.ReturnsWhatAnAppliedOperationObserves` and
 `TransactionObservationTest.ARecordKeepsWhatAnOperationReturned` (the retry and
-`GetTransaction` carry the first answer's bytes).
+`GetTransaction` carry the first answer's bytes),
+`TransactionObservationTest.AnAppliedRecordIsKeptPastTheLimit` and
+`TransactionEngineBatchingTest.ASetPastTheRetireBudgetIsSplitAndApplied`.
 
 ## D-211 G1.4 closes on the shipped stats and event surfaces
 

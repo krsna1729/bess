@@ -1879,6 +1879,12 @@ TEST(TransactionEngineBatchingTest, ASetPastTheRetireBudgetIsSplitAndApplied) {
   const size_t after =
       engine.outcome_counts()[static_cast<size_t>(Outcome::kApplied)];
   EXPECT_GT(after - before, 1u) << "the set must take more than one transaction";
+  // One result per request operation, every batch's: an earlier batch's
+  // results (and what its operations returned, D-210) are not dropped.
+  ASSERT_EQ(batched.ops.size(), count);
+  for (size_t i = 0; i < count; i++) {
+    EXPECT_EQ(batched.ops[i].status, OpStatus::kApplied) << i;
+  }
 
   // Converged: every key is gone, which the engine reports as a refusal to
   // erase a key that is not there. That is also the reason the busy retry lives
