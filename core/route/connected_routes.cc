@@ -227,6 +227,11 @@ bool SameRouteV6(const DerivedRouteV6 &a, const DerivedRouteV6 &b) {
   return a.domain == b.domain && a.prefix == b.prefix;
 }
 
+// fe80::/10 (RFC 4291 §2.5.6).
+bool IsLinkLocalV6(const utils::Ipv6Address &address) {
+  return address.bytes[0] == 0xfe && (address.bytes[1] & 0xc0U) == 0x80;
+}
+
 }  // namespace
 
 std::expected<DerivedRoutesV6, DerivationError> DerivedRoutesV6::Derive(
@@ -240,9 +245,14 @@ std::expected<DerivedRoutesV6, DerivationError> DerivedRoutesV6::Derive(
     if (interface.length > 128) {
       return std::unexpected(DerivationError::kInvalidPrefixLength);
     }
-    // A /128 address has no subnet beyond the address itself: its connected
-    // and local entries would share the key, and the local one is the honest
-    // meaning of the address.
+    // A link-local address is scoped to its interface: every interface has
+    // fe80::/64, so its routes would repeat across interfaces in a table keyed
+    // by domain and prefix alone. It derives nothing (D-212).
+    if (IsLinkLocalV6(interface.address)) {
+      continue;
+    }
+    // A /128 address has no subnet beyond the address itself: only its local
+    // route is derived.
     if (HasFlag(interface.flags, DerivedRouteFlags::kConnected) &&
         interface.length < 128) {
       const auto connected =
@@ -277,9 +287,8 @@ std::expected<DerivedRoutesV6, DerivationError> DerivedRoutesV6::Derive(
   unique.reserve(entries.size());
   for (const DerivedRouteV6 &entry : entries) {
     if (!unique.empty() && SameRouteV6(unique.back(), entry)) {
-      // A duplicate input (the same address twice, or a /128 address whose
-      // local route is also its implicit connected one) collapses; two
-      // different interfaces deriving the same key is a conflict.
+      // A duplicate input (the same address twice) collapses; two different
+      // interfaces deriving the same key is a conflict.
       if (unique.back().kind == entry.kind &&
           unique.back().interface == entry.interface) {
         continue;
