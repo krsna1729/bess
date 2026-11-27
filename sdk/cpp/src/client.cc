@@ -113,7 +113,25 @@ Error Busy(int attempts) {
   return e;
 }
 
-Result<Applied> Finish(const pb::TransactionRecord &rec, bool replayed,
+// Result `i` of `req`'s record in the caller's terms (OpFailure).
+void Place(const pb::ApplyTransactionRequest &req, int i, OpFailure *failure) {
+  int at = req.ops_size();
+  if (i < at) {
+    return;  // a plain operation
+  }
+  for (int r = 0; r < req.replace_scopes_size(); r++) {
+    const int objects = req.replace_scopes(r).objects_size();
+    if (i <= at + objects) {
+      failure->replacement = r;
+      failure->object = i < at + objects ? i - at : -1;
+      return;
+    }
+    at += objects + 1;
+  }
+}
+
+Result<Applied> Finish(const pb::ApplyTransactionRequest &req,
+                       const pb::TransactionRecord &rec, bool replayed,
                        uint64_t epoch, bool unknown_attempt) {
   switch (rec.outcome()) {
     case pb::TransactionRecord::OUTCOME_APPLIED:
@@ -139,7 +157,9 @@ Result<Applied> Finish(const pb::TransactionRecord &rec, bool replayed,
       e.record = rec;
       for (int i = 0; i < rec.ops_size(); i++) {
         if (rec.ops(i).status() == pb::TransactionOpResult::STATUS_FAILED) {
-          e.failures.push_back({i, rec.ops(i).error()});
+          OpFailure failure{.index = i, .error = rec.ops(i).error()};
+          Place(req, i, &failure);
+          e.failures.push_back(std::move(failure));
           e.message += std::format(" #{} {};", i, rec.ops(i).error());
         }
       }
@@ -771,7 +791,7 @@ Result<Applied> Client::Commit(const pb::ApplyTransactionRequest &req,
         backoff *= 2;
         continue;
       }
-      return Finish(resp.record(), resp.replayed(), resp.daemon_epoch(),
+      return Finish(req, resp.record(), resp.replayed(), resp.daemon_epoch(),
                     unknown_attempt);
     }
     auto asked = GetTransaction(req.request_id());
@@ -788,7 +808,7 @@ Result<Applied> Client::Commit(const pb::ApplyTransactionRequest &req,
       return std::unexpected(std::move(ok.error()));
     }
     if (asked->known) {
-      return Finish(asked->record, true, asked->daemon_epoch, unknown_attempt);
+      return Finish(req, asked->record, true, asked->daemon_epoch, unknown_attempt);
     }
     transport_failure = grpc::StatusCode::OK;
     send = true;  // confirmed unseen under this epoch: sending again is safe
@@ -921,6 +941,11 @@ Result<void> Transaction::ReplaceScope(const Resource &scope,
   if (auto ok = Bind(scope); !ok) {
     return ok;
   }
+  if (scope.kind == pb::TransactionResource::KIND_SINGLETON) {
+    return std::unexpected(MakeError(
+        ErrorKind::kInvalidRequest,
+        "resource \"" + scope.name + "\" is a singleton: it has no scopes to replace"));
+  }
   if (auto ok = CheckType(scope, "key", key, scope.key_type); !ok) {
     return ok;
   }
@@ -974,6 +999,11 @@ Result<void> Transaction::EraseScope(const Resource &scope,
                                      const google::protobuf::Message &key) {
   if (auto ok = Bind(scope); !ok) {
     return ok;
+  }
+  if (scope.kind == pb::TransactionResource::KIND_SINGLETON) {
+    return std::unexpected(MakeError(
+        ErrorKind::kInvalidRequest,
+        "resource \"" + scope.name + "\" is a singleton: it is set, not erased"));
   }
   if (auto ok = CheckType(scope, "key", key, scope.key_type); !ok) {
     return ok;

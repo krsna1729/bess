@@ -71,7 +71,8 @@ enum class ErrorKind {
   // `after_unknown_attempt`: an earlier send of the same commit went
   // unanswered and may have applied (its record since aged out): re-read.
   kConflict,
-  // An operation failed and nothing changed (`failures`).
+  // An operation failed and nothing changed, replacements included
+  // (`failures`).
   kRejected,
   // The dataplane stayed busy through every attempt, and every send was
   // answered (nothing applied).
@@ -95,9 +96,19 @@ enum class ErrorKind {
   kCancelled,
 };
 
+// One failing operation of a rejected transaction. `index` is its place in
+// the record's results: the plain operations in the order they were added,
+// then each ReplaceScope or EraseScope in order, its objects and then its
+// scope. `replacement` and `object` locate it in the caller's terms:
+// `replacement` is -1 for a plain operation (`index` is then its place among
+// them), else the replacement's place among them; `object` is the object's
+// place in that replacement, or -1 for its scope (a refused retirement of an
+// old Version's entry is reported there, naming the key).
 struct OpFailure {
   int index = 0;
   std::string error;
+  int replacement = -1;
+  int object = -1;
 };
 
 struct Error {
@@ -406,19 +417,23 @@ class Transaction {
     const google::protobuf::Message *key = nullptr;
     const google::protobuf::Message *value = nullptr;
   };
-  // Replaces a whole scope (D-050's ReplaceScope): the new Version (scope,
-  // key, value) and the entries it names. The daemon creates the objects
-  // referentially, switches the scope in one store, and retires the old
-  // Version's entries the new one drops, as one logical operation.
+  // Replaces a whole scope (D-050's ReplaceScope, D-213): the new Version
+  // (scope, key, value) and the entries it names. The objects, the switch and
+  // the retirement of the old Version's entries the new one drops are part of
+  // the transaction: all of it applies, or none. An object must be new to
+  // readers: one the old Version (or anything else) already names is
+  // refused, so change a shared entry with Upsert. A singleton has no scopes.
   Result<void> ReplaceScope(const Resource &scope,
                             const google::protobuf::Message &key,
                             const google::protobuf::Message &value,
                             std::span<const Object> objects = {});
-  // The deletion form: erases the scope; its Version's entries are retired.
+  // The deletion form: erases the scope; its Version's entries are retired
+  // in the same transaction.
   Result<void> EraseScope(const Resource &scope,
                           const google::protobuf::Message &key);
 
-  // Applies every operation or none. A committed transaction returns its
+  // Applies every operation or none, each ReplaceScope and EraseScope with
+  // its objects and retirements included. A committed transaction returns its
   // result again without sending.
   Result<Applied> Commit(std::stop_token stop = {});
 

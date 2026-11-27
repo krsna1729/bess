@@ -92,13 +92,23 @@ func (e *ConflictError) Error() string {
 	return s
 }
 
-// OpFailure is one failing operation of a rejected transaction.
+// OpFailure is one failing operation of a rejected transaction. Index is its
+// place in the record's results: the plain operations in the order they were
+// added, then each ReplaceScope or EraseScope in order, its objects and then
+// its scope. Replacement and Object locate it in the caller's terms:
+// Replacement is -1 for a plain operation (Index is then its place among
+// them), else the replacement's place among them; Object is the object's
+// place in that replacement, or -1 for its scope (a refused retirement of an
+// old Version's entry is reported there, naming the key).
 type OpFailure struct {
-	Index int
-	Error string
+	Index       int
+	Error       string
+	Replacement int
+	Object      int
 }
 
-// RejectedError: an operation failed and nothing changed.
+// RejectedError: an operation failed and nothing changed, replacements
+// included (D-213).
 type RejectedError struct {
 	Record   *pb.TransactionRecord
 	Failures []OpFailure
@@ -1209,10 +1219,12 @@ type ScopeObject struct {
 	Value    proto.Message
 }
 
-// ReplaceScope replaces a whole scope (D-050's ReplaceScope): the new Version
-// (scope, key, value) and the entries it names. The daemon creates the objects
-// referentially, switches the scope in one store, and retires the old
-// Version's entries the new one drops, as one logical operation.
+// ReplaceScope replaces a whole scope (D-050's ReplaceScope, D-213): the new
+// Version (scope, key, value) and the entries it names. The objects, the
+// switch and the retirement of the old Version's entries the new one drops
+// are part of the transaction: all of it applies, or none. An object must be
+// new to readers: one the old Version (or anything else) already names is
+// refused, so change a shared entry with Upsert.
 func (t *Transaction) ReplaceScope(scope Resource, key, value proto.Message, objects ...ScopeObject) error {
 	if err := t.upsertable(scope); err != nil {
 		return err
@@ -1393,7 +1405,8 @@ func checkType(r Resource, what string, m proto.Message, want string) error {
 	return nil
 }
 
-// Commit applies every operation or none. A committed transaction returns
+// Commit applies every operation or none, each ReplaceScope and EraseScope
+// with its objects and retirements included. A committed transaction returns
 // its result again.
 func (t *Transaction) Commit(ctx context.Context) (*Applied, error) {
 	if t.result != nil {
@@ -1450,7 +1463,7 @@ func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, ep
 		if resentAfterUnknown && rec.GetOutcome() == pb.TransactionRecord_OUTCOME_REJECTED {
 			return nil, &TransportError{RequestID: req.GetRequestId(), Code: lastUnanswered}
 		}
-		return finish(rec, replayed, answered, unknownAttempt)
+		return finish(req, rec, replayed, answered, unknownAttempt)
 	}
 	send := true
 	for attempt := range c.retry.Attempts {
@@ -1544,7 +1557,7 @@ func (c *Client) commit(ctx context.Context, req *pb.ApplyTransactionRequest, ep
 	return nil, &BusyError{Attempts: c.retry.Attempts}
 }
 
-func finish(rec *pb.TransactionRecord, replayed bool, epoch uint64, unknownAttempt bool) (*Applied, error) {
+func finish(req *pb.ApplyTransactionRequest, rec *pb.TransactionRecord, replayed bool, epoch uint64, unknownAttempt bool) (*Applied, error) {
 	switch rec.GetOutcome() {
 	case pb.TransactionRecord_OUTCOME_APPLIED:
 		return &Applied{RequestID: rec.GetRequestId(), Generation: rec.GetGeneration(),
@@ -1555,7 +1568,9 @@ func finish(rec *pb.TransactionRecord, replayed bool, epoch uint64, unknownAttem
 		e := &RejectedError{Record: rec}
 		for i, op := range rec.GetOps() {
 			if op.GetStatus() == pb.TransactionOpResult_STATUS_FAILED {
-				e.Failures = append(e.Failures, OpFailure{i, op.GetError()})
+				replacement, object := place(req, i)
+				e.Failures = append(e.Failures, OpFailure{Index: i, Error: op.GetError(),
+					Replacement: replacement, Object: object})
 			}
 		}
 		return nil, e
@@ -1563,6 +1578,25 @@ func finish(rec *pb.TransactionRecord, replayed bool, epoch uint64, unknownAttem
 		return nil, &BusyError{Attempts: 1}
 	}
 	return nil, fmt.Errorf("bess: unexpected outcome %v", rec.GetOutcome())
+}
+
+// place locates result i of req's record in the caller's terms (OpFailure).
+func place(req *pb.ApplyTransactionRequest, i int) (replacement, object int) {
+	at := len(req.GetOps())
+	if i < at {
+		return -1, -1
+	}
+	for r, scope := range req.GetReplaceScopes() {
+		objects := len(scope.GetObjects())
+		if i < at+objects {
+			return r, i - at
+		}
+		if i == at+objects {
+			return r, -1
+		}
+		at += objects + 1
+	}
+	return -1, -1 // past the request: a record the request does not shape
 }
 
 // noAnswer: without BESS's typed refusal detail these statuses can follow an
