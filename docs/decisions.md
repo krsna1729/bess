@@ -14944,8 +14944,18 @@ connected and local routes in one transaction, with the same failure
 semantics as v4. The v4 API is unchanged. Both families' routes still go
 through the same Router next-hop namespace, so one hop id can serve either.
 
+**Link-local addresses derive nothing (amended 2026-11-28).** Every IPv6
+interface has an fe80::/10 address (RFC 4291 §2.5.6), and its fe80::/64
+connected route is the same on every interface; a link-local address may also
+repeat across interfaces. The v6 table is keyed by domain and prefix, with no
+interface scope, so deriving them refused every set of more than one
+interface (`kConflictingRoute`). `Derive` skips an fe80::/10 address; a
+controller that needs link-local reachability installs it per interface
+itself.
+
 **Evidence.** `ConnectedRoutesV6Test` (subnet and host route, /0 and /128
-edges, 129 refused, flags, duplicates and conflicts, stale keys after an
+edges, 129 refused, flags, duplicates and conflicts, link-local addresses on
+two interfaces skipped, stale keys after an
 address change) and
 `Backend/ConnectedRoutesTest.IPv6InstallationOpsAreOneHopAndOneRoutePerEntry`
 (both backends; one hop and one route per entry, short id list refused, a

@@ -632,6 +632,25 @@ TEST(ConnectedRoutesV6Test, DuplicatesCollapseAndTwoInterfacesConflict) {
   EXPECT_EQ(DerivationError::kConflictingRoute, conflict.error());
 }
 
+// Every interface has a link-local address, and fe80::/64 on two interfaces
+// would be the same key: it derives nothing, so the global addresses of a
+// whole interface set still derive (D-212).
+TEST(ConnectedRoutesV6Test, LinkLocalAddressesDeriveNothing) {
+  const std::vector<InterfaceAddressV6> interfaces = {
+      Iface6(1, "fe80::1", 64), Iface6(2, "fe80::1", 64),
+      Iface6(1, "febf::2", 10), Iface6(1, "2001:db8:6::1", 64)};
+  const auto derived = DerivedRoutesV6::Derive(interfaces);
+  ASSERT_TRUE(derived.has_value()) << DerivationErrorName(derived.error());
+  ASSERT_EQ(2u, derived->size());
+  EXPECT_NE(nullptr, derived->Find(Key6("2001:db8:6::", 64)));
+  EXPECT_NE(nullptr, derived->Find(Key6("2001:db8:6::1", 128)));
+
+  // fec0:: is outside fe80::/10 and derives as usual.
+  const auto outside = DerivedRoutesV6::Derive(One6(Iface6(1, "fec0::1", 64)));
+  ASSERT_TRUE(outside.has_value()) << DerivationErrorName(outside.error());
+  EXPECT_EQ(2u, outside->size());
+}
+
 TEST(ConnectedRoutesV6Test, AnAddressChangeLeavesTheOldKeysStale) {
   const auto before = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8:6::4d", 64)));
   const auto after = DerivedRoutesV6::Derive(One6(Iface6(1, "2001:db8:7::4d", 64)));

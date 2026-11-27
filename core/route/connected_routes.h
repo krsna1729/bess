@@ -188,7 +188,9 @@ std::optional<uint8_t> PrefixLengthFromMask(uint32_t mask);
 
 // --- IPv6 -------------------------------------------------------------------
 //
-// The same two routes, rules and refusals for an interface's IPv6 addresses.
+// The same two routes, rules and refusals for an interface's IPv6 addresses,
+// except that a link-local address (fe80::/10) derives nothing: it is scoped
+// to its interface, and the v6 table's key has no interface (D-212).
 // The v4 and v6 derivations are separate types because the Router's v4 and v6
 // resources have different keys: a v6 route key is a 16-byte prefix, not the
 // packed 64-bit v4 key, and mixing the families in one sorted set would need a
