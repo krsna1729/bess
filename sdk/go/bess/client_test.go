@@ -445,13 +445,13 @@ func TestAFailureIsPlacedInTheCallersTerms(t *testing.T) {
 		value := &pb.ListTransactionResourcesRequest{}
 		object := ScopeObject{Resource: r, Key: key, Value: value}
 		tx := h.c.Transaction()
-		if err := tx.Upsert(r, key, value); err != nil {
+		if err = tx.Upsert(r, key, value); err != nil {
 			t.Fatal(err)
 		}
-		if err := tx.ReplaceScope(r, key, value, object, object); err != nil {
+		if err = tx.ReplaceScope(r, key, value, object, object); err != nil {
 			t.Fatal(err)
 		}
-		if err := tx.EraseScope(r, key); err != nil {
+		if err = tx.EraseScope(r, key); err != nil {
 			t.Fatal(err)
 		}
 		_, err = tx.Commit(ctx)
