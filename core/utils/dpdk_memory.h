@@ -216,6 +216,9 @@ size_t FallbackChunkCap(size_t limit_bytes) noexcept;
 // so test binaries, whose EAL runs on normal pages, exercise hugepage
 // backing. Off by default; never set in bessd.
 void SetNativeHeapIsHugepagesForTest(bool on) noexcept;
+// Tests only: the memory node's segment lists the hugepage charge reads,
+// instead of walking DPDK's (empty: walk DPDK's again). Never set in bessd.
+void SetSegmentListsForTest(std::span<const SegmentList> lists);
 }  // namespace detail
 
 // The hugepage heap's growth gate (D-198): a DPDK allocation validator on
