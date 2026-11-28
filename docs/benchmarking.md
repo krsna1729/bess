@@ -112,14 +112,19 @@ silences the warning. Numbers taken while siblings compete measure contention,
 so treat a warned run as the caveat says.
 
 `--fail-every N` also submits, after every Nth committed transaction, a
-transaction the engine must refuse: one rule key is upserted twice (its
-one-operation-per-key rule). Each rate prints one `# failure_injection` line
-with attempted/rejected/unexpected counts and the mean rejection latency; the
-process exits non-zero if one was applied or refused for another reason. A
-smoke run (4 clients, 8192 sessions, 1 upsert + 1 erase, 1000 tx/s for 2 s,
-this host) injected 200: 200 rejected, 0 unexpected, 344.9 us mean rejection
-latency, alongside 23.56 Mpps at the 0.50 hit fraction. This checks the
-engine's refusal and the forwarding state.
+transaction the engine must refuse after it has reserved a valid operation:
+an upsert of the next session's rule, plus an operation refused once that
+upsert is reserved. With `--chain session` it is a rule naming a meter that
+does not exist (0x00ffffff), which the engine's reference check refuses after
+every operation is reserved; with the exact chain it is an erase of an absent
+rule, refused at its own reservation after the upsert's. The refusal must roll
+the upsert back: the bench then erases that key and expects "not found". A
+round with injections must also keep the idle round's hit fraction (within
+0.02). Each rate prints one `# failure_injection` line with
+attempted/rejected/unexpected/leaked counts and the mean rejection latency;
+the process exits non-zero if an injected transaction was applied, refused
+for another reason, or left its upsert applied, or if a round's hit fraction
+drifted.
 
 `--chain session` builds the G1 full chain instead: ExactMatch -> Meter ->
 Router. The rule's 8-byte result record names a shared meter (BE32 id 1) and
@@ -127,17 +132,19 @@ a next hop (BE32 id 1..kGates); the setup transaction creates `mt/meters` and
 `rt/next_hops` first, and the rules reference them (the engine orders each
 rule after its references). The Mpps column and the counter window report the
 router's forwarded packets; the hit fraction still comes from the exact match.
-A four-round sweep on 2026-11-26 (4 clients, 8192 sessions, 1 upsert + 1
-erase, 2 s per rate, `--fail-every 10`, the daemon pinned to CPUs 6,8 and the
-bench to 4; the host was shared with a browser, so the pins were the
-isolation) served 5.30-5.45 Mpps at the 0.50 hit fraction from 0 to 8820
-tx/s with 0 busy answers; round-to-round Mpps varied by at most 0.15. The
-daemon's packet worker used 0.98-0.99 core and its control side 84-137 us per
-transaction (at 1000 tx/s the process-wide figure is 1095-1120 us/tx: the
-worker's poll divided by the few transactions). Every injected duplicate was
-rejected (200/200 each round at 1000 tx/s; 1620-1762 at 10000; 1722-1761 at
-max; 0 unexpected; 277-397 us mean). These are pins-on-a-shared-host numbers,
-not a quiet-host record; the host was not isolated beyond the pins.
+A four-round sweep on 2026-11-28 (i9-13900H, `build/perf-release`, 4 clients,
+8192 sessions, 1 upsert + 1 erase, 2 s per rate at 0, 1000, 10000 and max,
+`--fail-every 10`; bessd `--mem_backing=normal` pinned to CPUs 6,8 with the
+worker on 8, the bench to 4; the host was shared, so the pins were the
+isolation) served 5.97-6.01 Mpps at the 0.50 hit fraction from 0 to 9560
+tx/s with 0 busy answers; round-to-round Mpps varied by at most 0.01 per
+rate. The daemon's packet worker used 1.00 core and its control side
+90.1-116.2 us per transaction (at 1000 tx/s the process-wide figure is
+1105.0-1115.0 us/tx: the worker's poll divided by the few transactions).
+Every injected transaction was rejected and rolled back (200/200 each round
+at 1000 tx/s; 1879-1912 at 10000; 1894-1906 at max; 0 unexpected, 0 leaked,
+no hit-fraction drift; 289.8-324.1 us mean rejection latency). These are
+pins-on-a-shared-host numbers, not a quiet-host record.
 
 ## Control RPC worker reuse: PR #149
 

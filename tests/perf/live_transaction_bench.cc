@@ -9,9 +9,10 @@
 //     sessions, so ~0.5 confirms the rules steer packets);
 //   - transactions/s achieved, client-side commit latency p50/p99 (busy
 //     retries included), and the daemon's busy answers in the window;
-//   - with --fail-every N, a deliberately invalid transaction (one key
-//     upserted twice) after every Nth commit: it must be answered rejected,
-//     and a run that applies one (or refuses it differently) exits non-zero.
+//   - with --fail-every N, after every Nth commit a transaction the engine
+//     must refuse after it reserved a valid rule (InjectFailure): it must be
+//     answered rejected and leave that rule absent, and the round's hit
+//     fraction must stay the idle round's; otherwise the run exits non-zero.
 //
 // A controller on the C++ SDK: the pipeline is desired state, the rules are
 // SDK transactions on `em/rules` (request ids, busy retries, typed outcomes),
@@ -41,6 +42,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -75,10 +77,21 @@ using bess::perf::Types;
 
 constexpr uint32_t kBase = 0x0a000000;  // 10.0.0.0
 constexpr int kGates = 4;               // rules steer to gates 1..kGates; misses go to gate 0
+// A meter id the session chain never creates (SetupSession makes meter 1):
+// a rule naming it is refused by the engine's reference check.
+constexpr uint32_t kMissingMeter = 0x00ffffff;
 
-// Any injected transaction that was applied, or refused for a reason other
-// than the engine's rejection, fails the run after every thread has joined.
+// Any injected transaction that was applied, refused for a reason other than
+// the engine's rejection, or that left its reserved upsert applied, and any
+// injection round whose hit fraction moved off the idle round's, fails the
+// run after every thread has joined.
 long g_injection_unexpected = 0;
+// The hit fraction of the last round that committed nothing (-1: none yet).
+double g_idle_hit = -1;
+// How far an injection round's hit fraction may sit from the idle round's:
+// above the rounds' sampling noise. A single leaked rule is caught by the
+// probe erase, not here; this catches refusals that disturb steering.
+constexpr double kHitTolerance = 0.02;
 
 // This thread's CPU time, and this process's (every client thread, gRPC's
 // included), both in nanoseconds: the client side of a commit has to be
@@ -125,8 +138,8 @@ struct Options {
   std::string stage_mode = "message";
   int transaction_streams = 0;
   // Every Nth committed transaction, also submit one the engine must refuse
-  // (one key upserted twice). 0 disables the check; the run fails if one is
-  // applied.
+  // (InjectFailure: refused after a valid rule was reserved). 0 disables the
+  // check; the run fails if one is applied or leaves its rule behind.
   int fail_every = 0;
   // exact: ExactMatch -> Sink per gate (one resource, the rule). session:
   // ExactMatch -> Meter -> Router, the rule's result naming the meter and
@@ -299,20 +312,37 @@ class Committer {
   long TakeRejected() { return std::exchange(rejected_, 0); }
   long TakeUnexpected() { return std::exchange(unexpected_, 0); }
   double TakeInjectionSeconds() { return std::exchange(injection_seconds_, 0.0); }
+  long TakeLeaked() { return std::exchange(leaked_, 0); }
 
  private:
-  // A transaction the engine must refuse: one key is upserted twice, which its
-  // one-operation-per-key rule rejects before applying anything. A busy answer
-  // is retried under a new request id; any applied or differently refused
-  // attempt is counted, not thrown, so the run can report it and fail.
+  // A transaction the engine must refuse after it reserved something: the
+  // next session's rule, valid and reserved, then an operation refused once
+  // reserved -- on the session chain a rule naming a meter that does not
+  // exist (the reference check runs after every Reserve), on the exact chain
+  // an erase of a rule that is not there (refused at its own Reserve, after
+  // the upsert's). The refusal must roll the upsert back: an erase of its key
+  // afterwards is refused "not found". A busy answer is retried under a new
+  // request id; any applied or differently refused attempt, or a key the
+  // refusal left behind, is counted, not thrown, so the run can report it and
+  // fail.
   void InjectFailure() {
     injected_++;
+    const int s = next_;
+    const auto key = Key(types_, o_, block_, s);
+    const auto value = Value(types_, o_, s);
+    const auto bad_key = Key(types_, o_, block_, s + 1);
+    const auto bad_value =
+        o_.chain == "session"
+            ? types_.Make("ExactMatchRuleValue",
+                          R"({"gate": 0, "result": ")" +
+                              Base64(Be32(kMissingMeter) + Be32(1)) + R"("})")
+            : nullptr;
     while (true) {
       bess::sdk::Transaction tx = client_.NewTransaction();
-      const int s = next_;
-      const auto key = Key(types_, o_, block_, s);
-      const auto value = Value(types_, o_, s);
-      if (!tx.Upsert(rules_, *key, *value) || !tx.Upsert(rules_, *key, *value)) {
+      const bool built =
+          tx.Upsert(rules_, *key, *value) &&
+          (bad_value ? tx.Upsert(rules_, *bad_key, *bad_value) : tx.Erase(rules_, *bad_key));
+      if (!built) {
         unexpected_++;
         return;
       }
@@ -320,17 +350,34 @@ class Committer {
       const auto result = tx.Commit();
       injection_seconds_ += std::chrono::duration<double>(Clock::now() - t0).count();
       if (result) {
-        unexpected_++;  // applied: the engine did not refuse the duplicate
+        unexpected_++;  // applied: the engine did not refuse it
         return;
       }
       if (result.error().kind == bess::sdk::ErrorKind::kBusy) {
         continue;
       }
-      if (result.error().kind == bess::sdk::ErrorKind::kRejected) {
-        rejected_++;
+      if (result.error().kind != bess::sdk::ErrorKind::kRejected) {
+        unexpected_++;  // a different refusal is not the check this mode makes
         return;
       }
-      unexpected_++;  // a different refusal is not the check this mode makes
+      rejected_++;
+      break;
+    }
+    // The reserved upsert must be gone with the refusal.
+    while (true) {
+      bess::sdk::Transaction probe = client_.NewTransaction();
+      if (!probe.Erase(rules_, *key)) {
+        unexpected_++;
+        return;
+      }
+      const auto result = probe.Commit();
+      if (!result && result.error().kind == bess::sdk::ErrorKind::kBusy) {
+        continue;
+      }
+      if (result || result.error().kind != bess::sdk::ErrorKind::kRejected) {
+        unexpected_++;  // the key was there: the refusal left it applied
+        leaked_++;
+      }
       return;
     }
   }
@@ -349,6 +396,7 @@ class Committer {
   long rejected_ = 0;
   long unexpected_ = 0;
   double injection_seconds_ = 0.0;
+  long leaked_ = 0;  // refused transactions whose reserved upsert stayed applied
 };
 
 class Bench {
@@ -908,19 +956,20 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
     done += c->TakeDone();
     thread_cpu_ns += c->TakeCpuNs();
   }
-  long injected = 0, rejected = 0, unexpected = 0;
+  long injected = 0, rejected = 0, unexpected = 0, leaked = 0;
   double injection_seconds = 0;
   for (Committer *c : committers) {
     injected += c->TakeInjected();
     rejected += c->TakeRejected();
     unexpected += c->TakeUnexpected();
     injection_seconds += c->TakeInjectionSeconds();
+    leaked += c->TakeLeaked();
   }
   if (o.fail_every > 0) {
     g_injection_unexpected += unexpected;
     std::printf("# failure_injection {\"rate\":%d,\"attempted\":%ld,\"rejected\":%ld,"
-                "\"unexpected\":%ld,\"mean_us\":%.3f}\n",
-                rate, injected, rejected, unexpected,
+                "\"unexpected\":%ld,\"leaked\":%ld,\"mean_us\":%.3f}\n",
+                rate, injected, rejected, unexpected, leaked,
                 rejected > 0 ? injection_seconds / rejected * 1e6 : 0.0);
   }
   const double client_cpu_s =
@@ -976,10 +1025,21 @@ void Measure(std::vector<Committer *> &committers, Bench &bench, const Options &
   }
   const double p50 = latency[latency.size() / 2];
   const double p99 = latency[std::min(latency.size() - 1, size_t(latency.size() * 0.99))];
+  const double hit = total > 0 ? 1 - misses / total : 0.0;
   std::printf("%8s %8.2f %6.2f %10.0f %9.0f %9.0f %6.0f\n",
               rate < 0 ? "max" : std::to_string(rate).c_str(), rate_packets / elapsed / 1e6,
-              total > 0 ? 1 - misses / total : 0.0, done / elapsed, p50 * 1e6, p99 * 1e6,
-              bench.Busy() - busy_before);
+              hit, done / elapsed, p50 * 1e6, p99 * 1e6, bench.Busy() - busy_before);
+  // The refused transactions must leave the rules steering as before: a round
+  // with injections keeps the idle round's hit fraction (the live set is the
+  // same size when each transaction adds as many rules as it drops).
+  if (done == 0 && total > 0) {
+    g_idle_hit = hit;
+  } else if (o.fail_every > 0 && injected > 0 && g_idle_hit >= 0 &&
+             o.upserts == o.erases && std::abs(hit - g_idle_hit) > kHitTolerance) {
+    g_injection_unexpected++;
+    std::printf("# failure_injection_hit {\"rate\":%d,\"hit\":%.4f,\"idle_hit\":%.4f}\n",
+                rate, hit, g_idle_hit);
+  }
   if (done > 0) {
     std::printf("%8s   client CPU %.1f us/tx (%zu threads, %.2f cores used)",
                 rate < 0 ? "max" : std::to_string(rate).c_str(),

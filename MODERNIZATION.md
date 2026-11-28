@@ -8835,9 +8835,10 @@ consumer-driven (D-008, §31.3 item 2).
   vSwitch's policy root is a shipped consumer (D-197); `VISIBILITY_ATOMIC` is
   deprecated and never sent.
 - **Other G1.2 follow-ons:** the live Mpps benchmark (D-027) covers unary
-  ExactMatch rule churn, not the full classifier→Meter→Router chain.
-  Full-chain failure injection under traffic and `ReplaceScope` remain
-  pending. Production streaming is public: `Control.TransactionChannel`
+  ExactMatch rule churn; `live_transaction_bench --chain session` covers the
+  full classifier→Meter→Router chain with failure injection that is refused
+  after reservation and must roll back (`docs/benchmarking.md`).
+  Production streaming is public: `Control.TransactionChannel`
   carries 1..64 independent transactions per frame over 1..64 persistent
   streams, driven by the Go and C++ SDKs (D-210). The proto in
   `protobuf/tests/ingress_bench.proto` remains benchmark-only.
@@ -11032,7 +11033,7 @@ drive the design.
 | 1 | P0 | **G1.2b transaction engine and providers**: reserve/publish, dependency ordering, reference safety, retirement (D-021); ExactMatch, WildcardMatch, Router and Meter (D-022–D-024, D-032) | manual ordering, best-effort rollback | routers, firewalls, NAT | complete |
 | 2 | P0 | **G1.2c unary transaction RPC:** `ApplyTransaction`, `GetTransaction`, `ListTransactionResources`, `request_id`, generations and daemon epoch (D-025) | per-rule RPC orchestration and timeout ambiguity | any controller | unary path complete; persistent streams complete (Go, C++ SDKs); Python SDK rebuild in progress (D-146) |
 | 3 | P0 | **Scope-snapshot publication:** one pointer store selects a complete old or new immutable policy version | overlapping PDR/FAR/QER modification windows | route-set replace, firewall policy swap | `ScopeTable`/`ScopeResource` and `CONSISTENCY_SCOPE_SNAPSHOT` complete with two test applications (D-050); the reference vSwitch's policy root is a shipped consumer (D-197); `ReplaceScope` is complete through the engine, the RPC (`ApplyTransactionRequest.replace_scopes`) and the C++/Go SDKs (`ReplaceScope`/`EraseScope`) |
-| 4 | P1 | **Generic session vertical slice** (D-032): ExactMatch → K5 Meter → Router, with the meter and next-hop ids in the rule's result record (D-172, D-174), programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; the full-chain live gate is complete through `live_transaction_bench --chain session` (5.27-5.55 Mpps at the 0.50 hit fraction, every injected duplicate rejected; `docs/benchmarking.md`, 2026-11-26) |
+| 4 | P1 | **Generic session vertical slice** (D-032): ExactMatch → K5 Meter → Router, with the meter and next-hop ids in the rule's result record (D-172, D-174), programmed in one transaction | controller-side ordering/rollback | session policy, firewall/QoS/forwarding chains | basic in-process and live-daemon slice complete; the full-chain live gate is complete through `live_transaction_bench --chain session` (5.97-6.01 Mpps at the 0.50 hit fraction; every injected transaction -- a valid rule upsert plus a rule naming a missing meter, refused by the reference check after both were reserved -- rejected and its upsert rolled back, 0 leaked; `docs/benchmarking.md`, 2026-11-28) |
 | 5 | P0 | **External plugin package** (`bess-dev`) with an explicit header contract | vendored BESS fork | out-of-tree module authors | curated 51-header source API and installed-plugin checks complete (D-037, D-041); no C++ ABI promise |
 | 6 | P1 | **K3.8 range backend** (arbitrary source/destination ranges and precedence), differential against scalar reference | Go ternary expansion and Cartesian products | ACL, firewall rules | complete (D-038) |
 | 7 | P1 | **K7.1 route domains** (`RouteDomainId`, `ApplyRouteSet`) | Network Instance workarounds | VRFs, multi-tenant routers | complete (D-039; unified into `Router` by D-046) |
@@ -11215,7 +11216,7 @@ WildcardMatch lookups on small tables are +15..+31% (§31.3 item 1).
      `CONSISTENCY_SCOPE_SNAPSHOT` over the RPC, refused (not downgraded) for
      resources that cannot provide it. The earlier packed `ScopeCell` word was
      deleted.
-   **Pending:** `ReplaceScope`;
+   **Pending:**
    `GetSystem` (G1.3). Done since 2026-10-01: the shipped scope consumer
    (D-197); production streaming (Go and C++ SDKs over
    `Control.TransactionChannel`); G1.4 stats/events on the shipped surfaces
@@ -11617,7 +11618,7 @@ G1.1, G1.2a single-table updates, G1.2b transaction core, G1.2c unary RPC and
 persistent transaction streams, G1.2d scope snapshots with a shipped consumer
 (D-197), G1.5, G1.6, G1.7 (legacy commands pending), G1.8, G1.9, and M2
 curated plugin package.
-Partial: F, G1 (`ReplaceScope`, full-chain gate, `GetSystem`), H, and I. Not started: D and K8 (consumer-driven).
+Partial: F, G1 (`GetSystem`), H, and I. Not started: D and K8 (consumer-driven).
 ---
 
 
@@ -11633,7 +11634,7 @@ G1.1, G1.2a, G1.2b transaction core, G1.2c unary RPC and persistent
 transaction streams, G1.2d scope snapshots with a shipped consumer (D-197),
 G1.5, G1.6, G1.7 (legacy commands pending), G1.8, G1.9, and M2 curated
 plugin package.
-Partial: F, G1 (`ReplaceScope`, full-chain gate, `GetSystem`), H, and I. Not started: D and K8 (consumer-driven).
+Partial: F, G1 (`GetSystem`), H, and I. Not started: D and K8 (consumer-driven).
 C-HW remains a separate deferred hardware-validation track.
 
 **Start here:** §14 G1 status and §31.3 remaining work, updated 2026-11-25;
@@ -11641,8 +11642,7 @@ entry 168 lists the November landings. Historical entries below/above record
 what was planned at the time; do not reopen completed transaction
 core/providers or duplicate the D-032 session slice.
 
-**Next software work:** `ReplaceScope` and the full-chain
-failure-injection/Mpps gate; continue Phase L (section 27) as a parallel
+**Next software work:** `GetSystem` (G1.3); continue Phase L (section 27) as a parallel
 performance track. The unary control-path ceiling arms parked on 2026-10-17
 (performance-contract.md §4) resume when a consumer's numbers ask for them.
 Do not block software work on real-NIC validation.
