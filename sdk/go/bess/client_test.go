@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/krsna1729/bess/sdk/go/controlv2"
 )
@@ -47,13 +48,17 @@ func known(o pb.TransactionRecord_Outcome, epoch uint64) step {
 }
 
 type fake struct {
-	epoch        uint64
-	applies      []step
-	gets         []step
-	sent         []*pb.ApplyTransactionRequest
-	asked        []string
-	listed       int
-	rejectOps    bool
+	epoch     uint64
+	applies   []step
+	gets      []step
+	sent      []*pb.ApplyTransactionRequest
+	asked     []string
+	listed    int
+	rejectOps bool
+	// failOne: answer one result per operation in the daemon's layout (plain
+	// ops, then each replacement's objects and its scope), failIndex FAILED.
+	failOne      bool
+	failIndex    int
 	oldDaemon    bool // answers GetCapabilities with UNIMPLEMENTED
 	refuse       bool // answers GetCapabilities with PERMISSION_DENIED
 	streams      []*scriptedStream
@@ -161,6 +166,19 @@ func (f *fake) apply(_ context.Context, in *pb.ApplyTransactionRequest) (*pb.App
 	rec := &pb.TransactionRecord{RequestId: in.GetRequestId(), Outcome: s.outcome, Generation: 7}
 	if f.rejectOps {
 		rec.Ops = []*pb.TransactionOpResult{{Status: pb.TransactionOpResult_STATUS_FAILED, Error: "no such next hop"}}
+	}
+	if f.failOne {
+		n := len(in.GetOps())
+		for _, r := range in.GetReplaceScopes() {
+			n += len(r.GetObjects()) + 1
+		}
+		for i := range n {
+			op := &pb.TransactionOpResult{Status: pb.TransactionOpResult_STATUS_NOT_APPLIED}
+			if i == f.failIndex {
+				op.Status, op.Error = pb.TransactionOpResult_STATUS_FAILED, "refused"
+			}
+			rec.Ops = append(rec.Ops, op)
+		}
 	}
 	return &pb.ApplyTransactionResponse{Record: rec, DaemonEpoch: s.epoch}, nil, nil
 }
@@ -364,6 +382,84 @@ func TestReplaceScopePacksTheScopeAndItsObjects(t *testing.T) {
 	}
 	if replacement.Scope.Key.GetTypeUrl() != "type.googleapis.com/"+keyType {
 		t.Fatalf("scope key type %q", replacement.Scope.Key.GetTypeUrl())
+	}
+}
+
+func TestEraseScopePacksAnEraseOfTheScopeAlone(t *testing.T) {
+	h := newHarness(&fake{applies: []step{answer(applied, 1)}}, 4)
+	ctx := context.Background()
+	r, err := h.c.Resource(ctx, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := h.c.Transaction()
+	if err := tx.EraseScope(r, &pb.GetTransactionRequest{RequestId: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	req := h.f.sent[0]
+	if len(req.Ops) != 0 || len(req.ReplaceScopes) != 1 {
+		t.Fatalf("ops %d, replace scopes %d", len(req.Ops), len(req.ReplaceScopes))
+	}
+	replacement := req.ReplaceScopes[0]
+	if replacement.Scope.GetResource() != resource || !replacement.Scope.GetErase() ||
+		replacement.Scope.GetValue() != nil || len(replacement.Objects) != 0 {
+		t.Fatalf("replacement %+v", replacement)
+	}
+}
+
+// A singleton has no scopes: both calls refuse it, and nothing is sent.
+func TestScopeCallsRefuseASingleton(t *testing.T) {
+	h := newHarness(&fake{}, 4)
+	ctx := context.Background()
+	s, err := h.c.Resource(ctx, singleton)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := h.c.Transaction()
+	as[*InvalidRequestError](t, tx.ReplaceScope(s, &emptypb.Empty{}, &pb.ListTransactionResourcesRequest{}))
+	as[*InvalidRequestError](t, tx.EraseScope(s, &emptypb.Empty{}))
+	if len(h.f.sent) != 0 {
+		t.Fatalf("sent %d", len(h.f.sent))
+	}
+}
+
+// A failure's Index is its place in the record (plain ops, then each
+// replacement's objects and its scope); Replacement/Object say which call.
+func TestAFailureIsPlacedInTheCallersTerms(t *testing.T) {
+	// 1 plain op; ReplaceScope with 2 objects (1, 2; scope 3); EraseScope (4).
+	for _, c := range []OpFailure{
+		{Index: 0, Replacement: -1, Object: -1}, {Index: 1, Replacement: 0, Object: 0},
+		{Index: 2, Replacement: 0, Object: 1}, {Index: 3, Replacement: 0, Object: -1},
+		{Index: 4, Replacement: 1, Object: -1},
+	} {
+		h := newHarness(&fake{applies: []step{answer(rejected, 1)}, failOne: true, failIndex: c.Index}, 4)
+		ctx := context.Background()
+		r, err := h.c.Resource(ctx, resource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := &pb.GetTransactionRequest{RequestId: "k"}
+		value := &pb.ListTransactionResourcesRequest{}
+		object := ScopeObject{Resource: r, Key: key, Value: value}
+		tx := h.c.Transaction()
+		if err = tx.Upsert(r, key, value); err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.ReplaceScope(r, key, value, object, object); err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.EraseScope(r, key); err != nil {
+			t.Fatal(err)
+		}
+		_, err = tx.Commit(ctx)
+		e := as[*RejectedError](t, err)
+		c.Error = "refused"
+		if len(e.Failures) != 1 || e.Failures[0] != c {
+			t.Fatalf("index %d: %+v", c.Index, e.Failures)
+		}
 	}
 }
 

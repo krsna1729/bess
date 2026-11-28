@@ -125,6 +125,10 @@ class Fake final : public Transport {
   std::vector<pb::InvokeActionRequest> invoked;
   int listed = 0;
   bool reject_ops = false;
+  // >= 0: answer one result per operation of the request in the daemon's
+  // layout (plain ops, then each replacement's objects and its scope), this
+  // one FAILED.
+  int fail_index = -1;
   bool old_daemon = false;  // GetCapabilities: UNIMPLEMENTED
   bool refuse = false;      // GetCapabilities: PERMISSION_DENIED
   std::deque<std::deque<StreamStep>> streams;
@@ -171,6 +175,20 @@ class Fake final : public Transport {
       auto *op = rec->add_ops();
       op->set_status(pb::TransactionOpResult::STATUS_FAILED);
       op->set_error("no such next hop");
+    }
+    if (fail_index >= 0) {
+      int n = in.ops_size();
+      for (const auto &replacement : in.replace_scopes()) {
+        n += replacement.objects_size() + 1;
+      }
+      for (int i = 0; i < n; i++) {
+        auto *op = rec->add_ops();
+        op->set_status(i == fail_index ? pb::TransactionOpResult::STATUS_FAILED
+                                       : pb::TransactionOpResult::STATUS_NOT_APPLIED);
+        if (i == fail_index) {
+          op->set_error("refused");
+        }
+      }
     }
     out->set_daemon_epoch(s.epoch);
     return grpc::Status::OK;
@@ -432,6 +450,75 @@ TEST(SdkClient, ReplaceScopePacksTheScopeAndItsObjects) {
   ASSERT_EQ(replacement.objects_size(), 1);
   EXPECT_EQ(replacement.objects(0).resource(), kResource);
   EXPECT_FALSE(replacement.objects(0).erase());
+}
+
+TEST(SdkClient, EraseScopePacksAnEraseOfTheScopeAlone) {
+  Harness h(4);
+  h.f->applies = {Answer(kApplied, 1)};
+  auto r = h.c->Resource(kResource);
+  ASSERT_TRUE(r);
+  pb::GetTransactionRequest key;
+  key.set_request_id("k");
+  Transaction tx = h.c->NewTransaction();
+  ASSERT_TRUE(tx.EraseScope(*r, key));
+  ASSERT_TRUE(tx.Commit());
+  ASSERT_EQ(h.f->sent.size(), 1u);
+  const auto &req = h.f->sent[0];
+  EXPECT_EQ(req.ops_size(), 0);
+  ASSERT_EQ(req.replace_scopes_size(), 1);
+  const auto &replacement = req.replace_scopes(0);
+  EXPECT_EQ(replacement.scope().resource(), kResource);
+  EXPECT_TRUE(replacement.scope().erase());
+  EXPECT_FALSE(replacement.scope().has_value());
+  EXPECT_EQ(replacement.objects_size(), 0);
+}
+
+// A singleton has no scopes: both calls refuse it, and nothing is sent.
+TEST(SdkClient, ScopeCallsRefuseASingleton) {
+  Harness h(4);
+  auto s = h.c->Resource(kSingleton);
+  ASSERT_TRUE(s);
+  pb::GetTransactionRequest key;
+  pb::ListTransactionResourcesRequest value;
+  Transaction tx = h.c->NewTransaction();
+  const auto replaced = tx.ReplaceScope(*s, key, value);
+  ASSERT_FALSE(replaced);
+  EXPECT_EQ(replaced.error().kind, ErrorKind::kInvalidRequest);
+  const auto erased = tx.EraseScope(*s, key);
+  ASSERT_FALSE(erased);
+  EXPECT_EQ(erased.error().kind, ErrorKind::kInvalidRequest);
+  EXPECT_TRUE(h.f->sent.empty());
+}
+
+// A failure's index is its place in the record (plain ops, then each
+// replacement's objects and its scope); replacement/object say which call.
+TEST(SdkClient, AFailureIsPlacedInTheCallersTerms) {
+  struct Case {
+    int index, replacement, object;
+  };
+  // 1 plain op; ReplaceScope with 2 objects (1, 2; scope 3); EraseScope (4).
+  for (const Case c : {Case{0, -1, -1}, Case{1, 0, 0}, Case{2, 0, 1}, Case{3, 0, -1},
+                       Case{4, 1, -1}}) {
+    Harness h(4);
+    h.f->applies = {Answer(kRejected, 1)};
+    h.f->fail_index = c.index;
+    auto r = h.c->Resource(kResource);
+    ASSERT_TRUE(r);
+    pb::GetTransactionRequest key;
+    pb::ListTransactionResourcesRequest value;
+    const Transaction::Object objects[] = {{&*r, &key, &value}, {&*r, &key, &value}};
+    Transaction tx = h.c->NewTransaction();
+    ASSERT_TRUE(tx.Upsert(*r, key, value));
+    ASSERT_TRUE(tx.ReplaceScope(*r, key, value, objects));
+    ASSERT_TRUE(tx.EraseScope(*r, key));
+    const auto a = tx.Commit();
+    ASSERT_EQ(KindOf(a), ErrorKind::kRejected) << c.index;
+    ASSERT_EQ(a.error().failures.size(), 1u) << c.index;
+    const OpFailure &f = a.error().failures[0];
+    EXPECT_EQ(f.index, c.index);
+    EXPECT_EQ(f.replacement, c.replacement) << c.index;
+    EXPECT_EQ(f.object, c.object) << c.index;
+  }
 }
 
 TEST(SdkClient, ATimeoutIsResolvedByAskingNotByResending) {

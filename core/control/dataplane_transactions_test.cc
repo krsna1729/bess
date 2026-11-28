@@ -1391,6 +1391,46 @@ TEST_F(ConsistencyRpcTest, AKeyNamedTwiceInOneRequestIsRefused) {
   EXPECT_FALSE(HasMeter(1));
 }
 
+// EraseScope through the adapter: the erased Version's entries retire unless
+// another Version names them, and erasing a scope that is not there is
+// refused at the scope's place in the record.
+TEST_F(ConsistencyRpcTest, EraseScopeRetiresOnlyWhatNothingElseNames) {
+  v2::ApplyTransactionRequest first;
+  AddPolicy(&first, 1, 1, {Op("meters", 1, 100)});
+  AddPolicy(&first, 2, 1, {});
+  v2::ApplyTransactionResponse response;
+  ASSERT_TRUE(Apply(first, &response).ok());
+  ASSERT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+
+  v2::ApplyTransactionRequest erase_one;
+  *erase_one.add_replace_scopes()->mutable_scope() = Erase("policies", 1);
+  ASSERT_TRUE(Apply(erase_one, &response).ok());
+  ASSERT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  Settle();
+  EXPECT_EQ(Policy(1), nullptr);
+  EXPECT_TRUE(HasMeter(1)) << "policy 2 still names it";
+
+  v2::ApplyTransactionRequest again;
+  *again.add_ops() = Op("meters", 5, 500);
+  *again.add_replace_scopes()->mutable_scope() = Erase("policies", 1);
+  const uint64_t generation = engine_.generation();
+  ASSERT_TRUE(Apply(again, &response).ok());
+  EXPECT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_REJECTED);
+  ASSERT_EQ(response.record().ops_size(), 2);
+  EXPECT_EQ(response.record().ops(0).status(), v2::TransactionOpResult::STATUS_NOT_APPLIED);
+  EXPECT_EQ(response.record().ops(1).status(), v2::TransactionOpResult::STATUS_FAILED);
+  EXPECT_EQ(engine_.generation(), generation);
+  EXPECT_FALSE(HasMeter(5));
+
+  v2::ApplyTransactionRequest erase_two;
+  *erase_two.add_replace_scopes()->mutable_scope() = Erase("policies", 2);
+  ASSERT_TRUE(Apply(erase_two, &response).ok());
+  ASSERT_EQ(response.record().outcome(), v2::TransactionRecord::OUTCOME_APPLIED);
+  Settle();
+  EXPECT_EQ(Policy(2), nullptr);
+  EXPECT_FALSE(HasMeter(1)) << "named by no Version after the erase";
+}
+
 TEST_F(ConsistencyRpcTest, ReplaceScopeRefusesAReferentialScopeResource) {
   v2::ApplyTransactionRequest req;
   req.set_request_id("replace-3");

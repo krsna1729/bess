@@ -205,7 +205,12 @@ whole transaction. The scope resource must provide scope-snapshot
 consistency whatever the transaction asks; the transaction's consistency
 applies to its plain operations. A record lists the plain operations' results,
 then each replacement's objects and its scope, in the order the calls were
-made: a failure's index is its place in that list.
+made: a failure's index is its place in that list. The C++ and Go SDKs also
+locate it in the caller's terms (`OpFailure` `replacement`/`object`, Go
+`Replacement`/`Object`): the replacement's place among the `ReplaceScope` and
+`EraseScope` calls (-1 for a plain operation) and the object's place in it (-1
+for its scope, where a refused retirement is reported, naming the key). Both
+refuse `ReplaceScope` and `EraseScope` on a singleton before sending.
 
 ## Desired state
 
