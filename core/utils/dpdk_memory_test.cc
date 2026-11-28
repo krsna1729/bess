@@ -452,6 +452,43 @@ TEST_F(DpdkMemoryTest, GrowthPageSizeIsTheSizeTheHeapMaps) {
   EXPECT_EQ(GrowthPageSize({}), 0u);
 }
 
+// The charge reads the page size backing the heap at each admission, not the
+// first one seen: DPDK grows the heap smallest page size first and maps
+// 1 GiB pages once its 2 MiB pages run out (alloc_more_mem_on_socket).
+TEST_F(DpdkMemoryTest, TheHugepageChargeFollowsThePageSizeTheHeapGrowsInto) {
+  using bess::utils::detail::SegmentList;
+  using bess::utils::detail::SetSegmentListsForTest;
+  constexpr size_t kGB = 1024 * kMB;
+  bess::utils::detail::SetNativeHeapIsHugepagesForTest(true);
+  rte_malloc_socket_stats stats{};
+  ASSERT_EQ(rte_malloc_get_socket_stats(bess::utils::MemoryNode(), &stats), 0);
+  // Past what the heap holds (it must grow), 1 MiB over a GiB multiple: the
+  // 1 GiB charge is about a GiB more than the 2 MiB one. Admitted only, never
+  // allocated.
+  const size_t bytes = (stats.greatest_free_size / kGB + 1) * kGB + kMB;
+  const size_t charge_2m = bytes - kMB + 2 * kMB;
+  MemoryPolicy policy = TightPolicy(32 * kMB + charge_2m + 64 * kMB, 32 * kMB);
+  policy.hugetlb_charged = true;
+  {
+    PolicyScope scope(policy);
+    const SegmentList only_2m_mapped[] = {{kGB, 0}, {2 * kMB, 3}};
+    SetSegmentListsForTest(only_2m_mapped);
+    EXPECT_EQ(AdmitTable(bytes), TableBacking::kHugepages);
+    ReleaseTable(TableBacking::kHugepages, bytes);
+    const SegmentList grown_into_1g[] = {{kGB, 1}, {2 * kMB, 3}};
+    SetSegmentListsForTest(grown_into_1g);
+    try {
+      AdmitTable(bytes);
+      ReleaseTable(TableBacking::kHugepages, bytes);
+      ADD_FAILURE() << "1 GiB pages charged as 2 MiB ones";
+    } catch (const MemoryRefused &e) {
+      EXPECT_EQ(e.reason(), MemoryRefused::Reason::kNormalLimit);
+    }
+  }
+  SetSegmentListsForTest({});
+  bess::utils::detail::SetNativeHeapIsHugepagesForTest(false);
+}
+
 TEST_F(DpdkMemoryTest, ChargedHugepagesAreAdmittedAgainstTheLimit) {
   if (!rte_eal_has_hugepages()) {
     GTEST_SKIP() << "DPDK runs on normal pages (BESSD_MEM_BACKING)";

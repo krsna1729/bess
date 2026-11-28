@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -67,6 +68,9 @@ struct Armed {
 thread_local Armed armed;
 std::atomic<PlacementObserver> placement_observer{nullptr};
 std::atomic<bool> native_is_hugepages_for_test{false};
+// detail::SetSegmentListsForTest; read only while segment_lists_overridden.
+std::vector<detail::SegmentList> segment_lists_for_test;
+std::atomic<bool> segment_lists_overridden{false};
 
 // DPDK's native heap is hugepages (detail::SetNativeHeapIsHugepagesForTest
 // says so for test binaries, whose EAL runs on normal pages). The EAL must
@@ -539,35 +543,31 @@ bool HugepageBacked() {
 
 // The page size the memory node's hugepage heap grows by (GrowthPageSize).
 // Walked on the control path, never from a validator callback
-// (rte_memseg_list_walk takes the hotplug lock those run under). Kept once a
-// list holds segments: the packet pool maps the heap's first pages at
-// startup, so the walk repeats only before that.
+// (rte_memseg_list_walk takes the hotplug lock those run under). Walked for
+// every charge, not kept: DPDK grows the heap with its smallest page size
+// first and maps a larger one only once that runs out
+// (alloc_more_mem_on_socket), so the size backing the heap can grow after
+// the first walk, and a kept smaller size under-admits every later table.
 size_t HeapPageSize() {
-  static std::atomic<size_t> mapped{0};
-  if (const size_t page = mapped.load(std::memory_order_relaxed); page != 0) {
-    return page;
+  if (segment_lists_overridden.load(std::memory_order_relaxed)) {
+    return detail::GrowthPageSize(segment_lists_for_test);
   }
   struct Walk {
     int socket;
-    std::vector<detail::SegmentList> lists;
-  } walk{MemoryNode(), {}};
+    size_t count;
+    std::array<detail::SegmentList, RTE_MAX_MEMSEG_LISTS> lists;
+  } walk{MemoryNode(), 0, {}};
   rte_memseg_list_walk(
       [](const rte_memseg_list *msl, void *arg) {
         auto *w = static_cast<Walk *>(arg);
-        if (!msl->external && msl->socket_id == w->socket) {
-          w->lists.push_back({msl->page_sz, msl->memseg_arr.count});
+        if (!msl->external && msl->socket_id == w->socket &&
+            w->count < w->lists.size()) {
+          w->lists[w->count++] = {msl->page_sz, msl->memseg_arr.count};
         }
         return 0;
       },
       &walk);
-  const size_t page = detail::GrowthPageSize(walk.lists);
-  for (const detail::SegmentList &list : walk.lists) {
-    if (list.segments != 0) {
-      mapped.store(page, std::memory_order_relaxed);
-      break;
-    }
-  }
-  return page;
+  return detail::GrowthPageSize(std::span(walk.lists.data(), walk.count));
 }
 
 // The memory node heap's size as DPDK grows and shrinks it (memory events),
@@ -643,6 +643,12 @@ size_t FallbackChunkCap(size_t limit_bytes) noexcept {
 
 void SetNativeHeapIsHugepagesForTest(bool on) noexcept {
   native_is_hugepages_for_test.store(on, std::memory_order_relaxed);
+}
+
+void SetSegmentListsForTest(std::span<const SegmentList> lists) {
+  segment_lists_overridden.store(false, std::memory_order_relaxed);
+  segment_lists_for_test.assign(lists.begin(), lists.end());
+  segment_lists_overridden.store(!lists.empty(), std::memory_order_relaxed);
 }
 
 }  // namespace detail
