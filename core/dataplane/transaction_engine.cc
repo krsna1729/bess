@@ -926,7 +926,11 @@ TransactionEngine::Result TransactionEngine::ApplyImpl(
       return reject(i, std::move(reserved.error()));
     }
     if (reserved->busy) {
-      DCHECK(reserved->staged == nullptr) << "a busy reservation stages nothing";
+      // A busy answer should stage nothing; if it did, release it like any
+      // reservation the transaction will not publish.
+      if (reserved->staged != nullptr) {
+        reserved->staged->Abort();
+      }
       return Busy(n);
     }
     // Neither push can throw (both reserved for every operation): the

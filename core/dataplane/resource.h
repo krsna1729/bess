@@ -263,13 +263,13 @@ class Resource {
     // saves the engine two more lookups per operation.
     bool existed = false;
     std::vector<Reference> previous_references;
-    // Set, with nothing staged, when `op` can be reserved only after a grace
-    // period the resource started earlier has passed (the slots a previous
-    // version of the key still names, say). The transaction answers
-    // TransactionEngine::Outcome::kBusy with nothing attempted, and its
-    // caller retries after a backoff with no lock held. Waiting here instead
-    // (RcuDomain::Synchronize) would hold the engine's and the control
-    // plane's locks for the grace period (D-021 amendment 6).
+    // Set, staging nothing (anything staged is aborted), when `op` can be
+    // reserved only after a grace period the resource started earlier has
+    // passed (the slots a previous version of the key still names, say). The
+    // transaction answers TransactionEngine::Outcome::kBusy with nothing
+    // attempted, and its caller retries after a backoff with no lock held.
+    // Waiting here instead (RcuDomain::Synchronize) would hold the engine's
+    // and the control plane's locks for the grace period (D-021 amendment 6).
     bool busy = false;
   };
 

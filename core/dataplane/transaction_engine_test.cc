@@ -422,6 +422,35 @@ TEST_F(TransactionEngineTest, AReservationThatMustWaitAnswersBusy) {
   EXPECT_EQ(engine.generation(), generation + 1);
 }
 
+// A busy answer that staged something anyway (a reserved id, say) has it
+// aborted with the rest: the transaction will not publish it.
+TEST_F(TransactionEngineTest, ABusyReservationThatStagedIsAborted) {
+  class StagingWaiter final : public Resource {
+   public:
+    StagingWaiter() : Resource("waiter") {}
+    size_t LiveCount() const override { return 0; }
+    bool Contains(const ResourceKey &) const override { return false; }
+    std::expected<Reservation, std::string> Reserve(const Op &) override {
+      struct Staged final : StagedOp {
+        int *aborted;
+        explicit Staged(int *a) : aborted(a) {}
+        void Publish(Retirer &) noexcept override {}
+        void Abort() noexcept override { ++*aborted; }
+      };
+      Reservation r{std::make_unique<Staged>(&aborted), {}};
+      r.busy = true;
+      return r;
+    }
+    int aborted = 0;
+  };
+  StagingWaiter waiter;
+  TransactionEngine engine(domain_);
+  ASSERT_TRUE(engine.Register(&waiter));
+  const std::vector<Op> ops = {Op::Upsert("waiter", "k", std::any(1))};
+  ASSERT_EQ(engine.Apply(ops).outcome, Outcome::kBusy);
+  EXPECT_EQ(waiter.aborted, 1);
+}
+
 TEST_F(TransactionEngineTest, MissingReferentRejectsAndNothingIsVisible) {
   auto r = Apply({Met(7, 1000), Rule(10, 5)});  // action 5 does not exist
   ASSERT_EQ(r.outcome, Outcome::kRejected);
