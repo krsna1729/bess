@@ -42,7 +42,7 @@ build_packages=(
   libnuma-dev libpcap-dev zlib1g-dev libunwind-dev libbpf-dev libxdp-dev
   libgoogle-glog-dev libgflags-dev libgtest-dev libbenchmark-dev
   libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler
-  libsystemd-dev libc-ares-dev libcap-dev libyaml-dev
+  libsystemd-dev libc-ares-dev libcap-dev libyaml-dev systemtap-sdt-dev
 )
 
 vm_packages=(cloud-image-utils curl numactl openssh-client qemu-kvm qemu-utils)

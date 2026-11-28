@@ -218,6 +218,11 @@ def meson_options(s):
     # replays them under ASan and UBSan (suite `fuzz`, run by `meson test`).
     if s.name == 'gcc' or s.sanitize == 'address':
         options.append('-Dbuild_fuzzers=true')
+    # The TransactionChannel USDT markers (-Dtransaction_trace, sys/sdt.h from
+    # systemtap-sdt-dev) are off by default; the gating gcc lane builds and
+    # tests with them so the traced build cannot rot unseen.
+    if s.name == 'gcc':
+        options.append('-Dtransaction_trace=true')
     if s.sanitize == 'address':
         # Benchmarks are timing code: built and run in the other lanes.
         options += ['-Db_sanitize=address,undefined', '-Db_lundef=false',

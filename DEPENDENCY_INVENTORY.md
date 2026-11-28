@@ -60,7 +60,7 @@ below.
 | Installer mode | Explicit package names |
 |---|---|
 | `runtime` | `libnuma1`, `libpcap0.8t64`, `zlib1g`, `libunwind8`, `libbpf1`, `libxdp1`, `libgoogle-glog0v6t64`, `libgflags2.2`, `libprotobuf32t64`, `libgrpc++1.51t64`, `libc-ares2`, `libsystemd0`, `libcap2`, `libelf1t64`, `libarchive13t64`, `libjansson4`, `libyaml-0-2`, `tcpdump`. |
-| `build` | `build-essential`, `gcc-14`, `g++-14`, `clang-19`, `ccache`, `mold`, `meson`, `ninja-build`, `pkg-config`, `python3`, `python3-pyelftools`, `xz-utils`, `libnuma-dev`, `libpcap-dev`, `zlib1g-dev`, `libunwind-dev`, `libbpf-dev`, `libxdp-dev`, `libgoogle-glog-dev`, `libgflags-dev`, `libgtest-dev`, `libbenchmark-dev`, `libgrpc++-dev`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `protobuf-compiler`, `libsystemd-dev`, `libc-ares-dev`, `libcap-dev`, `libyaml-dev`. |
+| `build` | `build-essential`, `gcc-14`, `g++-14`, `clang-19`, `ccache`, `mold`, `meson`, `ninja-build`, `pkg-config`, `python3`, `python3-pyelftools`, `xz-utils`, `libnuma-dev`, `libpcap-dev`, `zlib1g-dev`, `libunwind-dev`, `libbpf-dev`, `libxdp-dev`, `libgoogle-glog-dev`, `libgflags-dev`, `libgtest-dev`, `libbenchmark-dev`, `libgrpc++-dev`, `protobuf-compiler-grpc`, `libprotobuf-dev`, `protobuf-compiler`, `libsystemd-dev`, `libc-ares-dev`, `libcap-dev`, `libyaml-dev`, `systemtap-sdt-dev`. |
 | `vm` | `cloud-image-utils`, `curl`, `numactl`, `openssh-client`, `qemu-kvm`, `qemu-utils`. |
 
 ## Container, VM, and external action references
